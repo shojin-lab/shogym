@@ -37,7 +37,7 @@ import hgym
 
 rollouts = await hgym.run_episodes(
     env_name="wordle_v1",
-    model="openai/gpt-5.2-mini",
+    model="openai/gpt-5.4-nano",
     num_tasks=50,
 )
 ```
