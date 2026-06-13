@@ -85,19 +85,64 @@ with the tool, which creates an ownership question. The clean rule:
 So the instruction surface's editable text is: the templates + skills + extras-tool
 descriptions. Mandatory-tool descriptions are read-only env interface.
 
-## 5. Skills (open question, leaning yes)
+## 5. Skills: adopt the SKILL.md open standard (resolved by research, 2026-06-13)
 
-"Skills" (Claude Code's SKILL.md pattern) are instruction content the model loads on demand
-rather than carrying in every prompt: progressive disclosure. They matter disproportionately
-for the self-improvement program (P3), where the optimizer mines its own traces into skills.
+The open question was whether skills are Claude-Code-specific and whether "an injectable
+optional fragment of the system prompt" faithfully represents them. Research settled both:
 
-Proposal: `instruction/skills/*.md`, each a named, on-demand instruction module, surfaced to
-the model through whatever mechanism the agent supports (a `load_skill` tool, or
-context-strategy injection). Whether skills are "just more instruction templates" or deserve
-their own structure (frontmatter: when-to-use, token budget) is the open question. Leaning
-toward light structure (frontmatter + body) because the self-improvement loop needs to
-reason about *which* skill helped (per-skill attribution), which wants each skill to be its
-own diffable file with metadata. Deferred to a focused follow-up once P1 lands.
+- **Skills are no longer Claude-specific.** `SKILL.md` is a cross-vendor **open standard**
+  (agentskills.io), adopted by Claude Code, OpenAI Codex, Google Gemini CLI / Antigravity,
+  Cursor, Copilot, and ~30 others. Every one converges on the same shape: a folder named for
+  the skill, a `SKILL.md` with `name` + `description` frontmatter and a Markdown body, optional
+  `references/`/`assets/`/`scripts/`, loaded by **progressive disclosure** (the name+description
+  always in context for routing; the body loaded on match; resources/scripts on demand).
+- **"Injectable system-prompt fragment" is faithful only for the trivial case** (a small
+  reference skill with no resources). It loses the three things that make skills more than
+  snippets, all of which are in the standard, not Claude-only: (1) progressive disclosure (only
+  ~name+description in context until matched, budgeted to ~1-2% of the window), (2) linked
+  files/executable scripts (a script runs and only its *output* enters context), (3) per-skill
+  `allowed-tools` (experimental in the standard).
+
+**Decision: adopt the SKILL.md standard verbatim as hgym's on-disk skills format.** It is
+simultaneously the most faithful to Claude Code and the most portable (it is literally the
+shared format), so it is the agent-agnostic answer. The instruction surface becomes two tiers:
+
+```
+harness/
+└── instruction/
+    ├── system.minijinja            # the system template (the policy)
+    └── skills/                     # the Agent Skills standard, verbatim
+        └── failure-analysis/
+            ├── SKILL.md            # name + description frontmatter (always loaded) + body (on demand)
+            ├── references/         # optional, lazy
+            └── scripts/            # optional, executed; output-only into context
+```
+
+Notes:
+
+- This is *not* a return of the harness manifest (RFC 000 §5 P3): the per-skill `SKILL.md`
+  frontmatter is the skill's *own* descriptor (the always-loaded routing layer the standard
+  requires), not a harness-level index of surfaces. File-presence still governs which surfaces
+  are engaged; SKILL.md frontmatter governs which skill the model loads when. No conflict.
+- **Graceful degradation:** for an agent (or a v1 reference agent) that cannot do on-demand
+  loading, the fallback is deterministic: concatenate each skill's `SKILL.md` body (description
+  order) into the system prompt. A skill with no scripts/resources degrades losslessly; the
+  only loss is context-economy and script-execution-without-context. So "injectable fragment"
+  becomes the *fallback path*, not the primary representation — which is exactly the right
+  relationship.
+- **Keep only the portable frontmatter subset** in the canonical descriptor (`name`,
+  `description`, optional `license`/`compatibility`/`metadata`); treat `allowed-tools` as an
+  experimental hint; tuck any Claude-only knobs (`context: fork`, `model`, `hooks`) under
+  `metadata` so non-Claude targets ignore them.
+- **Why this matters for P3 (self-improvement):** the optimizer mines its own traces into
+  skills. Each skill being its own diffable folder with a description gives per-skill
+  attribution (RFC 007) for free, and the standard's progressive disclosure is exactly the
+  "don't bloat the prompt with every learned lesson" property P3's bloat-guard needs (cf. ACE,
+  Cursor's rolled-back auto-memories in `lit-reviews/self-optimization.md`).
+
+Open sub-question: does a skill's *content* attribute to the instruction surface as one hash,
+or does each skill get its own sub-hash (so "which skill helped" is a query)? Leaning per-skill
+sub-hash, given P3. RFC 007 decides.
 
 ## 6. The inference surface (model + inference params) (revised per review)
 
