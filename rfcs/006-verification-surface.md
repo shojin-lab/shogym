@@ -72,6 +72,13 @@ experiment mode*, not a harness surface, and the boundary must be unambiguous:
 Making this a *mode*, not a config file in `harness/`, is what keeps it from leaking. If a
 judge config ever appears in the harness directory, that is a bug.
 
+**How a judge legitimately changes (per review):** only via a **version bump** of the env or
+hgym, never within an optimization run. A judge update is a new verifier version, recorded in
+the trace's `verifier` provenance hash (RFC 007 §3, e.g. `v:env@1.3`). So results from
+`env@1.2` and `env@1.3` are correctly seen as measured by *different rulers* and not pooled.
+The judge is fixed within a version and versioned across them; the optimizer never touches it
+in either case.
+
 ## 5. Recommended (env-side) verifier quality patterns
 
 Closed does not mean crude. Two patterns from the Harness-Bench review are worth adopting on

@@ -120,6 +120,17 @@ it attaches at the rollout, which means it can be added *without touching the en
 **Rule.** Optimizable ⟺ attribute of the rollout or the agent. Fixed ⟺ attribute of the
 environment or the verifier.
 
+**Read the rule at the attribute level, not the surface level.** A *surface* is a
+user-facing grouping of attributes, and a surface may span loci. The tool surface is the
+clearest case (and the question that exposes this): mandatory tools are an environment
+attribute and are therefore **fixed**, while extras are a rollout attribute and are
+therefore **optimizable** — the same surface, two loci. So "the tool surface is optimizable"
+is shorthand for "its rollout-locus component (extras) is optimizable; its env-locus
+component (mandatory) is fixed." The rule never contradicts itself; the surface is just a
+coarser unit than the rule operates on. (This resolves what was an "open question" in earlier
+drafts: surfaces are the editable artifacts, loci are the architecture, and where they
+disagree the locus wins.)
+
 Corollaries that fall straight out, several of which the seven-surface framing left
 ambiguous:
 
@@ -142,9 +153,16 @@ ambiguous:
 6. **Observability is the substrate, not a target.** It is always on and never optimized;
    its job is to make the other six *attributable* (per-surface hashes in the trace).
    (RFC 007.)
-7. **The model is the substrate the surfaces wrap.** Swapping it is allowed and lives in
-   the harness (`model = ...`), but it is not one of the seven surfaces; report
-   model-holding-surfaces-fixed and surfaces-holding-model-fixed as distinct axes.
+7. **The model/inference surface is a real, explicit surface** (revised per review). Earlier
+   drafts called the model "the substrate, not a surface." That under-served it. The model id
+   *and the inference-API request config that travels with it* (temperature, top_p,
+   max_tokens, reasoning_effort, stop sequences — everything a gateway's inference call takes
+   besides messages and tools) form one coherent optimizable surface: the **inference
+   surface**. It is optimizable (tune temperature, swap model, raise reasoning effort) and
+   lives in `harness.toml` (it does **not** get its own file — that would be overkill for a
+   handful of scalars). It is still worth reporting model *swaps* on a distinct axis from
+   prompt edits, because a model swap is a categorically larger lever; but it is a surface,
+   not a special category. See RFC 001 §6.
 
 ---
 
@@ -157,9 +175,9 @@ ambiguous:
 | Context | **rollout** (transform over trajectory) | yes | `context.toml` | 003 |
 | Control | rollout (env contributes horizon + `terminate`) | yes | `control.toml` | 004 |
 | Environment | rollout (run policy) + tool exec substrate | yes (policy) | `environment.toml` | 005 |
+| Inference (model) | agent | yes | `harness.toml: [inference]` (model + params; no own file) | 001 §6 |
 | Verification | **env / verifier** | **no (by design)** | — (env-owned) | 006 |
 | Observability | substrate | no (always on) | — (emitted, not configured) | 007 |
-| *(Model)* | agent | yes (substrate, not a surface) | `harness.toml: model` | 001 §6 |
 
 The two "no" rows are not omissions; they are load-bearing. A measurement instrument the
 optimizer can edit measures nothing; a substrate that is itself optimized stops being a
@@ -193,56 +211,55 @@ important readability lever: the optimizer (and the reader) never wade through i
 for surfaces nobody touched. A missing file means "this surface is at its default," which is
 also the cleanest possible semantics for attribution (no edit, no contribution).
 
-### P3. The manifest is the index, the files are the content
+### P3. No manifest; file presence is the signal (revised per review)
 
-`harness.toml` carries the model, run limits, and a short manifest listing which surface
-files are active. Reading `harness.toml` tells you the whole shape of the harness in one
-screen; the per-surface files hold the detail. This mirrors the "Home page + linked pages"
-structure that already works for the wiki.
+Earlier drafts proposed a `[manifest]` in `harness.toml` listing active surface files. On
+review: that is redundant with P2 (engaged = file exists), and the redundancy is a liability
+(two sources of truth that can disagree). **Drop it.** `load_harness` simply reads whatever
+surface files are present; a missing file means "this surface is at its default." `harness.toml`
+carries only the inference config (`[inference]`) and run limits (`[limits]`). If a one-screen
+overview is ever wanted, it is a *generated* view (`hgym harness show`), never hand-maintained
+config. (Globbing could support both styles, but it is an advanced concept users would not
+reach for; skip it.)
 
 ### Proposed layout (baseline → fully engaged)
 
 ```
 # Baseline (what export_harness writes for a fresh env):
 harness/
-├── harness.toml            # model, params, limits, manifest
+├── harness.toml            # [inference] (model + params) + [limits]
 └── instruction/
-    └── system.minijinja    # (+ user/assistant templates if the function declares them)
+    └── system.minijinja    # the system template only (see RFC 001: no user/assistant templates)
 
 # After an optimizer has engaged several surfaces:
 harness/
-├── harness.toml            # model + manifest now lists the active surface files
+├── harness.toml            # [inference] + [limits]
 ├── instruction/
 │   ├── system.minijinja
-│   └── skills/             # optional skill files (RFC 001)
+│   └── skills/             # optional skill modules (RFC 001 §5; representation pending research)
 ├── tools.toml              # extras MCP servers (RFC 002); replaces hgym_extras.toml
 ├── context.toml            # context strategy (RFC 003)
 ├── control.toml            # hooks, retries, gating (RFC 004)
-└── environment.toml        # budgets, permissions, sandbox policy (RFC 005)
+└── execution.toml          # budgets, permissions, isolation policy (RFC 005)
 ```
 
 `harness.toml` sketch:
 
 ```toml
-model = "openai/gpt-5.4-nano"        # the substrate (RFC 001 §6)
+[inference]                           # the inference surface (RFC 001 §6); no own file
+model = "openai/gpt-5.4-nano"
+temperature = 0.7
+max_tokens = 2048
+# reasoning_effort = "medium"         # for reasoning models
 [limits]
 horizon = 12                          # may only tighten the env's horizon, never loosen it
-[manifest]                            # which surfaces are engaged; absent file = default
-instruction = "instruction/"
-tools       = "tools.toml"
-context     = "context.toml"
-# control / environment omitted here => at their defaults
 ```
 
 Notes:
 
 - `tools.toml` **replaces** the current `hgym_extras.toml` name (`mcp/config.py`). One
   consistent per-surface naming scheme beats a special-cased filename.
-- The manifest is redundant with file presence (P2 already encodes "engaged = file
-  exists"); it exists so a reader/optimizer gets the shape from one file, and so
-  `load_harness` can fail loudly on a referenced-but-missing file. If the redundancy
-  proves annoying, the manifest can be dropped in favour of pure file-presence; that is an
-  open question (§9).
+- No manifest (P3): engaged surfaces are exactly the files that exist; absent file = default.
 
 ---
 
@@ -331,12 +348,10 @@ together. RFC 005 proposes renaming this surface **"execution"** to end the coll
 
 ## 9. Open questions / where this might be wrong
 
-1. **Manifest vs pure file-presence (§5 P3).** Is the `[manifest]` worth its redundancy, or
-   should "engaged = file exists" be the sole signal? Leaning toward a minimal manifest for
-   the one-screen overview and loud load-time errors, but it is a real call.
-2. **Where the context transform attaches (§7.1).** Runner-applied (agent stays thin, but
-   the runner grows a responsibility) vs agent-wrapper (composes, but every agent must opt
-   in). RFC 003 picks one; the choice affects how `agent_builder` users get context for free.
+1. **~~Manifest vs file-presence~~ RESOLVED (review 2026-06-13):** no manifest; engaged = file
+   exists (§5 P3). A one-screen overview, if wanted, is generated (`hgym harness show`).
+2. **~~Where the context transform attaches~~ RESOLVED (review 2026-06-13):** runner-applied
+   (RFC 003 §6), so the agent stays thin and `agent_builder` users get context for free.
 3. **Is "execution" (§7.3) really separable from "tool"?** Because an MCP server delivers
    interface + execution together, the run-level policy (budgets/permissions) is the only
    cleanly separable part. If that part turns out thin, the execution surface may fold into
@@ -349,9 +364,12 @@ together. RFC 005 proposes renaming this surface **"execution"** to end the coll
    judge config is env-owned and closed (RFC 006). But research *on judge robustness* wants
    to vary it. That is a separate experiment mode, not a harness surface; RFC 006 must make
    the mode boundary unambiguous so it never leaks into the optimization loop.
-6. **Could the whole seven-surface taxonomy be wrong-grained?** The locus analysis suggests
-   the deepest cut is actually three (env / rollout / agent), and "surfaces" are a
-   finer-grained, user-facing slicing of the rollout-and-agent locus. That is a feature (the
-   surfaces are the editable artifacts; the loci are the architecture), but if a surface
-   ever fails to map to a single locus cleanly, prefer the locus. Tool and Execution already
-   strain this (both span env and rollout); watch for more.
+6. **~~Could the seven-surface taxonomy be wrong-grained?~~ RESOLVED (review 2026-06-13):**
+   not a question, a framing. The deepest cut is three loci (env / rollout / agent); surfaces
+   are the user-facing editable artifacts and may span loci (tool, execution). The rule
+   operates at the attribute level; where surface and locus disagree, the locus wins. Folded
+   into §3.
+7. **Skills representation (RFC 001 §5).** Pending a research pass on how reusable
+   instruction modules work across Claude Code (SKILL.md), Codex, and Google's agent, to find
+   the minimal agent-agnostic representation (injectable system-prompt fragments vs on-demand
+   modules with linked files). Launched 2026-06-13.
