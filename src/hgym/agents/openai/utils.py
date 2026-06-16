@@ -155,14 +155,26 @@ def get_tools(
 
 
 def parse_observation(
-    obs: Observation, function_config: Union[FunctionConfigChat, FunctionConfigJson]
+    obs: Observation,
+    function_config: Union[FunctionConfigChat, FunctionConfigJson],
+    system_template: Optional[str] = None,
 ) -> List[ChatCompletionMessageParam]:
     """
     Parses the message from an observation using the provided function configuration.
+
+    ``system_template`` is the **instruction surface** (RFC 002): when a loaded harness
+    supplies one, it overrides ``function_config.example_system_template`` for rendering
+    the system message. The env still owns the *variables* (``obs.system``); the harness
+    owns only the template they fill.
     """
+    template = (
+        system_template
+        if system_template is not None
+        else function_config.example_system_template
+    )
     messages: List[ChatCompletionMessageParam] = []
-    if obs.system or function_config.example_system_template:
-        messages.extend(parse_system_message(obs, function_config))
+    if obs.system or template:
+        messages.extend(parse_system_message(obs, function_config, template))
     if obs.messages:
         for message in obs.messages:
             if message.role == "assistant":
@@ -175,7 +187,9 @@ def parse_observation(
 
 
 def parse_system_message(
-    obs: Observation, function_config: Union[FunctionConfigChat, FunctionConfigJson]
+    obs: Observation,
+    function_config: Union[FunctionConfigChat, FunctionConfigJson],
+    system_template: Optional[str] = None,
 ) -> List[ChatCompletionSystemMessageParam]:
     """
     Parses the system message from an observation using the provided function configuration.
@@ -197,10 +211,15 @@ def parse_system_message(
         data = obs.system[0].value
     else:
         data = None
+    template = (
+        system_template
+        if system_template is not None
+        else function_config.example_system_template
+    )
     message["content"] = filter_and_render(
         data=data,
         schema=function_config.system_schema,
-        template=function_config.example_system_template,
+        template=template,
     )
     return [ChatCompletionSystemMessageParam(**message)]
 
