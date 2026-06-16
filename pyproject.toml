@@ -13,6 +13,7 @@ dependencies = [
     "fastmcp>=3.2",
     "minijinja>=2.0",
     "numpy>=1.26",
+    "tomli-w>=1.0",
 ]
 keywords = ["llm", "agents", "evaluation", "mcp", "harness", "gym", "optimization"]
 classifiers = [
