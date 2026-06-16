@@ -13,5 +13,14 @@ from hgym.harness._format import (
     export_harness,
     load_harness,
 )
+from hgym.harness._hash import SURFACES, harness_hash, surface_hashes
 
-__all__ = ["ExtraIsolationError", "Harness", "export_harness", "load_harness"]
+__all__ = [
+    "SURFACES",
+    "ExtraIsolationError",
+    "Harness",
+    "export_harness",
+    "harness_hash",
+    "load_harness",
+    "surface_hashes",
+]
