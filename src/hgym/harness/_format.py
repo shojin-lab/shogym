@@ -36,6 +36,37 @@ from hgym.mcp.types import MCPServerSpec
 _T = TypeVar("_T")
 
 
+class ExtraIsolationError(ValueError):
+    """An extras (``tools.toml``) entry asked for a non-isolated transport.
+
+    The tool surface (RFC 002) splits tools by authorship: env-mandatory tools are
+    env-authored and trusted (they may run ``in_process``); extras are
+    optimizer-authored and untrusted, so they must run *isolated* — out of the host
+    process — via ``stdio`` (subprocess) or ``streamable_http`` (remote). An
+    ``in_process`` extra would execute optimizer-authored code with full access to the
+    runner, defeating the boundary, so it is refused at both the write and read edges.
+    """
+
+    def __init__(self, name: str, source: str) -> None:
+        self.name = name
+        self.source = source
+        super().__init__(
+            f"extras server {name!r} in {source} uses transport `in_process`; "
+            f"optimizer-authored extras must be isolated (`stdio` or "
+            f"`streamable_http`). in_process is reserved for env-mandatory tools."
+        )
+
+
+def _require_isolated_extras(
+    specs: List[MCPServerSpec], source: str
+) -> List[MCPServerSpec]:
+    """Enforce the tool-surface trust boundary: no ``in_process`` extras."""
+    for spec in specs:
+        if spec.transport == "in_process":
+            raise ExtraIsolationError(spec.name, source)
+    return specs
+
+
 @dataclass
 class Harness:
     """A loaded harness: the optimizable surfaces, decoupled from the env.
@@ -66,16 +97,22 @@ def export_harness(
     *,
     inference_params: Optional[Dict[str, Any]] = None,
     env_config: Optional[Dict[str, Any]] = None,
+    extra_specs: Optional[List[MCPServerSpec]] = None,
 ) -> Path:
-    """Write a baseline harness directory for ``env_name`` to ``path``.
+    """Write a harness directory for ``env_name`` to ``path``.
 
     Offline: builds the env to read its single chat function's system template and
-    horizon, then writes ``harness.toml`` and ``instruction/system.minijinja``. It
-    never writes ``tools.toml`` (a baseline harness has no extras; the optimizer
-    creates that file when it engages the tool surface).
+    horizon, then writes ``harness.toml`` and ``instruction/system.minijinja``.
+
+    A baseline harness has no extras and no ``tools.toml`` (the optimizer creates that
+    file when it engages the tool surface). ``extra_specs`` lets a caller export a
+    harness that already engages the tool surface; each must use an isolated transport
+    (``stdio`` / ``streamable_http``) or :class:`ExtraIsolationError` is raised before
+    anything is written.
 
     Returns the harness directory path.
     """
+    extras = _require_isolated_extras(list(extra_specs or []), f"{path}/tools.toml")
     out = Path(path)
     env = make(env_name, config=env_config)
     try:
@@ -103,7 +140,18 @@ def export_harness(
         instruction.mkdir(exist_ok=True)
         (instruction / "system.minijinja").write_text(system_template)
 
+    if extras:
+        servers = [_dump_spec(spec) for spec in extras]
+        (out / "tools.toml").write_text(tomli_w.dumps({"mcp_servers": servers}))
+
     return out
+
+
+def _dump_spec(spec: MCPServerSpec) -> Dict[str, Any]:
+    """Serialize a spec for ``tools.toml``, dropping empty optional tables so the
+    written file stays minimal (and tomli_w never sees an empty inline table)."""
+    data = spec.model_dump()
+    return {k: v for k, v in data.items() if not (isinstance(v, dict) and not v)}
 
 
 def load_harness(path: Union[str, Path]) -> Harness:
@@ -131,7 +179,9 @@ def load_harness(path: Union[str, Path]) -> Harness:
 
     tools_path = src / "tools.toml"
     extra_specs: List[MCPServerSpec] = (
-        load_mcp_server_specs(tools_path) if tools_path.exists() else []
+        _require_isolated_extras(load_mcp_server_specs(tools_path), str(tools_path))
+        if tools_path.exists()
+        else []
     )
 
     return Harness(

@@ -7,6 +7,11 @@ See ``docs`` / the RFC stack for the design. Public surface:
 - :func:`load_harness` — read a harness directory back into a :class:`Harness`.
 """
 
-from hgym.harness._format import Harness, export_harness, load_harness
+from hgym.harness._format import (
+    ExtraIsolationError,
+    Harness,
+    export_harness,
+    load_harness,
+)
 
-__all__ = ["Harness", "export_harness", "load_harness"]
+__all__ = ["ExtraIsolationError", "Harness", "export_harness", "load_harness"]

@@ -56,13 +56,15 @@ def test_load_missing_model_raises(tmp_path: Path) -> None:
 
 
 def test_load_reads_optional_extras(tmp_path: Path) -> None:
-    # A harness the optimizer has extended with a tool-surface extras file.
+    # A harness the optimizer has extended with a tool-surface extras file. Extras are
+    # optimizer-authored, so they must use an isolated transport (see the tool-surface
+    # tests for the guardrail that enforces this).
     export_harness("wordle_v1", "openai/gpt-5.4-nano", tmp_path)
     (tmp_path / "tools.toml").write_text(
-        '[[mcp_servers]]\nname = "think"\ntransport = "in_process"\n'
-        'module = "harness.tools.think_mcp"\n'
+        '[[mcp_servers]]\nname = "think"\ntransport = "stdio"\n'
+        'command = ["python", "-m", "think_mcp"]\n'
     )
     h = load_harness(tmp_path)
     assert len(h.extra_specs) == 1
     assert h.extra_specs[0].name == "think"
-    assert h.extra_specs[0].transport == "in_process"
+    assert h.extra_specs[0].transport == "stdio"
