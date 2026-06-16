@@ -1,7 +1,5 @@
 from asyncio import Semaphore
-from typing import Optional
-
-from openai import AsyncOpenAI
+from typing import Any, Dict, Optional
 
 from hgym.agents import LLMAgent
 from hgym.agents.openai.utils import (
@@ -11,6 +9,7 @@ from hgym.agents.openai.utils import (
     parse_observation,
     to_openai_tool_choice,
 )
+from hgym.models import CompletionRequest, ModelClient, OpenAICompatClient
 from hgym.types import (
     Action,
     FunctionConfigs,
@@ -28,6 +27,10 @@ class OpenAIAgent(LLMAgent):
         tool_configs: Optional[ToolConfigs] = None,
         metric_configs: Optional[MetricConfigs] = None,
         semaphore: Optional[Semaphore] = None,
+        *,
+        inference_params: Optional[Dict[str, Any]] = None,
+        base_url: Optional[str] = None,
+        client: Optional[ModelClient] = None,
     ):
         super().__init__(
             function_configs=function_configs,
@@ -39,31 +42,41 @@ class OpenAIAgent(LLMAgent):
             function_configs=self._function_configs,
             tool_configs=self._tool_configs,
         )
-        self._client = AsyncOpenAI()
+        # The inference seam (RFC 001 Section 6): a swappable ModelClient plus the
+        # inference params (temperature, max_tokens, ...) that travel with the model.
+        self._client: ModelClient = (
+            client if client is not None else OpenAICompatClient(base_url=base_url)
+        )
         self._model_name = model_name
+        self._inference_params: Dict[str, Any] = dict(inference_params or {})
 
     async def act(self, obs: Observation) -> Action:
         function_config = self._function_configs[obs.function_name]
         messages = parse_observation(obs, function_config)
-        kwargs = dict(self._client_kwargs[obs.function_name])
 
-        # Override with dynamic tools from observation if present
+        base = self._client_kwargs[obs.function_name]
+        tools = base.get("tools")
+        tool_choice = base.get("tool_choice")
+        parallel = base.get("parallel_tool_calls")
+
+        # Dynamic tools from the observation override the static function config (this
+        # is how runtime extras reach an agent whose static config only knew the
+        # env-mandatory tools).
         if obs.tools is not None:
-            kwargs["tools"] = get_tools(
-                tool_configs=obs.tools,
-                function_config=None,
-            )
-            kwargs["tool_choice"] = to_openai_tool_choice(obs.tool_choice) or "auto"
-            if kwargs["tools"]:
-                kwargs["parallel_tool_calls"] = False
+            tools = get_tools(tool_configs=obs.tools, function_config=None)
+            tool_choice = to_openai_tool_choice(obs.tool_choice) or "auto"
+            if tools:
+                parallel = False
 
-        response = await self.throttle(
-            self._client.chat.completions.create(
-                model=self._model_name,
-                messages=messages,
-                **kwargs,
-            )
+        request = CompletionRequest(
+            model=self._model_name,
+            messages=messages,
+            tools=tools,
+            tool_choice=tool_choice,
+            parallel_tool_calls=parallel,
+            params=self._inference_params,
         )
+        response = await self.throttle(self._client.complete(request))
         return get_action(response.choices, function_config)
 
     def reset(self):
