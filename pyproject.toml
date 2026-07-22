@@ -9,9 +9,7 @@ authors = [{ name = "Andrew Jesson", email = "andrew.d.jesson@gmail.com" }]
 requires-python = ">=3.12"
 dependencies = [
     "pydantic>=2.7",
-    "openai>=1.99",
     "fastmcp>=3.2",
-    "minijinja>=2.0",
     "numpy>=1.26",
 ]
 keywords = ["llm", "agents", "evaluation", "mcp", "harness", "gym", "optimization"]

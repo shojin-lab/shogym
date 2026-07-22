@@ -84,10 +84,11 @@ class ToolUsingEnv(Env):
     Tool surface: the full merged tool set (terminate + env-mandatory + runtime
     ``extra_toolset``) is advertised **both** statically on
     ``function.tools_available`` and dynamically on every ``Observation.tools``.
-    The dynamic copy is what surfaces runtime extras to an agent (or external
+    The dynamic copy is what surfaces runtime extras to a client (or external
     gateway) whose static config only knows the env-mandatory tools, so it
-    can't simply be dropped. Agents dedupe: ``OpenAIAgent`` takes the dynamic
-    path and (today) forces ``parallel_tool_calls=False``.
+    can't simply be dropped. A client consuming the dynamic surface should read
+    its tools from ``Observation.tools`` (and disable parallel tool calls)
+    rather than re-declaring the static set.
 
     Deployment contract for external gateways: an agent that can introspect
     ``tools_available`` should send nothing it already declared, so there is no

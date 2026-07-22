@@ -32,17 +32,13 @@ Pre-alpha. The core engine is ported and under active development. The design �
 (with the background lit reviews) — lives in the [wiki](https://github.com/anndvision/hgym/wiki).
 Not yet ready for use.
 
-## Quickstart (target API)
+## Quickstart
 
-```python
-import hgym
-
-rollouts = await hgym.run_episodes(
-    env_name="wordle_v1",
-    model="openai/gpt-5.4-nano",
-    num_tasks=50,
-)
-```
+Pre-alpha, mid-rebuild — **there is no runnable entrypoint at this commit.** This commit
+removes the v1 agent-loop path (`hgym.run_episodes(...)` / `hgym.runner`); the env-as-center
+replacement — an environment served over MCP and driven by any external harness
+(`hgym serve` + `hgym.evaluate(...)`) — arrives in later commits of this stack. See the
+[RFCs](https://github.com/anndvision/hgym/wiki/Surface-RFCs).
 
 ## License
 
