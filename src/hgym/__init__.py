@@ -1,4 +1,4 @@
-from hgym import mcp, types
+from hgym import feedback, mcp, trace, types
 from hgym.core import Env
 from hgym.envs import make, register, registered_envs
 from hgym.envs.tool_using_env import ToolUsingEnv
@@ -13,10 +13,12 @@ __all__ = [
     "ToolManifest",
     "ToolUsingEnv",
     "Trajectory",
+    "feedback",
     "make",
     "mcp",
     "register",
     "registered_envs",
+    "trace",
     "types",
 ]
 
