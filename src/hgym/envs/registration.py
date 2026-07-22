@@ -51,7 +51,11 @@ def make(
     if env_name not in _ENV_REGISTRY:
         raise ValueError(f"Environment '{env_name}' is not registered.")
     env_class = _ENV_REGISTRY[env_name]
-    return env_class(semaphore=semaphore, **config)
+    env = env_class(semaphore=semaphore, **config)
+    # Stamp the registered name so `env.describe()` can report it (the env class
+    # itself does not otherwise know which name it was registered under).
+    env._registered_name = env_name
+    return env
 
 
 def registered_envs():

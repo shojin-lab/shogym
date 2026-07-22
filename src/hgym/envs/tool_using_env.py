@@ -28,6 +28,7 @@ from hgym.core import Env
 from hgym.mcp import MCPServerSpec, MCPSession, MCPToolset, ToolNameConflictError
 from hgym.mcp.toolset import _open_session_for_spec
 from hgym.shared.terminate_mcp import TERMINATE_TOOL_NAME
+from hgym.task import ReferenceTemplate, TaskSpec, ToolManifest
 from hgym.types import (
     Action,
     FeedbackCollection,
@@ -226,6 +227,64 @@ class ToolUsingEnv(Env):
             horizon=horizon,
             num_tasks=num_tasks,
             semaphore=semaphore,
+        )
+
+    def describe(self, task_id: Optional[str] = None) -> TaskSpec:
+        """Publish this env's task contract as a :class:`TaskSpec` (RFC 008 §3.1).
+
+        Read-only: reflects the static configuration probed at ``__init__`` (the
+        function templates/schemas, the merged tool manifest, the horizon). It opens
+        no session and makes no model call, so it is safe to call right after
+        ``make(...)`` and before any ``reset``.
+
+        ``instructions`` is the rendered system template — the durable task framing
+        (rules + tool docs) a harness can use verbatim. Envs whose system template
+        references per-task variables should still keep the durable framing static;
+        the per-turn variables reach the model as tool results, and the full template
+        + its schema are also exposed via ``reference_templates`` for a harness that
+        renders the structured split itself.
+        """
+        fc = self.function
+        instructions = _render_static(fc.example_system_template)
+
+        reference_templates: List[ReferenceTemplate] = []
+        if fc.example_system_template is not None:
+            reference_templates.append(
+                ReferenceTemplate(
+                    role="system",
+                    template=fc.example_system_template,
+                    variables_schema=_schema_json(fc.system_schema),
+                )
+            )
+        if fc.example_user_template is not None:
+            reference_templates.append(
+                ReferenceTemplate(
+                    role="user",
+                    template=fc.example_user_template,
+                    variables_schema=_schema_json(fc.user_schema),
+                )
+            )
+
+        tools: List[ToolManifest] = []
+        for name, tool_config in (self.tools or {}).items():
+            tools.append(
+                ToolManifest(
+                    name=name,
+                    description=tool_config.description,
+                    input_schema=tool_config.parameters.model_dump(),
+                    provenance=(
+                        "reserved" if name == TERMINATE_TOOL_NAME else "env-mandatory"
+                    ),
+                )
+            )
+
+        return TaskSpec(
+            env_name=getattr(self, "_registered_name", type(self).__name__),
+            task_id=task_id,
+            instructions=instructions,
+            tools=tools,
+            reference_templates=reference_templates,
+            horizon=self.horizon,
         )
 
     # ----- subclass hooks -----
@@ -547,6 +606,27 @@ class ToolUsingEnv(Env):
 
 
 _T = TypeVar("_T")
+
+
+def _schema_json(schema: Optional[type]) -> Optional[Dict[str, Any]]:
+    """JSON Schema for a pydantic model class, or ``None`` if the env declares none."""
+    if schema is None:
+        return None
+    return schema.model_json_schema()
+
+
+def _render_static(template: Optional[str]) -> str:
+    """Render a template with no variables — the durable, task-instance-independent
+    framing. Templates that reference per-task variables fall back to their raw text
+    (the variables + schema travel via ``TaskSpec.reference_templates`` instead)."""
+    if not template:
+        return ""
+    from minijinja import Environment
+
+    try:
+        return Environment().render_str(template)
+    except Exception:
+        return template
 
 
 def _sync_run_async(coro: Awaitable[_T]) -> _T:
