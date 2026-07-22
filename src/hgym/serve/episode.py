@@ -16,7 +16,7 @@ from pathlib import Path
 from typing import Any, Dict, List, Optional, Union
 
 from hgym.envs import make
-from hgym.feedback.wire import build_meta, select_inband
+from hgym.feedback.wire import build_meta, dump_item, select_inband
 from hgym.mcp.session import MCPSession
 from hgym.mcp.toolset import _open_session_for_spec
 from hgym.shared.terminate_mcp import TERMINATE_TOOL_NAME
@@ -67,6 +67,10 @@ class ServedEpisode:
         self._trajectory: Trajectory = []
         self._step = 0
         self._terminated = False
+        # The terminal step's feedback in wire form (inference + episode), retained so
+        # the in-process `evaluate()` can report the score without a trace file. Same
+        # list `result_from_trace` reconstructs from the terminal row.
+        self._terminal_feedback: List[Dict[str, Any]] = []
         # Serialize calls: one episode is a single sequential trajectory. `call()`
         # mutates shared step/trajectory/terminated state across an `await`, so
         # concurrent MCP requests on this session must not interleave.
@@ -142,6 +146,11 @@ class ServedEpisode:
     def session_id(self) -> str:
         return self._session_id
 
+    @property
+    def terminal_feedback(self) -> List[Dict[str, Any]]:
+        """The terminal step's feedback (wire form), or ``[]`` until the episode ends."""
+        return self._terminal_feedback
+
     def describe(self) -> TaskSpec:
         return self._env.describe(self._task_id)
 
@@ -197,6 +206,11 @@ class ServedEpisode:
 
             feedback = self._env.verify(self._trajectory, self._task, terminated=terminated)
             items = [*feedback.inference, *feedback.episode]
+
+            if terminated:
+                # Retain the terminal feedback so the no-trace `evaluate()` path can
+                # report the score directly off the episode (not only via the trace).
+                self._terminal_feedback = [dump_item(item) for item in items]
 
             if self._trace_path is not None:
                 append_trace(

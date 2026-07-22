@@ -34,11 +34,23 @@ Not yet ready for use.
 
 ## Quickstart
 
-Pre-alpha, mid-rebuild — **there is no runnable entrypoint at this commit.** This commit
-removes the v1 agent-loop path (`hgym.run_episodes(...)` / `hgym.runner`); the env-as-center
-replacement — an environment served over MCP and driven by any external harness
-(`hgym serve` + `hgym.evaluate(...)`) — arrives in later commits of this stack. See the
-[RFCs](https://github.com/anndvision/hgym/wiki/Surface-RFCs).
+Serve an environment over MCP for any harness to spawn and drive; it scores the result off
+a local JSONL trace:
+
+```bash
+hgym serve wordle_v1 --task 17 --trace ./hgym_logs/run.jsonl
+```
+
+Or evaluate a harness in-process and read the terminal feedback:
+
+```python
+import hgym
+
+# `harness` is an async callable given a FastMCP client connected to the served env;
+# see examples/openai_harness.py for a runnable one.
+result = await hgym.evaluate("wordle_v1", task=17, harness=my_harness)
+print(result.value("check_answer"))
+```
 
 ## License
 
