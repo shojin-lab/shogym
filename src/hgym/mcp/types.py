@@ -42,8 +42,7 @@ class MCPServerSpec(BaseModel):
         - ``stdio``: ``command`` (argv list) must be set; ``env`` is optional.
         - ``streamable_http``: ``url`` must be set; ``headers`` is optional.
 
-    This is a public config contract loaded from ``hgym_extras.toml`` via
-    ``MCPToolset.from_config``, so it fails loudly on bad config rather than
+    A declarative spec validated eagerly, so it fails loudly on bad config rather than
     silently dropping it:
         - Unknown fields are rejected (``extra="forbid"``) — e.g. a typo like
           ``header`` for ``headers``.

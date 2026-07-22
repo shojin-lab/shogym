@@ -5,10 +5,11 @@ into this session via `begin_session`. State is keyed by ``_session_id`` so
 multiple concurrent episodes can share the server safely.
 
 Lifecycle (in-process only for now):
-  - ``begin_session(session_id, target)`` — env calls this once per episode
-    after `_load_task` to push the target word into the server.
-  - ``guess(word, _session_id)`` — agent-callable; scores the guess.
-  - ``end_session(session_id)`` — env calls this from `_close` to drop state.
+  - ``begin_session(session_id, target)`` — the env pushes the target word into the
+    server when an episode's session starts, before any tool is called.
+  - ``guess(word, _session_id)`` — scores the guess.
+  - ``end_session(session_id)`` — the env drops the session's state on teardown
+    (via ``ToolUsingEnv.end_session`` / ``close``).
 """
 
 from __future__ import annotations
@@ -27,18 +28,17 @@ server: FastMCP = FastMCP(name="wordle")
 # Per-episode state keyed by session_id.
 sessions: Dict[str, Dict[str, Any]] = {}
 
-# Serializes the read-decrement-score path inside `guess`. The base class's
-# `_step` dispatches all tool calls in an action via `asyncio.gather`, so two
-# `guess` calls from a single action would otherwise race on `remaining` and
-# bypass the per-episode cap.
+# Serializes the read-decrement-score path inside `guess` so concurrent `guess` calls
+# can't race on `remaining` and bypass the per-episode cap. Uncontended in the common
+# single-call case; `score_guess` is microseconds, so serializing is fine.
 _state_lock = threading.RLock()
 
 
 def begin_session(session_id: str, target: str) -> None:
     """Register a fresh episode's target word.
 
-    Called by the env (in-process) at `_reset` time, before the agent has a
-    chance to call any tool. Idempotent within a session_id.
+    Called by the env (in-process) when an episode's session starts, before any
+    tool is called. Idempotent within a session_id.
     """
     sessions[session_id] = {
         "target": target.lower(),
@@ -46,16 +46,13 @@ def begin_session(session_id: str, target: str) -> None:
     }
 
 
-@server.tool
-def __end_session__(_session_id: str) -> Dict[str, Any]:
-    """Drop per-session state on episode teardown.
+def end_session(session_id: str) -> None:
+    """Drop a finished episode's per-session state.
 
-    Invoked by `ToolUsingEnv._end_episode` via the generic `__end_session__`
-    lifecycle hook (terminate / horizon / re-reset / close). Excluded from the
-    agent-facing tool surface by the base class, so the model never sees it.
+    Symmetric with `begin_session`; called by the env (in-process) on episode
+    teardown. Idempotent — dropping an unknown session_id is a no-op.
     """
-    sessions.pop(_session_id, None)
-    return {"ended": _session_id}
+    sessions.pop(session_id, None)
 
 
 @server.tool

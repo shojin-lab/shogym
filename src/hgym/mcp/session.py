@@ -1,4 +1,4 @@
-"""The MCP session protocol used by `ToolUsingEnv` for tool dispatch."""
+"""The MCP session protocol used to probe and call an env's tools."""
 
 from typing import Any, Dict, List, Protocol, runtime_checkable
 
@@ -11,9 +11,8 @@ class MCPSession(Protocol):
     """Per-episode handle to a running MCP server.
 
     Implementations are returned by transport-specific openers (e.g.
-    ``open_in_process`` in PR 2). The session is keyed to a single
-    ``session_id`` for the duration of an episode; the env layer rotates
-    sessions on every ``reset``.
+    ``open_in_process``). The session is keyed to a single ``session_id`` for the
+    duration of an episode; a fresh session is opened per episode.
 
     Concrete implementations must:
       - inject the episode's ``session_id`` as a hidden ``_session_id``

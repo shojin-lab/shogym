@@ -1,15 +1,15 @@
 """Stdio MCP transport backed by ``fastmcp.client.transports.StdioTransport``.
 
 Spec ``transport="stdio"`` launches a subprocess from ``spec.command`` (argv)
-and speaks MCP over its stdin/stdout. This is the transport an *authored* tool
-server uses: an optimizer (or a user) writes a standalone FastMCP server and
-points an ``hgym_extras.toml`` entry at it, e.g.::
+and speaks MCP over its stdin/stdout. This is the transport a standalone tool
+server uses — a FastMCP server run out-of-process, e.g.::
 
-    [[mcp_servers]]
-    name = "dictionary"
-    transport = "stdio"
-    command = ["uv", "run", "python", "/experiments/run_42/dictionary_server.py"]
-    env = { LOG_LEVEL = "warning" }
+    MCPServerSpec(
+        name="dictionary",
+        transport="stdio",
+        command=["uv", "run", "python", "/path/to/dictionary_server.py"],
+        env={"LOG_LEVEL": "warning"},
+    )
 
 Each session spawns its own process (``keep_alive=False``) so per-episode
 sessions stay isolated and ``close()`` terminates the process. The session

@@ -8,17 +8,16 @@ Feedback can come in two forms:
 It also defines utility methods to retrieve and extend feedback items.
 """
 
-from typing import Any, Dict, Generic, List, Optional, TypeVar, Union
+from typing import Generic, List, Optional, TypeVar, Union
 
 from pydantic import BaseModel, Field
 
-Demonstration = Union[
-    str, Dict[str, Any]
-]  # A feedback value containing a reference label for some input.
 Comment = str  # A feedback value containing an arbitrary string.
 
 
-InferenceFeedbackValue = Union[float, bool, Demonstration, Comment]
+# Both levels carry the same JSON-scalar value set (number | bool | text); the wire
+# contract in hgym.feedback serializes exactly these.
+InferenceFeedbackValue = Union[float, bool, Comment]
 
 
 EpisodeFeedbackValue = Union[float, bool, Comment]

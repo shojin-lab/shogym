@@ -1,13 +1,11 @@
-"""MCP integration for hgym.
+"""MCP integration for hgym — the tool substrate.
 
-This subpackage exposes the contract used by `ToolUsingEnv` to source tools
-from MCP servers. PR 1 lands the types and session protocol; transports and
-the toolset land in subsequent PRs.
+Environments expose their tools as MCP servers; the env base and the serving layer open
+per-episode sessions (``_open_session_for_spec``) and call tools over the session protocol.
+Transports: in-process and stdio.
 """
 
-from hgym.mcp.config import load_mcp_server_specs, load_mcp_toolset
 from hgym.mcp.session import MCPSession
-from hgym.mcp.toolset import MCPToolset
 from hgym.mcp.types import (
     MCPServerSpec,
     MCPTransport,
@@ -18,10 +16,7 @@ from hgym.mcp.types import (
 __all__ = [
     "MCPServerSpec",
     "MCPSession",
-    "MCPToolset",
     "MCPTransport",
     "ToolNameConflictError",
     "UnknownToolError",
-    "load_mcp_server_specs",
-    "load_mcp_toolset",
 ]

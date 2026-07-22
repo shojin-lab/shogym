@@ -1,12 +1,11 @@
-"""Built-in ``terminate`` tool.
+"""Built-in ``terminate`` tool — the reserved episode-completion signal.
 
-`ToolUsingEnv` registers this server at construction time. Calling
-``terminate`` is the agent's signal that the episode is over (alongside
-horizon). The result is a no-op acknowledgement; the env's `_step` does the
-actual termination bookkeeping.
+Every env serves this server (see ``ToolUsingEnv.essential_specs``). Calling ``terminate``
+signals the episode is over (alongside the horizon); the result is a no-op acknowledgement —
+the terminate call itself is the terminal signal, detected by name.
 
-The name ``terminate`` is reserved — no env-mandatory or user-supplied server
-may expose a tool with that name.
+The name ``terminate`` is reserved — no env-mandatory or user-supplied server may expose a
+tool with that name.
 """
 
 from typing import Any, Dict
