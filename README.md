@@ -27,11 +27,9 @@ Design goals:
 
 ## Status
 
-Pre-alpha. The core engine is ported and under active development. Design
-documents — [the surfaces of an agent harness](https://github.com/anndvision/hgym/wiki/The-Surfaces-of-an-Agent-Harness),
-[the roadmap](https://github.com/anndvision/hgym/wiki/Roadmap), and the
-[surface RFCs](https://github.com/anndvision/hgym/wiki/Surface-RFCs) (with the
-background lit reviews) — live in the [wiki](https://github.com/anndvision/hgym/wiki).
+Pre-alpha. The core engine is ported and under active development. The design —
+[RFC 008: the environment is the center of gravity](https://github.com/anndvision/hgym/wiki/RFC-008-Environment-as-Center-of-Gravity)
+(with the background lit reviews) — lives in the [wiki](https://github.com/anndvision/hgym/wiki).
 Not yet ready for use.
 
 ## Quickstart (target API)
