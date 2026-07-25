@@ -6,7 +6,10 @@ readme = "README.md"
 license = "Apache-2.0"
 license-files = ["LICENSE", "NOTICE"]
 authors = [{ name = "Andrew Jesson", email = "andrew.d.jesson@gmail.com" }]
-requires-python = ">=3.12"
+# Pinned to Python 3.12: the tau2-bench port (the [tau2] extra) requires it — the pinned tau2
+# revision imports the stdlib `audioop` module, which was removed in 3.13. Keeping the whole
+# project on 3.12 avoids per-dependency version gymnastics.
+requires-python = ">=3.12,<3.13"
 dependencies = [
     "pydantic>=2.7",
     "fastmcp>=3.2",
@@ -18,7 +21,6 @@ classifiers = [
     "Development Status :: 2 - Pre-Alpha",
     "Intended Audience :: Science/Research",
     "Programming Language :: Python :: 3.12",
-    "Programming Language :: Python :: 3.13",
     "Typing :: Typed",
 ]
 
@@ -34,18 +36,35 @@ analysis = ["pandas>=2.2", "duckdb>=1.0"]
 # Only the real OpenAI model path in examples/openai_harness.py needs this — the core and
 # the offline tests never import openai.
 examples = ["openai>=1.99"]
+# The tau2-bench port (src/hgym/envs/tau2), pinned to an upstream commit SHA: `[gym]` pulls
+# gymnasium (the GymAgent bridge needs it), `[knowledge]` pulls rank-bm25 (banking's offline
+# retrieval). Kept as an optional extra so `pip install hgym` (and the core test suite) stay
+# lean and never import tau2 — `import hgym` registers `tau2_*` envs without loading it.
+# NOTE: tau2 does not ship its `data/` in the wheel, so it must be provisioned at runtime; the
+# tau2 example lazy-downloads it (or honor `TAU2_DATA_DIR`).
+tau2 = [
+    "tau2[gym,knowledge] @ git+https://github.com/sierra-research/tau2-bench@1d244f5dca42944b67a379b44bfeb9f5748f189d",
+]
 
 [dependency-groups]
+# The dev group is synced by default (plain `uv run` / `uv sync`), so putting the tau2 extra
+# here is what makes `uv run …` include tau2 out of the box. `pip install hgym` never installs
+# dependency-groups, so the core pip install stays lean.
 dev = [
     "pytest>=8.0",
     "pytest-asyncio>=0.26",
     "ruff>=0.8",
     "pyright>=1.1.390",
+    "hgym[tau2]",
 ]
 
 [build-system]
 requires = ["hatchling"]
 build-backend = "hatchling.build"
+
+[tool.hatch.metadata]
+# The `tau2` optional extra pins upstream to a git commit SHA (a direct reference).
+allow-direct-references = true
 
 [tool.hatch.build.targets.wheel]
 packages = ["src/hgym"]
