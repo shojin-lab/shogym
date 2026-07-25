@@ -11,6 +11,7 @@ from hgym.envs.registration import make, register, registered_envs
 from hgym.envs.hle import env_v1 as hle_env_v1  # noqa: F401 — triggers registration
 from hgym.envs.tau2 import env_v1 as tau2_env_v1  # noqa: F401 — triggers registration
 from hgym.envs.wordle import env_v1 as wordle_env_v1  # noqa: F401 — triggers registration
+from hgym.envs.yc_bench import env_v1 as yc_bench_env_v1  # noqa: F401 — triggers registration
 
 __all__ = [
     "hle_env_v1",
@@ -19,4 +20,5 @@ __all__ = [
     "registered_envs",
     "tau2_env_v1",
     "wordle_env_v1",
+    "yc_bench_env_v1",
 ]

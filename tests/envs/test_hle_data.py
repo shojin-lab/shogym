@@ -65,12 +65,18 @@ def _synthetic_hle_dataset() -> Dataset:
 def test_load_hle_tasks_is_text_only_and_needs_no_pillow(monkeypatch) -> None:
     ds = _synthetic_hle_dataset()
 
-    # Sanity: this synthetic set genuinely reproduces the bug — iterating with decoding on
-    # raises the Pillow ImportError (so the fix, not a toothless fixture, is what makes the
-    # load below succeed).
-    with pytest.raises(ImportError, match="Pillow"):
+    # Sanity: this synthetic set genuinely reproduces the bug — iterating it *with decoding*
+    # blows up, so the fix (not a toothless fixture) is what makes the load below succeed. The
+    # failure differs by environment: with Pillow absent, `datasets` raises an ImportError
+    # asking for Pillow; with Pillow present (e.g. pulled in transitively by a sibling extra),
+    # decoding the fake bytes raises PIL's UnidentifiedImageError (an OSError). Either proves
+    # decode-on-iteration fails, which is all this sanity check needs.
+    with pytest.raises((ImportError, OSError)) as excinfo:
         for row in ds:
             _ = row["image_preview"]
+    assert (
+        "Pillow" in str(excinfo.value) or type(excinfo.value).__name__ == "UnidentifiedImageError"
+    )
 
     monkeypatch.setattr(datasets, "load_dataset", lambda *a, **k: ds)
     # Also block PIL outright, so any decode attempt fails loudly rather than silently working

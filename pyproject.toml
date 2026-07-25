@@ -54,10 +54,20 @@ hle = [
     "datasets>=2.19",
     "openai>=1.99",
 ]
+# The YC-Bench port (src/hgym/envs/yc_bench), pinned to an upstream commit SHA. YC-Bench has no
+# stable public API, so the port wraps its internal modules (sim engine, world seeder, config
+# loader, command policy, ORM) behind a thin adapter — pinning a SHA makes drift a one-file
+# maintenance cost. Kept as an optional extra so `pip install hgym` (and the core test suite)
+# stay lean and never import yc_bench — `import hgym` registers the `yc_bench` env without
+# loading it. YC-Bench generates its whole world deterministically from a seed, so (unlike
+# tau2) it needs no external data provisioned at runtime.
+yc_bench = [
+    "yc-bench @ git+https://github.com/collinear-ai/yc-bench@e7d606789be4c52a34f9fa5b04ada4a2eaf9d731",
+]
 
 [dependency-groups]
-# The dev group is synced by default (plain `uv run` / `uv sync`), so putting the tau2 extra
-# here is what makes `uv run …` include tau2 out of the box. `pip install hgym` never installs
+# The dev group is synced by default (plain `uv run` / `uv sync`), so putting the env extras
+# here is what makes `uv run …` include them out of the box. `pip install hgym` never installs
 # dependency-groups, so the core pip install stays lean.
 dev = [
     "pytest>=8.0",
@@ -66,6 +76,7 @@ dev = [
     "pyright>=1.1.390",
     "hgym[tau2]",
     "hgym[hle]",
+    "hgym[yc_bench]",
 ]
 
 [build-system]
