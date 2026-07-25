@@ -5,10 +5,15 @@ from hgym.envs.registration import make, register, registered_envs
 # `hgym.envs.tau2.env_v1` imports nothing from `tau2` at top level (tau2 is loaded lazily,
 # only when a tau2 env is constructed or served), so `import hgym` works without the
 # `tau2` extra installed.
+# `hgym.envs.hle.env_v1` imports nothing from the `hle` extra (datasets/openai) at top level
+# — the dataset loads lazily on env construction and the judge's client on first call — so
+# `import hgym` stays offline without the extra installed.
+from hgym.envs.hle import env_v1 as hle_env_v1  # noqa: F401 — triggers registration
 from hgym.envs.tau2 import env_v1 as tau2_env_v1  # noqa: F401 — triggers registration
 from hgym.envs.wordle import env_v1 as wordle_env_v1  # noqa: F401 — triggers registration
 
 __all__ = [
+    "hle_env_v1",
     "make",
     "register",
     "registered_envs",
