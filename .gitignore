@@ -8,4 +8,6 @@ build/
 .ruff_cache/
 hgym_logs/
 .env
+.envrc
+.direnv/
 .DS_Store

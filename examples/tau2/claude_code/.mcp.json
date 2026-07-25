@@ -1,0 +1,19 @@
+{
+  "mcpServers": {
+    "tau2": {
+      "command": "uv",
+      "args": [
+        "run",
+        "python",
+        "-m",
+        "hgym.cli",
+        "serve",
+        "tau2_mock",
+        "--task",
+        "0",
+        "--trace",
+        "hgym_logs/tau2_mock.jsonl"
+      ]
+    }
+  }
+}
