@@ -7,16 +7,29 @@ contract and scores what happened.
 """
 
 from abc import ABC, abstractmethod
-from typing import Any, Dict, List, Optional
+from typing import TYPE_CHECKING, Any, Awaitable, Callable, Dict, List, Optional
 
 from hgym.mcp.types import MCPServerSpec
 from hgym.task import TaskSpec
 from hgym.trajectory import Trajectory
 from hgym.types import FeedbackCollection
 
+if TYPE_CHECKING:
+    from hgym.serve.lifecycle import FinalizeRequest, TerminalEvidence
+
 
 class Env(ABC):
     """Abstract environment: describe + serve (MCP specs) + verify."""
+
+    # The optional, typed terminal-transaction hook. Default ``None`` means the env has no
+    # scoring finalizer (a pure-verify / abort-only env): the serve layer never engages the
+    # seal transaction for it and it behaves exactly as before. An env opts in by declaring a
+    # ``score`` terminal tool *and* overriding this with
+    # ``async def finalize(self, req: FinalizeRequest) -> TerminalEvidence`` — the serve layer
+    # runs it on the already-sealed episode to produce the trusted terminal evidence.
+    finalize: Optional[
+        Callable[["FinalizeRequest"], Awaitable["TerminalEvidence"]]
+    ] = None
 
     @abstractmethod
     def describe(self, task_id: Optional[str] = None) -> TaskSpec:
@@ -43,9 +56,19 @@ class Env(ABC):
 
     @abstractmethod
     def verify(
-        self, trajectory: Trajectory, task: Dict[str, Any], *, terminated: bool
+        self,
+        trajectory: Trajectory,
+        task: Dict[str, Any],
+        *,
+        terminated: bool,
+        evidence: "Optional[TerminalEvidence]" = None,
     ) -> FeedbackCollection:
-        """Score the recorded trajectory. Pure — no side effects, no env state read."""
+        """Score the recorded trajectory. Pure — no side effects, no env state read.
+
+        A ``score``-terminal env additionally receives core-owned, immutable ``evidence``
+        (the trusted verdict from ``finalize``) and scores from it instead of scanning the
+        trajectory for marker JSON. Non-score envs are always called with ``evidence=None``
+        and behave exactly as before."""
 
     async def close(self) -> None:
         """Release any resources. Default: no-op."""

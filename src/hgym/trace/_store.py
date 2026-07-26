@@ -90,6 +90,79 @@ def step_record(
     )
 
 
+@dataclass
+class TerminalEvent:
+    """The versioned, core-owned ``terminal`` event, appended as a **distinct** row
+    (``kind="terminal"``) after the final ``step`` row.
+
+    A step row carries no ``kind`` (readers default an absent ``kind`` to ``"step"``), so this
+    additive event never changes the serialization of existing rows: a reader that doesn't know
+    about ``terminal`` events ignores unknown kinds. Confidential diagnostics/provenance never
+    appear here — they live only in the private finalization store, keyed by
+    ``(session_id, finalization_id)``. This row carries the ``args_digest`` (a hash, never the
+    raw args) and the public-safe, core-stamped ``verdict``."""
+
+    session_id: str
+    env_name: str
+    task_id: Optional[str]
+    step: int
+    source: str
+    status: str
+    verdict: Dict[str, Any]
+    finalization_id: str
+    args_digest: Optional[str] = None
+    schema_version: int = 1
+    kind: str = "terminal"
+
+    def __post_init__(self) -> None:
+        _require_str("session_id", self.session_id)
+        _require_str("env_name", self.env_name)
+        _require_str("task_id", self.task_id, optional=True)
+        _require_str("source", self.source)
+        _require_str("status", self.status)
+        _require_str("finalization_id", self.finalization_id)
+        _require_str("args_digest", self.args_digest, optional=True)
+        if isinstance(self.step, bool) or not isinstance(self.step, int):
+            raise ValueError(f"TerminalEvent.step must be an int, got {self.step!r}")
+        if not isinstance(self.verdict, dict):
+            raise ValueError(f"TerminalEvent.verdict must be a dict, got {self.verdict!r}")
+
+
+def terminal_event_record(
+    *,
+    session_id: str,
+    env_name: str,
+    task_id: Optional[str],
+    step: int,
+    source: str,
+    status: str,
+    verdict: Dict[str, Any],
+    finalization_id: str,
+    args_digest: Optional[str] = None,
+) -> TerminalEvent:
+    return TerminalEvent(
+        session_id=session_id,
+        env_name=env_name,
+        task_id=task_id,
+        step=step,
+        source=source,
+        status=status,
+        verdict=dict(verdict),
+        finalization_id=finalization_id,
+        args_digest=args_digest,
+    )
+
+
+def append_terminal_event(path: Union[str, Path], event: TerminalEvent) -> None:
+    """Append one ``terminal`` event to the JSONL store (same file as the step rows)."""
+    event.__post_init__()  # re-validate at the write boundary (mutable public dataclass)
+    p = Path(path)
+    p.parent.mkdir(parents=True, exist_ok=True)
+    line = json.dumps(asdict(event), sort_keys=True, allow_nan=False)
+    with p.open("a", encoding="utf-8") as f:
+        f.write(line + "\n")
+
+
 def append_trace(path: Union[str, Path], record: TraceRecord) -> None:
     """Append one record to the JSONL store at ``path`` (parents created if absent)."""
     # Re-validate at the write boundary: the record may have been mutated between

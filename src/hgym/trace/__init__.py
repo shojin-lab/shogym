@@ -6,6 +6,22 @@ surfaces, so the row records what hgym *can* attribute — ``(session_id, env, t
 step, tool, feedback)`` — and leaves the harness's internals to the harness.
 """
 
-from hgym.trace._store import TraceRecord, append_trace, load_traces, step_record
+from hgym.trace._store import (
+    TerminalEvent,
+    TraceRecord,
+    append_terminal_event,
+    append_trace,
+    load_traces,
+    step_record,
+    terminal_event_record,
+)
 
-__all__ = ["TraceRecord", "append_trace", "load_traces", "step_record"]
+__all__ = [
+    "TerminalEvent",
+    "TraceRecord",
+    "append_terminal_event",
+    "append_trace",
+    "load_traces",
+    "step_record",
+    "terminal_event_record",
+]
