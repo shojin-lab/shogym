@@ -8,12 +8,19 @@ from hgym.envs.registration import make, register, registered_envs
 # `hgym.envs.hle.env_v1` imports nothing from the `hle` extra (datasets/openai) at top level
 # — the dataset loads lazily on env construction and the judge's client on first call — so
 # `import hgym` stays offline without the extra installed.
+# `hgym.envs.automationbench.env_v1` imports nothing from the vendored `automationbench` package
+# at top level — the package (and `datasets`) load lazily on env construction/serve — so
+# `import hgym` stays offline without the `automationbench` extra installed.
+from hgym.envs.automationbench import (  # noqa: F401 — triggers registration
+    env_v1 as automationbench_env_v1,
+)
 from hgym.envs.hle import env_v1 as hle_env_v1  # noqa: F401 — triggers registration
 from hgym.envs.tau2 import env_v1 as tau2_env_v1  # noqa: F401 — triggers registration
 from hgym.envs.wordle import env_v1 as wordle_env_v1  # noqa: F401 — triggers registration
 from hgym.envs.yc_bench import env_v1 as yc_bench_env_v1  # noqa: F401 — triggers registration
 
 __all__ = [
+    "automationbench_env_v1",
     "hle_env_v1",
     "make",
     "register",
