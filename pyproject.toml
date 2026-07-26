@@ -68,6 +68,19 @@ hle = [
 yc_bench = [
     "yc-bench @ git+https://github.com/collinear-ai/yc-bench@e7d606789be4c52a34f9fa5b04ada4a2eaf9d731",
 ]
+# The BrowseComp-Plus port (src/hgym/envs/browsecomp_plus), a faithful wrap pinned to upstream
+# commit 0469490. `datasets` lazy-loads the XOR-encrypted `Tevatron/browsecomp-plus` queries
+# (decrypted in memory only — never persisted), `openai` backs the default model-graded judge,
+# and `pyserini` (which also needs a Java 21 runtime) is the BM25/Lucene retriever over the
+# prebuilt corpus index. Optional so `pip install hgym` (and the core offline test suite) stay
+# lean — `import hgym` registers `browsecomp_plus` without importing any of them. Offline tests
+# inject their own tasks + an in-memory searcher + a scripted judge, so they need none of it
+# (no download, no key, no Java).
+browsecomp_plus = [
+    "datasets>=2.19",
+    "openai>=1.99",
+    "pyserini>=0.22",
+]
 
 [dependency-groups]
 # The dev group is synced by default (plain `uv run` / `uv sync`), so putting the env extras
@@ -81,6 +94,7 @@ dev = [
     "hgym[tau2]",
     "hgym[hle]",
     "hgym[yc_bench]",
+    "hgym[browsecomp_plus]",
 ]
 
 [build-system]
