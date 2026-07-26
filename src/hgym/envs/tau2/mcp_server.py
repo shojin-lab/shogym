@@ -142,9 +142,18 @@ class _Tau2Session:
         self.env_kwargs = env_kwargs
         self.terminated = False
         self.verdict: Optional[Dict[str, Any]] = None
+        # The evaluator's private diagnostic (exception text on an evaluator failure), kept OFF
+        # the public verdict — the hgym `finalize` hook forwards it only to the durable store.
+        self.eval_error: Optional[str] = None
 
         self._done = threading.Event()
         self._sim_run: Any = None
+        # Serialize (and once-guard) every stop+evaluate against the background Orchestrator.
+        # The autonomous-stop detector (an ordinary tool/user turn that drove tau2 to stop) and
+        # the hgym seal finalizer both drive termination; this lock + the `terminated` guard make
+        # the Orchestrator impossible to double-stop and `evaluate_simulation` run at most once.
+        # `abort()` shares it, so an end_session teardown can never race an in-flight finalize.
+        self._finalize_lock = threading.Lock()
 
         environment = _make_env(domain, solo_mode=solo_mode, env_kwargs=env_kwargs)
         agent_tools = list(environment.get_tools())
@@ -219,26 +228,53 @@ class _Tau2Session:
         self._wait_for_turn()
         return self._latest_content()
 
+    def finalize_once(self) -> Dict[str, Any]:
+        """Atomically finalize tau2 and return the verdict. Idempotent + once-guarded.
+
+        The single stop+score transaction, safe to call from BOTH the autonomous-stop detector
+        (an ordinary tool/user turn that already drove tau2 to a stop) and the hgym seal
+        finalizer. Under ``_finalize_lock``: if the run is already terminated (an autonomous stop
+        stashed a verdict, or a prior finalize ran) return the **stored** outcome — never
+        re-stop, never re-evaluate. Otherwise deliver ``done`` to the Orchestrator exactly once
+        (unless it already finished), wait for it to unwind, run ``evaluate_simulation`` exactly
+        once, and stash the verdict (+ any private diagnostic)."""
+        with self._finalize_lock:
+            if self.terminated:
+                return self.verdict if self.verdict is not None else _empty_verdict()
+            if not self._done.is_set() and self._agent.is_agent_turn:
+                self._agent.set_action(_tool_call_message(DONE_TOOL_NAME, {}))
+            while not self._done.is_set():
+                self._done.wait(0.05)
+            verdict, diagnostic = self._evaluate()
+            self.verdict = verdict
+            self.eval_error = diagnostic
+            self.terminated = True
+            return verdict
+
     def stop_and_evaluate(self) -> Dict[str, Any]:
-        """Signal tau2 agent-stop, wait for the Orchestrator to finalize, and score."""
-        if not self._done.is_set() and self._agent.is_agent_turn:
-            self._agent.set_action(_tool_call_message(DONE_TOOL_NAME, {}))
-        while not self._done.is_set():
-            self._done.wait(0.05)
-        self.terminated = True
-        self.verdict = self._evaluate()
-        return self.verdict
+        """Signal tau2 agent-stop, wait for the Orchestrator to finalize, and score.
+
+        Retained as the autonomous-stop entry point (see ``dispatch``); delegates to the
+        once-guarded :meth:`finalize_once` so a stop detected on the background thread and the
+        hgym finalizer can never double-stop the Orchestrator or double-run the evaluator."""
+        return self.finalize_once()
 
     def abort(self) -> None:
-        """Best-effort teardown of a still-running simulation (no scoring)."""
-        if self._done.is_set():
-            return
-        try:
-            if self._agent.is_agent_turn:
-                self._agent.set_action(_tool_call_message(DONE_TOOL_NAME, {}))
-        except Exception:
-            pass
-        # Give the thread a moment to unwind; it's a daemon, so don't block forever.
+        """Best-effort teardown of a still-running simulation (no scoring).
+
+        Shares ``_finalize_lock`` with :meth:`finalize_once`, so an ``end_session`` teardown can
+        never drive the agent concurrently with an in-flight finalize (which would double-stop
+        the Orchestrator). A run that already terminated/scored is left untouched."""
+        with self._finalize_lock:
+            if self.terminated or self._done.is_set():
+                return
+            try:
+                if self._agent.is_agent_turn:
+                    self._agent.set_action(_tool_call_message(DONE_TOOL_NAME, {}))
+            except Exception:
+                pass
+        # Give the thread a moment to unwind; it's a daemon, so don't block forever. Waited
+        # OUTSIDE the lock so it can't stall a (defensively concurrent) finalize.
         self._done.wait(2.0)
 
     # -- helpers --
@@ -252,9 +288,15 @@ class _Tau2Session:
             return content
         return json.dumps(content) if content is not None else ""
 
-    def _evaluate(self) -> Dict[str, Any]:
+    def _evaluate(self) -> "tuple[Dict[str, Any], Optional[str]]":
+        """Run tau2's evaluator over the completed simulation.
+
+        Returns ``(public-safe verdict, private diagnostic)``. The exception text of an evaluator
+        failure goes ONLY into the diagnostic (a fail-closed reward-0 verdict is returned) — it
+        is never written into the public verdict the agent can read, so an evaluator crash leaks
+        no oracle. A clean run returns ``(verdict, None)``."""
         if self._sim_run is None:
-            return _empty_verdict()
+            return _empty_verdict(), "no completed simulation to evaluate"
         try:
             reward_info = evaluate_simulation(
                 simulation=self._sim_run,
@@ -265,10 +307,8 @@ class _Tau2Session:
                 env_kwargs=self.env_kwargs,
             )
         except Exception as exc:
-            verdict = _empty_verdict()
-            verdict["error"] = f"evaluation failed: {exc}"
-            return verdict
-        return _verdict_from_reward_info(reward_info)
+            return _empty_verdict(), f"tau2 evaluate_simulation failed: {exc}"
+        return _verdict_from_reward_info(reward_info), None
 
 
 def _safe_user_tools(environment: Any, task: Any) -> Optional[List[Any]]:
@@ -443,14 +483,18 @@ def dispatch(tool_name: str, kind: str, arguments: Dict[str, Any]) -> str:
     if session is None:
         return json.dumps({"error": "session not initialized; env did not call begin_session"})
     if session.terminated:
-        # The episode is already scored (explicit `done`, or tau2 auto-terminated earlier).
-        # A `done` call retrieves the stored verdict — so the verdict is *always* surfaced on
-        # a `done` step, which is the only step the verifier trusts. Any other call is a no-op.
+        # The run is already scored (an autonomous stop stashed the verdict, or a prior
+        # finalize ran). `done` never reaches here on the served path — it's the env's `score`
+        # terminal, intercepted and finalized by the serve layer, not dispatched inward — but
+        # keep the retrieve-the-stored-verdict branch as a defensive fallback for any direct
+        # dispatch. Every other call after termination is a no-op.
         if tool_name == DONE_TOOL_NAME and session.verdict is not None:
             return json.dumps(session.verdict)
         return json.dumps({"error": "episode already terminated"})
 
     if tool_name == DONE_TOOL_NAME:
+        # Defensive: on the served path the serve layer handles `done` via the seal + `finalize`,
+        # so this is unreachable there. Retained so a direct in-process dispatch still scores.
         return json.dumps(session.stop_and_evaluate())
 
     if kind == "message":
@@ -458,9 +502,11 @@ def dispatch(tool_name: str, kind: str, arguments: Dict[str, Any]) -> str:
     else:
         result = session.act_tool(tool_name, arguments)
     # A domain tool call or user message can also drive tau2 to termination on its own
-    # (max_steps, or the user simulator ending the conversation). Score it now and stash the
-    # verdict, but return the tool/user result here — the verdict is surfaced only when the
-    # harness calls `done` (keeping the verifier's "trust only the done step" contract intact).
+    # (max_steps, or the user simulator ending the conversation). Score it now and STASH the
+    # verdict on the background-thread session, but return the tool/user result here. The hgym
+    # `finalize` hook (run when the harness reaches a terminal, or at the horizon) later retrieves
+    # this stashed verdict via `finalize_once` — so tau2's evaluator score over the completed run
+    # is preserved without double-stopping the Orchestrator.
     if session.orchestrator_done and not session.terminated:
         session.stop_and_evaluate()
     return result
@@ -495,12 +541,33 @@ def begin_session(
         _sessions[session_id] = session
 
 
+def finalize_once(session_id: str) -> "tuple[Dict[str, Any], Optional[str]]":
+    """Run tau2's atomic finalize for ``session_id`` and return ``(verdict, private diagnostic)``.
+
+    The hgym-side terminal wiring: the env's ``finalize`` hook calls this on the already-sealed
+    episode to drive tau2 to a stop (or reuse a stashed autonomous-stop verdict) and score it —
+    exactly once (see :meth:`_Tau2Session.finalize_once`). If the session is gone (never begun,
+    or already torn down), there is no tau2 run to score: return a premature reward-0 verdict
+    with a diagnostic, never raise."""
+    with _lock:
+        session = _sessions.get(session_id)
+    if session is None:
+        return (
+            _empty_verdict(),
+            "tau2 session not found at finalize (never begun or already ended)",
+        )
+    verdict = session.finalize_once()
+    return verdict, session.eval_error
+
+
 def end_session(session_id: str) -> None:
     """Tear down a session's tau2 simulation. Idempotent.
 
-    Runs *after* ``verify`` (which already scored from the recorded trajectory), so aborting a
-    still-running simulation here cannot change the episode's score — it just unblocks the
-    parked Orchestrator thread instead of leaking a daemon."""
+    Runs *after* the episode is sealed and finalized (``finalize_once`` already scored the run,
+    or synthesized no-score abort evidence), so aborting a still-running simulation here cannot
+    change the episode's score — it just unblocks the parked Orchestrator thread instead of
+    leaking a daemon. A finalized session is already ``terminated`` so ``abort()`` is a no-op;
+    the shared ``_finalize_lock`` guarantees this teardown never races an in-flight finalize."""
     with _lock:
         session = _sessions.pop(session_id, None)
     if session is None:
