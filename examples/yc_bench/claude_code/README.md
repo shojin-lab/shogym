@@ -9,25 +9,26 @@ Claude Code's model, prompt, or loop — only the tool calls and the verifier's 
   Claude Code  ──spawns──▶  hgym serve yc_bench          (stdio MCP server)
   (the harness)             ├─ describe            → the rules + this run's seed + tools
       │                     ├─ run_command("yc-bench …") → the CLI's JSON result
-      │                     ├─ submit()            → final funds / survival verdict
-      └──tool calls────────▶└─ terminate()         → episode scored → ./hgym_logs/yc_bench.jsonl
+      └──tool calls────────▶└─ submit()            → seal → finalize reads sim → episode scored
+                                                                → ./hgym_logs/yc_bench.jsonl
                                                                              │
                             hgym.result_from_trace(...) ◀───────────────────┘
 ```
 
-## The flow: `run_command` → `submit` → `terminate`
+## The flow: `run_command` → `submit`
 
 The agent operates a simulated AI startup for one year — starting with $200,000 — by issuing
-YC-Bench CLI commands through the `run_command` tool, then ends the run in two steps:
+YC-Bench CLI commands through the `run_command` tool, then ends the run with one terminal call:
 
 1. Run the company with **`run_command`**: `yc-bench market browse`, `yc-bench task accept`,
    `yc-bench task assign`, `yc-bench task dispatch`, then `yc-bench sim resume` to advance the
    clock to the next event — repeat until the run ends (bankruptcy or the one-year horizon).
    Every command returns JSON in the tool result.
-2. Call **`submit`** — this reads YC-Bench's final sim state (final funds, survival, task
-   outcomes) and returns the verdict **in the tool result**.
-3. Call **`terminate`** — this ends the hgym episode; hgym's verifier reads the verdict off the
-   recorded `submit` step into the terminal feedback.
+2. Call **`submit`** — the env's **`score` terminal**. hgym seals the episode, then its
+   `finalize` hook reads YC-Bench's final sim state (final funds, survival, task outcomes) off
+   the live DB, scores it, and ends the episode in one step. The core-owned verdict is recorded
+   as the terminal feedback (no separate `terminate` needed — that stays available only as the
+   no-score abort).
 
 The agent learns this from the task instructions it reads via `describe`. Scoring credits the
 final funds **only from a genuine terminal state** (the horizon, or bankruptcy) — a solvent,
@@ -99,7 +100,7 @@ project's interpreter so it has the `yc_bench` extra):
 Then let Claude Code drive it:
 
 ```bash
-claude -p "You are the YC-Bench CEO. Call describe, run the company with run_command (yc-bench …), then submit, then terminate." \
+claude -p "You are the YC-Bench CEO. Call describe, run the company with run_command (yc-bench …), then submit to end and score the run." \
   --mcp-config ./.mcp.json \
   --strict-mcp-config \
   --allowedTools "mcp__yc_bench__*" \
