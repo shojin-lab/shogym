@@ -2,8 +2,9 @@
 
 The **external-harness** path: hgym does not drive Claude Code — Claude Code spawns
 ``hgym serve hle`` as its MCP server (per the generated ``.mcp.json``), reads the question
-via ``describe``, calls ``submit_answer`` (the env grades it **server-side** with the LLM
-judge), then ``terminate``. When it finishes, we read the terminal feedback (``correct`` +
+via ``describe`` and calls ``submit_answer`` (the score terminal: it seals the episode, grades
+it **server-side** with the LLM judge, and ends the episode in one step — no separate
+``terminate``). When it finishes, we read the terminal feedback (``correct`` +
 ``calibration_error``) with :func:`hgym.result_from_trace`.
 
 Run it::
@@ -79,7 +80,8 @@ PROMPT = (
     f"`{SERVER_KEY}` MCP tools. First call `describe` to read the question. Reason "
     "carefully from your own knowledge — do not look anything up. Then call "
     "`submit_answer` exactly once with your final `answer` and a `confidence` from 0 to "
-    "100, and finally call `terminate` to end the episode."
+    "100. That call grades your answer and ends the episode — do not call `terminate` "
+    "afterward."
 )
 
 

@@ -41,10 +41,12 @@ _TASKS = [
 
 async def _grade(answer: str, confidence: int) -> dict:
     # No `judge` in the config -> the env builds the default OpenAIJudge (real network call).
+    # submit_answer is the score terminal: the call seals + grades + ends the episode, and
+    # returns the sanitized public payload (correct + judge_error).
     episode = await ServedEpisode.start("hle", task=0, env_config={"tasks": _TASKS})
     try:
         result = await episode.call("submit_answer", {"answer": answer, "confidence": confidence})
-        await episode.call("terminate", {})
+        assert result.terminated
         grade = json.loads(result.content)
         grade["feedback"] = {i["name"]: i["value"] for i in episode.terminal_feedback}
         return grade
@@ -53,8 +55,10 @@ async def _grade(answer: str, confidence: int) -> dict:
 
 
 async def test_real_judge_accepts_a_paraphrased_correct_answer() -> None:
+    # A paraphrase whose surface form defeats the exact-match fast path, so the real LLM judge
+    # (not the fast path) must grade it correct.
     grade = await _grade("It happened in the year nineteen sixty-nine.", confidence=80)
-    assert grade["judged_by"] == "llm_judge", "exact-match must miss so the judge grades"
+    assert grade["judge_error"] is False, "the judge graded (no grading-infra failure)"
     assert grade["correct"] is True
     assert grade["feedback"]["correct"] is True
 
