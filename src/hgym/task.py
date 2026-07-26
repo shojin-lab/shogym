@@ -10,9 +10,20 @@ from __future__ import annotations
 
 from typing import Any, Dict, List, Literal, Optional
 
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, model_validator
 
 ToolProvenance = Literal["env-mandatory", "reserved"]
+
+# The terminal-kind marker. Exactly zero or one `score` terminal per env; `abort` is the
+# reserved `terminate`; everything else is `none`. Only a `score`-terminal tool engages the
+# serve layer's validate -> seal -> evaluate transaction; `none`/`abort` tools behave exactly
+# as before, so an env that marks nothing `score` publishes an unchanged contract.
+TerminalKind = Literal["none", "score", "abort"]
+
+# The wire-contract version a `TaskSpec` advertises. Bumped from an implicit 1 to 2 when the
+# `terminal_kind` marker was added to `ToolManifest`, so a client can tell whether the
+# seal-before-verdict semantics are in force.
+CONTRACT_VERSION = 2
 
 
 class ReferenceTemplate(BaseModel):
@@ -33,6 +44,11 @@ class ToolManifest(BaseModel):
     description: str
     input_schema: Dict[str, Any]
     provenance: ToolProvenance = "env-mandatory"
+    # The tool's role in the terminal lifecycle. `none` (default) is an ordinary tool; `abort`
+    # is the reserved `terminate`; `score` is the single per-env scoring terminal whose call
+    # the serve layer turns into a validate -> seal -> evaluate transaction. Defaulting to
+    # `none` keeps every ordinary tool unchanged.
+    terminal_kind: TerminalKind = "none"
 
 
 class TaskSpec(BaseModel):
@@ -50,3 +66,33 @@ class TaskSpec(BaseModel):
     tools: List[ToolManifest] = Field(default_factory=list)
     reference_templates: List[ReferenceTemplate] = Field(default_factory=list)
     horizon: Optional[int] = None
+    # Wire-contract version. 2 carries the `terminal_kind` marker (and, for a `score`-terminal
+    # env, the seal-before-verdict semantics); see ``CONTRACT_VERSION``.
+    contract_version: int = CONTRACT_VERSION
+
+    @model_validator(mode="after")
+    def _enforce_terminal_kind_invariants(self) -> "TaskSpec":
+        """Enforce the terminal-kind invariants on **every** published contract, not only the
+        ``ToolUsingEnv`` convenience path — a custom ``Env.describe()`` cannot slip two score
+        terminals (both would seal/finalize) or a scoring ``terminate`` past the serve layer.
+        Exactly zero-or-one ``score`` terminal per env, and the reserved ``terminate`` must be
+        ``abort`` (never ``score``)."""
+        score = [t.name for t in self.tools if t.terminal_kind == "score"]
+        if len(score) > 1:
+            raise ValueError(
+                f"a task may advertise at most one `score` terminal, got {score}"
+            )
+        # `abort` iff `terminate`: the serve layer treats only the literal `terminate` tool as
+        # the abort path, so the published marker must match that mapping exactly (else a custom
+        # contract would advertise semantics the runtime doesn't honor).
+        for t in self.tools:
+            if t.name == "terminate" and t.terminal_kind != "abort":
+                raise ValueError(
+                    "the reserved `terminate` tool must have terminal_kind='abort', got "
+                    f"{t.terminal_kind!r}"
+                )
+            if t.terminal_kind == "abort" and t.name != "terminate":
+                raise ValueError(
+                    f"terminal_kind='abort' is reserved for the `terminate` tool, not {t.name!r}"
+                )
+        return self

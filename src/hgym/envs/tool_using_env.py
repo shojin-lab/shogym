@@ -12,16 +12,29 @@ from __future__ import annotations
 import asyncio
 import concurrent.futures
 from abc import abstractmethod
-from typing import Any, Awaitable, Dict, List, Optional, Sequence, TypeVar
+from typing import (
+    TYPE_CHECKING,
+    Any,
+    Awaitable,
+    Dict,
+    List,
+    Optional,
+    Sequence,
+    TypeVar,
+    cast,
+)
 
 from hgym.core import Env
 from hgym.mcp import MCPServerSpec
 from hgym.mcp.toolset import _open_session_for_spec
 from hgym.shared.terminate_mcp import TERMINATE_TOOL_NAME
-from hgym.task import ReferenceTemplate, TaskSpec, ToolManifest
+from hgym.task import ReferenceTemplate, TaskSpec, TerminalKind, ToolManifest
 from hgym.trajectory import Trajectory
 from hgym.types import FeedbackCollection, FunctionConfig, ToolConfig
 from hgym.utils import seeding
+
+if TYPE_CHECKING:
+    from hgym.serve.lifecycle import TerminalEvidence
 
 _TERMINATE_SPEC = MCPServerSpec(
     name="__terminate__",
@@ -37,6 +50,12 @@ class ToolUsingEnv(Env):
     mcp_servers: Sequence[MCPServerSpec] = ()
     function: FunctionConfig = FunctionConfig()
     function_name: str = "agent"
+    # The single tool (if any) this env marks as the `score` terminal. When set, ``describe()``
+    # advertises it with ``terminal_kind="score"`` and the serve layer runs its call as a
+    # validate -> seal -> evaluate transaction (only if the env also overrides ``finalize``).
+    # Left ``None`` by an env with no scoring terminal, so it advertises only `none`/`abort`
+    # tools and the seal transaction never engages.
+    score_terminal_tool: Optional[str] = None
 
     def __init__(self, *, horizon: int, num_tasks: Optional[int] = None) -> None:
         self._horizon = horizon
@@ -60,7 +79,43 @@ class ToolUsingEnv(Env):
                 if tc.name in tools:
                     raise ValueError(f"duplicate tool name {tc.name!r} across mcp_servers")
                 tools[tc.name] = tc
+        # Enforce exactly zero-or-one `score` terminal per env, and that it is a real
+        # advertised tool (never the reserved `terminate`). Fail fast at construction so a typo
+        # can't silently leave the env with no scoring terminal, and describe() can never
+        # advertise two `score` terminals.
+        score = self.score_terminal_tool
+        if score is not None:
+            if score not in tools:
+                raise ValueError(
+                    f"score_terminal_tool {score!r} is not an advertised tool "
+                    f"({sorted(tools)})"
+                )
+            if score == TERMINATE_TOOL_NAME:
+                raise ValueError(
+                    f"score_terminal_tool may not be the reserved {TERMINATE_TOOL_NAME!r}"
+                )
+            # A declared score terminal MUST have a *callable* finalize hook, else a v2 contract
+            # would advertise seal-before-verdict semantics that never engage. This is an early,
+            # clearer error for the common ToolUsingEnv path; the AUTHORITATIVE enforcement lives
+            # at the serve boundary (`ServedEpisode.__init__`), which every env — including a
+            # non-ToolUsingEnv one that hand-builds its manifest — must pass through. Check
+            # `callable`, not just `is None`, so a non-callable finalize (`False`, a stray
+            # attribute) also fails fast rather than silently disabling the transaction.
+            if not callable(getattr(self, "finalize", None)):
+                raise ValueError(
+                    f"score_terminal_tool {score!r} is declared but this env has no callable "
+                    "`finalize` hook; a score terminal requires an async finalize()"
+                )
         return tools
+
+    def _terminal_kind(self, tool_name: str) -> TerminalKind:
+        """The terminal role of ``tool_name``: the reserved ``terminate`` is ``abort``, this
+        env's ``score_terminal_tool`` (if any) is ``score``, everything else is ``none``."""
+        if tool_name == TERMINATE_TOOL_NAME:
+            return "abort"
+        if tool_name == self.score_terminal_tool:
+            return "score"
+        return "none"
 
     def describe(self, task_id: Optional[str] = None) -> TaskSpec:
         """Publish the task contract (RFC 008 §3.1). Read-only; opens no session."""
@@ -89,6 +144,7 @@ class ToolUsingEnv(Env):
                 description=tc.description,
                 input_schema=tc.parameters.model_dump(),
                 provenance="reserved" if name == TERMINATE_TOOL_NAME else "env-mandatory",
+                terminal_kind=self._terminal_kind(name),
             )
             for name, tc in self._tool_configs.items()
         ]
@@ -118,8 +174,26 @@ class ToolUsingEnv(Env):
         self._open_session_ids.discard(session_id)
 
     def verify(
-        self, trajectory: Trajectory, task: Dict[str, Any], *, terminated: bool
+        self,
+        trajectory: Trajectory,
+        task: Dict[str, Any],
+        *,
+        terminated: bool,
+        evidence: "Optional[TerminalEvidence]" = None,
     ) -> FeedbackCollection:
+        # Only forward ``evidence`` to ``_verify`` when the serve layer actually produced it (a
+        # score-terminal env's seal path). A non-score env is called with ``evidence=None`` and
+        # dispatched exactly as before — its ``_verify`` keeps its original three-argument
+        # signature, so this is transparent for envs with no scoring terminal.
+        if evidence is not None:
+            # A score-terminal env's ``_verify`` accepts a fourth keyword, ``evidence``; a
+            # legacy env's does not. Only score envs ever reach this branch (evidence is None
+            # for every legacy env), so forward it dynamically — this keeps the abstract
+            # ``_verify`` contract at three args, so legacy overrides stay type-compatible.
+            verify_with_evidence = cast(Any, self._verify)
+            return verify_with_evidence(
+                trajectory, task, terminated=terminated, evidence=evidence
+            )
         return self._verify(trajectory, task, terminated=terminated)
 
     async def close(self) -> None:
@@ -156,7 +230,12 @@ class ToolUsingEnv(Env):
     def _verify(
         self, trajectory: Trajectory, task: Dict[str, Any], *, terminated: bool
     ) -> FeedbackCollection:
-        """Score the recorded trajectory (pure)."""
+        """Score the recorded trajectory (pure).
+
+        A ``score``-terminal env additionally accepts a keyword ``evidence`` (core-owned
+        :class:`~hgym.serve.lifecycle.TerminalEvidence`) and scores from it. A non-score env
+        keeps this three-argument signature — the base ``verify`` forwards ``evidence`` only to
+        an env that produced it, so a non-score env is never called with it."""
 
     async def _close(self) -> None:
         """Release resources. Default: no-op."""

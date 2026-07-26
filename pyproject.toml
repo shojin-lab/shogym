@@ -15,6 +15,10 @@ dependencies = [
     "fastmcp>=3.2",
     "minijinja>=2.0",
     "numpy>=1.26",
+    # RFC 009: the serve layer validates a score-terminal call's args against the full
+    # advertised JSON Schema *before* it seals the episode. jsonschema is already resolved
+    # transitively (via fastmcp); declaring it makes the direct import explicit.
+    "jsonschema>=4.20",
 ]
 keywords = ["llm", "agents", "evaluation", "mcp", "harness", "gym", "optimization"]
 classifiers = [

@@ -12,9 +12,11 @@ from pathlib import Path
 from typing import Any, Awaitable, Callable, Dict, Optional, Union
 
 from fastmcp import FastMCP
+from fastmcp.server.middleware import Middleware
 from fastmcp.tools import Tool, ToolResult
 from pydantic import PrivateAttr
 
+from hgym.feedback.wire import build_meta
 from hgym.serve.episode import ServedEpisode
 from hgym.task import ToolManifest
 
@@ -24,6 +26,43 @@ _Dispatch = Callable[[str, Dict[str, Any]], Awaitable[ToolResult]]
 # silently replace it, so the manifest would list a tool that dispatches to the control
 # endpoint). `terminate` is already reserved by the always-present terminate server.
 _DESCRIBE_TOOL = "describe"
+
+
+class _IngressGate(Middleware):
+    """Request-level ingress gate: the post-seal tombstone at the MCP request boundary.
+
+    A universal post-seal tombstone cannot live at the per-tool dispatcher: an **unknown**
+    tool never reaches the Python dispatcher (FastMCP rejects it first), and `describe` /
+    `tools/list` / resource reads don't route through ``episode.call`` at all. So the gate sits
+    at the MCP request boundary as FastMCP middleware.
+
+    **Post-seal method policy** (the invariant is "no request reaches task/env *state* after the
+    seal"):
+
+    - **Tombstoned** (``on_call_tool`` returns the generic terminal tombstone with **no inward
+      dispatch and no recorded step**): every ``tools/call`` — including a repeat of the score
+      terminal, the reserved ``terminate``, and any *unknown* tool — and, by the same hook, any
+      ToolSearch/deferred-tool activation (no such tool exists in this checkout, but any future
+      one is a ``tools/call`` and is covered here).
+    - **Read-only, allowed** (pass straight through): ``describe`` (the immutable task spec),
+      ``tools/list`` (``on_list_tools``), ``resources/read`` (``on_read_resource``), and
+      ``resources/list``/``resources/templates/list`` — they expose no task state and no
+      verdict, and harnesses legitimately re-read them.
+
+    The gate only ever fires for a **sealed** seal-enabled episode; a non-seal episode is
+    always OPEN, so the gate is inert and the server behaves exactly as before.
+    """
+
+    def __init__(self, episode: ServedEpisode) -> None:
+        self._episode = episode
+
+    async def on_call_tool(self, context, call_next):  # type: ignore[override]
+        if self._episode.sealed and context.message.name != _DESCRIBE_TOOL:
+            return ToolResult(
+                content="<episode sealed; no further tool calls are dispatched>",
+                meta=build_meta(terminate=True) or None,
+            )
+        return await call_next(context)
 
 
 class _PassthroughTool(Tool):
@@ -64,6 +103,9 @@ def build_server(episode: ServedEpisode, *, name: Optional[str] = None) -> FastM
     a FastMCP ``Client`` (the tests and the example harness)."""
     spec = episode.describe()
     server: FastMCP = FastMCP(name=name or f"hgym:{spec.env_name}")
+    # Request-level ingress gate. Inert for a non-seal episode (always OPEN); tombstones every
+    # post-seal `tools/call` (incl. unknown tools) for a seal-enabled one.
+    server.add_middleware(_IngressGate(episode))
 
     async def dispatch(tool_name: str, arguments: Dict[str, Any]) -> ToolResult:
         result = await episode.call(tool_name, arguments)
@@ -97,6 +139,9 @@ async def run_stdio(
 ) -> None:
     """Start an episode and serve it over stdio until the client disconnects — the body of
     ``hgym serve``, which a harness spawns as its MCP server."""
+    # Restart recovery runs transport-independently inside ServedEpisode.start (at store
+    # construction), so `hgym serve`, `evaluate()`, and every in-process caller share it — no
+    # extra step is needed here.
     episode = await ServedEpisode.start(env_name, task=task, trace_path=trace_path)
     try:
         # Inside the guard: build_server can raise (e.g. a reserved-name collision) after
