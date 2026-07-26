@@ -68,6 +68,16 @@ hle = [
 yc_bench = [
     "yc-bench @ git+https://github.com/collinear-ai/yc-bench@e7d606789be4c52a34f9fa5b04ada4a2eaf9d731",
 ]
+# The Frontier-Bench port (src/hgym/envs/frontier_bench) is a faithful, pinned snapshot of the
+# Harbor benchmark (release tag v0.1.0). Its only runtime dependency is a working local
+# **Docker** daemon (a system dependency, not a pip package): the env builds+runs the task's
+# environment container as the served agent's world and runs the task's own verifier container
+# for the 0/1 verdict. The Python code uses stdlib only (subprocess + tomllib), so this extra
+# carries no Python packages — it exists as a stable install/label target and a home for this
+# note. `import hgym` registers `frontier_bench` without importing Docker; only serving an
+# episode shells out to `docker`. Task files are vendored under the package (tiny), so
+# describe / verdict-parsing / the offline tests need neither Docker nor a network.
+frontier_bench = []
 
 [dependency-groups]
 # The dev group is synced by default (plain `uv run` / `uv sync`), so putting the env extras
@@ -81,6 +91,7 @@ dev = [
     "hgym[tau2]",
     "hgym[hle]",
     "hgym[yc_bench]",
+    "hgym[frontier_bench]",
 ]
 
 [build-system]
@@ -103,7 +114,14 @@ pythonpath = ["."]
 [tool.ruff]
 line-length = 100
 target-version = "py312"
+# Vendored, pinned upstream benchmark task files (redistributed byte-for-byte with the canary):
+# not this project's code and never imported by hgym — they run only inside task containers.
+extend-exclude = ["src/hgym/envs/frontier_bench/tasks"]
 
 [tool.pyright]
 include = ["src"]
 pythonVersion = "3.12"
+# The vendored frontier_bench task files (solution/solve.py, tests/test_outputs.py) are pinned
+# upstream artifacts executed inside the task's Docker containers — not part of hgym's typed
+# surface and never imported by the port — so they are excluded from type-checking.
+exclude = ["src/hgym/envs/frontier_bench/tasks"]
