@@ -20,10 +20,14 @@ delta in the trace is attributable to the harness.
 |---|---|---|
 | `wordle_v1` | The reference env-as-center environment — Wordle in the smallest honest form (`guess` + reserved `terminate`, a pure trajectory verifier). No extra deps; runs on core hgym. | [`wordle/README.md`](wordle/README.md) |
 | `tau2_mock`, `tau2_airline`, `tau2_retail`, `tau2_telecom`, `tau2_banking_knowledge` | A faithful port of [τ²-bench](https://github.com/sierra-research/tau2-bench) — tool-using customer-service agents across domains, scored by tau2's own evaluator. Needs the `tau2` extra + tau2 data (Python 3.12). | [`tau2/README.md`](tau2/README.md) |
+| `yc_bench` | A faithful port of [YC-Bench](https://github.com/collinear-ai/yc-bench) — operate a simulated AI startup for one year via a single `run_command` tool, scored on survival, funds, and tasks completed. Needs the `yc_bench` extra (deterministic in-process sim — no data or key; Python 3.12). | [`yc_bench/README.md`](yc_bench/README.md) |
+| `hle` | A faithful port of [Humanity's Last Exam](https://huggingface.co/datasets/cais/hle) — a single-turn, expert-level question answered via one `submit_answer` tool, graded server-side (exact-match fast path, then an OpenAI model judge; hgym's first model-graded verifier). Needs the `hle` extra, `OPENAI_API_KEY`, and gated `cais/hle` access (Python 3.12). | [`hle/README.md`](hle/README.md) |
 
 Runnable end-to-end demos (Claude Code drives a served env; hgym scores off the trace) live
-under [`examples/`](../../../examples/): [`examples/wordle/claude_code/`](../../../examples/wordle/claude_code/README.md)
-and [`examples/tau2/claude_code/`](../../../examples/tau2/claude_code/README.md).
+under [`examples/`](../../../examples/): [`examples/wordle/claude_code/`](../../../examples/wordle/claude_code/README.md),
+[`examples/tau2/claude_code/`](../../../examples/tau2/claude_code/README.md),
+[`examples/yc_bench/claude_code/`](../../../examples/yc_bench/claude_code/README.md),
+and [`examples/hle/claude_code/`](../../../examples/hle/claude_code/README.md).
 
 ## Adding an env: the README template
 

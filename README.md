@@ -58,6 +58,15 @@ env-README template.
   [τ²-bench](https://github.com/sierra-research/tau2-bench): tool-using customer-service
   agents (`tau2_mock`, `tau2_airline`, `tau2_retail`, `tau2_telecom`,
   `tau2_banking_knowledge`), scored by tau2's own evaluator. Needs the `tau2` extra + data.
+- **[`yc_bench`](src/hgym/envs/yc_bench/README.md)** — a faithful port of
+  [YC-Bench](https://github.com/collinear-ai/yc-bench): operate a simulated AI startup for a
+  year via a single `run_command` tool, scored on survival, funds, and tasks. Deterministic
+  in-process sim (no data or key). Needs the `yc_bench` extra.
+- **[`hle`](src/hgym/envs/hle/README.md)** — a faithful port of
+  [Humanity's Last Exam](https://huggingface.co/datasets/cais/hle): a single-turn,
+  expert-level question answered via one `submit_answer` tool and graded server-side
+  (exact-match fast path, then an OpenAI model judge). hgym's first model-graded verifier.
+  Needs the `hle` extra, `OPENAI_API_KEY`, and gated `cais/hle` access.
 
 Runnable end-to-end demos (Claude Code drives a served env; hgym scores off the trace):
 
@@ -65,6 +74,10 @@ Runnable end-to-end demos (Claude Code drives a served env; hgym scores off the 
   plays Wordle through a served hgym env.
 - **[`examples/tau2/claude_code/`](examples/tau2/claude_code/README.md)** — Claude Code plays
   a tau2 domain; hgym scores it with tau2's evaluator.
+- **[`examples/yc_bench/claude_code/`](examples/yc_bench/claude_code/README.md)** — Claude Code
+  operates the YC-Bench startup sim; hgym scores the run off the trace.
+- **[`examples/hle/claude_code/`](examples/hle/claude_code/README.md)** — Claude Code answers an
+  HLE question through a served hgym env; hgym grades it server-side.
 
 ## License
 
