@@ -45,6 +45,15 @@ examples = ["openai>=1.99"]
 tau2 = [
     "tau2[gym,knowledge] @ git+https://github.com/sierra-research/tau2-bench@1d244f5dca42944b67a379b44bfeb9f5748f189d",
 ]
+# The HLE env (src/hgym/envs/hle): `datasets` lazy-loads the gated `cais/hle` benchmark, and
+# `openai` backs the default model-graded judge (an OpenAI-compatible client, created only
+# when the judge is first called). Optional so `pip install hgym` (and the core offline test
+# suite) stay lean — `import hgym` registers `hle` without importing either. Offline tests
+# inject their own tasks + a scripted judge, so they need neither the download nor a key.
+hle = [
+    "datasets>=2.19",
+    "openai>=1.99",
+]
 
 [dependency-groups]
 # The dev group is synced by default (plain `uv run` / `uv sync`), so putting the tau2 extra
@@ -56,6 +65,7 @@ dev = [
     "ruff>=0.8",
     "pyright>=1.1.390",
     "hgym[tau2]",
+    "hgym[hle]",
 ]
 
 [build-system]
