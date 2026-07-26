@@ -767,6 +767,7 @@ version = "0.0.1"
 source = { editable = "." }
 dependencies = [
     { name = "fastmcp" },
+    { name = "jsonschema" },
     { name = "minijinja" },
     { name = "numpy" },
     { name = "pydantic" },
@@ -805,6 +806,7 @@ requires-dist = [
     { name = "datasets", marker = "extra == 'hle'", specifier = ">=2.19" },
     { name = "duckdb", marker = "extra == 'analysis'", specifier = ">=1.0" },
     { name = "fastmcp", specifier = ">=3.2" },
+    { name = "jsonschema", specifier = ">=4.0" },
     { name = "minijinja", specifier = ">=2.0" },
     { name = "numpy", specifier = ">=1.26" },
     { name = "openai", marker = "extra == 'examples'", specifier = ">=1.99" },

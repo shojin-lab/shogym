@@ -34,9 +34,11 @@ from hgym.types import EpisodeFeedback, FeedbackCollection, FunctionConfig
 GRADE_MARKER = "hle_grade"
 SUBMIT_TOOL_NAME = "submit_answer"
 
-# One `submit_answer`, then `terminate` — a single-turn episode. The horizon also caps a
-# harness that keeps submitting: the last graded submission before the cap is scored.
-HORIZON = 2
+# RFC 009: `submit_answer` is the terminal action — submitting seals + grades + ends the
+# episode in one step (no separate `terminate`). The horizon is 1 so a single action ends
+# the episode; reaching it with no valid submission scores `correct=False`
+# (`zero_unsubmitted`).
+HORIZON = 1
 
 HLE_SPEC = MCPServerSpec(
     name="hle",
@@ -49,9 +51,9 @@ _BASE_INSTRUCTIONS = (
     "expert-level, closed-ended academic questions across many subjects.\n"
     "Read the question, reason carefully, then call `submit_answer` exactly once with your "
     "final `answer` and a `confidence` score from 0 to 100 (how sure you are it is "
-    "correct). Then call `terminate` to end the episode.\n"
-    "There is no feedback loop and no other tools: your first submitted answer is graded, "
-    "so commit to your best answer."
+    "correct). Submitting grades your answer and ends the episode — there is no second "
+    "submission, no feedback loop, and no further step to take (do not call `terminate` "
+    "afterward), so commit to your best answer."
 )
 
 
@@ -71,6 +73,12 @@ class HleEnv(ToolUsingEnv):
 
     mcp_servers = (HLE_SPEC,)
     function_name = "solver"
+    # RFC 009 (HLE-only prototype): `submit_answer` is the env's single `score` terminal.
+    # The serve layer validates its args, atomically seals the episode, then runs the judge
+    # (seal-before-verdict), so a graded verdict only ever exists for an already-sealed,
+    # un-continuable episode. Every other env leaves this `None`, so only HLE engages the
+    # seal transaction.
+    score_terminal_tool = SUBMIT_TOOL_NAME
 
     def __init__(
         self,

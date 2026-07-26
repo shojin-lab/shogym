@@ -76,19 +76,18 @@ def end_session(session_id: str) -> None:
 def submit_answer(
     answer: str, _session_id: str, confidence: int = 100
 ) -> Dict[str, Any]:
-    """Submit a final answer for grading.
+    """Submit your final answer. **This ends the episode** (RFC 009): submitting seals the
+    episode, grades ``answer`` against the gold answer (an exact-match fast path first, then
+    the LLM judge on a miss), and returns a **public-safe** result:
 
-    Grades ``answer`` against the session's gold answer — an exact-match fast path first,
-    then the session's LLM judge on a miss — and returns a marked verdict dict:
+      - ``correct``: whether your answer was judged correct
+      - ``judge_error``: ``True`` only if the grader itself failed (a fail-closed zero, not
+        an honest wrong answer); otherwise ``False``
 
-      - ``hle_grade``: the trust marker (always ``True`` on a real grade)
-      - ``correct``: whether the answer was judged correct
-      - ``confidence``: the caller's clamped 0–100 confidence (echoed for transparency)
-      - ``judged_by``: ``"exact_match"``, ``"llm_judge"``, or ``"llm_judge_error"``
-      - ``extracted_answer`` / ``reasoning``: judge diagnostics (advisory)
-
-    The authoritative signals the verifier consumes are ``correct`` (from here) and the
-    ``confidence`` **argument** (read off the trajectory); the rest is diagnostic.
+    There is no second submission and no separate ``terminate`` — call this exactly once.
+    (Internally the handler records a fuller, server-owned marked grade on the sealed step
+    for the pure verifier; the judge's reasoning/extracted answer are **not** returned to
+    you — they are answer oracles, stripped by the serve layer before you see the result.)
     """
     conf = _clamp_confidence(confidence)
     with _lock:

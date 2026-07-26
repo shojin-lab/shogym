@@ -41,6 +41,17 @@ def test_tool_manifest_covers_guess_and_reserved_terminate() -> None:
     assert guess_schema["required"] == ["word"]
 
 
+def test_non_score_env_advertises_only_none_and_abort_terminal_kinds() -> None:
+    # RFC 009 gate: a non-score env (wordle) marks `terminate` as `abort` and every other
+    # tool as `none` — no `score` terminal, so the seal transaction never engages for it.
+    spec = _spec()
+    by_name = {t.name: t.terminal_kind for t in spec.tools}
+    assert by_name["terminate"] == "abort"
+    assert by_name["guess"] == "none"
+    assert all(k != "score" for k in by_name.values())
+    assert spec.contract_version == 2
+
+
 def test_reference_templates_carry_shape_and_schema() -> None:
     spec = _spec()
     assert isinstance(spec.reference_templates[0], ReferenceTemplate)

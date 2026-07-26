@@ -32,9 +32,11 @@ export OPENAI_API_KEY=sk-...                             # the judge is an OpenA
 uv run python -m hgym.cli serve hle --task 0 --trace ./hgym_logs/hle.jsonl
 ```
 
-The harness reads the question via `describe`, calls **`submit_answer`** (the env grades it
-server-side), then **`terminate`**; hgym reads the verdict off the trace via
-`hgym.result_from_trace(...)`.
+The harness reads the question via `describe` and calls **`submit_answer`** exactly once:
+under RFC 009 that call is the **score terminal** — it validates the args, atomically
+**seals** the episode, grades server-side, and **ends** the episode in one step (no separate
+`terminate`; a `terminate` or repeat `submit_answer` afterward is tombstoned). hgym reads the
+verdict off the trace via `hgym.result_from_trace(...)`.
 
 **Config** (via `hgym.make(name, config)` / `env_config`): `task_split` (`"train"`/`"test"`),
 `tasks` (an explicit task list — bypasses the dataset download, used by the offline tests),
@@ -73,23 +75,31 @@ uv run python examples/hle/claude_code/run.py --task 0 --transcript
 ### describe → TaskSpec
 
 `env.describe(task_id)` publishes the task contract the harness reads: the **question** (in
-`instructions`) and the **tool manifest** — `submit_answer` (provenance `env-mandatory`) and
-the reserved `terminate`. There is no observation stream and no other tool.
+`instructions`) and the **tool manifest** — `submit_answer` (provenance `env-mandatory`,
+**`terminal_kind: score`**) and the reserved `terminate` (`terminal_kind: abort`). There is
+no observation stream and no other tool.
 
 ### Tools (served over MCP)
 
-- **`submit_answer(answer: str, confidence: int = 100)`** — backed by the in-process server in
-  `mcp_server.py`. The handler grades server-side and returns a marked verdict dict
-  (`hle_grade`, `correct`, `confidence`, `judged_by`, plus judge diagnostics):
+- **`submit_answer(answer: str, confidence: int = 100)`** — the **score terminal** (RFC 009),
+  backed by the in-process server in `mcp_server.py`. Calling it validates the args against the
+  advertised schema, **seals** the episode, grades server-side, and **ends** the episode — so a
+  verdict only ever exists for an already-sealed, un-continuable episode. Grading is:
   - an **exact-match fast path** first (normalize + compare, offline and free); on a match the
     LLM judge is not called;
   - otherwise the session's **LLM judge** (`judge.py`) grades it, using HLE's own judge prompt.
   The judge is **injectable** (`config={"judge": …}`): the registered env defaults to
   `OpenAIJudge`; offline tests inject a scripted judge, mirroring how the tau2 port injects a
   scripted user simulator. A judge exception scores the answer incorrect rather than crashing
-  the episode.
-- **`terminate()`** — the reserved episode-completion tool every env serves. Its call, detected
-  by name, is the terminal signal.
+  the episode. The **result returned to the agent is sanitized** — only the public-safe
+  `correct` (bool) and `judge_error` (bool); the judge's reasoning/extracted answer are
+  answer-oracles and are stripped by the serve layer. (Internally the handler still records a
+  fuller, server-owned marked grade on the sealed step for the pure verifier — that is the
+  authoritative trust source, distinct from what the agent sees.)
+- **`terminate()`** — the reserved abort tool every env serves (`terminal_kind: abort`). Under
+  RFC 009 `submit_answer` already ends the episode, so a harness does **not** call `terminate`
+  after submitting (it would be tombstoned); `terminate` before submitting ends the episode
+  with no submission (`correct = False`).
 
 The env pushes per-episode state — the question, its gold answer, and the judge — into the
 in-process server via `begin_session(session_id, …)` on start and drops it via `end_session`
@@ -112,8 +122,9 @@ Feedback emitted on termination (episode-level):
   the stated confidence and the outcome (0 is perfectly calibrated). A premature end with no
   graded submission emits only `correct = False` (there is no confidence to calibrate).
 
-Termination happens when `terminate` is called **or** the horizon (2) is reached, whichever
-comes first.
+Termination happens when the `submit_answer` score terminal seals the episode, when
+`terminate` is called, **or** when the horizon (1) is reached — whichever comes first. Reaching
+the horizon with no submission scores `correct = False` (the `zero_unsubmitted` policy).
 
 ## Tasks
 
@@ -153,8 +164,9 @@ its own trace file.
   follow-up.
 - **Look-ups defeat the point.** HLE measures the model's own reasoning — a harness must deny
   web tools (`--disallowedTools "WebFetch,WebSearch,…"`), as the example does.
-- **Single-turn.** The horizon is 2 (`submit_answer` then `terminate`); the last graded
-  submission before the cap is scored.
+- **Single-turn, single terminal action.** `submit_answer` is the score terminal (RFC 009):
+  submitting seals + grades + ends the episode in one step (horizon 1), so there is no second
+  submission and no separate `terminate` to call afterward.
 - **Offline vs keyed tests.** The pure verifier + judge-helper tests and the served
   scripted-judge tests run offline in the suite; a keyed fidelity test — the real `OpenAIJudge`
   grading a served episode — is skipped unless `OPENAI_API_KEY` is set.

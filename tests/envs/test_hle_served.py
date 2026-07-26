@@ -61,18 +61,19 @@ async def test_describe_surfaces_the_question_and_tools() -> None:
 
 
 async def test_exact_match_scores_correct_without_calling_the_judge() -> None:
+    # RFC 009: submit_answer is the `score` terminal. The call itself seals + finalizes, so
+    # it returns terminated=True and a *sanitized* payload (score + judge_error only), never
+    # the judge's reasoning/extracted_answer.
     judge = _ScriptedJudge()
     episode = await ServedEpisode.start("hle", task=0, env_config=_config(judge))
     try:
         result = await episode.call("submit_answer", {"answer": "Paris", "confidence": 90})
-        grade = json.loads(result.content)
-        assert grade[mcp_server.GRADE_MARKER] is True
-        assert grade["correct"] is True
-        assert grade["judged_by"] == "exact_match"
+        assert result.terminated
+        payload = json.loads(result.content)
+        assert payload == {"correct": True, "judge_error": False}
+        assert mcp_server.GRADE_MARKER not in payload  # marker stays server-side
         assert judge.calls == 0  # fast path short-circuited the judge
 
-        end = await episode.call("terminate", {})
-        assert end.terminated
         fb = _feedback(episode)
         assert fb["correct"] is True
         assert fb["confidence"] == 0.9
@@ -88,12 +89,12 @@ async def test_llm_judge_path_grades_a_paraphrase_correct() -> None:
         result = await episode.call(
             "submit_answer", {"answer": "The City of Light", "confidence": 40}
         )
-        grade = json.loads(result.content)
-        assert grade["judged_by"] == "llm_judge"
-        assert grade["correct"] is True
+        assert result.terminated
+        payload = json.loads(result.content)
+        assert payload["correct"] is True
+        assert payload["judge_error"] is False
         assert judge.calls == 1  # exact match missed, so the judge ran
 
-        await episode.call("terminate", {})
         fb = _feedback(episode)
         assert fb["correct"] is True
         assert abs(fb["calibration_error"] - 0.6) < 1e-9  # |0.4 - 1.0|
@@ -128,24 +129,25 @@ async def test_negative_task_index_is_rejected() -> None:
 
 
 async def test_second_submission_cannot_replace_the_first_answer() -> None:
-    # A harness must not be able to submit a wrong answer, read `correct: false`, then submit
-    # a replacement and keep the better score. The first (wrong) grade stands.
+    # RFC 009: the first submit_answer SEALS the episode. A harness cannot submit a wrong
+    # answer, read `correct: false`, then submit a replacement: the second call is tombstoned
+    # (no inward dispatch, no second judge run) and the first verdict stands.
     judge = _ScriptedJudge()
     episode = await ServedEpisode.start("hle", task=0, env_config=_config(judge))
     try:
         first = await episode.call("submit_answer", {"answer": "Berlin", "confidence": 100})
-        first_grade = json.loads(first.content)
-        assert first_grade[mcp_server.GRADE_MARKER] is True
-        assert first_grade["correct"] is False
+        assert first.terminated
+        assert json.loads(first.content)["correct"] is False
+        calls_after_first = judge.calls  # "Berlin" missed exact-match, so the judge ran once
 
-        # Second submission (the correct answer) is refused — no grade marker, so it can never
-        # become terminal credit.
+        # Second submission (the correct answer) hits the post-seal tombstone: a generic
+        # terminal notice, no grade, no dispatch, and no second judge run.
         second = await episode.call("submit_answer", {"answer": "Paris", "confidence": 100})
-        second_grade = json.loads(second.content)
-        assert mcp_server.GRADE_MARKER not in second_grade
-        assert "already submitted" in second_grade.get("error", "")
+        assert second.terminated
+        assert "sealed" in second.content
+        assert judge.calls == calls_after_first  # the judge was NOT invoked a second time
 
-        fb = _feedback(episode)  # the second submit hit the horizon, terminating the episode
+        fb = _feedback(episode)
         assert fb["correct"] is False  # the first, wrong answer stands
     finally:
         await episode.close()
@@ -171,10 +173,12 @@ async def test_judge_exception_scores_incorrect_without_crashing() -> None:
     episode = await ServedEpisode.start("hle", task=0, env_config=_config(_BoomJudge()))
     try:
         result = await episode.call("submit_answer", {"answer": "somewhere", "confidence": 70})
-        grade = json.loads(result.content)
-        assert grade["judged_by"] == "llm_judge_error"
-        assert grade["correct"] is False
-        await episode.call("terminate", {})
+        assert result.terminated
+        payload = json.loads(result.content)
+        # Sanitized: fail-closed to incorrect, with the judge_error flag set (no exception
+        # text, no reasoning leaked to the agent).
+        assert payload["correct"] is False
+        assert payload["judge_error"] is True
         assert _feedback(episode)["correct"] is False
     finally:
         await episode.close()
@@ -281,14 +285,14 @@ async def test_keyless_base_url_grades_via_llm_judge_not_error(monkeypatch) -> N
         result = await episode.call(
             "submit_answer", {"answer": "The City of Light", "confidence": 40}
         )
-        grade = json.loads(result.content)
-        # The client constructed and the judge ran: no llm_judge_error.
-        assert grade["judged_by"] == "llm_judge"
-        assert grade["correct"] is True
+        assert result.terminated
+        payload = json.loads(result.content)
+        # The client constructed and the judge ran: correct, no judge_error.
+        assert payload["correct"] is True
+        assert payload["judge_error"] is False
         assert constructed["base_url"] == "http://localhost:11434/v1"
         assert constructed["api_key"]  # non-empty placeholder (no real key was set)
 
-        await episode.call("terminate", {})
         fb = _feedback(episode)
         assert fb["correct"] is True
         assert "judge_error" not in fb

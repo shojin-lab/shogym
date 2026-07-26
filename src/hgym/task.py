@@ -14,6 +14,18 @@ from pydantic import BaseModel, Field
 
 ToolProvenance = Literal["env-mandatory", "reserved"]
 
+# RFC 009 — the terminal-kind marker. Exactly zero or one `score` terminal per env; `abort`
+# is the reserved `terminate`; everything else is `none`. Only a `score`-terminal tool
+# engages the serve layer's validate -> seal -> evaluate transaction; `none`/`abort` tools
+# behave exactly as before, so an env that marks nothing `score` is byte-identical to the
+# pre-RFC-009 contract.
+TerminalKind = Literal["none", "score", "abort"]
+
+# The wire-contract version a `TaskSpec` advertises. Bumped from an implicit 1 to 2 when the
+# `terminal_kind` marker (RFC 009) was added to `ToolManifest`, so a client can tell whether
+# the seal-before-verdict semantics are in force.
+CONTRACT_VERSION = 2
+
 
 class ReferenceTemplate(BaseModel):
     """A template a harness MAY render — advisory, not injected by hgym. ``variables_schema``
@@ -33,6 +45,11 @@ class ToolManifest(BaseModel):
     description: str
     input_schema: Dict[str, Any]
     provenance: ToolProvenance = "env-mandatory"
+    # RFC 009: the tool's role in the terminal lifecycle. `none` (default) is an ordinary
+    # tool; `abort` is the reserved `terminate`; `score` is the single per-env scoring
+    # terminal whose call the serve layer turns into a validate -> seal -> evaluate
+    # transaction. Defaulting to `none` keeps every pre-RFC-009 tool unchanged.
+    terminal_kind: TerminalKind = "none"
 
 
 class TaskSpec(BaseModel):
@@ -50,3 +67,6 @@ class TaskSpec(BaseModel):
     tools: List[ToolManifest] = Field(default_factory=list)
     reference_templates: List[ReferenceTemplate] = Field(default_factory=list)
     horizon: Optional[int] = None
+    # RFC 009 wire-contract version. 2 carries the `terminal_kind` marker (and, for a
+    # `score`-terminal env, the seal-before-verdict semantics); see ``CONTRACT_VERSION``.
+    contract_version: int = CONTRACT_VERSION

@@ -13,6 +13,7 @@ requires-python = ">=3.12,<3.13"
 dependencies = [
     "pydantic>=2.7",
     "fastmcp>=3.2",
+    "jsonschema>=4.0",
     "minijinja>=2.0",
     "numpy>=1.26",
 ]

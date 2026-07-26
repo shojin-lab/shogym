@@ -18,7 +18,7 @@ from hgym.core import Env
 from hgym.mcp import MCPServerSpec
 from hgym.mcp.toolset import _open_session_for_spec
 from hgym.shared.terminate_mcp import TERMINATE_TOOL_NAME
-from hgym.task import ReferenceTemplate, TaskSpec, ToolManifest
+from hgym.task import ReferenceTemplate, TaskSpec, TerminalKind, ToolManifest
 from hgym.trajectory import Trajectory
 from hgym.types import FeedbackCollection, FunctionConfig, ToolConfig
 from hgym.utils import seeding
@@ -37,6 +37,12 @@ class ToolUsingEnv(Env):
     mcp_servers: Sequence[MCPServerSpec] = ()
     function: FunctionConfig = FunctionConfig()
     function_name: str = "agent"
+    # RFC 009: the single tool (if any) this env marks as the `score` terminal. When set,
+    # ``describe()`` advertises it with ``terminal_kind="score"`` and the serve layer runs
+    # its call as a validate -> seal -> evaluate transaction. Left ``None`` by every env but
+    # HLE, so all other envs advertise only `none`/`abort` tools and behave exactly as
+    # before (the seal transaction never engages).
+    score_terminal_tool: Optional[str] = None
 
     def __init__(self, *, horizon: int, num_tasks: Optional[int] = None) -> None:
         self._horizon = horizon
@@ -60,7 +66,31 @@ class ToolUsingEnv(Env):
                 if tc.name in tools:
                     raise ValueError(f"duplicate tool name {tc.name!r} across mcp_servers")
                 tools[tc.name] = tc
+        # RFC 009: exactly zero or one `score` terminal per env, and it must be a real
+        # advertised tool (never the reserved `terminate`). Fail fast at construction so a
+        # typo can't silently leave the env with no scoring terminal.
+        score = self.score_terminal_tool
+        if score is not None:
+            if score not in tools:
+                raise ValueError(
+                    f"score_terminal_tool {score!r} is not an advertised tool "
+                    f"({sorted(tools)})"
+                )
+            if score == TERMINATE_TOOL_NAME:
+                raise ValueError(
+                    f"score_terminal_tool may not be the reserved {TERMINATE_TOOL_NAME!r}"
+                )
         return tools
+
+    def _terminal_kind(self, tool_name: str) -> TerminalKind:
+        """The RFC-009 terminal role of ``tool_name``: the reserved ``terminate`` is
+        ``abort``, this env's ``score_terminal_tool`` (if any) is ``score``, everything
+        else is ``none``."""
+        if tool_name == TERMINATE_TOOL_NAME:
+            return "abort"
+        if tool_name == self.score_terminal_tool:
+            return "score"
+        return "none"
 
     def describe(self, task_id: Optional[str] = None) -> TaskSpec:
         """Publish the task contract (RFC 008 §3.1). Read-only; opens no session."""
@@ -89,6 +119,7 @@ class ToolUsingEnv(Env):
                 description=tc.description,
                 input_schema=tc.parameters.model_dump(),
                 provenance="reserved" if name == TERMINATE_TOOL_NAME else "env-mandatory",
+                terminal_kind=self._terminal_kind(name),
             )
             for name, tc in self._tool_configs.items()
         ]
