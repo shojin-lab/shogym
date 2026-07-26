@@ -1,0 +1,43 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+# Cancel superseded runs on the same ref (e.g. new pushes to a PR branch).
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      # setup-uv reads the committed .python-version (3.12); the project is pinned
+      # >=3.12,<3.13 because the tau2 git dependency imports stdlib `audioop`, removed in 3.13.
+      - name: Set up uv
+        uses: astral-sh/setup-uv@v6
+        with:
+          enable-cache: true
+
+      # Installs the project plus the default `dev` dependency group, which pulls the env
+      # extras on main (tau2 — a git dependency — and hle). Network/git access is available
+      # on the runner for the tau2 git ref.
+      - name: Install dependencies
+        run: uv sync
+
+      # The offline suite runs keyless: keyed tests (tau2 user-sim, hle judge) self-skip
+      # without OPENAI_API_KEY. Unset it explicitly so nothing here depends on a secret.
+      - name: Run tests (offline, keyless)
+        run: env -u OPENAI_API_KEY uv run pytest -q
+
+      - name: Lint (ruff)
+        run: uv run ruff check .
+
+      - name: Type check (pyright)
+        run: uv run pyright
