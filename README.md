@@ -77,6 +77,11 @@ env-README template.
   business workflow over a fully simulated world of ~47 SaaS apps via an `api` tool surface,
   scored end-state-only by a pure rubric. Deterministic and offline (no key). Needs the
   `automationbench` extra.
+- **[`frontier_bench`](src/hgym/envs/frontier_bench/README.md)** — a faithful port of
+  [Frontier-Bench](https://github.com/harbor-framework/frontier-bench): operate a per-task Docker
+  container through a shell (`exec` / `read_file` / `write_file` / `done`), scored by the task's
+  own verifier over the container end-state. A CPU-only, single-container slice (5 tasks). Needs
+  the `frontier_bench` extra and a local Docker daemon (no key or data download).
 
 Runnable end-to-end demos (Claude Code drives a served env; hgym scores off the trace):
 
@@ -93,6 +98,8 @@ Runnable end-to-end demos (Claude Code drives a served env; hgym scores off the 
   retrieval off the trace.
 - **[`examples/automationbench/claude_code/`](examples/automationbench/claude_code/README.md)** —
   Claude Code runs an AutomationBench workflow through a served env; hgym scores the end-state.
+- **[`examples/frontier_bench/claude_code/`](examples/frontier_bench/claude_code/README.md)** —
+  Claude Code operates a served Frontier-Bench container; hgym scores off the task's own verifier.
 
 ## License
 

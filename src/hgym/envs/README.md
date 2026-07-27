@@ -98,6 +98,7 @@ offline.
 | `hle` | A faithful hgym port of [Humanity's Last Exam](https://huggingface.co/datasets/cais/hle) — a single-turn, expert-level question answered via one `submit_answer` tool, graded server-side (exact-match fast path, then an OpenAI model judge; hgym's first model-graded verifier). Needs the `hle` extra, `OPENAI_API_KEY`, and gated `cais/hle` access. | [`hle/README.md`](hle/README.md) |
 | `browsecomp_plus` | A faithful hgym port of [BrowseComp-Plus](https://github.com/texttron/BrowseComp-Plus) — answer reasoning-heavy queries against a fixed ~100K-doc corpus via `search` / `get_document` / `submit_answer`, graded by an LLM judge plus deterministic retrieval-recall / citation metrics. Needs the `browsecomp_plus` extra, `OPENAI_API_KEY`, Java 21, and gated dataset access. | [`browsecomp_plus/README.md`](browsecomp_plus/README.md) |
 | `automationbench` | A faithful hgym port of [AutomationBench](https://github.com/zapier/AutomationBench) — carry out a cross-application business workflow over a fully simulated world of ~47 SaaS apps via an `api` tool surface, scored end-state-only by a pure rubric. Needs the `automationbench` extra (offline / deterministic — no key). | [`automationbench/README.md`](automationbench/README.md) |
+| `frontier_bench` | A faithful hgym port of [Frontier-Bench](https://github.com/harbor-framework/frontier-bench) — operate a per-task Docker container through a shell (`exec` / `read_file` / `write_file` / `done`), scored by the task's own verifier over the container end-state. A CPU-only, single-container slice (5 tasks). Needs the `frontier_bench` extra + a local Docker daemon (no key or data download). | [`frontier_bench/README.md`](frontier_bench/README.md) |
 
 Runnable end-to-end demos (Claude Code drives a served env; hgym scores off the trace) live
 under [`examples/`](../../../examples/): [`wordle`](../../../examples/wordle/claude_code/README.md),
@@ -105,7 +106,8 @@ under [`examples/`](../../../examples/): [`wordle`](../../../examples/wordle/cla
 [`yc_bench`](../../../examples/yc_bench/claude_code/README.md),
 [`hle`](../../../examples/hle/claude_code/README.md),
 [`browsecomp_plus`](../../../examples/browsecomp_plus/claude_code/README.md),
-and [`automationbench`](../../../examples/automationbench/claude_code/README.md).
+[`automationbench`](../../../examples/automationbench/claude_code/README.md),
+and [`frontier_bench`](../../../examples/frontier_bench/claude_code/README.md).
 
 ## Adding an env: the README template
 
