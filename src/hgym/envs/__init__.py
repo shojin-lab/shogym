@@ -19,6 +19,11 @@ from hgym.envs.automationbench import (  # noqa: F401 — triggers registration
 # (datasets/openai/pyserini) at top level — the encrypted queries decrypt in memory on env
 # construction, the BM25 index and judge client load lazily — so `import hgym` stays offline.
 from hgym.envs.browsecomp_plus import env_v1 as browsecomp_plus_env_v1  # noqa: F401 — triggers registration
+
+# `hgym.envs.frontier_bench.env_v1` imports nothing Docker-related at top level — the task
+# metadata loads from vendored files on env construction and Docker is touched only when an
+# episode is served — so `import hgym` stays offline without a Docker daemon.
+from hgym.envs.frontier_bench import env_v1 as frontier_bench_env_v1  # noqa: F401 — registration
 from hgym.envs.hle import env_v1 as hle_env_v1  # noqa: F401 — triggers registration
 from hgym.envs.tau2 import env_v1 as tau2_env_v1  # noqa: F401 — triggers registration
 from hgym.envs.wordle import env_v1 as wordle_env_v1  # noqa: F401 — triggers registration
@@ -27,6 +32,7 @@ from hgym.envs.yc_bench import env_v1 as yc_bench_env_v1  # noqa: F401 — trigg
 __all__ = [
     "automationbench_env_v1",
     "browsecomp_plus_env_v1",
+    "frontier_bench_env_v1",
     "hle_env_v1",
     "make",
     "register",
