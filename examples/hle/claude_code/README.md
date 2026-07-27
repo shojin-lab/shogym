@@ -9,23 +9,23 @@ feedback.
 ```
   Claude Code  ──spawns──▶  hgym serve hle              (stdio MCP server)
   (the harness)             ├─ describe            → the question + tools
-      │                     ├─ submit_answer(a,c)  → LLM judge grades it → verdict
-      └──tool calls────────▶└─ terminate()         → episode scored → ./hgym_logs/hle.jsonl
+      │                     └─ submit_answer(a,c)  → seal + LLM judge grades it → episode
+      └──tool calls───────────                        scored → ./hgym_logs/hle.jsonl
                                                                           │
                             hgym.result_from_trace(...) ◀────────────────┘
 ```
 
-## The flow: `submit_answer` → `terminate`
+## The flow: `submit_answer` is the terminal action
 
-HLE is single-turn. The agent does two things, in order:
+HLE is single-turn. The agent does one thing:
 
 1. Call **`describe`** to read the question, reason from its own knowledge, then call
-   **`submit_answer`** exactly once with its final `answer` and a `confidence` (0–100). The
-   env grades it **server-side** — an exact-match fast path, then an LLM judge — and returns
-   the verdict in the tool result.
-2. Call **`terminate`** — this ends the hgym episode; hgym's verifier reads the verdict off
-   the recorded `submit_answer` step into the terminal feedback (`correct` +
-   `calibration_error`).
+   **`submit_answer`** exactly once with its final `answer` and a `confidence` (0–100).
+   `submit_answer` is the **score terminal**: the call validates the args, **seals** the
+   episode, grades it **server-side** — an exact-match fast path, then an LLM judge — and
+   **ends** the episode in one step, returning a sanitized verdict (`correct` + `judge_error`).
+   There is no separate `terminate` to call afterward (it would be tombstoned); hgym's verifier
+   scores the sealed episode into the terminal feedback (`correct` + `calibration_error`).
 
 The agent learns this from the question it reads via `describe`.
 
@@ -67,7 +67,7 @@ run from the repo root, so `uv run` (which the config uses to launch the server)
 this project's `.venv`:
 
 ```bash
-claude -p "Answer the HLE question: call describe, reason it out, then submit_answer, then terminate." \
+claude -p "Answer the HLE question: call describe, reason it out, then submit_answer once (that ends the episode)." \
   --mcp-config examples/hle/claude_code/.mcp.json \
   --strict-mcp-config \
   --allowedTools "mcp__hle__*" \

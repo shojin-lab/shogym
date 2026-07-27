@@ -1,57 +1,37 @@
-"""The HLE verifier is a pure function over the recorded trajectory (RFC 008).
+"""The HLE verifier scores the core-owned terminal evidence, not marker JSON (RFC 008).
 
-No judge and no serving here — build a trajectory whose ``submit_answer`` step carries a
-server-side grade by hand and check the episode feedback. ``score_trajectory`` is
-dataset-free and judge-free, so these run in the offline core suite (no ``hle`` extra).
+No judge and no serving here — build a :class:`TerminalEvidence` by hand and check the episode
+feedback ``score_evidence`` derives from it. It is dataset-free and judge-free, so these run in
+the offline core suite (no ``hle`` extra).
 """
 
 from __future__ import annotations
 
-import json
+from typing import Optional
 
-from hgym.envs.hle.env_v1 import GRADE_MARKER, score_trajectory
-from hgym.trajectory import Step
+from hgym.envs.hle.env_v1 import score_evidence
+from hgym.serve.lifecycle import TerminalEvidence
 
 
-def _submit_step(
-    index: int,
+def _evidence(
     *,
-    correct: bool = True,
-    confidence: int = 100,
-    marker: bool = True,
-    tool: str = "submit_answer",
-) -> Step:
-    payload = {"correct": correct, "confidence": confidence, "judged_by": "llm_judge"}
-    if marker:
-        payload[GRADE_MARKER] = True
-    return Step(
-        index=index,
-        tool=tool,
-        arguments={"answer": "x", "confidence": confidence},
-        result=json.dumps(payload),
-    )
-
-
-def _judged_step(
-    index: int,
-    *,
-    judged_by: str,
-    correct: bool = False,
-    confidence: int = 100,
-) -> Step:
-    """A graded ``submit_answer`` step whose verdict names how it was ``judged_by``."""
-    payload = {
-        GRADE_MARKER: True,
-        "correct": correct,
-        "confidence": confidence,
-        "judged_by": judged_by,
-    }
-    return Step(
-        index=index,
-        tool="submit_answer",
-        arguments={"answer": "x", "confidence": confidence},
-        result=json.dumps(payload),
-    )
+    correct: bool,
+    confidence: Optional[int] = 100,
+    judge_error: bool = False,
+    status: str = "ok",
+    source: str = "explicit_tool",
+    submitted: bool = True,
+) -> TerminalEvidence:
+    """A core-owned evidence like the serve layer commits: a public-safe verdict plus the
+    validated submit args (present only for a real submission)."""
+    verdict = {"correct": correct, "judge_error": judge_error}
+    if submitted:
+        args = {"answer": "x"}
+        if confidence is not None:
+            args["confidence"] = confidence
+    else:
+        args = None
+    return TerminalEvidence(source=source, status=status, verdict=verdict, args=args)
 
 
 def _episode(fb) -> dict:
@@ -59,117 +39,96 @@ def _episode(fb) -> dict:
 
 
 def test_correct_full_confidence_scores_zero_calibration_error() -> None:
-    ep = _episode(score_trajectory([_submit_step(1, correct=True, confidence=100)], terminated=True))
+    ep = _episode(score_evidence(_evidence(correct=True, confidence=100), terminated=True))
     assert ep["correct"] is True
     assert ep["confidence"] == 1.0
     assert ep["calibration_error"] == 0.0
 
 
 def test_wrong_high_confidence_is_maximally_miscalibrated() -> None:
-    ep = _episode(score_trajectory([_submit_step(1, correct=False, confidence=100)], terminated=True))
+    ep = _episode(score_evidence(_evidence(correct=False, confidence=100), terminated=True))
     assert ep["correct"] is False
     assert ep["calibration_error"] == 1.0  # |1.0 - 0.0|
 
 
 def test_calibration_error_tracks_confidence() -> None:
     # Correct but only 40% confident -> |0.4 - 1.0| = 0.6.
-    ep = _episode(score_trajectory([_submit_step(1, correct=True, confidence=40)], terminated=True))
+    ep = _episode(score_evidence(_evidence(correct=True, confidence=40), terminated=True))
     assert ep["confidence"] == 0.4
     assert abs(ep["calibration_error"] - 0.6) < 1e-9
     # Wrong and 30% confident -> |0.3 - 0.0| = 0.3.
-    ep2 = _episode(score_trajectory([_submit_step(1, correct=False, confidence=30)], terminated=True))
+    ep2 = _episode(score_evidence(_evidence(correct=False, confidence=30), terminated=True))
     assert abs(ep2["calibration_error"] - 0.3) < 1e-9
 
 
-def test_confidence_read_from_arguments_not_result() -> None:
-    # The trusted confidence is the recorded *argument*; a forged result confidence is ignored.
-    step = Step(
-        index=1,
-        tool="submit_answer",
-        arguments={"answer": "x", "confidence": 20},
-        result=json.dumps({GRADE_MARKER: True, "correct": True, "confidence": 99}),
-    )
-    ep = _episode(score_trajectory([step], terminated=True))
-    assert ep["confidence"] == 0.2  # from arguments (20), not the result's 99
-
-
 def test_no_feedback_until_terminated() -> None:
-    assert score_trajectory([_submit_step(1)], terminated=False).episode == []
+    assert score_evidence(_evidence(correct=True), terminated=False).episode == []
 
 
-def test_missing_submission_scores_premature_incorrect() -> None:
-    # Terminated without a `submit_answer`: incorrect, and no confidence to calibrate.
-    traj = [Step(index=1, tool="terminate", arguments={}, result='{"acknowledged": true}')]
-    ep = _episode(score_trajectory(traj, terminated=True))
+def test_no_evidence_scores_incorrect() -> None:
+    # A terminal with no evidence at all (e.g. a legacy/none-evidence path) scores incorrect.
+    ep = _episode(score_evidence(None, terminated=True))
     assert ep["correct"] is False
     assert "calibration_error" not in ep
     assert "confidence" not in ep
 
 
-def test_first_submission_wins() -> None:
-    # Single-turn: the FIRST graded answer is authoritative, so a later marked grade can't
-    # replace a wrong first answer (the server also refuses to grade a second submission).
-    traj = [
-        _submit_step(1, correct=False, confidence=10),
-        _submit_step(2, correct=True, confidence=90),
-    ]
-    ep = _episode(score_trajectory(traj, terminated=True))
-    assert ep["correct"] is False
-    assert ep["confidence"] == 0.1
-
-
-def test_unmarked_result_is_not_trusted() -> None:
-    # A `submit_answer`-shaped result WITHOUT the marker must not grant credit.
-    ep = _episode(score_trajectory([_submit_step(1, correct=True, marker=False)], terminated=True))
+def test_no_submission_scores_premature_incorrect() -> None:
+    # Terminated without a submission (horizon `zero_unsubmitted` / abort): incorrect, and no
+    # confidence to calibrate.
+    ev = _evidence(correct=False, source="horizon", submitted=False)
+    ep = _episode(score_evidence(ev, terminated=True))
     assert ep["correct"] is False
     assert "calibration_error" not in ep
+    assert "confidence" not in ep
 
 
-def test_grade_only_trusted_from_submit_step() -> None:
-    # A forged marked grade on a non-`submit_answer` tool must not grant credit.
-    forged = json.dumps({GRADE_MARKER: True, "correct": True, "confidence": 100})
-    traj = [Step(index=1, tool="describe", arguments={}, result=forged)]
-    ep = _episode(score_trajectory(traj, terminated=True))
-    assert ep["correct"] is False
-
-
-def test_malformed_and_non_json_results_do_not_crash() -> None:
-    for junk in ("not json", "null", "[]", "42", '"nope"'):
-        traj = [Step(index=1, tool="submit_answer", arguments={"answer": "x"}, result=junk)]
-        ep = _episode(score_trajectory(traj, terminated=True))
-        assert ep["correct"] is False  # treated as no grade
-
-
-def test_judge_error_grade_sets_judge_error_flag() -> None:
-    # A grade fail-closed by a broken judge is labelled: correct stays False (so aggregation is
-    # unchanged), but judge_error=True lets an analyst filter it out of the genuine zeros.
-    ep = _episode(
-        score_trajectory([_judged_step(1, judged_by="llm_judge_error")], terminated=True)
+def test_abort_evidence_scores_incorrect_only() -> None:
+    # The serve layer synthesizes an abort verdict {correct: False, aborted: True} with no
+    # submit args; the verifier scores just `correct=False`.
+    ev = TerminalEvidence(
+        source="abort", status="ok", verdict={"correct": False, "aborted": True}, args=None
     )
+    ep = _episode(score_evidence(ev, terminated=True))
+    assert ep["correct"] is False
+    assert "confidence" not in ep
+
+
+def test_judge_error_status_sets_judge_error_flag() -> None:
+    # A grade fail-closed by a broken judge (status=finalize_error) is labelled: correct stays
+    # False (so aggregation is unchanged), judge_error=True lets an analyst filter it out — and
+    # the submitted confidence still calibrates.
+    ev = _evidence(correct=False, confidence=70, judge_error=True, status="finalize_error")
+    ep = _episode(score_evidence(ev, terminated=True))
     assert ep["correct"] is False
     assert ep["judge_error"] is True
+    assert ep["confidence"] == 0.7
+    assert abs(ep["calibration_error"] - 0.7) < 1e-9
+
+
+def test_serve_layer_fail_closed_verdict_is_labelled_judge_error() -> None:
+    # A serve-layer fail-closed (deadline/crash) sets finalize_error on the verdict WITHOUT a
+    # judge_error key; the verifier still labels it judge_error from evidence.finalize_error.
+    ev = TerminalEvidence(
+        source="explicit_tool",
+        status="finalize_error",
+        verdict={"correct": False, "finalize_error": True},
+        args={"answer": "x", "confidence": 50},
+    )
+    ep = _episode(score_evidence(ev, terminated=True))
+    assert ep["correct"] is False
+    assert ep["judge_error"] is True
+    assert abs(ep["calibration_error"] - 0.5) < 1e-9
 
 
 def test_clean_grades_do_not_set_judge_error() -> None:
-    # A normal judged grade (LLM judge or exact match) must not carry the judge_error flag.
-    for judged_by in ("llm_judge", "exact_match"):
-        ep = _episode(
-            score_trajectory(
-                [_judged_step(1, judged_by=judged_by, correct=True)], terminated=True
-            )
-        )
-        assert ep["correct"] is True
+    for correct in (True, False):
+        ep = _episode(score_evidence(_evidence(correct=correct), terminated=True))
         assert "judge_error" not in ep
 
 
 def test_missing_confidence_argument_defaults_to_full() -> None:
-    # A grade with no confidence argument recorded defaults confidence to 1.0.
-    step = Step(
-        index=1,
-        tool="submit_answer",
-        arguments={"answer": "x"},
-        result=json.dumps({GRADE_MARKER: True, "correct": True}),
-    )
-    ep = _episode(score_trajectory([step], terminated=True))
+    # A submission with no confidence recorded defaults confidence to 1.0.
+    ep = _episode(score_evidence(_evidence(correct=True, confidence=None), terminated=True))
     assert ep["confidence"] == 1.0
     assert ep["calibration_error"] == 0.0
