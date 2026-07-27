@@ -1,4 +1,4 @@
-# YC-Bench — CEO of a simulated AI startup, wrapped faithfully in hgym
+# `yc_bench` — YC-Bench, CEO of a simulated AI startup
 
 A faithful hgym port of [**YC-Bench**](https://github.com/collinear-ai/yc-bench) (Collinear
 AI's long-horizon deterministic benchmark). YC-Bench puts an agent in charge of a simulated AI
@@ -7,15 +7,17 @@ deterministic, SQLite-backed discrete-event simulation — accepting tasks from 
 assigning employees, advancing the clock, and managing cash flow — until **bankruptcy**
 (funds < 0) or the **one-year horizon**. The score is how the company ends up.
 
-YC-Bench ships **no agent loop**: it explicitly expects an *external driver* to advance the
-sim, feed CLI results back, and collect the next commands. hgym's harness *is* that driver, so
-the port is a clean wrap — YC-Bench's sim engine, command execution/validation, SQLite state,
-world seeding, and scoring are reused verbatim; only the *agent* is replaced (by the harness,
-through the served tools).
+Like every hgym env this **describes** a task, **serves** its tools over MCP, and **verifies**
+a recorded trajectory while an external harness drives the tools — see
+[`../README.md`](../README.md). YC-Bench ships **no agent loop**: it explicitly expects an
+*external driver* to advance the sim, feed CLI results back, and collect the next commands.
+hgym's harness *is* that driver, so the port is a clean wrap — only the *agent* is replaced (by
+the harness, through the served tools). The runnable demo is
+[`examples/yc_bench/claude_code/`](../../../../examples/yc_bench/claude_code/).
 
 ## Running it
 
-> Requires **Python 3.12 + the yc_bench extra** — see [Requirements](#requirements). Unlike
+> Requires **Python 3.12 + the `yc_bench` extra** — see [Requirements](#requirements). Unlike
 > tau2, YC-Bench needs **no data download**: its whole world is generated deterministically
 > from the seed and the sim runs in-process, so a served episode is fully offline (no API key).
 
@@ -37,11 +39,12 @@ uv run python -m hgym.cli serve yc_bench --task 0 --trace ./hgym_logs/yc_bench.j
 
 The harness runs the year with **`run_command`** (browse the market, accept/assign/dispatch
 tasks, `yc-bench sim resume` to advance the clock), then calls **`submit`** when the run is
-over. `submit` is the env's **`score` terminal**: hgym seals the episode, reads the final
-funds / survival / task outcomes straight off the sim, scores it, and ends the episode in one
-step — there is no separate stop call. hgym reads the verdict off the trace via
-`hgym.result_from_trace(...)`. (`terminate` remains available as the *abort* terminal, which
-ends the episode without crediting anything.)
+over. `submit` is the env's **score terminal**: hgym seals the episode, reads the final funds /
+survival / task outcomes straight off the sim in `finalize`, scores it, and ends the episode in
+one step — there is no separate stop call (`terminate` remains available as the *abort*
+terminal, which ends the episode without crediting anything). See the shared
+[terminal lifecycle](../README.md#terminal-lifecycle-seal-terminal-score-terminal-abort). hgym
+reads the verdict off the trace via `hgym.result_from_trace(...)`.
 
 **Config** (via `hgym.make(name, config)` / `env_config`): `task_split` (`"train"`/`"test"`),
 `config_name` (YC-Bench preset name or `.toml` path, default `"default"`), `max_commands`
@@ -62,17 +65,17 @@ uv run python examples/yc_bench/claude_code/run.py --task 0 --transcript
 
 ## Requirements
 
-- **Python 3.12.** The project is pinned to 3.12 (`requires-python = ">=3.12,<3.13"`); YC-Bench
-  requires `>=3.12` and installs cleanly there.
-- **`uv sync`** builds the venv with YC-Bench: the `yc_bench` extra is also listed in the
-  default `dev` dependency-group, so `uv sync` / `uv run …` include it without a manual
-  `--extra` flag. (`pip install hgym` stays lean; `pip install hgym[yc_bench]` adds it
-  explicitly.) The extra is pinned to an upstream **commit SHA** — YC-Bench has no stable
-  public API, so a pin makes upstream drift a contained maintenance cost.
+The Python pin and the `uv sync` / `pip install` / `import hgym` mechanics are the shared
+[requirements boilerplate](../README.md#requirements-boilerplate); the `yc_bench` extra is in
+the default `dev` group, so `uv sync` includes it. On top of that:
+
 - **No data, no API key** for a served episode. YC-Bench generates its world deterministically
   from the seed and runs its sim in-process, so the whole served path (seed → commands →
   verdict) is offline. (A YC-Bench *model* key is only needed by upstream's own agent loop,
   which this port replaces with the harness.)
+- **Heavy extra.** YC-Bench depends on litellm / streamlit / matplotlib / plotly (its own
+  runner/dashboard). They install with the extra but are never imported by the served path
+  (only the sim engine, CLI commands, and ORM are), so command execution stays light.
 
 ## How it works
 
@@ -105,31 +108,23 @@ drops it on `end_session`. It exposes two tools:
   memory command is reached through this one tool. `yc-bench run` (YC-Bench's own
   credential-inheriting LLM agent loop) and `yc-bench start` (interactive) are **rejected
   before any subprocess is spawned**, keeping the surface offline and trace-attributable.
-- **`submit()`** — the env's **`score` terminal** (seal-before-verdict). Its call is not an
-  ordinary step: the serve layer validates it, **atomically seals** the episode, then runs the
-  env's `finalize` hook, which reads the authoritative final metrics (survival, final funds,
-  task outcomes) straight off the **live** sim DB and returns them as core-owned
-  `TerminalEvidence`. Because the read happens on a frozen, un-continuable episode and the
-  verdict is stamped by the core (never surfaced as forgeable tool output), the terminal score
-  can't be gamed by inspecting a verdict and issuing more commands.
+- **`submit()`** — the env's **score terminal**. Its call is not an ordinary step: the serve
+  layer validates it, **atomically seals** the episode, then runs the env's `finalize` hook,
+  which reads the authoritative final metrics (survival, final funds, task outcomes) straight
+  off the **live** sim DB and returns them as core-owned `TerminalEvidence`. Because the read
+  happens on a frozen, un-continuable episode and the verdict is stamped by the core (never
+  surfaced as forgeable tool output), the terminal score can't be gamed by inspecting a verdict
+  and issuing more commands.
 
-### finalize → verify
+### finalize + verify
 
 `finalize` runs on the already-sealed episode. It reads the sim's final state through the
 session while the SQLite engine is still live — the serve layer disposes the session only
 *after* `finalize` returns — and returns the verdict as `TerminalEvidence`. hgym's pure
 `_verify` then scores from `evidence.verdict` (never from tool output), defensively: a missing
-/ non-terminal verdict scores a non-surviving zero. The old one-shot / "trust only the `submit`
-step" guard is now **structural** — a `score` terminal seals on its first call, so there is no
+/ non-terminal verdict scores a non-surviving zero. The one-shot / "trust only the `submit`
+step" guard is **structural** — a `score` terminal seals on its first call, so there is no
 second submission to guard against and no trajectory to scan for a forged marker.
-
----
-
-YC-Bench's sim engine, command execution/validation, SQLite state, world seeding, and scoring
-are reused **verbatim** — only the agent is swapped. There are **zero hgym core changes**; the
-whole port is additive under `src/hgym/envs/yc_bench/`. `import hgym` registers the `yc_bench`
-env **without importing yc_bench**, so the core stays lean and offline; yc-bench is loaded only
-when the env is constructed or served.
 
 ## Tasks
 
@@ -156,13 +151,36 @@ horizon (`terminal_reason == "horizon_end"`) or bankruptcy (`"bankruptcy"`). A s
 pre-horizon `submit` (the agent stopping early) is treated as **premature** and scores
 `reward = 0.0`, `survived = False`, `success = False` — exactly like a missing verdict — so
 submitting on turn one can't bank the starting $200k without operating the company. This
-terminal-state gate lives in the scorer and is preserved verbatim by the seal migration; the
-horizon path finalizes the same way (it credits the end-state only if the sim's own
-`terminal_reason` says it genuinely ended).
+terminal-state gate lives in the scorer; the horizon path finalizes the same way (it credits
+the end-state only if the sim's own `terminal_reason` says it genuinely ended).
 
-**Fidelity check:** for a fixed seed + command sequence, the final funds are reproducible run
-to run (the deterministic sim is preserved) and match a direct `yc-bench` seeding of the same
-seed — the served/determinism tests assert this.
+Read the score back off the trace:
+
+```python
+import hgym
+result = hgym.result_from_trace("hgym_logs/yc_bench.jsonl", env="yc_bench", task="0")
+print(result.terminated, result.value("success"), result.value("final_funds_cents"))
+```
+
+`result_from_trace` treats `env` / `task` / `session_id` as **filters** — see
+[Reading a score back](../README.md#reading-a-score-back-result_from_trace) for the shared
+semantics (give each run its own trace file for a guaranteed 1:1 mapping).
+
+## Fidelity & deviations
+
+- **Verbatim reuse.** YC-Bench's sim engine, command execution/validation, SQLite state, world
+  seeding, and scoring are reused **verbatim** — only the agent is swapped for the harness.
+  There are **zero hgym core changes**; the whole port is additive under
+  `src/hgym/envs/yc_bench/`.
+- **Pinned to a commit SHA.** The extra is pinned to an upstream **commit SHA** — YC-Bench has
+  no stable public API, so a pin makes upstream drift a contained maintenance cost.
+- **`run` / `start` rejected.** `run_command` allowlists only the operational sub-command
+  groups; `yc-bench run` (upstream's own credential-inheriting LLM agent loop) and `yc-bench
+  start` (interactive) are rejected before any subprocess spawns — that agent loop is exactly
+  what this port replaces with the harness.
+- **Determinism check.** For a fixed seed + command sequence the final funds are reproducible
+  run to run and match a direct `yc-bench` seeding of the same seed — the served/determinism
+  tests assert this.
 
 ## Gotchas
 
@@ -170,12 +188,7 @@ seed — the served/determinism tests assert this.
   advance the clock with no active task — the agent must `market browse → task accept → task
   assign → task dispatch` first. The command returns an error payload (`ok: false`); it does
   not raise.
-- **Only operational command groups are allowed.** `run_command` allowlists the groups that
-  operate the seeded session and rejects `yc-bench run` / `yc-bench start` — `run` would launch
-  YC-Bench's own LLM agent loop (inheriting provider credentials, replacing `DATABASE_URL`, and
-  doing unbounded external model work outside the trace), which is exactly what this port
-  replaces with the harness.
-- **Completion is a single step:** `submit` is the `score` terminal — it seals the episode,
+- **Completion is a single step:** `submit` is the score terminal — it seals the episode,
   reads the sim's final state, scores it, and ends the run in one call. No separate `terminate`
   is needed (that stays available only as the *abort* terminal, which scores nothing).
 - **Long horizon.** A full year is many `run_command` / `sim resume` turns; the hgym horizon is
@@ -185,10 +198,19 @@ seed — the served/determinism tests assert this.
 - **One company per DB.** YC-Bench stores a single simulation per database, so each episode gets
   its own private SQLite file (seeded on `begin_session`, deleted on `end_session`). Sessions
   never share state.
-- **Heavy extra.** YC-Bench depends on litellm / streamlit / matplotlib / plotly (its own
-  runner/dashboard). They install with the extra but are never imported by the served path
-  (only the sim engine, CLI commands, and ORM are), so command execution stays light.
-- **Offline vs keyed tests.** The pure-`verify` unit tests run in the core suite with no extra;
-  the served + determinism tests need the `yc_bench` extra but no API key (the sim is
-  deterministic and in-process), and are `importorskip`-gated so the core 3.12 suite stays
-  green without it.
+- **Offline vs keyed tests.** Follows the shared
+  [offline-vs-keyed split](../README.md#tests-offline-vs-keyed): the pure-`verify` unit tests run
+  in the core suite with no extra; the served + determinism tests need the `yc_bench` extra but
+  no API key (the sim is deterministic and in-process), and are `importorskip`-gated so the core
+  3.12 suite stays green without it.
+
+## Layout
+
+A source map for orientation:
+
+| File | Role |
+|---|---|
+| `env_v1.py` | The registered `yc_bench` env: `describe` (rules + seed + manifest), the train/test seed banks, the `finalize` hook (reads final sim metrics on the sealed episode), and the pure `_verify` scorer (verdict from evidence, with the genuine-terminal-state gate). |
+| `mcp_server.py` | The in-process MCP server: `run_command` (allowlisted `yc-bench` CLI against a per-session SQLite DB) + `submit` (the score terminal), seeding/dropping the private DB per session. |
+| `adapter.py` | The single seam funnelling all `yc_bench` imports (sim engine, CLI, ORM, `_init_simulation` seeding), so upstream API drift touches one file. |
+</content>

@@ -1,17 +1,15 @@
-# `wordle_v1` — hgym's reference env-as-center environment
+# `wordle_v1` — Wordle, hgym's reference env-as-center environment
 
-This is the reference implementation of the **env-as-center** design (RFC 008). An
-environment does exactly three things, and Wordle shows each one in the smallest honest
-form:
-
-1. **describe** a task — publish a `TaskSpec` (rules + tool manifest + horizon).
-2. **serve** its essential tools over MCP — here `guess` and the reserved `terminate`.
-3. **verify** — score the *recorded trajectory* of tool calls with a pure function.
-
-There is no agent loop, no observation stream, and no model inside the env. An external
-harness (Claude Code, Codex, pi, Hermes, or a small in-process loop) drives the tools; the
-env only describes, serves, and scores. The end-to-end demo lives at
+This is the reference implementation of hgym's **env-as-center** design: an environment
+**describes** a task, **serves** its tools over MCP, and **verifies** a recorded trajectory
+with a pure function — see [`../README.md`](../README.md). Wordle shows each step in the
+smallest honest form: a `guess` tool, the reserved `terminate`, and a pure trajectory
+verifier. The end-to-end demo lives at
 [`examples/wordle/claude_code/`](../../../../examples/wordle/claude_code/README.md).
+
+`wordle_v1` is a **marker/trivial** env: it has no `finalize` hook — the episode ends on
+`terminate` or the horizon and `verify` scores the recorded guesses directly (see the
+[terminal lifecycle](../README.md#terminal-lifecycle-seal-terminal-score-terminal-abort)).
 
 No extra dependencies — `wordle_v1` runs on core hgym.
 
@@ -132,13 +130,8 @@ the held-out set. Task indices are relative to the chosen split.
 
 ## Scoring
 
-Every served tool call appends one row to the JSONL trace
-(`session_id, env_name, task_id, step, tool, feedback, terminated`). The feedback is stored
-in the same wire form it rides out on each result's MCP `_meta` sidecar, so the trace and
-the in-band signal never diverge. Dense per-step `format_reward` is recorded but not
-surfaced in-band; the episode scores ride out only on the terminal result.
-
-To read the score back, filter the trace to the run and take its terminal row:
+Dense per-step `format_reward` is recorded but not surfaced in-band; the episode scores ride
+out only on the terminal result. Read the score back off the trace:
 
 ```python
 import hgym
@@ -146,12 +139,16 @@ result = hgym.result_from_trace("hgym_logs/wordle.jsonl", env="wordle_v1", task=
 print(result.terminated, result.value("check_answer"), result.value("partial_credit"))
 ```
 
-`result_from_trace` treats `env`/`task`/`session_id` as **filters** (not just labels): each
-narrows the rows before the terminal row is chosen, so a shared, append-only trace can't let
-another run supply a stale result. For a guaranteed 1:1 mapping, give each run its own trace
-file. The in-process `evaluate` path and the external `hgym serve` path both converge on the
-same `EvalResult` this way — hold `(env, task)` fixed, swap the harness, and the delta in the
-trace is attributable to the harness.
+`result_from_trace` treats `env` / `task` / `session_id` as **filters** — see
+[Reading a score back](../README.md#reading-a-score-back-result_from_trace) for the shared
+semantics (each run should own its trace file for a guaranteed 1:1 mapping).
+
+## Fidelity & deviations
+
+`wordle_v1` is hgym's own reference environment, not a port of an external benchmark — there
+is no upstream commit to pin or deviate from. It exists to demonstrate the env-as-center
+contract in the smallest honest form; the port envs (tau2, yc_bench, hle, browsecomp_plus,
+automationbench) each carry their own `Fidelity & deviations` section.
 
 ## Layout
 
@@ -164,3 +161,4 @@ A source map for orientation:
 | `utils.py` | `load_words`, `score_guess` (the G/Y/X scorer), `format_feedback`. |
 | `functions/` | The advisory instruction templates (`guess_v1/example/*.minijinja`) and their variable schemas. |
 | `data/words.txt` | 2,315 five-letter answers, one per line. |
+</content>

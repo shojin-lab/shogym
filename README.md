@@ -67,6 +67,21 @@ env-README template.
   expert-level question answered via one `submit_answer` tool and graded server-side
   (exact-match fast path, then an OpenAI model judge). hgym's first model-graded verifier.
   Needs the `hle` extra, `OPENAI_API_KEY`, and gated `cais/hle` access.
+- **[`browsecomp_plus`](src/hgym/envs/browsecomp_plus/README.md)** — a faithful port of
+  [BrowseComp-Plus](https://github.com/texttron/BrowseComp-Plus): answer reasoning-heavy queries
+  against a fixed ~100K-doc corpus via `search` / `get_document` / `submit_answer`, graded by an
+  LLM judge plus deterministic retrieval-recall and citation metrics. Needs the
+  `browsecomp_plus` extra, `OPENAI_API_KEY`, Java 21, and gated dataset access.
+- **[`automationbench`](src/hgym/envs/automationbench/README.md)** — a faithful port of
+  [AutomationBench](https://github.com/zapier/AutomationBench): carry out a cross-application
+  business workflow over a fully simulated world of ~47 SaaS apps via an `api` tool surface,
+  scored end-state-only by a pure rubric. Deterministic and offline (no key). Needs the
+  `automationbench` extra.
+- **[`frontier_bench`](src/hgym/envs/frontier_bench/README.md)** — a faithful port of
+  [Frontier-Bench](https://github.com/harbor-framework/frontier-bench): operate a per-task Docker
+  container through a shell (`exec` / `read_file` / `write_file` / `done`), scored by the task's
+  own verifier over the container end-state. A CPU-only, single-container slice (5 tasks). Needs
+  the `frontier_bench` extra and a local Docker daemon (no key or data download).
 
 Runnable end-to-end demos (Claude Code drives a served env; hgym scores off the trace):
 
@@ -78,6 +93,13 @@ Runnable end-to-end demos (Claude Code drives a served env; hgym scores off the 
   operates the YC-Bench startup sim; hgym scores the run off the trace.
 - **[`examples/hle/claude_code/`](examples/hle/claude_code/README.md)** — Claude Code answers an
   HLE question through a served hgym env; hgym grades it server-side.
+- **[`examples/browsecomp_plus/claude_code/`](examples/browsecomp_plus/claude_code/README.md)** —
+  Claude Code answers a BrowseComp-Plus query against the fixed corpus; hgym grades it and scores
+  retrieval off the trace.
+- **[`examples/automationbench/claude_code/`](examples/automationbench/claude_code/README.md)** —
+  Claude Code runs an AutomationBench workflow through a served env; hgym scores the end-state.
+- **[`examples/frontier_bench/claude_code/`](examples/frontier_bench/claude_code/README.md)** —
+  Claude Code operates a served Frontier-Bench container; hgym scores off the task's own verifier.
 
 ## License
 
