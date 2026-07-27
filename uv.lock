@@ -872,6 +872,9 @@ analysis = [
     { name = "duckdb" },
     { name = "pandas" },
 ]
+automationbench = [
+    { name = "datasets" },
+]
 browsecomp-plus = [
     { name = "datasets" },
     { name = "openai" },
@@ -893,7 +896,7 @@ yc-bench = [
 
 [package.dev-dependencies]
 dev = [
-    { name = "hgym", extra = ["browsecomp-plus", "hle", "tau2", "yc-bench"] },
+    { name = "hgym", extra = ["automationbench", "browsecomp-plus", "hle", "tau2", "yc-bench"] },
     { name = "pyright" },
     { name = "pytest" },
     { name = "pytest-asyncio" },
@@ -902,6 +905,7 @@ dev = [
 
 [package.metadata]
 requires-dist = [
+    { name = "datasets", marker = "extra == 'automationbench'", specifier = ">=2.19" },
     { name = "datasets", marker = "extra == 'browsecomp-plus'", specifier = ">=2.19" },
     { name = "datasets", marker = "extra == 'hle'", specifier = ">=2.19" },
     { name = "duckdb", marker = "extra == 'analysis'", specifier = ">=1.0" },
@@ -918,10 +922,11 @@ requires-dist = [
     { name = "tau2", extras = ["gym", "knowledge"], marker = "extra == 'tau2'", git = "https://github.com/sierra-research/tau2-bench?rev=1d244f5dca42944b67a379b44bfeb9f5748f189d" },
     { name = "yc-bench", marker = "extra == 'yc-bench'", git = "https://github.com/collinear-ai/yc-bench?rev=e7d606789be4c52a34f9fa5b04ada4a2eaf9d731" },
 ]
-provides-extras = ["analysis", "examples", "tau2", "hle", "yc-bench", "browsecomp-plus"]
+provides-extras = ["analysis", "examples", "tau2", "hle", "yc-bench", "automationbench", "browsecomp-plus"]
 
 [package.metadata.requires-dev]
 dev = [
+    { name = "hgym", extras = ["automationbench"] },
     { name = "hgym", extras = ["browsecomp-plus"] },
     { name = "hgym", extras = ["hle"] },
     { name = "hgym", extras = ["tau2"] },
