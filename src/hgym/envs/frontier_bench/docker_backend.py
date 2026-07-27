@@ -23,6 +23,7 @@ Docker; only calling into it does.
 
 from __future__ import annotations
 
+import functools
 import os
 import shutil
 import subprocess
@@ -77,6 +78,32 @@ def _run_docker(
             f"{proc.stderr.strip() or proc.stdout.strip()}"
         )
     return proc
+
+
+@functools.lru_cache(maxsize=1)
+def _daemon_cpus() -> Optional[int]:
+    """The Docker *daemon's* CPU count (``docker info --format '{{.NCPU}}'``), cached for the run.
+
+    We clamp ``--cpus`` against this, not the client's ``os.cpu_count()``: ``os.cpu_count()``
+    reports the topology of the Python client process, but ``docker run`` rejects a ``--cpus``
+    larger than what the *daemon* enforces. On Docker Desktop / rootless / a remote daemon the
+    client can see 8+ CPUs while the daemon is capped at 2, so a client-side clamp still emits
+    a request the daemon refuses. The daemon's NCPU doesn't change within a run, so cache it.
+
+    Returns ``None`` (query failed or unparseable) so the caller can fall back rather than crash;
+    a broken ``docker info`` must never block a container start on an otherwise healthy daemon.
+    """
+    try:
+        proc = _run_docker(["info", "--format", "{{.NCPU}}"], timeout=30, check=False)
+    except (DockerError, subprocess.TimeoutExpired):
+        return None
+    if proc.returncode != 0:
+        return None
+    try:
+        ncpu = int(proc.stdout.strip())
+    except (TypeError, ValueError):
+        return None
+    return ncpu if ncpu > 0 else None
 
 
 def docker_available() -> bool:
@@ -168,12 +195,17 @@ class Container:
             self.workdir,
         ]
         if self._cpus is not None:
-            # Clamp to the host's physical CPU count: `docker run` rejects a `--cpus` request
-            # larger than what the host has (e.g. a 2-CPU CI runner can't grant the task's 4).
-            # A roomier host still honors the task's full request, so this preserves benchmark
-            # behavior wherever the resources exist and only bounds it to physical reality.
-            host_cpus = os.cpu_count() or 1
-            args += ["--cpus", str(min(self._cpus, host_cpus))]
+            # Clamp to the Docker *daemon's* CPU count: `docker run` rejects a `--cpus` request
+            # larger than what the daemon enforces (e.g. a 2-CPU CI runner or a 2-CPU Docker
+            # Desktop VM can't grant the task's 4). We query the daemon's NCPU rather than the
+            # client's `os.cpu_count()` because the client can report more CPUs than the daemon
+            # allows (Docker Desktop / rootless / a remote daemon). If that query fails we fall
+            # back to the client count — a broken `docker info` must not block starts on a
+            # healthy daemon. A roomier daemon still honors the task's full request, so this
+            # preserves benchmark behavior wherever the resources exist and only bounds it to
+            # the daemon's physical limit.
+            cpu_limit = _daemon_cpus() or os.cpu_count() or 1
+            args += ["--cpus", str(min(self._cpus, cpu_limit))]
         if self._memory_mb is not None:
             args += ["--memory", f"{self._memory_mb}m"]
         if self._network is not None:
