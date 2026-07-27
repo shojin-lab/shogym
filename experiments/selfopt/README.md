@@ -42,3 +42,31 @@ uv run python experiments/selfopt/sandbox/study.py --go --build --arm both --wan
   file.
 - All run outputs (traces, snapshots, provenance, metrics) go to the **gitignored** `runs/` dir
   (override with `$HGYM_SELFOPT_RUNS`, e.g. `~/.cache/hgym`). Nothing large is committed.
+
+## Cell #2 — Codex on the same env + same study
+
+Same environment, same seeded task stream, same authoritative scoring — the harness swaps Claude
+Code → **Codex** (`codex exec`, GPT-5.6 "terra"). Everything below the harness is **reused
+unchanged** (`split.py` / `broker.py` / `snapshot.py` / `sink.py` / `heldout.py` and the broker
+container image); only the harness is adapted, behind a small parallel adapter so cell #1 keeps
+working untouched:
+
+| Piece | File | Notes |
+|---|---|---|
+| Codex command / config / trace / auth | `codex_arms.py` | `codex exec --json` (JSONL trace = the stream-json analog); the curriculum served as a **streamable-HTTP MCP server** in an isolated `config.toml` (Codex consumes HTTP MCP natively — no stdio shim); Codex's own sandbox at `danger-full-access` (the container is the isolation boundary); the **prompts are imported verbatim from `arms.py`**; subscription-only auth (billed `OPENAI_API_KEY` stripped from the run env). |
+| Codex agent image | `sandbox/agent.codex.Dockerfile` | mirrors `agent.Dockerfile`; the `codex` CLI in place of `claude`. |
+| Two-container study | `sandbox/study_codex.py` | mirrors `study.py`; container names prefixed `selfopt-c2-` on network `selfopt-c2-net` — **disjoint from cell #1**, so a concurrent cell-#1 run is never touched. |
+
+Tool policy maps to two Codex levers (no per-tool allow-list): the local self-surface comes
+uniformly from `danger-full-access`; the one per-arm capability toggle is **`web_search`**
+(treatment-train ON, held-out + control OFF), matching cell #1's web split. **The self** =
+the persistent workdir (Codex's `AGENTS.md`), snapshotted whole per task boundary as in cell #1;
+Codex's `~/.codex` durable surface (skills/rules/memories) lives in the per-run `CODEX_HOME`
+**outside** the snapshotted self so the subscription credential is never archived (see the
+open-question note in the issue).
+
+```bash
+uv run python -m experiments.selfopt.smoke_codex          # keyless spine + Codex plumbing
+uv run python -m experiments.selfopt.smoke_codex --real   # + ONE real codex exec via a local HTTP broker
+uv run python experiments/selfopt/sandbox/study_codex.py --plan  # the two-container plan (dry-run)
+```
