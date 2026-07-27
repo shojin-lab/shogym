@@ -32,8 +32,10 @@ export OPENAI_API_KEY=sk-...                             # the judge is an OpenA
 uv run python -m hgym.cli serve hle --task 0 --trace ./hgym_logs/hle.jsonl
 ```
 
-The harness reads the question via `describe`, calls **`submit_answer`** (the env grades it
-server-side), then **`terminate`**; hgym reads the verdict off the trace via
+The harness reads the question via `describe` and calls **`submit_answer`** exactly once:
+that call is the **score terminal** — it validates the args, atomically **seals** the episode,
+grades it, and **ends** the episode in one step (no separate `terminate`; a `terminate` or a
+repeat `submit_answer` afterward is tombstoned). hgym reads the verdict off the trace via
 `hgym.result_from_trace(...)`.
 
 **Config** (via `hgym.make(name, config)` / `env_config`): `task_split` (`"train"`/`"test"`),
@@ -57,7 +59,7 @@ uv run python examples/hle/claude_code/run.py --task 0 --transcript
 - **The `hle` extra.** `datasets` (loads `cais/hle`) + `openai` (the default judge client).
   `uv sync` installs it (it's in the dev group); `pip install 'hgym[hle]'` adds it to a plain
   install. `import hgym` registers `hle` **without** importing either — the core stays lean.
-- **`OPENAI_API_KEY`.** The `submit_answer` handler grades with an OpenAI LLM judge. With the
+- **`OPENAI_API_KEY`.** Grading (in the env's `finalize`) uses an OpenAI LLM judge. With the
   default judge, an episode **fails fast at startup** — a clear, actionable error raised before
   any tool runs — if no key is set, so a keyless run never silently scores everything wrong. Opt
   out by injecting a scripted `judge` (offline tests do this, need no key) or by pointing
@@ -73,47 +75,58 @@ uv run python examples/hle/claude_code/run.py --task 0 --transcript
 ### describe → TaskSpec
 
 `env.describe(task_id)` publishes the task contract the harness reads: the **question** (in
-`instructions`) and the **tool manifest** — `submit_answer` (provenance `env-mandatory`) and
-the reserved `terminate`. There is no observation stream and no other tool.
+`instructions`) and the **tool manifest** — `submit_answer` (provenance `env-mandatory`,
+**`terminal_kind: score`**) and the reserved `terminate` (`terminal_kind: abort`). There is no
+observation stream and no other tool.
 
 ### Tools (served over MCP)
 
-- **`submit_answer(answer: str, confidence: int = 100)`** — backed by the in-process server in
-  `mcp_server.py`. The handler grades server-side and returns a marked verdict dict
-  (`hle_grade`, `correct`, `confidence`, `judged_by`, plus judge diagnostics):
+- **`submit_answer(answer: str, confidence: int = 100)`** — the **score terminal**. Calling it
+  validates the args against the advertised schema, atomically **seals** the episode, grades
+  it, and **ends** the episode — so a verdict only ever exists for an already-sealed,
+  un-continuable episode (an agent cannot grade, read the verdict, then revise). Grading runs
+  in the env's `finalize` hook:
   - an **exact-match fast path** first (normalize + compare, offline and free); on a match the
     LLM judge is not called;
   - otherwise the session's **LLM judge** (`judge.py`) grades it, using HLE's own judge prompt.
   The judge is **injectable** (`config={"judge": …}`): the registered env defaults to
   `OpenAIJudge`; offline tests inject a scripted judge, mirroring how the tau2 port injects a
-  scripted user simulator. A judge exception scores the answer incorrect rather than crashing
-  the episode.
-- **`terminate()`** — the reserved episode-completion tool every env serves. Its call, detected
-  by name, is the terminal signal.
+  scripted user simulator. A judge failure **fails closed** — the answer scores incorrect and
+  the verdict is flagged `judge_error` — rather than crashing the episode. The **result
+  returned to the agent is sanitized**: only the public-safe `correct` (bool) and `judge_error`
+  (bool). The judge's reasoning / extracted answer and any exception text are answer oracles —
+  they never reach the agent; they live only in the private, off-trace diagnostic.
+- **`terminate()`** — the reserved abort tool every env serves (`terminal_kind: abort`). Since
+  `submit_answer` already ends the episode, a harness does **not** call `terminate` after
+  submitting (it would be tombstoned); `terminate` before submitting ends the episode with no
+  submission (`correct = False`).
 
-The env pushes per-episode state — the question, its gold answer, and the judge — into the
-in-process server via `begin_session(session_id, …)` on start and drops it via `end_session`
-on teardown. State is keyed by session id, so one server safely backs many concurrent episodes.
+The env holds per-episode state — the question, its gold answer, and the judge — keyed by
+session id, so one env instance safely backs many concurrent episodes; `finalize` reads it to
+grade the sealed submission.
 
 ### verify
 
-`verify` is a **pure** function over the recorded trajectory. `score_trajectory` scans for the
-terminal **`submit_answer`** step whose result carries the `hle_grade` marker and reads
-`correct` from it; the **confidence** is read from the step **arguments** (the trustworthy
-trajectory value), not the echoed result. Only a `submit_answer` step is trusted — a forged
-marker on any other tool result grants no credit — and a missing / malformed / non-JSON grade
-scores as incorrect rather than raising (the same untrusted-result discipline as wordle/tau2).
+`verify` scores the **core-owned terminal evidence** the serve layer commits after the seal —
+not marker JSON off the trajectory. `score_evidence` reads the authoritative, seal-protected
+`correct` from the evidence verdict and the **confidence** from the validated submit arguments.
+A fail-closed grade (any grading-infra failure) is labelled `judge_error`; a terminal with no
+submission scores just `correct = False`.
 
 Feedback emitted on termination (episode-level):
 
 - **`correct`** — did the judge (or the exact-match fast path) accept the answer.
 - **`confidence`** — the submitted 0–100 confidence as a 0–1 fraction.
 - **`calibration_error`** — `|confidence − correct|`, the per-episode Brier-style gap between
-  the stated confidence and the outcome (0 is perfectly calibrated). A premature end with no
-  graded submission emits only `correct = False` (there is no confidence to calibrate).
+  the stated confidence and the outcome (0 is perfectly calibrated). A terminal with no graded
+  submission emits only `correct = False` (there is no confidence to calibrate).
+- **`judge_error`** — set (`True`) only when the grade fail-closed on a grading-infra failure
+  (a judge exception, or a serve-layer finalize deadline/crash), so an analyst can filter those
+  out of the genuine zeros.
 
-Termination happens when `terminate` is called **or** the horizon (2) is reached, whichever
-comes first.
+Termination happens when the `submit_answer` score terminal seals the episode, when `terminate`
+is called, **or** when the horizon (1) is reached — whichever comes first. Reaching the horizon
+with no submission scores `correct = False` (the `zero_unsubmitted` policy).
 
 ## Tasks
 
@@ -153,8 +166,9 @@ its own trace file.
   follow-up.
 - **Look-ups defeat the point.** HLE measures the model's own reasoning — a harness must deny
   web tools (`--disallowedTools "WebFetch,WebSearch,…"`), as the example does.
-- **Single-turn.** The horizon is 2 (`submit_answer` then `terminate`); the last graded
-  submission before the cap is scored.
+- **Single-turn, single terminal action.** `submit_answer` is the score terminal: submitting
+  seals + grades + ends the episode in one step (horizon 1), so there is no second submission
+  and no separate `terminate` to call afterward.
 - **Offline vs keyed tests.** The pure verifier + judge-helper tests and the served
   scripted-judge tests run offline in the suite; a keyed fidelity test — the real `OpenAIJudge`
   grading a served episode — is skipped unless `OPENAI_API_KEY` is set.

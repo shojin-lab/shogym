@@ -14,6 +14,11 @@ from hgym.envs.registration import make, register, registered_envs
 from hgym.envs.automationbench import (  # noqa: F401 — triggers registration
     env_v1 as automationbench_env_v1,
 )
+
+# `hgym.envs.browsecomp_plus.env_v1` likewise imports nothing from the `browsecomp_plus` extra
+# (datasets/openai/pyserini) at top level — the encrypted queries decrypt in memory on env
+# construction, the BM25 index and judge client load lazily — so `import hgym` stays offline.
+from hgym.envs.browsecomp_plus import env_v1 as browsecomp_plus_env_v1  # noqa: F401 — triggers registration
 from hgym.envs.hle import env_v1 as hle_env_v1  # noqa: F401 — triggers registration
 from hgym.envs.tau2 import env_v1 as tau2_env_v1  # noqa: F401 — triggers registration
 from hgym.envs.wordle import env_v1 as wordle_env_v1  # noqa: F401 — triggers registration
@@ -21,6 +26,7 @@ from hgym.envs.yc_bench import env_v1 as yc_bench_env_v1  # noqa: F401 — trigg
 
 __all__ = [
     "automationbench_env_v1",
+    "browsecomp_plus_env_v1",
     "hle_env_v1",
     "make",
     "register",

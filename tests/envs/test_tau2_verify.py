@@ -1,15 +1,18 @@
-"""tau2's verifier is a pure function over the recorded trajectory (RFC 008).
+"""tau2's verifier is a pure function over the terminal verdict (RFC 008).
 
-No tau2 install and no serving here — build a trajectory whose ``done`` step carries a
-tau2 verdict by hand and check the episode feedback. ``score_trajectory`` is tau2-free, so
-these run in the offline core suite.
+No tau2 install and no serving here — build a verdict by hand (as a ``done``-step trajectory
+for the legacy ``score_trajectory``, or as core-owned ``TerminalEvidence`` for the migrated
+``score_evidence``) and check the episode feedback. Both scorers are tau2-free, so these run
+in the offline core suite. The parity tests are the **migration fidelity gate**: for the same
+verdict, the new evidence-based path emits byte-identical feedback to the legacy path.
 """
 
 from __future__ import annotations
 
 import json
 
-from hgym.envs.tau2.env_v1 import VERDICT_MARKER, score_trajectory
+from hgym.envs.tau2.env_v1 import VERDICT_MARKER, score_evidence, score_trajectory
+from hgym.serve.lifecycle import TerminalEvidence
 from hgym.trajectory import Step
 
 
@@ -128,3 +131,63 @@ def test_non_json_results_do_not_crash() -> None:
         traj = [Step(index=1, tool="done", arguments={}, result=junk)]
         ep = _episode(score_trajectory(traj, terminated=True))
         assert ep["reward"] == 0.0  # treated as no verdict
+
+
+# ----- migration fidelity gate: score_evidence == score_trajectory for the same verdict -----
+
+
+def _evidence(verdict: dict, *, source: str = "explicit_tool", status: str = "ok") -> TerminalEvidence:
+    return TerminalEvidence(source=source, status=status, verdict=verdict)  # type: ignore[arg-type]
+
+
+def _verdict(reward=1.0, db_match=True, action_match_proportion=1.0) -> dict:
+    return {
+        VERDICT_MARKER: True,
+        "reward": reward,
+        "db_match": db_match,
+        "action_match_proportion": action_match_proportion,
+    }
+
+
+def test_score_evidence_matches_score_trajectory_full_credit() -> None:
+    # The seal migration must be score-preserving: for a real verdict, the evidence-based scorer
+    # emits byte-identical episode feedback to the legacy trajectory-based scorer.
+    v = _verdict()
+    traj = [_tool_step(1), Step(index=2, tool="done", arguments={}, result=json.dumps(v))]
+    assert _episode(score_evidence(_evidence(v))) == _episode(
+        score_trajectory(traj, terminated=True)
+    )
+
+
+def test_score_evidence_matches_score_trajectory_partial_and_edge_verdicts() -> None:
+    for v in (
+        _verdict(reward=0.0, db_match=False, action_match_proportion=0.5),
+        _verdict(reward=0.4, db_match=None, action_match_proportion=None),
+        {VERDICT_MARKER: True, "reward": None, "db_match": "junk"},  # malformed fields
+    ):
+        traj = [Step(index=1, tool="done", arguments={}, result=json.dumps(v))]
+        assert _episode(score_evidence(_evidence(v))) == _episode(
+            score_trajectory(traj, terminated=True)
+        ), v
+
+
+def test_score_evidence_abort_scores_premature_zero() -> None:
+    # The core-synthesized abort verdict (a `terminate` with no tau2 reward) reads as a premature
+    # zero — identical to the legacy "no verdict recorded" outcome.
+    ev = _evidence({"correct": False, "aborted": True}, source="abort")
+    ep = _episode(score_evidence(ev))
+    assert ep["reward"] == 0.0 and ep["success"] is False
+    assert "db_match" not in ep and "action_match_proportion" not in ep
+    assert "eval_error" not in ep
+
+
+def test_score_evidence_flags_eval_error() -> None:
+    # An evaluator failure fails closed to reward 0 AND flags eval_error, so infra failures are
+    # distinguishable in audit data from a genuine reward-0 run. finalize_error status alone
+    # (with no verdict flag) also raises the flag.
+    ev = _evidence({VERDICT_MARKER: True, "reward": 0.0, "eval_error": True}, status="finalize_error")
+    ep = _episode(score_evidence(ev))
+    assert ep["reward"] == 0.0 and ep["success"] is False and ep["eval_error"] is True
+
+    ev2 = _evidence({VERDICT_MARKER: True, "reward": 0.0}, status="finalize_error")
+    assert _episode(score_evidence(ev2))["eval_error"] is True

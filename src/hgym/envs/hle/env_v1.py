@@ -2,11 +2,15 @@
 
 A minimal single-turn reasoning env, and hgym's first **model-graded verifier**. The env
 serves one tool, ``submit_answer`` (plus the reserved ``terminate``); the question rides in
-the ``TaskSpec`` instructions that ``describe()`` hands the harness. The ``submit_answer``
-handler grades server-side (an exact-match fast path, then an injectable LLM judge — see
-``mcp_server`` / ``judge``), and this env's pure ``_verify`` parses that verdict off the
-recorded trajectory into episode feedback: ``correct`` plus a ``calibration_error`` derived
-from the submitted confidence.
+the ``TaskSpec`` instructions that ``describe()`` hands the harness. ``submit_answer`` is the
+env's **score terminal**: calling it validates the args, atomically seals the episode, and
+ends it in one step. The serve layer then runs this env's ``finalize`` hook on the sealed
+episode — an exact-match fast path, then an injectable LLM judge (see ``judge``) — which
+returns core-owned :class:`~hgym.serve.lifecycle.TerminalEvidence` carrying a **public-safe**
+verdict. ``_verify`` scores that evidence into episode feedback: ``correct`` plus a
+``calibration_error`` derived from the submitted confidence. Because grading runs only on an
+already-sealed, un-continuable episode, an agent can never grade, read the verdict, and revise
+its answer.
 
 This module imports **nothing** heavy at load time — not ``datasets``, not ``openai`` — so
 ``import hgym`` (which imports this module to register the env) stays offline. The dataset is
@@ -16,27 +20,25 @@ network client only when it is first *called*.
 
 from __future__ import annotations
 
-import json
+import asyncio
 import os
 from typing import Any, Dict, List, Optional
 
-from hgym.envs.hle import mcp_server as hle_mcp_server
-from hgym.envs.hle.judge import DEFAULT_JUDGE_MODEL, Judge, OpenAIJudge
+from hgym.envs.hle.judge import DEFAULT_JUDGE_MODEL, Judge, OpenAIJudge, exact_match
 from hgym.envs.registration import register
 from hgym.envs.tool_using_env import ToolUsingEnv
 from hgym.mcp import MCPServerSpec
+from hgym.serve.lifecycle import FinalizeRequest, TerminalEvidence
 from hgym.task import TaskSpec
 from hgym.trajectory import Trajectory
 from hgym.types import EpisodeFeedback, FeedbackCollection, FunctionConfig
 
-# Kept in sync with mcp_server (duplicated here so the verifier needn't import it). Only a
-# `submit_answer` step carrying this marker is trusted for terminal credit.
-GRADE_MARKER = "hle_grade"
 SUBMIT_TOOL_NAME = "submit_answer"
 
-# One `submit_answer`, then `terminate` — a single-turn episode. The horizon also caps a
-# harness that keeps submitting: the last graded submission before the cap is scored.
-HORIZON = 2
+# `submit_answer` is the single terminal action: submitting seals + grades + ends the episode
+# in one step (no separate `terminate`). The horizon is 1 so a single action ends the episode;
+# reaching it with no valid submission scores `correct=False` (`zero_unsubmitted`).
+HORIZON = 1
 
 HLE_SPEC = MCPServerSpec(
     name="hle",
@@ -49,9 +51,9 @@ _BASE_INSTRUCTIONS = (
     "expert-level, closed-ended academic questions across many subjects.\n"
     "Read the question, reason carefully, then call `submit_answer` exactly once with your "
     "final `answer` and a `confidence` score from 0 to 100 (how sure you are it is "
-    "correct). Then call `terminate` to end the episode.\n"
-    "There is no feedback loop and no other tools: your first submitted answer is graded, "
-    "so commit to your best answer."
+    "correct). Submitting grades your answer and ends the episode — there is no second "
+    "submission, no feedback loop, and no further step to take (do not call `terminate` "
+    "afterward), so commit to your best answer."
 )
 
 
@@ -71,6 +73,10 @@ class HleEnv(ToolUsingEnv):
 
     mcp_servers = (HLE_SPEC,)
     function_name = "solver"
+    # `submit_answer` is this env's single `score` terminal. The serve layer validates its
+    # args, atomically seals the episode, then runs `finalize` (seal-before-verdict), so a
+    # graded verdict only ever exists for an already-sealed, un-continuable episode.
+    score_terminal_tool = SUBMIT_TOOL_NAME
 
     def __init__(
         self,
@@ -87,6 +93,10 @@ class HleEnv(ToolUsingEnv):
         self._tasks: List[Dict[str, Any]] = (
             list(tasks) if tasks is not None else _load_default_tasks(task_split)
         )
+        # Per-session grading state (question, gold answer, judge), keyed by session_id so one
+        # env instance safely backs many concurrent episodes. `finalize` reads it to grade the
+        # sealed submission; `_begin_session`/`_end_session` own its lifecycle.
+        self._grading_state: Dict[str, Dict[str, Any]] = {}
         self.function = FunctionConfig(example_system_template=_BASE_INSTRUCTIONS)
         super().__init__(horizon=HORIZON, num_tasks=len(self._tasks))
 
@@ -139,16 +149,17 @@ class HleEnv(ToolUsingEnv):
         return OpenAIJudge(model=self._judge_model, base_url=self._judge_base_url)
 
     def _begin_session(self, session_id: str, task: Dict[str, Any]) -> None:
-        hle_mcp_server.begin_session(
-            session_id,
-            question=task["question"],
-            correct_answer=task["answer"],
-            judge=self._judge_for_session(),
-            answer_type=task.get("answer_type", ""),
-        )
+        # Grading runs in `finalize` (on the env), not in the tool handler, so the per-episode
+        # question / gold answer / judge live here on the env rather than in the tool server.
+        self._grading_state[session_id] = {
+            "question": task["question"],
+            "correct_answer": task["answer"],
+            "judge": self._judge_for_session(),
+            "answer_type": task.get("answer_type", ""),
+        }
 
     def _end_session(self, session_id: str) -> None:
-        hle_mcp_server.end_session(session_id)
+        self._grading_state.pop(session_id, None)
 
     # ----- describe: surface this task's question in the instructions -----
 
@@ -175,86 +186,143 @@ class HleEnv(ToolUsingEnv):
             return self._tasks[idx]
         return None
 
-    # ----- verify: parse the server-side grade off the recorded trajectory -----
+    # ----- finalize: grade the sealed submission (seal-before-verdict) -----
+
+    # `Env.finalize` is declared as an optional Callable attribute (default None); overriding
+    # it with the sanctioned `async def finalize(self, req)` method is the documented opt-in,
+    # so the attribute-vs-method variance report here is a false positive.
+    async def finalize(  # pyright: ignore[reportIncompatibleVariableOverride]
+        self, req: FinalizeRequest
+    ) -> TerminalEvidence:
+        """Grade the already-sealed episode and return core-owned terminal evidence.
+
+        Runs HLE's grading on the sealed submission: a normalized exact-match fast path first
+        (offline, free) and, on a miss, the session's injectable LLM judge. The returned
+        ``verdict`` is **public-safe** — only ``correct`` and ``judge_error`` — and is the sole
+        thing the agent ever sees (the serve layer stamps provenance / finalization_id / source
+        and appends its own ``finalize_error`` flag). The judge's ``reasoning`` /
+        ``extracted_answer`` and any exception text are answer oracles: they go **only** in the
+        private ``diagnostic`` (durable store / server logs), never in the verdict.
+
+        A judge failure fails **closed** — ``correct=False`` with ``status='finalize_error'`` —
+        so a grading-infra failure is a distinguishable, non-oracle zero rather than a crash. A
+        terminal with no gradeable submission (the ``horizon`` ``zero_unsubmitted`` path, or a
+        lost session) scores ``correct=False`` without invoking the judge. (``terminate``/abort
+        is scored by the serve layer directly and never reaches this hook.)"""
+        state = self._grading_state.get(req.session_id)
+        if req.source != "explicit_tool" or req.args is None or state is None:
+            # No scoreable submission reached the seal: no credit, no judge call.
+            return TerminalEvidence(
+                source=req.source,
+                status="ok",
+                verdict={"correct": False, "judge_error": False},
+                diagnostic=f"no gradeable submission (source={req.source})",
+            )
+
+        answer = str(req.args.get("answer", ""))
+        gold = state["correct_answer"]
+        # Fast path: a normalized exact match short-circuits the LLM judge (offline, free).
+        if exact_match(answer, gold):
+            return TerminalEvidence(
+                source=req.source,
+                status="ok",
+                verdict={"correct": True, "judge_error": False},
+                diagnostic="graded exact_match correct=True",
+            )
+
+        judge: Judge = state["judge"]
+        question = state["question"]
+        try:
+            # Offload the (possibly blocking, network-bound) judge to a worker thread so it
+            # neither wedges the event loop for concurrent episodes nor defeats the serve
+            # layer's finalize deadline.
+            verdict = await asyncio.to_thread(
+                judge, question=question, correct_answer=gold, response=answer
+            )
+        except Exception as exc:  # noqa: BLE001 — any judge failure fails closed, never crashes
+            return TerminalEvidence(
+                source=req.source,
+                status="finalize_error",
+                verdict={"correct": False, "judge_error": True},
+                # Exception text is PRIVATE — it may echo the answer/gold; keep it off the wire.
+                diagnostic=f"judge error: {type(exc).__name__}: {exc}",
+            )
+        return TerminalEvidence(
+            source=req.source,
+            status="ok",
+            verdict={"correct": bool(verdict.correct), "judge_error": False},
+            # extracted_answer / reasoning are answer oracles — private diagnostic only.
+            diagnostic=(
+                f"graded llm_judge correct={bool(verdict.correct)} "
+                f"extracted={verdict.extracted_answer!r}"
+            ),
+        )
+
+    # ----- verify: score the core-owned terminal evidence -----
 
     def _verify(
-        self, trajectory: Trajectory, task: Dict[str, Any], *, terminated: bool
+        self,
+        trajectory: Trajectory,
+        task: Dict[str, Any],
+        *,
+        terminated: bool,
+        evidence: Optional[TerminalEvidence] = None,
     ) -> FeedbackCollection:
-        """Score the episode from the judge's verdict, recorded on the ``submit_answer`` step.
+        """Score the episode from the core-owned terminal ``evidence`` (never marker JSON).
 
-        The grade is produced server-side by the tool handler (exact-match or LLM judge); this
-        function only *parses* it — pure over the trajectory, like tau2's verifier. Parsing is
-        defensive: a missing, forged, or malformed grade scores as incorrect rather than
-        raising."""
-        return score_trajectory(trajectory, terminated=terminated)
+        Pure over the evidence + the submitted confidence. The verdict's ``correct`` is the
+        authoritative, seal-protected grade; the confidence rides on the validated submit
+        args."""
+        return score_evidence(evidence, terminated=terminated)
 
 
 # ----- pure scoring (module-level so it is unit-testable without a judge or the dataset) -----
 
 
-def score_trajectory(trajectory: Trajectory, *, terminated: bool) -> FeedbackCollection:
-    """Build episode feedback from the ``submit_answer`` grade recorded in the trajectory.
+def score_evidence(
+    evidence: Optional[TerminalEvidence], *, terminated: bool
+) -> FeedbackCollection:
+    """Build episode feedback from the core-owned terminal :class:`TerminalEvidence`.
 
-    Pure. Emits ``correct`` (bool) always on termination; when a grade is present it also
-    emits ``confidence`` (0–1) and ``calibration_error`` — the absolute gap between the
-    submitted confidence and the correctness indicator (a per-episode Brier-style term). A
-    premature end with no graded submission emits only ``correct = False`` (no confidence to
-    calibrate).
+    Pure. Emits ``correct`` (bool) always on termination; when there was a submission it also
+    emits ``confidence`` (0–1, from the validated submit args) and ``calibration_error`` — the
+    absolute gap between the submitted confidence and the correctness indicator (a per-episode
+    Brier-style term). A terminal with no submission (``terminate``/abort or the
+    ``zero_unsubmitted`` horizon) emits only ``correct = False`` — there is no confidence to
+    calibrate.
 
-    When the recorded grade was produced by a **failed** judge call
-    (``judged_by == "llm_judge_error"`` — a mid-run key revocation, rate-limit, or network
-    drop that the handler fail-closed to ``correct=False``), an extra ``judge_error = True`` is
-    emitted so an analyst can filter judge-infra failures out instead of counting them as
-    legitimate zeros. A clean grade (``exact_match`` / ``llm_judge``) emits no ``judge_error``
-    (mirroring how tau2's verifier only emits its optional flags when relevant)."""
+    A **fail-closed** grade (a judge failure, or a serve-layer deadline/crash — any
+    ``finalize_error``) also emits ``judge_error = True`` so an analyst can filter grading-infra
+    failures out instead of counting them as legitimate zeros. A clean grade emits no
+    ``judge_error`` (mirroring how tau2's verifier only emits its optional flags when
+    relevant)."""
     fb = FeedbackCollection()
     if not terminated:
         return fb
-
-    grade = _find_grade(trajectory)
-    if grade is None:
-        # No graded `submit_answer` recorded — the episode ended without a scoreable answer.
+    if evidence is None:
+        # No evidence produced — the episode ended without a scoreable outcome.
         fb.episode.append(EpisodeFeedback(name="correct", value=False))
         return fb
 
-    correct = bool(grade["result"].get("correct"))
-    confidence = _confidence_fraction(grade["confidence"])
+    verdict = evidence.verdict or {}
+    correct = bool(verdict.get("correct"))
     fb.episode.append(EpisodeFeedback(name="correct", value=correct))
-    if grade["result"].get("judged_by") == "llm_judge_error":
-        # The judge itself failed; `correct=False` is fail-closed, not a genuine wrong answer.
+    if evidence.finalize_error or bool(verdict.get("judge_error")):
+        # A grading-infra failure fail-closed to `correct=False`, not a genuine wrong answer.
         fb.episode.append(EpisodeFeedback(name="judge_error", value=True))
-    fb.episode.append(EpisodeFeedback(name="confidence", value=confidence))
-    fb.episode.append(
-        EpisodeFeedback(
-            name="calibration_error",
-            value=abs(confidence - (1.0 if correct else 0.0)),
+    # Confidence rides on the validated submit args (explicit_tool only). A no-submission
+    # terminal carries none, so there is nothing to calibrate.
+    args = evidence.args
+    if args is not None:
+        confidence = _confidence_fraction(args.get("confidence"))
+        fb.episode.append(EpisodeFeedback(name="confidence", value=confidence))
+        fb.episode.append(
+            EpisodeFeedback(
+                name="calibration_error",
+                value=abs(confidence - (1.0 if correct else 0.0)),
+            )
         )
-    )
     return fb
-
-
-def _find_grade(trajectory: Trajectory) -> Optional[Dict[str, Any]]:
-    """Return the **first** trusted grade in the trajectory, or None.
-
-    Single-turn: the *first* submitted answer is the graded one (the server already refuses to
-    grade a second submission), so the verifier also takes the first marked grade — a harness
-    can't inspect a wrong verdict and replace it. Only a ``submit_answer`` step is trusted: it
-    is the sole tool whose handler runs the judge, so a marked grade on any *other* recorded
-    result (a forged tool output) grants no credit. Scans from the start for a ``submit_answer``
-    result that is a JSON object carrying ``GRADE_MARKER``; the confidence is read from the step
-    **arguments** (the trustworthy trajectory value the transport strips of any injected
-    ``_session_id``), not from the (echoed) result. Any non-JSON / non-object / unmarked /
-    non-``submit_answer`` result is skipped, never raised on."""
-    for step in trajectory:
-        if step.tool != SUBMIT_TOOL_NAME:
-            continue
-        try:
-            payload = json.loads(step.result)
-        except (TypeError, ValueError):
-            continue
-        if isinstance(payload, dict) and payload.get(GRADE_MARKER) is True:
-            return {"result": payload, "confidence": step.arguments.get("confidence")}
-    return None
 
 
 def _confidence_fraction(confidence: Any) -> float:
