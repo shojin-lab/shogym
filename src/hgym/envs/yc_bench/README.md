@@ -36,9 +36,12 @@ uv run python -m hgym.cli serve yc_bench --task 0 --trace ./hgym_logs/yc_bench.j
 ```
 
 The harness runs the year with **`run_command`** (browse the market, accept/assign/dispatch
-tasks, `yc-bench sim resume` to advance the clock), calls **`submit`** when the run is over
-(its result reports the final funds / survival / task outcomes), then **`terminate`** to end
-the hgym episode; hgym reads the verdict off the trace via `hgym.result_from_trace(...)`.
+tasks, `yc-bench sim resume` to advance the clock), then calls **`submit`** when the run is
+over. `submit` is the env's **`score` terminal**: hgym seals the episode, reads the final
+funds / survival / task outcomes straight off the sim, scores it, and ends the episode in one
+step — there is no separate stop call. hgym reads the verdict off the trace via
+`hgym.result_from_trace(...)`. (`terminate` remains available as the *abort* terminal, which
+ends the episode without crediting anything.)
 
 **Config** (via `hgym.make(name, config)` / `env_config`): `task_split` (`"train"`/`"test"`),
 `config_name` (YC-Bench preset name or `.toml` path, default `"default"`), `max_commands`
@@ -83,7 +86,8 @@ file.
 `env.describe(task_id)` publishes the task contract the harness reads: the **rules** (the
 startup-sim objective, the command loop, and the key mechanics — deadlines, payroll growth,
 client trust, adversarial clients), this run's **seed / preset**, and the **tool manifest**
-(`run_command`, `submit`, plus the reserved `terminate`).
+(`run_command` (`terminal_kind: none`), `submit` (`terminal_kind: score`), plus the reserved
+`terminate` (`terminal_kind: abort`)).
 
 ### Tools (served over MCP)
 
@@ -101,17 +105,23 @@ drops it on `end_session`. It exposes two tools:
   memory command is reached through this one tool. `yc-bench run` (YC-Bench's own
   credential-inheriting LLM agent loop) and `yc-bench start` (interactive) are **rejected
   before any subprocess is spawned**, keeping the surface offline and trace-attributable.
-- **`submit()`** — an hgym terminal tool that reads the authoritative final metrics
-  (survival, final funds, task outcomes) straight off the sim DB and returns a **marked**
-  verdict. (`terminate` then ends the hgym episode.)
+- **`submit()`** — the env's **`score` terminal** (seal-before-verdict). Its call is not an
+  ordinary step: the serve layer validates it, **atomically seals** the episode, then runs the
+  env's `finalize` hook, which reads the authoritative final metrics (survival, final funds,
+  task outcomes) straight off the **live** sim DB and returns them as core-owned
+  `TerminalEvidence`. Because the read happens on a frozen, un-continuable episode and the
+  verdict is stamped by the core (never surfaced as forgeable tool output), the terminal score
+  can't be gamed by inspecting a verdict and issuing more commands.
 
-### verify
+### finalize → verify
 
-hgym's pure `_verify` parses that verdict off the recorded terminal **`submit`** step into
-episode feedback — defensively: a missing / forged / malformed verdict scores a
-non-surviving zero, and **only a `submit` step is trusted** (a marked payload forged onto a
-`run_command` result grants no credit, mirroring how wordle trusts only its recorded `guess`
-argument and tau2 only its `done` verdict).
+`finalize` runs on the already-sealed episode. It reads the sim's final state through the
+session while the SQLite engine is still live — the serve layer disposes the session only
+*after* `finalize` returns — and returns the verdict as `TerminalEvidence`. hgym's pure
+`_verify` then scores from `evidence.verdict` (never from tool output), defensively: a missing
+/ non-terminal verdict scores a non-surviving zero. The old one-shot / "trust only the `submit`
+step" guard is now **structural** — a `score` terminal seals on its first call, so there is no
+second submission to guard against and no trajectory to scan for a forged marker.
 
 ---
 
@@ -140,12 +150,15 @@ surfaced by `_verify` as episode feedback:
 - **`success`** — `survived and horizon_reached` (finished the year solvent).
 - **`tasks_succeeded`** / **`tasks_failed`** — completed-task outcome counts.
 
-**Funds are credited only from a genuine terminal state.** `submit` is callable at any time,
-so the verdict is trusted for reward *only* when the sim actually ended — the one-year horizon
-(`terminal_reason == "horizon_end"`) or bankruptcy (`"bankruptcy"`). A solvent, pre-horizon
-`submit` (the agent stopping early) is treated as **premature** and scores `reward = 0.0`,
-`survived = False`, `success = False` — exactly like a missing verdict — so submitting on turn
-one can't bank the starting $200k without operating the company.
+**Funds are credited only from a genuine terminal state.** `submit` can seal the episode at any
+time, so the verdict is credited for reward *only* when the sim actually ended — the one-year
+horizon (`terminal_reason == "horizon_end"`) or bankruptcy (`"bankruptcy"`). A solvent,
+pre-horizon `submit` (the agent stopping early) is treated as **premature** and scores
+`reward = 0.0`, `survived = False`, `success = False` — exactly like a missing verdict — so
+submitting on turn one can't bank the starting $200k without operating the company. This
+terminal-state gate lives in the scorer and is preserved verbatim by the seal migration; the
+horizon path finalizes the same way (it credits the end-state only if the sim's own
+`terminal_reason` says it genuinely ended).
 
 **Fidelity check:** for a fixed seed + command sequence, the final funds are reproducible run
 to run (the deterministic sim is preserved) and match a direct `yc-bench` seeding of the same
@@ -162,10 +175,13 @@ seed — the served/determinism tests assert this.
   YC-Bench's own LLM agent loop (inheriting provider credentials, replacing `DATABASE_URL`, and
   doing unbounded external model work outside the trace), which is exactly what this port
   replaces with the harness.
-- **Completion is a two-step:** `submit` (reads the sim's final state) then `terminate` (ends
-  the hgym episode). The verdict is only ever surfaced on — and trusted from — a `submit` step.
+- **Completion is a single step:** `submit` is the `score` terminal — it seals the episode,
+  reads the sim's final state, scores it, and ends the run in one call. No separate `terminate`
+  is needed (that stays available only as the *abort* terminal, which scores nothing).
 - **Long horizon.** A full year is many `run_command` / `sim resume` turns; the hgym horizon is
-  `max_commands + 2` (default 4002 steps). Raise `max_commands` for verbose policies.
+  `max_commands + 1` (default 4001 steps) — `max_commands` non-terminal commands plus one
+  reserved slot so the terminal `submit` is never preempted by the horizon. Raise `max_commands`
+  for verbose policies.
 - **One company per DB.** YC-Bench stores a single simulation per database, so each episode gets
   its own private SQLite file (seeded on `begin_session`, deleted on `end_session`). Sessions
   never share state.

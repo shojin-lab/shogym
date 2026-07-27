@@ -1,25 +1,28 @@
-"""Evaluate Claude Code on a served YC-Bench episode through hgym (RFC 008 §7, issue #32).
+"""Evaluate Claude Code on a served AutomationBench episode through hgym (RFC 008 §7, issue #42).
 
 The **external-harness** path: hgym does not drive Claude Code — Claude Code spawns
-``hgym serve yc_bench`` as its MCP server (per the generated ``.mcp.json``), plays the episode
-by issuing YC-Bench CLI commands through the ``run_command`` tool, and writes the JSONL trace.
-When it finishes, we read the terminal feedback with :func:`hgym.result_from_trace`.
+``hgym serve automationbench`` as its MCP server (per the generated ``.mcp.json``), plays the
+episode by discovering endpoints with ``api_search`` and mutating the simulated workspace with
+``api_fetch``, and writes the JSONL trace. When it finishes, we read the terminal feedback with
+:func:`hgym.result_from_trace`.
 
-Completion (from the task instructions the harness reads via ``describe``): the agent runs the
-one-year simulation with ``run_command`` (accept/assign/dispatch tasks, ``sim resume`` to
-advance the clock), then calls ``submit`` — the env's ``score`` terminal, which seals the
-episode, reads the final funds / survival / task outcomes off the sim, scores it, and ends the
-run in one step (``terminate`` remains available only as the no-score abort).
+Completion (from the task instructions the harness reads via ``describe``): the agent carries out
+the requested cross-application workflow with the ``api`` toolset, then calls ``done``. ``done`` is
+the ``score`` terminal — calling it seals the episode and scores the final state in one step (no
+separate ``terminate``). hgym reruns AutomationBench's own rubric (``partial_credit`` /
+``task_completed_correctly``) over the sealed end-state.
 
 Run it::
 
-    # Fully offline sim (no OpenAI/YC-Bench API key — the deterministic sim runs in-process;
-    # the Claude harness itself still makes model calls / needs Claude credentials):
-    uv run python examples/yc_bench/claude_code/run.py --task 0
-    uv run python examples/yc_bench/claude_code/run.py --task 0 --transcript
+    # Fully offline sim (no OpenAI/Zapier key — the ~47-app world runs in-process; the Claude
+    # harness itself still makes model calls / needs Claude credentials):
+    uv run python examples/automationbench/claude_code/run.py --task 0
+    uv run python examples/automationbench/claude_code/run.py --task 0 --transcript
 
-Nothing about hgym is Claude-specific — swap ``build_claude_command`` for a Codex / pi /
-Hermes invocation pointed at the same ``.mcp.json`` and the trace/score path is identical.
+The first run provisions the pinned upstream source into ``~/.cache/hgym`` (a one-time fetch);
+after that it is fully offline. Nothing about hgym is Claude-specific — swap
+``build_claude_command`` for a Codex / pi / Hermes invocation pointed at the same ``.mcp.json``
+and the trace/score path is identical.
 """
 
 from __future__ import annotations
@@ -35,7 +38,7 @@ from typing import Any, Dict, List, Optional
 
 import hgym
 
-ENV_NAME = "yc_bench"
+ENV_NAME = "automationbench"
 
 # Latest Sonnet (the alias ``sonnet`` also resolves to it); override with --model.
 DEFAULT_MODEL = "claude-sonnet-5"
@@ -45,20 +48,18 @@ DEFAULT_EFFORT = "low"
 
 # The key under `mcpServers` in the generated .mcp.json. Claude Code namespaces this server's
 # tools as ``mcp__<SERVER_KEY>__<tool>``.
-SERVER_KEY = "yc_bench"
+SERVER_KEY = "automationbench"
 
-# Allow every tool the served yc_bench env exposes (run_command + submit + describe +
-# terminate) without enumerating them. Claude Code's allow-rule grammar requires a glob-free
-# ``mcp__<server>__`` prefix, so the correct "all tools from this server" form is the ``__*``
-# suffix (a bare ``mcp__yc_bench`` is rejected). We deliberately do NOT pass ``--tools ""`` —
-# in current Claude Code that strips the MCP tools too, leaving the agent with no tools.
+# Allow every tool the served env exposes (api_search / api_fetch / base64_encode / done +
+# describe + terminate) without enumerating them. Claude Code's allow-rule grammar requires a
+# glob-free ``mcp__<server>__`` prefix, so the "all tools from this server" form is the ``__*``
+# suffix. We deliberately do NOT pass ``--tools ""`` — in current Claude Code that strips the MCP
+# tools too, leaving the agent with no tools.
 ALLOWED_TOOLS = f"mcp__{SERVER_KEY}__*"
 
-# Deny the built-in tools so the agent can't take untraced side-channel actions (shell out to
-# run `yc-bench` directly, read the sim DB, fetch the web) that never appear in the hgym trace,
-# keeping the score attributable to the MCP tool surface alone. `--permission-mode dontAsk`
-# already denies everything not in `--allowedTools`, but its read-only exemption would still
-# permit Read/Grep; denying them explicitly (and WebFetch/WebSearch) closes that.
+# Deny the built-in tools so the agent can't take untraced side-channel actions (shell out, read
+# local files, fetch the web) that never appear in the hgym trace — keeping the score
+# attributable to the MCP tool surface alone.
 DISALLOWED_TOOLS = ",".join(
     [
         "Bash",
@@ -78,64 +79,68 @@ DISALLOWED_TOOLS = ",".join(
 )
 
 PROMPT = (
-    "You are the CEO in a YC-Bench startup simulation, played through the "
-    f"`{SERVER_KEY}` MCP tools. First call `describe` to read the rules and your run. Then "
-    "operate the company with `run_command` (pass full `yc-bench …` command strings): browse "
-    "the market, accept/assign/dispatch tasks, and call `yc-bench sim resume` to advance the "
-    "clock — repeat until the run ends (bankruptcy or the one-year horizon). When the run is "
-    "over, call `submit` — it ends the episode and records your final result in one step."
+    "You are a workflow automation agent, played through the "
+    f"`{SERVER_KEY}` MCP tools. First call `describe` to read the task and your tools. Then "
+    "carry out the requested workflow over the simulated SaaS workspace: use `api_search` to "
+    "find the right endpoint, then `api_fetch` to read and change state (use `base64_encode` "
+    "for Gmail bodies). When the workflow is complete, call `done` — that seals the episode and "
+    "scores the final state in one step (there is no second submission and no need to call "
+    "`terminate` afterward)."
 )
 
 
-def _assert_server_can_import_yc_bench() -> None:
+def _assert_server_can_import_automationbench() -> None:
     """The MCP server runs under this same interpreter (``write_mcp_config`` uses
-    ``sys.executable``). If it can't ``import yc_bench``, ``hgym serve yc_bench`` will crash at
-    startup and Claude Code will connect to a server with **no tools** and give up — an opaque
-    failure. Fail loud here with the fix instead."""
+    ``sys.executable``). It needs ``datasets`` (the domain task loaders) importable; if it isn't,
+    ``hgym serve automationbench`` crashes at startup and Claude Code connects to a toolless
+    server and gives up — an opaque failure. Fail loud here with the fix instead."""
     try:
-        importlib.import_module("yc_bench")
+        importlib.import_module("datasets")
     except ImportError as exc:
         raise SystemExit(
-            f"[yc_bench example] the server interpreter cannot import yc_bench:\n"
+            f"[automationbench example] the server interpreter cannot import datasets:\n"
             f"    {sys.executable}\n"
             f"    ({exc})\n"
-            f"Sync the dev environment (this repo pins Python 3.12 and installs the yc_bench "
-            f"extra there):\n"
+            f"Sync the dev environment (this repo pins Python 3.12 and installs the "
+            f"automationbench extra there):\n"
             f"    uv sync\n"
             f"then run this via `uv run python …`."
         )
 
 
 def _assert_env_constructible() -> Any:
-    """yc_bench imports — confirm the env actually builds (the same probe the served process
-    does), turning any residual failure into an actionable message rather than a served-server
-    crash. Returns the constructed env."""
+    """Provision the pinned upstream source (a one-time fetch on a cold cache) and confirm the env
+    actually builds — the same path the served process takes — turning any residual failure into
+    an actionable message rather than a served-server crash. Returns the constructed env."""
     try:
-        return hgym.make(ENV_NAME)
+        from hgym.envs.automationbench import adapter
+
+        adapter.ensure_source()
+        return hgym.make(ENV_NAME, config={"domain": "simple"})
     except SystemExit:
         raise
     except Exception as exc:
         raise SystemExit(
-            f"[yc_bench example] yc_bench is installed but building {ENV_NAME!r} failed:\n"
+            f"[automationbench example] building {ENV_NAME!r} failed:\n"
             f"    {type(exc).__name__}: {exc}\n"
-            f"Try `uv sync` to (re)install the yc_bench extra."
+            f"The first run fetches the pinned upstream source into ~/.cache/hgym — check your "
+            f"network, or set AUTOMATIONBENCH_SRC to a local checkout. Try `uv sync` too."
         )
 
 
 def preflight() -> None:
-    """Verify the interpreter can serve the env before spawning Claude (fail loud, with a
-    fix). YC-Bench needs no external data — its world is generated deterministically from the
-    seed — so there is nothing to download."""
-    _assert_server_can_import_yc_bench()
+    """Verify the interpreter can serve the env before spawning Claude (fail loud, with a fix).
+    On a cold cache this performs the one-time upstream-source fetch."""
+    _assert_server_can_import_automationbench()
     _assert_env_constructible()
 
 
 def write_mcp_config(config_path: Path, task: str, trace_path: Path) -> Path:
-    """Write a ``.mcp.json`` that makes Claude Code spawn ``hgym serve yc_bench``.
+    """Write a ``.mcp.json`` that makes Claude Code spawn ``hgym serve automationbench``.
 
-    Invoke the CLI through the *current* interpreter (``python -m hgym.cli``) rather than a
-    bare ``hgym`` on ``PATH`` — so the example works whether or not the venv that has hgym
-    (with the ``yc_bench`` extra) installed is the one on the spawned subprocess's ``PATH``."""
+    Invoke the CLI through the *current* interpreter (``python -m hgym.cli``) rather than a bare
+    ``hgym`` on ``PATH`` — so the example works whether or not the venv that has hgym (with the
+    ``automationbench`` extra) installed is the one on the spawned subprocess's ``PATH``."""
     config = {
         "mcpServers": {
             SERVER_KEY: {
@@ -166,12 +171,8 @@ def build_claude_command(
 ) -> List[str]:
     """The ``claude`` invocation: print mode, the model, reasoning effort, our MCP config
     (``--strict-mcp-config`` keeps inherited user/project servers out, so the trace is
-    attributable solely to this ``hgym serve`` process), the yc_bench tools pre-allowed, the
-    built-ins denied, and ``--permission-mode dontAsk`` so tool calls run non-interactively.
-
-    Note: we deliberately do **not** pass ``--tools ""`` — in current Claude Code that removes
-    the MCP tools too, leaving the agent with an empty toolset. ``transcript=True`` emits the
-    turn-by-turn stream."""
+    attributable solely to this ``hgym serve`` process), the env's tools pre-allowed, the
+    built-ins denied, and ``--permission-mode dontAsk`` so tool calls run non-interactively."""
     cmd = [
         "claude",
         "-p",
@@ -243,11 +244,11 @@ def evaluate_claude(
     transcript: bool = False,
     workdir: Optional[Path] = None,
 ) -> hgym.EvalResult:
-    """Run Claude Code on one yc_bench task and read the terminal feedback off the trace."""
+    """Run Claude Code on one automationbench task and read the terminal feedback off the trace."""
     # Fail loud (with a fix) if the server interpreter can't serve the env — otherwise Claude
     # Code connects to a crashed server, sees no tools, and gives up opaquely.
     preflight()
-    workdir = workdir or Path(tempfile.mkdtemp(prefix="hgym-claude-yc-"))
+    workdir = workdir or Path(tempfile.mkdtemp(prefix="hgym-claude-ab-"))
     trace_path = workdir / f"{ENV_NAME}.jsonl"
     mcp_config = write_mcp_config(workdir / ".mcp.json", task, trace_path)
 
@@ -269,7 +270,9 @@ def evaluate_claude(
 
 def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--task", default="0", help="task index (selects the world seed)")
+    parser.add_argument(
+        "--task", default="0", help="task index into the default `public` domain set"
+    )
     parser.add_argument(
         "--model",
         default=DEFAULT_MODEL,
@@ -295,7 +298,7 @@ def main() -> None:
     )
     print(
         f"env={result.env} task={result.task} terminated={result.terminated} "
-        f"reward={result.value('reward')} survived={result.value('survived')} "
+        f"reward={result.value('reward')} partial_credit={result.value('partial_credit')} "
         f"success={result.value('success')}"
     )
     print(f"feedback: {result.feedback}")

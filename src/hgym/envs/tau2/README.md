@@ -31,9 +31,11 @@ Serve it as a stdio MCP server any harness can drive:
 uv run python -m hgym.cli serve tau2_mock --task 0 --trace ./hgym_logs/tau2_mock.jsonl
 ```
 
-The harness completes the task with the domain tools, calls **`done`** (its result reports
-the score), then **`terminate`** to end the hgym episode; hgym reads the verdict off the
-trace via `hgym.result_from_trace(...)`.
+The harness completes the task with the domain tools, then calls **`done`** — tau2's **score
+terminal**. Calling `done` seals the hgym episode and runs tau2's evaluator (its result
+reports the score) in one step; the episode ends there (no separate `terminate` needed).
+`terminate` remains available as an explicit abort (a no-score end). hgym reads the verdict
+off the trace via `hgym.result_from_trace(...)`.
 
 **Config** (via `hgym.make(name, config)` / `env_config`): `task_split` (`"train"`/`"test"`),
 `max_steps` (default 100, matching upstream), `user_llm` / `user_llm_args` (non-solo user
@@ -95,21 +97,30 @@ becomes the agent's next action:
   the MCP result;
 - **`send_message`** (non-solo domains) → an `AssistantMessage` with text routed to the
   **user simulator**; its result is the user's reply;
-- **`done`** → tau2 agent-stop; the Orchestrator finalizes and tau2's **evaluator** scores its
-  final state; the verdict JSON is returned as the tool result. (`terminate` then ends the
-  hgym episode.)
+- **`done`** → the env's **score terminal**. The serve layer validates it, atomically seals the
+  episode, then runs this env's `finalize` hook (seal-before-verdict): tau2 agent-stop, the
+  Orchestrator finalizes, and tau2's **evaluator** scores its final state — **exactly once**.
+  The verdict is returned as the tool result and the episode ends there.
 
-### verify
+### finalize + verify
 
-hgym's pure `_verify` parses that verdict off the recorded terminal **`done`** step into
-episode feedback — defensively: a missing / forged / malformed verdict scores 0, and only a
-`done` step is trusted.
+`done` is a `score` terminal, so hgym scores from **core-owned terminal evidence**, not marker
+JSON. On the sealed episode the serve layer runs `finalize`, a tau2-owned atomic `finalize_once`
+on the background Orchestrator: if tau2 already stopped autonomously (max-step, or the user
+simulator ended the conversation) it returns the stashed verdict; otherwise it delivers `done`
+once, waits, and runs `evaluate_simulation` once — never double-stopping the Orchestrator. The
+evaluator's exception text (on failure) is a private diagnostic, never surfaced to the agent.
+`_verify` then scores from `evidence.verdict`. Reaching the hgym horizon runs the same
+`finalize` (source `horizon`), so a hit cap scores tau2's evaluator over the completed run
+(**preserve_upstream_maxstep**), never an independent premature zero; an explicit `terminate`
+(abort) is a no-score premature end.
 
 ---
 
 tau2's `Orchestrator`, user simulator, domains/tools/tasks, and **evaluator** are reused
-**verbatim** — only the agent is swapped. There are **zero hgym core changes**; the whole
-port is additive under `src/hgym/envs/tau2/`. `import hgym` registers the `tau2_*` envs
+**verbatim** — only the agent is swapped and the hgym-side terminal wiring rides on the seal.
+There are **zero hgym core changes**; the whole port is additive under
+`src/hgym/envs/tau2/`. `import hgym` registers the `tau2_*` envs
 **without importing tau2**, so the core stays lean and offline; tau2 is loaded only when a
 tau2 env is constructed or served.
 
@@ -145,8 +156,9 @@ never reimplements it. `_verify` surfaces it as episode feedback:
 - **`db_match`** — did the final database state match the task's expected state.
 - **`action_match_proportion`** — fraction of the task's expected agent actions that matched.
 
-A premature end (no `done` verdict recorded — e.g. the harness calls `terminate` without
-completing the task) scores `reward = 0.0`, `success = False`.
+A premature end — the harness calls `terminate` (abort) instead of `done` — scores
+`reward = 0.0`, `success = False`. An evaluator failure fails closed to `reward = 0.0` with an
+`eval_error` flag (the exception text is a private diagnostic, never shown to the agent).
 
 ## Gotchas
 
@@ -166,8 +178,9 @@ completing the task) scores `reward = 0.0`, `success = False`.
 - **Task splits.** `airline` / `retail` / `telecom` use tau2's declared `train`/`test` splits
   verbatim (no positional slicing, no leakage). `mock` and `banking_knowledge` declare no
   train/test holdout, so both splits return the full task set.
-- **Completion is a two-step:** `done` (tau2 scores) then `terminate` (hgym ends the
-  episode). The verdict is only ever surfaced on a `done` step.
+- **Completion is one step:** `done` is the score terminal — it seals the episode, runs tau2's
+  evaluator, and ends the episode in a single call. A `terminate` after `done` is a no-op
+  (the episode is already sealed); `terminate` *instead of* `done` is an abort (premature zero).
 - **Offline vs keyed tests.** Pure-`verify` unit tests and the mock/served + non-solo
   (`mock_response` user) tests run offline in the suite; a keyed fidelity test — which
   replays gold agent actions through both this bridge and upstream tau2's `AgentGymEnv` and

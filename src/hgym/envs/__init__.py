@@ -8,6 +8,18 @@ from hgym.envs.registration import make, register, registered_envs
 # `hgym.envs.hle.env_v1` imports nothing from the `hle` extra (datasets/openai) at top level
 # — the dataset loads lazily on env construction and the judge's client on first call — so
 # `import hgym` stays offline without the extra installed.
+# `hgym.envs.automationbench.env_v1` imports nothing from the vendored `automationbench` package
+# at top level — the package (and `datasets`) load lazily on env construction/serve — so
+# `import hgym` stays offline without the `automationbench` extra installed.
+from hgym.envs.automationbench import (  # noqa: F401 — triggers registration
+    env_v1 as automationbench_env_v1,
+)
+
+# `hgym.envs.browsecomp_plus.env_v1` likewise imports nothing from the `browsecomp_plus` extra
+# (datasets/openai/pyserini) at top level — the encrypted queries decrypt in memory on env
+# construction, the BM25 index and judge client load lazily — so `import hgym` stays offline.
+from hgym.envs.browsecomp_plus import env_v1 as browsecomp_plus_env_v1  # noqa: F401 — triggers registration
+
 # `hgym.envs.frontier_bench.env_v1` imports nothing Docker-related at top level — the task
 # metadata loads from vendored files on env construction and Docker is touched only when an
 # episode is served — so `import hgym` stays offline without a Docker daemon.
@@ -18,6 +30,8 @@ from hgym.envs.wordle import env_v1 as wordle_env_v1  # noqa: F401 — triggers 
 from hgym.envs.yc_bench import env_v1 as yc_bench_env_v1  # noqa: F401 — triggers registration
 
 __all__ = [
+    "automationbench_env_v1",
+    "browsecomp_plus_env_v1",
     "frontier_bench_env_v1",
     "hle_env_v1",
     "make",

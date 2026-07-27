@@ -78,6 +78,33 @@ yc_bench = [
 # episode shells out to `docker`. Task files are vendored under the package (tiny), so
 # describe / verdict-parsing / the offline tests need neither Docker nor a network.
 frontier_bench = []
+# The AutomationBench port (src/hgym/envs/automationbench). Upstream (MIT, © Zapier) is pinned to
+# commit a321764 but **cannot be a git extra** like tau2/yc-bench: it declares `requires-python
+# >=3.13` (hgym is hard-pinned to <3.13 for tau2's `audioop`) and pulls the heavy `verifiers` /
+# `anthropic` agent-loop stack — an unsatisfiable resolve on 3.12. The env-as-center port needs
+# none of that loop, only the deterministic verifiers-free pieces (simulated tools + WorldState,
+# task defs, pure rubric), which import fine on 3.12 with just `pydantic` + `datasets`. So the
+# pinned upstream source is provisioned at runtime into a gitignored cache
+# (`~/.cache/hgym/automationbench/<sha>/`, honoring `AUTOMATIONBENCH_SRC` / `HGYM_CACHE`) — never
+# vendored into the repo — and this extra only needs `datasets` (the domain loaders build a
+# HuggingFace `Dataset`). Kept optional so `pip install hgym` (and the core offline test suite)
+# stay lean — `import hgym` registers the `automationbench` env without provisioning or `datasets`.
+automationbench = [
+    "datasets>=2.19",
+]
+# The BrowseComp-Plus port (src/hgym/envs/browsecomp_plus), a faithful wrap pinned to upstream
+# commit 0469490. `datasets` lazy-loads the XOR-encrypted `Tevatron/browsecomp-plus` queries
+# (decrypted in memory only — never persisted), `openai` backs the default model-graded judge,
+# and `pyserini` (which also needs a Java 21 runtime) is the BM25/Lucene retriever over the
+# prebuilt corpus index. Optional so `pip install hgym` (and the core offline test suite) stay
+# lean — `import hgym` registers `browsecomp_plus` without importing any of them. Offline tests
+# inject their own tasks + an in-memory searcher + a scripted judge, so they need none of it
+# (no download, no key, no Java).
+browsecomp_plus = [
+    "datasets>=2.19",
+    "openai>=1.99",
+    "pyserini>=0.22",
+]
 
 [dependency-groups]
 # The dev group is synced by default (plain `uv run` / `uv sync`), so putting the env extras
@@ -92,6 +119,8 @@ dev = [
     "hgym[hle]",
     "hgym[yc_bench]",
     "hgym[frontier_bench]",
+    "hgym[automationbench]",
+    "hgym[browsecomp_plus]",
 ]
 
 [build-system]
