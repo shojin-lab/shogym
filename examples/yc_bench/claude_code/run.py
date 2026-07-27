@@ -7,8 +7,9 @@ When it finishes, we read the terminal feedback with :func:`hgym.result_from_tra
 
 Completion (from the task instructions the harness reads via ``describe``): the agent runs the
 one-year simulation with ``run_command`` (accept/assign/dispatch tasks, ``sim resume`` to
-advance the clock), signals it is done with ``submit`` (its result reports the final funds /
-survival / task outcomes), then ends the episode with ``terminate``.
+advance the clock), then calls ``submit`` — the env's ``score`` terminal, which seals the
+episode, reads the final funds / survival / task outcomes off the sim, scores it, and ends the
+run in one step (``terminate`` remains available only as the no-score abort).
 
 Run it::
 
@@ -82,7 +83,7 @@ PROMPT = (
     "operate the company with `run_command` (pass full `yc-bench …` command strings): browse "
     "the market, accept/assign/dispatch tasks, and call `yc-bench sim resume` to advance the "
     "clock — repeat until the run ends (bankruptcy or the one-year horizon). When the run is "
-    "over, call `submit` (its result reports your final funds), then call `terminate`."
+    "over, call `submit` — it ends the episode and records your final result in one step."
 )
 
 

@@ -18,9 +18,8 @@ when the env is *constructed* (its in-process MCP server is probed) or *served*.
 
 from __future__ import annotations
 
-import json
 import math
-from typing import Any, Dict, List, Optional
+from typing import TYPE_CHECKING, Any, Dict, List, Optional
 
 from hgym.envs.registration import register
 from hgym.envs.tool_using_env import ToolUsingEnv
@@ -29,9 +28,11 @@ from hgym.task import TaskSpec
 from hgym.trajectory import Trajectory
 from hgym.types import EpisodeFeedback, FeedbackCollection, FunctionConfig
 
-# Kept in sync with mcp_server (duplicated so this module needn't import yc_bench). The verdict
-# is only trusted off the `submit` step — the sole tool that reads the sim's final state.
-VERDICT_MARKER = "yc_bench_verdict"
+if TYPE_CHECKING:
+    from hgym.serve.lifecycle import FinalizeRequest, TerminalEvidence
+
+# The `submit` score terminal (duplicated so this module needn't import yc_bench). Its call is
+# sealed by the serve layer and scored from core-owned evidence, never from tool output.
 SUBMIT_TOOL_NAME = "submit"
 
 # One hgym step per yc-bench command. A full solvent year is a few hundred commands; the
@@ -89,8 +90,10 @@ persist strategy notes.
 
 # Finishing
 When the run is over — `sim resume` reports bankruptcy or horizon end, or you choose to stop — \
-call `submit` (its result reports your final funds, survival, and task outcomes), then call \
-`terminate` to end the episode."""
+call `submit`. That ends the episode and records your final result (funds, survival, task \
+outcomes) read straight off the sim; there is no separate stop step. Submitting while the \
+company is still solvent *before* the horizon scores zero, so only submit once the run has \
+actually ended."""
 
 
 class YcBenchEnv(ToolUsingEnv):
@@ -106,6 +109,10 @@ class YcBenchEnv(ToolUsingEnv):
     """
 
     function_name = "run_command"
+    # `submit` is the env's single `score` terminal: the serve layer validates its call, seals
+    # the episode, then runs `finalize` (below) to score off the sim's frozen end-state — so an
+    # authoritative verdict only ever exists for an already-sealed, un-continuable episode.
+    score_terminal_tool = SUBMIT_TOOL_NAME
 
     def __init__(
         self,
@@ -136,8 +143,14 @@ class YcBenchEnv(ToolUsingEnv):
                 module="hgym.envs.yc_bench.mcp_server",
             ),
         )
-        # Horizon: one step per command, plus room for `submit` + `terminate`.
-        super().__init__(horizon=max_commands + 2, num_tasks=len(self._seeds))
+        # Horizon: one step per command, plus a single reserved slot for the terminal call.
+        # `submit` (the `score` terminal) and `terminate` (the `abort` terminal) are intercepted
+        # by the serve layer *before* the horizon check, so neither consumes a counted step — the
+        # budget is exactly `max_commands` non-terminal `run_command` steps, after which the agent
+        # can still `submit`. The `+ 1` keeps a policy that runs the full command budget from
+        # having its terminal `submit` preempted by the horizon; a policy that instead keeps
+        # issuing commands hits the horizon on its `max_commands + 1`-th call.
+        super().__init__(horizon=max_commands + 1, num_tasks=len(self._seeds))
 
     # ----- task loading -----
 
@@ -206,18 +219,49 @@ class YcBenchEnv(ToolUsingEnv):
             return self._seeds[idx]
         return None
 
-    # ----- verify -----
+    # ----- finalize + verify (seal-before-verdict) -----
+
+    # The base declares `finalize` as an `Optional[Callable]` attribute (default None) precisely
+    # so a score-terminal env overrides it with this coroutine; the variable→method override is
+    # the intended opt-in, so silence pyright's structural mismatch.
+    async def finalize(  # type: ignore[reportIncompatibleVariableOverride]
+        self, req: "FinalizeRequest"
+    ) -> "TerminalEvidence":
+        """Score the sealed episode off YC-Bench's authoritative sim end-state.
+
+        Runs on the already-sealed episode (the serve layer froze it before this hook fires) and
+        reads the sim's final metrics straight off the **live** SQLite DB through the session,
+        returning them as core-owned :class:`TerminalEvidence`. The serve layer disposes the
+        session (``engine.dispose()`` / DB teardown) only *after* this returns, so the read here
+        always sees an open DB. The verdict is the sim's own end-state — the agent's company
+        metrics, public-safe with no oracle; ``verify`` applies the terminal-state gate when it
+        scores it, and core stamps the provenance. Deterministic, offline, keyless: the sim is a
+        pure in-process function of the seed and the commands issued.
+        """
+        from hgym.envs.yc_bench import mcp_server  # lazy: pulls in yc_bench
+        from hgym.serve.lifecycle import TerminalEvidence
+
+        verdict = mcp_server.read_verdict(req.session_id)
+        return TerminalEvidence(source=req.source, status="ok", verdict=verdict)
 
     def _verify(
-        self, trajectory: Trajectory, task: Dict[str, Any], *, terminated: bool
+        self,
+        trajectory: Trajectory,
+        task: Dict[str, Any],
+        *,
+        terminated: bool,
+        evidence: "Optional[TerminalEvidence]" = None,
     ) -> FeedbackCollection:
-        """Score the episode off the terminal ``submit`` verdict recorded in the trajectory.
+        """Score the episode from the core-owned terminal ``evidence`` (never from tool output).
 
-        Like tau2, the authoritative metrics are computed server-side (against the sim's final
-        state) and surfaced on a single terminal step; ``_verify`` parses them defensively — a
-        missing / forged / malformed verdict scores as a premature, non-surviving zero rather
-        than raising."""
-        return score_trajectory(trajectory, terminated=terminated)
+        The authoritative metrics are read server-side by ``finalize`` against the sim's frozen
+        final state and handed here as trusted evidence; this scores from ``evidence.verdict``.
+        Scoring is defensive — a missing / non-terminal verdict scores a premature, non-surviving
+        zero rather than raising — and preserves YC-Bench's terminal-state gate: a solvent state
+        is credited ONLY on a genuine ``horizon_end`` / bankruptcy, never on a manual or
+        pre-horizon submission."""
+        verdict = evidence.verdict if evidence is not None else None
+        return score_verdict(verdict, terminated=terminated)
 
 
 # ----- pure scoring (module-level so it is unit-testable without yc_bench installed) -----
@@ -228,18 +272,23 @@ class YcBenchEnv(ToolUsingEnv):
 _TERMINAL_REASONS = ("horizon_end", "bankruptcy")
 
 
-def score_trajectory(trajectory: Trajectory, *, terminated: bool) -> FeedbackCollection:
-    """Build episode feedback from the ``submit`` verdict recorded in the trajectory. Pure."""
+def score_verdict(
+    verdict: Optional[Dict[str, Any]], *, terminated: bool
+) -> FeedbackCollection:
+    """Build episode feedback from the core-owned terminal verdict. Pure.
+
+    ``verdict`` is the sim's final end-state (``finalize`` read it off the DB), or ``None`` when
+    the episode ended with no scoring submission (an abort, or a fail-closed finalize)."""
     fb = FeedbackCollection()
     if not terminated:
         return fb
 
-    verdict = _find_verdict(trajectory)
-    # `submit` is callable at any time, so a marked verdict alone is not enough: an agent could
-    # submit on turn one and bank the starting $200k without operating the company. Credit the
-    # final funds *only* when the sim actually reached a terminal state — the horizon (a
-    # legitimate completion) or bankruptcy (a genuine, negative-funds outcome). A solvent,
-    # pre-horizon submission is premature and scores zero, exactly like a missing verdict.
+    # The terminal-state gate (YC-Bench fidelity): `submit` is callable at any time, so a
+    # solvent end-state alone is not enough — an agent could seal on turn one and bank the
+    # starting $200k without operating the company. Credit the final funds *only* when the sim
+    # actually reached a terminal state — the horizon (a legitimate completion) or bankruptcy (a
+    # genuine, negative-funds outcome). A solvent, pre-horizon seal is premature and scores zero,
+    # exactly like a missing verdict.
     if verdict is None or verdict.get("terminal_reason") not in _TERMINAL_REASONS:
         fb.episode.append(EpisodeFeedback(name="reward", value=0.0))
         fb.episode.append(EpisodeFeedback(name="survived", value=False))
@@ -280,25 +329,6 @@ def _as_float(value: Any) -> float:
     except (TypeError, ValueError):
         return 0.0
     return out if math.isfinite(out) else 0.0
-
-
-def _find_verdict(trajectory: Trajectory) -> Optional[Dict[str, Any]]:
-    """Return the most recent marked verdict recorded on a ``submit`` step, or None.
-
-    Only a ``submit`` step is trusted: ``submit`` is the one tool that reads the sim's final
-    state, so a marked payload on any *other* recorded result (e.g. a forged ``run_command``
-    output) must not grant terminal credit. Scans from the end; any non-JSON / non-object /
-    unmarked / non-``submit`` result is skipped, never raised on."""
-    for step in reversed(trajectory):
-        if step.tool != SUBMIT_TOOL_NAME:
-            continue
-        try:
-            payload = json.loads(step.result)
-        except (TypeError, ValueError):
-            continue
-        if isinstance(payload, dict) and payload.get(VERDICT_MARKER) is True:
-            return payload
-    return None
 
 
 @register("yc_bench")
