@@ -23,6 +23,7 @@ Docker; only calling into it does.
 
 from __future__ import annotations
 
+import os
 import shutil
 import subprocess
 import tempfile
@@ -167,7 +168,12 @@ class Container:
             self.workdir,
         ]
         if self._cpus is not None:
-            args += ["--cpus", str(self._cpus)]
+            # Clamp to the host's physical CPU count: `docker run` rejects a `--cpus` request
+            # larger than what the host has (e.g. a 2-CPU CI runner can't grant the task's 4).
+            # A roomier host still honors the task's full request, so this preserves benchmark
+            # behavior wherever the resources exist and only bounds it to physical reality.
+            host_cpus = os.cpu_count() or 1
+            args += ["--cpus", str(min(self._cpus, host_cpus))]
         if self._memory_mb is not None:
             args += ["--memory", f"{self._memory_mb}m"]
         if self._network is not None:
