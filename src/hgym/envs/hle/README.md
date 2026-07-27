@@ -1,14 +1,16 @@
 # `hle` — Humanity's Last Exam, hgym's first model-graded env
 
-An hgym port of [**Humanity's Last Exam**](https://agi.safe.ai/) (HLE) — 2,500 expert,
-frontier-difficulty, closed-ended academic questions from the Center for AI Safety & Scale
-AI. HLE has essentially no tool surface: it is single-turn Q&A. Its value here is (a)
-coverage of a reasoning/QA task and (b) exercising hgym's **verification surface** with a
-real **LLM judge** — a model-graded verifier that nothing else in hgym uses.
+A faithful hgym port of [**Humanity's Last Exam**](https://agi.safe.ai/) (HLE) — 2,500
+expert, frontier-difficulty, closed-ended academic questions from the Center for AI Safety &
+Scale AI. HLE has essentially no tool surface: it is single-turn Q&A. Its value here is (a)
+coverage of a reasoning/QA task and (b) exercising hgym's **verification surface** with a real
+**LLM judge** — a model-graded verifier that nothing else in hgym uses.
 
-An hgym env **describes** a task, **serves** its tools over MCP, and **verifies** a recorded
-trajectory — an external harness (Claude Code, Codex, …) drives the tools. Here the single
-tool grades server-side, so the verifier stays a pure function over the trajectory.
+Like every hgym env this **describes** a task, **serves** its tools over MCP, and **verifies**
+a recorded trajectory while an external harness drives the tools — see
+[`../README.md`](../README.md). Here the single tool grades server-side, so the verifier stays
+a pure function over the sealed episode's evidence. The runnable demo is
+[`examples/hle/claude_code/`](../../../../examples/hle/claude_code/).
 
 ## Running it
 
@@ -32,11 +34,12 @@ export OPENAI_API_KEY=sk-...                             # the judge is an OpenA
 uv run python -m hgym.cli serve hle --task 0 --trace ./hgym_logs/hle.jsonl
 ```
 
-The harness reads the question via `describe` and calls **`submit_answer`** exactly once:
-that call is the **score terminal** — it validates the args, atomically **seals** the episode,
-grades it, and **ends** the episode in one step (no separate `terminate`; a `terminate` or a
-repeat `submit_answer` afterward is tombstoned). hgym reads the verdict off the trace via
-`hgym.result_from_trace(...)`.
+The harness reads the question via `describe` and calls **`submit_answer`** exactly once: that
+call is the **score terminal** — it validates the args, atomically **seals** the episode,
+grades it in `finalize`, and **ends** the episode in one step (no separate `terminate`; a
+`terminate` or a repeat `submit_answer` afterward is tombstoned). See the shared
+[terminal lifecycle](../README.md#terminal-lifecycle-seal-terminal-score-terminal-abort). hgym
+reads the verdict off the trace via `hgym.result_from_trace(...)`.
 
 **Config** (via `hgym.make(name, config)` / `env_config`): `task_split` (`"train"`/`"test"`),
 `tasks` (an explicit task list — bypasses the dataset download, used by the offline tests),
@@ -55,10 +58,10 @@ uv run python examples/hle/claude_code/run.py --task 0 --transcript
 
 ## Requirements
 
-- **Python 3.12.** The project is pinned to 3.12 (`requires-python = ">=3.12,<3.13"`).
-- **The `hle` extra.** `datasets` (loads `cais/hle`) + `openai` (the default judge client).
-  `uv sync` installs it (it's in the dev group); `pip install 'hgym[hle]'` adds it to a plain
-  install. `import hgym` registers `hle` **without** importing either — the core stays lean.
+The Python pin and the `uv sync` / `pip install` / `import hgym` mechanics are the shared
+[requirements boilerplate](../README.md#requirements-boilerplate). The `hle` extra pulls
+`datasets` (loads `cais/hle`) + `openai` (the default judge client). On top of that:
+
 - **`OPENAI_API_KEY`.** Grading (in the env's `finalize`) uses an OpenAI LLM judge. With the
   default judge, an episode **fails fast at startup** — a clear, actionable error raised before
   any tool runs — if no key is set, so a keyless run never silently scores everything wrong. Opt
@@ -82,10 +85,10 @@ observation stream and no other tool.
 ### Tools (served over MCP)
 
 - **`submit_answer(answer: str, confidence: int = 100)`** — the **score terminal**. Calling it
-  validates the args against the advertised schema, atomically **seals** the episode, grades
-  it, and **ends** the episode — so a verdict only ever exists for an already-sealed,
-  un-continuable episode (an agent cannot grade, read the verdict, then revise). Grading runs
-  in the env's `finalize` hook:
+  validates the args against the advertised schema, atomically **seals** the episode, grades it
+  in `finalize`, and **ends** the episode — so a verdict only ever exists for an already-sealed,
+  un-continuable episode (an agent cannot grade, read the verdict, then revise). Grading in the
+  `finalize` hook is:
   - an **exact-match fast path** first (normalize + compare, offline and free); on a match the
     LLM judge is not called;
   - otherwise the session's **LLM judge** (`judge.py`) grades it, using HLE's own judge prompt.
@@ -105,13 +108,14 @@ The env holds per-episode state — the question, its gold answer, and the judge
 session id, so one env instance safely backs many concurrent episodes; `finalize` reads it to
 grade the sealed submission.
 
-### verify
+### finalize + verify
 
-`verify` scores the **core-owned terminal evidence** the serve layer commits after the seal —
-not marker JSON off the trajectory. `score_evidence` reads the authoritative, seal-protected
-`correct` from the evidence verdict and the **confidence** from the validated submit arguments.
-A fail-closed grade (any grading-infra failure) is labelled `judge_error`; a terminal with no
-submission scores just `correct = False`.
+`submit_answer` is a `score` terminal, so on the sealed episode the env's `finalize` hook runs
+the judge (or the exact-match fast path) and commits **core-owned terminal evidence** — not
+marker JSON off the trajectory. The pure `verify` then scores from that evidence:
+`score_evidence` reads the authoritative, seal-protected `correct` from the evidence verdict and
+the **confidence** from the validated submit arguments. A fail-closed grade (any grading-infra
+failure) is labelled `judge_error`; a terminal with no submission scores just `correct = False`.
 
 Feedback emitted on termination (episode-level):
 
@@ -138,8 +142,8 @@ split.
 
 ## Scoring
 
-Every served tool call appends one row to the JSONL trace; the episode scores ride out on the
-terminal result's `_meta` sidecar and the terminal trace row. Read the score back with:
+The episode scores ride out on the terminal result's `_meta` sidecar and the terminal trace
+row. Read the score back with:
 
 ```python
 import hgym
@@ -147,9 +151,21 @@ result = hgym.result_from_trace("hgym_logs/hle.jsonl", env="hle", task="0")
 print(result.terminated, result.value("correct"), result.value("calibration_error"))
 ```
 
-`result_from_trace` treats `env`/`task`/`session_id` as **filters**, so a shared, append-only
-trace can't let another run supply a stale result. For a guaranteed 1:1 mapping, give each run
-its own trace file.
+`result_from_trace` treats `env` / `task` / `session_id` as **filters** — see
+[Reading a score back](../README.md#reading-a-score-back-result_from_trace) for the shared
+semantics (give each run its own trace file for a guaranteed 1:1 mapping).
+
+## Fidelity & deviations
+
+- **Grading is HLE's own.** The judge uses HLE's own judge prompt; the registered env defaults
+  to `OpenAIJudge` (overridable via `judge_model` / `judge_base_url`, or a fully injected
+  `judge`). The exact-match fast path is a free, offline pre-check that never changes a correct
+  verdict.
+- **Text-only for now.** Questions carrying an image are filtered out; multimodal is a
+  follow-up.
+- **Judge fail-closed.** A grading-infra failure scores `correct = False` with `judge_error =
+  True` rather than crashing — so an infra failure is distinguishable from a genuine wrong
+  answer, not silently counted as one.
 
 ## Gotchas
 
@@ -157,18 +173,27 @@ its own trace file.
   answer hits the exact-match fast path. With the default judge, starting an episode without
   `OPENAI_API_KEY` raises early (before any tool runs) rather than letting the run score
   everything incorrect — inject a scripted `judge`, or set `judge_base_url` for a keyless local
-  endpoint, to opt out. A judge that fails *mid-run* (revoked key, rate-limit, network) still
-  fail-closes to `correct = False`, but is flagged with `judge_error = True` in the episode
-  feedback so an infra failure isn't counted as a genuine wrong answer.
+  endpoint, to opt out.
 - **The dataset is gated.** `cais/hle` needs accepted terms + HF auth; constructing the
   registered env downloads it (once). Inject `tasks` to construct the env without the download.
-- **Text-only for now.** Questions carrying an image are filtered out; multimodal is a
-  follow-up.
 - **Look-ups defeat the point.** HLE measures the model's own reasoning — a harness must deny
   web tools (`--disallowedTools "WebFetch,WebSearch,…"`), as the example does.
 - **Single-turn, single terminal action.** `submit_answer` is the score terminal: submitting
   seals + grades + ends the episode in one step (horizon 1), so there is no second submission
   and no separate `terminate` to call afterward.
-- **Offline vs keyed tests.** The pure verifier + judge-helper tests and the served
-  scripted-judge tests run offline in the suite; a keyed fidelity test — the real `OpenAIJudge`
-  grading a served episode — is skipped unless `OPENAI_API_KEY` is set.
+- **Offline vs keyed tests.** Follows the shared
+  [offline-vs-keyed split](../README.md#tests-offline-vs-keyed): the pure verifier + judge-helper
+  tests and the served scripted-judge tests run offline; the keyed fidelity test (the real
+  `OpenAIJudge` grading a served episode) is skipped unless `OPENAI_API_KEY` is set.
+
+## Layout
+
+A source map for orientation:
+
+| File | Role |
+|---|---|
+| `env_v1.py` | The registered `hle` env: `describe` (question + manifest), the dataset load + 80/20 split, the `finalize` hook (exact-match fast path → LLM judge on the sealed submission), and the pure `score_evidence` verifier. |
+| `mcp_server.py` | The in-process MCP server backing `submit_answer` (the score terminal, sealed before any verdict) + the reserved `terminate`. |
+| `judge.py` | The `Judge` seam: `OpenAIJudge` (default) + the scripted judge used by offline tests, plus HLE's own judge prompt. |
+| `data.py` | Loads the gated `cais/hle` dataset, filters to text-only, and caches under `~/.cache/hgym/hle`. |
+</content>

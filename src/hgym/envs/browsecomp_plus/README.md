@@ -1,17 +1,18 @@
 # `browsecomp_plus` — BrowseComp-Plus, a Deep-Research retrieval env ("HLE with a fixed corpus")
 
-An hgym port of [**BrowseComp-Plus**](https://github.com/texttron/BrowseComp-Plus) (ACL 2026) —
-answer OpenAI BrowseComp's reasoning-heavy queries against a **fixed, human-verified ~100K-doc
-corpus** served as `search` / `get_document` tools, instead of the live web. Freezing the corpus
-isolates search + reasoning from web noise and makes runs reproducible. `submit_answer` is the
-**score terminal**: submitting seals the episode and the env's `finalize` hook grades the sealed
-answer with an LLM judge (seal-before-verdict, as in the [HLE](../hle/README.md) port), and the
-env adds deterministic **retrieval-recall** and **citation** metrics computed purely off the
-recorded trajectory against the query's relevance judgements (qrels) — so it exercises hgym's
-verification surface with both a model judge *and* deterministic retrieval metrics.
+A faithful hgym port of [**BrowseComp-Plus**](https://github.com/texttron/BrowseComp-Plus) (ACL
+2026) — answer OpenAI BrowseComp's reasoning-heavy queries against a **fixed, human-verified
+~100K-doc corpus** served as `search` / `get_document` tools, instead of the live web. Freezing
+the corpus isolates search + reasoning from web noise and makes runs reproducible. `submit_answer`
+is the **score terminal**: submitting seals the episode and the env's `finalize` hook grades the
+sealed answer with an LLM judge (as in the [HLE](../hle/README.md) port), and the env adds
+deterministic **retrieval-recall** and **citation** metrics computed purely off the recorded
+trajectory against the query's relevance judgements (qrels) — so it exercises hgym's verification
+surface with both a model judge *and* deterministic retrieval metrics.
 
-An hgym env **describes** a task, **serves** its tools over MCP, and **verifies** a recorded
-trajectory — an external harness (Claude Code, Codex, …) drives the tools. The runnable demo is
+Like every hgym env this **describes** a task, **serves** its tools over MCP, and **verifies** a
+recorded trajectory while an external harness drives the tools — see
+[`../README.md`](../README.md). The runnable demo is
 [`examples/browsecomp_plus/claude_code/`](../../../../examples/browsecomp_plus/claude_code/).
 
 ## Running it
@@ -42,7 +43,9 @@ uv run python -m hgym.cli serve browsecomp_plus --task 0 --trace ./hgym_logs/bcp
 The harness reads the query via `describe`, calls **`search`** / **`get_document`** to gather
 evidence, then calls **`submit_answer`** — the score terminal that seals the episode, grades the
 sealed answer in `finalize` (the LLM judge), and ends the episode in one call (no separate
-`terminate`); hgym reads the score off the trace via `hgym.result_from_trace(...)`.
+`terminate`). See the shared
+[terminal lifecycle](../README.md#terminal-lifecycle-seal-terminal-score-terminal-abort). hgym
+reads the score off the trace via `hgym.result_from_trace(...)`.
 
 **Config** (via `hgym.make(name, config)` / `env_config`): `task_split` (`"train"`/`"test"`),
 `tasks` (an explicit task list — bypasses the dataset/decryption, used by offline tests),
@@ -60,11 +63,11 @@ uv run python examples/browsecomp_plus/claude_code/run.py --task 0 --transcript
 
 ## Requirements
 
-- **Python 3.12.** The project is pinned to 3.12 (`requires-python = ">=3.12,<3.13"`).
-- **The `browsecomp_plus` extra.** `datasets` (loads the encrypted queries), `openai` (the
-  default judge client), and `pyserini` (the BM25/Lucene retriever). `uv sync` installs it (it's
-  in the dev group); `pip install 'hgym[browsecomp_plus]'` adds it to a plain install. `import
-  hgym` registers `browsecomp_plus` **without** importing any of them — the core stays lean.
+The Python pin and the `uv sync` / `pip install` / `import hgym` mechanics are the shared
+[requirements boilerplate](../README.md#requirements-boilerplate). The `browsecomp_plus` extra
+pulls `datasets` (the encrypted queries), `openai` (the default judge client), and `pyserini`
+(the BM25/Lucene retriever). On top of that:
+
 - **Java 21.** pyserini's BM25 backend runs on Lucene (JVM). Without a JDK 21 the real retriever
   can't run; offline tests use an in-memory searcher and need no Java.
 - **`OPENAI_API_KEY`.** `submit_answer` grades with an LLM judge. With the default judge, an
@@ -101,12 +104,12 @@ Backed by the in-process server in `mcp_server.py` (hgym's near-verbatim reuse o
   `snippet`). The docids returned across a run are what the verifier reads back as
   `retrieved_docids`.
 - **`get_document(docid)`** — fetch a document's full text (upstream's optional tool).
-- **`submit_answer(answer, confidence)`** — the **`score` terminal**. The serve layer validates
+- **`submit_answer(answer, confidence)`** — the **score terminal**. The serve layer validates
   its args, atomically **seals** the episode, then runs the env's `finalize` hook — so its handler
-  body is never dispatched inward. The **judge runs in `finalize`** (seal-before-verdict): it
-  grades `answer` against the session's gold answer (BrowseComp-Plus's own `GRADER_TEMPLATE`, temp
-  0 for determinism) and returns core-owned, **sanitized** `TerminalEvidence`. Submitting ends the
-  episode; single submission is structural (a second `submit_answer` is tombstoned).
+  body is never dispatched inward. The **judge runs in `finalize`**: it grades `answer` against
+  the session's gold answer (BrowseComp-Plus's own `GRADER_TEMPLATE`, temp 0 for determinism) and
+  returns core-owned, **sanitized** `TerminalEvidence`. Submitting ends the episode; single
+  submission is structural (a second `submit_answer` is tombstoned).
 - **`terminate()`** — the reserved `abort` terminal (ending without a submission scores
   `correct=False`).
 
@@ -149,8 +152,8 @@ the set **positionally 80/20** into `train` / `test`, like the HLE/wordle ports.
 
 ## Scoring
 
-Every served tool call appends one row to the JSONL trace; the episode scores ride out on the
-terminal result's `_meta` sidecar and the terminal trace row. Read the score back with:
+The episode scores ride out on the terminal result's `_meta` sidecar and the terminal trace row.
+Read the score back with:
 
 ```python
 import hgym
@@ -158,16 +161,26 @@ result = hgym.result_from_trace("hgym_logs/bcp.jsonl", env="browsecomp_plus", ta
 print(result.terminated, result.value("correct"), result.value("retrieval_recall"))
 ```
 
-## Gotchas
+`result_from_trace` treats `env` / `task` / `session_id` as **filters** — see
+[Reading a score back](../README.md#reading-a-score-back-result_from_trace) for the shared
+semantics (give each run its own trace file for a guaranteed 1:1 mapping).
 
-- **Fidelity pins.** Upstream commit `0469490` (MIT). The auto-downloaded BM25 index is pinned to
+## Fidelity & deviations
+
+- **Upstream pin.** Upstream commit `0469490` (MIT). The auto-downloaded BM25 index is pinned to
   an immutable commit of `Tevatron/browsecomp-plus-indexes` (`INDEX_REVISION` in `data.py`), so a
-  cold-cache download is reproducible and can't drift with an upstream index replacement. The retriever materially changes scores
-  (BM25 vs dense Qwen3-Embedding), so the backend is named in the TaskSpec and this first cut
-  pins **BM25** (CPU/Java-only; the dense path needs Faiss + GPU). The judge is pinned to temp 0;
-  upstream reports GPT-4.1 (paper) / Qwen3-32B (vLLM) — hgym defaults to GPT-4.1, overridable.
+  cold-cache download is reproducible and can't drift with an upstream index replacement.
+- **Retriever pinned to BM25.** The retriever materially changes scores (BM25 vs dense
+  Qwen3-Embedding), so the backend is named in the TaskSpec and this first cut pins **BM25**
+  (CPU/Java-only; the dense path needs Faiss + GPU — a deferred follow-up).
+- **Judge.** Pinned to temp 0 for determinism; upstream reports GPT-4.1 (paper) / Qwen3-32B
+  (vLLM) — hgym defaults to GPT-4.1, overridable via `judge_model` / `judge_base_url`. A judge
+  failure fails closed to `correct=False` with `judge_error=True`.
 - **Queries stay encrypted at rest.** The XOR/canary decryption happens only in memory at load;
   hgym never writes or commits decrypted queries/answers. The canary constant is preserved.
+
+## Gotchas
+
 - **The index is heavy but auto-provisioned.** ~2.78 GB Lucene index (Java 21); it auto-downloads
   once to `~/.cache/hgym/browsecomp_plus/bm25/` on first served use (override with
   `HGYM_BROWSECOMP_PLUS_BM25_INDEX`). The Java check runs *before* that download, so a missing JVM
@@ -177,9 +190,11 @@ print(result.terminated, result.value("correct"), result.value("retrieval_recall
   `WebFetch` / `WebSearch` (the example does), so retrieval goes only through the served tools.
 - **Judge keying.** Like HLE, starting an episode without `OPENAI_API_KEY` (and no injected judge
   / `judge_base_url`) raises early rather than scoring everything wrong.
-- **Offline vs keyed tests.** The pure verifier/metric/judge-parser/decryption tests and the
-  served in-memory-searcher + scripted-judge test run offline; a keyed fidelity test (the real
-  judge grading a served episode) is skipped unless `OPENAI_API_KEY` is set.
+- **Offline vs keyed tests.** Follows the shared
+  [offline-vs-keyed split](../README.md#tests-offline-vs-keyed): the pure verifier / metric /
+  judge-parser / decryption tests and the served in-memory-searcher + scripted-judge test run
+  offline; the keyed fidelity test (the real judge grading a served episode) is skipped unless
+  `OPENAI_API_KEY` is set.
 
 ## Layout
 
@@ -193,3 +208,4 @@ print(result.terminated, result.value("correct"), result.value("retrieval_recall
 - `metrics.py` — pure retrieval-recall + citation precision/recall (upstream verbatim).
 - `data.py` — in-memory decryption (canary preserved), qrel + lazy BM25-index auto-download, and
   the Java-21 fast-check (before any multi-GB download).
+</content>
