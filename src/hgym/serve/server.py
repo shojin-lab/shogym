@@ -87,14 +87,28 @@ class _PassthroughTool(Tool):
         return await self._dispatch(self.name, arguments)
 
 
-def _build_tool(manifest: ToolManifest, dispatch: _Dispatch) -> Tool:
-    """Expose one env tool: advertise its real JSON-Schema, forward raw args to dispatch."""
+def build_tool(
+    manifest: ToolManifest,
+    dispatch: _Dispatch,
+    *,
+    name: Optional[str] = None,
+    parameters: Optional[Dict[str, Any]] = None,
+) -> Tool:
+    """Expose one env tool: advertise its real JSON-Schema, forward raw args to dispatch.
+
+    ``name`` and ``parameters`` override what is advertised, for a server that publishes the
+    same env tool under a different public name or behind a wrapper schema. ``dispatch``
+    receives the **advertised** name, so such a caller maps it back itself."""
     return _PassthroughTool(
         dispatch=dispatch,
-        name=manifest.name,
+        name=name if name is not None else manifest.name,
         description=manifest.description,
-        parameters=manifest.input_schema,
+        parameters=parameters if parameters is not None else manifest.input_schema,
     )
+
+
+# Kept for callers that reached for this helper while it was private.
+_build_tool = build_tool
 
 
 def build_server(episode: ServedEpisode, *, name: Optional[str] = None) -> FastMCP:

@@ -15,6 +15,7 @@ from hgym.serve.lifecycle import (
     LifecycleState,
     TerminalEvidence,
 )
+from hgym.serve.stream import TaskRef, TaskStream, build_stream_server
 
 __all__ = [
     "CallResult",
@@ -23,5 +24,8 @@ __all__ = [
     "FinalizeRequest",
     "LifecycleState",
     "ServedEpisode",
+    "TaskRef",
+    "TaskStream",
     "TerminalEvidence",
+    "build_stream_server",
 ]
