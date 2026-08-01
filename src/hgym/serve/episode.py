@@ -60,38 +60,21 @@ from hgym.trajectory import Step, Trajectory
 from hgym.utils.uuid7 import uuid7
 
 
-def _wire_form(score_schemas: Dict[Any, Any]) -> Dict[str, Dict[str, Any]]:
-    """The score-terminal contract as the wire carries it: the names this episode enforces on and
-    the schemas it validates against, round-tripped through JSON.
+def _named(key: Any) -> str:
+    """The schema key a validation error is *about*, or a placeholder when naming it raises.
 
-    Both halves are the env's own objects, and a JSON scalar has subclasses — the models coerce
-    one away at construction but do not validate on assignment, so it reaches here verbatim. It
-    serializes like the scalar it subclasses, which is exactly what makes it invisible: a server
-    advertises ordinary text and this episode holds something that answers a comparison its own
-    way. A ``const`` like that refuses the argument the agent was shown; a *name* like that is
-    worse, because the name is the key a terminal call is looked up under — the call that ends
-    the task is dispatched as an ordinary step, sealing nothing, on the tool the endpoint
-    published as the way to finish.
-
-    **Contained, and that is not a hole.** A schema that will not serialize keeps the env's own
-    object, because the only honest alternative here is to fail opening an episode a caller may
-    have no other way to refuse — and that decision belongs to the layer that knows whether an
-    alternative exists. A stream makes it one step later and stops the run: it compares this
-    contract against the one its endpoint published, and a schema that cannot be serialized cannot
-    be compared either, so the task is never dispensed. What is left is a single-episode server
-    enforcing exactly what it advertises, which is what it did before."""
-    wire: Dict[str, Dict[str, Any]] = {}
-    for name, schema in score_schemas.items():
-        try:
-            entry = json.loads(json.dumps({"name": name, "schema": schema}, allow_nan=False))
-        except (ValueError, TypeError):
-            wire[name] = schema
-            continue
-        if not isinstance(entry["name"], str):
-            wire[name] = schema
-            continue
-        wire[entry["name"]] = entry["schema"]
-    return wire
+    A schema key is the env's own object and ``repr`` is that object's code, run here only to say
+    which argument the caller has to fix. Unguarded it replaces the validation error with its own
+    exception, which is the one outcome this check exists to prevent: the episode is left OPEN
+    with the terminal call the agent made answered by a traceback, and the harness above ends up
+    composing the task's outcome from a call it never carried. The refusal is the point and the
+    name is the decoration, so the name is what gives way — and nothing of the failure is echoed
+    into it, because this message goes to the caller and an env's exception text is not the
+    caller's business."""
+    try:
+        return repr(key)
+    except Exception:  # noqa: BLE001 — the refusal outranks its own decoration
+        return "<a key this schema cannot name>"
 
 
 def _json_safe(obj: Any) -> bool:
@@ -102,6 +85,55 @@ def _json_safe(obj: Any) -> bool:
         return True
     except (ValueError, TypeError):
         return False
+
+
+def _wire_form(spec: TaskSpec) -> TaskSpec:
+    """The published contract as the wire carries it: every advertised tool round-tripped through
+    JSON, so the values this episode *enforces* are the values a client is *shown*.
+
+    A schema is the env's object, and a JSON scalar in it may be a subclass — the models coerce
+    one away at construction but do not validate on assignment, so it reaches here verbatim. It
+    serializes like the scalar it subclasses, which is exactly what makes it invisible: a server
+    advertises ordinary text while this episode validates against something that answers a
+    comparison differently. The agent then sends what it was told to send and the terminal
+    transaction refuses it, which the harness above can only record as a wrong answer.
+
+    **Contained, and that is not a hole.** A schema that will not serialize keeps the env's own
+    object, because the only honest alternative here is to fail opening an episode that a caller
+    may have no other way to refuse — and refusing it is a decision for the layer that knows
+    whether an alternative exists. A stream makes that decision one step later and stops the run:
+    it compares this contract against the one its endpoint published, and a schema that cannot be
+    serialized cannot be compared either (see :meth:`TaskStream._require_published_manifest`), so
+    the task is never dispensed. What is left is a single-episode server enforcing exactly what it
+    advertises, which is what it did before."""
+    tools = []
+    changed = False
+    for manifest in spec.tools:
+        try:
+            # The whole advertised tool, not the schema alone. A name is identity here — the
+            # score terminal is found by looking this episode's own key up against the name a
+            # call arrives under — so a `str` subclass answering that comparison its own way is
+            # a terminal call dispatched as an ordinary step, sealing nothing and scoring
+            # nothing, on a tool the endpoint advertised as the way to finish the task.
+            wire = json.loads(
+                json.dumps(
+                    {
+                        "name": manifest.name,
+                        "description": manifest.description,
+                        "input_schema": manifest.input_schema,
+                    },
+                    allow_nan=False,
+                )
+            )
+        except (ValueError, TypeError):
+            tools.append(manifest)
+            continue
+        if not isinstance(wire["name"], str) or not isinstance(wire["description"], str):
+            tools.append(manifest)
+            continue
+        changed = True
+        tools.append(manifest.model_copy(update=wire))
+    return spec.model_copy(update={"tools": tools}) if changed else spec
 
 
 @dataclass
@@ -139,7 +171,7 @@ class ServedEpisode:
         sessions: Dict[str, MCPSession],
         opened: List[MCPSession],
         trace_path: Optional[Union[str, Path]],
-        score_schemas: Optional[Dict[str, Dict[str, Any]]] = None,
+        spec: TaskSpec,
         finalize_deadline: Optional[float] = None,
     ) -> None:
         self._env = env
@@ -164,10 +196,50 @@ class ServedEpisode:
         # take it.
         self._lock = asyncio.Lock()
 
+        # The task contract, described once and snapshotted here. Everything that publishes this
+        # episode's contract or enforces it reads THIS object: `describe()` hands it out, and the
+        # score schemas below — what a terminal call's arguments are validated against — are the
+        # schemas in it. Describing again per reader is what that replaces: `Env.describe` is
+        # ordinary env code and nothing obliges two calls to agree, so a stateful env could
+        # publish one contract to whoever frames the agent and enforce another when the agent
+        # acts on it. The agent then sends the arguments it was told to send, the seal refuses
+        # them against a schema it was never shown, and the task is recorded as a wrong answer.
+        #
+        # Copied rather than kept, because `describe` hands back the env's own object and an env
+        # is free to hold on to it: a snapshot the publisher can still reach is not a snapshot.
+        #
+        # And normalized, not merely copied, because a copy of an env's object is still the env's
+        # object. What a server advertises is this contract *as JSON*, and what the terminal
+        # transaction refuses a call against is the schema in here — so the two have to be the
+        # same value, not two renderings of one. A JSON scalar has subclasses, and the models do
+        # not validate on assignment, so a `const` that is a `str` subclass whose `__eq__` answers
+        # false is advertised as ordinary text and matches nothing the agent can send: the agent
+        # sends exactly what it was shown, the seal refuses it, and the row says it answered
+        # wrong. The round trip strips the subclass and leaves the value the wire carries.
+        #
+        # Normalized *first*, and the order is load-bearing. Copying is the one step here that
+        # runs code the env wrote — `__deepcopy__` belongs to whatever object is being copied —
+        # so a copy taken of the env's own spec lets an env decide whether an episode can be
+        # opened at all, on a value the round trip was about to replace with plain data anyway.
+        # Nothing contains that: it leaves `open_env` as the env's own exception, before the
+        # layer above has a task to attribute it to. Normalized first, every tool the round trip
+        # replaced is copied as data and that code is never reached.
+        #
+        # It is a narrowing and not a seal. What the round trip does not replace — a tool it
+        # could not serialize, and the advisory fields it does not touch — is still the env's
+        # object, and copying one still runs the env's code. The first is refused a step later
+        # by a stream, which cannot compare a contract it cannot serialize; the second is not,
+        # and is what a per-field detachment here would have to cover.
+        self._spec = _wire_form(spec).model_copy(deep=True)
+
         # ----- seal-before-verdict lifecycle -----
-        # The score-terminal tool name -> its advertised outer schema, from the manifest.
-        # Empty for every non-score env, so `call()` never leaves its legacy path there.
-        self._score_schemas: Dict[str, Dict[str, Any]] = dict(score_schemas or {})
+        # The score-terminal tool name -> its advertised outer schema, read off the *published
+        # contract* above (the manifest is the enforcement point, not a marker scan). At most one
+        # tool is `score`; empty for every non-score env, so `call()` never leaves its legacy
+        # path there.
+        self._score_schemas: Dict[str, Dict[str, Any]] = {
+            m.name: m.input_schema for m in self._spec.tools if m.terminal_kind == "score"
+        }
         # `finalize` is the env's terminal hook (None unless the env overrides it).
         self._finalize = getattr(env, "finalize", None)
         # A published `score` terminal is a promise: this call is authoritatively sealed and
@@ -298,16 +370,10 @@ class ServedEpisode:
                 for tool_config in await session.list_tools():
                     sessions[tool_config.name] = session
             env.begin_session(session_id, task_data)
-            # Read the score-terminal marker off the *published contract* (the manifest is the
-            # enforcement point, not a marker scan). At most one tool is `score`; capture its
-            # advertised schema so the seal path can validate args.
-            score_schemas = _wire_form(
-                {
-                    m.name: m.input_schema
-                    for m in env.describe(resolved_task).tools
-                    if m.terminal_kind == "score"
-                }
-            )
+            # The one description this episode ever asks for. Everything published about the task
+            # and everything enforced on it comes off this single answer — see the snapshot the
+            # constructor takes of it.
+            spec = env.describe(resolved_task)
             # Construct inside the try so the cleanup below also covers the constructor's own
             # fail-loud guard (a `score` manifest with no callable finalize): the sessions
             # opened above are released before the error propagates.
@@ -320,7 +386,7 @@ class ServedEpisode:
                 sessions,
                 opened,
                 trace_path,
-                score_schemas=score_schemas,
+                spec=spec,
                 finalize_deadline=finalize_deadline,
             )
         except BaseException:
@@ -402,7 +468,14 @@ class ServedEpisode:
             pass
 
     def describe(self) -> TaskSpec:
-        return self._env.describe(self._task_id)
+        """The contract this episode was opened on — the same snapshot for every reader, for as
+        long as the episode lives.
+
+        A copy per reader, because the snapshot is also what a terminal call's arguments are
+        validated against: handed out directly, whoever framed the agent could rewrite the schema
+        the seal enforces, or the tools a server had already registered, from under the episode
+        that is running on them."""
+        return self._spec.model_copy(deep=True)
 
     async def call(
         self, tool_name: str, arguments: Optional[Dict[str, Any]] = None
@@ -605,7 +678,17 @@ class ServedEpisode:
         downstream (a wrong type, an unknown extra field, a missing required key) is a normal
         error the harness can correct and re-submit, never a sealed finalizer that irrevocably
         scores 0. On top of the schema, a required string must be non-blank (schema
-        ``type: string`` accepts ``""``)."""
+        ``type: string`` accepts ``""``).
+
+        **Only the caller's request is answered here.** The schema is the env's own object and
+        validating against it runs the env's code — a key checked against the instance, a key
+        formatted into a message — so this can fail for reasons the caller could never fix. Those
+        are deliberately *not* turned into a validation error the caller is invited to retry:
+        nothing it sends will satisfy a contract that cannot be read, and answering as if it
+        might leaves the harness above composing an outcome for a task nobody could finish. They
+        propagate, and the layer that owns the task's record classifies it (see
+        :meth:`hgym.serve.stream.TaskStream.dispatch`). What does not propagate is the *name* of
+        an argument this refusal is about — see :func:`_named`."""
         schema = self._score_schemas.get(tool_name, {})
         try:
             jsonschema.validate(instance=args, schema=schema)
@@ -625,7 +708,7 @@ class ServedEpisode:
                 value = args.get(key)
                 if not isinstance(value, str) or not value.strip():
                     return self._validation_error(
-                        f"argument {key!r} must be a non-blank string"
+                        f"argument {_named(key)} must be a non-blank string"
                     )
         return None
 
