@@ -103,12 +103,7 @@ at construction, before anything is spent.
 A result row is durable before it is anything else — appended and fsync'd *before* it is
 published on :attr:`TaskStream.results` — and a stream that cannot write one stops rather than
 serving the rest of the queue over a record with a hole in it. Releasing the episode is a
-separate concern from recording it, and happens whether or not the row landed. A seal whose
-*caller* was cancelled before its row landed releases nothing and hands its claim back —
-nothing was lost there, the episode still holds the outcome, and the next drain or dispense
-records it. Once the row lands there is nothing left to hand back, so the rest of that seal —
-the release, and the stop an unheadlinable summary owes — finishes whatever became of the
-caller, rather than leaving an env nothing can reach or a stop nothing will report.
+separate concern from recording it, and happens whether or not the row landed.
 
 A row's ``observed`` is the env's own output, verbatim and authoritative: the wire items
 exactly as the episode published them — ``{name, value, level[, step]}``, ordered, every
@@ -159,6 +154,7 @@ from typing import (
     Literal,
     NamedTuple,
     Optional,
+    Protocol,
     Sequence,
     Tuple,
 )
@@ -174,7 +170,11 @@ from hgym.task import TaskSpec, ToolManifest
 
 __all__ = [
     "Closure",
+    "CompletedTask",
     "DispensedTask",
+    "Provenance",
+    "ProvenanceError",
+    "ProvenanceSpan",
     "QueueInfo",
     "ResultRow",
     "Score",
@@ -327,7 +327,25 @@ class ResultRow:
     ``score`` is ``None`` unless the closure was earned *and* the env's headline was readable,
     so aggregating ``score`` can never silently average in an infrastructure failure or a
     coerced verdict. ``observed`` keeps every item the env emitted, in wire form, for audit even
-    on an unscored row; it is evidence, never a score."""
+    on an unscored row; it is evidence, never a score. ``extensions`` is namespaced provenance
+    from :class:`Provenance` extensions, never merged into the fields above.
+
+    Each entry in ``extensions`` carries what one extension observed, and its members say which
+    halves of the span were recorded:
+
+    ============================  ==========================================================
+    ``extensions[namespace]``     what it means
+    ============================  ==========================================================
+    ``{dispensed, sealed}``       both halves ran; ``sealed`` is what ``finalize`` returned
+    ``{dispensed, error}``        ``finalize`` failed; ``error`` renders its failure
+    ``{dispensed}``               nothing was recorded after the dispense — the row came from
+                                  :func:`reconcile`, so ``closure`` is ``broker_abort``
+    ============================  ==========================================================
+
+    ``dispensed`` is always present, because a span that would not open refuses the dispense
+    outright. So a row written in-process always has exactly one of ``sealed`` or ``error``
+    beside it, and only a reconciled row has neither — but the discriminator a consumer should
+    read is ``closure``, which is typed and says the same thing about the whole row."""
 
     seq: int
     lease: str
@@ -338,6 +356,7 @@ class ResultRow:
     score: Optional[Score]
     observed: List[Dict[str, Any]] = field(default_factory=list)
     diagnostic: Optional[str] = None
+    extensions: Dict[str, Any] = field(default_factory=dict)
 
     def to_wire(self) -> Dict[str, Any]:
         return {
@@ -350,6 +369,7 @@ class ResultRow:
             "score": self.score.to_wire() if self.score is not None else None,
             "observed": [dict(item) for item in self.observed],
             "diagnostic": self.diagnostic,
+            "extensions": dict(self.extensions),
         }
 
     @classmethod
@@ -373,7 +393,68 @@ class ResultRow:
             ),
             observed=[dict(item) for item in (row.get("observed") or [])],
             diagnostic=row.get("diagnostic"),
+            extensions=dict(row.get("extensions") or {}),
         )
+
+
+class ProvenanceError(RuntimeError):
+    """An extension failed to open its span, so the task was not handed out."""
+
+
+@dataclass(frozen=True)
+class CompletedTask:
+    """What an extension learns about the task it spanned: where it sat in the queue, how it
+    ended, and what it scored.
+
+    Redacted — an extension never receives the row, the episode, the env, the lease registry, or
+    the target — and **detached**: this is built for one extension, from the summary re-parsed
+    out of its own JSON, and is not the object the row is written from.
+
+    ``frozen=True`` alone would not have been enough, and reading it as immutability is the
+    mistake worth naming. It stops an attribute being rebound; it says nothing about the list
+    behind :attr:`Score.feedback` or the dicts inside it. The row's ``observed`` and its
+    ``Score.feedback`` are one list, so an extension handed the row's own summary could
+    ``clear()`` it and rewrite both authoritative fields — or append a value that is not JSON
+    and take the whole row down with the append. Detaching is what makes the guarantee true:
+    whatever an extension does to what it is handed reaches nothing but its own copy, and not
+    the next extension's either."""
+
+    position: int
+    closure: Closure
+    score: Optional[Score]
+
+
+class ProvenanceSpan(Protocol):
+    """One extension's observation of one *dispense*.
+
+    A span exists because ``TaskRef`` is not a dispense identity: the queue may hold the same
+    task index twice, so a before/after pair keyed on the ref could not be correlated. The span
+    is the correlation."""
+
+    @property
+    def dispensed(self) -> Dict[str, Any]:
+        """What was observed before the task was handed out. Strict JSON.
+
+        Read once, and made durable with the dispense record itself, so it reaches the row
+        whether the task is sealed or the process is killed holding it."""
+        ...
+
+    async def finalize(self, completed: CompletedTask) -> Dict[str, Any]:
+        """What was observed after the task was sealed, scored and classified. Strict JSON."""
+        ...
+
+
+class Provenance(Protocol):
+    """An extension that records something extra about every dispensed task.
+
+    Its output is nested under ``ResultRow.extensions[namespace]`` and never merged into the
+    authoritative fields, so an extension can add to a row but never rewrite one."""
+
+    namespace: str
+
+    async def begin(self, ref: TaskRef) -> ProvenanceSpan:
+        """Open a span for one dispense, before the task is exposed."""
+        ...
 
 
 @dataclass
@@ -391,11 +472,11 @@ class _Live:
     # An entry only reaches the watchdog after the stamp, so the placeholder is never compared.
     started: float = 0.0
     sealed: bool = False
+    # Letting this task's episode go, held as a task. The entry outlives its own release — a seal
+    # publishes the stop it owes afterwards — so more than one caller can reach it; the first
+    # claims it and the rest await this rather than closing the episode again.
+    releasing: Optional["asyncio.Task[None]"] = None
     row: Optional[ResultRow] = None
-    # The row a seal composed but could not yet append, kept across a claim that was handed back
-    # so the retry writes the answer the first attempt reached rather than reading a fresh one off
-    # an episode that attempt has already ended (see `_record`). Cleared the moment `row` is set.
-    pending_row: Optional[ResultRow] = None
     # The tool that actually ended the task, so the stream knows whether the agent ended it
     # itself and how. Written by the one call that entered the terminal — never by a call the
     # episode tombstoned, which is `terminated` without having ended anything — and otherwise
@@ -428,13 +509,57 @@ class _Live:
     # agent played out and got wrong.
     call_error: Optional[BaseException] = None
     # Set when the env's headline could not be read off this task's feedback. The row still
-    # lands (unscored, with a diagnostic); the stop comes *after* the release, because a
+    # lands (unscored, with a diagnostic); the stop is raised *after* the release, because a
     # row that landed makes the seal final and this entry is the only handle on its episode.
     summary_error: Optional[_MalformedSummary] = None
-    # The tail a final row owes — the release, and that stop — held as a task so it belongs to
-    # the stream rather than to whichever caller happened to start it (see `_settled`). Set only
-    # where `row` already is, so an entry whose claim was handed back never has one over it.
-    settling: Optional["asyncio.Task[None]"] = None
+    # The single per-task finalization transition: the seal itself, held as a task. Whoever
+    # creates it owns the seal and everyone else awaits *that* task rather than starting their
+    # own, so a terminal call, the deadline and the drain — which all race for this — produce
+    # one classification, one row and one finalize per span however their callers are cancelled.
+    sealing: Optional["asyncio.Task[ResultRow]"] = None
+    # The row this task's seal composed, retained from the moment it is built until the durable
+    # append that commits it returns. A seal that failed hands its claim back so a later drain can
+    # retry — and what is retryable is the *append*, nothing above it. Composing a second time
+    # would call every extension's `finalize` again, and would re-read an episode the first
+    # attempt already force-terminated, filing a task the stream drained as one the agent ended
+    # itself. So the retry picks this up and goes straight to the write (see `_run_seal`).
+    pending_row: Optional[ResultRow] = None
+    # namespace -> the open span, and what it observed at dispense.
+    spans: Dict[str, ProvenanceSpan] = field(default_factory=dict)
+    dispensed_extensions: Dict[str, Any] = field(default_factory=dict)
+
+    @property
+    def released(self) -> bool:
+        """This task's episode has been let go: its env is closed, its MCP sessions are gone,
+        and nothing will ever call into it again.
+
+        The release is claimed once and *is* the task (see :meth:`TaskStream._release`), so this
+        asks whether that task has finished rather than whether one was started — an episode
+        still closing is still holding what it holds.
+
+        The entry can outlive this. A seal that failed on the storage keeps its composed row and
+        hands its claim back so a later drain can retry the *append*, and the drain releases the
+        episode in the meantime because a failed seal is not retried above the write. What is
+        left then is a row still owed to the file and nothing else — which is not an episode in
+        flight, and :meth:`TaskStream.queue_info` may not report it as one."""
+        return self.releasing is not None and self.releasing.done()
+
+    @property
+    def settled(self) -> bool:
+        """Nothing is owed for this task any more: its row is durable **and** the seal that
+        landed it has finished — the episode released, and whatever stop the row implies
+        recorded on the stream.
+
+        A row on its own does not say that. The append commits it in the middle of the seal,
+        with the episode still open behind it and a stop it may owe still unpublished, so an
+        entry read as finished at that moment lets the queue move past a task that is still
+        ending: the next dispense takes a slot the previous episode has not let go of, and it
+        takes it over a stop nobody has recorded yet (see :meth:`_run_seal`).
+
+        Neither does the claim on its own. A seal that failed, or one whose owner cancelled it,
+        is ``done()`` with no row, and that task is still owed one — the claim is handed back
+        for a later drain to retry."""
+        return self.row is not None and self.sealing is not None and self.sealing.done()
 
     def failed_to_end(self, exc: BaseException, source: _TerminalErrorSource) -> None:
         """Remember that this task has no verdict behind it, and where that came from.
@@ -633,7 +758,7 @@ def _failure_type(exc: BaseException) -> str:
 
 
 def _rendered_failure(exc: BaseException) -> str:
-    """Describe a failure an env supplied, without running its code unguarded.
+    """Describe a failure an env or an extension supplied, without running its code unguarded.
 
     Every message this module builds about a failure it has *caught* formats that failure — and
     formatting an exception runs code belonging to whoever raised it, a second time and outside
@@ -641,11 +766,11 @@ def _rendered_failure(exc: BaseException) -> str:
     message built lazily from state that is gone by the time it is asked for raises here rather
     than at the raise site. The second exception is not the one the handler caught, so it does
     not stay caught — it walks out of the handler carrying the handler's job with it. Measured,
-    at the agent's own terminal: the redacted constant a terminating call answers with becomes a
-    traceback, the stop is never published because its message is an *argument* to it, so the
-    queue is served on against an env that fails every task, and ``aclose()`` reports a clean
-    run having lost the row. A failure this module has already decided to contain may not be
-    un-contained by the act of writing it down.
+    at three sites in this module: the row a sealed episode is owed is never composed, the stop a
+    failed terminal transaction owes is never published (so the stream serves the rest of the
+    queue against the env that failed and reports a clean run), and the redacted constant a
+    terminating call answers with becomes a traceback at the agent. A failure this module has
+    already decided to contain may not be un-contained by the act of writing it down.
 
     So: the message is attempted, and on failure the type alone, and on failure a constant. What
     is never attempted twice is the caller's code — a fallback that formats the same object again
@@ -655,8 +780,8 @@ def _rendered_failure(exc: BaseException) -> str:
     so no cancellation can be *delivered* during it; one raised here was raised by the object
     being rendered, and letting that through would strand the seal exactly as a ``finalize`` that
     raises one does. ``SystemExit`` and ``KeyboardInterrupt`` still propagate, which is the line
-    this module already holds for the env callbacks themselves: an interpreter-level signal costs
-    the row loudly rather than being swallowed inside a diagnostic."""
+    this module already holds for the callbacks themselves: an interpreter-level signal costs the
+    row loudly rather than being swallowed inside a diagnostic."""
     name = _failure_type(exc)
     try:
         return f"{name}: {exc}"
@@ -956,7 +1081,27 @@ def reconcile(prov_dir: Path) -> List[ResultRow]:
     — a crash, a SIGKILL, a ``docker rm -f``. Recovery is this pairing, not a promise the stream
     could not keep: each unmatched dispense becomes a ``broker_abort`` row with **no score**, so
     it can be counted but never averaged. The rows are returned, not written: whether an
-    abandoned queue position is replayed is the caller's policy (``resume=True`` replays it)."""
+    abandoned queue position is replayed is the caller's policy (``resume=True`` replays it).
+
+    **Provenance survives with it.** Whatever each extension observed before the task went out is
+    in the dispense record (see :meth:`TaskStream._write_dispense`), so the row carries
+    ``extensions[namespace] = {"dispensed": ...}`` — the half of the span that actually happened,
+    and nothing else. There is no ``sealed`` member and no ``error`` one, because no ``finalize``
+    result was ever committed for this dispense, and inventing either would put a value on the row
+    that no extension produced. That absence is the shape, not an omission: an orderly row's entry
+    always carries exactly one of ``sealed`` or ``error`` beside its ``dispensed``, so
+    ``"sealed" not in entry and "error" not in entry`` holds for a reconciled entry and for no
+    other. A consumer does not need even that much — ``closure == "broker_abort"`` is produced
+    here and nowhere else in the module, and is the row-level fact the namespace shape follows
+    from.
+
+    It says the record has no sealed observation, never that ``finalize`` did not run: a kill
+    between the callback and the durable append leaves the extension's side effect out in the
+    world with nothing committed about it, which is the boundary an append-is-the-commit log has
+    and not one this can read past.
+
+    A dispense record written before provenance was recorded on it has no ``extensions`` member at
+    all, and reconciles to an empty map — the same answer a run with no extensions gives."""
     prov_dir = Path(prov_dir)
     sealed = {row.lease for row in read_results(prov_dir)}
     return [
@@ -969,6 +1114,10 @@ def reconcile(prov_dir: Path) -> List[ResultRow]:
             closure="broker_abort",
             score=None,
             diagnostic="dispensed but never sealed; the stream did not exit in an orderly way",
+            extensions={
+                namespace: {"dispensed": observed}
+                for namespace, observed in dict(record.get("extensions") or {}).items()
+            },
         )
         for record in read_dispenses(prov_dir)
         if record["lease"] not in sealed
@@ -1012,16 +1161,28 @@ class TaskStream:
             a call in flight — an env that is slow in a tool or in its finalizer cannot spend
             the clock and still be recorded as an ordinary seal. What it is not is a bound on the
             env: the seal it claims adopts an already-running finalization rather than forcing a
-            second terminal over the top of it (see :meth:`_record`), so the row lands when that
-            finalization returns. It says ``timeout``, but it says it late, and a finalization
-            that never returns leaves the task unrecorded and the drain waiting on it —
-            there is no outcome to record and nothing here may invent one. Bounding the env
+            second terminal over the top of it (see :meth:`_run_seal`), so the row lands when
+            that finalization returns. It says ``timeout``, but it says it late, and a
+            finalization that never returns leaves the task unrecorded and the drain waiting on
+            it — there is no outcome to record and nothing here may invent one. Bounding the env
             itself is the env's own timeout to set.
         resume: replay only the queue positions that have no result row yet. The stored
             provenance must have been recorded against this same queue — every recorded
             position is checked against it, and a disagreement raises rather than skipping a
             task that never ran. This is also the only way to serve into a directory that
             already holds records: without it they would be appended to, not continued.
+        provenance: extensions that record something extra per dispensed task, under
+            ``ResultRow.extensions[namespace]``. Namespaces must be unique, and must be exact
+            ``str`` — this is the key a row's provenance is filed under, so a value that could
+            answer a later comparison differently is refused rather than recorded.
+        provenance_timeout: how long this stream will *wait* for an extension's
+            ``begin``/``finalize`` before treating it as failed. A callback that hangs must not
+            wedge the queue, so at the bound the stream stops waiting: the callback is cancelled
+            and let go, and the dispense or the seal carries on without it. It is a bound on the
+            wait and not a kill — a callback that ignores its cancellation keeps running, and one
+            that never yields to the event loop at all cannot be pre-empted by anything
+            in-process (see :meth:`_with_timeout`). Finite and positive, for the same reason
+            ``deadline`` is; ``None`` waits indefinitely.
     """
 
     def __init__(
@@ -1033,6 +1194,8 @@ class TaskStream:
         max_in_flight: int = 1,
         deadline: Optional[float] = None,
         resume: bool = False,
+        provenance: Sequence[Provenance] = (),
+        provenance_timeout: Optional[float] = 30.0,
     ) -> None:
         if max_in_flight != 1:
             raise ValueError(
@@ -1047,6 +1210,49 @@ class TaskStream:
             raise ValueError(
                 f"deadline must be a finite positive number of seconds, got {deadline}; "
                 "pass None to serve without one"
+            )
+        if provenance_timeout is not None and not (
+            math.isfinite(provenance_timeout) and provenance_timeout > 0
+        ):
+            # The same hole, and the timer splits it in two: infinity bounds nothing, while NaN
+            # expires immediately (measured, not assumed: `asyncio.wait` returns nothing done at
+            # 0.0s against it), so every extension on every task would be filed as having timed
+            # out. Either way the rows are wrong and the run reports fine.
+            raise ValueError(
+                "provenance_timeout must be a finite positive number of seconds, got "
+                f"{provenance_timeout}; pass None to bound it at nothing"
+            )
+        # Read once, here, and kept: `namespace` is an ordinary attribute of an object the caller
+        # owns and can rebind at any time, so re-reading it at every dispense would validate one
+        # value and record under another. The names checked below are the names every row is
+        # keyed by (see `self._provenance`).
+        namespaces = [extension.namespace for extension in provenance]
+        for ns in namespaces:
+            # Exact `str`, subclasses included, for the reason `_require_task_ref` gives about a
+            # queue entry: this is an identity field, and a subclass brings its own
+            # `__eq__`/`__hash__`/`__len__` to every comparison later made on it. Both of the
+            # checks that follow are such comparisons, and neither of them lasts. `not ns` is one
+            # `__len__` call; the uniqueness check below is one round of hashing — while the
+            # dict writes they protect happen once per dispense and once per seal, on the far
+            # side of every containment boundary this module draws. An object that answers one
+            # way here and another way later is the whole hole, and both halves of it are worse
+            # than a refusal: two namespaces that pass as distinct and then compare equal file
+            # one extension's output under the other's name, with the loser's `finalize` never
+            # called, the row reporting success and nothing anywhere saying a name was involved;
+            # and one whose `__hash__` starts raising mid-run raises where the row is being
+            # *keyed*, outside the boundary that contains a failing extension, suppressing a row
+            # whose score terminal had already succeeded.
+            if type(ns) is not str or not ns:
+                raise ValueError(
+                    "every provenance extension needs a non-empty string namespace, got "
+                    f"{ns!r} ({type(ns).__name__}); it is the key this extension's output is "
+                    "filed under on every row, so it has to be a value whose identity cannot "
+                    "change after it has been checked"
+                )
+        if len(set(namespaces)) != len(namespaces):
+            raise ValueError(
+                f"provenance namespaces must be unique, got {namespaces}; two extensions "
+                "sharing one would overwrite each other's output"
             )
         # Checked, not merely rebuilt: these two fields are the identity every row of this run is
         # filed under (see :func:`_require_task_ref`).
@@ -1067,6 +1273,13 @@ class TaskStream:
         self._queue: List[TaskRef] = queue
         self._max_in_flight = max_in_flight
         self._deadline = deadline
+        # The validated names, bound to the extensions they were validated for. Uniqueness and
+        # non-emptiness are properties of *these* strings, and these are the ones the spans and
+        # the rows are keyed by — an extension that renames itself afterwards renames nothing.
+        self._provenance: Tuple[Tuple[str, Provenance], ...] = tuple(
+            zip(namespaces, provenance)
+        )
+        self._provenance_timeout = provenance_timeout
         self.prov_dir = Path(prov_dir)
         self.results_path = self.prov_dir / _RESULTS_FILE
         self.dispenses_path = self.prov_dir / _DISPENSES_FILE
@@ -1156,7 +1369,12 @@ class TaskStream:
             self._consumed = 0
             self._live: Dict[str, _Live] = {}
             self._results: List[ResultRow] = []
+            # A SHORT registry lock: it guards the live/queue bookkeeping and is never held across
+            # an episode call, an extension callback, or a seal.
             self._lock = asyncio.Lock()
+            # Serialises dispensing, which the registry lock cannot: a dispense opens spans and
+            # starts an episode, both of which must happen with the registry free.
+            self._dispense_lock = asyncio.Lock()
             self._closed = False
             self._stopped: Optional[_Stopped] = None
             self._catalog_closed = False
@@ -1542,6 +1760,15 @@ class TaskStream:
         )
 
     def queue_info(self) -> QueueInfo:
+        """Where the queue stands right now (see :class:`QueueInfo`).
+
+        ``in_flight`` counts *episodes*, not registry entries. The two stopped being the same
+        thing when an entry began outliving its own release: a seal that failed on the storage
+        keeps its composed row, hands its claim back so a later drain can retry the append, and
+        is released in the meantime — so its entry reads unsealed with its env already closed.
+        Counting it would report a stopped, closed stream as still serving a task, to a harness
+        that has nothing left to wait for and to an agent that has nothing left to answer. What
+        that entry is owed is a row, and ``in_flight`` is not where a row is reported."""
         return QueueInfo(
             remaining=sum(
                 1
@@ -1549,7 +1776,9 @@ class TaskStream:
                 if position not in self._done_positions
             ),
             consumed=self._consumed,
-            in_flight=sum(1 for live in self._live.values() if not live.sealed),
+            in_flight=sum(
+                1 for live in self._live.values() if not live.sealed and not live.released
+            ),
         )
 
     async def __aenter__(self) -> "TaskStream":
@@ -1565,10 +1794,7 @@ class TaskStream:
         -f`` runs none of it, which is what the dispense records exist for.
 
         The drain is *total*: an episode that cannot be sealed does not cost the others their
-        seal, nor the stream its catalog envs and its watchdog. A task whose row already
-        landed is joined here too, in case its seal's tail is still in flight (see
-        :meth:`_settled`) — so a stop that tail owes is reported *by* this call rather than
-        a moment after it returned.
+        seal, nor the stream its catalog envs and its watchdog.
 
         **Releasing is not part of the drain, and a lost caller cannot take it with them.** The
         catalog envs and the deadline watchdog are held by this object and by nothing else, so a
@@ -1591,17 +1817,23 @@ class TaskStream:
                 # `_closed` alone must not end the drain. A shutdown cancelled mid-seal leaves a
                 # dispensed task still unrecorded; returning early here would answer its durable
                 # dispense with nothing at all, and recovery would call an orderly shutdown a
-                # crash. So a retry finishes whatever the cancelled attempt left behind.
+                # crash. So a retry joins the seal the cancelled attempt left running and
+                # finishes the drain.
                 self._closed = True
-                for live in list(self._live.values()):
-                    try:
-                        await self._seal(live, forced="drained")
-                    except Exception:  # noqa: BLE001 — recorded on the stream; drain the rest
-                        # A *failed* seal, unlike a cancelled one, is not retried, so this drain
-                        # is the last chance to release what the entry still holds.
-                        # (Cancellation is a BaseException and passes through untouched, leaving
-                        # the entry for the retry the claim hand-back exists for.)
-                        await self._release(live)
+                live_now = list(self._live.values())
+            # Sealing happens with the registry free: it drives a terminal call and runs
+            # extension callbacks, neither of which may hold the lock. A deadline firing at the
+            # same moment meets the single per-task transition and takes its outcome instead of
+            # racing it.
+            for live in live_now:
+                try:
+                    await self._seal(live, forced="drained")
+                except Exception:  # noqa: BLE001 — recorded on the stream; drain the rest
+                    # A *failed* seal, unlike a cancelled one, is not retried, so this drain is
+                    # the last chance to release what the entry still holds. (Cancellation is a
+                    # BaseException and passes through untouched, leaving the task for the retry
+                    # the claim hand-back exists for.)
+                    await self._release(live)
         finally:
             await self._released()
         if self._stopped is not None:
@@ -1616,20 +1848,20 @@ class TaskStream:
         await asyncio.shield(releasing)
 
     async def _release_stream(self) -> None:
-        """Let go of what only this stream holds: its catalog envs, then its watchdog.
+        """Let go of what only this stream holds: its deadline watchdog, then its catalog envs.
 
-        The catalog is released under the lock, so a deadline that fired at the same moment
-        finishes the seal it started rather than losing its env from under it; the watchdog is
-        stopped after, once there is nothing left for it to seal. Each env is dropped as it is
-        closed, so a release that is interrupted anyway leaves the rest still owed rather than
-        marked done.
+        Stopped only after the drain has sealed everything, so a deadline that fires at the same
+        moment finishes the seal it started instead of being cancelled halfway through it. Each
+        env is dropped as it is closed, so a release that is interrupted anyway leaves the rest
+        still owed rather than marked done.
 
         Nothing here may raise. This runs in :meth:`aclose`'s ``finally`` as the stream's own
         claimed task, so an exception escaping it would replace the run-level report the drain
-        was about to make, and — because the claim is the task, and a failed one stays claimed —
-        would replace it on every later attempt too. The watchdog already records what it could
-        not seal (see :meth:`_watch_deadlines`); this is the backstop for a failure that did
-        not, and it is recorded rather than swallowed so the drain still reports it.
+        was about to make — here it would also leave every catalog env open, since they are let
+        go after the watchdog — and, because the claim is the task and a failed one stays
+        claimed, it would do the same on every later attempt. The watchdog already records what
+        it could not seal (see :meth:`_watch_deadlines`); this is the backstop for a failure
+        that did not, and it is recorded rather than swallowed so the drain still reports it.
 
         "Nothing may raise" includes ``CancelledError``, which an env's ``close`` can raise like
         any other exception. This task is joined through a shield and nothing in this module ever
@@ -1639,15 +1871,6 @@ class TaskStream:
         the same cancelled task and raises again. A shutdown with no orderly exit, for a teardown
         failure that is not the run's outcome."""
         cancellation = _Cancellation()
-        async with self._lock:
-            for name in list(self._catalog):
-                env = self._catalog.pop(name)
-                try:
-                    await env.close()
-                except BaseException as exc:  # noqa: BLE001 — teardown is best-effort
-                    if _must_propagate(exc, cancellation):
-                        raise
-            self._catalog_closed = True
         watchdog, self._watchdog = self._watchdog, None
         if watchdog is not None:
             watchdog.cancel()
@@ -1667,12 +1890,23 @@ class TaskStream:
                         "may never have been enforced"
                     ),
                 )
+        for name in list(self._catalog):
+            env = self._catalog.pop(name)
+            try:
+                await env.close()
+            except BaseException as exc:  # noqa: BLE001 — teardown is best-effort
+                if _must_propagate(exc, cancellation):
+                    raise
+        self._catalog_closed = True
 
     async def get_task(self) -> Optional[DispensedTask]:
         """Dispense the next queued task, starting its episode. ``None`` once exhausted.
 
         Pulling a new task while one is still live abandons it, so the abandoned episode is
-        sealed and scored first: every dispensed task lands exactly one row.
+        sealed and scored first: every dispensed task lands exactly one row. One whose seal is
+        already running is waited for rather than abandoned — a task is not finished with its
+        slot until its episode has been released and any stop it owes recorded, and the next
+        task is not dispensed until then.
 
         The tools it lists are the ones the endpoint actually serves, and the episode is checked
         against them before it is dispensed (see :meth:`_require_published_manifest`) — the
@@ -1688,14 +1922,20 @@ class TaskStream:
         other caller gets, rather than as the raw storage error one abandoned episode happened
         to raise."""
         self._start_watchdog()
-        async with self._lock:
-            self._require_open()
-            # Every entry, not only the unsealed ones: a task whose row landed can still owe the
-            # tail of its seal, if the caller that started it went away mid-release. `_seal`
-            # joins that tail and returns the row. Stepping over it would open the next episode
-            # while the last one was still being torn down — and, for a row this record cannot
-            # headline, would dispense a task over a stop that was one await from being set.
-            for live in list(self._live.values()):
+        async with self._dispense_lock:
+            async with self._lock:
+                self._require_open()
+                # Every entry that still owes something, not merely the ones no seal has claimed:
+                # a seal already running is one this dispense must *join*, not step over. It is
+                # still holding the slot this dispense wants — its episode and env are open until
+                # its release returns — and the stop an unheadlinable summary or a failed terminal
+                # owes is published at the end of that seal, after the row. Taking the next
+                # position while one is in flight serves the queue past an integrity failure the
+                # stream has already found and hands out a second episode against
+                # `max_in_flight=1`. Joining is not restarting: a claimed seal is awaited, and
+                # only one whose claim was handed back is retried (see :meth:`_seal`).
+                unsettled = [live for live in self._live.values() if not live.settled]
+            for live in unsettled:
                 try:
                     await self._seal(live, forced="drained")
                 except Exception:  # noqa: BLE001 — recorded on the stream; reported just below
@@ -1704,14 +1944,21 @@ class TaskStream:
                     # drain releases here. (Cancellation is a BaseException and passes through
                     # untouched, leaving the entry for the retry the claim hand-back exists for.)
                     await self._release(live)
-            self._require_open()
 
-            position = self._next_position()
-            if position is None:
-                return None
-            ref = self._queue[position]
-            # Cancellation between here and the dispense record must leave the position
-            # untouched: nothing has been handed out, so it stays replayable.
+            async with self._lock:
+                # Rechecked because a seal above may have stopped the stream: dispensing over
+                # that would serve the rest of the queue against a record already missing an
+                # outcome.
+                self._require_open()
+                position = self._next_position()
+                if position is None:
+                    return None
+                ref = self._queue[position]
+
+            # Everything below is outside the registry lock, and none of it has been exposed
+            # yet: if a span refuses to open, the episode never starts and the position is
+            # still owed. Spans first, so nothing needs cleaning up when one fails.
+            spans, dispensed_extensions = await self._begin_spans(ref)
             episode = await ServedEpisode.open_env(
                 self._env_for(ref.env), env_name=ref.env, task=ref.task_idx
             )
@@ -1727,8 +1974,10 @@ class TaskStream:
                 # unchecked one.
                 instructions, budget = self._require_framable(ref.env, spec)
             except BaseException:
-                # Nothing was dispensed: the position is still owed and no row is due. The check
-                # sits *above* the dispense record deliberately — a durable record of a task that
+                # Nothing has been exposed, so this is the same cleanup the closed-mid-dispense
+                # path below does: release the episode and drop the spans without finalizing —
+                # no task was dispensed, so there is no outcome to close them against. The check
+                # sits *above* `_write_dispense` deliberately: a durable record of a task that
                 # was never handed out would read back through `reconcile` as a crash.
                 #
                 # The baseline is taken here, inside the handler, so it asks only about the
@@ -1745,8 +1994,9 @@ class TaskStream:
             # Built and proved before the position is consumed and the episode registered: what
             # the agent is handed is this object, and every field of it has to be one the
             # endpoint can answer with (see :meth:`_deliverable_framing`). A refusal here is the
-            # same shape as a drifted manifest — the position is still owed, no row is due, and
-            # the episode is released by the handler above.
+            # same shape as a drifted manifest — the position is still owed, no row is due, the
+            # episode is released here, and the spans opened for it are dropped without
+            # finalizing: no task was dispensed, so there is no outcome to close them against.
             try:
                 framing = self._deliverable_framing(ref, instructions, budget)
             except BaseException:
@@ -1757,63 +2007,93 @@ class TaskStream:
                     if _must_propagate(exc, cancellation):
                         raise
                 raise
-            live = _Live(
-                lease=secrets.token_hex(16),
-                seq=self._seq + 1,
-                position=position,
-                ref=ref,
-                episode=episode,
-            )
-            # Durable BEFORE the task is exposed: after this point a crash is reconcilable,
-            # because the record says a task was handed out and no result answers it. And
-            # nothing is committed before it: a position stepped over a write that failed is a
-            # task quietly dropped from the queue, its episode absent from the registry that is
-            # the only handle on it, and a drain that reports a clean run over the hole.
-            try:
-                self._write_dispense(live)
-            except BaseException as exc:
-                # Nothing was handed out, so this position is still owed and no row is due —
-                # the same shape as the manifest refusal above. But a provenance directory that
-                # cannot be appended to is not a per-task problem: the next dispense record and
-                # every result row after it go to that same directory, so the run can no longer
-                # be a record of the queue. Serving on would spend the rest of the queue against
-                # a file that already lost a task, so the stream stops and says so at both
-                # boundaries. (Cancellation is excluded, as everywhere else here: nothing failed.)
-                #
-                # The close below is teardown: what it raises, cancellation included, may not
-                # stand in for the failure being reported just under it.
+
+            undispensed: Optional[ServedEpisode] = None
+            unrecorded: Optional[BaseException] = None
+            async with self._lock:
+                # Rechecked in the very critical section that publishes the live record, because
+                # opening the spans and the episode above ran with the registry free: a shutdown
+                # can start and *finish* inside that window. Publishing afterwards would hand out
+                # a task the completed drain never saw and the stopped watchdog is not watching,
+                # so its durable dispense could never be answered — an orderly exit that reads
+                # back as a crash. Nothing has been exposed yet, so the dispense is abandoned and
+                # the caller gets the same answer a closed stream gives up front. The spans opened
+                # for it are dropped without finalizing: no task was ever dispensed, so there is
+                # no outcome to close them against.
+                if self._closed:
+                    undispensed = episode
+                else:
+                    live = _Live(
+                        lease=secrets.token_hex(16),
+                        seq=self._seq + 1,
+                        position=position,
+                        ref=ref,
+                        episode=episode,
+                        spans=spans,
+                        dispensed_extensions=dispensed_extensions,
+                    )
+                    # Durable BEFORE the task is exposed: after this point a crash is
+                    # reconcilable, because the record says a task was handed out and no result
+                    # answers it. And nothing is committed before it: a position stepped over a
+                    # write that failed is a task quietly dropped from the queue, its episode
+                    # absent from the registry that is the only handle on it, and a drain that
+                    # reports a clean run over the hole.
+                    try:
+                        self._write_dispense(live)
+                    except BaseException as exc:
+                        # Nothing was handed out, so this position is still owed and no row is
+                        # due — the same shape as the manifest refusal above. But a provenance
+                        # directory that cannot be appended to is not a per-task problem: the
+                        # next dispense record and every result row after it go to that same
+                        # directory, so the run can no longer be a record of the queue. Serving
+                        # on would spend the rest of the queue against a file that already lost
+                        # a task, so the stream stops and says so at both boundaries.
+                        # (Cancellation is excluded, as everywhere else here: nothing failed.)
+                        if not isinstance(exc, asyncio.CancelledError):
+                            self._stop(
+                                exc,
+                                dispensing=(
+                                    "this stream stopped: a task could not be recorded as "
+                                    f"dispensed to {self.dispenses_path}, so a crash from here "
+                                    "on could not be told apart from a task that was never "
+                                    "handed out"
+                                ),
+                                closing=(
+                                    "this stream could not record a dispense to "
+                                    f"{self.dispenses_path}; the queue was not served to the end"
+                                ),
+                            )
+                        # Closed outside the lock, with the dispense that was refused before
+                        # it: same window, same teardown, one path.
+                        undispensed = episode
+                        unrecorded = exc
+                    else:
+                        # Synchronous from the write down, so no cancellation point can
+                        # separate the record on disk from the bookkeeping that answers for
+                        # it — and so the agent's clock and the moment the task becomes
+                        # visible are the same instant. Started here rather than where the
+                        # entry was built because the durable dispense sits between the two:
+                        # a slow volume would otherwise charge its own latency to the agent,
+                        # which cannot see the task until this returns, and a write slower
+                        # than the deadline would hand out a task already out of time.
+                        live.started = time.monotonic()
+                        self._position = position + 1
+                        self._seq = live.seq
+                        self._consumed += 1
+                        self._live[live.lease] = live
+            if undispensed is not None:
+                # Same shape as the manifest refusal above: this close is teardown, and its
+                # failure — cancellation included — may not stand in for the answer the caller
+                # is owed just below.
                 cancellation = _Cancellation()
                 try:
-                    await episode.close()
-                except BaseException as error:  # noqa: BLE001 — teardown must not mask the failure
-                    if _must_propagate(error, cancellation):
+                    await undispensed.close()
+                except BaseException as exc:  # noqa: BLE001 — teardown of a task nobody ever saw
+                    if _must_propagate(exc, cancellation):
                         raise
-                if not isinstance(exc, asyncio.CancelledError):
-                    self._stop(
-                        exc,
-                        dispensing=(
-                            "this stream stopped: a task could not be recorded as dispensed to "
-                            f"{self.dispenses_path}, so a crash from here on could not be told "
-                            "apart from a task that was never handed out"
-                        ),
-                        closing=(
-                            "this stream could not record a dispense to "
-                            f"{self.dispenses_path}; the queue was not served to the end"
-                        ),
-                    )
-                raise
-            # Synchronous from here down, so no cancellation point can separate the record on
-            # disk from the bookkeeping that answers for it — and so the agent's clock and the
-            # moment the task becomes visible are the same instant. Started here rather than
-            # where the entry was built because the durable dispense sits between the two: a
-            # slow volume would otherwise charge its own latency to the agent, which cannot see
-            # the task until this returns, and a write slower than the deadline would hand out a
-            # task already out of time.
-            live.started = time.monotonic()
-            self._position = position + 1
-            self._seq = live.seq
-            self._consumed += 1
-            self._live[live.lease] = live
+                if unrecorded is not None:
+                    raise unrecorded
+                raise RuntimeError("this stream is closed")
             return framing
 
     async def dispatch(self, tool: str, arguments: Optional[Dict[str, Any]] = None) -> ToolResult:
@@ -1850,12 +2130,10 @@ class TaskStream:
                     {"error": "no active task", "hint": f"call `{_GET_TASK_TOOL}` first"}
                 )
             )
-        # Outside the stream's lock, deliberately. The episode has its own, and holding a
-        # stream-wide one across an awaited env call hands the env the stream's clock: the
-        # deadline needs this lock to arbitrate, so an env that is slow in a tool or in its
-        # finalizer would push its own task past the deadline and still be recorded as an
-        # ordinary seal, with a score. A task that outran the wall clock the harness set must not
-        # be indistinguishable from one that did not.
+        # Outside the registry lock: the episode has its own lock, holding a stream-wide one
+        # across an awaited env call would serialise the whole stream behind one tool, and the
+        # deadline needs that lock to arbitrate — an env slow in a tool or in its finalizer must
+        # not be able to spend the wall clock and still be recorded as an ordinary seal.
         cancellation = _Cancellation()
         try:
             call = await live.episode.call(tool, dict(arguments or {}))
@@ -1884,33 +2162,31 @@ class TaskStream:
                 if live.call_error is None:  # the first loss explains the row
                     live.call_error = exc
                 raise
-            async with self._lock:
-                # The episode ended and *then* the call failed: the terminal is committed and
-                # the feedback the episode was about to hand over is what raised. So a row is
-                # still owed — it lands carrying whatever feedback survived, which is what makes
-                # the loss legible — and the stream stops. A row with no readable outcome is the
-                # same eval-integrity failure whether the value is unusable or missing, and an
-                # env that raises here raises for every task in the queue; without the stop a
-                # solved task is recorded unscored and `aclose()` reports a clean run.
-                #
-                # The failure is described through the guarded funnel: this message is an
-                # *argument* to the stop, so a failure that cannot be formatted would take the
-                # stop, the row and the redacted answer with it — see :func:`_rendered_failure`.
-                rendered = _rendered_failure(exc)
-                self._stop(
-                    exc,
-                    dispensing=(
-                        f"this stream stopped: env {live.ref.env!r} raised while ending a task "
-                        f"({rendered}), so that task's row carries no outcome "
-                        "and no further task could be scored either"
-                    ),
-                    closing=(
-                        f"this stream stopped before its queue was served: env "
-                        f"{live.ref.env!r} raised while ending a task "
-                        f"({rendered})"
-                    ),
-                )
-                await self._seal_redacted(live)
+            # The episode ended and *then* the call failed: the terminal is committed and the
+            # feedback the episode was about to hand over is what raised. So a row is still owed
+            # — it lands carrying whatever feedback survived, which is what makes the loss
+            # legible — and the stream stops. A row with no readable outcome is the same
+            # eval-integrity failure whether the value is unusable or missing, and an env that
+            # raises here raises for every task in the queue; without the stop a solved task is
+            # recorded unscored and `aclose()` reports a clean run.
+            # Rendered once, and guarded: an env's exception formats through the env's own code,
+            # and letting that escape here would take the stop, the seal and the redacted answer
+            # with it — see :func:`_rendered_failure`.
+            rendered = _rendered_failure(exc)
+            self._stop(
+                exc,
+                dispensing=(
+                    f"this stream stopped: env {live.ref.env!r} raised while ending a task "
+                    f"({rendered}), so that task's row carries no outcome "
+                    "and no further task could be scored either"
+                ),
+                closing=(
+                    f"this stream stopped before its queue was served: env "
+                    f"{live.ref.env!r} raised while ending a task "
+                    f"({rendered})"
+                ),
+            )
+            await self._seal_redacted(live)
             return ToolResult(content=_TASK_OVER)
         if not call.terminated:
             return ToolResult(content=json.dumps({"content": call.content, "terminated": False}))
@@ -1920,15 +2196,11 @@ class TaskStream:
             # is `terminated` too — so a `terminate` racing an accepted `submit` returns first
             # (the submission is still in its finalizer), and taking the ending from whichever
             # response reaches the seal first would file the agent's earned, scored submission
-            # as a task it aborted. Stamped synchronously, before this call contends for the
-            # lock, so whoever runs the seal sees it. The payload is not taken from here at all:
-            # it is the core's to stamp, and `_record` reads it off the episode.
+            # as a task it aborted. Stamped synchronously, the moment the call returns, so
+            # whoever claims the seal already sees it. The payload is not taken from here at
+            # all: it is the core's to stamp, and `_record` reads it off the episode.
             live.terminal_tool = tool
-        # Back under the lock to seal: the deadline, the drain and the next dispense all reach
-        # `_seal`, and at this commit the lock is what lets exactly one of them run it. Whichever
-        # arrived first has already claimed this task — a landed row is joined, not repeated.
-        async with self._lock:
-            await self._seal_redacted(live)
+        await self._seal_redacted(live)
         return ToolResult(content=_TASK_OVER)
 
     # ----- the deadline -----
@@ -1968,24 +2240,27 @@ class TaskStream:
                 if self._closed:
                     return
                 now = time.monotonic()
-                for live in list(self._live.values()):
-                    if not live.sealed and now - live.started >= deadline:
-                        try:
-                            await self._seal(live, forced="timeout")
-                        except Exception as exc:  # noqa: BLE001 — recorded, not raised at nobody
-                            self._stop(
-                                exc,
-                                dispensing=(
-                                    "this stream stopped: a dispensed task could not be sealed "
-                                    "when its deadline elapsed, so the run's record is missing "
-                                    "an outcome"
-                                ),
-                                closing=(
-                                    "this stream could not seal every dispensed task; the run's "
-                                    "record is incomplete"
-                                ),
-                            )
-                            return
+                expired = [
+                    live
+                    for live in self._live.values()
+                    if not live.sealed and now - live.started >= deadline
+                ]
+            for live in expired:
+                try:
+                    await self._seal(live, forced="timeout")
+                except Exception as exc:  # noqa: BLE001 — recorded, not raised at nobody
+                    self._stop(
+                        exc,
+                        dispensing=(
+                            "this stream stopped: a dispensed task could not be sealed when "
+                            "its deadline elapsed, so the run's record is missing an outcome"
+                        ),
+                        closing=(
+                            "this stream could not seal every dispensed task; the run's "
+                            "record is incomplete"
+                        ),
+                    )
+                    return
 
     # ----- sealing -----
 
@@ -2025,47 +2300,69 @@ class TaskStream:
         ``forced`` is set when the *stream* ended the task rather than the agent — an orderly
         drain or abandonment (``drained``) or the deadline (``timeout``).
 
-        A row that could not be persisted at all stops the stream (see :meth:`_require_open`):
-        the record is missing an outcome the agent earned, and every further task would be
-        served over that hole. So does a row that cannot be *summarized*: a ``success``/``reward``
-        that is wrong-typed, or published twice, is a property of the env rather than of the task,
-        so it would recur for the whole queue.
+        A terminal call, the deadline and the drain all race for this. They meet at one shared
+        per-task transition — the seal itself, held as a task: the first claims it, the rest
+        await that same task and take its outcome.
 
-        **A seal abandoned before its row landed hands the claim back; one abandoned after it
-        does not.** ``row`` is the finality marker, so everything downstream of it — the release,
-        and the stop an unheadlinable summary owes — is the tail of a seal that already happened
-        and can only be *finished*, never retried. It therefore runs as the stream's own work
-        rather than the caller's; see :meth:`_settled`.
+        The claim is the *running seal*, not merely a flag, because a caller can go away
+        mid-seal. Its cancellation must not restart the work: a restarted seal calls each
+        extension's ``finalize`` a second time, and it re-reads an episode the first attempt has
+        already terminated, which reclassifies a task the stream drained as one the agent sealed
+        or aborted itself — an outcome the agent never earned, recorded as one it did. So the
+        caller's await is shielded: the seal runs to completion on its own and a later caller
+        joins it. Only a seal that genuinely *failed* hands the claim back, so a later drain
+        retries it rather than waiting forever on a transition that never completed — an entry
+        left claimed with no row is invisible to a later drain, to ``get_task`` and to
+        ``queue_info``, so its durable dispense would be reported as a crash that never
+        happened.
 
-        What a retry retries is the durable append and nothing above it. The composed row is
-        retained on the entry across the hand-back, so a task the deadline or the drain ended is
-        not reclassified from an episode the first attempt has already ended (see
-        :meth:`_record`)."""
-        if live.row is not None:
-            # A final row whose tail a lost caller left in flight: join it rather than stepping
-            # over it, so nobody reads this entry as settled ahead of the stop it may still owe.
-            await self._settled(live)
-            return live.row
-        # Claim the seal before any await: the deadline, a terminal call and the drain can all
-        # reach here, and exactly one of them may finalize this task. The row is what makes the
-        # claim final.
-        live.sealed = True
+        What that retry retries is the durable append and nothing above it. Both objections in
+        the paragraph above are just as true of a seal that failed on the storage as of one whose
+        caller was cancelled, so the composed row is retained on the entry across the hand-back
+        and the retry starts at the write (see :meth:`_run_seal`).
+
+        **What a later caller joins is the claim, never the row.** The row becomes durable in the
+        middle of the seal — the episode is still open behind it and any stop it owes is still
+        unrecorded — so answering with it there would let a drain report a shutdown complete
+        while an episode was still releasing, and let the next dispense take a slot over a stop
+        nobody had published yet. The claim covers the whole seal, tail included, so joining it
+        is joining that tail too; once the seal is over, joining it is free and hands back the
+        same row it recorded.
+
+        A failed seal also stops the stream (see :meth:`_require_open`): the row it
+        was going to write is lost, and every further task would be served over that hole. So
+        does a row that landed but cannot be *summarized*: a ``success``/``reward`` that is
+        wrong-typed, or published twice, is a property of the env rather than of the task, so it
+        would recur for the whole queue."""
+        async with self._lock:
+            sealing = live.sealing
+            if sealing is None:
+                sealing = live.sealing = asyncio.ensure_future(self._run_seal(live, forced))
+                live.sealed = True
+                # Bookkeeping only: a seal that fails while its caller is being cancelled has no
+                # awaiter at that instant, and asyncio would log it as unretrieved (see
+                # `_mark_retrieved`). The failure itself is still reported the usual way, by the
+                # next caller to join this same task.
+                sealing.add_done_callback(_mark_retrieved)
         try:
-            row = await self._record(live, forced)
-        except BaseException as exc:
-            # A seal abandoned partway — a cancelled drain — must hand the claim back. An entry
-            # left marked sealed with no row is invisible to a later drain, to `get_task` and to
-            # `queue_info`, so its durable dispense would end up reported as a crash that never
-            # happened. Handing it back makes the task sealable again instead.
-            if live.row is None:
-                live.sealed = False
-            # A seal that *failed* has lost a row rather than deferred it, so stop dispensing:
-            # the rest of the queue would be served over a record missing an outcome the agent
-            # earned. Cancellation is excluded — that one really is deferred, and the hand-back
-            # above is what lets a later drain finish it.
-            if not isinstance(exc, asyncio.CancelledError):
+            return await asyncio.shield(sealing)
+        except BaseException:
+            failure = (
+                sealing.exception()
+                if sealing.done() and not sealing.cancelled()
+                else None
+            )
+            if failure is not None:
+                async with self._lock:
+                    if live.sealing is sealing and live.row is None:
+                        live.sealing = None
+                        live.sealed = False
+                # The seal *failed* rather than being deferred, so a row is lost: stop
+                # dispensing, or the rest of the queue is served over a record missing an
+                # outcome the agent earned. A merely cancelled seal never reaches here — that
+                # one is finished by whoever drains next.
                 self._stop(
-                    exc,  # the first loss is the one that explains the run
+                    failure,  # the first loss is the one that explains the run
                     dispensing=(
                         "this stream stopped: a dispensed task could not be recorded to "
                         f"{self.results_path}, so the run's record is missing an outcome the "
@@ -2077,169 +2374,157 @@ class TaskStream:
                     ),
                 )
             raise
-        await self._settled(live)
-        if live.summary_error is not None:
-            # Recorded on the stream by the tail above, which also released the episode; all
-            # that is left here is telling this caller. Raised *after* the release because a row
-            # that landed makes the seal final: a later `_seal` returns that row without reaching
-            # the drain's release, so raising ahead of it would strand this episode's env.
-            raise live.summary_error
-        return row
-
-    async def _settled(self, live: _Live) -> None:
-        """Wait for everything a landed row owes — **without being able to abandon it**.
-
-        The release and the summary stop are consequences of a row that is already durable, so
-        they belong to the stream rather than to whichever of the drain, the next dispense or a
-        retried call reached them. A caller can be cancelled at any await it owns, and both of
-        these are awaits: an MCP client that gave up on its request would otherwise leave the
-        episode's env open with its registry entry already dropped — unreachable by any later
-        drain, so its MCP sessions and subprocesses are held for the life of the process — and,
-        for a summary this record cannot headline, would skip the stop that is the whole reason
-        the offending row was written first. That row's ``success`` is ``null``, which in a run
-        that *finished* means exactly one thing: the env published no such field. Losing the stop
-        turns it into the other thing, and the run reports itself complete carrying it.
-
-        So the tail is run as a task and awaited through a shield: this caller's cancellation
-        reaches the caller and stops there, while the work goes on to completion. It is claimed
-        once and every later arrival joins that same task, so it never runs twice."""
-        settling = live.settling
-        if settling is None:
-            settling = live.settling = asyncio.ensure_future(self._settle(live))
-        await asyncio.shield(settling)
-
-    async def _settle(self, live: _Live) -> None:
-        """The claimed tail: release the episode, then stop the stream if the row it recorded
-        reports an env that failed while the task was being ended — either while the stream drove
-        the terminal, or in a summary this record cannot headline.
-
-        The two are ordered and the order is not cosmetic. The row landed first, deliberately:
-        ``observed`` is authoritative and is written verbatim, so every offending item is in
-        ``results.jsonl`` as durable evidence of *which* env published *what*, with ``diagnostic``
-        saying why the row is unscored — an exception string dies with the process. The release
-        comes next, and only then the stop, so that no reader can find this entry gone from the
-        registry while the stream still looks like it is serving.
-
-        Both stops mean the same thing about the rest of the queue: what failed is a property of
-        the env rather than of this task, so it would recur for every task still to be served."""
-        await self._release(live)
-        # A promoted `call_error` is deliberately **not** one of these (see :meth:`_compose_row`),
-        # and the source is what says which this is — never the exception object, which an env may
-        # raise on both boundaries. What a lost call owed the record is the row it already
-        # produced: unscored, saying the call was lost, which is the whole property — an outcome
-        # nothing the agent did produced cannot be averaged into a benchmark. Stopping on top of
-        # that spends the rest of the queue on one lost call, and the failure it names is one the
-        # *next* task need not have: a mid-episode call is where a transient fault lands, and a
-        # session that hiccups once would end a 480-task run. A terminal that failed is the
-        # opposite case and still stops here — there the env is on its way out of a task it had
-        # already ended, and every task of that env leaves the same way.
-        if live.terminal_error is not None and live.terminal_error_source == "terminal":
-            exc = live.terminal_error
-            # Guarded, and for more than tidiness: this runs *after* the append, so an unguarded
-            # format would leave a durable row standing beside a stop that was never published,
-            # and the queue would serve on against the env that failed.
-            rendered = _rendered_failure(exc)
-            self._stop(
-                exc,
-                dispensing=(
-                    f"this stream stopped: env {live.ref.env!r} failed while the stream ended a "
-                    f"task ({rendered}), so that task's row carries no outcome "
-                    "and no further task could be scored either"
-                ),
-                closing=(
-                    f"this stream stopped before its queue was served: env {live.ref.env!r} "
-                    f"failed while the stream ended a task ({rendered})"
-                ),
-            )
-        if live.summary_error is not None:
-            self._stop(
-                live.summary_error,
-                dispensing=(
-                    f"this stream stopped: env {live.ref.env!r} published a summary value this "
-                    f"record cannot headline ({live.summary_error}), so no further task can be "
-                    "scored against it"
-                ),
-                closing=(
-                    f"this stream stopped before its queue was served: env {live.ref.env!r} "
-                    f"published a summary value this record cannot headline "
-                    f"({live.summary_error})"
-                ),
-            )
 
     async def _release(self, live: _Live) -> None:
-        """Let go of a task's episode (and its env) and drop it from the registry.
+        """Let go of a task's episode (and its env), leaving its registry entry in place.
 
         Separate from recording it, and reached whether or not the row landed: the episode owns
         MCP sessions and an env, this entry is the only handle on either, and a seal that failed
         is not retried.
 
-        Nothing here may raise, ``CancelledError`` included, and that one costs most. An env's
-        ``close`` can raise it, and on the settled path this runs inside the tail task that
-        :meth:`_settled` joins through a shield — so one observed here is the env's, not a
-        caller's. Out it would go into the middle of :meth:`_seal`, PAST the durable append and
-        BEFORE the stop an unheadlinable summary still owes: the terminating call would answer
-        the agent with a traceback instead of the constant, the stop would never be published,
-        and ``aclose`` would then report a clean run over a row this record has already refused
-        to headline."""
-        cancellation = _Cancellation()
-        try:
-            await live.episode.close()
-        except BaseException as exc:  # noqa: BLE001 — the row is settled; teardown is best-effort
-            if _must_propagate(exc, cancellation):
-                raise
-        finally:
-            self._live.pop(live.lease, None)
+        **Claimed once, and every later arrival joins that same release** — the shape
+        :meth:`_released` uses for the stream's own teardown and :meth:`_seal` for the seal,
+        applied per episode. Two callers can reach here for one entry now that the entry outlives
+        its release: a seal publishes the stop it owes *after* letting the episode go, so whoever
+        joins that seal arrives behind a release already running, and a retry of a failed append
+        runs the tail a second time. A flag would stop the second close but let its caller past a
+        teardown still in flight — which is the same 'finished with the slot' mistake one level
+        down, and would let a dispense proceed while an env was still closing. So the second
+        caller waits on the first, and a cancelled one leaves it running rather than taking it
+        along."""
+        releasing = live.releasing
+        if releasing is None:
+            releasing = live.releasing = asyncio.ensure_future(_close_episode(live))
+        await asyncio.shield(releasing)
 
-    async def _record(self, live: _Live, forced: Optional[Closure]) -> ResultRow:
-        """Bring the episode to an end, classify it, and append its one durable row.
+    async def _run_seal(self, live: _Live, forced: Optional[Closure]) -> ResultRow:
+        """The claimed seal: end the episode, classify, finalize the spans, record the row.
 
-        Two phases, and only the second is retryable. Composing the row ends the episode and
-        reads its verdict, which happens once per dispensed task and cannot be undone. Appending
-        it is a durable write that can fail on the storage and be retried by a later drain, which
-        is what the claim hand-back in :meth:`_seal` exists for.
+        Two phases, and only the second is retryable. Composing the row ends the episode, reads
+        its verdict and runs every extension's ``finalize`` — each of those happens once per
+        dispensed task and none of them can be undone. Recording it is a durable append that can
+        fail on the storage and be retried by a later drain, which is what the claim hand-back in
+        :meth:`_seal` exists for.
 
-        So the composed row is retained on the entry across that hand-back and the retry starts at
-        the append. A retry that found no row would compose a second one from an episode this
-        attempt has already force-terminated: the drive is a no-op the second time, so the
-        classification it reaches is the one an *ended* episode reports, and a task the deadline
-        or the drain ended is filed as one the agent sealed or aborted itself — in the scored
-        closures, carrying the summary that reading implies. The first attempt's answer is the
-        true one, and it is the one kept.
+        So the composed row is retained on the entry across that hand-back. A retry that found no
+        row would compose a second one, and both halves of that are wrong: every ``finalize``
+        would run again — its snapshots and commits are already out in the world and no row says
+        it ran twice — and the classification would be taken from an episode this attempt has
+        already force-terminated, so a task the stream drained would be recorded as one the agent
+        sealed or aborted itself, in the scored closures, exactly as a restarted seal would (see
+        :meth:`_seal`). The retry therefore starts at the append.
 
         If no retry ever comes — the caller abandons the stream without closing it — the row is
-        lost with the process, as it is without this: nothing durable was written, the dispense
-        record goes unanswered, and :func:`reconcile` reports the crash it actually was."""
+        lost with the process, as it is today: nothing durable was written, so the dispense record
+        goes unanswered and :func:`reconcile` reports the crash it actually was. What the retained
+        row buys is that the extensions are not asked to produce their side effects a second time
+        for a row that may never land.
+
+        **The entry stays in the registry until this whole task is over**, not until its row is
+        durable. The append is the middle of the seal: the episode is still open behind it, and
+        the stop an unheadlinable summary or a failed terminal owes is recorded after the release
+        and not before it. An entry taken out of the registry at the append is a seal nobody can
+        find and nobody can join — the drain thinks it has drained everything and returns while
+        an episode is still releasing, and the next dispense takes a queue slot over a stop that
+        has not been published yet, which is the whole point of stopping. So the entry is let go
+        in the ``finally`` below, once there is nothing left for a joiner to wait for."""
         row = live.pending_row
         if row is None:
             row = live.pending_row = await self._compose_row(live, forced)
-        # Durable before the row counts anywhere else. `reconcile` reads a missing result as a
-        # crash, so a row that only reached the page cache would turn a sealed, scored task into
-        # a `broker_abort` after a host crash — an outcome the agent earned, reported as
-        # infrastructure failure. Everything from here is synchronous, so no cancellation point
-        # can split the write from the claim it makes.
-        _append_jsonl(self.results_path, row.to_wire(), durable=True)
-        # What the run keeps is the row *the file now holds*, re-read from its own wire form.
-        # That is the canonical snapshot every reader is shown a copy of (see :attr:`results`),
-        # and taking it here is what makes those copies cheap and certain: they copy plain data,
-        # run no env code, and cannot disagree with the record. Held any other way this list
-        # would carry the env's own objects — the feedback values it published, and the one list
-        # that `observed` and `score.feedback` both are — and every view of it would be a handle
-        # on them.
-        #
-        # It cannot fail here, and that is why it is here rather than a step earlier: the append
-        # above just serialised these exact values, with the same encoder and the same
-        # `allow_nan`, so a normalization that ran before the write could suppress a row this run
-        # has already committed to. After it, there is nothing left to find out.
-        recorded = _recorded_row(row)
-        live.row = recorded
-        live.pending_row = None
-        self._results.append(recorded)
-        self._done_positions.add(live.position)
-        return recorded
+        async with self._lock:
+            # Durable before the row counts anywhere else. `reconcile` reads a missing result as
+            # a crash, so a row that only reached the page cache would turn a sealed, scored task
+            # into a `broker_abort` after a host crash — an outcome the agent earned, reported as
+            # an infrastructure failure. Everything in here is synchronous, so no cancellation
+            # point can split the write from the claim it makes.
+            _append_jsonl(self.results_path, row.to_wire(), durable=True)
+            # What the run keeps is the row *the file now holds*, re-read from its own wire form.
+            # That is the canonical snapshot every reader is shown a copy of (see :attr:`results`),
+            # and taking it here is what makes those copies cheap and certain: they copy plain
+            # data, run no env code, and cannot disagree with the record. Held any other way this
+            # list would carry the env's own objects — the feedback values it published, the one
+            # list that `observed` and `score.feedback` both are, and whatever an extension put on
+            # `extensions` — and every view of it would be a handle on them.
+            #
+            # It cannot fail here, and that is why it is here rather than a step earlier: the
+            # append above just serialised these exact values, with the same encoder and the same
+            # `allow_nan`, so a normalization that ran before the write could suppress a row this
+            # run has already committed to. After it, there is nothing left to find out.
+            recorded = _recorded_row(row)
+            live.row = recorded
+            live.pending_row = None
+            self._results.append(recorded)
+            self._done_positions.add(live.position)
+        try:
+            # The row is committed and fsync'd; letting the episode go is best-effort, and it is
+            # the same release a drain would run for an entry whose seal failed (see
+            # :meth:`_release`), so whichever gets there first is the only one that runs.
+            await self._release(live)
+            # A promoted `call_error` is deliberately **not** one of these (see
+            # :meth:`_compose_row`), and the source is what says which this is — never the
+            # exception object, which an env may raise on both boundaries. What a lost call owed
+            # the record is the row it already produced: unscored, saying the call was lost, which
+            # is the whole property — an outcome nothing the agent did produced cannot be averaged
+            # into a benchmark. Stopping on top of that spends the rest of the queue on one lost
+            # call, and the failure it names is one the *next* task need not have: a mid-episode
+            # call is where a transient fault lands, and a session that hiccups once would end a
+            # 480-task run. A terminal that failed is the opposite case and still stops here —
+            # there the env is on its way out of a task it had already ended, and every task of
+            # that env leaves the same way.
+            if live.terminal_error is not None and live.terminal_error_source == "terminal":
+                exc = live.terminal_error
+                # Guarded, and for more than tidiness: this runs *after* the append, so an
+                # unguarded format would leave a durable row standing beside a stop that was
+                # never published, and the queue would serve on against the env that failed.
+                rendered = _rendered_failure(exc)
+                self._stop(
+                    exc,
+                    dispensing=(
+                        f"this stream stopped: env {live.ref.env!r} failed while the stream "
+                        f"ended a task ({rendered}), so that task's row carries "
+                        "no outcome and no further task could be scored either"
+                    ),
+                    closing=(
+                        f"this stream stopped before its queue was served: env {live.ref.env!r} "
+                        f"failed while the stream ended a task ({rendered})"
+                    ),
+                )
+            if live.summary_error is not None:
+                # The row landed first — `observed` carries every offending item verbatim, so the
+                # evidence is durable rather than confined to an exception string — and the
+                # episode is already released. Only then does the stream stop. The order is not
+                # cosmetic: the row is what makes this seal final, so nothing above may raise
+                # ahead of it and strand the episode. What the order does *not* license is
+                # answering a joiner as soon as the row is there: this stop is still owed, and
+                # until it is published a dispense that stepped over it would serve the rest of
+                # the queue against an env whose headline this record has already refused.
+                self._stop(
+                    live.summary_error,
+                    dispensing=(
+                        f"this stream stopped: env {live.ref.env!r} published a summary value "
+                        f"this record cannot headline ({live.summary_error}), so no further task "
+                        "can be scored against it"
+                    ),
+                    closing=(
+                        f"this stream stopped before its queue was served: env {live.ref.env!r} "
+                        f"published a summary value this record cannot headline "
+                        f"({live.summary_error})"
+                    ),
+                )
+                raise live.summary_error
+            # The recorded snapshot, so one seal produces one row wherever it is read from.
+            return recorded
+        finally:
+            # Reached only past the append, so this lets go of exactly the entries the pop above
+            # used to: one whose row is durable. A seal that failed before the append, or one its
+            # owner cancelled there, never gets here — those entries are still owed a row and
+            # stay in the registry for the drain that retries them.
+            async with self._lock:
+                self._live.pop(live.lease, None)
 
     async def _compose_row(self, live: _Live, forced: Optional[Closure]) -> ResultRow:
         """Everything a seal does exactly once: end the episode, read its verdict, classify it,
-        and build the row from all of it. Nothing here is retried."""
+        close the spans, and build the row from all of it. Nothing here is retried."""
         episode = live.episode
         # A terminal call whose caller was cancelled leaves its finalization running: the episode
         # is already sealed while its verdict is still landing. Adopt that outcome rather than
@@ -2332,6 +2617,11 @@ class TaskStream:
             except _MalformedSummary as exc:
                 live.summary_error = exc
                 diagnostic = f"the env published a summary value this record cannot headline: {exc}"
+        # Extensions run here — after the outcome is decided, before the row is written, and
+        # outside every lock. Whatever they return is namespaced; whatever they do wrong is
+        # recorded in their own namespace and cannot stop the row. What they are *handed* is
+        # built per extension and detached from `score`, which is the row's own summary object.
+        extensions = await self._finalize_spans(live, closure, score)
         return ResultRow(
             seq=live.seq,
             lease=live.lease,
@@ -2342,6 +2632,7 @@ class TaskStream:
             score=score,
             observed=observed,
             diagnostic=diagnostic,
+            extensions=extensions,
         )
 
     async def _force_terminal(
@@ -2366,10 +2657,11 @@ class TaskStream:
         invent — and the reserved abort is what answers it.
 
         A ``CancelledError`` the env raises is that env failing and is classified with the rest
-        (see :func:`_must_propagate`). Letting it through instead cancels whoever is sealing: no
-        row is composed for a task that was dispensed, the entry is handed back unsealed, and the
-        drain that meets it reports the run as cancelled rather than recording the outcome the
-        queue is still owed."""
+        (see :func:`_must_propagate`). Letting it through instead cancels the *seal task* this
+        runs in — the seal is its own task precisely so a lost caller cannot restart it — leaving
+        a claim nothing can ever complete: no row is composed, the entry keeps a cancelled seal,
+        and every later drain re-awaits it and raises the same cancellation, so an orderly
+        shutdown reconciles as a crash."""
         cancellation = _Cancellation()
         try:
             call = await live.episode.call(tool, {})
@@ -2381,6 +2673,157 @@ class TaskStream:
             live.failed_to_end(exc, "terminal")
             return True, None
         return (call.terminated and not call.tombstoned), None
+
+    # ----- provenance spans -----
+
+    async def _begin_spans(
+        self, ref: TaskRef
+    ) -> Tuple[Dict[str, ProvenanceSpan], Dict[str, Any]]:
+        """Open one span per extension, before the task is exposed.
+
+        An extension that raises, hangs, or hands back something that is not strict JSON stops
+        the dispense: the task is never handed out and its queue position is still owed. Failing
+        loudly here is the honest option — a run whose provenance is silently missing for some
+        tasks is worse than one that stops."""
+        spans: Dict[str, ProvenanceSpan] = {}
+        dispensed: Dict[str, Any] = {}
+        # See `_Cancellation` for why cancellation is counted rather than caught by type. Here
+        # the task being watched is the caller's own — whoever is dispensing — so a cancellation
+        # aimed at *it* still ends the dispense, and one an extension merely raised is that
+        # extension failing to open its span, which is what `ProvenanceError` already says.
+        cancellation = _Cancellation()
+
+        def refused(namespace: str, cause: BaseException) -> ProvenanceError:
+            # The cause is the extension's own object, so describing it is guarded: an unguarded
+            # format would hand the caller the formatter's failure in place of the
+            # `ProvenanceError` this promises, which is the one thing every caller of `get_task`
+            # is told to expect from a span that would not open.
+            return ProvenanceError(
+                f"provenance extension {namespace!r} failed to open a span for "
+                f"{ref.env}[{ref.task_idx}]: {_rendered_failure(cause)}"
+            )
+
+        # The namespace is the one the constructor validated, never a fresh read of the
+        # extension's attribute: uniqueness and non-emptiness were checked against those strings,
+        # and re-reading here would key the row by whatever the object says now. Two extensions
+        # that end up agreeing on a name would silently overwrite each other's span — one key on
+        # the row, one `finalize` never called — and an emptied one would key a row by "".
+        for namespace, extension in self._provenance:
+            try:
+                span = await self._with_timeout(extension.begin(ref))
+                observed = _strict_json_object(span.dispensed)
+            except BaseException as exc:  # noqa: BLE001 — reported, never swallowed
+                if _must_propagate(exc, cancellation):
+                    raise
+                raise refused(namespace, exc) from exc
+            spans[namespace] = span
+            dispensed[namespace] = observed
+        return spans, dispensed
+
+    async def _finalize_spans(
+        self, live: _Live, closure: Closure, score: Optional[Score]
+    ) -> Dict[str, Any]:
+        """Close every open span and collect its namespaced output.
+
+        The episode is already sealed and scored, so a failing extension cannot change the
+        outcome: it gets a structured error under its own namespace and the row is written
+        regardless. An extension can neither suppress a row nor create a second one.
+
+        Each span is handed its **own** :class:`CompletedTask`, built from a detached copy of the
+        summary. One shared object would be a hole in exactly that guarantee — ``frozen=True``
+        does not freeze the list behind ``Score.feedback``, and that list *is* the row's
+        ``observed`` — and a shared one would also let the first extension decide what the second
+        one observes.
+
+        **Cancellation is told apart by where it was requested, not by its type** (see
+        :class:`_Cancellation`). The seal runs as its own task precisely so a lost caller cannot
+        restart it, which means a ``CancelledError`` arriving here is one of two unrelated things:
+        this seal task being cancelled, or an extension raising one. Unmoved count, the extension
+        raised it and it is that extension's failure, recorded in its namespace like any other;
+        moved, the seal itself is being cancelled and it must propagate — swallowing that one
+        would write a row for a seal its owner cancelled. (Expiring a hung extension does not move
+        it either: the callback runs in a task of its own and the bound cancels *that* one, never
+        this — see :meth:`_with_timeout` — so a timed-out span arrives as the ``TimeoutError`` it
+        is, through the same handler below.)
+
+        Without the count, an extension could raise ``CancelledError`` and cancel the seal task
+        out from under the row: ``_seal`` would see a cancelled claim, record no stop, and leave
+        the entry sealed with no row, so every retry re-awaits the same cancelled task, the
+        durable dispense is never answered, and an orderly shutdown reconciles as a crash."""
+        extensions: Dict[str, Any] = {}
+        cancellation = _Cancellation()
+        for namespace, span in live.spans.items():
+            entry: Dict[str, Any] = {"dispensed": live.dispensed_extensions.get(namespace)}
+            try:
+                # Built inside the boundary, not above it. Detaching the summary is the one step
+                # here that touches the *row's* objects rather than the extension's, and above
+                # the boundary a failure in it is uncontained: no row at all, and a second
+                # `_compose_row` that finalizes again every span that had already closed. It is
+                # detached by serialisation precisely so it cannot fail (see
+                # :func:`_detached_summary`) — and it is built here so that a row does not
+                # depend on that argument holding.
+                completed = CompletedTask(
+                    position=live.position, closure=closure, score=_detached_summary(score)
+                )
+                entry["sealed"] = _strict_json_object(
+                    await self._with_timeout(span.finalize(completed))
+                )
+            except BaseException as exc:  # noqa: BLE001 — an extension may not break a row
+                if _must_propagate(exc, cancellation):
+                    raise
+                entry["error"] = _rendered_failure(exc)
+            extensions[namespace] = entry
+        return extensions
+
+    async def _with_timeout(self, awaitable: Any) -> Any:
+        """Run one extension callback in a task of its own, and **stop waiting on it** at the
+        bound. A callback that hangs must not wedge the queue.
+
+        The bound is on how long the *harness* waits, which is the only thing a bound can be
+        in-process. ``asyncio.wait_for`` is deliberately not what enforces it: it expires a
+        callback by cancelling the task the callback is running in and then awaiting that
+        cancellation to finish — and ``CancelledError`` is catchable, so asyncio documents that a
+        callback which suppresses it has its value returned instead. A callback that catches it
+        and carries on is therefore accepted past the deadline, and one that catches it and never
+        returns holds the waiter for ever: at ``begin`` that is the dispense lock and so the whole
+        queue, and at ``finalize`` it is the seal, so ``aclose`` never returns either.
+
+        So the callback gets its own task and this waits on that task with a timeout that touches
+        nothing else. On expiry the task is cancelled and let go (see :func:`_abandon`) instead of
+        awaited, and the callback is recorded as the failure it is. Its own task is also the
+        smallest surface that can be handed to arbitrary code: a callback can now only cancel
+        *itself* through ``asyncio.current_task()``, and a cancellation requested against the
+        seal reaches this caller rather than being catchable inside the extension — which is what
+        :meth:`_finalize_spans` tells the two kinds of ``CancelledError`` apart by.
+
+        **What is not bounded, stated exactly, because in-process nothing can bound it.** A
+        callback that never yields to the event loop — a synchronous loop, or blocking I/O —
+        stalls the loop itself, so no timer fires and there is nothing left running to pre-empt
+        it; the same is true of the synchronous ``span.dispensed``. And an abandoned callback is
+        cancelled, not stopped: it may catch the cancellation and run on, holding whatever *it*
+        holds. That reaches one thing outside itself, and only one: ``asyncio.run`` awaits every
+        outstanding task before it returns, so a callback that refuses to end delays the *loop's*
+        shutdown after this stream has already answered and closed. That belongs to whoever owns
+        the loop, and no bound this stream could set would change it. What an abandoned callback
+        cannot do is reach anything of this stream's — see :func:`_abandon`."""
+        call = asyncio.ensure_future(awaitable)
+        # `asyncio.wait` reports on the callback without joining its fate to this caller's: it
+        # never cancels this task, never raises what the callback raised, and a timeout leaves
+        # the callback merely unfinished rather than waited on.
+        try:
+            done, _ = await asyncio.wait((call,), timeout=self._provenance_timeout)
+        except BaseException:
+            # Only this caller's own cancellation reaches here. The callback goes with it: it was
+            # opened for work nobody is waiting for any more.
+            _abandon(call)
+            raise
+        if not done:
+            _abandon(call)
+            raise TimeoutError(f"the callback did not return within {self._provenance_timeout}s")
+        # Raises whatever the callback raised, in this task, without moving its cancel count —
+        # a callback that raised `CancelledError` leaves its own task cancelled, and reading its
+        # result here is what turns that into this task seeing the exception it raised.
+        return call.result()
 
     def _classify(self, live: _Live, forced: Optional[Closure]) -> Tuple[Closure, Optional[str]]:
         """Decide how this task ended.
@@ -2464,7 +2907,30 @@ class TaskStream:
 
     def _write_dispense(self, live: _Live) -> None:
         """The durable record that makes a crash reconcilable. fsync'd: a record that only
-        reaches the page cache is exactly the record a hard kill loses."""
+        reaches the page cache is exactly the record a hard kill loses.
+
+        It carries what each extension observed **before** the task was handed out, because this
+        record is the only artifact that survives a kill and that observation is the only half of
+        a span a crash can leave behind. Without it the guarantee is lopsided: provenance for
+        every orderly closure and none for the one closure that is *about* not exiting in an
+        orderly way, so a snapshot an extension had already taken is disconnected from the
+        dispense that caused it. On a resumed run that is the difference between an orphaned
+        snapshot and one the ``broker_abort`` row names (see :func:`reconcile`).
+
+        **The payload is captured before this record is composed, not while it is written.** It
+        is ``live.dispensed_extensions``, built in :meth:`_begin_spans` — before the episode was
+        opened, before the registry lock, and long before here — so no extension code runs at or
+        after this point and nothing here can be blocked, delayed or refused by one. An extension
+        that fails still fails where it always did, at ``begin``, where it costs a dispense that
+        was never recorded rather than one that was.
+
+        It also cannot make this append fail. :func:`_strict_json_object` already serialised each
+        value with ``json.dumps(..., allow_nan=False)`` — the same encoder and the same setting
+        :func:`_append_jsonl` uses — and returned the *re-parsed* result, so what is written here
+        is a detached copy that the exact call about to encode it has already encoded once. The
+        ordering below it is untouched: still one synchronous append inside the same critical
+        section, still the last thing before the clock starts and the counters commit, with no new
+        suspension point between the record landing and the bookkeeping that answers for it."""
         _append_jsonl(
             self.dispenses_path,
             {
@@ -2474,6 +2940,11 @@ class TaskStream:
                 "env": live.ref.env,
                 "task_idx": live.ref.task_idx,
                 "dispensed_at": time.time(),
+                # namespace -> what that extension observed at dispense. The `{"dispensed": ...}`
+                # wrapper the row carries is deliberately *not* here: it exists to sit beside
+                # `sealed`/`error`, which are outcomes, and a dispense record has no outcome.
+                # `reconcile` puts it on, so exactly one place knows the row's shape.
+                "extensions": live.dispensed_extensions,
             },
             durable=True,
         )
@@ -2497,6 +2968,11 @@ def _recorded_row(row: ResultRow) -> ResultRow:
     are the same row, and every view taken of it afterwards copies plain data (see
     :func:`_detached_row`).
 
+    ``extensions`` comes through it too, and it has to: each namespace's halves are already
+    strict JSON (:func:`_strict_json_object`), but the mapping holding them is this seal's own
+    dict and ``to_wire`` copies only its top level. A snapshot that kept it would leave the run
+    reporting an extension's output that the file it committed does not have.
+
     Called **after** the append, which is what makes it safe to run at all: those exact values
     have just been serialised, so nothing here can fail that the write did not already fail. The
     same call a step earlier would be a normalization that could suppress a row the run had
@@ -2507,15 +2983,15 @@ def _recorded_row(row: ResultRow) -> ResultRow:
 def _detached_row(row: ResultRow) -> ResultRow:
     """One recorded row, copied whole, for a reader that must not be able to reach the run's.
 
-    :class:`ResultRow` is frozen and *shallow*: ``observed`` is a list of dicts and
-    ``Score.feedback`` is the same list again, so a reader handed the row itself can edit what
-    the run reports without touching what the file says — and every later read would show the
-    edit. A run's record is not a thing reading it may rewrite.
+    :class:`ResultRow` is frozen and *shallow*: ``observed`` is a list of dicts, ``extensions``
+    is a dict of them, and ``Score.feedback`` is a list of them too — so a reader handed the row
+    itself can edit what the run reports without touching what the file says, and every later
+    read would show the edit. A run's record is not a thing reading it may rewrite.
 
-    ``deepcopy`` here, for the reason :func:`_detached_manifest` gives: what is behind this is
-    already plain data (see :func:`_recorded_row`), so copying it copies data and runs no code an
-    env wrote. That is what makes the read total — a reader gets the row whatever the env
-    published in it."""
+    ``deepcopy`` here, for the reason :func:`_detached_manifest` gives and not despite the one
+    :func:`_detached_summary` gives: what is behind this is already plain data (see
+    :func:`_recorded_row`), so copying it copies data and runs no code an env wrote. That is what
+    makes the read total — a reader gets the row whatever the env published in it."""
     return copy.deepcopy(row)
 
 
@@ -2531,6 +3007,184 @@ def _detached_manifest(manifest: ToolManifest) -> ToolManifest:
     afterwards. The snapshot behind this is plain JSON (see the constructor), so copying it
     copies data and runs no env code."""
     return manifest.model_copy(update={"input_schema": copy.deepcopy(manifest.input_schema)})
+
+def _detached_summary(score: Optional[Score]) -> Optional[Score]:
+    """A private copy of a row's summary, for a caller that must not be able to reach the row's.
+
+    Detachment has to reach the shallow layers, because those are the ones that alias: the row's
+    ``observed`` list *is* the ``Score.feedback`` list, and each item in it is the dict the row
+    carries. So it is round-tripped through the same strict JSON :func:`_strict_json_object`
+    detaches *returned* provenance with — the same encoder and the same ``allow_nan`` setting
+    :func:`_append_jsonl` commits the row with.
+
+    **Not deep-copied, because a copy runs the copied object's own code.** ``deepcopy`` dispatches
+    to ``__deepcopy__``/``__reduce_ex__``, and the values here are the env's: the feedback models
+    are mutable and do not validate on assignment, so a value that is a *subclass* of a JSON
+    scalar reaches ``observed`` and is written to the row like any other string or number. Its
+    ``__deepcopy__`` raising would take down a row this same run records without provenance — the
+    copy is built here, above the boundary that contains a failing extension, so nothing catches
+    it, the seal fails, and ``_compose_row`` is retried, finalizing a second time every span that
+    had already closed. One that blocks would wedge the seal where no extension bound applies.
+    Merely turning provenance on would then suppress a row the stream would otherwise have
+    scored, with every extension behaving perfectly.
+
+    Serialising runs none of that code: ``json``'s encoder reads JSON scalars through their
+    concrete C representation rather than through ``__repr__`` or ``__str__``, so a subclass gets
+    no say. What it strips is exactly what the subclass was: scalar subclasses become the exact
+    ``str``/``int``/``float``/``bool``, tuples become lists, non-string keys become strings.
+    Nothing declared is lost — the wire type of a feedback value is ``float | bool | str`` — and
+    nothing the *row* keeps is lost either, because the row is this same JSON. An extension now
+    sees the summary in the form the file will hold it in, which is the form it should have been
+    reasoning about.
+
+    Nor can it refuse a summary the row can carry. ``hgym.feedback.wire`` validates every item on
+    the way into ``observed`` and admits exactly the finite JSON scalars this call accepts, so
+    there is no value that reaches here and fails here. The caller contains it anyway (see
+    :meth:`TaskStream._finalize_spans`): that argument holds across a module boundary, and a row
+    may not depend on one to survive.
+
+    ``reward`` and ``success`` are handed over as they are, not copied. They are already exact
+    primitives rather than anything the env passed in — :func:`_pick_float` returns ``float(v)``
+    and ``bool`` cannot be subclassed — and they are immutable, so sharing them aliases nothing
+    the row can be reached through."""
+    if score is None:
+        return None
+    return Score(
+        reward=score.reward,
+        success=score.success,
+        feedback=json.loads(json.dumps(score.feedback, allow_nan=False)),
+    )
+
+
+async def _close_episode(live: _Live) -> None:
+    """The release itself, run as the entry's own claimed task (see
+    :meth:`TaskStream._release`).
+
+    Nothing here may raise. The claim *is* this task and a failed one stays claimed, so an
+    exception would be handed to every later joiner — a seal publishing the stop it owes, a drain
+    finishing what a failed seal left — for a teardown that is best-effort by nature and whose
+    failure is not the run's outcome.
+
+    ``CancelledError`` included, and it is the one that costs most. An env's ``close`` can raise
+    it, this task is joined through a shield and nothing in this module cancels it, so one here
+    is the env's. Out it would go through :meth:`_release`, into the middle of :meth:`_run_seal`
+    — past the durable append, before the stop that seal still owes — so an unheadlinable summary
+    or a failed terminal would go unpublished, the terminating call would answer the agent with a
+    traceback instead of the constant, and ``aclose`` would report a clean run over it."""
+    cancellation = _Cancellation()
+    try:
+        await live.episode.close()
+    except BaseException as exc:  # noqa: BLE001 — the row is settled; teardown is best-effort
+        if _must_propagate(exc, cancellation):
+            raise
+
+
+# Extension callbacks nobody is waiting on any more. Held only so the loop cannot collect a task
+# that is still running — asyncio keeps no strong reference of its own — and dropped as each one
+# ends. One that never ends stays here, which is the same fact as a callback that never ends.
+_abandoned_calls: "set[asyncio.Task[Any]]" = set()
+
+
+def _abandon(call: "asyncio.Task[Any]") -> None:
+    """Stop waiting on an extension callback: cancel it, and let it go.
+
+    Cancelled but deliberately **not awaited**, which is the whole difference between a bound and
+    a wish. ``CancelledError`` is catchable, so a callback that catches it can run on or never
+    return at all, and awaiting that is exactly the wedge the bound exists to prevent.
+
+    What is left running holds only what it was handed: its own span object, the immutable
+    :class:`TaskRef` at ``begin``, and at ``finalize`` that span's private re-parse of the
+    summary (see :func:`_detached_summary`). It holds no lock, no registry entry, no episode and
+    no file, and whatever it eventually returns is dropped on the floor — the row was written
+    with this callback recorded as failed, and nothing reads it again. So an abandoned callback
+    can spend CPU and its own resources; it cannot alter or suppress a row, or delay one.
+
+    The done callback keeps a task nobody will ever await off asyncio's unretrieved list, the
+    same bookkeeping :meth:`_seal` does for a seal whose caller left."""
+    call.cancel()
+    _abandoned_calls.add(call)
+    call.add_done_callback(_abandoned_calls.discard)
+    call.add_done_callback(_mark_retrieved)
+
+
+def _mark_retrieved(task: "asyncio.Future[Any]") -> None:
+    """Take a finished task's failure off asyncio's unretrieved list, without consuming it.
+
+    A caller cancelled mid-seal leaves nobody awaiting the seal at the instant it fails, so
+    asyncio logs ``Task exception was never retrieved`` for a failure that is not lost at all —
+    the claim is still held, and the next drain joins the same task, reads the same exception and
+    reports it. ``Future.exception()`` only clears the *warning*; the exception stays on the task
+    for that later awaiter, so this changes what is logged and nothing else."""
+    if not task.cancelled():
+        task.exception()
+
+
+def _strict_json_value(value: Any, enclosing: Tuple[int, ...]) -> Any:
+    """One value on its way onto a row, **read exactly once** and rebuilt in plain containers,
+    with every object name checked to be exact text.
+
+    Only the containers are rebuilt. Every scalar is passed through untouched, so what decides
+    whether a ``Path``, a datetime or a ``NaN`` is admissible is still the encoder the record is
+    written with, and not a second opinion here that could drift from it.
+
+    Reading once is the point of doing it here rather than checking and then encoding. A value
+    only has to be a ``dict`` to arrive; the encoder asks a ``dict`` *subclass* for its
+    ``items()``, so a check that walked one read and an encoder that walked another would put
+    values on the row that nothing looked at. What comes back is what was inspected, in exact
+    ``dict`` and ``list``, which is what the encoder then sees.
+
+    ``enclosing`` is the identity of every container this one sits inside. A structure that
+    contains itself is refused here, with the same finding the encoder would have reached, rather
+    than recursing until the interpreter stops it."""
+    if isinstance(value, dict):
+        if id(value) in enclosing:
+            raise ValueError("a JSON object may not contain itself")
+        inside = enclosing + (id(value),)
+        built: Dict[str, Any] = {}
+        for name, item in value.items():
+            if type(name) is not str:
+                raise TypeError(
+                    "a JSON object's names must be text, got "
+                    f"{_described(lambda: f'{name!r} ({type(name).__name__})')}"
+                )
+            if name in built:
+                # Only a mapping that answers for itself can get here — two equal names cannot
+                # both be in a `dict` — and the encoder would write both, leaving the decoder to
+                # keep whichever came last. Losing one silently is the failure this refuses.
+                raise ValueError(f"a JSON object may not name {name!r} twice")
+            built[name] = _strict_json_value(item, inside)
+        return built
+    if isinstance(value, (list, tuple)):
+        if id(value) in enclosing:
+            raise ValueError("a JSON array may not contain itself")
+        inside = enclosing + (id(value),)
+        return [_strict_json_value(item, inside) for item in value]
+    return value
+
+
+def _strict_json_object(value: Any) -> Dict[str, Any]:
+    """A JSON object an extension handed back, proved to be strict JSON and detached from it.
+
+    A type annotation does not stop a ``Path``, a datetime, a NaN or a mutable alias reaching
+    the provenance file, so the value is actually serialised and re-parsed: what lands on the
+    row is a detached copy that is provably writable.
+
+    The encoder proves the *values* and is deliberately not trusted with the **names**. It
+    coerces any key it is handed into text instead of refusing it — ``1``, ``True`` and ``1.0``
+    are all written as names a JSON object can hold, and so is a ``str`` subclass that its own
+    ``__eq__`` says is nothing like the plain key of the same text. Two keys a ``dict`` holds
+    apart therefore become one name, and the value that survives is whichever was written last.
+    Nothing raises anywhere: the extension is told its output was recorded, the row says as much,
+    and one of the two values it handed over is simply not on it. "Strict JSON" has to mean the
+    names too, so :func:`_strict_json_value` refuses everything but exact ``str``, the whole way
+    down, and refuses a normalization that would put one name on an object twice."""
+    if not isinstance(value, dict):
+        raise TypeError(f"expected a JSON object, got {type(value).__name__}")
+    named = _strict_json_value(value, ())
+    round_tripped = json.loads(json.dumps(named, allow_nan=False))
+    if not isinstance(round_tripped, dict):  # pragma: no cover - json.dumps of a dict
+        raise TypeError("expected a JSON object")
+    return round_tripped
 
 
 # Scheduled catalog closes, held so the loop cannot collect one before it runs. A failure in
