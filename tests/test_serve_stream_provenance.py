@@ -1418,7 +1418,7 @@ async def test_extension_callbacks_run_with_the_registry_free(tmp_path: Path) ->
         observed["probe"] = json.loads(probe.content[0].text)  # type: ignore[union-attr]
         release.set()
         await sealing
-    assert observed["probe"]["error"] == "no active task"
+    assert observed["probe"]["error"] == "no_active_task"
     assert len(stream.results) == 1
 
 
