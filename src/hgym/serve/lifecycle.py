@@ -93,9 +93,13 @@ class TerminalEvidence:
     An env's ``finalize`` returns this with ``verdict`` / ``status`` / ``args`` /
     ``diagnostic`` populated; the serve layer **stamps** ``source``, ``finalization_id``, and
     the ``provenance`` (a system field the harness cannot supply) before it is trusted, so a
-    returned ``provenance`` is always overwritten. ``verdict`` is the public-safe, core-stamped
-    authoritative score; ``diagnostic`` is private (server-side logs / the durable store only)
-    and must never reach the agent.
+    returned ``provenance`` is always overwritten. ``verdict`` is the public-safe authoritative
+    score, public-safe because the RFC forbids returning judge reasoning or extracted answers —
+    not because anything rewrote it, so it is the env's dict verbatim and a key in it that the
+    core also owns is still only the env's word for that key. ``status`` is the env's *declared*
+    outcome and the one channel that decides it; :attr:`finalize_error` reads that, never the
+    verdict. ``diagnostic`` is private (server-side logs / the durable store only) and must
+    never reach the agent.
     """
 
     source: TerminalSource
@@ -142,8 +146,12 @@ def args_digest(args: Optional[Dict[str, Any]]) -> Optional[str]:
 class FinalizationRecord:
     """One durable finalization record, keyed by ``(session_id, finalization_id)``.
 
-    ``verdict`` is the public-safe core-stamped score; ``provenance`` and ``diagnostic`` are
-    confidential (they live here, in the private store — never in the user-readable trace).
+    ``verdict`` is the public-safe score exactly as the env's ``finalize`` returned it — evidence
+    of what the env said, not authority over what happened: :attr:`status` is where the core
+    recorded the outcome, and :meth:`to_evidence` takes the outcome from that and only that,
+    reconstructing the rest of the evidence around it. ``provenance`` and
+    ``diagnostic`` are confidential (they live here, in the private store — never in the
+    user-readable trace).
     """
 
     session_id: str
@@ -162,23 +170,40 @@ class FinalizationRecord:
 
     def to_evidence(self) -> TerminalEvidence:
         """Reconstruct the terminal evidence this record persisted (for a ``FINALIZED``
-        replay or a recovered fail-closed resolution)."""
-        status: TerminalStatus = (
-            "ok" if self.status == "FINALIZED" and not _is_fail_closed(self.verdict)
-            else "finalize_error"
-        )
+        replay or a recovered fail-closed resolution).
+
+        **The outcome comes from** :attr:`status` **and from nothing else.** The core owns that
+        field at every transition, and settles it at commit: ``FAILED`` exactly when the evidence
+        it committed carried ``finalize_error``, ``FINALIZED`` otherwise. So it already *is* the
+        decision the live path reached, not a restatement of one — an env
+        reaches it only through ``TerminalEvidence.status``, the one channel that declares an
+        outcome, and that is the same channel the live path answered from. Reading it back
+        replays the live answer rather than deriving a second one. ``verdict`` is the opposite —
+        persisted as the env's ``finalize`` returned it, verbatim — so consulting it as well
+        would let an env overturn a decision the core had already made.
+        Reading it by truthiness gets that wrong twice over, because an episode feedback value
+        legally admits text and numbers and ``bool("false")`` is ``True``; but reading it
+        *strictly* is wrong too, because even a literal ``True`` under a reserved name is still
+        only the env's word — the live path overwrites that key from the core's own flag before
+        the agent is ever shown it. Taken from ``status`` alone, a replay reproduces the outcome
+        the live path published; taken from the verdict, a clean episode comes back as an
+        infrastructure failure with its real result discarded.
+
+        The verdict is still reconstructed verbatim: it is evidence of what the env returned,
+        and only its authority over the outcome is withheld. Verbatim includes ``{}``, which is
+        a verdict an env may legally return and is not the same thing as a record that never
+        reached one — only ``None`` means no verdict was ever written, and only that gets the
+        synthetic fail-closed stand-in. Testing the verdict for truthiness instead would answer
+        a clean replay with an invented ``correct=False``."""
+        status: TerminalStatus = "ok" if self.status == "FINALIZED" else "finalize_error"
         return TerminalEvidence(
             source=self.source,
             status=status,
-            verdict=dict(self.verdict or fail_closed_verdict()),
+            verdict=dict(self.verdict) if self.verdict is not None else fail_closed_verdict(),
             provenance=self.provenance,
             finalization_id=self.finalization_id,
             diagnostic=self.diagnostic,
         )
-
-
-def _is_fail_closed(verdict: Optional[Dict[str, Any]]) -> bool:
-    return bool(verdict and verdict.get("finalize_error"))
 
 
 class FinalizationStore:
@@ -222,8 +247,12 @@ class FinalizationStore:
     def write(self, record: FinalizationRecord) -> None:
         """Persist ``record`` durably: write a temp file, ``fsync`` it, atomically rename over
         the target, then ``fsync`` the directory. Every state transition calls this, so a crash
-        can never leave a torn/partial record on disk."""
-        self._dir.mkdir(parents=True, exist_ok=True)
+        can never leave a torn/partial record on disk.
+
+        The directory holding it is made durable the same way, by :func:`_mkdir_durable`, and so
+        is every level above it — a record fsync'd into a directory whose own entry is still
+        only in the page cache is no more durable than that entry."""
+        _mkdir_durable(self._dir)
         target = self._path(record.finalization_id)
         blob = json.dumps(asdict(record), sort_keys=True, allow_nan=False)
         fd, tmp = tempfile.mkstemp(dir=str(self._dir), suffix=".tmp")
@@ -240,14 +269,7 @@ class FinalizationStore:
                 pass
             raise
         # fsync the directory so the rename itself is durable across a crash.
-        try:
-            dfd = os.open(str(self._dir), os.O_RDONLY)
-            try:
-                os.fsync(dfd)
-            finally:
-                os.close(dfd)
-        except OSError:
-            pass
+        _fsync_dir(self._dir)
 
     def read(self, finalization_id: str) -> Optional[FinalizationRecord]:
         path = self._path(finalization_id)
@@ -316,13 +338,72 @@ def _pid_alive(pid: Optional[int]) -> bool:
 
 def _sessions_cache_root() -> Path:
     """The shared, zero-config fallback root for durable records when no trace path is set.
-    A module function so tests can redirect it without env-vars or config."""
+    A module function so tests can redirect it without env-vars or config.
+
+    Whoever creates a directory publishes it, so this creates the root through
+    :func:`_mkdir_durable` rather than leaving it to whichever caller happens to write first.
+    That keeps the contract local: the root exists and its entry is on disk when this returns,
+    with no appeal to a later write that a recovery-only startup never performs."""
     try:
         base = Path(os.path.expanduser("~")) / ".cache" / "hgym" / "sessions"
-        base.mkdir(parents=True, exist_ok=True)
+        _mkdir_durable(base)
         return base
     except OSError:
         return Path(tempfile.gettempdir()) / "hgym-sessions"
+
+
+def _mkdir_durable(directory: Path) -> None:
+    """Create ``directory``, and make every entry on the path to it survive a host crash.
+
+    Syncing a directory persists the entries *inside* it, never the entry that names it — that
+    one lives in its parent. So each level has to be synced into the level above it, top down,
+    and the walk runs the whole way up rather than stopping at the levels this call created.
+
+    **An existing level is no evidence that anyone synced it.** ``mkdir`` makes a level visible
+    immediately and durable never, and this store is deliberately shared between processes, so
+    stopping at what this call created is a first-use race: one writer creates the chain and
+    then stalls or dies before its own sync loop runs, and a writer starting a moment later
+    finds every level present, concludes there is nothing left to publish, and returns success
+    over a store whose directory entry is still only in the page cache. A crash then takes the
+    whole store, with every write having reported success. The same hole opens without any
+    concurrency at all whenever some other program created the path just before this one used
+    it — the race is the sharpest instance, not the only one.
+
+    Walking to the root costs one directory fsync per level. Not free, but a directory with
+    nothing dirty behind it costs a syscall rather than a disk flush — measured on this path at
+    roughly a twentieth of the record's own file sync, which the write pays anyway — and it is
+    bounded by the depth of the path and charged only on the handful of writes a lifecycle
+    makes. What it buys is that the publishing is unconditional: this call syncs every entry
+    leading to ``directory``, regardless of who created it or how far they got, instead of
+    inferring from a level's existence that someone else already did. The syncs themselves stay
+    best-effort — see :func:`_fsync_dir`, where a filesystem that refuses one must not fail the
+    write it was protecting — so what is guaranteed is that nothing on the path goes
+    unattempted, not that a hostile filesystem was talked into it. Top down, so a crash
+    part-way through leaves a durable prefix rather than a durable entry inside an ancestor
+    that is still missing."""
+    directory.mkdir(parents=True, exist_ok=True)
+    holders: List[Path] = []
+    level = directory
+    while level.parent != level:  # the filesystem root names no entry above itself
+        holders.append(level.parent)
+        level = level.parent
+    for holder in reversed(holders):
+        _fsync_dir(holder)
+
+
+def _fsync_dir(directory: Path) -> None:
+    """Fsync a directory entry. Best-effort: not every platform or filesystem permits it, and a
+    refusal must never fail the write it was protecting."""
+    try:
+        fd = os.open(directory, os.O_RDONLY)
+    except OSError:
+        return
+    try:
+        os.fsync(fd)
+    except OSError:
+        pass
+    finally:
+        os.close(fd)
 
 
 def _record_from_dict(data: Dict[str, Any]) -> FinalizationRecord:

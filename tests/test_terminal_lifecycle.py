@@ -9,7 +9,10 @@ Coverage: manifest gating (zero-or-one score terminal), validate-before-seal,
 seal-before-evaluate, the request-level ingress-gate tombstone (tool call + a non-tool method
 + unknown tool + no recorded step), close-race, single-finalization cancellation, the
 finalize-deadline fail-closed rule, the durable record + simulated-crash restart recovery to
-fail-closed, and the terminal TraceEvent schema + the ``_verify``-consumes-evidence path.
+fail-closed (including the directories the store had to create, which are only as durable as
+the entries naming them), the rule that a replayed outcome comes from the record's core-owned
+status and never from the env-authored verdict beside it, and the terminal TraceEvent schema +
+the ``_verify``-consumes-evidence path.
 """
 
 from __future__ import annotations
@@ -788,6 +791,264 @@ def test_no_trace_recovery_reaches_a_prior_sessions_dangling_record() -> None:
     assert [r.finalization_id for r in resolved] == ["f-crash"]
     assert later.read("f-crash").status == "FAILED"
     assert later.read("f-crash").verdict["finalize_error"] is True
+
+
+# ----- a directory the store created is durable too -----
+
+
+def _fsync_spy(monkeypatch: pytest.MonkeyPatch, watched: dict) -> list:
+    """Record, by name, which of ``watched``'s paths each ``os.fsync`` was issued against.
+
+    A crash cannot be staged in a test, so durability is shown structurally: the sync either
+    happened or it did not. An fd is attributed to a path by ``(st_dev, st_ino)`` taken on BOTH
+    sides at the moment of the sync. Inode numbers are recycled, so a key captured during the
+    run and compared against a ``stat()`` taken after it can credit a deleted temp file's sync
+    to a directory that later inherited its inode — and this store creates and renames away a
+    temp file on every single write, so that is not hypothetical here. Read at the same instant,
+    a match means the fd and the path name the same live object: two live objects on one device
+    cannot share an inode number.
+    """
+    real_fsync = os.fsync
+    synced = []
+
+    def _watch(fd: int) -> None:
+        info = os.fstat(fd)
+        for name, path in watched.items():
+            try:
+                here = path.stat()
+            except OSError:
+                continue  # not created yet, or already gone — either way, not this fd
+            if (here.st_dev, here.st_ino) == (info.st_dev, info.st_ino):
+                synced.append(name)
+        real_fsync(fd)
+
+    monkeypatch.setattr(os, "fsync", _watch)
+    return synced
+
+
+def test_a_directory_the_store_created_is_synced_into_its_parent(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # Syncing the finalization directory persists the records *inside* it. The entry that names
+    # the directory itself lives one level up, so the first episode against a fresh trace path
+    # can lose the entire store — records, files and directory — with every write having
+    # returned successfully. Every level the write had to create must be synced into the level
+    # above it, which is the one case that matters most: the store's directory is routinely new.
+    run_dir = tmp_path / "runs" / "run-1"  # two levels that do not exist yet...
+    store_dir = FinalizationStore.resolve_dir("s1", run_dir / "run.jsonl")  # ...and a third
+    watched = {
+        "tmp_path": tmp_path,
+        "runs": tmp_path / "runs",
+        "run-1": run_dir,
+        "finalizations": store_dir,
+    }
+    synced = _fsync_spy(monkeypatch, watched)
+
+    FinalizationStore(store_dir).write(
+        FinalizationRecord(
+            session_id="s1", finalization_id="f1", status="FINALIZED",
+            source="explicit_tool", verdict={"correct": True},
+        )
+    )
+
+    assert (store_dir / "finalization-f1.json").exists()
+    assert "finalizations" in synced, "the record's own directory was never synced"
+    for created, holder in (("finalizations", "run-1"), ("run-1", "runs"), ("runs", "tmp_path")):
+        assert holder in synced, (
+            f"{created}/ was created by this write, so the entry naming it — which lives in "
+            f"{holder}/, not in {created}/ — is what a crash can still take away"
+        )
+
+
+def test_the_shared_fallback_root_is_durable_the_first_time_it_is_used(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # The no-trace root is created by `resolve_dir`, EAGERLY — so by the time a record is
+    # written the directory is already there and `write` has nothing above it left to make
+    # durable. First use is exactly the case the zero-config recovery contract rests on: the
+    # root a later process scans for a crashed run's records is the one that crashed run created.
+    monkeypatch.undo()  # the autouse fixture redirects this root; here the real one is the point
+    home = tmp_path / "home"
+    monkeypatch.setenv("HOME", str(home))
+    watched = {
+        "tmp_path": tmp_path,
+        "home": home,
+        ".cache": home / ".cache",
+        "hgym": home / ".cache" / "hgym",
+        "sessions": home / ".cache" / "hgym" / "sessions",
+    }
+    synced = _fsync_spy(monkeypatch, watched)
+
+    assert FinalizationStore.resolve_dir("sid-1", None) == watched["sessions"]
+
+    for created, holder in (
+        ("sessions", "hgym"), ("hgym", ".cache"), (".cache", "home"), ("home", "tmp_path")
+    ):
+        assert holder in synced, (
+            f"{created}/ was created here, so the entry naming it — which lives in {holder}/ — "
+            "is what a crash can take away, and with it every record recovery would have found"
+        )
+
+
+def test_a_directory_another_writer_created_is_published_too(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # `mkdir` makes a level visible immediately and durable never, and this store is shared
+    # between processes on purpose — recovery is written around a live concurrent worker. So one
+    # writer can create the whole chain and then stall or die before it syncs anything, leaving
+    # the next writer a path on which every level exists and none is on disk. A writer that
+    # published only what it created itself would find nothing to do, return success, and lose
+    # the entire store to the next crash. An existing level is not evidence that anyone synced
+    # it, so what gets published is the path, not this call's share of it.
+    store_dir = tmp_path / "runs" / "run-1" / "finalizations"
+    store_dir.mkdir(parents=True, exist_ok=True)  # the other writer, this far and no further
+    watched = {
+        "tmp_path": tmp_path,
+        "runs": tmp_path / "runs",
+        "run-1": tmp_path / "runs" / "run-1",
+        "finalizations": store_dir,
+    }
+    synced = _fsync_spy(monkeypatch, watched)
+
+    FinalizationStore(store_dir).write(
+        FinalizationRecord(
+            session_id="s1", finalization_id="f1", status="FINALIZED",
+            source="explicit_tool", verdict={"correct": True},
+        )
+    )
+
+    assert (store_dir / "finalization-f1.json").exists()
+    for existed, holder in (("finalizations", "run-1"), ("run-1", "runs"), ("runs", "tmp_path")):
+        assert holder in synced, (
+            f"{existed}/ was already there when this write ran, which says nothing about whether "
+            f"the entry naming it in {holder}/ ever reached the disk"
+        )
+
+
+# ----- a replayed outcome comes from the record's status, never from the env's verdict -----
+
+# The verdict names the core gives a meaning of its own along the terminal path — `finalize_error`
+# is the flag the live payload carries, stamped in `_sanitize_terminal` from the core's own
+# status. A *persisted* verdict is whatever the env's `finalize` returned, verbatim, so any of
+# these can arrive holding anything an episode feedback value admits. None may steer a replay.
+_CORE_OWNED_VERDICT_NAMES = ("finalize_error",)
+
+# Everything an `EpisodeFeedbackValue` legally permits, on both sides of the intent. `True` is in
+# here deliberately: it is the value a strict `is True` read would still have honoured, and
+# honouring it is the same defect as coercing `"false"` — the env's word outranking the core's.
+_ANY_ENV_VALUE = [True, False, "false", "true", "no", "0", 0, 1, 2.5, ""]
+
+
+@pytest.mark.parametrize("name", _CORE_OWNED_VERDICT_NAMES)
+@pytest.mark.parametrize("value", _ANY_ENV_VALUE)
+def test_a_clean_record_replays_clean_whatever_its_verdict_says(
+    tmp_path: Path, name: str, value: object
+) -> None:
+    # A FINALIZED record is the core's own statement that the finalization succeeded. Replay must
+    # not go looking for a second opinion in the env-authored verdict: read by truthiness,
+    # `"false"` becomes a failure (`bool("false")` is `True`); read strictly, a literal `True`
+    # still does. Either way a clean episode comes back as an infrastructure failure with its
+    # real outcome discarded — and contradicting the answer the agent was already given.
+    store = FinalizationStore(tmp_path / "finalizations")
+    store.write(
+        FinalizationRecord(
+            session_id="s1", finalization_id="f-clean", status="FINALIZED",
+            source="explicit_tool", verdict={"correct": True, name: value},
+        )
+    )
+
+    evidence = store.read("f-clean").to_evidence()
+    assert evidence.status == "ok", f"the record says FINALIZED; {name}={value!r} is the env's word"
+    assert evidence.finalize_error is False
+    # The verdict is still evidence of what the env returned — only its authority is withheld.
+    assert evidence.verdict == {"correct": True, name: value}
+
+
+@pytest.mark.parametrize("name", _CORE_OWNED_VERDICT_NAMES)
+@pytest.mark.parametrize("value", _ANY_ENV_VALUE)
+def test_a_failed_record_replays_failed_whatever_its_verdict_says(
+    tmp_path: Path, name: str, value: object
+) -> None:
+    # The same rule in the direction that costs something: a fail-closed record must stay
+    # fail-closed. An env that publishes `finalize_error: False` next to a finalization the core
+    # already failed cannot talk it back open, which is what makes the fail-closed contract worth
+    # anything — the reason to read only the core's status rather than to read the verdict more
+    # carefully.
+    store = FinalizationStore(tmp_path / "finalizations")
+    store.write(
+        FinalizationRecord(
+            session_id="s1", finalization_id="f-failed", status="FAILED",
+            source="explicit_tool", verdict={"correct": False, name: value},
+        )
+    )
+
+    evidence = store.read("f-failed").to_evidence()
+    assert evidence.status == "finalize_error", f"the record says FAILED; {name}={value!r} is not"
+    assert evidence.finalize_error is True
+
+
+def test_an_empty_verdict_is_a_verdict_and_a_missing_one_is_not(tmp_path: Path) -> None:
+    # `{}` is a verdict an env may legally return: the pre-commit guard asks whether a verdict is
+    # a JSON-safe dict, never whether it says anything. A record that never reached a verdict is
+    # a different thing, and only *that* gets the synthetic fail-closed stand-in. Told apart by
+    # truthiness the two collapse together, and a clean replay comes back carrying a
+    # `correct=False` the env never returned — for a verifier scoring off the reconstructed
+    # evidence, an invented zero.
+    store = FinalizationStore(tmp_path / "finalizations")
+    store.write(
+        FinalizationRecord(
+            session_id="s1", finalization_id="f-empty", status="FINALIZED",
+            source="explicit_tool", verdict={},
+        )
+    )
+    store.write(
+        FinalizationRecord(
+            session_id="s1", finalization_id="f-none", status="SEALED", source="explicit_tool",
+        )
+    )
+
+    empty = store.read("f-empty").to_evidence()
+    assert empty.status == "ok"
+    assert empty.verdict == {}, "an empty verdict is what the env returned, reconstructed"
+
+    # A record that never reached a verdict still resolves fail-closed, stand-in and all.
+    missing = store.read("f-none").to_evidence()
+    assert missing.status == "finalize_error"
+    assert missing.verdict == fail_closed_verdict()
+
+
+async def test_a_replay_reports_the_outcome_the_live_path_published(tmp_path: Path) -> None:
+    # The whole point of the durable record: what a crashed run replays is what the run itself
+    # answered. An env is free to publish a key the core also owns — nothing about that is
+    # malformed — and the live path already ignores it, stamping the public `finalize_error`
+    # from the core's own status. So an episode answered as clean, whose verdict happens to carry
+    # `finalize_error: True`, must not become a failure the moment it is read back off disk.
+    trace = tmp_path / "run.jsonl"
+    ep = await ServedEpisode.start(
+        "_fixture_score", task=0, trace_path=trace, env_config=_config()
+    )
+
+    async def clean_but_flagged(req):
+        return TerminalEvidence(
+            source=req.source, status="ok", verdict={"correct": True, "finalize_error": True}
+        )
+
+    ep._finalize = clean_but_flagged  # type: ignore[assignment]
+    try:
+        payload = json.loads((await ep.call("submit", {"answer": "4"})).content)
+    finally:
+        await ep.close()
+
+    assert payload["finalize_error"] is False  # live: the core stamped its own flag over the env's
+    assert ep._evidence is not None and ep._evidence.status == "ok"
+
+    rec = FinalizationStore(FinalizationStore.resolve_dir(ep.session_id, trace)).load_all()[0]
+    assert rec.status == "FINALIZED"
+    assert rec.verdict["finalize_error"] is True  # the env's value IS what got persisted
+    assert rec.to_evidence().status == ep._evidence.status, (
+        "the replayed outcome contradicts the one the episode published"
+    )
+    assert rec.to_evidence().finalize_error is False
 
 
 # ----- serve-boundary enforcement for a NON-ToolUsingEnv env -----
