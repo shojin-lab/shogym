@@ -82,10 +82,14 @@ env-README template.
   own verifier over the container end-state. A CPU-only, single-container slice (5 tasks). Needs
   the `frontier_bench` extra and a local Docker daemon (no key or data download).
 
-Runnable end-to-end quickstarts live under [`examples/quickstarts/`](examples/quickstarts/),
-one per harness. Each publishes a **stream** of tasks: one MCP endpoint serves a whole queue,
-the agent pulls a task, plays it with the env's own tools, and pulls the next until the queue
-is empty. The server scores every task as it ends, into a durable record the agent never sees.
+## Quickstarts
+
+One directory per harness, each idiomatic to that harness. Every quickstart does the same three
+things: serve a **stream** of tasks over one endpoint, swap the env with **one variable**, and
+read the scores back out of the server's own durable rows (the harness never grades itself).
+
+- **[`examples/quickstarts/claude_code/`](examples/quickstarts/claude_code/README.md)**: the
+  reference implementation. Point the `claude` CLI at a queue of tasks and read the results.
 
 Swapping the environment is one variable at the top of `serve.py`, so any quickstart runs any
 env in the catalogue above.
