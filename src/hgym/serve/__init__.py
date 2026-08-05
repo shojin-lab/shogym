@@ -15,17 +15,37 @@ from hgym.serve.lifecycle import (
     LifecycleState,
     TerminalEvidence,
 )
-from hgym.serve.stream import TaskRef, TaskStream, build_stream_server
+from hgym.serve.stream import (
+    Closure,
+    DispensedTask,
+    QueueInfo,
+    ResultRow,
+    Score,
+    TaskRef,
+    TaskStream,
+    build_stream_server,
+    read_dispenses,
+    read_results,
+    reconcile,
+)
 
 __all__ = [
     "CallResult",
+    "Closure",
+    "DispensedTask",
     "FinalizationRecord",
     "FinalizationStore",
     "FinalizeRequest",
     "LifecycleState",
+    "QueueInfo",
+    "ResultRow",
+    "Score",
     "ServedEpisode",
     "TaskRef",
     "TaskStream",
     "TerminalEvidence",
     "build_stream_server",
+    "read_dispenses",
+    "read_results",
+    "reconcile",
 ]

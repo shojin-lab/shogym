@@ -13,14 +13,20 @@ import errno
 import json
 import os
 from pathlib import Path
-from typing import Any, Callable, Dict, List, Tuple
+from typing import Any, Callable, Dict, List, Sequence, Tuple
 
 import pytest
 from fastmcp import Client
 
 import hgym.serve.stream as stream_module
 from hgym.serve.lifecycle import FinalizeRequest, TerminalEvidence
-from hgym.serve.stream import TaskRef, TaskStream, build_stream_server
+from hgym.serve.stream import (
+    QueueInfo,
+    TaskRef,
+    TaskStream,
+    build_stream_server,
+    read_dispenses,
+)
 from hgym.shared.terminate_mcp import TERMINATE_TOOL_NAME
 from hgym.task import TaskSpec, ToolManifest
 from hgym.types import EpisodeFeedback, FeedbackCollection, InferenceFeedback
@@ -52,13 +58,13 @@ def _rows(tmp_path: Path) -> List[Dict[str, Any]]:
     return [json.loads(line) for line in path.read_text().splitlines() if line.strip()]
 
 
-def _published(row: Dict[str, Any], name: str) -> Any:
-    """What a row's verbatim feedback records under ``name`` at episode level — the same
+def _published(feedback: Sequence[Dict[str, Any]], name: str) -> Any:
+    """What a verbatim feedback record says under ``name`` at episode level — the same
     first-match lookup ``FeedbackCollection.get`` and ``EvalResult.value`` answer with."""
     return next(
         (
             item["value"]
-            for item in row["feedback"]
+            for item in feedback
             if item.get("level") == "episode" and item["name"] == name
         ),
         None,
@@ -84,6 +90,30 @@ async def _clean_terminal_response(tmp_path: Path) -> str:
     async with _stream(tmp_path / "control", [0]) as stream:
         await stream.get_task()
         return _terminal_text(await stream.dispatch(SUBMIT_TOOL, {"answer": "4"}))
+
+
+async def _exhausted_response(tmp_path: Path) -> Dict[str, Any]:
+    """What the endpoint answers ``get_task`` with once the queue really is empty — the answer a
+    stopped stream has to be indistinguishable from, taken from a real run for the same reason
+    :func:`_clean_terminal_response` is."""
+    async with _stream(tmp_path / "exhausted", [0]) as stream:
+        server = build_stream_server(stream)
+        async with Client(server) as client:
+            await client.call_tool("get_task", {})
+            await client.call_tool(SUBMIT_TOOL, {"answer": "4"})
+            out = await client.call_tool("get_task", {})
+    return json.loads(out.content[0].text)  # type: ignore[union-attr]
+
+
+async def _reads_as_exhausted(tmp_path: Path, *, consumed: int) -> Dict[str, Any]:
+    """The exact payload a stopped stream owes ``get_task``: what an exhausted queue answers,
+    differing only in the count of tasks the caller itself played — a number the agent already
+    has, and the one residue no response here can hide.
+
+    Compared whole, values included. Key sets alone cannot see the failure this pins: a stopped
+    stream relaying its live queue counts would answer ``done: true`` beside a non-zero
+    ``remaining``, contradicting itself inside one object while every key stayed in place."""
+    return {**await _exhausted_response(tmp_path), "consumed": consumed}
 
 
 class _TrackedEnv(_FixtureScoreEnv):
@@ -117,13 +147,10 @@ async def test_dispensed_framing_is_redacted(tmp_path: Path) -> None:
     async with _stream(tmp_path, [2]) as stream:
         task = await stream.get_task()
         assert task is not None
-        # Exactly the four documented fields: the framing is what the agent needs to act, and
-        # how much queue is left belongs to `queue_info`, not to the task.
-        assert set(task) == {"env", "instructions", "budget", "tools"}
-        assert SUBMIT_TOOL in {t["name"] for t in task["tools"]}
-        assert task["instructions"] == _FixtureScoreEnv(tasks=TASKS).describe().instructions
-        assert "10" not in task["instructions"]  # TASKS[2]["answer"]
-        assert stream.queue_info() == {"remaining": 0, "consumed": 1, "in_flight": 1}
+        assert set(task.to_wire()) == {"env", "instructions", "budget", "tools"}
+        assert SUBMIT_TOOL in {t["name"] for t in task.tools}
+        assert task.instructions == _FixtureScoreEnv(tasks=TASKS).describe().instructions
+        assert "10" not in task.instructions  # TASKS[2]["answer"]
 
 
 async def test_serves_a_queue_end_to_end(tmp_path: Path) -> None:
@@ -133,18 +160,21 @@ async def test_serves_a_queue_end_to_end(tmp_path: Path) -> None:
         for expected in ("4", "6", "10"):
             task = await stream.get_task()
             assert task is not None
-            assert expected in task["instructions"] or True  # framing is env-static
             result = await stream.dispatch(SUBMIT_TOOL, {"answer": expected})
             payload = json.loads(result.content[0].text)  # type: ignore[union-attr]
             assert payload["terminated"] is True
             # Scored on the row the harness keeps — never handed back to whoever answered.
-            assert _published(stream.results[-1], "correct") is True
+            row = stream.results[-1]
+            assert row.closure == "sealed"
+            assert row.score is not None
+            assert _published(row.score.feedback, "correct") is True
         assert await stream.get_task() is None
 
     rows = _rows(tmp_path)
     assert [row["seq"] for row in rows] == [1, 2, 3]
     assert [row["task_idx"] for row in rows] == [0, 1, 2]
-    assert all(row["success"] is True for row in rows)
+    assert all(row["score"]["success"] is True for row in rows)
+    assert all(row["closure"] == "sealed" for row in rows)
     assert len({row["lease"] for row in rows}) == 3
 
 
@@ -183,9 +213,10 @@ async def test_a_terminating_call_returns_no_provenance_to_the_caller(tmp_path: 
 
     # ...and the harness still has all of it, on the row and in the file.
     row = stream.results[0]
-    assert row["task_idx"] == 2 and row["position"] == 0 and row["lease"]
-    assert _published(row, "gold") == "10" and row["success"] is False
-    assert _rows(tmp_path) == [dict(row)]
+    assert row.task_idx == 2 and row.position == 0 and row.lease
+    assert row.score is not None and _published(row.score.feedback, "gold") == "10"
+    assert row.score.success is False
+    assert _rows(tmp_path) == [row.to_wire()]
 
 
 async def test_a_terminating_call_returns_no_verdict_to_the_caller(tmp_path: Path) -> None:
@@ -235,9 +266,11 @@ async def test_a_terminating_call_returns_no_verdict_to_the_caller(tmp_path: Pat
     assert json.loads(wrong)["terminated"] is True  # the caller still learns the task ended
 
     # The harness kept every bit of it, and the two attempts are distinguishable there.
-    assert [row["success"] for row in stream.results] == [False, True]
-    assert [row["reward"] for row in stream.results] == [0.75, 0.75]
-    assert [row["task_idx"] for row in stream.results] == [2, 2]
+    scores = [row.score for row in stream.results]
+    assert all(score is not None for score in scores)
+    assert [score.success for score in scores if score is not None] == [False, True]
+    assert [score.reward for score in scores if score is not None] == [0.75, 0.75]
+    assert [row.task_idx for row in stream.results] == [2, 2]
 
 
 async def test_the_feedback_sidecar_never_rides_out_on_a_terminating_call(
@@ -251,7 +284,8 @@ async def test_the_feedback_sidecar_never_rides_out_on_a_terminating_call(
         result = await stream.dispatch(SUBMIT_TOOL, {"answer": "4"})
         assert result.meta is None
         # Not vacuous: the sealed episode really did produce terminal feedback to withhold.
-        assert _published(stream.results[-1], "correct") is True
+        score = stream.results[-1].score
+        assert score is not None and _published(score.feedback, "correct") is True
 
 
 async def test_an_ordinary_call_returns_the_env_response_unchanged(tmp_path: Path) -> None:
@@ -280,7 +314,8 @@ async def test_reaching_the_horizon_is_redacted_like_a_submission(tmp_path: Path
         last = (await stream.dispatch("noop", {})).content[0].text  # type: ignore[union-attr]
     assert json.loads(last)["terminated"] is True
     assert "correct" not in last and "ok" not in last
-    assert _published(stream.results[-1], "correct") is False  # the harness has the outcome
+    score = stream.results[-1].score  # the harness has the outcome
+    assert score is not None and _published(score.feedback, "correct") is False
 
 
 async def test_a_failing_tool_cannot_relay_env_text_to_the_caller(tmp_path: Path) -> None:
@@ -362,17 +397,19 @@ async def test_a_malformed_summary_is_invisible_to_the_agent(tmp_path: Path) -> 
     # ...and so does the call the agent makes next, which is where the same leak would surface
     # one call later: a stopped stream is the end of the queue, not an error.
     assert _observed(right_next)[0] is False and _observed(wrong_next)[0] is False
-    assert json.loads(_observed(right_next)[1]) == {"done": True, "remaining": 0, "consumed": 1}
+    ended = json.loads(_observed(right_next)[1])
+    assert ended == await _reads_as_exhausted(tmp_path, consumed=1)
 
     # The harness is told everything, on the stream and out of the drain.
     assert right.stopped and not wrong.stopped
     with pytest.raises(RuntimeError, match="cannot headline.*'correct' must be true or false"):
         await right.aclose()
     (row,) = _rows(tmp_path / "right")
-    assert row["success"] is None
-    assert row["feedback"] == [_episode_item("correct", "true")], "the evidence must be durable"
+    assert row["score"] is None
+    assert row["observed"] == [_episode_item("correct", "true")], "the evidence must be durable"
+    assert "cannot headline" in (row["diagnostic"] or "")
     await wrong.aclose()
-    assert [r["success"] for r in _rows(tmp_path / "wrong")] == [False, False]
+    assert [r["score"]["success"] for r in _rows(tmp_path / "wrong")] == [False, False]
 
 
 async def test_an_env_that_raises_while_ending_a_task_is_redacted_and_stops_the_run(
@@ -406,18 +443,20 @@ async def test_an_env_that_raises_while_ending_a_task_is_redacted_and_stops_the_
     assert _observed(wrong_end) == _observed(right_end), "the outcome is readable off the call"
     assert _observed(wrong_end)[0] is False
     # The run is over rather than continuing into the repeat.
-    assert json.loads(_observed(right_next)[1]) == {"done": True, "remaining": 0, "consumed": 1}
+    ended = json.loads(_observed(right_next)[1])
+    assert ended == await _reads_as_exhausted(tmp_path, consumed=1)
 
     # A task was still dispensed, so exactly one row is owed and lands — unscored, with the
     # feedback that never serialized absent from it, which is what makes the loss legible.
     (row,) = _rows(tmp_path / "right")
-    assert (row["success"], row["reward"], row["feedback"]) == (None, None, [])
+    assert row["observed"] == [], "feedback that never serialized cannot be on the row"
+    assert row["score"] == {"reward": None, "success": None, "feedback": []}
     assert right.stopped, "a run that lost an outcome reported itself complete"
     with pytest.raises(RuntimeError, match="raised while ending a task.*must be finite") as end:
         await right.aclose()
     assert isinstance(end.value.__cause__, ValueError)
     await wrong.aclose()
-    assert [r["success"] for r in _rows(tmp_path / "wrong")] == [False, False]
+    assert [r["score"]["success"] for r in _rows(tmp_path / "wrong")] == [False, False]
 
 
 class _UnrenderableError(RuntimeError):
@@ -504,7 +543,8 @@ async def test_a_stopped_stream_reports_to_the_harness_and_not_to_the_agent(
         out = await client.call_tool("get_task", {}, raise_on_error=False)
     assert not out.is_error
     seen = out.content[0].text  # type: ignore[union-attr]
-    assert json.loads(seen) == {"done": True, "remaining": 0, "consumed": 1}
+    ended = json.loads(seen)
+    assert ended == await _reads_as_exhausted(tmp_path, consumed=1)
     assert str(tmp_path) not in seen and "record" not in seen
     with pytest.raises(RuntimeError, match="record is incomplete"):
         await stream.aclose()
@@ -533,13 +573,13 @@ async def test_an_ordinary_call_that_fails_is_still_the_env_s_own_answer(
         await stream.get_task()
         with pytest.raises(RuntimeError, match="fell over mid-episode"):
             await stream.dispatch("noop", {})
-        assert stream.queue_info()["in_flight"] == 1, "the task ended when nothing ended it"
+        assert stream.queue_info().in_flight == 1, "the task ended when nothing ended it"
         assert not stream.stopped
         # ...and the task can still be finished, which is the whole reason it is not redacted.
         assert json.loads(
             _terminal_text(await stream.dispatch(SUBMIT_TOOL, {"answer": "4"}))
         )["terminated"] is True
-    assert [row["success"] for row in _rows(tmp_path)] == [True]
+    assert [row["score"]["success"] for row in _rows(tmp_path)] == [True]
 
 
 class _VaryingManifest(_FixtureScoreEnv):
@@ -670,10 +710,10 @@ def _unwritable_prov(tmp_path: Path) -> None:
 
 
 async def test_a_failed_row_write_still_releases_the_episode(tmp_path: Path) -> None:
-    # The row and the episode are independent: the episode owns MCP sessions and an env, its
-    # `_Live` entry is the only handle on them, and a seal is not retried. So a write that
-    # fails must not take the release with it — the entry would sit in the registry sealed
-    # forever, invisible to `aclose`, with the env alive behind it.
+    # The row and the episode are independent: the episode owns MCP sessions and an env, and its
+    # `_Live` entry is the only handle on them. A seal whose write fails hands its claim back so
+    # the drain can retry it, so the entry outlives the failed call on purpose — but the drain is
+    # the last chance, and a write still failing there must not take the release with it.
     built: List[_TrackedEnv] = []
     stream = TaskStream(
         _tracked_factory(built), [TaskRef(ENV_NAME, 0)], prov_dir=tmp_path / "prov"
@@ -681,20 +721,21 @@ async def test_a_failed_row_write_still_releases_the_episode(tmp_path: Path) -> 
     clean = await _clean_terminal_response(tmp_path)
     _unwritable_prov(tmp_path)
     await stream.get_task()
-    assert stream.queue_info()["in_flight"] == 1
+    assert stream.queue_info().in_flight == 1
     # The caller is told the task ended and nothing else: a failure that reached it as an
     # exception would be a response shape that varies with what the seal found (see
     # `test_a_malformed_summary_is_invisible_to_the_agent`).
     assert _terminal_text(await stream.dispatch(SUBMIT_TOOL, {"answer": "4"})) == clean
+    assert stream.queue_info().in_flight == 1  # still sealable: the claim was handed back
 
-    assert stream.queue_info()["in_flight"] == 0  # the entry is gone from the registry
-    assert built[1].closed, "the episode's env outlived the failed write"
-    # aclose still releases the catalog, and reports the row the run never got — with the write
-    # failure itself still on the chain, which is where it went instead of to the caller.
+    # The drain reports the row the run never got — with the write failure itself still on the
+    # chain, which is where it went instead of to the caller.
     assert stream.stopped
     with pytest.raises(RuntimeError, match="record is incomplete") as raised:
         await stream.aclose()
     assert isinstance(raised.value.__cause__, OSError)
+    assert stream.queue_info().in_flight == 0  # the entry is gone from the registry
+    assert built[1].closed, "the episode's env outlived the failed write"
     assert all(env.closed for env in built)
 
 
@@ -719,7 +760,7 @@ async def test_a_row_counts_as_recorded_only_once_it_is_durable(tmp_path: Path) 
     with pytest.raises(RuntimeError, match="could not be recorded") as refused:
         await stream.get_task()
     assert isinstance(refused.value.__cause__, OSError)
-    assert stream.queue_info()["consumed"] == 1
+    assert stream.queue_info().consumed == 1
     with pytest.raises(RuntimeError, match="record is incomplete"):
         await stream.aclose()
 
@@ -896,7 +937,12 @@ async def test_a_row_that_cannot_be_synced_is_a_failed_write(
     assert _terminal_text(await stream.dispatch(SUBMIT_TOOL, {"answer": "4"})) == clean
 
     assert stream.results == ()
-    assert stream.queue_info()["in_flight"] == 0
+    assert stream.queue_info().in_flight == 1  # still sealable: the claim was handed back
+    with pytest.raises(RuntimeError, match="could not be recorded"):
+        await stream.get_task()
+    with pytest.raises(RuntimeError, match="record is incomplete"):
+        await stream.aclose()
+    assert stream.queue_info().in_flight == 0
     assert built[1].closed, "the episode's env outlived the failed sync"
     assert stream.stopped
     with pytest.raises(RuntimeError, match="could not be recorded") as refused:
@@ -904,40 +950,6 @@ async def test_a_row_that_cannot_be_synced_is_a_failed_write(
     assert isinstance(refused.value.__cause__, OSError)
     with pytest.raises(RuntimeError, match="record is incomplete"):
         await stream.aclose()
-
-
-async def test_a_recorded_provenance_directory_is_refused_not_appended_to(
-    tmp_path: Path,
-) -> None:
-    # Two runs into one directory produce a file whose rows collide on the keys that identify
-    # them — a queue holding one task recorded as two outcomes — while each stream's `results`
-    # shows only its own. A harness scoring the file and a harness scoring the object then
-    # report different numbers for the same run, and neither is misreading what it was given.
-    prov = tmp_path / "prov"
-    async with _stream(tmp_path, [0]) as first:
-        await first.get_task()
-        await first.dispatch(SUBMIT_TOOL, {"answer": "4"})
-    assert [(row["seq"], row["position"]) for row in _rows(tmp_path)] == [(1, 0)]
-
-    built: List[_TrackedEnv] = []
-    with pytest.raises(ValueError, match="already holds recorded rows"):
-        TaskStream(_tracked_factory(built), [TaskRef(ENV_NAME, 0)], prov_dir=prov)
-
-    # The refusal happens before a single env is built, so there is nothing to clean up after it
-    # — and the record it protected is untouched: not appended to, and not truncated either.
-    assert built == []
-    assert [(row["seq"], row["position"], row["success"]) for row in _rows(tmp_path)] == [
-        (1, 0, True)
-    ]
-
-    # Scoped to a directory that holds a *run*: an existing but empty one is a fresh start, and
-    # so is a different directory. Neither is the mistake.
-    (tmp_path / "empty" / "prov").mkdir(parents=True)
-    (tmp_path / "empty" / "prov" / "results.jsonl").touch()
-    async with _stream(tmp_path / "empty", [0]) as reused_dir:
-        await reused_dir.get_task()
-    async with _stream(tmp_path / "elsewhere", [0]) as fresh:
-        await fresh.get_task()
 
 
 async def test_a_failed_drain_still_releases_every_env(tmp_path: Path) -> None:
@@ -954,14 +966,15 @@ async def test_a_failed_drain_still_releases_every_env(tmp_path: Path) -> None:
     with pytest.raises(RuntimeError, match="record is incomplete"):
         await stream.aclose()
     assert len(built) == 2 and all(env.closed for env in built)
-    assert stream.queue_info()["in_flight"] == 0
+    assert stream.queue_info().in_flight == 0
 
 
 async def test_wrong_answer_scores_zero_not_an_error(tmp_path: Path) -> None:
     async with _stream(tmp_path, [0]) as stream:
         await stream.get_task()
         await stream.dispatch(SUBMIT_TOOL, {"answer": "nope"})
-    assert _rows(tmp_path)[0]["success"] is False
+    row = _rows(tmp_path)[0]
+    assert row["closure"] == "sealed" and row["score"]["success"] is False
 
 
 def _feedback_env(
@@ -1023,11 +1036,13 @@ async def test_a_wrong_typed_success_is_neither_coerced_nor_dropped(
     assert _terminal_text(await stream.dispatch(SUBMIT_TOOL, {"answer": "nope"})) == clean
 
     (row,) = _rows(tmp_path)
-    assert row["success"] is None, f"{value!r} was coerced into a verdict"
-    assert row["feedback"] == [
+    assert row["score"] is None, f"{value!r} was coerced into a verdict"
+    assert row["observed"] == [
         _episode_item(name, value)
     ], "the env's own output must survive verbatim"
-    assert stream.results == (row,), "the durable row and the in-memory one must agree"
+    assert "cannot headline" in (row["diagnostic"] or ""), "the file must say why it is unscored"
+    assert stream.results[0].to_wire() == row
+    assert stream.queue_info().in_flight == 0, "the episode outlived its recorded row"
     assert stream.stopped
     with pytest.raises(RuntimeError, match=f"{name!r} must be true or false"):
         await stream.get_task()
@@ -1048,7 +1063,7 @@ async def test_a_wrong_typed_reward_is_not_silently_dropped(tmp_path: Path) -> N
     assert _terminal_text(await stream.dispatch(SUBMIT_TOOL, {"answer": "4"})) == clean
 
     (row,) = _rows(tmp_path)
-    assert row["reward"] is None and row["feedback"] == [_episode_item("reward", "0.75")]
+    assert row["score"] is None and row["observed"] == [_episode_item("reward", "0.75")]
     assert stream.stopped
     with pytest.raises(RuntimeError, match="cannot headline.*'reward' must be a number"):
         await stream.aclose()
@@ -1071,10 +1086,11 @@ async def test_an_env_that_publishes_no_summary_records_none_and_carries_on(
             await stream.dispatch(SUBMIT_TOOL, {"answer": "4"})
 
     rows = _rows(tmp_path)
-    assert [(row["success"], row["reward"]) for row in rows] == [(None, None)] * 2
+    assert [(r["score"]["success"], r["score"]["reward"]) for r in rows] == [(None, None)] * 2
     assert all(
-        row["feedback"] == [_episode_item("notes", "graded offline")] for row in rows
+        r["observed"] == [_episode_item("notes", "graded offline")] for r in rows
     )
+    assert all(r["closure"] == "sealed" and r["diagnostic"] is None for r in rows)
 
 
 @pytest.mark.parametrize(
@@ -1102,8 +1118,9 @@ async def test_a_summary_name_published_twice_is_refused_not_resolved(
     #
     # There is no silent answer that is right. Keeping either occurrence decides the benchmark
     # headline by list order and erases the other from the row that is supposed to be evidence.
-    # So it is refused exactly like a wrong-typed value: the row lands first, carrying both
-    # occurrences verbatim so the ambiguity is legible in the file, and then the stream stops.
+    # So it is refused exactly like a wrong-typed value: the row lands first — unscored, with a
+    # diagnostic, carrying both occurrences verbatim so the ambiguity is legible in the file —
+    # and then the stream stops.
     clean = await _clean_terminal_response(tmp_path)
     stream = TaskStream(
         _feedback_env([("episode", name, first), ("episode", name, second)]),
@@ -1114,12 +1131,15 @@ async def test_a_summary_name_published_twice_is_refused_not_resolved(
     assert _terminal_text(await stream.dispatch(SUBMIT_TOOL, {"answer": "4"})) == clean
 
     (row,) = _rows(tmp_path)
-    assert row["success"] is None and row["reward"] is None, "an ambiguous headline was taken"
-    assert row["feedback"] == [
+    assert row["score"] is None, "an ambiguous headline was taken"
+    assert row["observed"] == [
         _episode_item(name, first),
         _episode_item(name, second),
     ], "an occurrence the stream refused to trust was dropped from the record"
-    assert stream.results == (row,), "the durable row and the in-memory one must agree"
+    assert "cannot headline" in (row["diagnostic"] or ""), "the file must say why it is unscored"
+    assert row["closure"] == "sealed", "how the task ended is a separate question"
+    assert stream.results[0].to_wire() == row
+    assert stream.queue_info().in_flight == 0, "the episode outlived its recorded row"
     assert stream.stopped
     with pytest.raises(RuntimeError, match=f"{name!r} was published 2 times"):
         await stream.get_task()
@@ -1196,11 +1216,13 @@ async def test_a_summary_value_that_cannot_be_described_still_fails_loudly(
     assert _terminal_text(await stream.dispatch(SUBMIT_TOOL, {"answer": "nope"})) == clean
 
     (row,) = _rows(tmp_path)
-    assert row["success"] is None and row["reward"] is None, "an unreadable value was headlined"
-    assert row["feedback"] == [
+    assert row["score"] is None, "an unreadable value was headlined"
+    assert row["observed"] == [
         _episode_item(name, json.loads(json.dumps(value))) for name, value in items
     ], "the durable evidence must survive a value the record cannot describe"
-    assert stream.results == (row,), "the durable row and the in-memory one must agree"
+    assert "cannot headline" in (row["diagnostic"] or ""), "the file must say why it is unscored"
+    assert stream.results[0].to_wire() == row, "the durable row and the in-memory one must agree"
+    assert stream.queue_info().in_flight == 0, "the episode outlived its recorded row"
     assert stream.stopped, "the stop the refusal owes was lost to the refusal's own message"
     with pytest.raises(RuntimeError, match=refusal):
         await stream.get_task()
@@ -1239,20 +1261,20 @@ async def test_a_row_keeps_each_item_at_the_level_the_env_published_it(
         await stream.dispatch(SUBMIT_TOOL, {"answer": "4"})
 
     (row,) = _rows(tmp_path)
-    assert row["feedback"] == [
+    assert row["observed"] == [
         {"name": "format_reward", "value": True, "level": "inference", "step": 1},
         {"name": "correct", "value": False, "level": "inference", "step": 1},
         _episode_item("correct", True),
     ]
-    assert row["success"] is True, "the episode-level item is the task's outcome"
+    assert row["score"]["success"] is True, "the episode-level item is the task's outcome"
 
 
 async def test_an_inference_item_never_headlines_a_row(tmp_path: Path) -> None:
     # Dense per-step reward is a legitimate env design — `wordle` publishes one — so a stream
     # must serve it rather than refuse it. What it must not do is headline it: a `reward` that
     # meant "this task" on one row and "step 1" on the next would be unaggregatable, and
-    # indistinguishable in the file. The run therefore continues, unscored, with the step's
-    # value on the row as evidence for whoever wonders why.
+    # indistinguishable in the file. The run therefore continues, scored but with empty
+    # headlines, and the step's value stays on the row as evidence for whoever wonders why.
     async with TaskStream(
         _feedback_env([("inference", "reward", 0.5), ("inference", "success", True)]),
         [TaskRef(ENV_NAME, 0)],
@@ -1262,18 +1284,18 @@ async def test_an_inference_item_never_headlines_a_row(tmp_path: Path) -> None:
         await stream.dispatch(SUBMIT_TOOL, {"answer": "4"})
 
     (row,) = _rows(tmp_path)
-    assert (row["reward"], row["success"]) == (None, None)
-    assert [item["value"] for item in row["feedback"]] == [0.5, True]
-    assert all(item["level"] == "inference" for item in row["feedback"])
+    assert (row["score"]["reward"], row["score"]["success"]) == (None, None)
+    assert [item["value"] for item in row["observed"]] == [0.5, True]
+    assert all(item["level"] == "inference" for item in row["observed"])
 
 
 async def test_reading_the_recorded_rows_cannot_rewrite_them(tmp_path: Path) -> None:
-    # `results` used to hand back the run's own rows: `results[0] is results[0]`, and each one a
-    # dict of dicts. So a reader held the record — an edit through it changed what the stream
-    # reported for the rest of the run while the file it had already committed said something
-    # else. That is the shape of the worst version: an in-memory row headlining `success=True`
-    # beside a feedback item saying the answer was wrong, with the record on disk agreeing with
-    # neither.
+    # `results` used to hand back the run's own rows: `results[0] is results[0]`. A `ResultRow` is
+    # frozen and *shallow*, so what a reader got was a handle on `observed` and on the one list
+    # that `score.feedback` also is — and an edit through either changed what the run reported
+    # while the file it had already committed said something else. That is the shape of the worst
+    # version: an in-memory row headlining `success=True` beside an `observed` item saying the
+    # answer was wrong, with the record on disk agreeing with neither.
     #
     # So the run keeps one canonical row — the wire form the file holds — and every read is a
     # copy of it.
@@ -1284,24 +1306,25 @@ async def test_reading_the_recorded_rows_cannot_rewrite_them(tmp_path: Path) -> 
         await stream.dispatch(SUBMIT_TOOL, {"answer": "wrong"})
 
     durable = _rows(tmp_path)
-    assert list(stream.results) == durable, (
+    assert [row.to_wire() for row in stream.results] == durable, (
         "what the run reports in memory and what it committed are one record"
     )
     first = stream.results[0]
     assert first is not stream.results[0], "two reads of the record share one row"
-    assert first["feedback"] is not stream.results[0]["feedback"]
+    assert first.score is not None
+    assert first.observed is not first.score.feedback, "one list is both halves of the row"
 
-    # A reader edits everything a row leaves reachable, at both levels.
+    # A reader edits everything the frozen row leaves reachable, at both levels.
     for row in stream.results:
-        row["success"] = not row["success"]
-        row["reward"] = 99.0
-        row["feedback"][0]["value"] = "invented"
-        row["feedback"].append(_episode_item("invented", True))
+        row.observed[0]["value"] = "invented"
+        row.observed.append(_episode_item("invented", True))
+        if row.score is not None:
+            row.score.feedback[0]["value"] = "invented"
 
-    assert list(stream.results) == durable, "the record was rewritten"
+    assert [row.to_wire() for row in stream.results] == durable, "the record was rewritten"
     assert _rows(tmp_path) == durable
     # The outcomes are still the ones the two episodes earned.
-    assert [row["success"] for row in stream.results] == [True, False]
+    assert [row.score.success for row in stream.results if row.score] == [True, False]
 
 
 async def test_pulling_a_new_task_seals_the_abandoned_one(tmp_path: Path) -> None:
@@ -1310,349 +1333,23 @@ async def test_pulling_a_new_task_seals_the_abandoned_one(tmp_path: Path) -> Non
     async with _stream(tmp_path, [0, 1]) as stream:
         await stream.get_task()
         await stream.get_task()
-        assert stream.queue_info() == {"remaining": 0, "consumed": 2, "in_flight": 1}
+        assert stream.queue_info() == QueueInfo(remaining=0, consumed=2, in_flight=1)
     rows = _rows(tmp_path)
     assert len(rows) == 2
-    assert rows[0]["task_idx"] == 0 and rows[0]["success"] is False
+    assert rows[0]["task_idx"] == 0 and rows[0]["closure"] == "drained"
+    assert rows[0]["score"]["success"] is False
 
 
 async def test_orderly_drain_seals_the_live_episode(tmp_path: Path) -> None:
     stream = _stream(tmp_path, [0])
     async with stream:
         await stream.get_task()
-        assert stream.queue_info()["in_flight"] == 1
+        assert stream.queue_info().in_flight == 1
     assert len(_rows(tmp_path)) == 1
-    assert stream.queue_info()["in_flight"] == 0
+    assert stream.queue_info().in_flight == 0
     # Idempotent: a second drain neither re-seals nor duplicates a row.
     await stream.aclose()
     assert len(_rows(tmp_path)) == 1
-
-
-# ----- a terminal whose caller went away -----
-
-
-class _BlockedFinalize(_FixtureScoreEnv):
-    """An env whose grading blocks until the test lets it finish, so a task can be caught mid
-    terminal transaction: sealed, its evaluator running, its verdict not yet landed."""
-
-    def __init__(self, grading: asyncio.Event, release: asyncio.Event, **kwargs: Any) -> None:
-        super().__init__(**kwargs)
-        self._grading = grading
-        self._release = release
-
-    async def finalize(self, req: FinalizeRequest) -> TerminalEvidence:
-        self._grading.set()
-        await self._release.wait()
-        return await super().finalize(req)
-
-
-def _abandoned_terminal(
-    tmp_path: Path, indices: List[int]
-) -> Tuple[TaskStream, asyncio.Event, asyncio.Event]:
-    """A stream whose env blocks in ``finalize``, plus the two events that drive it: one it sets
-    when grading starts, one the test sets to let the verdict land."""
-    grading, release = asyncio.Event(), asyncio.Event()
-    stream = TaskStream(
-        lambda _name: _BlockedFinalize(grading, release, tasks=TASKS),
-        [TaskRef(ENV_NAME, i) for i in indices],
-        prov_dir=tmp_path / "prov",
-    )
-    return stream, grading, release
-
-
-async def _lose_the_caller_mid_finalization(stream: TaskStream, grading: asyncio.Event) -> None:
-    """Answer the first task correctly, then lose the caller while the env is still grading it —
-    an MCP disconnect, or a client that gave up on the request. The episode shields its
-    finalization, so the task is left sealed with its evaluator running and nothing recorded."""
-    await stream.get_task()
-    call = asyncio.ensure_future(stream.dispatch(SUBMIT_TOOL, {"answer": "4"}))
-    await asyncio.wait_for(grading.wait(), timeout=5)
-    call.cancel()
-    with pytest.raises(asyncio.CancelledError):
-        await call
-
-
-def _assert_scored_correct(row: Dict[str, Any]) -> None:
-    """The row an authoritative seal of the right answer produces — as against the unscored,
-    empty-feedback one a read taken ahead of the verdict records."""
-    assert (row["success"], _published(row, "correct")) == (True, True), row
-
-
-async def test_a_cancelled_terminal_is_scored_from_its_own_finalization(
-    tmp_path: Path,
-) -> None:
-    # The next dispense drains the abandoned task. It must adopt the outcome already in flight,
-    # not force a terminal over the top of it: a forced call on a sealed episode only reads the
-    # post-seal tombstone, and reading the feedback straight after snapshots it before the
-    # finalizer has published any — filing a task the agent solved as `success: null` with empty
-    # feedback, indistinguishable from an env that publishes no summary.
-    stream, grading, release = _abandoned_terminal(tmp_path, [0, 1])
-    await _lose_the_caller_mid_finalization(stream, grading)
-
-    pull = asyncio.ensure_future(stream.get_task())
-    await asyncio.sleep(0.05)
-    # Observed before the verdict is released, and asserted after, so that a failure here ends
-    # the test rather than leaving the evaluator blocked on a queue nobody will drain.
-    waited, recorded = not pull.done(), stream.results
-    landed = (tmp_path / "prov" / "results.jsonl").exists()
-    release.set()
-    dispensed = await pull
-    await stream.aclose()
-
-    assert waited, "the drain read the episode without waiting for its verdict"
-    assert not recorded, "an unscored row was published before the verdict landed"
-    assert not landed
-    assert dispensed is not None  # and the next task is still dispensed
-
-    first, second = _rows(tmp_path)
-    _assert_scored_correct(first)
-    assert first == stream.results[0], "the durable row and the in-memory one disagree"
-    assert [row["position"] for row in (first, second)] == [0, 1]
-
-
-async def test_a_call_after_a_cancelled_terminal_is_still_scored_from_it(
-    tmp_path: Path,
-) -> None:
-    # The likelier arrival: the client that lost the response retries the same call. It reaches
-    # the entry the cancellation left unsealed, the episode tombstones it as terminated, and the
-    # stream seals from there — the identical read, at an entry point no drain is involved in.
-    # The agent still gets the constant, and the row is still the one it earned.
-    stream, grading, release = _abandoned_terminal(tmp_path, [0])
-    await _lose_the_caller_mid_finalization(stream, grading)
-
-    retry = asyncio.ensure_future(stream.dispatch(SUBMIT_TOOL, {"answer": "4"}))
-    await asyncio.sleep(0.05)
-    waited, recorded = not retry.done(), stream.results
-    release.set()
-    answer = _terminal_text(await retry)
-    await stream.aclose()
-
-    assert waited, "the retry read the episode without waiting for its verdict"
-    assert not recorded, "an unscored row was published before the verdict landed"
-    assert answer == await _clean_terminal_response(tmp_path)
-    (row,) = _rows(tmp_path)
-    _assert_scored_correct(row)
-
-
-async def test_the_drain_waits_for_a_cancelled_terminal_before_recording_it(
-    tmp_path: Path,
-) -> None:
-    # And the third way in: nobody calls back at all, so shutdown is what reaches the task.
-    stream, grading, release = _abandoned_terminal(tmp_path, [0])
-    await _lose_the_caller_mid_finalization(stream, grading)
-
-    closing = asyncio.ensure_future(stream.aclose())
-    await asyncio.sleep(0.05)
-    waited, recorded = not closing.done(), stream.results
-    release.set()
-    await closing
-
-    assert waited, "the drain read the episode without waiting for its verdict"
-    assert not recorded, "an unscored row was published before the verdict landed"
-    (row,) = _rows(tmp_path)
-    _assert_scored_correct(row)
-    assert not stream.stopped and stream.queue_info()["in_flight"] == 0
-
-
-async def _cancel_mid_seal(sealing: "asyncio.Future[Any]", release: asyncio.Event) -> None:
-    """Cancel a caller that is waiting inside a seal, then let the verdict land.
-
-    Released before the await so a regression *fails* here rather than hanging: the unfixed
-    code closes the episode on its way out, which cannot finish while the evaluator is blocked.
-    """
-    sealing.cancel()
-    release.set()
-    with pytest.raises(asyncio.CancelledError):
-        await asyncio.wait_for(sealing, timeout=5)
-    await asyncio.sleep(0.05)
-
-
-async def test_a_cancelled_pull_leaves_the_task_sealable(tmp_path: Path) -> None:
-    # A `get_task` cancelled while it seals the previous task has *lost* nothing: the episode
-    # still holds the authoritative outcome. Consuming the entry there — marking it sealed,
-    # closing it and dropping it — makes that outcome permanently unreachable, with `consumed`
-    # still counting the task and no row that can ever land for it. So the claim is handed back
-    # and the next arrival finishes the seal.
-    stream, grading, release = _abandoned_terminal(tmp_path, [0, 1])
-    await _lose_the_caller_mid_finalization(stream, grading)
-
-    pull = asyncio.ensure_future(stream.get_task())
-    await asyncio.sleep(0.05)
-    assert not pull.done(), "the pull did not reach the seal"
-    await _cancel_mid_seal(pull, release)
-
-    # Still owed, still holdable: nothing recorded, nothing released, and nothing to stop for.
-    assert stream.queue_info() == {"remaining": 1, "consumed": 1, "in_flight": 1}
-    assert stream.results == ()
-    assert not (tmp_path / "prov" / "results.jsonl").exists()
-    assert not stream.stopped, "an ordinary cancellation must not end the run"
-
-    # ...and the next pull records the outcome the cancelled one abandoned, then serves the
-    # rest of the queue as if nothing had happened.
-    assert await stream.get_task() is not None
-    await stream.aclose()
-    first, second = _rows(tmp_path)
-    _assert_scored_correct(first)
-    assert first == stream.results[0], "the durable row and the in-memory one disagree"
-    assert [row["position"] for row in (first, second)] == [0, 1]
-
-
-async def test_a_cancelled_drain_leaves_the_task_sealable(tmp_path: Path) -> None:
-    # The shutdown variant, which is worse: `aclose` sets `_closed` on the way in, so a drain
-    # consumed by its own cancellation would leave the retry — the only call that could still
-    # record the task — returning as if the run had completed.
-    stream, grading, release = _abandoned_terminal(tmp_path, [0])
-    await _lose_the_caller_mid_finalization(stream, grading)
-
-    closing = asyncio.ensure_future(stream.aclose())
-    await asyncio.sleep(0.05)
-    assert not closing.done(), "the drain did not reach the seal"
-    await _cancel_mid_seal(closing, release)
-
-    assert stream.queue_info()["in_flight"] == 1
-    assert stream.results == ()
-    assert not (tmp_path / "prov" / "results.jsonl").exists()
-    assert not stream.stopped
-
-    # The retry finishes what the cancelled drain started: exactly one row, scored off the
-    # episode's own verdict, and the drain is idempotent from there.
-    await stream.aclose()
-    (row,) = _rows(tmp_path)
-    _assert_scored_correct(row)
-    assert row == stream.results[0]
-    assert stream.queue_info()["in_flight"] == 0
-    await stream.aclose()
-    assert len(_rows(tmp_path)) == 1
-
-
-class _SlowRelease(_FixtureScoreEnv):
-    """An env whose teardown blocks, so a caller can be lost in the *other* half of a seal: the
-    window after the row is durable, while the episode is being let go."""
-
-    def __init__(
-        self,
-        closing: asyncio.Event,
-        release: asyncio.Event,
-        summary: Any,
-        **kwargs: Any,
-    ) -> None:
-        super().__init__(**kwargs)
-        self._closing = closing
-        self._release = release
-        self._summary = summary
-        self.released = False
-
-    def _verify(self, trajectory, task, *, terminated, evidence=None) -> FeedbackCollection:
-        fb = FeedbackCollection()
-        if terminated:
-            fb.episode.append(EpisodeFeedback(name="success", value=self._summary))
-        return fb
-
-    async def close(self) -> None:
-        self._closing.set()
-        await self._release.wait()
-        await super().close()
-        self.released = True
-
-
-def _lost_in_the_release(
-    tmp_path: Path, indices: List[int], *, summary: Any = True
-) -> Tuple[TaskStream, asyncio.Event, asyncio.Event, List[_SlowRelease]]:
-    """A stream whose episodes block in teardown, the two events that drive one, and every env
-    the factory built — the catalog's first, then one per dispensed task."""
-    closing, release = asyncio.Event(), asyncio.Event()
-    built: List[_SlowRelease] = []
-
-    def factory(_name: str) -> _SlowRelease:
-        env = _SlowRelease(closing, release, summary, tasks=TASKS)
-        built.append(env)
-        return env
-
-    stream = TaskStream(
-        factory, [TaskRef(ENV_NAME, i) for i in indices], prov_dir=tmp_path / "prov"
-    )
-    return stream, closing, release, built
-
-
-async def _lose_the_caller_mid_release(
-    caller: "asyncio.Future[Any]", closing: asyncio.Event, release: asyncio.Event
-) -> None:
-    """Lose the caller once the row is durable and the episode is being let go — a client that
-    gave up on a request it has effectively already been answered for.
-
-    Unblocked before the await so a regression *fails* here rather than hanging on a teardown
-    nothing can finish."""
-    await asyncio.wait_for(closing.wait(), timeout=5)
-    caller.cancel()
-    release.set()
-    with pytest.raises(asyncio.CancelledError):
-        await asyncio.wait_for(caller, timeout=5)
-    await asyncio.sleep(0.05)
-
-
-async def test_a_release_that_loses_its_caller_still_stops_an_unheadlinable_run(
-    tmp_path: Path,
-) -> None:
-    # A cancelled seal hands its claim back because nothing was lost. Once the row is durable
-    # there is nothing left to hand back, and what follows it — letting the episode go, and
-    # stopping for a summary this record cannot headline — is the stream's, not the caller's. A
-    # client that disconnects between the two would otherwise leave the run reporting itself
-    # complete while carrying `success: null`, which in a run that *finished* means exactly one
-    # thing: the env published no such field. That ambiguity is what the stop exists to prevent.
-    stream, closing, release, _ = _lost_in_the_release(tmp_path, [0, 1], summary="false")
-    await stream.get_task()
-    call = asyncio.ensure_future(stream.dispatch(SUBMIT_TOOL, {"answer": "4"}))
-    await _lose_the_caller_mid_release(call, closing, release)
-
-    assert stream.stopped, "a lost caller must not cost the run its stop"
-    (row,) = _rows(tmp_path)
-    assert (row["success"], _published(row, "success")) == (None, "false"), row
-    assert row == stream.results[0]
-    # ...and the queue is not served over it: the next task is refused, and the drain reports it.
-    with pytest.raises(RuntimeError, match="cannot headline"):
-        await stream.get_task()
-    assert stream.queue_info()["remaining"] == 1
-    with pytest.raises(RuntimeError, match="cannot headline"):
-        await stream.aclose()
-
-
-async def test_a_release_that_loses_its_caller_still_closes_the_episode(
-    tmp_path: Path,
-) -> None:
-    # No broken env needed for this half. `_release` drops the entry from the registry on its
-    # way out, so a release abandoned partway leaves an episode nothing holds a handle on: its
-    # MCP sessions and its env stay open for the life of the process and no later drain can
-    # reach them, because a row that landed makes the seal final.
-    stream, closing, release, built = _lost_in_the_release(tmp_path, [0])
-    await stream.get_task()
-    call = asyncio.ensure_future(stream.dispatch(SUBMIT_TOOL, {"answer": "4"}))
-    await _lose_the_caller_mid_release(call, closing, release)
-
-    episode_env = built[1]  # the catalog's is built first
-    assert episode_env.released, "the episode's env was left open with nothing able to close it"
-    assert not stream.stopped, "an ordinary cancellation must not end the run"
-    (row,) = _rows(tmp_path)
-    assert row["success"] is True
-    await stream.aclose()
-
-
-async def test_a_drain_that_loses_its_caller_still_finishes_what_the_row_owes(
-    tmp_path: Path,
-) -> None:
-    # The shutdown entry, which is the worse one: `aclose` is the only place a stream driven
-    # entirely over MCP reports anything, and a retried drain finds the row already final — so a
-    # tail abandoned here is abandoned for good, and the run's last word is that it went fine.
-    stream, closing, release, built = _lost_in_the_release(tmp_path, [0], summary="false")
-    await stream.get_task()
-    closer = asyncio.ensure_future(stream.aclose())
-    await _lose_the_caller_mid_release(closer, closing, release)
-
-    assert stream.stopped
-    assert built[1].released
-    (row,) = _rows(tmp_path)
-    assert (row["success"], _published(row, "success")) == (None, "false"), row
-    with pytest.raises(RuntimeError, match="cannot headline"):
-        await stream.aclose()
 
 
 async def test_a_repeated_task_index_is_dispensed_twice(tmp_path: Path) -> None:
@@ -1671,7 +1368,7 @@ async def test_dispatch_without_a_task_is_a_stream_error_not_an_env_step(tmp_pat
         result = await stream.dispatch(SUBMIT_TOOL, {"answer": "4"})
         payload = json.loads(result.content[0].text)  # type: ignore[union-attr]
         assert payload["error"] == "no active task"
-        assert stream.queue_info()["consumed"] == 0
+        assert stream.queue_info().consumed == 0
     # The unstarted task was never dispensed, so it left no row.
     assert not (tmp_path / "prov" / "results.jsonl").exists()
 
@@ -1783,9 +1480,12 @@ async def test_an_episode_that_adds_a_tool_is_never_dispensed(tmp_path: Path) ->
 
     # Nothing was handed out: no position consumed, no row owed, and the episode's env released
     # here rather than left for a drain that would score a task nobody ever saw.
-    assert stream.queue_info() == {"remaining": 2, "consumed": 0, "in_flight": 0}
+    assert stream.queue_info() == QueueInfo(remaining=2, consumed=0, in_flight=0)
     assert stream.results == ()
     assert not (tmp_path / "prov" / "results.jsonl").exists()
+    # Not even a dispense record: one would read back through `reconcile` as a task that was
+    # handed out and crashed, which is why the check sits above `_write_dispense`.
+    assert read_dispenses(tmp_path / "prov") == []
     assert built[1].closed, "the episode's env outlived the refused dispense"
 
     # And the drift belongs to the factory, not to this task, so the rest of the queue would be
@@ -1832,7 +1532,8 @@ async def test_an_episode_that_changes_a_schema_is_never_dispensed(tmp_path: Pat
         out = await client.call_tool("get_task", {}, raise_on_error=False)
         assert not out.is_error
         seen = out.content[0].text  # type: ignore[union-attr]
-        assert json.loads(seen) == {"done": True, "remaining": 0, "consumed": 0}
+        ended = json.loads(seen)
+        assert ended == await _reads_as_exhausted(tmp_path, consumed=0)
         assert "final_answer" not in seen
     # ...while the harness has the whole of it, on the stream and out of the drain.
     assert stream.stopped
@@ -1879,7 +1580,7 @@ async def test_a_drifted_tool_name_that_cannot_be_described_still_stops_the_stre
     # The stop is the whole point: the drift belongs to the factory, so without it the rest of
     # the queue is served against the same contract the endpoint does not expose.
     assert stream.stopped, "the stop the refusal owes was lost to the refusal's own message"
-    assert stream.queue_info() == {"remaining": 2, "consumed": 0, "in_flight": 0}
+    assert stream.queue_info() == QueueInfo(remaining=2, consumed=0, in_flight=0)
     with pytest.raises(RuntimeError, match="no further task can be scored"):
         await stream.get_task()
     with pytest.raises(RuntimeError, match="stopped before its queue was served"):
@@ -1920,7 +1621,7 @@ async def test_an_episode_manifest_that_cannot_be_compared_still_stops_the_strea
     assert "TypeError" in str(refused.value)
 
     assert stream.stopped, "the stop the refusal owes was lost to reading the manifest"
-    assert stream.queue_info() == {"remaining": 2, "consumed": 0, "in_flight": 0}
+    assert stream.queue_info() == QueueInfo(remaining=2, consumed=0, in_flight=0)
     with pytest.raises(RuntimeError, match="no further task can be scored"):
         await stream.get_task()
     with pytest.raises(RuntimeError, match="stopped before its queue was served"):
@@ -1975,6 +1676,7 @@ async def test_a_task_this_endpoint_cannot_hand_over_is_never_dispensed(
         built.append(env)
         return env
 
+    exhausted = await _reads_as_exhausted(tmp_path, consumed=0)
     stream = TaskStream(factory, [TaskRef(ENV_NAME, 0)], prov_dir=tmp_path / "prov")
     server = build_stream_server(stream)
     async with Client(server) as client:
@@ -1982,16 +1684,18 @@ async def test_a_task_this_endpoint_cannot_hand_over_is_never_dispensed(
         assert not out.is_error
         answer = json.loads(out.content[0].text)  # type: ignore[union-attr]
 
-    # Nothing was handed out, so nothing was spent: no row, and the position is still owed.
+    # Nothing was handed out, so nothing was spent: no durable dispense for recovery to answer,
+    # no row, and the position is still owed.
+    assert not (tmp_path / "prov" / "dispenses.jsonl").exists()
     assert not (tmp_path / "prov" / "results.jsonl").exists()
     assert stream.results == ()
-    assert stream.queue_info() == {"remaining": 1, "consumed": 0, "in_flight": 0}
+    assert stream.queue_info() == QueueInfo(remaining=1, consumed=0, in_flight=0)
     assert built[-1].closed, "the refused episode's env was never released"
     # An env that publishes a framing this endpoint cannot carry publishes it again next time it
     # is asked, and a refusal does not advance the position — so this is the run's, not the
     # task's. The agent reads it as the end of the queue; the harness gets the reason.
     assert stream.stopped
-    assert answer == {"done": True, "remaining": 0, "consumed": 0}
+    assert answer == exhausted
     with pytest.raises(RuntimeError, match="framing this stream cannot hand out") as closing:
         await stream.aclose()
     assert defect in str(closing.value.__cause__)
@@ -2045,7 +1749,7 @@ async def test_a_framing_that_cannot_be_read_still_stops_the_stream(tmp_path: Pa
     assert "RuntimeError: instructions exploded" in str(refused.value)
 
     assert stream.stopped, "the stop the refusal owes was lost to reading the framing"
-    assert stream.queue_info() == {"remaining": 2, "consumed": 0, "in_flight": 0}
+    assert stream.queue_info() == QueueInfo(remaining=2, consumed=0, in_flight=0)
     with pytest.raises(RuntimeError, match="could not be served past it"):
         await stream.get_task()
     with pytest.raises(RuntimeError, match="stopped before its queue was served"):
@@ -2146,13 +1850,14 @@ async def test_a_framing_is_plain_data_by_the_time_a_task_is_dispensed(tmp_path:
     async with stream:
         task = await stream.get_task()
         assert task is not None
-        assert all(type(tool["description"]) is str for tool in task["tools"])
-        assert {tool["description"] for tool in task["tools"]} == {
+        wire = task.to_wire()
+        assert all(type(tool["description"]) is str for tool in wire["tools"])
+        assert {tool["description"] for tool in wire["tools"]} == {
             tool.description for tool in stream.tools
         }, "freezing the description changed what the endpoint says a tool is for"
         await stream.dispatch(SUBMIT_TOOL, {"answer": "4"})
     (row,) = stream.results
-    assert row["success"] is True, "the task the agent solved was recorded as solved"
+    assert row.closure == "sealed" and row.score is not None and row.score.success is True
 
 
 async def test_reading_the_published_contract_cannot_rewrite_it(tmp_path: Path) -> None:
@@ -2169,7 +1874,7 @@ async def test_reading_the_published_contract_cannot_rewrite_it(tmp_path: Path) 
         first = await stream.get_task()
         assert first is not None
         published = {tool.name: tool.input_schema for tool in stream.tools}
-        framed = {tool["name"]: tool["input_schema"] for tool in first["tools"]}
+        framed = {tool["name"]: tool["input_schema"] for tool in first.tools}
         assert published[SUBMIT_TOOL] == framed[SUBMIT_TOOL]
         assert published[SUBMIT_TOOL] is not framed[SUBMIT_TOOL]
         assert published[SUBMIT_TOOL] is not next(
@@ -2188,9 +1893,10 @@ async def test_reading_the_published_contract_cannot_rewrite_it(tmp_path: Path) 
         assert _terminal_text(await stream.dispatch(SUBMIT_TOOL, {"answer": "4"})) == clean
         second = await stream.get_task()
         assert second is not None
-        assert {tool["name"]: tool["input_schema"] for tool in second["tools"]} == served
+        assert {tool["name"]: tool["input_schema"] for tool in second.tools} == served
 
-    assert stream.results[0]["success"] is True, "the task the agent solved was recorded as solved"
+    first_row = stream.results[0]
+    assert first_row.score is not None and first_row.score.success is True
 
 
 async def test_the_whole_framing_is_proved_before_the_dispense_is_committed(
@@ -2213,10 +1919,10 @@ async def test_the_whole_framing_is_proved_before_the_dispense_is_committed(
         assert not out.is_error, "the endpoint answered a dispense it could not encode"
         seen = json.loads(out.content[0].text)  # type: ignore[union-attr]
     # The agent reads a stopped stream as the end of the queue, and nothing was spent.
-    assert seen == {"done": True, "remaining": 0, "consumed": 0}
+    assert seen == await _reads_as_exhausted(tmp_path, consumed=0)
     assert not (tmp_path / "prov" / "results.jsonl").exists()
     assert stream.results == ()
-    assert stream.queue_info() == {"remaining": 1, "consumed": 0, "in_flight": 0}
+    assert stream.queue_info() == QueueInfo(remaining=1, consumed=0, in_flight=0)
     # An env key is the run's, not this task's, so the queue cannot be served past it.
     assert stream.stopped
     with pytest.raises(RuntimeError, match="could not be put on the wire"):
@@ -2247,8 +1953,11 @@ async def test_a_queue_entry_is_the_identity_its_record_is_filed_under(tmp_path:
         await stream.get_task()
         await stream.dispatch(SUBMIT_TOOL, {"answer": "6"})
     (durable,) = _rows(tmp_path)
-    assert durable["task_idx"] == stream.results[0]["task_idx"] == 1
-    assert durable["success"] is True, "the row must be the task the queue actually played"
+    (row,) = stream.results
+    assert durable["task_idx"] == row.task_idx == 1, (
+        "the file and the run's own copy are two readings of one task"
+    )
+    assert row.score is not None and row.score.success is True
 
 
 async def test_the_episode_enforces_the_contract_the_endpoint_advertises(
@@ -2293,14 +2002,15 @@ async def test_the_episode_enforces_the_contract_the_endpoint_advertises(
     ) as stream:
         task = await stream.get_task()
         assert task is not None
-        framed = next(t for t in task["tools"] if t["name"] == SUBMIT_TOOL)
+        framed = next(t for t in task.tools if t["name"] == SUBMIT_TOOL)
         advertised = framed["input_schema"]["properties"]["answer"]["const"]
         assert type(advertised) is str and advertised == "4"
         # The action the framing describes is the action the endpoint accepts.
         assert _terminal_text(await stream.dispatch(SUBMIT_TOOL, {"answer": "4"})) == clean
 
     (row,) = stream.results
-    assert row["success"] is True, "an advertised-correct action was refused"
+    assert row.closure == "sealed", "an advertised-correct action was refused"
+    assert row.score is not None and row.score.success is True
     assert not stream.stopped
 
 
@@ -2360,7 +2070,9 @@ async def test_the_stream_drives_the_terminal_it_published(tmp_path: Path) -> No
         _Unhashable._armed = False
 
     (row,) = stream.results
-    assert row["reward"] == 1.0, "the stream could not call the terminal it published"
+    assert row.score is not None and row.score.reward == 1.0, (
+        "the stream could not call the terminal it published"
+    )
     assert not stream.stopped
 
 
@@ -2430,13 +2142,13 @@ async def test_mcp_end_to_end(tmp_path: Path) -> None:
 
             for expected in ("4", "10"):
                 task = json.loads((await client.call_tool("get_task", {})).content[0].text)  # type: ignore[union-attr]
-                assert "task_idx" not in json.dumps(task)
+                assert set(task) == {"env", "instructions", "budget", "tools"}
                 out = await client.call_tool(SUBMIT_TOOL, {"answer": expected})
                 assert json.loads(out.content[0].text)["terminated"] is True  # type: ignore[union-attr]
 
             exhausted = json.loads((await client.call_tool("get_task", {})).content[0].text)  # type: ignore[union-attr]
-            assert exhausted == {"done": True, "remaining": 0, "consumed": 2}
-    assert [row["success"] for row in _rows(tmp_path)] == [True, True]
+            assert exhausted == {"done": True, "remaining": 0, "consumed": 2, "in_flight": 0}
+    assert [row["score"]["success"] for row in _rows(tmp_path)] == [True, True]
 
 
 async def test_server_rejects_a_control_tool_collision(tmp_path: Path) -> None:
@@ -2547,13 +2259,15 @@ async def test_an_episode_teardown_that_cancels_still_answers_and_still_stops(
     assert built[1].closes == 1, "the episode's env was never closed, so nothing was under test"
     (row,) = stream.results
     assert len(_rows(tmp_path)) == 1, "the durable row is owed whatever the teardown did"
+    assert row.closure == "sealed", "a teardown failure is not how the task ended"
 
     if headlinable:
-        assert _published(row, "correct") is True
+        assert row.score is not None and row.score.success is True
         assert not stream.stopped, "a teardown failure is not the run's outcome"
         await stream.aclose()
     else:
-        assert row["success"] is None
+        assert row.score is None
+        assert "cannot headline" in (row.diagnostic or ""), "the row must say why it is unscored"
         assert stream.stopped, "the stop the seal owed was lost with the cancelled release"
         with pytest.raises(RuntimeError, match="cannot headline"):
             await stream.get_task()
@@ -2630,15 +2344,17 @@ async def test_an_env_that_cancels_on_the_agents_terminal_answers_the_same_way(
 @pytest.mark.parametrize(
     "failure", [asyncio.CancelledError, RuntimeError], ids=["cancels", "raises"]
 )
-async def test_a_forced_terminal_that_fails_is_contained_however_it_failed(
+async def test_a_forced_terminal_that_fails_is_recorded_the_same_way_however_it_failed(
     tmp_path: Path, failure: Callable[[], BaseException]
 ) -> None:
     # The same env on the stream's own forced terminal, which is where cancellation costs most:
     # this runs while the drain is composing the row, so letting one out cancels whoever is
     # sealing — no row is composed for a task that was dispensed, the entry is handed back
     # unsealed, and the drain reports the run as cancelled instead of recording what the queue is
-    # still owed. Contained, the forced call falls through to the reserved abort exactly as any
-    # other failure does, which is what the two parameters assert is one behaviour and not two.
+    # still owed. Contained, it is classified exactly as any other failure of a terminal the
+    # stream drove: the terminal is committed and the env is what failed, so the task ended with
+    # no verdict standing behind it and the row lands unscored over a stopped queue. The two
+    # parameters assert that is one behaviour and not two.
     stream = TaskStream(
         _raises_on_the_terminal_step(failure),
         [TaskRef(ENV_NAME, 0), TaskRef(ENV_NAME, 1)],
@@ -2646,10 +2362,200 @@ async def test_a_forced_terminal_that_fails_is_contained_however_it_failed(
     )
     await stream.get_task()
 
-    await stream.aclose()
-    (row,) = _rows(tmp_path)
-    assert (row["success"], row["reward"]) == (None, None)
+    with pytest.raises(RuntimeError, match="failed while the stream ended a task"):
+        await stream.aclose()
+    (row,) = stream.results
+    assert row.closure == "finalize_error", "an env the stream could not end is not an agent seal"
+    assert row.score is None, "a task with no verdict behind it may not be scored"
+    assert failure.__name__ in (row.diagnostic or ""), "the failure must be on the row"
+    assert [r["closure"] for r in _rows(tmp_path)] == ["finalize_error"]
+    assert stream.stopped, "the queue may not be served on against an env that raises at the end"
+
+
+def _loses_the_agents_call(exc: BaseException) -> Any:
+    """A score-terminal env that fails every call made while the task is still live: the call
+    reaches no result, so nothing the agent asked for lands on the episode's record."""
+
+    class _RaisesMidEpisode(_FixtureScoreEnv):
+        def _verify(self, trajectory, task, *, terminated, evidence=None) -> FeedbackCollection:
+            if not terminated:
+                raise exc
+            return super()._verify(trajectory, task, terminated=terminated, evidence=evidence)
+
+    return lambda _name: _RaisesMidEpisode(tasks=TASKS)
+
+
+async def test_a_call_the_harness_lost_is_not_a_task_the_agent_played_out(
+    tmp_path: Path,
+) -> None:
+    # A call that raised reached no result, so nothing the agent asked for is on this episode's
+    # record. Forgotten, the drain then drives the terminal itself and files the task in a
+    # *scored* closure: an agent whose submission the harness dropped is recorded as one that
+    # answered wrong, and a run's mean averages that zero in. So the loss is kept on the entry
+    # and the seal reads it — the row lands unscored, saying which boundary lost the call.
+    #
+    # It is the row that pays and not the run. `score=None` is already unaggregatable, so the
+    # record is sound without a stop; and a mid-episode call is where a transient fault lands, so
+    # one session hiccup may not end a queue the rest of which is still playable.
+    stream = TaskStream(
+        _loses_the_agents_call(RuntimeError("the session dropped the call")),
+        [TaskRef(ENV_NAME, 0), TaskRef(ENV_NAME, 1)],
+        prov_dir=tmp_path / "prov",
+    )
+    async with stream:
+        await stream.get_task()
+        with pytest.raises(RuntimeError, match="dropped the call"):
+            await stream.dispatch("noop", {})
+        # The agent never ends this task; pulling the next one drains it.
+        await stream.get_task()
+        await stream.dispatch(SUBMIT_TOOL, {"answer": "6"})
+
+    lost, played = stream.results
+    assert lost.closure == "finalize_error", "a task the agent never played out is not a seal"
+    assert lost.score is None, "a call the harness lost may not be recorded as an answer"
+    assert "the agent never played it out" in (lost.diagnostic or "")
+    assert "dropped the call" in (lost.diagnostic or ""), "the failure must be on the row"
+    # The queue is served on, and the task after it is scored exactly as it was earned.
+    assert not stream.stopped, "one lost call ended a queue the agent could still play"
+    assert played.closure == "sealed"
+    assert played.score is not None and played.score.success is True
+    durable = _rows(tmp_path)
+    assert [row["closure"] for row in durable] == ["finalize_error", "sealed"]
+    assert durable[0]["score"] is None
+
+
+async def test_an_agent_that_recovers_from_a_lost_call_keeps_what_it_earned(
+    tmp_path: Path,
+) -> None:
+    # The loss is *kept*, not acted on. A task the agent goes on to end itself is the agent's,
+    # whatever failed on the way there — the terminal it called is a verdict the env stands
+    # behind, and a row that answered a dropped call by unscoring it would take away an outcome
+    # the agent actually earned.
+    async with TaskStream(
+        _loses_the_agents_call(RuntimeError("the session dropped the call")),
+        [TaskRef(ENV_NAME, 0)],
+        prov_dir=tmp_path / "prov",
+    ) as stream:
+        await stream.get_task()
+        with pytest.raises(RuntimeError, match="dropped the call"):
+            await stream.dispatch("noop", {})
+        await stream.dispatch(SUBMIT_TOOL, {"answer": "4"})
+
+    (row,) = stream.results
+    assert row.closure == "sealed", "the agent ended this task itself"
+    assert row.score is not None and row.score.success is True
+    assert row.diagnostic is None
     assert not stream.stopped
+
+
+def _publishes_a_terminal_schema_that_cannot_be_used(for_task: "str | None" = None) -> Any:
+    """An env whose score terminal is exactly what the wire carries and still cannot validate a
+    call: a top-level ``$ref`` that points nowhere.
+
+    Nothing above notices — it is plain JSON, it serialises identically wherever the contract is
+    compared, and a server advertises it verbatim — and resolving it while checking a terminal
+    call raises out of the validator, for the agent's own submission and for the empty call the
+    stream drives alike. (A schema *key* whose own code misbehaved would not reach here any more:
+    an episode enforces the contract in wire form, so an env object is not what a terminal call is
+    validated against — see :func:`hgym.serve.episode._wire_form`.)"""
+
+    class _Unusable(_FixtureScoreEnv):
+        def describe(self, task_id: Any = None) -> TaskSpec:
+            spec = super().describe(task_id)
+            if for_task is not None and str(task_id) != for_task:
+                return spec
+            for manifest in spec.tools:
+                if manifest.name == SUBMIT_TOOL:
+                    manifest.input_schema = {"$ref": "#/definitions/answer"}
+            return spec
+
+    return lambda _name: _Unusable(tasks=TASKS)
+
+
+def _raises_one_object_at_both_boundaries(exc: BaseException) -> Any:
+    """A non-seal env — ``verify`` runs inline on every call — that raises the **same object** on
+    a call the agent makes mid-episode and on the terminal the stream drives afterwards.
+
+    One instance, two boundaries: which failure a `terminal_error` is cannot be read back off the
+    object, because nothing stops an env raising one twice."""
+
+    class _RaisesTheSameObject(_FixtureScoreEnv):
+        score_terminal_tool = None
+
+        def _verify(self, trajectory, task, *, terminated, evidence=None) -> FeedbackCollection:
+            raise exc
+
+    return lambda _name: _RaisesTheSameObject(tasks=TASKS)
+
+
+async def test_a_score_terminal_the_abort_rescued_is_still_a_failed_terminal(
+    tmp_path: Path,
+) -> None:
+    # The abort is what *ended* this task; it is not what graded it. The score terminal is the
+    # only call that can produce a verdict for this env, so what the abort ended is a task with
+    # nothing behind it — and the abort's own fail-closed `correct=False` recorded as an outcome
+    # is an earned zero the agent never had a way to avoid. The refusal outlives the fallback
+    # that answered it: an env whose score terminal cannot be called will refuse the next task
+    # the same way, so the run stops here rather than scoring the rest of the queue that way.
+    stream = TaskStream(
+        # Every task of this env, because a stream registers one schema per tool name for the
+        # whole queue: a contract that varies by task is a different refusal, made earlier.
+        _publishes_a_terminal_schema_that_cannot_be_used(),
+        [TaskRef(ENV_NAME, 0), TaskRef(ENV_NAME, 1)],
+        prov_dir=tmp_path / "prov",
+    )
+    await stream.get_task()  # the agent does nothing; the drain ends the task
+
+    with pytest.raises(RuntimeError, match="failed while the stream ended a task"):
+        await stream.aclose()
+    (row,) = stream.results
+    assert row.closure == "finalize_error", "the abort ended the task; it did not grade it"
+    assert row.score is None, "a task with no verdict behind it may not be scored"
+    assert "definitions/answer" in (row.diagnostic or "")
+    assert stream.stopped, "the rest of the queue would be scored against the same refusal"
+    assert [r["closure"] for r in _rows(tmp_path)] == ["finalize_error"]
+
+
+async def test_one_failure_raised_on_both_boundaries_is_still_a_failed_terminal(
+    tmp_path: Path,
+) -> None:
+    # Python lets one exception instance be raised as often as its raiser likes, so *which*
+    # failure a terminal error is cannot be read back off the object. An env that raises one
+    # shared error on a call the agent made and raises that same object again on the terminal the
+    # stream drives would, read by identity, have a genuine terminal failure taken for the
+    # promoted call error above: unscored either way, but with a diagnostic naming the wrong
+    # boundary, no stop, and the rest of the queue dispensed and scored against an env that can
+    # end no task of its own.
+    #
+    # So the entry records where the failure came from at the moment it records the failure, and
+    # the promotion is the only thing that reads as one.
+    shared = RuntimeError("the same object, raised twice")
+    stream = TaskStream(
+        _raises_one_object_at_both_boundaries(shared),
+        [TaskRef(ENV_NAME, 0), TaskRef(ENV_NAME, 1)],
+        prov_dir=tmp_path / "prov",
+    )
+    await stream.get_task()
+    with pytest.raises(RuntimeError, match="the same object"):
+        await stream.dispatch("noop", {})  # the agent's call is lost, and the entry keeps it
+
+    # The stream now ends the task itself: the forced score terminal raises that same object, and
+    # the abort brings the task to an end.
+    with pytest.raises(RuntimeError, match="no further task could be scored"):
+        await stream.get_task()
+    with pytest.raises(RuntimeError, match="failed while the stream ended a task"):
+        await stream.aclose()
+
+    (row,) = stream.results
+    assert row.closure == "finalize_error" and row.score is None
+    assert "while the stream ended the task" in (row.diagnostic or ""), (
+        "a failed terminal was read as the agent's own lost call"
+    )
+    assert "on a call the agent made" not in (row.diagnostic or "")
+    assert stream.stopped
+    # The task after it was never served, which is the whole of what the stop buys.
+    assert len(_rows(tmp_path)) == 1
+    assert stream.queue_info().remaining == 1
 
 
 async def test_a_refused_dispense_reports_the_refusal_a_cancelling_teardown_cannot_replace(

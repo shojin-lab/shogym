@@ -113,6 +113,12 @@ class CallResult:
     content: str
     meta: Dict[str, Any]
     terminated: bool
+    # True when this call arrived after the episode had already ended and was answered with a
+    # tombstone: nothing was dispatched, nothing was sealed, and ``terminated`` reports the
+    # episode's state rather than anything this call did. A caller that attributes the ending
+    # to the call it made — "this request is what aborted the task" — has to tell the two
+    # apart, because every call after the first terminal is answered this way.
+    tombstoned: bool = False
 
 
 class ServedEpisode:
@@ -190,6 +196,10 @@ class ServedEpisode:
         self._finalization: Optional["asyncio.Future[CallResult]"] = None
         self._finalization_id: Optional[str] = None
         self._finalization_source: Optional[str] = None
+        # The tool that entered the terminal transaction, recorded AT the seal — so a caller
+        # whose terminal call was cancelled before its verdict landed can still learn how the
+        # episode ended, from the episode itself.
+        self._finalization_tool: Optional[str] = None
         # The committed, core-owned terminal evidence (None until FINALIZED).
         self._evidence: Optional[TerminalEvidence] = None
         # Teardown is idempotent and runs exactly once (owned by the finalizer, after
@@ -354,6 +364,27 @@ class ServedEpisode:
         """The terminal step's feedback (wire form), or ``[]`` until the episode ends."""
         return self._terminal_feedback
 
+    @property
+    def terminal_source(self) -> Optional[str]:
+        """How the terminal transaction was entered — ``explicit_tool``, ``abort`` or
+        ``horizon`` — or ``None`` while the episode is still open.
+
+        Recorded AT the seal, so it is readable even when the call that requested it was
+        cancelled before its verdict landed."""
+        return self._finalization_source
+
+    @property
+    def terminal_tool(self) -> Optional[str]:
+        """The tool that entered the terminal transaction (``None`` for an abort, which has no
+        tool, and until the episode seals). Recorded at the seal, like :attr:`terminal_source`."""
+        return self._finalization_tool
+
+    @property
+    def terminal_payload(self) -> Optional[Dict[str, Any]]:
+        """The public-safe terminal payload — the same sanitized verdict a terminal call
+        returns — or ``None`` until the terminal transaction has committed its evidence."""
+        return None if self._evidence is None else self._sanitize_terminal(self._evidence)
+
     async def wait_finalized(self) -> None:
         """Wait for an in-flight terminal transaction to commit, if there is one.
 
@@ -397,6 +428,7 @@ class ServedEpisode:
                     content="<episode already terminated>",
                     meta=build_meta(terminate=True),
                     terminated=True,
+                    tombstoned=True,
                 )
 
             args = dict(arguments or {})
@@ -615,6 +647,7 @@ class ServedEpisode:
         finalization_id = str(uuid7())
         self._finalization_id = finalization_id
         self._finalization_source = source
+        self._finalization_tool = tool_name
         self._state = LifecycleState.SEALED
         self._write_record("SEALED", source, args_digest(args))
         finalization: "asyncio.Future[CallResult]" = asyncio.ensure_future(
@@ -903,6 +936,7 @@ class ServedEpisode:
             content="<episode sealed; no further tool calls are dispatched>",
             meta=build_meta(terminate=True),
             terminated=True,
+            tombstoned=True,
         )
 
     async def _teardown(self) -> None:
