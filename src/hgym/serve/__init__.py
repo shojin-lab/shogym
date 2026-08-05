@@ -17,7 +17,11 @@ from hgym.serve.lifecycle import (
 )
 from hgym.serve.stream import (
     Closure,
+    CompletedTask,
     DispensedTask,
+    Provenance,
+    ProvenanceError,
+    ProvenanceSpan,
     QueueInfo,
     ResultRow,
     Score,
@@ -32,11 +36,15 @@ from hgym.serve.stream import (
 __all__ = [
     "CallResult",
     "Closure",
+    "CompletedTask",
     "DispensedTask",
     "FinalizationRecord",
     "FinalizationStore",
     "FinalizeRequest",
     "LifecycleState",
+    "Provenance",
+    "ProvenanceError",
+    "ProvenanceSpan",
     "QueueInfo",
     "ResultRow",
     "Score",

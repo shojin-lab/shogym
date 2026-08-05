@@ -7,6 +7,7 @@ carries ``score=None``, so it can be counted but never averaged.
 
 from __future__ import annotations
 
+import ast
 import asyncio
 import json
 import os
@@ -15,7 +16,7 @@ import sys
 import textwrap
 import time
 from pathlib import Path
-from typing import Any, List, Optional
+from typing import Any, Dict, List, Optional, Tuple
 
 import pytest
 
@@ -32,6 +33,7 @@ from hgym.serve.stream import (
     read_results,
     reconcile,
 )
+from hgym.shared.terminate_mcp import TERMINATE_TOOL_NAME
 from hgym.task import TaskSpec, ToolManifest
 from hgym.types import EpisodeFeedback, FeedbackCollection
 from tests._fixtures.score_env import ENV_NAME, SUBMIT_TOOL, _FixtureScoreEnv
@@ -49,6 +51,36 @@ def _stream(tmp_path: Path, indices: List[int], factory=None, **kwargs: Any) -> 
         prov_dir=tmp_path / "prov",
         **kwargs,
     )
+
+
+def _slow_no_arg_terminal(release: asyncio.Event) -> Any:
+    """An env whose score terminal the stream can force with no arguments (the shape a real env
+    with a no-arg ``done`` has) and whose grading blocks until ``release`` — so a drain really
+    does seal inside it, which is where a cancellation can land."""
+
+    class _SlowNoArgTerminal(_FixtureScoreEnv):
+        def describe(self, task_id: Any = None) -> TaskSpec:
+            spec = super().describe(task_id)
+            spec.tools = [
+                ToolManifest(
+                    name=m.name,
+                    description=m.description,
+                    input_schema=(
+                        {**m.input_schema, "required": []}
+                        if m.name == SUBMIT_TOOL
+                        else m.input_schema
+                    ),
+                    terminal_kind=m.terminal_kind,
+                )
+                for m in spec.tools
+            ]
+            return spec
+
+        async def finalize(self, req: FinalizeRequest) -> TerminalEvidence:
+            await release.wait()
+            return await super().finalize(req)
+
+    return _SlowNoArgTerminal
 
 
 # ----- the closure taxonomy -----
@@ -277,9 +309,11 @@ async def test_a_failure_this_record_cannot_describe_still_lands_its_row(tmp_pat
     (row,) = stream.results
     assert row.closure == "finalize_error", "a failure it cannot describe still ended the task"
     assert row.score is None
-    assert "_Unrenderable" in (row.diagnostic or ""), "the type survives when the message cannot"
+    # The class is still named, which is the part of a failure that never needed the env's help.
+    assert "_Unrenderable: <unrenderable message>" in (row.diagnostic or "")
     assert [r.closure for r in read_results(tmp_path / "prov")] == ["finalize_error"]
     assert reconcile(tmp_path / "prov") == [], "a dispense answered by a row is not a crash"
+    assert stream.stopped, "a run that lost an outcome reported itself complete"
     with pytest.raises(RuntimeError, match="failed while the stream ended a task") as end:
         await stream.aclose()
     assert isinstance(end.value.__cause__, _Unrenderable)
@@ -312,6 +346,24 @@ async def test_a_timed_out_task_still_reports_a_failure_it_cannot_describe(
     assert isinstance(end.value.__cause__, _Unrenderable), (
         "the stop must name the env's failure, not whatever describing it raised"
     )
+
+
+async def test_an_unformattable_env_failure_still_answers_the_agent_the_same_way(
+    tmp_path: Path,
+) -> None:
+    # The same failure on the agent's own terminal, where it costs more than a row. The stop is
+    # recorded from `dispatch`, and building its message raised — so the stop never happened
+    # (the queue served on and `aclose` returned clean), and the exception the formatter raised
+    # went back to the *agent* in place of the one constant every ending answers with.
+    stream = _stream(tmp_path, [0, 1], factory=lambda _n: _RaisesUnrenderably(tasks=TASKS))
+    await stream.get_task()
+    answer = await stream.dispatch(TERMINATE_TOOL_NAME, {})
+    assert answer.content[0].text == _TASK_OVER, "an env failure changed the agent's answer"  # type: ignore[union-attr]
+    assert stream.stopped, "the stop the message described was never published"
+    with pytest.raises(RuntimeError, match="raised while ending a task") as end:
+        await stream.aclose()
+    assert isinstance(end.value.__cause__, _Unrenderable), "the failure itself is kept"
+    assert len(read_results(tmp_path / "prov")) == 1
 
 
 def _values_the_record_may_not_read(name: str) -> tuple:
@@ -629,33 +681,7 @@ async def test_cancelling_the_drain_leaves_the_task_sealable(tmp_path: Path) -> 
     # marked sealed with no row is invisible to a later drain, so its durable dispense would be
     # reported as a crash that never happened.
     release = asyncio.Event()
-
-    class _SlowNoArgTerminal(_FixtureScoreEnv):
-        """A score terminal the stream can force with no arguments (the shape a real env with a
-        no-arg `done` has), whose grading blocks — so the drain really seals here."""
-
-        def describe(self, task_id: Any = None) -> TaskSpec:
-            spec = super().describe(task_id)
-            spec.tools = [
-                ToolManifest(
-                    name=m.name,
-                    description=m.description,
-                    input_schema=(
-                        {**m.input_schema, "required": []}
-                        if m.name == SUBMIT_TOOL
-                        else m.input_schema
-                    ),
-                    terminal_kind=m.terminal_kind,
-                )
-                for m in spec.tools
-            ]
-            return spec
-
-        async def finalize(self, req: FinalizeRequest) -> TerminalEvidence:
-            await release.wait()
-            return await super().finalize(req)
-
-    stream = _stream(tmp_path, [0], factory=lambda _n: _SlowNoArgTerminal(tasks=TASKS))
+    stream = _stream(tmp_path, [0], factory=lambda _n: _slow_no_arg_terminal(release)(tasks=TASKS))
     await stream.__aenter__()
     await stream.get_task()
 
@@ -779,11 +805,10 @@ async def _lose_the_caller_mid_release(
 async def test_a_release_that_loses_its_caller_still_closes_the_episode(
     tmp_path: Path,
 ) -> None:
-    # A seal abandoned *before* its row lands hands the claim back, because nothing was lost.
-    # After the row lands there is nothing left to hand back — and `_release` drops the entry
-    # from the registry on its way out, so a release abandoned partway would leave an episode
-    # nothing holds a handle on, its MCP sessions and its env open for the life of the process
-    # and no later drain able to reach them.
+    # The seal is held as a task precisely so a caller can go away without taking the rest of it
+    # with them, and the release is part of that rest: a row that landed makes the seal final, so
+    # every later `_seal` returns it without reaching a release left behind the cancellation, and
+    # the episode's MCP sessions and env would stay open for the life of the process.
     stream, built = await _lose_the_caller_mid_release(tmp_path, [0], True)
 
     assert built[1].released, "the episode's env was left open with nothing able to close it"
@@ -812,6 +837,182 @@ async def test_a_release_that_loses_its_caller_still_stops_an_unheadlinable_run(
         await stream.get_task()
     with pytest.raises(RuntimeError, match="cannot headline"):
         await stream.aclose()
+
+
+async def _stopped_inside_the_release(
+    tmp_path: Path, indices: List[int], summary: Any, *, catalog_blocks: bool = True
+) -> Any:
+    """Answer the first task and hold the world still *inside* its release: the row is durable,
+    the episode has not been let go, and any stop that row owes has not been published."""
+    closing, release = asyncio.Event(), asyncio.Event()
+    built: List[Any] = []
+
+    def factory(_name: str) -> Any:
+        # The catalog env is built first, and a test about shutdown needs it to close fast —
+        # otherwise the stream's own release is what `aclose` is waiting on, and the seal it was
+        # supposed to wait for proves nothing.
+        env: Any = (
+            _SlowRelease(closing, release, summary, tasks=TASKS)
+            if built or catalog_blocks
+            else _FixtureScoreEnv(tasks=TASKS)
+        )
+        built.append(env)
+        return env
+
+    stream = _stream(tmp_path, indices, factory=factory)
+    await stream.get_task()
+    call = asyncio.ensure_future(stream.dispatch(SUBMIT_TOOL, {"answer": "4"}))
+    await asyncio.wait_for(closing.wait(), timeout=5)
+    return stream, built, release, call
+
+
+async def test_a_dispense_waits_for_the_seal_that_still_holds_the_slot(tmp_path: Path) -> None:
+    # A task is not finished with its slot when its row lands: the episode behind that row is
+    # still open, and its env with it. Dispensing there hands out a second episode against
+    # `max_in_flight=1` and starts an agent's clock on a task whose predecessor is still being
+    # torn down.
+    stream, built, release, call = await _stopped_inside_the_release(tmp_path, [0, 1], True)
+    nxt = asyncio.ensure_future(stream.get_task())
+    await asyncio.sleep(0.05)
+
+    assert not nxt.done(), "the next task was dispensed while the previous episode was releasing"
+    assert not built[1].released
+    assert len(read_dispenses(tmp_path / "prov")) == 1, "the durable dispense count moved on"
+
+    release.set()
+    assert await asyncio.wait_for(nxt, timeout=5) is not None
+    assert built[1].released, "the dispense did not wait for the release to finish"
+    assert len(read_dispenses(tmp_path / "prov")) == 2
+    await call
+    await stream.aclose()
+
+
+async def test_a_dispense_cannot_step_over_a_stop_the_seal_has_not_published(
+    tmp_path: Path,
+) -> None:
+    # The stop an unheadlinable summary owes is recorded *after* the release, deliberately: the
+    # row is the evidence and it lands first. So between the row and the stop there is a stream
+    # that has already refused to read this env's headline and has not said so yet. A dispense
+    # that reads the row as the end of the seal serves the rest of the queue through that gap,
+    # against exactly the env-integrity failure the stop exists to end the queue on.
+    stream, built, release, call = await _stopped_inside_the_release(tmp_path, [0, 1], "false")
+    nxt = asyncio.ensure_future(stream.get_task())
+    await asyncio.sleep(0.05)
+
+    assert not nxt.done(), "a task was dispensed before the seal published its stop"
+    assert not stream.stopped
+
+    release.set()
+    with pytest.raises(RuntimeError, match="cannot headline"):
+        await asyncio.wait_for(nxt, timeout=5)
+    await call
+
+    assert stream.stopped
+    assert len(read_dispenses(tmp_path / "prov")) == 1, "the queue was served past the stop"
+    assert len(stream.results) == 1
+    with pytest.raises(RuntimeError, match="cannot headline"):
+        await stream.aclose()
+
+
+async def test_shutdown_waits_for_the_episode_a_seal_is_still_releasing(
+    tmp_path: Path,
+) -> None:
+    # The drain's promise is that every episode this stream dispensed is finished when it
+    # returns. A seal whose row has landed is still holding an env and an MCP session until its
+    # release returns, so a drain that stops looking at the row returns over a live episode —
+    # and over the terminal call that is still waiting to be answered.
+    stream, built, release, call = await _stopped_inside_the_release(
+        tmp_path, [0], True, catalog_blocks=False
+    )
+    shutdown = asyncio.ensure_future(stream.aclose())
+    await asyncio.sleep(0.05)
+
+    assert not shutdown.done(), "shutdown returned while an episode was still releasing"
+    assert not built[1].released
+
+    release.set()
+    await asyncio.wait_for(shutdown, timeout=5)
+    assert built[1].released, "the drain returned before the episode was let go"
+    assert call.done(), "the drain returned while the terminal call was still pending"
+    await call
+
+
+async def test_a_cancelled_drain_records_the_closure_the_drain_actually_forced(
+    tmp_path: Path,
+) -> None:
+    # A shutdown cancelled mid-seal must not change how the task is *classified*. Restarting the
+    # seal re-reads an episode the first attempt already terminated, and an episode that ended
+    # only because the stream forced its terminal then reads as one the agent ended itself — so
+    # a row the stream drained would be filed as earned. The cancelled run must land the same
+    # closure the uncancelled one does.
+    release = asyncio.Event()
+    stream = _stream(tmp_path, [0], factory=lambda _n: _slow_no_arg_terminal(release)(tasks=TASKS))
+    await stream.__aenter__()
+    await stream.get_task()
+    closing = asyncio.ensure_future(stream.aclose())
+    await asyncio.sleep(0.05)  # mid-seal, inside the forced terminal's finalizer
+    closing.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await closing
+    release.set()
+    await stream.aclose()
+
+    # The same run with nothing cancelled, as the reference classification.
+    unblocked = asyncio.Event()
+    unblocked.set()
+    control = _stream(
+        tmp_path / "control", [0], factory=lambda _n: _slow_no_arg_terminal(unblocked)(tasks=TASKS)
+    )
+    async with control:
+        await control.get_task()
+
+    (row,) = stream.results
+    assert row.closure == control.results[0].closure == "drained"
+
+
+async def test_shutdown_is_not_bypassed_by_a_dispense_in_flight(tmp_path: Path) -> None:
+    # `get_task` opens the spans and the episode with the registry free, so a whole shutdown can
+    # complete inside that window. It must not then publish a live task: the drain is over and
+    # the watchdog is stopped, so nothing would ever seal it and its durable dispense would read
+    # back as a crash the stream never had.
+    opening = asyncio.Event()
+    release = asyncio.Event()
+
+    class _BlockingSpan:
+        """An extension slow enough to hold the dispense open across a shutdown."""
+
+        namespace = "test.blocking"
+
+        async def begin(self, ref: TaskRef) -> Any:
+            opening.set()
+            await release.wait()
+            return self
+
+        @property
+        def dispensed(self) -> Dict[str, Any]:
+            return {}
+
+        async def finalize(self, completed: Any) -> Dict[str, Any]:
+            return {}
+
+    stream = _stream(
+        tmp_path, [0, 1], provenance=[_BlockingSpan()], provenance_timeout=None, deadline=0.05
+    )
+    await stream.__aenter__()
+    dispensing = asyncio.ensure_future(stream.get_task())
+    await opening.wait()
+    await stream.aclose()  # runs to completion while the dispense is still opening
+    release.set()
+
+    with pytest.raises(RuntimeError, match="closed"):
+        await dispensing
+    assert stream.queue_info().in_flight == 0
+    # Nothing was exposed, so nothing is owed: no dispense record, and the position is unspent.
+    assert read_dispenses(tmp_path / "prov") == []
+    assert stream.queue_info().consumed == 0
+    assert reconcile(tmp_path / "prov") == []
+    await asyncio.sleep(0.15)  # past the deadline: no stranded task to seal late
+    assert stream.results == ()
 
 
 async def test_a_result_row_is_fsynced_before_it_is_relied_on(tmp_path: Path) -> None:
@@ -935,6 +1136,47 @@ async def test_a_seal_retried_after_a_failed_append_records_what_it_first_reache
     assert row.score is None, "a task that ran out of time may not be scored by its retry"
     assert row.diagnostic == "the per-episode deadline elapsed before the task was sealed"
     assert [r.closure for r in read_results(prov)] == ["timeout"]
+
+
+async def test_a_released_episode_owing_only_a_row_is_not_reported_in_flight(
+    tmp_path: Path,
+) -> None:
+    # A registry entry stopped meaning "an episode is live" when it began outliving its own
+    # release. A seal that failed on the storage keeps its composed row, hands its claim back so
+    # a later drain can retry the append, and is released in the meantime — so the entry reads
+    # unsealed with its env already closed. Counting it tells a harness whose stream is stopped
+    # and closed that a task is still being played, and tells an agent there is still something
+    # to answer; there is not, and what the entry is owed is a row.
+    prov = _unwritable_results(tmp_path)
+    built: List[_ClosingEnv] = []
+
+    def factory(_name: str) -> _ClosingEnv:
+        env = _ClosingEnv(tasks=TASKS)
+        built.append(env)
+        return env
+
+    stream = _stream(tmp_path, [0], factory=factory)
+    await stream.get_task()
+    assert stream.queue_info().in_flight == 1, "a live episode must be counted"
+    await stream.dispatch(SUBMIT_TOOL, {"answer": "4"})
+    # The seal failed and handed its claim back, and nothing has released the episode yet: this
+    # one really is still in flight. The count that changed is the one after the close.
+    assert stream.queue_info().in_flight == 1
+
+    with pytest.raises(RuntimeError, match="record is incomplete"):
+        await stream.aclose()
+    assert stream.stopped and built[1].closed
+    assert stream.queue_info().in_flight == 0, "a closed stream reported a released episode live"
+
+    # ...and the count is a *discrimination*, not a deletion. The entry is still there with its
+    # composed row on it, so a drain that meets working storage still lands the row it owes —
+    # which is the whole reason the entry outlives its release.
+    (prov / "results.jsonl").rmdir()
+    with pytest.raises(RuntimeError, match="record is incomplete"):
+        await stream.aclose()
+    (row,) = read_results(prov)
+    assert row.closure == "sealed" and row.score is not None and row.score.success is True
+    assert stream.queue_info().in_flight == 0
 
 
 async def test_a_dispense_after_a_seal_that_failed_reports_the_stop(tmp_path: Path) -> None:
@@ -1429,3 +1671,386 @@ async def test_rejects_a_deadline_that_cannot_be_enforced(tmp_path: Path) -> Non
             _stream(tmp_path, [0], deadline=value)
     async with _stream(tmp_path, [0], deadline=None) as stream:
         assert await stream.get_task() is not None
+
+
+# ------------------------------------------------------------------------------------------
+# Cancellation an env or an extension *emits*
+#
+# `asyncio.CancelledError` inherits from `BaseException`, so it walks straight through an
+# `except Exception` written to contain everything. In this module that handler shape means two
+# unrelated things — a boundary whose contract is that nothing escapes, and a deliberate
+# passthrough where a caller's cancellation must end that caller — and the same exception object
+# is legitimate at one and a defect at the other. These pin the containment side: a `CancelledError`
+# raised by third-party code is that code failing, and it may not change what the harness answers,
+# what it records, or whether it can be shut down.
+
+
+class _CancelsOnClose(_FixtureScoreEnv):
+    """An env whose teardown raises `CancelledError` — what an env inherits by awaiting a child
+    task that was cancelled, and what it can simply raise."""
+
+    def __init__(self, cancels: bool, summary: Any = None, **kwargs: Any) -> None:
+        super().__init__(**kwargs)
+        self._cancels = cancels
+        self._summary = summary
+        self.closes = 0
+
+    def _verify(
+        self, trajectory: Any, task: Any, *, terminated: bool, evidence: Any = None
+    ) -> FeedbackCollection:
+        fb = super()._verify(trajectory, task, terminated=terminated, evidence=evidence)
+        if terminated and self._summary is not None:
+            fb.episode.append(EpisodeFeedback(name="success", value=self._summary))
+        return fb
+
+    async def close(self) -> None:
+        await super().close()
+        self.closes += 1
+        if self._cancels:
+            raise asyncio.CancelledError()
+
+
+def _cancelling_close_factory(which: str, **kwargs: Any) -> Tuple[Any, List[Any]]:
+    """A factory in which exactly one instance's teardown cancels.
+
+    The constructor builds one long-lived *catalog* env to read the published contract, and the
+    factory is called again per dispense for the *episode* env — two different instances closed
+    by two different teardowns, so which one raises picks the site under test."""
+    built: List[Any] = []
+
+    def factory(_name: str) -> Any:
+        nth = len(built)
+        env = _CancelsOnClose(
+            cancels=(nth == 0) if which == "catalog" else (nth > 0), tasks=TASKS, **kwargs
+        )
+        built.append(env)
+        return env
+
+    return factory, built
+
+
+@pytest.mark.parametrize(
+    "summary, headlinable", [(None, True), ("false", False)], ids=["scorable", "unheadlinable"]
+)
+async def test_an_episode_teardown_that_cancels_still_answers_and_still_stops(
+    tmp_path: Path, summary: Any, headlinable: bool
+) -> None:
+    # The per-episode release runs as the entry's own claimed task and its callers join it
+    # through a shield, so a `CancelledError` observed inside it is not cancellation of the
+    # caller — the shield already separated the two. Letting it out lands it in the middle of
+    # `_run_seal`, PAST the durable append and BEFORE the stop that seal still owes: the agent's
+    # terminating call answers with a traceback instead of the constant, the stop is never
+    # published, and `aclose` then reports a clean run over an env whose headline this record has
+    # already refused to read. The row is durable either way; what is at stake is everything the
+    # seal does after it.
+    factory, built = _cancelling_close_factory("episode", summary=summary)
+    stream = _stream(tmp_path, [0, 1], factory=factory)
+    await stream.get_task()
+
+    answer = await stream.dispatch(SUBMIT_TOOL, {"answer": "4"})
+    assert answer.content[0].text == _TASK_OVER, "a cancelling teardown changed the agent's answer"  # type: ignore[union-attr]
+    assert built[1].closes == 1, "the episode's env was never closed, so nothing was under test"
+    (row,) = stream.results
+    assert row.closure == "sealed"
+    assert reconcile(tmp_path / "prov") == [], "the durable dispense was left unanswered"
+
+    if headlinable:
+        assert row.score is not None and row.score.success is True
+        assert not stream.stopped, "a teardown failure is not the run's outcome"
+        await stream.aclose()
+    else:
+        assert row.score is None
+        assert row.diagnostic is not None and "cannot headline" in row.diagnostic
+        assert stream.stopped, "the stop the seal owed was lost with the cancelled release"
+        with pytest.raises(RuntimeError, match="cannot headline"):
+            await stream.get_task()
+        with pytest.raises(RuntimeError, match="cannot headline"):
+            await stream.aclose()
+
+
+async def test_a_catalog_teardown_that_cancels_still_lets_the_stream_close(
+    tmp_path: Path,
+) -> None:
+    # The stream's own release is claimed once and every later `aclose` joins that same task, so
+    # a cancelled one is not a failure to retry — it is the claim, and it answers every arrival
+    # for the rest of the process. The catalog entry is popped before the close, so nothing can
+    # even find the env again: shutdown would have no orderly exit and no way back.
+    factory, built = _cancelling_close_factory("catalog")
+    stream = _stream(tmp_path, [0], factory=factory)
+    await stream.get_task()
+    await stream.dispatch(SUBMIT_TOOL, {"answer": "4"})
+
+    await stream.aclose()
+    await stream.aclose()  # a poisoned release raises here, and on every attempt after it
+    assert built[0].closes == 1, "the catalog env was never closed, so nothing was under test"
+    assert len(stream.results) == 1
+    with pytest.raises(RuntimeError, match="this stream is closed"):
+        await stream.get_task()
+
+
+class _CancelsOnTheTerminalStep(_FixtureScoreEnv):
+    """A non-seal env — no seal transaction, so `_verify` runs inline and its failure reaches
+    the stream through the tool call itself. (A `score` env's terminal transaction contains any
+    evaluator failure, cancellation included, and fails the verdict closed instead.)"""
+
+    score_terminal_tool = None
+
+    def _verify(
+        self, trajectory: Any, task: Any, *, terminated: bool, evidence: Any = None
+    ) -> FeedbackCollection:
+        if terminated:
+            raise asyncio.CancelledError()
+        return FeedbackCollection()
+
+
+async def test_an_env_that_cancels_on_the_agents_terminal_answers_the_same_way(
+    tmp_path: Path,
+) -> None:
+    # The terminal is committed and the env is what failed, so a row is owed and the stream must
+    # stop — the same answer an env raising anything else gets, and for the same reason. Read as
+    # cancellation instead it skips all of it: `dispatch` raises at the agent on exactly the call
+    # the redaction exists for, the stop is never recorded so the queue serves on against an env
+    # that raises for every task in it, and `aclose` returns clean having lost an outcome.
+    stream = _stream(tmp_path, [0, 1], factory=lambda _n: _CancelsOnTheTerminalStep(tasks=TASKS))
+    await stream.get_task()
+
+    answer = await stream.dispatch(TERMINATE_TOOL_NAME, {})
+    assert answer.content[0].text == _TASK_OVER, "an env failure changed the agent's answer"  # type: ignore[union-attr]
+    assert stream.stopped, "the stream served on against an env that raised at the terminal"
+    assert len(stream.results) == 1
+    with pytest.raises(RuntimeError, match="raised while ending a task") as end:
+        await stream.aclose()
+    assert isinstance(end.value.__cause__, asyncio.CancelledError)
+    assert len(read_results(tmp_path / "prov")) == 1
+
+
+async def test_an_env_that_cancels_on_a_forced_terminal_still_records_and_stops(
+    tmp_path: Path,
+) -> None:
+    # The same env on the stream's own forced terminal, which is where it costs most: this runs
+    # inside the seal task, and the seal is a task precisely so a lost caller cannot restart it.
+    # A cancellation out of here cancels the claim itself — no row is ever composed, the entry
+    # keeps a seal nothing can complete, and every later drain re-awaits it and raises again, so
+    # an orderly shutdown reconciles as a crash it never was.
+    stream = _stream(tmp_path, [0, 1], factory=lambda _n: _CancelsOnTheTerminalStep(tasks=TASKS))
+    await stream.get_task()
+
+    with pytest.raises(RuntimeError, match="failed while the stream ended a task"):
+        await stream.get_task()  # the drain forces the terminal; the queue may not go on
+    (row,) = stream.results
+    assert row.closure == "finalize_error", "an env the stream could not end is not an agent seal"
+    assert row.score is None
+    assert "CancelledError" in (row.diagnostic or ""), "the failure must be on the row"
+    with pytest.raises(RuntimeError, match="failed while the stream ended a task") as end:
+        await stream.aclose()
+    assert isinstance(end.value.__cause__, asyncio.CancelledError)
+    assert [r.closure for r in read_results(tmp_path / "prov")] == ["finalize_error"]
+    assert reconcile(tmp_path / "prov") == []
+
+
+async def test_a_refused_dispense_reports_the_refusal_a_cancelling_teardown_cannot_replace(
+    tmp_path: Path,
+) -> None:
+    # A manifest that drifts is refused before anything is exposed, and the episode opened for it
+    # is released on the way out — teardown, whose failure must not stand in for the refusal every
+    # caller of `get_task` is told to expect. Nothing was spent, so the damage is only the answer;
+    # but the answer is the whole contract here, and a `CancelledError` also ends whoever is
+    # dispensing rather than being an error they can act on.
+    built: List[Any] = []
+
+    class _DriftsAndCancels(_CancelsOnClose):
+        def describe(self, task_id: Any = None) -> TaskSpec:
+            spec = super().describe(task_id)
+            if self._cancels:  # the episode instance, never the catalog one
+                spec.tools = [
+                    *spec.tools,
+                    ToolManifest(
+                        name="hint",
+                        description="Ask for a hint.",
+                        input_schema={"type": "object", "properties": {}},
+                    ),
+                ]
+            return spec
+
+    def factory(_name: str) -> Any:
+        env = _DriftsAndCancels(cancels=bool(built), tasks=TASKS)
+        built.append(env)
+        return env
+
+    stream = _stream(tmp_path, [0, 1], factory=factory)
+    with pytest.raises(RuntimeError, match="different tool manifest"):
+        await stream.get_task()
+    assert built[1].closes == 1, "the refused episode's env was never closed"
+    assert stream.results == ()
+    assert not (tmp_path / "prov" / "results.jsonl").exists()
+
+
+def test_a_failed_constructor_reports_its_own_error_when_the_catalog_cancels(
+    tmp_path: Path,
+) -> None:
+    # Sync, and outside a running loop on purpose: that is where `_close_on_owning_loop` runs the
+    # close to completion rather than scheduling it, so the env's failure reaches the cleanup.
+    # This is the one path whose whole job is not to mask the error being raised.
+    prov = tmp_path / "prov"
+    prov.mkdir(parents=True)
+    (prov / "dispenses.jsonl").write_text(
+        json.dumps(
+            {
+                "seq": 1,
+                "position": 0,
+                "env": "some_other_env",
+                "task_idx": 0,
+                "lease": "x",
+                "dispensed_at": 0.0,
+            }
+        )
+        + "\n"
+    )
+    with pytest.raises(ValueError, match="but this queue holds") as refused:
+        TaskStream(
+            lambda _n: _CancelsOnClose(cancels=True, tasks=TASKS),
+            [TaskRef(ENV_NAME, 0)],
+            prov_dir=prov,
+            resume=True,
+        )
+    notes = getattr(refused.value, "__notes__", [])
+    assert any("could not be closed" in note for note in notes), (
+        "a cleanup that could not finish must be reported on the error being raised"
+    )
+
+
+# ----- the structural guard -----
+#
+# Three passes of this review found the same defect at three different handlers, which makes the
+# handler the wrong unit to fix. The rule now lives in one place — `_must_propagate` — and these
+# two keep it from being bypassed: the first is behavioural, over every third-party surface the
+# stream calls; the second refuses the handler shape that hid it, at the source.
+
+
+class _CancellingSpan:
+    dispensed = {"opened": True}
+
+    async def finalize(self, completed: Any) -> Dict[str, Any]:
+        raise asyncio.CancelledError()
+
+
+class _CancellingProvenance:
+    namespace = "test.cancels"
+
+    def __init__(self, where: str) -> None:
+        self._where = where
+
+    async def begin(self, ref: TaskRef) -> Any:
+        if self._where == "begin":
+            raise asyncio.CancelledError()
+        return _CancellingSpan()
+
+
+def _stream_whose(surface: str, tmp_path: Path) -> Tuple[TaskStream, str, Dict[str, Any]]:
+    """A stream in which exactly one third-party surface raises `CancelledError`, plus the tool
+    that ends its task."""
+    if surface == "an episode teardown":
+        factory, _ = _cancelling_close_factory("episode")
+        return _stream(tmp_path, [0, 1], factory=factory), SUBMIT_TOOL, {"answer": "4"}
+    if surface == "the catalog teardown":
+        factory, _ = _cancelling_close_factory("catalog")
+        return _stream(tmp_path, [0, 1], factory=factory), SUBMIT_TOOL, {"answer": "4"}
+    if surface == "a terminal step":
+        return (
+            _stream(tmp_path, [0, 1], factory=lambda _n: _CancelsOnTheTerminalStep(tasks=TASKS)),
+            TERMINATE_TOOL_NAME,
+            {},
+        )
+    if surface == "a span opening":
+        return (
+            _stream(tmp_path, [0, 1], provenance=[_CancellingProvenance("begin")]),
+            SUBMIT_TOOL,
+            {"answer": "4"},
+        )
+    if surface == "a span closing":
+        return (
+            _stream(tmp_path, [0, 1], provenance=[_CancellingProvenance("finalize")]),
+            SUBMIT_TOOL,
+            {"answer": "4"},
+        )
+    raise AssertionError(f"unknown surface {surface!r}")
+
+
+@pytest.mark.parametrize("ended_by", ["the agent", "the drain"])
+@pytest.mark.parametrize(
+    "surface",
+    [
+        "an episode teardown",
+        "the catalog teardown",
+        "a terminal step",
+        "a span opening",
+        "a span closing",
+    ],
+)
+async def test_no_cancellation_an_env_or_extension_raises_reaches_the_harness(
+    tmp_path: Path, surface: str, ended_by: str
+) -> None:
+    # One statement over every third-party surface this module calls: whatever an env or an
+    # extension raises, the harness's own API never answers with cancellation. It may raise the
+    # loud integrity error, it may return normally — but a caller of `get_task`, `dispatch` or
+    # `aclose` is never *cancelled* by code it was only supposed to be running.
+    stream, tool, args = _stream_whose(surface, tmp_path)
+    cancelled: List[str] = []
+
+    async def call(label: str, coro: Any) -> None:
+        try:
+            await coro
+        except asyncio.CancelledError:
+            cancelled.append(label)
+        except Exception:  # noqa: BLE001 — only cancellation is under test here
+            pass
+
+    await call("get_task", stream.get_task())
+    if ended_by == "the agent":
+        await call("dispatch", stream.dispatch(tool, dict(args)))
+    await call("aclose", stream.aclose())
+    await call("aclose again", stream.aclose())
+
+    assert cancelled == [], f"{surface} cancelled the harness's own caller"
+
+
+def test_a_containment_boundary_may_not_catch_exception_and_leave_cancellation_to_chance() -> None:
+    # The source-level half, because the behavioural half above can only cover the surfaces that
+    # exist today. Any `try` that runs an env's or an extension's code is a containment boundary,
+    # and `except Exception` there is silently *not* a decision about `CancelledError` — which is
+    # exactly how this landed three times. So the shape is refused: such a boundary catches
+    # `BaseException` and asks `_must_propagate`, or it names `asyncio.CancelledError` itself.
+    # Elsewhere `except Exception` keeps its meaning, a deliberate passthrough of the caller's own
+    # cancellation, and is left alone.
+    #
+    # A tripwire, not a proof: it keys on the names this module gives its third-party handles, so
+    # renaming one would slip past. It fails at the moment the shape is written, which a comment
+    # cannot do.
+    handles = frozenset({"env", "episode", "undispensed", "span", "extension"})
+    source = Path(stream_module.__file__).read_text()
+    offenders: List[str] = []
+    for node in ast.walk(ast.parse(source)):
+        if not isinstance(node, ast.Try):
+            continue
+        mentioned = set()
+        for statement in node.body:
+            for inner in ast.walk(statement):
+                if isinstance(inner, ast.Name):
+                    mentioned.add(inner.id)
+                elif isinstance(inner, ast.Attribute):
+                    mentioned.add(inner.attr)
+        if not mentioned & handles:
+            continue
+
+        def caught(handler: ast.ExceptHandler) -> List[str]:
+            kinds = handler.type
+            listed = kinds.elts if isinstance(kinds, ast.Tuple) else [kinds]
+            return [ast.unparse(k) for k in listed if k is not None]
+
+        names = [name for handler in node.handlers for name in caught(handler)]
+        if "Exception" in names and not any("CancelledError" in name for name in names):
+            offenders.append(f"line {node.handlers[0].lineno}: {sorted(set(names))}")
+    assert offenders == [], (
+        "these boundaries run an env's or an extension's code and catch `Exception`, so a "
+        "`CancelledError` it raises escapes a handler meant to contain everything: " + "; ".join(offenders)
+    )

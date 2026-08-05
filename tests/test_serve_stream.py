@@ -734,7 +734,7 @@ async def test_a_failed_row_write_still_releases_the_episode(tmp_path: Path) -> 
     with pytest.raises(RuntimeError, match="record is incomplete") as raised:
         await stream.aclose()
     assert isinstance(raised.value.__cause__, OSError)
-    assert stream.queue_info().in_flight == 0  # the entry is gone from the registry
+    assert stream.queue_info().in_flight == 0  # the episode is released; only a row is owed
     assert built[1].closed, "the episode's env outlived the failed write"
     assert all(env.closed for env in built)
 
@@ -1314,10 +1314,11 @@ async def test_reading_the_recorded_rows_cannot_rewrite_them(tmp_path: Path) -> 
     assert first.score is not None
     assert first.observed is not first.score.feedback, "one list is both halves of the row"
 
-    # A reader edits everything the frozen row leaves reachable, at both levels.
+    # A reader edits everything the frozen row leaves reachable, at every level.
     for row in stream.results:
         row.observed[0]["value"] = "invented"
         row.observed.append(_episode_item("invented", True))
+        row.extensions["invented"] = True
         if row.score is not None:
             row.score.feedback[0]["value"] = "invented"
 
@@ -1325,6 +1326,47 @@ async def test_reading_the_recorded_rows_cannot_rewrite_them(tmp_path: Path) -> 
     assert _rows(tmp_path) == durable
     # The outcomes are still the ones the two episodes earned.
     assert [row.score.success for row in stream.results if row.score] == [True, False]
+
+
+async def test_the_run_keeps_the_row_the_file_holds(tmp_path: Path) -> None:
+    # The other half of that, and the one a rewrite can drop without anything noticing: what the
+    # run *keeps* is the row re-read from the wire form it just committed, not the one it
+    # composed. Composed, the row is a handle on the env's own values — `observed` holds the
+    # items the episode published and `score.feedback` is that same list — so a reader that
+    # copies it runs the env's code, on a run that is already over. A feedback value is allowed
+    # to be a `str` subclass (the models do not validate on assignment), and one whose
+    # `__deepcopy__` raises turns reading a finished run's results into an exception.
+    #
+    # Re-read, the same row is plain data: the copies below are of what the file holds.
+    class _Uncopyable(str):
+        def __deepcopy__(self, memo: Any) -> Any:
+            raise RuntimeError("this value cannot be copied")
+
+    class _PublishesASubclass(_FixtureScoreEnv):
+        def _verify(self, trajectory, task, *, terminated, evidence=None) -> FeedbackCollection:
+            fb = super()._verify(trajectory, task, terminated=terminated, evidence=evidence)
+            if terminated:
+                # Assigned rather than constructed, for the reason `_publishes_undescribable`
+                # gives: pydantic coerces the subclass away at construction.
+                item = EpisodeFeedback(name="note", value="placeholder")
+                item.value = _Uncopyable("kept")
+                fb.episode.append(item)
+            return fb
+
+    async with TaskStream(
+        lambda _name: _PublishesASubclass(tasks=TASKS),
+        [TaskRef(ENV_NAME, 0)],
+        prov_dir=tmp_path / "prov",
+    ) as stream:
+        await stream.get_task()
+        await stream.dispatch(SUBMIT_TOOL, {"answer": "4"})
+
+    (row,) = stream.results  # a read that runs env code does not get this far
+    note = next(item for item in row.observed if item["name"] == "note")
+    assert type(note["value"]) is str, "the run kept the env's object rather than the wire form"
+    assert row.score is not None and row.score.success is True
+    assert row.observed is not row.score.feedback, "one list is both halves of the row"
+    assert [row.to_wire()] == _rows(tmp_path), "memory and the file are one record"
 
 
 async def test_pulling_a_new_task_seals_the_abandoned_one(tmp_path: Path) -> None:
@@ -1648,6 +1690,17 @@ async def test_an_episode_manifest_that_cannot_be_compared_still_stops_the_strea
             lambda spec: setattr(spec, "horizon", True),
             "budget is not a whole number",
             id="the budget is a bool",
+        ),
+        pytest.param(
+            # Text to every `isinstance` check, and a `UnicodeEncodeError` the moment the
+            # endpoint encodes it — a framing whose type is right and whose bytes do not exist.
+            # The three above are settled by the declared types; this one is only settled by
+            # actually encoding the two values, which is what the check proves rather than
+            # assumes. The phrasing is the spec-side one: a failure the whole-object proof
+            # caught instead would blame the framing, not the env that published it.
+            lambda spec: setattr(spec, "instructions", "answer this \ud800 question"),
+            "could not put it on the wire",
+            id="the instructions are text the endpoint cannot encode",
         ),
     ],
 )
