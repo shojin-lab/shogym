@@ -60,6 +60,40 @@ from hgym.trajectory import Step, Trajectory
 from hgym.utils.uuid7 import uuid7
 
 
+def _wire_form(score_schemas: Dict[Any, Any]) -> Dict[str, Dict[str, Any]]:
+    """The score-terminal contract as the wire carries it: the names this episode enforces on and
+    the schemas it validates against, round-tripped through JSON.
+
+    Both halves are the env's own objects, and a JSON scalar has subclasses — the models coerce
+    one away at construction but do not validate on assignment, so it reaches here verbatim. It
+    serializes like the scalar it subclasses, which is exactly what makes it invisible: a server
+    advertises ordinary text and this episode holds something that answers a comparison its own
+    way. A ``const`` like that refuses the argument the agent was shown; a *name* like that is
+    worse, because the name is the key a terminal call is looked up under — the call that ends
+    the task is dispatched as an ordinary step, sealing nothing, on the tool the endpoint
+    published as the way to finish.
+
+    **Contained, and that is not a hole.** A schema that will not serialize keeps the env's own
+    object, because the only honest alternative here is to fail opening an episode a caller may
+    have no other way to refuse — and that decision belongs to the layer that knows whether an
+    alternative exists. A stream makes it one step later and stops the run: it compares this
+    contract against the one its endpoint published, and a schema that cannot be serialized cannot
+    be compared either, so the task is never dispensed. What is left is a single-episode server
+    enforcing exactly what it advertises, which is what it did before."""
+    wire: Dict[str, Dict[str, Any]] = {}
+    for name, schema in score_schemas.items():
+        try:
+            entry = json.loads(json.dumps({"name": name, "schema": schema}, allow_nan=False))
+        except (ValueError, TypeError):
+            wire[name] = schema
+            continue
+        if not isinstance(entry["name"], str):
+            wire[name] = schema
+            continue
+        wire[entry["name"]] = entry["schema"]
+    return wire
+
+
 def _json_safe(obj: Any) -> bool:
     """True iff ``obj`` serializes to strict JSON (no NaN/Inf, only JSON types) — the same
     contract the trace store enforces with ``allow_nan=False``."""
@@ -203,8 +237,35 @@ class ServedEpisode:
     ) -> "ServedEpisode":
         """Build the env, load the task instance, open the essential MCP sessions, and push
         per-episode state into the (in-process) tool servers."""
-        env = make(env_name, config=env_config)
+        return await cls.open_env(
+            make(env_name, config=env_config),
+            env_name=env_name,
+            task=task,
+            trace_path=trace_path,
+            finalize_deadline=finalize_deadline,
+        )
+
+    @classmethod
+    async def open_env(
+        cls,
+        env,
+        *,
+        env_name: Optional[str] = None,
+        task: Optional[Union[int, str]] = None,
+        trace_path: Optional[Union[str, Path]] = None,
+        finalize_deadline: Optional[float] = None,
+    ) -> "ServedEpisode":
+        """Start an episode on an **already-constructed** env, which this episode then owns.
+
+        Same contract as :meth:`start` except the caller supplies the env instance instead of
+        a name, which lets a caller that serves several episodes at once give each one its own
+        env. Ownership transfers: :meth:`close` closes this env, and a failure during setup
+        closes it here — so the caller must hand over a *fresh* instance per episode rather
+        than a shared one (``Env.close`` on a ``ToolUsingEnv`` ends **every** session it
+        tracks, which would tear down any sibling episode sharing the instance).
+        """
         opened: List[MCPSession] = []
+        env_name = env_name if env_name is not None else env.name
         try:
             task_idx = int(task) if task is not None else None
             task_data = env.load_task(task_idx)
@@ -230,11 +291,13 @@ class ServedEpisode:
             # Read the score-terminal marker off the *published contract* (the manifest is the
             # enforcement point, not a marker scan). At most one tool is `score`; capture its
             # advertised schema so the seal path can validate args.
-            score_schemas = {
-                m.name: m.input_schema
-                for m in env.describe(resolved_task).tools
-                if m.terminal_kind == "score"
-            }
+            score_schemas = _wire_form(
+                {
+                    m.name: m.input_schema
+                    for m in env.describe(resolved_task).tools
+                    if m.terminal_kind == "score"
+                }
+            )
             # Construct inside the try so the cleanup below also covers the constructor's own
             # fail-loud guard (a `score` manifest with no callable finalize): the sessions
             # opened above are released before the error propagates.
@@ -290,6 +353,22 @@ class ServedEpisode:
     def terminal_feedback(self) -> List[Dict[str, Any]]:
         """The terminal step's feedback (wire form), or ``[]`` until the episode ends."""
         return self._terminal_feedback
+
+    async def wait_finalized(self) -> None:
+        """Wait for an in-flight terminal transaction to commit, if there is one.
+
+        A terminal call leaves its finalization running when its own caller is cancelled, so an
+        episode can be sealed with its verdict still landing. Anyone who needs to classify the
+        outcome must wait for it first — the alternative is reading a not-yet-terminated episode
+        and reporting an ending that never happened. The wait is shielded: waiting for the single
+        evaluation never cancels it."""
+        finalization = self._finalization
+        if finalization is None:
+            return
+        try:
+            await asyncio.shield(finalization)
+        except Exception:  # noqa: BLE001 — a failed finalization fails closed onto the episode
+            pass
 
     def describe(self) -> TaskSpec:
         return self._env.describe(self._task_id)
