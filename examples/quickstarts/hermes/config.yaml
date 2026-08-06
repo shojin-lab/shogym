@@ -1,0 +1,35 @@
+# The MCP block Hermes reads out of $HERMES_HOME/config.yaml.
+#
+# Hermes has no project-local MCP file: `mcp_servers` lives in the one config under
+# $HERMES_HOME. So point HERMES_HOME at a throwaway directory and copy this file into it --
+# then the quickstart's server exists only for the quickstart, and your real ~/.hermes is
+# never touched. See README.md.
+#
+#     export HERMES_HOME="$PWD/.hermes"
+#     mkdir -p "$HERMES_HOME" && cp config.yaml "$HERMES_HOME/config.yaml"
+#
+# `hermes mcp add hgym --command uv --args run python serve.py --connect-timeout 90` writes the
+# same block; this file is the shape it writes, checked in so you can read it before you run
+# anything. Hermes stamps a `_config_version:` line on configs it writes itself; it is not
+# required, and everything else in a Hermes config has a default -- this is the whole file.
+
+mcp_servers:
+  hgym:
+    # Relative because a stdio server inherits the cwd of the `hermes` process, and the README
+    # runs hermes from this directory. Absolute paths if you run hermes from anywhere else --
+    # a stdio server config takes no `cwd` key.
+    command: uv
+    args: ["run", "python", "serve.py"]
+    # First call builds the env, which on some envs means a one-time download. 90s is slack.
+    connect_timeout: 90.0
+    enabled: true
+    # Hermes hands stdio subprocesses a FILTERED environment -- PATH, HOME, USER, LANG, TERM,
+    # SHELL, TMPDIR, XDG_* and nothing else -- so that an MCP server you installed cannot read
+    # your keys. An env that needs one (hle's judge, browsecomp_plus) therefore has to be told
+    # here, by name. ${VAR} interpolates from your environment or $HERMES_HOME/.env:
+    #
+    # env:
+    #   OPENAI_API_KEY: "${OPENAI_API_KEY}"
+    #
+    # The alternative is `python serve.py http`, which runs in your own shell with your own
+    # environment; then this entry is `url: http://127.0.0.1:8973/mcp` and no `env` block.
