@@ -105,15 +105,33 @@ async def _exhausted_response(tmp_path: Path) -> Dict[str, Any]:
     return json.loads(out.content[0].text)  # type: ignore[union-attr]
 
 
-async def _reads_as_exhausted(tmp_path: Path, *, consumed: int) -> Dict[str, Any]:
+async def _reads_as_exhausted(
+    tmp_path: Path, *, consumed: int, in_flight: int = 0
+) -> Dict[str, Any]:
     """The exact payload a stopped stream owes ``get_task``: what an exhausted queue answers,
-    differing only in the count of tasks the caller itself played — a number the agent already
-    has, and the one residue no response here can hide.
+    differing only in numbers the caller already holds — the count of tasks it played, and the
+    count of its own episodes the stream still has open.
 
     Compared whole, values included. Key sets alone cannot see the failure this pins: a stopped
     stream relaying its live queue counts would answer ``done: true`` beside a non-zero
-    ``remaining``, contradicting itself inside one object while every key stayed in place."""
-    return {**await _exhausted_response(tmp_path), "consumed": consumed}
+    ``remaining``, contradicting itself inside one object while every key stayed in place.
+
+    ``in_flight`` is deliberately *not* part of what the redaction composes. It counts the
+    caller's own open episodes, so a fixed zero is not a redaction but a false statement about
+    the caller's own work — the one that makes a worker stop while a lease of its own is still
+    callable, leaving the task it could have answered to be force-scored at the drain (see
+    ``test_the_end_of_the_queue_is_not_told_as_nothing_being_live`` in the leases suite). It also
+    hides nothing: a stop seals no episode by itself, so for every stop an env can *cause* — a
+    summary the record cannot headline, an env that raises while ending a task, a drifted
+    manifest — the row lands, the episode is released, and this number is the same one an
+    exhausted queue reports. The exception is a stop the storage caused: a row that cannot be
+    appended keeps its entry until the drain, and no env can make a full disk conditional on its
+    own verdict."""
+    return {
+        **await _exhausted_response(tmp_path),
+        "consumed": consumed,
+        "in_flight": in_flight,
+    }
 
 
 class _TrackedEnv(_FixtureScoreEnv):
@@ -544,7 +562,11 @@ async def test_a_stopped_stream_reports_to_the_harness_and_not_to_the_agent(
     assert not out.is_error
     seen = out.content[0].text  # type: ignore[union-attr]
     ended = json.loads(seen)
-    assert ended == await _reads_as_exhausted(tmp_path, consumed=1)
+    # The row this stream could not write left its entry to be retried by the drain, so one
+    # episode is still open here. That count is reported rather than composed: it is the caller's
+    # own work, and it is the number `queue_info` answers this same caller with anyway.
+    assert ended == await _reads_as_exhausted(tmp_path, consumed=1, in_flight=1)
+    assert ended["in_flight"] == stream.queue_info().in_flight
     assert str(tmp_path) not in seen and "record" not in seen
     with pytest.raises(RuntimeError, match="record is incomplete"):
         await stream.aclose()
@@ -707,6 +729,41 @@ def _unwritable_prov(tmp_path: Path) -> None:
     """Make the real append fail, without reaching inside the stream: a *directory* where the
     results file goes, so `open("a")` raises where a full or read-only volume would."""
     (tmp_path / "prov" / "results.jsonl").mkdir(parents=True)
+
+
+async def test_a_task_whose_row_failed_is_no_longer_the_live_episode(tmp_path: Path) -> None:
+    # With one slot there is no lease to name a task with, so a call resolves to whichever entry
+    # is not sealed — and a seal that failed on the storage hands its claim back, which is what
+    # that read was standing on. The task the stream has already force-terminated therefore
+    # becomes the task every later call is routed to, and the agent is answered as though its
+    # call had ended something. What a call after a finished task gets is `no_active_task`,
+    # whether or not the row could be written.
+    built: List[_TrackedEnv] = []
+    stream = TaskStream(
+        _tracked_factory(built), [TaskRef(ENV_NAME, 0), TaskRef(ENV_NAME, 1)],
+        prov_dir=tmp_path / "prov",
+    )
+    _unwritable_prov(tmp_path)
+    await stream.get_task()
+    live = next(iter(stream._live.values()))  # noqa: SLF001 - inspecting the routing
+    reached: List[str] = []
+    original = live.episode.call
+
+    async def watched(tool: str, arguments: Any = None) -> Any:
+        reached.append(tool)
+        return await original(tool, arguments)
+
+    live.episode.call = watched  # type: ignore[method-assign]
+    await stream.dispatch(SUBMIT_TOOL, {"answer": "4"})
+    assert stream.stopped
+    after_terminal = list(reached)
+
+    late = json.loads(_terminal_text(await stream.dispatch("noop", {})))
+    assert late.get("error") == "no_active_task", "a task the stream had ended was still live"
+    assert reached == after_terminal, "a late call reached an episode the stream had ended"
+    with pytest.raises(RuntimeError, match="record is incomplete"):
+        await stream.aclose()
+    assert stream.results == ()
 
 
 async def test_a_failed_row_write_still_releases_the_episode(tmp_path: Path) -> None:
@@ -1409,7 +1466,7 @@ async def test_dispatch_without_a_task_is_a_stream_error_not_an_env_step(tmp_pat
     async with _stream(tmp_path, [0]) as stream:
         result = await stream.dispatch(SUBMIT_TOOL, {"answer": "4"})
         payload = json.loads(result.content[0].text)  # type: ignore[union-attr]
-        assert payload["error"] == "no active task"
+        assert payload["error"] == "no_active_task" and payload["stream_error"] is True
         assert stream.queue_info().consumed == 0
     # The unstarted task was never dispensed, so it left no row.
     assert not (tmp_path / "prov" / "results.jsonl").exists()
@@ -2145,8 +2202,8 @@ async def test_the_framing_lists_the_tools_the_endpoint_serves(tmp_path: Path) -
 
 
 async def test_rejects_unsupported_configurations(tmp_path: Path) -> None:
-    with pytest.raises(ValueError, match="max_in_flight"):
-        _stream(tmp_path, [0], max_in_flight=2)
+    with pytest.raises(ValueError, match="max_in_flight must be at least 1"):
+        _stream(tmp_path, [0], max_in_flight=0)
     with pytest.raises(ValueError, match="non-empty queue"):
         _stream(tmp_path, [])
     with pytest.raises(ValueError, match="serves one env"):

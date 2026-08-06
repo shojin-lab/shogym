@@ -40,6 +40,16 @@ can hide is that the run ended: a stop truncates the queue, and an agent countin
 was promised can see that. That residue is one bit, delivered at the moment the agent has no
 task left to spend it on, which is the most a stream that refuses to keep scoring can offer.
 
+That answer is about the *queue* and about nothing else. ``done`` says no further task is
+coming; it does not say the caller has finished the ones it already holds, and the ``in_flight``
+beside it is reported rather than composed. A worker that is told nothing of its own is open
+stops, and the task it was still entitled to answer is force-scored as an ordinary loss at the
+drain — a wrong result with an earned-looking closure, which is precisely what the redaction
+exists to prevent elsewhere. Nothing is hidden by reporting it: a stop seals no episode by
+itself, so this count is the same one an exhausted queue shows, and ``queue_info`` answers it on
+demand anyway. Which is also why an exhausted pull displaces nothing at all — a question about
+the queue may not end work the agent is still entitled to finish.
+
 That last point is deliberately *stricter* than a single served episode, which surfaces
 episode-level feedback on the terminal result (:func:`~hgym.feedback.wire.select_inband`) and
 returns the env's own terminal payload with it. That rule draws its line at the end of the
@@ -130,6 +140,32 @@ core stamps onto its terminal payload. So a value published under a reserved nam
 or wrong-typed, without being able to reclassify the row it sits on — and the one place where a
 published value does become a number validates it rather than coercing it.
 
+**Leases.** With more than one episode live at once, a native call has to say *which* one it
+belongs to. Native schemas are ``additionalProperties: false``, so the stream publishes wrapper
+schemas that add a required ``lease``, validates it, and **strips it before
+``ServedEpisode.call()``** — otherwise the routing capability would be recorded into the env's
+trajectory. A lease is opaque, unguessable and never reused, and the registry binds
+``(lease, env, native tool)``: a lease that is valid but denotes the wrong thing is refused.
+Every refusal is a stream-level result, never an env step, so a routing mistake costs no budget
+and enters no trajectory. A lease outlives the task it named — a call arriving late is told the
+task is over, not that its lease was never real — but *only* the lease does: the registry entry
+is retired the moment its seal is finished, so what a completed task leaves behind is its row and
+a 32-character string, not the env, trajectory and sessions it ran on. "Never reused" spans the
+whole *record*, not the process: a resumed run seeds the issued set from the dispenses already in
+the directory, because a repeat there is one a result would silently answer twice (see
+:func:`reconcile`).
+
+A wrapper is only published for a schema the added argument is provably sound for — a plain root
+object schema. A root that could reinterpret the addition (a ``$ref`` the arguments really live
+behind, a composed ``allOf``/``oneOf``, a constraint on the object's names or size) is refused at
+construction instead, because the *episode* keeps enforcing the env's own schema: advertising a
+contract the seal does not enforce is how a call that conforms to the published schema becomes a
+clean, earned-looking loss (see :func:`_leased_manifest`).
+At ``max_in_flight == 1`` there is no lease and no wrapper, and native
+tool registration *and* the arguments an env receives are exactly what they were: with one slot
+every call is unambiguous, so nothing is routed on and nothing is taken out of ``arguments`` —
+including an argument an env legitimately names ``lease`` itself.
+
 Drive it directly (``get_task`` / ``dispatch`` / ``queue_info``) or wrap it for an agent with
 :func:`build_stream_server`. The direct API needs no MCP at all, which is what makes the
 lifecycle testable.
@@ -156,6 +192,7 @@ from typing import (
     Optional,
     Protocol,
     Sequence,
+    Set,
     Tuple,
 )
 
@@ -220,6 +257,48 @@ _SUCCESS_NAMES = ("success", "correct")
 # name that gets a meaning without being added here is the gap to look for.
 _RESERVED_FEEDBACK_NAMES = (*_REWARD_NAMES, *_SUCCESS_NAMES, "finalize_error")
 
+# The wrapper argument that names an episode. Env tool schemas are `additionalProperties: false`,
+# so it has to be added to the published schema rather than smuggled alongside it.
+_LEASE_ARG = "lease"
+
+# How many times a dispense will redraw before it calls the source, rather than the draw, the
+# problem (see `TaskStream._mint_lease`). Any bound at all is the point: two independent 128-bit
+# draws colliding is not something a run meets, so a handful of repeats says the values are not
+# independent, and the next thousand draws would say the same thing with the event loop held.
+_LEASE_MINT_ATTEMPTS = 8
+
+# The root keywords a schema may carry and still be one the lease can be added to (see
+# `_leased_manifest`). An allow-list rather than a list of hazards: JSON Schema keeps gaining
+# keywords, a keyword this module has never heard of is one it cannot have proved anything about,
+# and the safe answer to an unknown constraint on the object being extended is to refuse it.
+#
+# Each of these is here for a reason of its own. `type`/`properties`/`required`/
+# `additionalProperties` are the object vocabulary the wrapper reads and rewrites — adding a name
+# to `properties` is exactly what makes a closed object accept it. `$defs`/`definitions` is a
+# container of subschemas that constrains nothing itself; what it holds is reached from inside
+# `properties`, which this wrapper does not touch. The rest are annotations: they carry no
+# assertion about an instance in any dialect, so an added property cannot violate one.
+_WRAPPABLE_ROOT_KEYWORDS = frozenset(
+    {
+        "type",
+        "properties",
+        "required",
+        "additionalProperties",
+        "$defs",
+        "definitions",
+        "$schema",
+        "$id",
+        "$comment",
+        "title",
+        "description",
+        "default",
+        "examples",
+        "deprecated",
+        "readOnly",
+        "writeOnly",
+    }
+)
+
 _RESULTS_FILE = "results.jsonl"
 _DISPENSES_FILE = "dispenses.jsonl"
 
@@ -273,14 +352,20 @@ class DispensedTask:
     instructions: str
     budget: Optional[int]
     tools: Tuple[Dict[str, Any], ...]
+    # The capability that names this episode, present only when more than one may be live. It
+    # identifies the episode, never the task: it is random, and a new one is minted per dispense.
+    lease: Optional[str] = None
 
     def to_wire(self) -> Dict[str, Any]:
-        return {
+        wire: Dict[str, Any] = {
             "env": self.env,
             "instructions": self.instructions,
             "budget": self.budget,
             "tools": [dict(tool) for tool in self.tools],
         }
+        if self.lease is not None:
+            wire["lease"] = self.lease
+        return wire
 
 
 @dataclass(frozen=True)
@@ -472,6 +557,15 @@ class _Live:
     # An entry only reaches the watchdog after the stamp, so the placeholder is never compared.
     started: float = 0.0
     sealed: bool = False
+    # This task has been *ended* — its seal has begun. Unlike the claim above, this never becomes
+    # false again: a seal that failed on the storage hands its claim back so a later drain can
+    # retry the append (see `TaskStream._join_seal`), and by then the episode has been
+    # force-terminated, the row composed and every span finalized. Whether a call may still be
+    # routed here is a question about *that*, not about who currently holds the claim — read the
+    # claim for it and the one task whose record already failed becomes the one task a late call
+    # is let into, answered as though its call had ended something (see
+    # `TaskStream._resolve`).
+    ended: bool = False
     # Letting this task's episode go, held as a task. The entry outlives its own release — a seal
     # publishes the stop it owes afterwards — so more than one caller can reach it; the first
     # claims it and the rest await this rather than closing the episode again.
@@ -1145,7 +1239,9 @@ class TaskStream:
             carry the task index and the env's raw feedback, so it belongs to the harness —
             keep it off any filesystem the agent under test can read. One directory per run:
             one that already holds records is refused unless ``resume`` says to continue it.
-        max_in_flight: how many episodes may be live at once.
+        max_in_flight: how many episodes may be live at once. Above 1, ``get_task`` returns a
+            lease and every native call must carry it. A pull beyond capacity seals the oldest
+            live task, exactly as a pull does at capacity 1.
         deadline: per-episode wall-clock seconds from the moment the task is handed out until
             the stream **takes it over**. When it elapses the stream claims the seal itself and
             records ``closure="timeout"`` with no score; the queue keeps draining. Must be a
@@ -1197,11 +1293,21 @@ class TaskStream:
         provenance: Sequence[Provenance] = (),
         provenance_timeout: Optional[float] = 30.0,
     ) -> None:
-        if max_in_flight != 1:
+        if not isinstance(max_in_flight, int):
+            # A capacity is a count of slots, and everything downstream reads it as one: it
+            # slices the live entries a pull displaces, and it is compared against 1 twice —
+            # once to decide whether a lease is advertised at all, once to decide whether a call
+            # must carry one. A value that is not a whole number passes each of those
+            # differently, so the stream half-works rather than refusing: `1.5` dispenses a task
+            # and then raises `TypeError` out of the *next* pull, and `nan` (which is `> 1` and
+            # `== 1` neither) hands out a task with no lease and then refuses every call on it
+            # as `missing_lease`. Neither is a capacity, and both are found here rather than one
+            # dispense later.
             raise ValueError(
-                f"max_in_flight={max_in_flight} is not supported yet; this stream serves one "
-                "episode at a time"
+                f"max_in_flight must be a whole number of slots, got {max_in_flight!r}"
             )
+        if max_in_flight < 1:
+            raise ValueError(f"max_in_flight must be at least 1, got {max_in_flight}")
         if deadline is not None and not (math.isfinite(deadline) and deadline > 0):
             # NaN and infinity would both pass a `<= 0` check and then silently disable
             # enforcement: `now - started >= deadline` is false forever against either, so the
@@ -1317,7 +1423,8 @@ class TaskStream:
             }
             # The frozen contract, in comparable form. Every episode this stream starts runs on
             # a *different* instance the factory built, so this is what each one's own manifest
-            # is checked against before its task is dispensed.
+            # is checked against before its task is dispensed. Compared on the NATIVE names the
+            # env publishes; what is advertised is derived from it afterwards.
             self._signature: Dict[str, Tuple[Any, ...]] = {
                 name: _manifest_signature(tools) for name, tools in self._manifest.items()
             }
@@ -1325,13 +1432,26 @@ class TaskStream:
                 name: next((m.name for m in tools if m.terminal_kind == "score"), None)
                 for name, tools in self._manifest.items()
             }
-            # What the agent actually sees. This stream serves one env and joins nothing, so the
-            # names on the wire are the env's own — and they are already this stream's plain data
-            # (frozen native, above), which is what every registration and every task's framing
-            # is built from.
+            # What the agent actually sees: at capacity 1 the env's own names and schemas, and
+            # above 1 each schema wrapped with the required `lease` that names the episode. Both
+            # are built from the frozen native contract above — already this stream's plain data
+            # (see :func:`_frozen_manifest`) — so the lease argument is added to a copy of this
+            # stream's own schema and never to an object the env still holds, and what the
+            # endpoint registers above capacity 1 is this stream's schema throughout.
+            #
+            # The native contract stays unwrapped in `self._manifest`, because that is what an
+            # episode's own manifest is compared against and what the terminal this stream drives
+            # is named from. Neither goes through the wrapper: the wrapper is the agent's routing
+            # surface, and an episode never sees the lease at all.
             self._advertised: Dict[str, List[ToolManifest]] = {
-                name: list(tools) for name, tools in self._manifest.items()
+                name: [_leased_manifest(m) for m in tools] if max_in_flight > 1 else list(tools)
+                for name, tools in self._manifest.items()
             }
+            # Every lease ever issued, so one can never be reused — a recycled lease would let a
+            # delayed call from a finished task act on, and be scored into, its successor. A
+            # resumed run seeds it from the record below: "ever" spans the whole record, not the
+            # process, or the guarantee lapses at exactly the boundary a crash creates.
+            self._issued: set[str] = set()
 
             # Resume by queue POSITION, never by task index: the same index may be queued twice and
             # both occurrences must play. A position that was dispensed but never sealed has no
@@ -1348,6 +1468,15 @@ class TaskStream:
             # own number, leaving `reconcile`'s `broker_abort` and the replay's real outcome
             # sharing one identifier: two rows for one position, indistinguishable in order, in
             # the record whose whole purpose is to keep them apart.
+            #
+            # Leases continue past this directory's record for the same reason `seq` does, and
+            # for a stricter one. `reconcile` pairs a dispense with a result **by lease alone**,
+            # so a resumed run that minted one this record already holds would have the earlier
+            # run's result answer the later run's dispense: the position dispensed and never
+            # sealed reconciles to nothing, and the `broker_abort` a crash owes is simply absent
+            # from a record that still reads as complete. A row goes missing, quietly. The odds
+            # of a 128-bit CSPRNG repeating are not what makes that safe — this module promises a
+            # lease is never reused, and it is the run that has to keep the promise.
             self._done_positions: set[int] = set()
             self._seq = 0
             if resume:
@@ -1357,17 +1486,39 @@ class TaskStream:
                         TaskRef(str(record["env"]), int(record["task_idx"])),
                         source="a dispense record",
                     )
+                    lease = str(record["lease"])
+                    if lease in self._issued:
+                        # Already ambiguous on disk, before this run adds anything: the pairing
+                        # `reconcile` does cannot answer two dispenses with one result, so
+                        # whichever of them was sealed reports both as sealed. Continuing would
+                        # append to a record that has already lost a row.
+                        raise ValueError(
+                            f"{self.dispenses_path} records two dispenses under one lease "
+                            f"({lease!r}); a result is paired with a dispense by its lease, so "
+                            "one of them can never be answered and a crash on it would be "
+                            "invisible to reconciliation"
+                        )
+                    self._issued.add(lease)
                     self._seq = max(self._seq, int(record["seq"]))
                 for row in read_results(self.prov_dir):
                     self._require_position_matches(
                         row.position, TaskRef(row.env, row.task_idx), source="a result row"
                     )
+                    # A row's lease is the dispense's, so this adds nothing to a record whose two
+                    # files agree — and it is what keeps the guarantee if they ever do not.
+                    self._issued.add(row.lease)
                     self._done_positions.add(row.position)
                     self._seq = max(self._seq, row.seq)
 
             self._position = 0
             self._consumed = 0
             self._live: Dict[str, _Live] = {}
+            # The leases of tasks that are over, and nothing else about them (see
+            # `_retire_settled`). A lease outlives its task because a late call must be told the
+            # task ended rather than that its lease was never real — but that answer needs the
+            # string and none of what the entry points at, so the entry goes and the string
+            # stays. Bounded by the queue, and by one 32-character key per task.
+            self._settled_leases: Set[str] = set()
             self._results: List[ResultRow] = []
             # A SHORT registry lock: it guards the live/queue bookkeeping and is never held across
             # an episode call, an extension callback, or a seal.
@@ -1644,7 +1795,7 @@ class TaskStream:
         raise cause
 
     def _deliverable_framing(
-        self, ref: TaskRef, instructions: str, budget: Optional[int]
+        self, ref: TaskRef, instructions: str, budget: Optional[int], lease: str
     ) -> DispensedTask:
         """The task the agent will be handed, proved deliverable **as a whole** before the
         dispense is committed.
@@ -1660,7 +1811,9 @@ class TaskStream:
 
         So what is proved is the object itself, through the encoder the endpoint uses (see
         :func:`_wire_json`). Field by field it would be the same check with a list to keep in
-        step; whole, a field added later is covered the day it is added.
+        step; whole, a field added later is covered the day it is added. The ``lease`` is that
+        field: it arrives already minted so the proof covers it too, rather than being attached
+        to a framing this had already signed off on.
 
         Nothing of this run's record is durable yet when this runs, and no position has been
         consumed, so a refusal costs no task. The stop is the run's, on the line this module
@@ -1687,6 +1840,10 @@ class TaskStream:
                 }
                 for m in self._advertised[ref.env]
             ),
+            # Only when more than one episode may be live: at capacity 1 the wire contract is the
+            # env's own, so there is no lease to publish and none to route on. The entry still
+            # carries one — it is the registry's key either way — but it is not the agent's.
+            lease=lease if self._max_in_flight > 1 else None,
         )
         try:
             # On the wire form the endpoint answers with, not on the object: `to_wire` is what
@@ -1748,9 +1905,13 @@ class TaskStream:
         return self._stopped is not None
 
     @property
+    def max_in_flight(self) -> int:
+        return self._max_in_flight
+
+    @property
     def tools(self) -> Sequence[ToolManifest]:
-        """The tool manifest this stream serves (validated identical across the queue), as the
-        frozen contract the constructor made of it.
+        """The tool manifest this stream advertises — the env's own schemas at capacity 1, and
+        the lease-carrying wrappers above it — as the frozen contract the constructor made of it.
 
         A detached view of that contract, rebuilt per read (see :func:`_detached_manifest`) —
         reading what this endpoint serves may not be a way to change it."""
@@ -1796,6 +1957,17 @@ class TaskStream:
         The drain is *total*: an episode that cannot be sealed does not cost the others their
         seal, nor the stream its catalog envs and its watchdog.
 
+        **Closing the stream and claiming its episodes are one step.** Every unsettled task's
+        seal is taken in the same critical section that marks the stream closed, before any of
+        them is waited on, so from the moment this stream reads closed there is no live episode
+        left for a call to be routed to. A seal that then *fails* hands its claim back for a
+        later drain to retry — and hands back only the claim: the task stays ended, which is what
+        a call is refused on (see :attr:`_Live.ended`), so the window does not reopen behind a
+        row that could not be written. What a call arriving after it gets is the refusal a
+        finished task gets — no budget spent, no trajectory entry, no row — and the row the
+        record ends up holding for that task is the one this drain forced (``drained``), never a
+        score an agent earned after the shutdown began.
+
         **Releasing is not part of the drain, and a lost caller cannot take it with them.** The
         catalog envs and the deadline watchdog are held by this object and by nothing else, so a
         shutdown cancelled on its way out would leave an env holding MCP sessions and
@@ -1820,14 +1992,37 @@ class TaskStream:
                 # crash. So a retry joins the seal the cancelled attempt left running and
                 # finishes the drain.
                 self._closed = True
-                live_now = list(self._live.values())
-            # Sealing happens with the registry free: it drives a terminal call and runs
+                # Anything still owed something, including a task whose seal another path has
+                # already claimed — the claim below joins that same transition rather than racing
+                # it. A row is not the end of that: the episode behind it is released, and any stop
+                # it owes published, in the tail after the append, so a drain that stopped at the
+                # row would return over an episode still letting go of its env (see
+                # :attr:`_Live.settled`).
+                #
+                # **Every one of them is claimed here, before any of them is waited on**, in the
+                # same critical section that closed the stream and with no await able to split the
+                # two. Sealing is not a step this can take one task at a time: it drives an env
+                # terminal, waits on its finalizer and runs every extension, any of which may block
+                # for as long as it likes. Claiming inside the loop below would leave every task
+                # after the blocked one unclaimed, and an unclaimed task is one :meth:`_resolve`
+                # still routes calls to — so an agent could earn a scored, `sealed` row on a
+                # stream that had already begun shutting down, for exactly as long as some
+                # *other* task's env took to let go: a stop that did not happen, recorded as an
+                # ordinary result.
+                # The deadline claims ahead of its waiting for the same reason and is documented
+                # there (see :meth:`_watch_deadlines`); this is the drain's half of it.
+                claimed = [
+                    (live, self._claim_seal(live, "drained"))
+                    for live in self._live.values()
+                    if not live.settled
+                ]
+            # Only the waiting happens with the registry free — it drives a terminal call and runs
             # extension callbacks, neither of which may hold the lock. A deadline firing at the
             # same moment meets the single per-task transition and takes its outcome instead of
             # racing it.
-            for live in live_now:
+            for live, sealing in claimed:
                 try:
-                    await self._seal(live, forced="drained")
+                    await self._join_seal(live, sealing)
                 except Exception:  # noqa: BLE001 — recorded on the stream; drain the rest
                     # A *failed* seal, unlike a cancelled one, is not retried, so this drain is
                     # the last chance to release what the entry still holds. (Cancellation is a
@@ -1908,6 +2103,12 @@ class TaskStream:
         slot until its episode has been released and any stop it owes recorded, and the next
         task is not dispensed until then.
 
+        A pull the queue cannot answer displaces nothing. Whether another position exists is
+        settled *before* any slot is taken, so the call that finds the queue empty leaves every
+        live episode live: it is a question about the queue, and answering it may not end work
+        the agent is still entitled to finish (nor record a forced outcome against a position no
+        task was dispensed for).
+
         The tools it lists are the ones the endpoint actually serves, and the episode is checked
         against them before it is dispensed (see :meth:`_require_published_manifest`) — the
         framing an agent acts on and the surface it can call are the same contract or there is
@@ -1925,17 +2126,35 @@ class TaskStream:
         async with self._dispense_lock:
             async with self._lock:
                 self._require_open()
-                # Every entry that still owes something, not merely the ones no seal has claimed:
-                # a seal already running is one this dispense must *join*, not step over. It is
-                # still holding the slot this dispense wants — its episode and env are open until
-                # its release returns — and the stop an unheadlinable summary or a failed terminal
-                # owes is published at the end of that seal, after the row. Taking the next
-                # position while one is in flight serves the queue past an integrity failure the
-                # stream has already found and hands out a second episode against
-                # `max_in_flight=1`. Joining is not restarting: a claimed seal is awaited, and
+                # **Exhaustion first, before a slot is taken from anyone.** A pull is a request
+                # for a slot, and a slot is only worth taking if there is a task to put in it.
+                # Asking afterwards makes the one call whose whole purpose is to learn that the
+                # run is over into a forced terminal: the oldest unfinished episode is sealed and
+                # scored as an ordinary agent-driven loss, over an answer its agent was still
+                # free to submit and against a position no task was dispensed for. So a queue
+                # with nothing left answers here, with every live episode untouched — the answer
+                # is about the queue, and the caller's own open work is not part of it.
+                if self._next_position() is None:
+                    return None
+                # There is a task, so the slot is worth taking. Below capacity nothing is
+                # displaced; at capacity the OLDEST occupant is the one that gives way, so a
+                # dispensed task always lands exactly one row instead of being silently
+                # forgotten.
+                #
+                # A task whose seal is already running still occupies its slot: its episode and
+                # env are open until that seal's release returns, and the stop an unheadlinable
+                # summary or a failed terminal owes is published at the end of it, after the row.
+                # So it is counted here and *joined* rather than stepped over — taking a slot
+                # from under a running seal serves the queue past an integrity failure the stream
+                # has already found. Joining is not restarting: a claimed seal is awaited, and
                 # only one whose claim was handed back is retried (see :meth:`_seal`).
-                unsettled = [live for live in self._live.values() if not live.settled]
-            for live in unsettled:
+                live_now = sorted(
+                    (live for live in self._live.values() if not live.settled),
+                    key=lambda live: live.seq,
+                )
+                over_capacity = len(live_now) - self._max_in_flight + 1
+                abandoned = live_now[:over_capacity] if over_capacity > 0 else []
+            for live in abandoned:
                 try:
                     await self._seal(live, forced="drained")
                 except Exception:  # noqa: BLE001 — recorded on the stream; reported just below
@@ -1952,7 +2171,15 @@ class TaskStream:
                 self._require_open()
                 position = self._next_position()
                 if position is None:
-                    return None
+                    # Unreachable: this same lock found a position before any slot was
+                    # displaced, `_dispense_lock` keeps every other pull out of this body, and
+                    # nothing a seal does consumes a queue position. Loud rather than `None`,
+                    # because a `None` here would be this call reporting that no task is coming
+                    # *after* it has just drained one — the outcome the check above exists to
+                    # prevent, arrived at by a different route.
+                    raise RuntimeError(
+                        "this stream lost the queue position this pull had already found"
+                    )
                 ref = self._queue[position]
 
             # Everything below is outside the registry lock, and none of it has been exposed
@@ -1991,14 +2218,26 @@ class TaskStream:
                     if _must_propagate(exc, cancellation):
                         raise
                 raise
-            # Built and proved before the position is consumed and the episode registered: what
-            # the agent is handed is this object, and every field of it has to be one the
-            # endpoint can answer with (see :meth:`_deliverable_framing`). A refusal here is the
-            # same shape as a drifted manifest — the position is still owed, no row is due, the
-            # episode is released here, and the spans opened for it are dropped without
-            # finalizing: no task was dispensed, so there is no outcome to close them against.
+            # Both of these are refusals of the same shape as a drifted manifest — the position
+            # is still owed, no row is due, the episode is released here, and the spans opened
+            # for it are dropped without finalizing: no task was dispensed, so there is no
+            # outcome to close them against. Which is why the mint sits inside this guard too:
+            # it can refuse (see :meth:`_mint_lease`), and a refusal that skipped the close would
+            # leave an env and its MCP sessions held by an episode nobody has a handle on.
             try:
-                framing = self._deliverable_framing(ref, instructions, budget)
+                # Minted before the framing rather than with the entry, because above capacity 1
+                # the lease is a *field of the framing* and the proof below is a proof of the
+                # whole object: a lease attached after it would be the one field nothing checked,
+                # which is the hole that proof exists to close. Minting is not registering —
+                # nothing is keyed by this string until the entry is published under the lock
+                # below, and a dispense refused between here and there simply retires it, which
+                # is what `_issued` is for. Safe outside the registry lock because `get_task`
+                # holds `_dispense_lock` for its whole body and nothing else mints.
+                lease = self._mint_lease()
+                # Built and proved before the position is consumed and the episode registered:
+                # what the agent is handed is this object, and every field of it has to be one
+                # the endpoint can answer with (see :meth:`_deliverable_framing`).
+                framing = self._deliverable_framing(ref, instructions, budget, lease)
             except BaseException:
                 cancellation = _Cancellation()
                 try:
@@ -2024,7 +2263,10 @@ class TaskStream:
                     undispensed = episode
                 else:
                     live = _Live(
-                        lease=secrets.token_hex(16),
+                        # The lease the framing above was proved carrying: the string the agent
+                        # is handed and the key the registry routes its calls on are one value,
+                        # or a call would name a task no entry answers to.
+                        lease=lease,
                         seq=self._seq + 1,
                         position=position,
                         ref=ref,
@@ -2096,8 +2338,21 @@ class TaskStream:
                 raise RuntimeError("this stream is closed")
             return framing
 
-    async def dispatch(self, tool: str, arguments: Optional[Dict[str, Any]] = None) -> ToolResult:
-        """Route one native tool call to the live episode, sealing it when it terminates.
+    async def dispatch(
+        self,
+        tool: str,
+        arguments: Optional[Dict[str, Any]] = None,
+        *,
+        lease: Optional[str] = None,
+    ) -> ToolResult:
+        """Route one native tool call to the episode its lease names, sealing it when it
+        terminates.
+
+        Above capacity 1 the lease is required; it may be passed as a keyword or (as the wrapper
+        schemas advertise it) inside ``arguments``, and it is **stripped before the episode sees
+        the call** so the routing capability never enters the env's trajectory. Every refusal
+        below is a stream-level result, not an env step: a misrouted call costs no budget and is
+        recorded nowhere.
 
         An ordinary call returns the env's own response: that *is* the agent's observation, and
         nothing but the env can produce it. A terminating call returns only the fact that the task
@@ -2121,22 +2376,27 @@ class TaskStream:
         with the same bytes as a clean one. Only a call that leaves the task *live* still raises:
         there the exception is the env's own answer to a call the agent can make again, no
         different in kind from the env text an ordinary call returns, and no task has ended for
-        it to be a verdict about."""
-        async with self._lock:
-            live = next((it for it in self._live.values() if not it.sealed), None)
-        if live is None:
-            return ToolResult(
-                content=json.dumps(
-                    {"error": "no active task", "hint": f"call `{_GET_TASK_TOOL}` first"}
-                )
-            )
+        it to be a verdict about.
+
+        At capacity 1 there is no routing lease to find: the env's own schemas are advertised
+        verbatim, so a ``lease`` in ``arguments`` is the *env's* argument and is passed through
+        untouched. Reading it here would take an env's own parameter away from it and refuse the
+        call — with one slot the call is unambiguous, so nothing needs naming."""
+        args = dict(arguments or {})
+        if self._max_in_flight > 1:
+            lease = lease if lease is not None else args.get(_LEASE_ARG)
+            args.pop(_LEASE_ARG, None)
+        resolved = await self._resolve(tool, lease)
+        if isinstance(resolved, ToolResult):
+            return resolved
+        live = resolved
         # Outside the registry lock: the episode has its own lock, holding a stream-wide one
         # across an awaited env call would serialise the whole stream behind one tool, and the
         # deadline needs that lock to arbitrate — an env slow in a tool or in its finalizer must
         # not be able to spend the wall clock and still be recorded as an ordinary seal.
         cancellation = _Cancellation()
         try:
-            call = await live.episode.call(tool, dict(arguments or {}))
+            call = await live.episode.call(tool, args)
         except BaseException as exc:  # noqa: BLE001 — see below; never re-raised at the agent
             # An env can raise `CancelledError` like anything else, and one raised *by the env*
             # is not this caller's cancellation (see `_must_propagate`). Told apart here rather
@@ -2203,6 +2463,127 @@ class TaskStream:
         await self._seal_redacted(live)
         return ToolResult(content=_TASK_OVER)
 
+    # ----- routing -----
+
+    async def _resolve(self, tool: str, lease: Optional[Any]) -> Any:
+        """Find the episode a call belongs to, or refuse it.
+
+        A lease alone is not identity. At capacity above 1 every env tool is exposed at once, so
+        a worker holding a valid lease for one task could name a tool belonging to another env or
+        to no task at all. The registry therefore binds ``(lease, env, native tool)`` and checks
+        all three **before** the call can reach the episode, where an unknown tool would consume
+        a step of the budget and land in the trajectory.
+
+        At capacity 1 a lease is ignored outright rather than merely unnecessary: only one
+        episode can be live, so the call is unambiguous, and the word ``lease`` belongs to the
+        env there — the stream advertises no wrapper to put a routing one in.
+
+        A lease whose task is over is refused as *over*, whether its entry is still in the
+        registry or has been retired down to the lease (see :meth:`_retire_settled`). The two
+        answers are not interchangeable: ``unknown_lease`` says the stream never dispensed this,
+        which would be a lie about a task the agent really was given, and about a task the row
+        for it can be found under.
+
+        Over includes ended by the *stream*: an orderly shutdown claims every unsettled task's
+        seal in the critical section that closes the stream (see :meth:`aclose`), and the
+        deadline claims an expired one the same way, so a call arriving after either finds a task
+        that is over rather than a live episode. That is what keeps this refusal — which costs no
+        budget and writes no row — from being a scored row the record files under a closure the
+        agent earned.
+
+        **Over is read from the task, not from who holds its claim.** A seal that failed on the
+        storage hands its claim back so a later drain can retry the append (see
+        :meth:`_join_seal`), and an entry read through the claim reads as live again the moment
+        that happens — so the one task whose record has already failed becomes the one task a
+        late call is routed to, on an episode this stream force-terminated, composed a row for
+        and finalized every span of. During a shutdown that is a call accepted after the drain
+        claimed the task, on the one entry the drain's own claim-everything-first rule cannot
+        hold; outside one it is a second ending for a task already ended. It is also a *shape*
+        the agent could read the record's failure off: every other finished task answers a late
+        call with this refusal, and that one would answer with the terminating payload instead.
+        So the read is :attr:`_Live.ended`, which a hand-back does not clear — and no check of
+        ``_closed`` is needed beside it, because the drain claims every unsettled task in the
+        critical section that closes the stream, and claiming is what sets that bit."""
+        async with self._lock:
+            if self._max_in_flight == 1:
+                # One slot, so the call is unambiguous and the wire contract is unchanged. The
+                # entry that answers is one whose task has not been ended — a stricter test than
+                # an unheld claim, and the same one the lease branch below applies.
+                live = next((it for it in self._live.values() if not it.ended), None)
+                if live is None:
+                    return _stream_error(
+                        "no_active_task", f"no task is live; call `{_GET_TASK_TOOL}` first"
+                    )
+            elif lease is None:
+                return _stream_error(
+                    "missing_lease",
+                    f"this call needs the `{_LEASE_ARG}` that `{_GET_TASK_TOOL}` returned, so "
+                    "the stream knows which task it belongs to",
+                )
+            # Looked up once, and the entry that lookup found is the one used. `lease` is the
+            # caller's own object and only has to be a `str` to arrive, so a membership test
+            # followed by a subscript is two reads of a value nothing obliges to answer the same
+            # way twice: the test passes, the subscript raises `KeyError`, and it raises where
+            # nothing catches it — out of `dispatch`, dropping a call the agent made while its
+            # task stays live for the drain to end and record as one the agent played and lost.
+            # An unearned wrong answer, from a routing key. This is the read that was checked
+            # (see :meth:`_require_framable` for the same rule about a spec's own values).
+            elif (found := self._live.get(lease) if isinstance(lease, str) else None) is None:
+                # A second read, and deliberately not the same hazard: it decides only which of
+                # two refusals this is. Both cost no budget, enter no trajectory and write no
+                # row, so a value that answers differently here mislabels a refusal rather than
+                # standing in for an outcome.
+                if isinstance(lease, str) and lease in self._settled_leases:
+                    return _stream_error(
+                        "sealed_lease",
+                        f"that task is over; call `{_GET_TASK_TOOL}` for the next one",
+                    )
+                return _stream_error("unknown_lease", "no task was dispensed under this lease")
+            else:
+                live = found
+                if live.ended:
+                    return _stream_error(
+                        "sealed_lease",
+                        f"that task is over; call `{_GET_TASK_TOOL}` for the next one",
+                    )
+            if tool not in self._advertised_names(live.ref.env):
+                # Either a tool of a different env, or one this task never advertised. Both are
+                # the same failure: a lease that is valid but denotes the wrong thing.
+                if any(tool in self._advertised_names(name) for name in self._advertised):
+                    return _stream_error(
+                        "wrong_env",
+                        f"tool {tool!r} belongs to another env; this lease names a "
+                        f"{live.ref.env!r} task",
+                    )
+                return _stream_error(
+                    "tool_not_in_task", f"tool {tool!r} is not advertised by this task"
+                )
+            return live
+
+    def _advertised_names(self, env_name: str) -> frozenset:
+        return frozenset(m.name for m in self._advertised[env_name])
+
+    def _mint_lease(self) -> str:
+        """An opaque, unguessable lease that is never reused.
+
+        **Bounded.** Redrawing until the value is fresh is the right loop and the wrong shape to
+        leave unbounded: it is synchronous, so a source that cannot produce a fresh value spins
+        inside the dispense lock with the event loop held — no task, no error, no deadline able
+        to fire, and nothing for a harness to read. A run that cannot name its next task has to
+        say so, and this is the only place that can. With a 128-bit CSPRNG and a set the size of
+        a queue, one repeat is already beyond reach, so a whole run of them is not a collision:
+        it is the source, and no further draw is going to fix it."""
+        for _ in range(_LEASE_MINT_ATTEMPTS):
+            lease = secrets.token_hex(16)
+            if lease not in self._issued:
+                self._issued.add(lease)
+                return lease
+        raise RuntimeError(
+            f"this stream could not mint a lease no task has used: {_LEASE_MINT_ATTEMPTS} "
+            "draws from `secrets.token_hex` all came back as values this run has already "
+            "issued, so the source is not producing fresh ones"
+        )
+
     # ----- the deadline -----
 
     def _start_watchdog(self) -> None:
@@ -2221,6 +2602,24 @@ class TaskStream:
         matters most — something is taking too long *right now* — is the one case this could
         never see.
 
+        **Every expired task is claimed before any of them is waited on.** With more than one
+        episode live, sealing is not a step this can take one task at a time: a seal drives the
+        env's terminal, waits on its finalizer and runs every extension, any of which may block
+        for as long as it likes. Claiming inside that loop would leave the tasks after the
+        blocked one expired but unclaimed, and an unclaimed task is one :meth:`_resolve` still
+        routes calls to — so an agent could earn a scored, ``sealed`` row on a task whose clock
+        ran out, for exactly as long as some *other* task's env took to let go. So the claims are
+        taken in the same critical section that finds them (see :meth:`_claim_seal`), which no
+        await can split, and only the waiting happens afterwards.
+
+        For the same reason the waiting does not happen *here*. A join is handed to its own task
+        and the loop goes back to its clock, because a blocked seal must not stop the deadline
+        being enforced on the episodes dispensed after it either — at capacity 1 a stuck seal
+        blocks the next pull as well, so there is nothing left to time; above 1 the queue keeps
+        moving, and a watch that stalled would leave every later task unclocked. Each task's
+        deadline fires once, ``timed_out`` being the record of that: a seal that failed hands its
+        claim back for the *drain* to retry, and a retry is not something a wall clock is owed.
+
         **A seal this cannot complete ends the watch, and is the stream's failure rather than
         this task's.** :meth:`_seal` has already recorded the stop, so the run is reported the
         way every other integrity failure is: by :meth:`aclose`, and by :attr:`stopped` before
@@ -2234,23 +2633,41 @@ class TaskStream:
         The fallback ``_stop`` is belt and braces for a future edit that raises without recording
         one — the first cause wins, so it is a no-op on every path that exists today."""
         tick = max(0.005, min(0.25, deadline / 10))
-        while True:
-            await asyncio.sleep(tick)
-            async with self._lock:
-                if self._closed:
-                    return
-                now = time.monotonic()
-                expired = [
-                    live
-                    for live in self._live.values()
-                    if not live.sealed and now - live.started >= deadline
+        joining: Set["asyncio.Task[ResultRow]"] = set()
+        timed_out: Set[str] = set()
+        try:
+            while True:
+                await asyncio.sleep(tick)
+                async with self._lock:
+                    if self._closed:
+                        return
+                    now = time.monotonic()
+                    for live in list(self._live.values()):
+                        if live.sealed or live.lease in timed_out:
+                            continue
+                        if now - live.started < deadline:
+                            continue
+                        timed_out.add(live.lease)
+                        joining.add(
+                            asyncio.ensure_future(
+                                self._join_seal(live, self._claim_seal(live, "timeout"))
+                            )
+                        )
+                finished = {join for join in joining if join.done()}
+                joining -= finished
+                # Every one of them is read before any of them is acted on: leaving a finished
+                # join un-inspected is asyncio's unretrieved-exception warning, and the loop
+                # below leaves on the first failure it finds.
+                failures = [
+                    exc
+                    for join in finished
+                    if not join.cancelled()
+                    for exc in [join.exception()]
+                    if exc is not None and not isinstance(exc, asyncio.CancelledError)
                 ]
-            for live in expired:
-                try:
-                    await self._seal(live, forced="timeout")
-                except Exception as exc:  # noqa: BLE001 — recorded, not raised at nobody
+                if failures:
                     self._stop(
-                        exc,
+                        failures[0],  # the first loss is the one that explains the run
                         dispensing=(
                             "this stream stopped: a dispensed task could not be sealed when "
                             "its deadline elapsed, so the run's record is missing an outcome"
@@ -2261,6 +2678,13 @@ class TaskStream:
                         ),
                     )
                     return
+        finally:
+            # The seals themselves are shielded and unaffected; what is dropped here is only
+            # this task's interest in them. Whatever is still owed is owed to the drain, which
+            # joins every unsettled entry and reports what these would have.
+            for join in joining:
+                join.cancel()
+            await asyncio.gather(*joining, return_exceptions=True)
 
     # ----- sealing -----
 
@@ -2333,17 +2757,58 @@ class TaskStream:
         was going to write is lost, and every further task would be served over that hole. So
         does a row that landed but cannot be *summarized*: a ``success``/``reward`` that is
         wrong-typed, or published twice, is a property of the env rather than of the task, so it
-        would recur for the whole queue."""
+        would recur for the whole queue.
+
+        Claiming and joining are separable, and the deadline and the drain both separate them
+        (see :meth:`_claim_seal`, :meth:`_watch_deadlines` and :meth:`aclose`): a caller that has
+        several tasks to end must be able to take every claim before it waits on any of them.
+        This method is the pair for a caller that has exactly one."""
         async with self._lock:
-            sealing = live.sealing
-            if sealing is None:
-                sealing = live.sealing = asyncio.ensure_future(self._run_seal(live, forced))
-                live.sealed = True
-                # Bookkeeping only: a seal that fails while its caller is being cancelled has no
-                # awaiter at that instant, and asyncio would log it as unretrieved (see
-                # `_mark_retrieved`). The failure itself is still reported the usual way, by the
-                # next caller to join this same task.
-                sealing.add_done_callback(_mark_retrieved)
+            sealing = self._claim_seal(live, forced)
+        return await self._join_seal(live, sealing)
+
+    def _claim_seal(
+        self, live: _Live, forced: Optional[Closure]
+    ) -> "asyncio.Task[ResultRow]":
+        """Take this task's one seal, or hand back the claim someone else already holds.
+
+        **Synchronous, and called with the registry lock held**, which is what makes it usable
+        for more than one task at a time: the scan that decides a task must be sealed and the
+        claim that stops anyone else acting on it happen in the same critical section, with no
+        await between them. A claimant with several tasks to end therefore takes every claim
+        first and waits afterwards, so one task's seal — which drives an env terminal, an env
+        finalizer and every extension, and may block on any of them — cannot leave another's
+        unclaimed and still answerable (see :meth:`_watch_deadlines` for the deadline's use of
+        this and :meth:`aclose` for the drain's).
+
+        It also records that this task has been *ended*, which the claim itself cannot say: the
+        claim is handed back when a seal fails, and what has already happened by then — the
+        forced terminal, the composed row, every span's ``finalize`` — has not been undone. That
+        bit never clears, and it is what :meth:`_resolve` refuses a late call on."""
+        sealing = live.sealing
+        if sealing is None:
+            sealing = live.sealing = asyncio.ensure_future(self._run_seal(live, forced))
+            live.sealed = True
+            live.ended = True
+            # Bookkeeping only: a seal that fails while its caller is being cancelled has no
+            # awaiter at that instant, and asyncio would log it as unretrieved (see
+            # `_mark_retrieved`). The failure itself is still reported the usual way, by the
+            # next caller to join this same task.
+            sealing.add_done_callback(_mark_retrieved)
+        return sealing
+
+    async def _join_seal(
+        self, live: _Live, sealing: "asyncio.Task[ResultRow]"
+    ) -> ResultRow:
+        """Wait on a claimed seal without being able to disturb it, and answer for it if it
+        failed: hand the claim back so a later drain retries the append, and stop the stream.
+
+        What goes back is the *claim* and nothing else. This task has been ended — its episode
+        force-terminated, its row composed, its spans finalized — and no retry undoes any of
+        that, so :attr:`_Live.ended` stays set and a call naming it is still refused as over.
+
+        Split from :meth:`_claim_seal` so the two can happen at different moments; joining is
+        what may block, and nothing here holds the registry lock while it does."""
         try:
             return await asyncio.shield(sealing)
         except BaseException:
@@ -2397,6 +2862,32 @@ class TaskStream:
             releasing = live.releasing = asyncio.ensure_future(_close_episode(live))
         await asyncio.shield(releasing)
 
+    def _retire_settled(self, live: _Live) -> None:
+        """Drop a finished task's entry from the registry, keeping only its lease.
+
+        What the entry held was an episode — its env, its MCP sessions, the task payload, the
+        trajectory and every tool result in it, the provenance spans and what they observed —
+        and none of that is answerable to anyone once the seal's tail has run. The row is already
+        in ``results.jsonl`` and on :attr:`results`; the episode is closed. Keeping the entry for
+        the sake of the one answer still owed would make a run's memory grow with every task it
+        had already finished, which is what :meth:`_run_seal` retires it to avoid.
+
+        The one answer still owed is that a call naming this lease is naming a task that is over
+        rather than one that never existed (see :meth:`_resolve`), and that needs the lease
+        string alone. Everything else a settled entry was ever asked is a constant for it: it is
+        sealed, it is released, and it is settled, so it counts toward no capacity, is drained by
+        nobody, and is never the episode a capacity-one call resolves to. An absent entry answers
+        all three the same way the entry did.
+
+        **Synchronous on purpose.** It runs from :meth:`_run_seal`'s ``finally``, where a
+        cancellation may already be pending, so it may not be allowed to await — a retirement
+        that could be skipped there would leave exactly the entry it exists to remove. Taking the
+        registry lock is what it would have to await for, and it does not need to: every scan of
+        the registry is itself synchronous from its first read to its last, so two statements
+        with no await between them cannot land in the middle of one."""
+        self._live.pop(live.lease, None)
+        self._settled_leases.add(live.lease)
+
     async def _run_seal(self, live: _Live, forced: Optional[Closure]) -> ResultRow:
         """The claimed seal: end the episode, classify, finalize the spans, record the row.
 
@@ -2420,42 +2911,57 @@ class TaskStream:
         row buys is that the extensions are not asked to produce their side effects a second time
         for a row that may never land.
 
-        **The entry stays in the registry until this whole task is over**, not until its row is
-        durable. The append is the middle of the seal: the episode is still open behind it, and
-        the stop an unheadlinable summary or a failed terminal owes is recorded after the release
-        and not before it. An entry taken out of the registry at the append is a seal nobody can
-        find and nobody can join — the drain thinks it has drained everything and returns while
-        an episode is still releasing, and the next dispense takes a queue slot over a stop that
-        has not been published yet, which is the whole point of stopping. So the entry is let go
-        in the ``finally`` below, once there is nothing left for a joiner to wait for."""
-        row = live.pending_row
-        if row is None:
-            row = live.pending_row = await self._compose_row(live, forced)
-        async with self._lock:
-            # Durable before the row counts anywhere else. `reconcile` reads a missing result as
-            # a crash, so a row that only reached the page cache would turn a sealed, scored task
-            # into a `broker_abort` after a host crash — an outcome the agent earned, reported as
-            # an infrastructure failure. Everything in here is synchronous, so no cancellation
-            # point can split the write from the claim it makes.
-            _append_jsonl(self.results_path, row.to_wire(), durable=True)
-            # What the run keeps is the row *the file now holds*, re-read from its own wire form.
-            # That is the canonical snapshot every reader is shown a copy of (see :attr:`results`),
-            # and taking it here is what makes those copies cheap and certain: they copy plain
-            # data, run no env code, and cannot disagree with the record. Held any other way this
-            # list would carry the env's own objects — the feedback values it published, the one
-            # list that `observed` and `score.feedback` both are, and whatever an extension put on
-            # `extensions` — and every view of it would be a handle on them.
-            #
-            # It cannot fail here, and that is why it is here rather than a step earlier: the
-            # append above just serialised these exact values, with the same encoder and the same
-            # `allow_nan`, so a normalization that ran before the write could suppress a row this
-            # run has already committed to. After it, there is nothing left to find out.
-            recorded = _recorded_row(row)
-            live.row = recorded
-            live.pending_row = None
-            self._results.append(recorded)
-            self._done_positions.add(live.position)
+        **The registry entry outlives the append**, which is the middle of the seal and not its
+        end: the episode is still open behind the row, and the stop an unheadlinable summary or a
+        failed terminal owes is recorded after the release, not before it. An entry that stopped
+        being findable there would be a seal nobody can join — the drain would think it had
+        drained everything and return while an episode was still releasing, and the next dispense
+        would take a slot over a stop that has not been published yet, which is the whole point of
+        stopping. What a caller joins is therefore the claim, and :attr:`_Live.settled` is how the
+        rest of the stream tells a finished seal from one still in its tail.
+
+        **It does not outlive the seal.** Once the tail has run there is nothing left to join,
+        nothing left to release and no stop left to publish, and the only thing anyone can still
+        ask about this task is whether its lease was real — which is a question about the lease
+        and not about the episode behind it. So the entry is retired here and the lease alone is
+        kept (see :meth:`_retire_settled`); holding the entry instead would keep a finished
+        episode's env, trajectory, tool output, spans and session objects reachable for the
+        length of the run, growing a long queue's memory by every task it has already scored."""
         try:
+            row = live.pending_row
+            if row is None:
+                row = live.pending_row = await self._compose_row(live, forced)
+            async with self._lock:
+                # Durable before the row counts anywhere else. `reconcile` reads a missing result
+                # as a crash, so a row that only reached the page cache would turn a sealed,
+                # scored task into a `broker_abort` after a host crash — an outcome the agent
+                # earned, reported as an infrastructure failure. Everything in here is
+                # synchronous, so no cancellation point can split the write from the claim it
+                # makes.
+                _append_jsonl(self.results_path, row.to_wire(), durable=True)
+                # What the run keeps is the row *the file now holds*, re-read from its own wire
+                # form. That is the canonical snapshot every reader is shown a copy of (see
+                # :attr:`results`), and taking it here is what makes those copies cheap and
+                # certain: they copy plain data, run no env code, and cannot disagree with the
+                # record. Held any other way this list would carry the env's own objects — the
+                # feedback values it published, the one list that `observed` and `score.feedback`
+                # both are, and whatever an extension put on `extensions` — and every view of it
+                # would be a handle on them.
+                #
+                # It cannot fail here, and that is why it is here rather than a step earlier: the
+                # append above just serialised these exact values, with the same encoder and the
+                # same `allow_nan`, so a normalization that ran before the write could suppress a
+                # row this run has already committed to. After it, there is nothing left to find
+                # out.
+                recorded = _recorded_row(row)
+                live.row = recorded
+                live.pending_row = None
+                self._results.append(recorded)
+                self._done_positions.add(live.position)
+                # The entry stays in the registry through the tail below: the seal is not over at
+                # the append, and a dispense or a drain that means to join it has to be able to
+                # find it (see :attr:`_Live.settled`). It is retired in the `finally`, once there
+                # is nothing left for anyone to find it for.
             # The row is committed and fsync'd; letting the episode go is best-effort, and it is
             # the same release a drain would run for an entry whose seal failed (see
             # :meth:`_release`), so whichever gets there first is the only one that runs.
@@ -2485,8 +2991,8 @@ class TaskStream:
                         "no outcome and no further task could be scored either"
                     ),
                     closing=(
-                        f"this stream stopped before its queue was served: env {live.ref.env!r} "
-                        f"failed while the stream ended a task ({rendered})"
+                        f"this stream stopped before its queue was served: env "
+                        f"{live.ref.env!r} failed while the stream ended a task ({rendered})"
                     ),
                 )
             if live.summary_error is not None:
@@ -2502,25 +3008,23 @@ class TaskStream:
                     live.summary_error,
                     dispensing=(
                         f"this stream stopped: env {live.ref.env!r} published a summary value "
-                        f"this record cannot headline ({live.summary_error}), so no further task "
-                        "can be scored against it"
+                        f"this record cannot headline ({live.summary_error}), so no further "
+                        "task can be scored against it"
                     ),
                     closing=(
-                        f"this stream stopped before its queue was served: env {live.ref.env!r} "
-                        f"published a summary value this record cannot headline "
-                        f"({live.summary_error})"
+                        f"this stream stopped before its queue was served: env "
+                        f"{live.ref.env!r} published a summary value this record cannot "
+                        f"headline ({live.summary_error})"
                     ),
                 )
                 raise live.summary_error
             # The recorded snapshot, so one seal produces one row wherever it is read from.
             return recorded
         finally:
-            # Reached only past the append, so this lets go of exactly the entries the pop above
-            # used to: one whose row is durable. A seal that failed before the append, or one its
-            # owner cancelled there, never gets here — those entries are still owed a row and
-            # stay in the registry for the drain that retries them.
-            async with self._lock:
-                self._live.pop(live.lease, None)
+            # Only a task whose row is durable is finished with; one whose append failed keeps
+            # its entry, because the claim is handed back and a later drain retries the write.
+            if live.row is not None:
+                self._retire_settled(live)
 
     async def _compose_row(self, live: _Live, forced: Optional[Closure]) -> ResultRow:
         """Everything a seal does exactly once: end the episode, read its verdict, classify it,
@@ -3119,6 +3623,99 @@ def _mark_retrieved(task: "asyncio.Future[Any]") -> None:
         task.exception()
 
 
+def _stream_error(code: str, message: str) -> ToolResult:
+    """A refusal by the stream, not a step in an env. It consumes no budget, enters no
+    trajectory, and is never scored."""
+    return ToolResult(
+        content=json.dumps({"error": code, "message": message, "stream_error": True})
+    )
+
+
+def _leased_manifest(manifest: ToolManifest) -> ToolManifest:
+    """The same tool, advertised with the required ``lease`` that names its episode.
+
+    The env's schema is closed (``additionalProperties: false``), so the argument has to be part
+    of the published schema — and the stream strips it again before the episode sees the call,
+    or the routing capability would be recorded as part of the agent's action.
+
+    **Only a schema this addition is provably sound for is wrapped.** Adding a name to root
+    ``properties``/``required`` says what it means for a plain root object schema and for nothing
+    else, while the *episode* keeps enforcing the env's own schema — so a shape this rewrite
+    changes the meaning of leaves the endpoint advertising one contract and the seal enforcing
+    another, which is an unearned result with an ordinary closure on it. A valid ``$ref``-rooted
+    schema is the reachable case: the referenced object carries the native arguments and its own
+    ``additionalProperties: false``, and a ``$ref`` sibling is either ignored — advertising a tool
+    whose only permitted argument is the lease, so the one call a strict client can make seals as
+    a clean wrong answer — or applied beside it, refusing the lease the root now requires and
+    leaving the task impossible to finish.
+
+    So the root is checked against an allow-list of keywords whose meaning the addition is known
+    to preserve (see :data:`_WRAPPABLE_ROOT_KEYWORDS`), and anything else is refused *here* — at
+    construction, before an env is opened or a position is spent — in the same shape
+    :func:`_frozen_manifest` refuses a contract this endpoint cannot send. Transforming the whole
+    schema instead would mean re-deriving an arbitrary author's semantics into a different
+    document and hoping the two agree; a refusal is a statement the maintainer can act on, and
+    the only thing it costs is capacity: at ``max_in_flight == 1`` nothing is wrapped and every
+    one of these schemas is served exactly as the env wrote it.
+
+    The refusal is loud about which keywords it could not carry, because that is what an env
+    author has to change. It is not a claim that the schema is invalid.
+
+    Read once and checked on the copy that is wrapped: the manifest reaching this point is
+    already this stream's own plain data (see :func:`_frozen_manifest`), and checking the value
+    that is then rewritten keeps it that way regardless of who else calls this."""
+    schema = copy.deepcopy(manifest.input_schema)
+    if not isinstance(schema, dict):  # pragma: no cover - manifests are objects
+        raise ValueError(f"tool {manifest.name!r} has no object schema to wrap")
+    unprovable = sorted(name for name in schema if name not in _WRAPPABLE_ROOT_KEYWORDS)
+    if unprovable:
+        raise ValueError(
+            f"tool {manifest.name!r} has a schema the stream's {_LEASE_ARG!r} argument cannot be "
+            f"wrapped around: its root carries {unprovable}, and adding a property beside "
+            "any of those changes what the schema means rather than extending it. Serve this env "
+            "at max_in_flight=1, where its schema is advertised exactly as written, or publish "
+            "the tool's arguments as a plain root object schema"
+        )
+    if schema.get("type") != "object":
+        raise ValueError(
+            f"tool {manifest.name!r} has a schema the stream's {_LEASE_ARG!r} argument cannot be "
+            f"wrapped around: its root is {schema.get('type')!r}, not an object, so it does not "
+            "say that this tool takes named arguments a lease could be added to. Serve this env "
+            "at max_in_flight=1, where its schema is advertised exactly as written, or publish "
+            "the tool's arguments as a plain root object schema"
+        )
+    native_properties = schema.get("properties")
+    native_required = schema.get("required")
+    if not (native_properties is None or isinstance(native_properties, dict)) or not (
+        native_required is None or isinstance(native_required, list)
+    ):
+        # Both are read *and rewritten* here, so a value of another type is not something a
+        # lease can be added to: `[*"answer", _LEASE_ARG]` would publish a tool requiring six
+        # single-letter arguments and a lease, and `dict("answer")` would raise from inside a
+        # constructor that has envs open.
+        raise ValueError(
+            f"tool {manifest.name!r} has a schema the stream's {_LEASE_ARG!r} argument cannot be "
+            "wrapped around: its root `properties` must be an object and its `required` an "
+            "array, and the lease is added to both"
+        )
+    properties = dict(native_properties or {})
+    if _LEASE_ARG in properties or _LEASE_ARG in (native_required or []):
+        # Named in either place, because either is the env spending the word on an argument of
+        # its own: one the stream would strip out of every call, and whose name it cannot
+        # advertise twice.
+        raise ValueError(
+            f"tool {manifest.name!r} already takes an argument named {_LEASE_ARG!r}, which the "
+            "stream needs to name the episode a call belongs to"
+        )
+    properties[_LEASE_ARG] = {
+        "type": "string",
+        "description": "The lease `get_task` returned for the task this call belongs to.",
+    }
+    schema["properties"] = properties
+    schema["required"] = [*(native_required or []), _LEASE_ARG]
+    return manifest.model_copy(update={"input_schema": schema})
+
+
 def _strict_json_value(value: Any, enclosing: Tuple[int, ...]) -> Any:
     """One value on its way onto a row, **read exactly once** and rebuilt in plain containers,
     with every object name checked to be exact text.
@@ -3342,8 +3939,10 @@ def build_stream_server(stream: TaskStream, *, name: Optional[str] = None) -> Fa
         """Take the next task off the queue and start it.
 
         Returns the task framing — ``{env, instructions, budget, tools}`` — and never the task
-        index or the target. Returns ``{"done": true}`` once the queue is empty. Work the task
-        with the native tools it lists; they route to it automatically."""
+        index or the target. Returns ``{"done": true}`` once the queue is empty; any task
+        already dispensed to you is still yours to finish, and ``in_flight`` says how many of
+        them there are. Work the task with the native tools it lists; they route to it
+        automatically."""
         try:
             dispensed = await stream.get_task()
         except Exception:  # noqa: BLE001 — a stopped stream is the harness's business
@@ -3357,20 +3956,28 @@ def build_stream_server(stream: TaskStream, *, name: Optional[str] = None) -> Fa
                 raise
             dispensed = None
         if dispensed is None:
-            # Composed, not relayed from `queue_info`. A stopped stream gets this same answer
-            # and its queue is *not* empty, so passing the live counts through would have it
-            # say `done: true` beside a non-zero `remaining` — the two halves of one response
-            # contradicting each other, and the integrity failure this redaction keeps off the
-            # call written out in a field. The counts a queue's *state* would vary are therefore
-            # what the answer itself promises, and it promises the same thing either way: no
-            # further task is coming, and nothing of this caller's is still open. `consumed` is
-            # the only number that moves, and it is a count of the tasks the caller itself
-            # played — the one residue no answer here could hide from it.
+            # `done` is a statement about the QUEUE — no further task is coming — and about
+            # nothing else. `remaining` is composed rather than relayed, because a stopped
+            # stream gets this same answer and its queue is *not* empty: passing that count
+            # through would say `done: true` beside a non-zero `remaining`, the two halves of
+            # one response contradicting each other and the integrity failure this redaction
+            # keeps off the call written out in a field. Both cases promise the identical thing,
+            # which is what makes them indistinguishable here.
+            #
+            # `in_flight` is reported as it stands, and is not part of that promise. It counts
+            # the caller's OWN open episodes — tasks it was handed and has not ended — so
+            # claiming zero beside a live lease is not a redaction but a false statement about
+            # the caller's own work: a worker that believes it stops, and the task it was still
+            # entitled to answer lands as a forced loss at the drain. It reveals nothing a stop
+            # would: a stop seals nothing by itself, and `queue_info` already answers this same
+            # count on demand. `consumed` moves for the same reason — a count of the tasks the
+            # caller itself played is the one residue no answer here could hide from it.
+            info = stream.queue_info()
             return {
                 "done": True,
                 "remaining": 0,
-                "consumed": stream.queue_info().consumed,
-                "in_flight": 0,
+                "consumed": info.consumed,
+                "in_flight": info.in_flight,
             }
         return dispensed.to_wire()
 
