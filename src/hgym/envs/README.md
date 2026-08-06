@@ -101,13 +101,9 @@ offline.
 | `frontier_bench` | A faithful hgym port of [Frontier-Bench](https://github.com/harbor-framework/frontier-bench) — operate a per-task Docker container through a shell (`exec` / `read_file` / `write_file` / `done`), scored by the task's own verifier over the container end-state. A CPU-only, single-container slice (5 tasks). Needs the `frontier_bench` extra + a local Docker daemon (no key or data download). | [`frontier_bench/README.md`](frontier_bench/README.md) |
 
 Runnable end-to-end demos (Claude Code drives a served env; hgym scores off the trace) live
-under [`examples/`](../../../examples/): [`wordle`](../../../examples/wordle/claude_code/README.md),
-[`tau2`](../../../examples/tau2/claude_code/README.md),
-[`yc_bench`](../../../examples/yc_bench/claude_code/README.md),
-[`hle`](../../../examples/hle/claude_code/README.md),
-[`browsecomp_plus`](../../../examples/browsecomp_plus/claude_code/README.md),
-[`automationbench`](../../../examples/automationbench/claude_code/README.md),
-and [`frontier_bench`](../../../examples/frontier_bench/claude_code/README.md).
+under [`examples/quickstarts/`](../../../examples/quickstarts/), one per harness. Each serves a
+whole queue over a single MCP endpoint, and the environment it serves is one variable at the top
+of its `serve.py` — so every env listed above runs from any of them.
 
 ## Adding an env: the README template
 

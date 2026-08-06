@@ -13,7 +13,7 @@ surface with both a model judge *and* deterministic retrieval metrics.
 Like every hgym env this **describes** a task, **serves** its tools over MCP, and **verifies** a
 recorded trajectory while an external harness drives the tools — see
 [`../README.md`](../README.md). The runnable demo is
-[`examples/browsecomp_plus/claude_code/`](../../../../examples/browsecomp_plus/claude_code/).
+[`examples/quickstarts/`](../../../../examples/quickstarts/).
 
 ## Running it
 
@@ -54,12 +54,18 @@ reads the score off the trace via `hgym.result_from_trace(...)`.
 `judge_base_url` (the default judge's model + endpoint), `k` / `snippet_max_tokens` (retrieval
 knobs; upstream defaults 5 / 512), and `max_turns` (the tool-call horizon).
 
-### Claude Code example
+### Quickstart
 
-```bash
-export OPENAI_API_KEY=sk-...
-uv run python examples/browsecomp_plus/claude_code/run.py --task 0 --transcript
+Any quickstart under [`examples/quickstarts/`](../../../../examples/quickstarts/) serves this env: one MCP endpoint
+hands out a queue of tasks and scores each one server-side. Point it here with the single
+variable at the top of its `serve.py`:
+
+```python
+ENV = "browsecomp_plus"
 ```
+
+The default judge is model-graded, so this needs `OPENAI_API_KEY` set in the environment
+the server runs in.
 
 ## Requirements
 
