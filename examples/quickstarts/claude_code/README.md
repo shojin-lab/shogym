@@ -158,5 +158,5 @@ task is recorded unscored), `max_in_flight=` serves several tasks concurrently, 
 ## The other quickstarts
 
 `examples/quickstarts/` holds one directory per harness, each idiomatic to that harness rather
-than squeezed into a shared abstraction. `codex/`, `pi/` and `hermes/` follow this one and
-demonstrate the same three moves in their own idiom.
+than squeezed into a shared abstraction. [`codex/`](../codex/README.md), `pi/` and `hermes/`
+follow this one and demonstrate the same three moves in their own idiom.
