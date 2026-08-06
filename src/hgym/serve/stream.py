@@ -357,10 +357,11 @@ _TASK_OVER = json.dumps({**_TASK_OVER_FIELDS})
 _FEEDBACK_MEMBER = "feedback"
 
 # The whole response under a revealing policy that revealed nothing — an env that published no
-# episode-level feedback, a policy holding this task's back, a seal that recorded no row, or a
-# policy that could not answer at all. Serialized at import for the reason `_TASK_OVER` is: under
-# a revealing policy this member is always present, so an empty list and a missing key are never
-# the same answer, and every reason for an empty one is the same bytes. A stream whose record
+# episode-level feedback, a policy holding this task's back, a seal that recorded no row, a policy
+# that could not answer at all, or a call that reached the episode after it was already over and
+# so ended nothing (see `_tombstone_answer`). Serialized at import for the reason `_TASK_OVER` is:
+# under a revealing policy this member is always present, so an empty list and a missing key are
+# never the same answer, and every reason for an empty one is the same bytes. A stream whose record
 # already lost a row may not be the one stream whose terminal answers in a different shape.
 _TASK_OVER_SILENT = json.dumps({**_TASK_OVER_FIELDS, _FEEDBACK_MEMBER: []})
 
@@ -1963,12 +1964,11 @@ class TaskStream:
         # refusal: one that raises puts it back (see `_release_claim`).
         self._displaced: Optional[Dict[str, Any]] = None
         self._made_prov_dir = False
-        # Checked here, ahead of the catalog: it is a statement about the arguments, and refusing
-        # before a factory is called costs no env the caller would then have to see closed. The
-        # claim is taken in the same breath and for the same reason — it is the cheapest refusal
-        # this constructor has, and it is the one that has to happen before a *second* stream
-        # could pass the check above.
-        self._require_fresh_provenance(resume)
+        # Taken here, ahead of the catalog: it is the cheapest refusal this constructor has, and
+        # refusing before a factory is called costs no env the caller would then have to see
+        # closed. Ownership is one call and not two — what the directory already holds is checked
+        # inside the same exclusion that installs the claim, because an answer read outside it
+        # authorises nothing (see `_claim_provenance` and `_require_fresh_provenance`).
         self._claim_provenance(resume)
 
         # One long-lived env per env name, used only to read the published contract (it never
@@ -2223,8 +2223,20 @@ class TaskStream:
         Two streams constructed against the same *empty* directory both pass it, because at the
         moment each one looks there is nothing to find — and then both serve, and the record ends
         up holding two runs' rows under one set of positions, in both regimes, with no stop
-        anywhere. What closes that is :meth:`_claim_provenance`, which follows immediately and
-        turns "nobody has recorded here" into "nobody else is serving here"."""
+        anywhere. What closes that is :meth:`_claim_provenance`, which turns "nobody has recorded
+        here" into "nobody else is serving here".
+
+        **Which is why this runs inside that claim's critical section, and nowhere else. Callers
+        hold :func:`_locked`.** An answer read outside the exclusion is a statement about a moment
+        the claim does not cover, and the gap is wide enough for a whole other run: one that
+        begins, seals and *releases* its claim inside it leaves a directory that holds records and
+        is owned by nobody, so the paused constructor finds no claim to lose to and installs its
+        own over a complete record. That was reproducible from the public API — an ``immediate``
+        row and a ``never`` row for queue position 0, both ``seq`` 1, both streams closing
+        normally. A check that does not hold its exclusion across the write it authorises
+        authorises nothing, which is the rule :meth:`_append_owned` keeps for every append and the
+        reason this is not also called before the lock: a second, cheaper answer to this question
+        is one a later edit could mistake for the one that decides."""
         if resume:
             return
         recorded = [
@@ -2290,17 +2302,30 @@ class TaskStream:
         are ordered against each other rather than interleaved, whichever wins. What the loser of
         that ordering gets is a refusal at its next append and never a second row.
 
+        **A fresh claim is refused by the *record* inside this same section.** A claim file and a
+        record are the two halves of "nobody else is serving here", and only one of them survives
+        a run that ends: a stream that closed in an orderly way removed its claim and left its
+        rows. So the freshness refusal happens here, immediately before the create, rather than
+        as a separate statement before the lock — see :meth:`_require_fresh_provenance` for the
+        run that fits in the gap when it does not.
+
         **A claim carries the regime because the records may not have one yet.** A run killed
         between its claim and its first dispense leaves a directory with nothing in it to compare
         against, so :meth:`_require_regime_matches` — which reads records — has nothing to say,
         and a resume under the other posture would be waved through onto an empty file. The claim
         is the record of the regime that exists before any record does.
 
-        **The replay this constructor seeds afterwards needs no lock of its own.** It reads the
-        record once the claim is held, and by then no other stream can add to it: every append
-        re-reads this claim inside the same exclusion and refuses if it is not the appender's. So
-        the record a resume reads is the complete record of everything written before it — the
-        one property seeding a ``seq``, a lease set and a done-position set depends on."""
+        **The replay this constructor seeds afterwards needs no lock of its own**, and it is the
+        fresh path's ordering the right way round: a resume reads the record *after* taking the
+        claim, never before. By then no other stream can add to it, because every append re-reads
+        this claim inside the same exclusion and refuses if it is not the appender's. So the
+        record a resume reads is the complete record of everything written before it — the one
+        property seeding a ``seq``, a lease set and a done-position set depends on, and the one
+        :meth:`_require_regime_matches` needs to be reading a whole posture rather than half of
+        one. A *later* ``resume=True`` can still displace this stream while it reads, and rows in
+        the other regime can appear under it as it does; that costs nothing, because the same
+        claim it no longer holds refuses its own next append, so nothing it misread can become
+        anything it writes."""
         # The directory has to exist before a create in it can be exclusive. Made in two steps so
         # that whether *this* call made it is knowable rather than inferred: a constructor that
         # goes on to raise has to leave the filesystem as it found it, and `exist_ok=True` cannot
@@ -2339,6 +2364,11 @@ class TaskStream:
                         # a takeover means the claim it displaced, not merely no claim of its own
                         # (see :meth:`_release_claim`).
                         self._displaced = held
+            # The freshness refusal, here rather than before the lock, because this is the only
+            # place its answer can authorise anything (see :meth:`_require_fresh_provenance`).
+            # Immediately before the create, so nothing — not even the takeover above — sits
+            # between "this directory holds no run" and the claim that makes it stay that way.
+            self._require_fresh_provenance(resume)
             try:
                 self._write_claim(
                     {
@@ -3479,8 +3509,11 @@ class TaskStream:
         nothing but the env can produce it. A terminating call returns only the fact that the task
         is over — a fixed payload identical for every task and every outcome — plus, under a
         revealing feedback policy, that task's own published episode-level feedback and nothing
-        else (see :meth:`_terminal_answer` and :class:`FeedbackPolicy`). Everything below
-        describes the default, :class:`Never`.
+        else (see :meth:`_terminal_answer` and :class:`FeedbackPolicy`). A call that reaches an
+        episode already over is answered as terminating too — that is the episode's state and not
+        this call's doing — and gets the same payload with the feedback member empty, because the
+        reveal belongs to the call that sealed the task (see :meth:`_tombstone_answer`).
+        Everything below describes the default, :class:`Never`.
 
         Everything a terminal produces stays with the harness, not just the row the seal records
         (lease, position, task index, raw feedback). The env's terminal response is redacted too:
@@ -3583,16 +3616,22 @@ class TaskStream:
             return ToolResult(content=self._terminal_answer(await self._seal_redacted(live)))
         if not call.terminated:
             return ToolResult(content=json.dumps({"content": call.content, "terminated": False}))
-        if not call.tombstoned:
-            # Only the call that actually ended the task may say how it ended. Every call that
-            # arrives after the episode has ended is answered with a tombstone, and a tombstone
-            # is `terminated` too — so a `terminate` racing an accepted `submit` returns first
-            # (the submission is still in its finalizer), and taking the ending from whichever
-            # response reaches the seal first would file the agent's earned, scored submission
-            # as a task it aborted. Stamped synchronously, the moment the call returns, so
-            # whoever claims the seal already sees it. The payload is not taken from here at
-            # all: it is the core's to stamp, and `_record` reads it off the episode.
-            live.terminal_tool = native
+        if call.tombstoned:
+            # A call that ended nothing. The seal is still joined — this answer may not say the
+            # task is over before the row that says so is durable, and a seal that failed needs
+            # every joiner to hand the claim back and report the stop — but the row that join
+            # hands back is not this call's to be told about (see `_tombstone_answer`).
+            await self._seal_redacted(live)
+            return ToolResult(content=self._tombstone_answer())
+        # Only the call that actually ended the task may say how it ended. Every call that
+        # arrives after the episode has ended is answered with a tombstone, and a tombstone
+        # is `terminated` too — so a `terminate` racing an accepted `submit` returns first
+        # (the submission is still in its finalizer), and taking the ending from whichever
+        # response reaches the seal first would file the agent's earned, scored submission
+        # as a task it aborted. Stamped synchronously, the moment the call returns, so
+        # whoever claims the seal already sees it. The payload is not taken from here at
+        # all: it is the core's to stamp, and `_record` reads it off the episode.
+        live.terminal_tool = native
         return ToolResult(content=self._terminal_answer(await self._seal_redacted(live)))
 
     # ----- routing -----
@@ -3935,6 +3974,44 @@ class TaskStream:
                 ),
             )
             return _TASK_OVER_SILENT
+
+    def _tombstone_answer(self) -> str:
+        """The whole response to a call that reached an episode already over: the task ended, and
+        nothing whatever about how.
+
+        **The reveal belongs to the call that sealed the task.** A tombstone is what an episode
+        answers every ``tools/call`` with once it has left ``OPEN``: nothing is dispatched,
+        nothing is ended, and ``terminated`` reports the episode's state rather than anything this
+        call did. Composed like a terminal, an ordinary ``noop`` racing an accepted ``submit`` is
+        handed the verdict its sibling earned — a second recipient of a task's feedback, on a call
+        that did not ask for it and did not end anything. Under :class:`Never` the answer is the
+        same constant either way, which is why this survived until a revealing policy existed.
+
+        **The member is still present, and empty — not absent.** Under a revealing policy the
+        member is a property of the policy and never of the task (see :class:`FeedbackPolicy`), so
+        an answer missing it would be a shape no policy chose, and a shape a revealing run cannot
+        otherwise produce: its absence would then mean exactly one thing, "you were not the call
+        that ended this", readable off the envelope by a caller that shares a stream with the one
+        that was. :data:`_TASK_OVER_SILENT` already means four things — an env that published
+        nothing, a policy holding this task back, a seal that recorded no row, a policy that could
+        not answer — and this is the fifth, so the response space gains no value and nothing new
+        is readable off the one it reuses. It also keeps the promise a parser was written against:
+        under a revealing run ``feedback`` is always there to read.
+
+        **What the two policies show a tombstoned caller.** Under :class:`Never` this is
+        :data:`_TASK_OVER`; under a revealing policy it is that same envelope with an empty
+        member. The difference between them is the member, which is what the policy decides for
+        every terminal answer of the run — so the pair says "this run reveals" and nothing else,
+        which the same caller reads off any task it ends itself and which every row of the record
+        is stamped with. What it may not say, and no longer does, is what the task scored.
+
+        **The policy is not asked.** It answers one question — what does the call that ended this
+        task reveal about it — and this call ended no task, so there is nothing to put to it. That
+        matters for the policies this design anticipates rather than for the two that ship: a
+        ``Delayed(k)`` or ``Batched(n)`` holds verdicts back and lets them go on a *later* ending,
+        so a tombstone put through it would be an ending that never happened, spending a hold and
+        releasing a batch to whoever happened to race a seal."""
+        return _TASK_OVER_SILENT if self._reveals else _TASK_OVER
 
     async def _seal(self, live: _Live, *, forced: Optional[Closure] = None) -> ResultRow:
         """End the episode authoritatively, classify how it ended, record the row, and release
@@ -4796,10 +4873,12 @@ class EvalStream(TaskStream):
        the same empty one cannot both serve into it. Mechanism:
        :meth:`TaskStream._require_fresh_provenance`, :meth:`TaskStream._require_regime_matches`
        and :meth:`TaskStream._claim_provenance`, all at construction, before anything is spent —
-       with :meth:`TaskStream._append_owned` re-verifying the ownership inside an exclusive lock
-       on the directory at every dispense *and* every row, since a claim taken once says nothing
-       about the writes that follow it and a claim merely re-read says nothing about the write it
-       precedes.
+       the first of them *inside* the exclusion the last one claims in, since a check the claim
+       does not hold its exclusion across says nothing about the record that claim is installed
+       over — and with :meth:`TaskStream._append_owned` re-verifying the ownership inside an
+       exclusive lock on the directory at every dispense *and* every row, since a claim taken once
+       says nothing about the writes that follow it and a claim merely re-read says nothing about
+       the write it precedes.
 
     4. *Everything a stream already guarantees*, unchanged and named here because an evaluation
        rests on them: the framing has no field a task index or target could be written into; the

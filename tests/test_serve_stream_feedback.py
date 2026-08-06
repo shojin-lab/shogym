@@ -30,6 +30,7 @@ import os
 import subprocess
 import sys
 import textwrap
+import threading
 import time
 from abc import ABCMeta
 from pathlib import Path
@@ -490,6 +491,98 @@ async def test_a_task_the_stream_ended_reveals_nothing(tmp_path: Path) -> None:
     # The displaced task was scored, and only the harness has it.
     assert [row.closure for row in stream.results] == ["drained", "drained"]
     assert stream.results[0].score is not None
+
+
+async def test_a_call_that_ended_nothing_is_told_only_that_the_task_is_over(
+    tmp_path: Path,
+) -> None:
+    # The other side of the same boundary, and the one a *call* can reach. The reveal belongs to
+    # the call that sealed the task; every call that arrives after the seal is answered with the
+    # episode's tombstone, which is `terminated` too and ended nothing. Composed from the recorded
+    # row, an ordinary `noop` racing an accepted `submit` is handed the verdict its sibling
+    # earned — a second recipient of a task's feedback, on a call that did not ask for it and did
+    # not end anything. Under `Never` both answers are the same constant either way, which is the
+    # whole reason this survived until a revealing policy existed.
+    #
+    # What the tombstone gets instead is the envelope with the member EMPTY, not the envelope
+    # without the member. Absence would be a new signal: under a revealing policy the member is
+    # always present, so a response missing it would say "you were not the call that ended this"
+    # in a shape no policy chose — and it is not a shape either policy can otherwise produce. The
+    # empty list says the same nothing as the three answers that already reveal nothing, which is
+    # pinned below against one of them, byte for byte.
+    entered = asyncio.Event()
+    release = asyncio.Event()
+
+    class _SlowFinalize(_FixtureScoreEnv):
+        async def finalize(self, req: Any) -> Any:
+            entered.set()
+            await release.wait()
+            return await super().finalize(req)
+
+    async def raced(policy: Any, name: str) -> List[str]:
+        entered.clear()
+        release.clear()
+        stream = TaskStream(
+            lambda _name: _SlowFinalize(tasks=TASKS),
+            [TaskRef(ENV_NAME, 0)],
+            prov_dir=tmp_path / name / "prov",
+            feedback=policy,
+            provenance_timeout=None,
+        )
+        # Entered by hand so the finalizer is released whatever an assertion below does: a task
+        # left blocked in its env would wedge the drain rather than report anything.
+        await stream.__aenter__()
+        try:
+            await stream.get_task()
+            ending = asyncio.ensure_future(stream.dispatch(SUBMIT_TOOL, {"answer": "4"}))
+            await entered.wait()  # sealed, and its finalizer is still grading
+            tombstoned = asyncio.ensure_future(stream.dispatch("noop", {}))
+            await asyncio.sleep(0.05)  # the `noop` is tombstoned, with no verdict to wait for
+            # It waits all the same: the seal is joined whether or not its row is this call's to
+            # hear about, because "the stream recorded the outcome" may not be said before the
+            # outcome is durable, and a seal that failed needs every joiner to report it.
+            waited = not tombstoned.done()
+            release.set()
+            answers = await asyncio.gather(ending, tombstoned)
+        finally:
+            release.set()
+            await stream.aclose()
+        assert waited, "a tombstoned call answered ahead of the seal it joined"
+        # The tombstone changed nothing about the record: one row, sealed and scored by the call
+        # that earned it.
+        assert [row.closure for row in stream.results] == ["sealed"]
+        assert stream.results[0].score is not None and stream.results[0].score.success is True
+        return [_text(answer) for answer in answers]
+
+    earned, unearned = await raced(Immediate(), "immediate")
+    assert json.loads(earned)["feedback"] == [
+        {"name": "correct", "value": True, "level": "episode"}
+    ]
+    assert json.loads(unearned)["feedback"] == [], (
+        "a call that ended nothing was answered with the task's verdict"
+    )
+    assert set(json.loads(unearned)) == {"content", "terminated", "hint", "feedback"}
+
+    # Nothing new is readable off it: those are the bytes a revealing run already sends whenever
+    # there is nothing to reveal, so the tombstone adds no answer the response space did not hold.
+    class _PublishesNothing(_FixtureScoreEnv):
+        def _verify(self, trajectory, task, *, terminated, evidence=None) -> FeedbackCollection:
+            return FeedbackCollection()
+
+    quiet = TaskStream(
+        lambda _name: _PublishesNothing(tasks=TASKS),
+        [TaskRef(ENV_NAME, 0)],
+        prov_dir=tmp_path / "quiet" / "prov",
+        feedback=Immediate(),
+    )
+    async with quiet:
+        await quiet.get_task()
+        silent = _text(await quiet.dispatch(SUBMIT_TOOL, {"answer": "4"}))
+    assert unearned == silent
+
+    # And `Never` is untouched: both callers still get the one constant, so the pair of responses
+    # a tombstoned caller can compare across the two policies says only what the policies say.
+    assert await raced(Never(), "never") == [stream_module._TASK_OVER] * 2
 
 
 # ----- the regime, stamped into the record -----
@@ -988,6 +1081,68 @@ async def test_two_fresh_streams_cannot_serve_one_directory(tmp_path: Path) -> N
     rows = _rows(tmp_path)
     assert [row["position"] for row in rows] == [0]
     assert {row["feedback_regime"] for row in rows} == {"never"}
+
+
+async def test_a_run_that_finished_in_the_window_is_not_served_over(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # The test above keeps its winner alive, so the loser meets a *claim*. The dangerous loser
+    # meets a *record*: a check that reads the directory and a claim that installs ownership were
+    # two operations, and a check that does not hold its exclusion across the claim it authorises
+    # authorises nothing. A whole other fresh run can begin, seal and RELEASE its claim inside
+    # that window, so the constructor that resumes finds no claim to lose to and installs its own
+    # over a directory that now holds a complete run — an `immediate` row and a `never` row for
+    # queue position 0, both seq 1, both streams closing normally.
+    #
+    # The window is opened at the module's own directory lock rather than at anything the fix
+    # introduced, so this asks about the ordering and not about a shape: a constructor paused at
+    # the door of that exclusion has done every unlocked thing it is going to do and has taken
+    # nothing.
+    locked = stream_module._locked
+    opened: List[str] = []
+    released: List[bool] = []
+
+    def _winner() -> None:
+        async def serve() -> None:
+            stream = TaskStream(
+                _env_for,
+                [TaskRef(ENV_NAME, 0)],
+                prov_dir=tmp_path / "prov",
+                feedback=Immediate(),
+            )
+            async with stream:
+                await stream.get_task()
+                await stream.dispatch(SUBMIT_TOOL, {"answer": "4"})
+
+        asyncio.run(serve())
+
+    def _paused(directory: Path) -> Any:
+        if not opened:
+            opened.append("held")
+            # A whole other fresh run, start to finish, in the window: it claims the directory,
+            # records position 0 under `immediate`, and lets the claim go on its way out. Its own
+            # locking is the real one — the guard above fires once, for the paused constructor.
+            thread = threading.Thread(target=_winner)
+            thread.start()
+            thread.join(60.0)
+            released.append(not _claim(tmp_path).exists())
+        return locked(directory)
+
+    monkeypatch.setattr(stream_module, "_locked", _paused)
+    with pytest.raises(ValueError, match="already holds records") as refused:
+        EvalStream(_env_for, [TaskRef(ENV_NAME, 0)], prov_dir=tmp_path / "prov")
+    assert released == [True], "the winner still held the directory; this is the other test"
+    assert "resume=True" in str(refused.value)
+
+    # One run in the record, and the refused constructor left nothing of its own behind — no
+    # claim for the next attempt to have to break, and not a row or a dispense under its regime.
+    assert not _claim(tmp_path).exists()
+    rows = _rows(tmp_path)
+    assert [row["position"] for row in rows] == [0]
+    assert {row["feedback_regime"] for row in rows} == {"immediate"}
+    assert [record["feedback_regime"] for record in read_dispenses(tmp_path / "prov")] == [
+        "immediate"
+    ]
 
 
 async def test_the_claim_is_taken_before_the_first_write_not_by_it(tmp_path: Path) -> None:
