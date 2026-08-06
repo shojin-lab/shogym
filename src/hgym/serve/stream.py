@@ -7,8 +7,9 @@ task at a time, routes the env's native tool calls to the episode that task is r
 dispensed task.
 
 The stream owns scoring, so what it hands out is deliberately *redacted*: a
-:class:`DispensedTask` carries ``{env, instructions, budget, tools}`` and has no field that
-could hold the task index or the target.
+:class:`DispensedTask` carries ``{env, instructions, budget, tools}`` — plus, when the stream
+serves several envs, the ``tool_naming`` note that says what those tools are called — and has no
+field that could hold the task index or the target.
 
 The same rule holds for the *whole* agent-visible surface, not just the framing. A queue may
 repeat a task index, so anything that identifies a task is a correlation channel: learn an index
@@ -140,6 +141,35 @@ core stamps onto its terminal payload. So a value published under a reserved nam
 or wrong-typed, without being able to reclassify the row it sits on — and the one place where a
 published value does become a number validates it rather than coercing it.
 
+**Several envs at once.** Native tool names collide across envs — every ``ToolUsingEnv`` has
+``terminate``, and ``done`` and ``submit_answer`` each appear in more than one env with
+different schemas behind the same name — while a server registers one schema per name. So with
+more than one env in the queue the stream advertises ``<env>__<tool>``, and routing uses an
+explicit map rather than splitting the public string back apart. That map is also the collision
+check: it refuses to hold one public name twice, whichever pair of halves produced it. A
+single-env stream advertises the env's own names, unchanged.
+
+That join is where an env key stops being an internal one. Until there are two envs it is a
+caller's private label and may be any string; joined, it is *part of a tool name*, and a tool
+name is protocol-bounded — 1 to 128 characters of letters, digits, ``_``, ``-`` and ``.``. So a
+queue naming several envs is checked against that bound before it is served, on the **joined**
+name rather than either half, because neither half decides it: a key with a space makes an
+invalid name out of a valid tool, and two names each well under the length limit can join to
+one that is over it. The check is a refusal at construction because the layer that would
+otherwise catch it does not — FastMCP warns about a name outside the set and registers it
+anyway, leaving the endpoint to be rejected by a strict client or a downstream provider, where
+no harness can see it. A single-env stream is not checked at all, in either half: nothing is
+joined there, so there is no name the stream made, and an env's own tool names are that env's
+contract with its server rather than this join's business.
+
+Renaming a tool moves the *framing* out of step with it, and that is the agent's problem rather
+than the endpoint's: an env's ``instructions`` are the env author's prose and routinely name the
+env's own tools ("call ``submit`` with your answer"), while the endpoint now registers
+``answers__submit``. Those instructions ship **verbatim** — the stream does not edit an env's
+prose, because deciding which words in free text are tool names is a guess, and a wrong guess
+corrupts the task itself. Instead the framing says the mapping alongside them, in the stream's
+own words (``tool_naming``), naming only tools the endpoint really registers.
+
 **Leases.** With more than one episode live at once, a native call has to say *which* one it
 belongs to. Native schemas are ``additionalProperties: false``, so the stream publishes wrapper
 schemas that add a required ``lease``, validates it, and **strips it before
@@ -178,6 +208,7 @@ import copy
 import json
 import math
 import os
+import re
 import secrets
 import time
 from dataclasses import dataclass, field
@@ -299,6 +330,27 @@ _WRAPPABLE_ROOT_KEYWORDS = frozenset(
     }
 )
 
+# Joins an env key to a native tool name when a stream serves more than one env. Nothing ever
+# recovers the halves by splitting the joined string, and nothing needs to: routing goes through
+# an explicit map, and it is that map — which refuses to hold one public name twice — that makes
+# a public name unambiguous. Banning this in either half is a legibility rule sitting on top of
+# that guarantee, not the guarantee itself: two admissible pairs really can join to one string
+# (`("a", "_x")` and `("a_", "x")` both give `a___x`), and the map is what catches it.
+#
+# The ban, and every other rule about the shape of a name here, applies ONLY when a join
+# actually happens. With one env in the queue nothing is joined, the env's own names go on the
+# wire exactly as they always did, and none of this is any of the stream's business.
+_SEPARATOR = "__"
+
+# What a tool name may be, on the wire: one to 128 characters drawn from ASCII letters, digits,
+# `_`, `-` and `.`
+# (https://modelcontextprotocol.io/specification/2025-11-25/server/tools#tool-names). Restated
+# here rather than imported from the MCP package's internals, because it is what *this* module
+# promises about the names it manufactures and that promise may not change under it on a
+# dependency bump; a test pins the two against each other. See `_unregistrable`.
+_TOOL_NAME_CHAR = re.compile(r"[A-Za-z0-9._-]")
+_TOOL_NAME_MAX = 128
+
 _RESULTS_FILE = "results.jsonl"
 _DISPENSES_FILE = "dispenses.jsonl"
 
@@ -341,6 +393,46 @@ class TaskRef(NamedTuple):
     task_idx: int
 
 
+def _require_task_ref(ref: Any) -> TaskRef:
+    """One queue entry, checked to be the identity it will be *recorded* as.
+
+    A ``NamedTuple`` annotation is documentation, not validation, so anything at all reaches the
+    queue — and these two fields are identity, not payload. They name the env whose rows are
+    filed under them, they are written into every dispense and every result, and a resumed run
+    compares its queue against them. Nothing downstream re-checks them, but several things
+    *coerce* them: ``ServedEpisode.open_env`` takes ``int(task)`` to load a task, while the row
+    is appended carrying the caller's own value, and :meth:`ResultRow.from_wire` then coerces
+    again when the run re-reads what it just committed. A ``1.9`` therefore plays task 1, is
+    recorded as ``1.9`` in ``results.jsonl``, and comes back as ``1`` in memory — three readings
+    of one task, and a resume that refuses the run's own record as a queue mismatch.
+
+    Coercing here would only move the disagreement earlier: the caller asked for something this
+    queue cannot hold, and a canonical identity invented after the fact is what put a number in
+    the file that nothing else agrees with. So exact ``str`` and exact ``int`` — subclasses
+    included, because a subclass is a value with its own ``__eq__`` sitting in a field every
+    later comparison runs on, and the wire form is a plain scalar either way."""
+    try:
+        env, task_idx = ref
+    except (TypeError, ValueError) as exc:
+        raise ValueError(
+            f"a queue entry must be a (env, task_idx) pair, got {type(ref).__name__}"
+        ) from exc
+    if type(env) is not str or not env:
+        raise ValueError(
+            f"a queue entry's env must be a non-empty string, got {env!r} "
+            f"({type(env).__name__}); it is the key this run's rows are filed under"
+        )
+    if type(task_idx) is not int:
+        # `bool` is an `int` subclass, and `True` would index task 1 while being recorded as a
+        # boolean — the same disagreement in a shape `isinstance` would wave through.
+        raise ValueError(
+            f"a queue entry's task index must be a whole number, got {task_idx!r} "
+            f"({type(task_idx).__name__}); it is written to every dispense and every row, and "
+            "what the queue plays has to be what the record says it played"
+        )
+    return TaskRef(env, task_idx)
+
+
 @dataclass(frozen=True)
 class DispensedTask:
     """What the agent receives: enough to act, and nothing that identifies the task.
@@ -349,20 +441,28 @@ class DispensedTask:
     position could be written into."""
 
     env: str
+    # The env's own prose, exactly as the env published it. The stream never edits it — see
+    # `tool_naming` for what it says instead when the two would disagree.
     instructions: str
     budget: Optional[int]
     tools: Tuple[Dict[str, Any], ...]
     # The capability that names this episode, present only when more than one may be live. It
     # identifies the episode, never the task: it is random, and a new one is minted per dispense.
     lease: Optional[str] = None
+    # What this task's tools are called on this endpoint, said in the STREAM's words and only
+    # when the stream renamed them (see `_naming_note`). Env-static and derived from the frozen
+    # manifest, so it stays inside the redaction: there is nothing task-specific it could hold.
+    tool_naming: Optional[str] = None
 
     def to_wire(self) -> Dict[str, Any]:
-        wire: Dict[str, Any] = {
-            "env": self.env,
-            "instructions": self.instructions,
-            "budget": self.budget,
-            "tools": [dict(tool) for tool in self.tools],
-        }
+        wire: Dict[str, Any] = {"env": self.env, "instructions": self.instructions}
+        # Next to the instructions, because that is the prose it is about.
+        if self.tool_naming is not None:
+            wire["tool_naming"] = self.tool_naming
+        wire["budget"] = self.budget
+        # Deep, because a tool carries a schema: `dict(tool)` would copy the entry and leave
+        # every payload built from this task sharing one schema object with the task itself.
+        wire["tools"] = [copy.deepcopy(tool) for tool in self.tools]
         if self.lease is not None:
             wire["lease"] = self.lease
         return wire
@@ -580,12 +680,13 @@ class _Live:
     # `finalize_error` stamp the closure is classified from, and no env-supplied content may
     # stand in for it (see `_finalize_failed`).
     terminal_payload: Optional[Dict[str, Any]] = None
-    # Set when a terminal the *stream* drove failed after ending the task, or could not end it
-    # at all. Harness-owned — the exception a forced call raised, never anything the env
-    # published — so the classifier may read it without reopening the channel `_classify`
-    # closes. The row lands unscored with a diagnostic, and the stop follows the release, like
-    # `summary_error` and for the same reason. A `call_error` promoted into this field is the one
-    # that does not stop: it is the same finding about the row and a different one about the run.
+    # Set when a terminal the *stream* drove failed after ending the task, could not end it at
+    # all, or ended it and left a verdict this record could not read off the episode. An
+    # exception raised at a boundary the harness drove, never a value the env published — so the
+    # classifier may read it without reopening the channel `_classify` closes. The row lands
+    # unscored with a diagnostic, and the stop follows the release, like `summary_error` and for
+    # the same reason. A `call_error` promoted into this field is the one that does not stop: it
+    # is the same finding about the row and a different one about the run (see `_run_seal`).
     terminal_error: Optional[BaseException] = None
     # Which of those two this is. Kept as state because it cannot be read back off the exception:
     # one instance may be raised any number of times, so an env that raises a single object on a
@@ -598,9 +699,10 @@ class _Live:
     # a result out of it, so what the agent asked for is nowhere on this episode's record.
     # Recorded rather than acted on, because a mid-call failure is not yet an outcome — a task the
     # agent goes on to end itself is the agent's, whatever failed on the way there (see
-    # `dispatch`). It becomes this entry's `terminal_error` only if the *stream* ends up forcing
-    # the terminal, which is the case where a lost call would otherwise be recorded as a task the
-    # agent played out and got wrong.
+    # :meth:`dispatch`). It becomes this entry's `terminal_error` only if the *stream* ends up
+    # forcing the terminal, which is the case where a lost call would otherwise be recorded as a
+    # task the agent played out and got wrong. That promotion buys the row and not the stop, and
+    # the source recorded beside it is what tells the two apart.
     call_error: Optional[BaseException] = None
     # Set when the env's headline could not be read off this task's feedback. The row still
     # lands (unscored, with a diagnostic); the stop is raised *after* the release, because a
@@ -621,6 +723,17 @@ class _Live:
     # namespace -> the open span, and what it observed at dispense.
     spans: Dict[str, ProvenanceSpan] = field(default_factory=dict)
     dispensed_extensions: Dict[str, Any] = field(default_factory=dict)
+
+    def failed_to_end(self, exc: BaseException, source: _TerminalErrorSource) -> None:
+        """Remember that this task has no verdict behind it, and where that came from.
+
+        The first failure explains the run, so a later one never overwrites it. The source is
+        written *here*, beside the exception, because the two must never be able to disagree:
+        a caller that set one without the other would leave the classifier and the stop reading
+        a source that belongs to some earlier failure."""
+        if self.terminal_error is None:
+            self.terminal_error = exc
+            self.terminal_error_source = source
 
     @property
     def released(self) -> bool:
@@ -655,17 +768,6 @@ class _Live:
         for a later drain to retry."""
         return self.row is not None and self.sealing is not None and self.sealing.done()
 
-    def failed_to_end(self, exc: BaseException, source: _TerminalErrorSource) -> None:
-        """Remember that this task has no verdict behind it, and where that came from.
-
-        The first failure explains the run, so a later one never overwrites it. The source is
-        written *here*, beside the exception, because the two must never be able to disagree:
-        a caller that set one without the other would leave the classifier and the stop reading
-        a source that belongs to some earlier failure."""
-        if self.terminal_error is None:
-            self.terminal_error = exc
-            self.terminal_error_source = source
-
 
 @dataclass(frozen=True)
 class _Stopped:
@@ -681,60 +783,16 @@ class _Stopped:
     closing: str
 
 
-def _wire_json(value: Any) -> str:
-    """``value`` as the endpoint would put it on the wire — **proved**, not assumed.
-
-    Two things the type of a value does not settle. Strict JSON is the first: ``json.dumps``
-    accepts ``NaN`` and ``Infinity`` by default and writes them as bare tokens no JSON parser is
-    obliged to read, so a schema carrying one is advertised as something else entirely (FastMCP
-    sends ``null``) and the episode then refuses the value it advertised. UTF-8 is the second: a
-    Python ``str`` may hold an unpaired surrogate, which is text to every ``isinstance`` check and
-    a ``UnicodeEncodeError`` the moment a transport encodes it — and ``ensure_ascii`` would hide
-    exactly that by escaping it into ASCII, so the encode is done the way an endpoint does it.
-
-    Cheap to prove and expensive to assume: what fails here fails before anything is spent, and
-    what fails later fails after a task is out and its row is owed an outcome."""
-    text = json.dumps(value, allow_nan=False, ensure_ascii=False)
-    text.encode("utf-8")
-    return text
-
-
-def _require_task_ref(ref: Any) -> TaskRef:
-    """One queue entry, checked to be the identity it will be *recorded* as.
-
-    A ``NamedTuple`` annotation is documentation, not validation, so anything at all reaches the
-    queue — and these two fields are identity, not payload. They name the env whose rows are
-    filed under them, and they are written into every row this run records. Nothing downstream
-    re-checks them, but the episode *coerces* one: ``ServedEpisode.open_env`` takes ``int(task)``
-    to load a task, while the row is appended carrying the caller's own value. A ``1.9`` therefore
-    plays task 1 and is recorded as ``1.9`` — a record whose identity is not the task that ran,
-    and one that no later reading can repair.
-
-    Coercing here would only move the disagreement earlier: the caller asked for something this
-    queue cannot hold, and a canonical identity invented after the fact is what put a number in
-    the file that nothing else agrees with. So exact ``str`` and exact ``int`` — subclasses
-    included, because a subclass is a value with its own ``__eq__`` sitting in a field every later
-    comparison runs on, and the wire form is a plain scalar either way."""
-    try:
-        env, task_idx = ref
-    except (TypeError, ValueError) as exc:
-        raise ValueError(
-            f"a queue entry must be a (env, task_idx) pair, got {type(ref).__name__}"
-        ) from exc
-    if type(env) is not str or not env:
-        raise ValueError(
-            f"a queue entry's env must be a non-empty string, got {env!r} "
-            f"({type(env).__name__}); it is the key this run's rows are filed under"
-        )
-    if type(task_idx) is not int:
-        # `bool` is an `int` subclass, and `True` would index task 1 while being recorded as a
-        # boolean — the same disagreement in a shape `isinstance` would wave through.
-        raise ValueError(
-            f"a queue entry's task index must be a whole number, got {task_idx!r} "
-            f"({type(task_idx).__name__}); it is written to every row, and what the queue plays "
-            "has to be what the record says it played"
-        )
-    return TaskRef(env, task_idx)
+def _tool_signature(manifest: ToolManifest) -> Tuple[Any, ...]:
+    """Everything about one tool that a server freezes when it registers it: the name it is
+    called by, the description the model reads, the schema its arguments are validated against,
+    and its role in the terminal lifecycle."""
+    return (
+        manifest.name,
+        manifest.description,
+        manifest.terminal_kind,
+        json.dumps(manifest.input_schema, sort_keys=True),
+    )
 
 
 def _frozen_manifest(env_name: str, tools: Sequence[ToolManifest]) -> List[ToolManifest]:
@@ -743,15 +801,17 @@ def _frozen_manifest(env_name: str, tools: Sequence[ToolManifest]) -> List[ToolM
 
     Frozen as soon as the contract has been validated, and before anything is *derived* from it.
     ``model_copy`` is shallow and ``describe`` hands back the env's own objects, so without this
-    the signature the drift check compares, the score terminal the stream drives and every task's
-    framing would all be the env's values, each one running the env's code at a moment nothing is
-    guarding.
+    the signature the drift check compares, the score terminal the stream drives, the map a call
+    is routed through and the note a renamed task carries would all be the env's values, each one
+    running the env's code at a moment nothing is guarding.
 
-    That is not a leak of decoration: those are load-bearing paths. The score terminal's name is
-    what this stream calls to end a task the agent did not, and the episode finds that terminal by
-    looking the name up — so a name whose own ``__hash__`` answers differently once the run is
-    under way makes the stream's own terminal uncallable. The abort answers instead, and the task
-    is recorded as an ordinary wrong answer, with nothing anywhere saying a name was involved.
+    That is not a leak of decoration: those are the load-bearing paths. A tool name is looked up
+    to find the episode a call belongs to and is passed into the episode as the tool to call, so
+    a name whose own ``__hash__`` or ``__eq__`` answers differently once the run is under way
+    loses the agent's call — on a tool the endpoint advertised in plain text, that the agent
+    called exactly as advertised. Nothing downstream can see that a name was ever involved: the
+    call is simply lost, and a task the agent then ends itself keeps whatever score the missing
+    step left behind.
 
     Proved through the endpoint's own encoder (see :func:`_wire_json`), because a contract this
     endpoint cannot send is one it cannot serve, and refused here — at construction, before an
@@ -785,18 +845,6 @@ def _frozen_manifest(env_name: str, tools: Sequence[ToolManifest]) -> List[ToolM
                 )
         frozen.append(manifest.model_copy(update=wire))
     return frozen
-
-
-def _tool_signature(manifest: ToolManifest) -> Tuple[Any, ...]:
-    """Everything about one tool that a server freezes when it registers it: the name it is
-    called by, the description the model reads, the schema its arguments are validated against,
-    and its role in the terminal lifecycle."""
-    return (
-        manifest.name,
-        manifest.description,
-        manifest.terminal_kind,
-        json.dumps(manifest.input_schema, sort_keys=True),
-    )
 
 
 def _manifest_signature(tools: Sequence[ToolManifest]) -> Tuple[Any, ...]:
@@ -1091,21 +1139,21 @@ def _mkdir_durable(directory: Path) -> None:
     **An existing level is no evidence that anyone synced it.** ``mkdir`` makes a level visible
     immediately and durable never, so publishing only what this call created infers from a
     level's existence that someone else already did the work — and nothing anywhere promises
-    that. The provenance directory a harness made a moment earlier, a path some unrelated program
-    created last week, a writer that made the chain and died before its own sync: each one leaves
-    this call finding everything present and returning success over a store whose directory entry
-    is still only in the page cache. A crash then takes the whole record, rows and all, with
-    every write having reported success — which is the case this exists to prevent, arrived at
-    from the other side.
+    that. The provenance directory a harness made a moment earlier, a path some unrelated
+    program created last week, a writer that made the chain and died before its own sync: each
+    one leaves this call finding everything present and returning success over a store whose
+    directory entry is still only in the page cache. A crash then takes the whole record, rows
+    and all, with every write having reported success — which is exactly the case this exists to
+    prevent, arrived at from the other side.
 
     Walking to the root costs one directory fsync per level, and a directory with nothing dirty
     behind it costs a syscall rather than a disk flush — small against the record's own file
-    sync, which every row pays anyway, and bounded by the depth of the path. What it buys is that
-    the publishing is unconditional. The syncs themselves stay best-effort (see
+    sync, which every row pays anyway, and bounded by the depth of the path. What it buys is
+    that the publishing is unconditional. The syncs themselves stay best-effort (see
     :func:`_fsync_dir`, where a filesystem that refuses one may not fail the write it was
     protecting), so what is guaranteed is that nothing on the path goes unattempted, not that a
-    hostile filesystem was talked into it. Top down, so a crash part-way through leaves a durable
-    prefix rather than a durable entry inside an ancestor that is still missing."""
+    hostile filesystem was talked into it. Top down, so a crash part-way through leaves a
+    durable prefix rather than a durable entry inside an ancestor that is still missing."""
     directory.mkdir(parents=True, exist_ok=True)
     holders: List[Path] = []
     level = directory
@@ -1234,7 +1282,14 @@ class TaskStream:
             (see :func:`_close_on_owning_loop`). Nothing is moved to a worker loop, and nothing
             about the failure is swallowed — what could not be finished is attached to the
             error being raised.
-        tasks: the materialised queue. Non-empty; may repeat a task index.
+        tasks: the materialised queue. Non-empty; may repeat a task index. An env key is a
+            private label while the queue names one env — anything at all, ``__`` included,
+            since the wire carries only the env's own tool names. Name a second env and every
+            key is joined into a public tool name, so each one must be a name a tool may be
+            called: 1 to 128 characters of letters, digits, ``_``, ``-`` and ``.``, no ``__``,
+            and short enough that ``<key>__<tool>`` still fits. Checked at construction, on the
+            joined names, and refused rather than encoded — a key that were slugged onto the
+            wire would no longer be the key its own rows are filed under.
         prov_dir: where ``dispenses.jsonl`` and ``results.jsonl`` are appended. Its rows
             carry the task index and the env's raw feedback, so it belongs to the harness —
             keep it off any filesystem the agent under test can read. One directory per run:
@@ -1360,8 +1415,8 @@ class TaskStream:
                 f"provenance namespaces must be unique, got {namespaces}; two extensions "
                 "sharing one would overwrite each other's output"
             )
-        # Checked, not merely rebuilt: these two fields are the identity every row of this run is
-        # filed under (see :func:`_require_task_ref`).
+        # Checked, not merely rebuilt: these two fields are the identity every record of this run
+        # is filed under (see :func:`_require_task_ref`).
         queue = [_require_task_ref(ref) for ref in tasks]
         if not queue:
             raise ValueError(
@@ -1369,11 +1424,34 @@ class TaskStream:
                 "from the queued tasks"
             )
         env_names = sorted({ref.env for ref in queue})
-        if len(env_names) > 1:
-            raise ValueError(
-                f"a stream serves one env; the queue names {env_names}. Native tool names "
-                "collide across envs, so multi-env serving needs prefixed registration"
-            )
+        # Whether the env key reaches the wire at all — decided here, because it is what decides
+        # whether any of the rules below are this stream's to apply. With one env the stream
+        # advertises the env's own tool names untouched, the key stays the internal caller-chosen
+        # key it has always been, and a key is free to be anything. With several it is joined into
+        # every public tool name, so the constraints on a *tool name* start applying to it. The
+        # checks are therefore gated rather than unconditional: a single-env queue is exactly the
+        # wire it was before this stream could serve more than one env, down to a key holding
+        # `__`.
+        prefixed = len(env_names) > 1
+        if prefixed:
+            for env_name in env_names:
+                if _SEPARATOR in env_name:
+                    raise ValueError(
+                        f"env key {env_name!r} contains {_SEPARATOR!r}, which the stream uses to "
+                        "join an env key to a tool name when it serves several envs; the joined "
+                        "name would be ambiguous"
+                    )
+                defect = _unregistrable(env_name)
+                if defect is not None:
+                    # Refused, not encoded into something legal. A slug would make the name the
+                    # agent calls stop matching the key the caller wrote, which is also the key
+                    # every row and `results_by_env` is filed under — the endpoint and the record
+                    # would then disagree about what this env is called, silently. The caller
+                    # chose the key and can choose another.
+                    raise ValueError(
+                        f"env key {env_name!r} is joined into every tool name this stream "
+                        f"advertises, because the queue names several envs, and {defect}"
+                    )
 
         self._env_for = env_for
         self._queue: List[TaskRef] = queue
@@ -1412,19 +1490,22 @@ class TaskStream:
             # this one here means it costs no task at all; the per-dispense check below refuses
             # the disagreements this one cannot see, because it reads a single instance.
             # Frozen as soon as it is validated, and frozen *native* — before anything is derived
-            # from it. Everything downstream is a copy of these values: the signature the drift
-            # check compares, the score terminal this stream drives when the agent ends nothing,
-            # and the contract every task is framed with. Freezing only what the endpoint
-            # advertises would leave the rest carrying the env's own objects, on paths where
-            # running the env's code loses a call and costs a task its score (see
-            # :func:`_frozen_manifest`).
+            # from it. Everything downstream is one of two things: a copy of these values (the
+            # signature the drift check compares, the score terminal the stream drives, the route
+            # a call resolves to, the note a renamed task is told) or a name built out of them.
+            # Freezing only what the endpoint advertises would leave every one of those carrying
+            # the env's own objects while the two ends of the call — the endpoint and the episode
+            # — were canonical: the agent makes exactly the call it was shown, the *bridge*
+            # between them runs the env's code on the way past, and the call is lost with nothing
+            # in the record saying a name was ever involved.
             self._manifest: Dict[str, List[ToolManifest]] = {
                 name: _frozen_manifest(name, self._validate_manifest(name)) for name in env_names
             }
             # The frozen contract, in comparable form. Every episode this stream starts runs on
             # a *different* instance the factory built, so this is what each one's own manifest
             # is checked against before its task is dispensed. Compared on the NATIVE names the
-            # env publishes; what is advertised is derived from it afterwards.
+            # env publishes; the `<env>__<tool>` prefixing below is derived from it afterwards,
+            # so the check never has to know a prefix exists.
             self._signature: Dict[str, Tuple[Any, ...]] = {
                 name: _manifest_signature(tools) for name, tools in self._manifest.items()
             }
@@ -1432,21 +1513,86 @@ class TaskStream:
                 name: next((m.name for m in tools if m.terminal_kind == "score"), None)
                 for name, tools in self._manifest.items()
             }
-            # What the agent actually sees: at capacity 1 the env's own names and schemas, and
-            # above 1 each schema wrapped with the required `lease` that names the episode. Both
-            # are built from the frozen native contract above — already this stream's plain data
-            # (see :func:`_frozen_manifest`) — so the lease argument is added to a copy of this
-            # stream's own schema and never to an object the env still holds, and what the
-            # endpoint registers above capacity 1 is this stream's schema throughout.
-            #
-            # The native contract stays unwrapped in `self._manifest`, because that is what an
-            # episode's own manifest is compared against and what the terminal this stream drives
-            # is named from. Neither goes through the wrapper: the wrapper is the agent's routing
-            # surface, and an episode never sees the lease at all.
-            self._advertised: Dict[str, List[ToolManifest]] = {
-                name: [_leased_manifest(m) for m in tools] if max_in_flight > 1 else list(tools)
-                for name, tools in self._manifest.items()
-            }
+            # What the agent actually sees, per env: the native manifest at capacity 1 with a single
+            # env, wrapped with the required `lease` above capacity 1, and prefixed `<env>__<tool>`
+            # when more than one env is in play (`prefixed`, decided above the catalog).
+            self._advertised: Dict[str, List[ToolManifest]] = {}
+            # The ONLY way a public tool name is resolved: an explicit map built here, never a split
+            # of the published string. It is the collision check too — one public name, one owner,
+            # whichever pair of halves produced it (see `_SEPARATOR`).
+            self._routes: Dict[str, Tuple[str, str]] = {}
+            # What each env's tasks are told their tools are called, when that is not what the env
+            # itself calls them. `None` when nothing was renamed, and then the framing is silent.
+            self._naming: Dict[str, Optional[str]] = {}
+            for env_name, tools in self._manifest.items():
+                advertised: List[ToolManifest] = []
+                renamed: List[Tuple[str, str]] = []
+                for manifest in tools:
+                    if prefixed:
+                        if _SEPARATOR in manifest.name:
+                            raise ValueError(
+                                f"env {env_name!r} advertises a tool named {manifest.name!r}, "
+                                f"which contains the {_SEPARATOR!r} the stream uses to join an "
+                                "env key to a tool name when it serves several envs; the joined "
+                                "name would be ambiguous"
+                            )
+                        public = f"{env_name}{_SEPARATOR}{manifest.name}"
+                        # Checked on the joined string, which is the one that goes on the wire.
+                        # Neither half decides this on its own: the key is already known to be a
+                        # legal name and each of these tools' names may be too, while the join of
+                        # two legal names can still be longer than a tool name may be.
+                        defect = _unregistrable(public)
+                        if defect is not None:
+                            raise ValueError(
+                                f"env {env_name!r} advertises a tool named {manifest.name!r}, "
+                                f"which this stream would register as {public!r} because the "
+                                f"queue names several envs — and {defect}"
+                            )
+                    else:
+                        # Nothing is joined, so there is no name here for the stream to have made:
+                        # `public` is the env's own, on the wire exactly as it was before this
+                        # stream could serve more than one env. Whether an env's own tool names
+                        # are legal is that env's contract with its server, unchanged by this and
+                        # not a join's to police — `sub__mit` is a perfectly good tool name.
+                        public = manifest.name
+                    # The tool itself is already this stream's own plain data (frozen native, at
+                    # the top of this block). The *name* may not be: above one env it is a join,
+                    # and the env key half of it has only ever been checked to be exact non-empty
+                    # text — which an unpaired surrogate is. So the name the endpoint registers is
+                    # proved here, whether it was made by this stream or published by the env.
+                    try:
+                        public = json.loads(_wire_json(public))
+                    except (ValueError, TypeError, UnicodeError) as exc:
+                        raise ValueError(
+                            f"env {env_name!r} advertises a tool this endpoint could not put on "
+                            f"the wire ({_rendered_failure(exc)}); the name a server registers "
+                            "is what every task's framing carries and what a call arrives under, "
+                            "so it has to be a value the endpoint can send"
+                        ) from exc
+                    frozen = {
+                        "name": public,
+                        "description": manifest.description,
+                        "input_schema": manifest.input_schema,
+                    }
+                    clash = self._routes.get(public)
+                    if clash is not None:
+                        owner, taken = clash
+                        if owner == env_name:
+                            raise ValueError(
+                                f"env {env_name!r} publishes two tools named {manifest.name!r}; a "
+                                "server registers one schema per tool name, so the second would "
+                                "stand in for the first"
+                            )
+                        raise ValueError(
+                            f"tool {taken!r} of env {owner!r} and tool {manifest.name!r} of env "
+                            f"{env_name!r} would both be advertised as {public!r}"
+                        )
+                    self._routes[public] = (env_name, manifest.name)
+                    renamed.append((manifest.name, public))
+                    shown = manifest.model_copy(update=frozen)
+                    advertised.append(_leased_manifest(shown) if max_in_flight > 1 else shown)
+                self._advertised[env_name] = advertised
+                self._naming[env_name] = _naming_note(renamed) if prefixed else None
             # Every lease ever issued, so one can never be reused — a recycled lease would let a
             # delayed call from a finished task act on, and be scored into, its successor. A
             # resumed run seeds it from the record below: "ever" spans the whole record, not the
@@ -1528,7 +1674,6 @@ class TaskStream:
             self._dispense_lock = asyncio.Lock()
             self._closed = False
             self._stopped: Optional[_Stopped] = None
-            self._catalog_closed = False
             self._watchdog: Optional[asyncio.Task[None]] = None
             self._releasing: Optional[asyncio.Task[None]] = None
         except BaseException as error:
@@ -1583,27 +1728,42 @@ class TaskStream:
         close is an env left open with nothing left holding it, which is the whole failure this
         path exists to prevent.
 
-        Nothing in the loop below awaits, so no cancellation can be *delivered* into it: one
-        observed here was raised by the env's own close, and it masks the error being raised
-        exactly as any other failure would. Hence ``None`` for the cancellation (see
+        **Every env is let go independently**, the same guarantee :meth:`_release_stream` gives
+        the orderly path and for the same reason: ``Env.close()`` is third-party code that may
+        block for as long as it likes, and closed one at a time the first such env decides
+        whether any env after it is closed at all. So every close is *started* before any of them
+        is waited for. It still does not bound one — a hung env leaves this frame pending, since
+        there is no wall clock over teardown here — it stops being everyone else's wait.
+
+        Whether that is a complete close is decided once rather than per env, because it is a
+        property of this frame and not of any env: with no loop running these are closed together
+        on one temporary loop, and inside one they are handed to the loop that built them and
+        finish just after this error propagates (see :func:`_close_on_owning_loop`).
+
+        This frame never awaits, so no cancellation can be *delivered* into it: one observed here
+        was raised by the env's own close, and it masks the error being raised exactly as any
+        other failure would. Hence ``None`` for the cancellation (see
         :func:`_must_propagate`)."""
         notes: List[str] = []
-        for name, env in self._catalog.items():
-            try:
-                if _close_on_owning_loop(env):
-                    notes.append(
-                        f"the catalog env for {name!r} is being closed on the loop that built "
-                        "it; a synchronous constructor cannot await that, so the close finishes "
-                        "just after this error propagates"
-                    )
-            except BaseException as exc:  # noqa: BLE001 — never mask the failure being raised
-                if _must_propagate(exc, None):
-                    raise
+        # Handed over before any of them is closed, so a close that raises cannot leave half the
+        # catalog still on the registry with nobody left to answer for it.
+        catalog = list(self._catalog.items())
+        self._catalog.clear()
+        scheduled, outcomes = _close_on_owning_loop(catalog)
+        for name, failure in outcomes:
+            if failure is not None:
+                if _must_propagate(failure, None):
+                    raise failure
                 notes.append(
                     f"the catalog env for {name!r} could not be closed while this error was "
-                    f"being raised ({_rendered_failure(exc)}); it may still hold resources"
+                    f"being raised ({_rendered_failure(failure)}); it may still hold resources"
                 )
-        self._catalog.clear()
+            elif scheduled:
+                notes.append(
+                    f"the catalog env for {name!r} is being closed on the loop that built "
+                    "it; a synchronous constructor cannot await that, so the close finishes "
+                    "just after this error propagates"
+                )
         return notes
 
     def _require_position_matches(self, position: int, ref: TaskRef, *, source: str) -> None:
@@ -1709,28 +1869,28 @@ class TaskStream:
         """Refuse an episode whose task this endpoint could not hand over, and hand back the two
         values it confirmed.
 
-        A framing is the published contract plus two values off the episode's own spec, and the
+        A framing is the frozen contract plus two values off the episode's own spec, and the
         contract half is already plain data by the time it is advertised (see the constructor).
         These two are not. A model validates a field when it is built and not when it is
         assigned, so an env that edits its spec afterwards can publish anything at all as
         ``instructions`` or ``horizon``, and nothing between here and the wire looks at them:
-        they are carried verbatim into the framing and serialised by whoever answers
+        they are carried verbatim into :class:`DispensedTask` and serialised by whoever answers
         ``get_task``.
 
-        **Where it is found decides what it costs.** The position is consumed and the episode
-        registered before the framing is handed back, so one that fails after that point is a
-        dispensed task the agent was never answered for — the episode is live, the drain ends it,
-        and the row it lands says the agent played the task out and got it wrong. That is a wrong
-        number where a missing one was the truth. Found here the bad state is unreachable rather
-        than recoverable: nothing is recorded, the position is still owed, and the episode is let
-        go by the same handler that answers a drifted manifest.
+        **Where it is found decides what it costs.** The dispense is durable before the task is
+        handed out, so a framing that fails after that point is a committed dispense the agent
+        was never answered for — the episode is live, the drain ends it, and the row it lands
+        says the agent played the task out and got it wrong. That is a wrong number where a
+        missing one was the truth. Found here the bad state is unreachable rather than
+        recoverable: nothing is written, the position is still owed, and the episode is let go by
+        the same handler that answers a drifted manifest.
 
         Confirming is the whole of it, because there is nothing left to detach: ``str`` and
         ``int`` are immutable, so a confirmed one aliases nothing an env can reach through, and
-        every other field of the framing is this stream's own or the published contract's.
-        Reading them is still the env's code — the spec is the env's object — so the read is
-        contained like every other read of an env's values here, and a value that cannot be read
-        is not a different finding from one that cannot be carried.
+        every other field of the framing is this stream's own or the frozen contract's. Reading
+        them is still the env's code — the spec is the env's object — so the read is contained
+        like every other read of an env's values here, and a value that cannot be read is not a
+        different finding from one that cannot be carried.
 
         They are handed back rather than read again where the framing is built, because *this* is
         the read that was checked. A spec is the env's object and an attribute of one can be
@@ -1759,10 +1919,10 @@ class TaskStream:
                 # The types above are what the framing *declares*; this is whether the endpoint
                 # can actually send it. A `str` is not automatically text a transport can encode
                 # — an unpaired surrogate is a legal Python string and a `UnicodeEncodeError` on
-                # the way out — and that failure lands where it costs most: the position is
-                # already consumed, so the answer the agent was owed never arrives, the drain
-                # ends the task, and the row says it played the task out and got it wrong. Proved
-                # here instead, on exactly the two values this confirms (see :func:`_wire_json`).
+                # the way out — and that failure lands where it costs most: the dispense is
+                # already durable, so the answer the agent was owed never arrives, the drain ends
+                # the task, and the row says it played the task out and got it wrong. Proved here
+                # instead, on exactly the two values that go out (see :func:`_wire_json`).
                 try:
                     _wire_json({"instructions": instructions, "budget": budget})
                 except (ValueError, TypeError, UnicodeError) as exc:
@@ -1800,38 +1960,41 @@ class TaskStream:
         """The task the agent will be handed, proved deliverable **as a whole** before the
         dispense is committed.
 
-        The framing is assembled from more than the spec, and only the spec's half was ever
-        proved: ``instructions`` and ``budget`` (see :meth:`_require_framable`). This stream's own
-        env key and the frozen contract were added afterwards, past the point where the position
-        is consumed and the episode registered — so a value that cannot be encoded there costs a
-        task: the endpoint answers ``get_task`` with a serialization error, the agent is handed
-        nothing, and the drain then ends a task nobody ever received and records it as one the
-        agent played and lost. An env key is an ordinary non-empty ``str`` as far as every check
-        upstream of here is concerned, and one holding an unpaired surrogate is exactly that.
+        The framing is assembled from several sources, and only one of them was ever proved: the
+        episode's ``instructions`` and ``budget`` (see :meth:`_require_framable`). The env key,
+        the frozen contract, the naming note and the lease were added afterwards, past the point
+        where the dispense is durable — so a value that cannot be encoded there costs a task: the
+        endpoint answers ``get_task`` with a serialization error, the agent is handed nothing, and
+        the drain then ends a task nobody ever received and records it as one the agent played and
+        lost. An env key is an ordinary non-empty ``str`` as far as every check upstream of here
+        is concerned, and one holding an unpaired surrogate is exactly that.
 
         So what is proved is the object itself, through the encoder the endpoint uses (see
-        :func:`_wire_json`). Field by field it would be the same check with a list to keep in
-        step; whole, a field added later is covered the day it is added. The ``lease`` is that
-        field: it arrives already minted so the proof covers it too, rather than being attached
-        to a framing this had already signed off on.
+        :func:`_wire_json`) and on the wire form it will actually answer with. Field by field it
+        would be the same check with a list to keep in step; whole, a field added later is covered
+        the day it is added.
 
-        Nothing of this run's record is durable yet when this runs, and no position has been
-        consumed, so a refusal costs no task. The stop is the run's, on the line this module
-        already draws — an env key and a frozen contract are properties of the stream, not of this
-        task, so the next dispense would fail the same way."""
+        Nothing of this run's record is durable yet when this runs, so a refusal costs no task:
+        the dispense is unwritten, the position is still owed and no row is due. The stop is the
+        run's, on the line this module already draws — an env key, a tool naming note and a frozen
+        contract are properties of the stream, not of this task, so the next dispense would fail
+        the same way."""
         framing = DispensedTask(
-            # This stream's key for the env, which is what its rows are recorded under — not the
-            # name the instance calls itself, which nothing here is keyed by.
+            # The stream's key for this env: it is what `<env>__<tool>` is built from, so it has
+            # to be what the agent is told the task belongs to.
             env=ref.env,
-            # The two values `_require_framable` confirmed, not a fresh read of the spec.
+            # Verbatim. The env wrote this and it names the env's own tools; when those are not
+            # the names this endpoint registers, `tool_naming` below says so beside it rather
+            # than the stream editing an env author's prose (see `_naming_note`). The two values
+            # `_require_framable` confirmed, not a fresh read of the spec.
             instructions=instructions,
             budget=budget,
-            # The *published* manifest, never the live episode's: this is the contract the server
-            # registered, and the check above is what makes the two the same thing. Detached from
-            # it, and per dispense, for the reason :func:`_detached_manifest` gives: what a task
-            # is framed with is a reading of the frozen contract, not a handle on it, and one
-            # task's framing is not the next one's either. Its name and description are already
-            # this stream's own plain copies, taken when the contract was frozen.
+            # Derived from the *published* manifest, never from the live episode's: this is the
+            # contract the server registered, and the check above is what makes the two the same
+            # thing. Detached from it, and per dispense, for the reason :func:`_detached_manifest`
+            # gives: what a task is framed with is a reading of the frozen contract, not a handle
+            # on it, and one task's framing is not the next one's either. Its name and description
+            # are already this stream's own plain copies, taken when the contract was frozen.
             tools=tuple(
                 {
                     "name": m.name,
@@ -1840,14 +2003,12 @@ class TaskStream:
                 }
                 for m in self._advertised[ref.env]
             ),
-            # Only when more than one episode may be live: at capacity 1 the wire contract is the
-            # env's own, so there is no lease to publish and none to route on. The entry still
-            # carries one — it is the registry's key either way — but it is not the agent's.
             lease=lease if self._max_in_flight > 1 else None,
+            # From the same map the tools above came from, so the framing cannot name a tool this
+            # endpoint does not serve. `None` unless the stream renamed something.
+            tool_naming=self._naming[ref.env],
         )
         try:
-            # On the wire form the endpoint answers with, not on the object: `to_wire` is what
-            # `get_task` returns, and it is where a field that cannot be encoded would surface.
             _wire_json(framing.to_wire())
         except BaseException as exc:  # noqa: BLE001 — the refusal outranks its detail
             # Nothing here awaits, so a cancellation observed was raised where it was observed
@@ -1910,15 +2071,34 @@ class TaskStream:
 
     @property
     def tools(self) -> Sequence[ToolManifest]:
-        """The tool manifest this stream advertises — the env's own schemas at capacity 1, and
-        the lease-carrying wrappers above it — as the frozen contract the constructor made of it.
+        """Everything this stream advertises, across every env in its queue: the envs' own
+        schemas at capacity 1 with a single env, lease-carrying wrappers above capacity 1, and
+        ``<env>__<tool>`` names when more than one env is in play.
 
-        A detached view of that contract, rebuilt per read (see :func:`_detached_manifest`) —
-        reading what this endpoint serves may not be a way to change it."""
+        A detached view of the frozen contract, rebuilt per read (see
+        :func:`_detached_manifest`) — reading what this endpoint serves may not be a way to
+        change it."""
         return tuple(
             _detached_manifest(manifest)
-            for manifest in self._advertised[next(iter(self._advertised))]
+            for tools in self._advertised.values()
+            for manifest in tools
         )
+
+    @property
+    def results_by_env(self) -> Dict[str, Tuple[ResultRow, ...]]:
+        """The rows so far, grouped by env.
+
+        Grouping is the default because 0.7 on one env and 0.7 on another are not the same
+        quantity, and one mean over both silently mixes scales. Aggregating anyway is the
+        caller's call to make — :attr:`results` is right there.
+
+        Detached per read, like :attr:`results` and from the same recorded rows. Two accessors
+        onto one record are two chances to hand it out, and a row reached through this one is no
+        more the record's than a row reached through that one."""
+        grouped: Dict[str, List[ResultRow]] = {name: [] for name in sorted(self._advertised)}
+        for row in self._results:
+            grouped.setdefault(row.env, []).append(_detached_row(row))
+        return {name: tuple(rows) for name, rows in grouped.items()}
 
     def queue_info(self) -> QueueInfo:
         """Where the queue stands right now (see :class:`QueueInfo`).
@@ -1979,8 +2159,10 @@ class TaskStream:
 
         Raises if anything stopped the stream, here or earlier in the run — a dispensed task
         that went unrecorded, a task that could not be recorded as dispensed at all, a summary
-        the record cannot headline, an env that raised while ending a task, or an episode that
-        would have been framed with a contract the endpoint does not serve. Together with
+        the record cannot headline, an env that raised while a task ended, or an episode that
+        would have been framed with a contract the endpoint does not serve. A call the agent
+        made and the harness lost is **not** one of them: it costs its own task its score and
+        says so on the row, and no other task's (see :meth:`dispatch`). Together with
         :attr:`stopped` and the rows themselves, this is where a stream driven entirely over MCP
         reports any of them: the harness never calls ``get_task`` itself, and nothing the agent
         sees says a run went wrong."""
@@ -2046,9 +2228,17 @@ class TaskStream:
         """Let go of what only this stream holds: its deadline watchdog, then its catalog envs.
 
         Stopped only after the drain has sealed everything, so a deadline that fires at the same
-        moment finishes the seal it started instead of being cancelled halfway through it. Each
-        env is dropped as it is closed, so a release that is interrupted anyway leaves the rest
-        still owed rather than marked done.
+        moment finishes the seal it started instead of being cancelled halfway through it.
+
+        **Every catalog env is let go independently.** ``Env.close()`` is third-party code that
+        may block for as long as it likes — an MCP session that never answers, a subprocess that
+        will not reap — and closed one at a time, the first such env decides whether any env
+        after it is closed at all: they stay open, holding sessions and subprocesses, for exactly
+        as long as it hangs. So each close is handed to its own task, and the handing over is one
+        uninterruptible statement, so no env can be left waiting on another's turn. What that
+        does *not* do is bound a close: a hung env still leaves this pending, since there is no
+        wall clock over teardown here and inventing one would be a decision about how long an
+        env's own cleanup may take. It stops being everyone else's wait.
 
         Nothing here may raise. This runs in :meth:`aclose`'s ``finally`` as the stream's own
         claimed task, so an exception escaping it would replace the run-level report the drain
@@ -2059,13 +2249,12 @@ class TaskStream:
         that did not, and it is recorded rather than swallowed so the drain still reports it.
 
         "Nothing may raise" includes ``CancelledError``, which an env's ``close`` can raise like
-        any other exception. This task is joined through a shield and nothing in this module ever
-        cancels it, so one arriving here is the env's, not a caller's — and letting it out would
-        leave the release task *cancelled* while it is the claim, so ``_catalog_closed`` stays
-        false, the envs it already popped are unreachable, and every later ``aclose`` re-awaits
-        the same cancelled task and raises again. A shutdown with no orderly exit, for a teardown
-        failure that is not the run's outcome."""
-        cancellation = _Cancellation()
+        any other exception — contained per env in :meth:`_close_catalog_env`. This task is joined
+        through a shield and nothing in this module ever cancels it, so one arriving from an env
+        is the env's, not a caller's, and letting it out would leave the release task *cancelled*
+        while it is the claim: the envs it already popped are unreachable, and every later
+        ``aclose`` re-awaits that same cancelled task and raises again. A shutdown with no
+        orderly exit, for a teardown failure that is not the run's outcome."""
         watchdog, self._watchdog = self._watchdog, None
         if watchdog is not None:
             watchdog.cancel()
@@ -2085,14 +2274,35 @@ class TaskStream:
                         "may never have been enforced"
                     ),
                 )
-        for name in list(self._catalog):
-            env = self._catalog.pop(name)
-            try:
-                await env.close()
-            except BaseException as exc:  # noqa: BLE001 — teardown is best-effort
-                if _must_propagate(exc, cancellation):
-                    raise
-        self._catalog_closed = True
+        # Popped and handed over in one statement with no await in it, so there is no state in
+        # which some envs are the release's and the rest are still the registry's.
+        closing = [
+            asyncio.ensure_future(self._close_catalog_env(self._catalog.pop(name)))
+            for name in list(self._catalog)
+        ]
+        # Every one of them is awaited before any is acted on: an env whose close fails must not
+        # decide whether another env is closed at all, and an unread failure is asyncio's
+        # unretrieved-exception warning. Containment already happened inside each task, so
+        # anything still here is something no boundary in this module may swallow.
+        for outcome in await asyncio.gather(*closing, return_exceptions=True):
+            if isinstance(outcome, BaseException):
+                raise outcome
+
+    async def _close_catalog_env(self, env: Env) -> None:
+        """Close one catalog env, containing what it raises. Teardown is best-effort and one
+        env's failure is not another's, nor the run's outcome.
+
+        The cancellation baseline is this task's own, which is what makes the containment
+        correct here: nothing in this module cancels these, so a ``CancelledError`` observed
+        inside one was raised by the env and is contained like any other failure. One delivered
+        *to* this task could only come from the release being cancelled — and that is the caller's
+        cancellation, which passes through (see :func:`_must_propagate`)."""
+        cancellation = _Cancellation()
+        try:
+            await env.close()
+        except BaseException as exc:  # noqa: BLE001 — teardown is best-effort
+            if _must_propagate(exc, cancellation):
+                raise
 
     async def get_task(self) -> Optional[DispensedTask]:
         """Dispense the next queued task, starting its episode. ``None`` once exhausted.
@@ -2112,11 +2322,12 @@ class TaskStream:
         The tools it lists are the ones the endpoint actually serves, and the episode is checked
         against them before it is dispensed (see :meth:`_require_published_manifest`) — the
         framing an agent acts on and the surface it can call are the same contract or there is
-        no task.
+        no task. That is why a renamed tool is answered by ``tool_naming`` rather than by
+        leaving the env's instructions to name something uncallable (see :func:`_naming_note`).
 
         The framing is also confirmed to be something the endpoint can *carry*, and confirmed
         before the dispense is committed (see :meth:`_require_framable`): a task that cannot be
-        handed over has to be no task at all rather than a consumed position with no answer.
+        handed over has to be no task at all rather than a durable dispense with no answer.
 
         Raises if anything stopped the stream, including a seal this call itself could not
         finish: that one is reported as the stop it already recorded, in the same words every
@@ -2190,15 +2401,20 @@ class TaskStream:
                 self._env_for(ref.env), env_name=ref.env, task=ref.task_idx
             )
             try:
+                # The episode's own snapshot, taken when it was opened and the same for every
+                # reader (see :meth:`ServedEpisode.describe`). That is what makes the check below
+                # worth making: the manifest confirmed here, the framing built from it, and the
+                # schema the episode's seal validates a terminal call against are one
+                # description, so an env cannot pass the check with one contract and enforce
+                # another on the agent that was framed with it.
                 spec = episode.describe()
                 self._require_published_manifest(ref.env, spec)
-                # Both checks sit above the bookkeeping that commits the dispense, and this one
-                # for the second reason that check gives: a task nobody could be handed is not a
-                # task, and finding that out after the position is consumed turns a task that was
-                # never served into a row saying the agent served it badly (see
-                # :meth:`_require_framable`). What it confirmed is what the framing below is
-                # built from — a second read of the spec would be a second value, and an
-                # unchecked one.
+                # Both checks sit above `_write_dispense`, and this one for the second reason
+                # that check gives: a task nobody could be handed is not a task, and finding that
+                # out after the record is durable turns a task that was never served into a row
+                # saying the agent served it badly (see :meth:`_require_framable`). What it
+                # confirmed is what the framing below is built from — a second read of the spec
+                # would be a second value, and an unchecked one.
                 instructions, budget = self._require_framable(ref.env, spec)
             except BaseException:
                 # Nothing has been exposed, so this is the same cleanup the closed-mid-dispense
@@ -2218,37 +2434,10 @@ class TaskStream:
                     if _must_propagate(exc, cancellation):
                         raise
                 raise
-            # Both of these are refusals of the same shape as a drifted manifest — the position
-            # is still owed, no row is due, the episode is released here, and the spans opened
-            # for it are dropped without finalizing: no task was dispensed, so there is no
-            # outcome to close them against. Which is why the mint sits inside this guard too:
-            # it can refuse (see :meth:`_mint_lease`), and a refusal that skipped the close would
-            # leave an env and its MCP sessions held by an episode nobody has a handle on.
-            try:
-                # Minted before the framing rather than with the entry, because above capacity 1
-                # the lease is a *field of the framing* and the proof below is a proof of the
-                # whole object: a lease attached after it would be the one field nothing checked,
-                # which is the hole that proof exists to close. Minting is not registering —
-                # nothing is keyed by this string until the entry is published under the lock
-                # below, and a dispense refused between here and there simply retires it, which
-                # is what `_issued` is for. Safe outside the registry lock because `get_task`
-                # holds `_dispense_lock` for its whole body and nothing else mints.
-                lease = self._mint_lease()
-                # Built and proved before the position is consumed and the episode registered:
-                # what the agent is handed is this object, and every field of it has to be one
-                # the endpoint can answer with (see :meth:`_deliverable_framing`).
-                framing = self._deliverable_framing(ref, instructions, budget, lease)
-            except BaseException:
-                cancellation = _Cancellation()
-                try:
-                    await episode.close()
-                except BaseException as exc:  # noqa: BLE001 — teardown must not mask the failure
-                    if _must_propagate(exc, cancellation):
-                        raise
-                raise
 
             undispensed: Optional[ServedEpisode] = None
             unrecorded: Optional[BaseException] = None
+            framing: Optional[DispensedTask] = None
             async with self._lock:
                 # Rechecked in the very critical section that publishes the live record, because
                 # opening the spans and the episode above ran with the registry free: a shutdown
@@ -2262,67 +2451,84 @@ class TaskStream:
                 if self._closed:
                     undispensed = episode
                 else:
-                    live = _Live(
-                        # The lease the framing above was proved carrying: the string the agent
-                        # is handed and the key the registry routes its calls on are one value,
-                        # or a call would name a task no entry answers to.
-                        lease=lease,
-                        seq=self._seq + 1,
-                        position=position,
-                        ref=ref,
-                        episode=episode,
-                        spans=spans,
-                        dispensed_extensions=dispensed_extensions,
-                    )
-                    # Durable BEFORE the task is exposed: after this point a crash is
-                    # reconcilable, because the record says a task was handed out and no result
-                    # answers it. And nothing is committed before it: a position stepped over a
-                    # write that failed is a task quietly dropped from the queue, its episode
-                    # absent from the registry that is the only handle on it, and a drain that
-                    # reports a clean run over the hole.
+                    # Built before anything is durable, and proved whole: what the agent is
+                    # handed is this object, and every field of it has to be one the endpoint can
+                    # answer with (see :meth:`_deliverable_framing`). A refusal here costs the
+                    # same as a manifest this stream cannot serve — the position is still owed,
+                    # no row is due, and the episode is let go with the refused dispense below.
+                    #
+                    # Minting sits inside the same guard, and for the same reason rather than for
+                    # tidiness: it can refuse (see :meth:`_mint_lease`), and it runs where nothing
+                    # else would catch it — a raise from the `_Live(...)` arguments would leave
+                    # this method with `undispensed` unset, so the env and MCP sessions this
+                    # episode holds would be let go by nobody at all.
                     try:
-                        self._write_dispense(live)
+                        live = _Live(
+                            lease=self._mint_lease(),
+                            seq=self._seq + 1,
+                            position=position,
+                            ref=ref,
+                            episode=episode,
+                            spans=spans,
+                            dispensed_extensions=dispensed_extensions,
+                        )
+                        framing = self._deliverable_framing(ref, instructions, budget, live.lease)
                     except BaseException as exc:
-                        # Nothing was handed out, so this position is still owed and no row is
-                        # due — the same shape as the manifest refusal above. But a provenance
-                        # directory that cannot be appended to is not a per-task problem: the
-                        # next dispense record and every result row after it go to that same
-                        # directory, so the run can no longer be a record of the queue. Serving
-                        # on would spend the rest of the queue against a file that already lost
-                        # a task, so the stream stops and says so at both boundaries.
-                        # (Cancellation is excluded, as everywhere else here: nothing failed.)
-                        if not isinstance(exc, asyncio.CancelledError):
-                            self._stop(
-                                exc,
-                                dispensing=(
-                                    "this stream stopped: a task could not be recorded as "
-                                    f"dispensed to {self.dispenses_path}, so a crash from here "
-                                    "on could not be told apart from a task that was never "
-                                    "handed out"
-                                ),
-                                closing=(
-                                    "this stream could not record a dispense to "
-                                    f"{self.dispenses_path}; the queue was not served to the end"
-                                ),
-                            )
-                        # Closed outside the lock, with the dispense that was refused before
-                        # it: same window, same teardown, one path.
                         undispensed = episode
                         unrecorded = exc
                     else:
-                        # Synchronous from the write down, so no cancellation point can
-                        # separate the record on disk from the bookkeeping that answers for
-                        # it — and so the agent's clock and the moment the task becomes
-                        # visible are the same instant. Started here rather than where the
-                        # entry was built because the durable dispense sits between the two:
-                        # a slow volume would otherwise charge its own latency to the agent,
-                        # which cannot see the task until this returns, and a write slower
-                        # than the deadline would hand out a task already out of time.
-                        live.started = time.monotonic()
-                        self._position = position + 1
-                        self._seq = live.seq
-                        self._consumed += 1
-                        self._live[live.lease] = live
+                        # Durable BEFORE the task is exposed: after this point a crash is
+                        # reconcilable, because the record says a task was handed out and no
+                        # result answers it. And nothing is committed before it: a position
+                        # stepped over a write that failed is a task quietly dropped from the
+                        # queue, its episode absent from the registry that is the only handle on
+                        # it, and a drain that reports a clean run over the hole.
+                        try:
+                            self._write_dispense(live)
+                        except BaseException as exc:
+                            # Nothing was handed out, so this position is still owed and no row
+                            # is due — the same shape as the manifest refusal above. But a
+                            # provenance directory that cannot be appended to is not a per-task
+                            # problem: the next dispense record and every result row after it go
+                            # to that same directory, so the run can no longer be a record of the
+                            # queue. Serving on would spend the rest of the queue against a file
+                            # that already lost a task, so the stream stops and says so at both
+                            # boundaries. (Cancellation is excluded, as everywhere else here:
+                            # nothing failed.)
+                            if not isinstance(exc, asyncio.CancelledError):
+                                self._stop(
+                                    exc,
+                                    dispensing=(
+                                        "this stream stopped: a task could not be recorded as "
+                                        f"dispensed to {self.dispenses_path}, so a crash from "
+                                        "here on could not be told apart from a task that was "
+                                        "never handed out"
+                                    ),
+                                    closing=(
+                                        "this stream could not record a dispense to "
+                                        f"{self.dispenses_path}; the queue was not served to "
+                                        "the end"
+                                    ),
+                                )
+                            # Closed outside the lock, with the dispense that was refused before
+                            # it: same window, same teardown, one path.
+                            undispensed = episode
+                            unrecorded = exc
+                            framing = None
+                        else:
+                            # Synchronous from the write down, so no cancellation point can
+                            # separate the record on disk from the bookkeeping that answers for
+                            # it — and so the agent's clock and the moment the task becomes
+                            # visible are the same instant. Started here rather than where the
+                            # entry was built because the durable dispense sits between the two:
+                            # a slow volume would otherwise charge its own latency to the agent,
+                            # which cannot see the task until this returns, and a write slower
+                            # than the deadline would hand out a task already out of time.
+                            live.started = time.monotonic()
+                            self._position = position + 1
+                            self._seq = live.seq
+                            self._consumed += 1
+                            self._live[live.lease] = live
             if undispensed is not None:
                 # Same shape as the manifest refusal above: this close is teardown, and its
                 # failure — cancellation included — may not stand in for the answer the caller
@@ -2336,6 +2542,7 @@ class TaskStream:
                 if unrecorded is not None:
                     raise unrecorded
                 raise RuntimeError("this stream is closed")
+            assert framing is not None
             return framing
 
     async def dispatch(
@@ -2378,6 +2585,13 @@ class TaskStream:
         different in kind from the env text an ordinary call returns, and no task has ended for
         it to be a verdict about.
 
+        Answering that one is not the same as forgetting it. A call that raised reached no result,
+        so nothing it was for is on the episode's record, and if the agent never does end the task
+        then the outcome the stream composes is one nothing the agent did produced. The failure is
+        therefore kept on the entry and consulted by the seal: an agent that goes on to end the
+        task itself keeps whatever that terminal says, and a task the *stream* has to end instead
+        lands unscored rather than in a scored closure it did not earn.
+
         At capacity 1 there is no routing lease to find: the env's own schemas are advertised
         verbatim, so a ``lease`` in ``arguments`` is the *env's* argument and is passed through
         untouched. Reading it here would take an env's own parameter away from it and refuse the
@@ -2389,14 +2603,14 @@ class TaskStream:
         resolved = await self._resolve(tool, lease)
         if isinstance(resolved, ToolResult):
             return resolved
-        live = resolved
+        live, native = resolved
         # Outside the registry lock: the episode has its own lock, holding a stream-wide one
         # across an awaited env call would serialise the whole stream behind one tool, and the
         # deadline needs that lock to arbitrate — an env slow in a tool or in its finalizer must
         # not be able to spend the wall clock and still be recorded as an ordinary seal.
         cancellation = _Cancellation()
         try:
-            call = await live.episode.call(tool, args)
+            call = await live.episode.call(native, args)
         except BaseException as exc:  # noqa: BLE001 — see below; never re-raised at the agent
             # An env can raise `CancelledError` like anything else, and one raised *by the env*
             # is not this caller's cancellation (see `_must_propagate`). Told apart here rather
@@ -2408,18 +2622,18 @@ class TaskStream:
                 raise
             if not live.episode.terminated:
                 # The call ended nothing, so it goes back as the env's own answer to a call the
-                # agent can make again — but not on its own. It reached no result, so nothing the
-                # agent asked for is on this episode's record, and the outcome the stream would
-                # compose from that record is one the agent never got to play for. Left at a bare
-                # re-raise this is the whole failure: the drain later drives the terminal itself
-                # and files the task in a *scored* closure, so an agent whose submission the
-                # harness dropped is recorded as one that answered wrong — a number a run's mean
-                # would then average in. So the loss is kept on the entry and the seal decides —
-                # kept and not acted on, because an agent that recovers and ends the task itself
-                # has earned whatever that terminal says (see `_compose_row`). What it costs is
-                # this task's score and nothing else: the stream serves on, since the next task
-                # need not meet what this call met.
-                if live.call_error is None:  # the first loss explains the row
+                # agent can make again — but not on its own. It reached no result, so nothing
+                # the agent asked for is on this episode's record, and the outcome the stream
+                # would compose from that record is one the agent never got to play for. Left at
+                # a bare re-raise this is the whole failure: the drain later drives the terminal
+                # itself and files the task in a *scored* closure, so an agent whose submission
+                # the harness dropped is recorded as one that answered wrong — a number a run's
+                # mean would then average in. So the loss is kept on the entry and the seal
+                # decides — kept and not acted on, because an agent that recovers and ends the
+                # task itself has earned whatever that terminal says (see `_compose_row`). What
+                # it costs is this task's score and nothing else: the stream serves on, since the
+                # next task need not meet what this call met.
+                if live.call_error is None:  # the first loss explains the run
                     live.call_error = exc
                 raise
             # The episode ended and *then* the call failed: the terminal is committed and the
@@ -2427,8 +2641,10 @@ class TaskStream:
             # — it lands carrying whatever feedback survived, which is what makes the loss
             # legible — and the stream stops. A row with no readable outcome is the same
             # eval-integrity failure whether the value is unusable or missing, and an env that
-            # raises here raises for every task in the queue; without the stop a solved task is
-            # recorded unscored and `aclose()` reports a clean run.
+            # raises here raises for every task *of that env* in the queue; without the stop a
+            # solved task is recorded unscored and `aclose()` reports a clean run. The stop is
+            # the whole stream's even when the queue holds other envs: one record is missing an
+            # outcome, and that is the run's, not this env's.
             # Rendered once, and guarded: an env's exception formats through the env's own code,
             # and letting that escape here would take the stop, the seal and the redacted answer
             # with it — see :func:`_rendered_failure`.
@@ -2459,7 +2675,7 @@ class TaskStream:
             # as a task it aborted. Stamped synchronously, the moment the call returns, so
             # whoever claims the seal already sees it. The payload is not taken from here at
             # all: it is the core's to stamp, and `_record` reads it off the episode.
-            live.terminal_tool = tool
+            live.terminal_tool = native
         await self._seal_redacted(live)
         return ToolResult(content=_TASK_OVER)
 
@@ -2472,7 +2688,8 @@ class TaskStream:
         a worker holding a valid lease for one task could name a tool belonging to another env or
         to no task at all. The registry therefore binds ``(lease, env, native tool)`` and checks
         all three **before** the call can reach the episode, where an unknown tool would consume
-        a step of the budget and land in the trajectory.
+        a step of the budget and land in the trajectory. Returns the episode and the *native*
+        tool name to call it with, or the refusal to return instead.
 
         At capacity 1 a lease is ignored outright rather than merely unnecessary: only one
         episode can be live, so the call is unambiguous, and the word ``lease`` belongs to the
@@ -2546,22 +2763,23 @@ class TaskStream:
                         "sealed_lease",
                         f"that task is over; call `{_GET_TASK_TOOL}` for the next one",
                     )
-            if tool not in self._advertised_names(live.ref.env):
-                # Either a tool of a different env, or one this task never advertised. Both are
-                # the same failure: a lease that is valid but denotes the wrong thing.
-                if any(tool in self._advertised_names(name) for name in self._advertised):
-                    return _stream_error(
-                        "wrong_env",
-                        f"tool {tool!r} belongs to another env; this lease names a "
-                        f"{live.ref.env!r} task",
-                    )
+            route = self._routes.get(tool)
+            if route is None:
                 return _stream_error(
                     "tool_not_in_task", f"tool {tool!r} is not advertised by this task"
                 )
-            return live
-
-    def _advertised_names(self, env_name: str) -> frozenset:
-        return frozenset(m.name for m in self._advertised[env_name])
+            env_name, native = route
+            if env_name != live.ref.env:
+                # A lease that is valid but denotes the wrong thing — the same failure shape
+                # that disqualified lease-scoped tool names. Two envs can advertise the same
+                # native name with different meanings, so routing on the lease alone could seal
+                # and score the wrong task.
+                return _stream_error(
+                    "wrong_env",
+                    f"tool {tool!r} belongs to env {env_name!r}; this lease names a "
+                    f"{live.ref.env!r} task",
+                )
+            return live, native
 
     def _mint_lease(self) -> str:
         """An opaque, unguessable lease that is never reused.
@@ -2944,9 +3162,8 @@ class TaskStream:
                 # :attr:`results`), and taking it here is what makes those copies cheap and
                 # certain: they copy plain data, run no env code, and cannot disagree with the
                 # record. Held any other way this list would carry the env's own objects — the
-                # feedback values it published, the one list that `observed` and `score.feedback`
-                # both are, and whatever an extension put on `extensions` — and every view of it
-                # would be a handle on them.
+                # feedback values it published, and the one list that `observed` and
+                # `score.feedback` both are — and every view of it would be a handle on them.
                 #
                 # It cannot fail here, and that is why it is here rather than a step earlier: the
                 # append above just serialised these exact values, with the same encoder and the
@@ -2967,16 +3184,16 @@ class TaskStream:
             # :meth:`_release`), so whichever gets there first is the only one that runs.
             await self._release(live)
             # A promoted `call_error` is deliberately **not** one of these (see
-            # :meth:`_compose_row`), and the source is what says which this is — never the
-            # exception object, which an env may raise on both boundaries. What a lost call owed
-            # the record is the row it already produced: unscored, saying the call was lost, which
-            # is the whole property — an outcome nothing the agent did produced cannot be averaged
-            # into a benchmark. Stopping on top of that spends the rest of the queue on one lost
-            # call, and the failure it names is one the *next* task need not have: a mid-episode
-            # call is where a transient fault lands, and a session that hiccups once would end a
-            # 480-task run. A terminal that failed is the opposite case and still stops here —
-            # there the env is on its way out of a task it had already ended, and every task of
-            # that env leaves the same way.
+            # :meth:`_compose_row`), and the source recorded beside the failure is what says
+            # which this is — never the exception object, which an env may raise on both
+            # boundaries. What a lost call owed the record is the row it already produced:
+            # unscored, saying the call was lost, which is the whole property — an outcome
+            # nothing the agent did produced cannot be averaged into a benchmark. Stopping on top
+            # of that spends the rest of the queue on one lost call, and the failure it names is
+            # one the *next* task need not have: a mid-episode call is where a transient fault
+            # lands, and a session that hiccups once would end a 480-task run. A terminal that
+            # failed is the opposite case and still stops here — there the env is on its way out
+            # of a task it had already ended, and every task of that env leaves the same way.
             if live.terminal_error is not None and live.terminal_error_source == "terminal":
                 exc = live.terminal_error
                 # Guarded, and for more than tidiness: this runs *after* the append, so an
@@ -3053,9 +3270,9 @@ class TaskStream:
                 # answer may not stand in for it. An abort that succeeds does not make the score
                 # terminal's raise a non-event: that terminal is the only call that can produce a
                 # verdict for this env, so what the abort ended is a task with nothing behind it,
-                # and letting the reassignment drop the refusal would record the abort's
-                # fail-closed `correct=False` as an outcome — for a queue in which every task of
-                # that env will refuse the same way.
+                # and letting the reassignment drop the refusal records the abort's fail-closed
+                # `correct=False` as an outcome — for a queue in which every task of that env
+                # will refuse the same way.
                 if refused is None:
                     refused = abort_refusal
             # A forced call can be tombstoned too: the agent's own terminal may have been waiting
@@ -3077,7 +3294,7 @@ class TaskStream:
             # *scored* one, so the row would say the agent played the task out and got it wrong,
             # for a call the harness never carried. Same finding as a terminal that could not be
             # driven, one call earlier, and the row gets the same answer — the run does not, and
-            # the source recorded beside it is what tells the two apart (see :meth:`_settle`). An
+            # the source recorded beside it is what tells the two apart (see `_run_seal`). An
             # unscored closure needs none of this: it already says the outcome was not earned.
             if forced in _SCORED_CLOSURES and live.call_error is not None:
                 live.failed_to_end(live.call_error, "promoted_call")
@@ -3096,7 +3313,33 @@ class TaskStream:
             live.terminal_tool = episode.terminal_tool or (
                 TERMINATE_TOOL_NAME if episode.terminal_source == "abort" else None
             )
-        live.terminal_payload = episode.terminal_payload
+        # **Reading the payload is the env's data too**, and it is contained for the same reason
+        # every other read of an env's own values here is. The core stamps its flag onto a copy
+        # of the verdict *the env returned*, so both the stamping and the lookup below compare
+        # this module's key against keys the env owns — and an env's `__eq__` is env code, which
+        # may raise. Uncontained it takes the whole row with it: the closure is classified from
+        # this payload, so nothing is composed, the seal fails, and a task the agent earned and
+        # a sealed episode graded is answered by `reconcile` as a broker crash — the harness
+        # blamed for a failure that is the env's. A payload this record cannot read is a task
+        # with no verdict behind it, which is exactly what a failed terminal already means here,
+        # so it is recorded as one: the row lands unscored with a diagnostic, and the stream
+        # stops, because an env that does this does it for every task of its own in the queue.
+        #
+        # Nothing here awaits, so no cancellation can be delivered into it and one observed was
+        # raised where it was observed (see :func:`_must_propagate`).
+        try:
+            payload = episode.terminal_payload
+            # Re-keyed through `str` once, here, so the classification below compares strings
+            # this module made rather than objects the env did — the read is contained, and the
+            # value it yields carries nothing that could raise from a later lookup.
+            live.terminal_payload = (
+                None if payload is None else {str(key): value for key, value in payload.items()}
+            )
+        except BaseException as exc:  # noqa: BLE001 — the env's failure, never this row's
+            if _must_propagate(exc, None):
+                raise
+            live.terminal_payload = None
+            live.failed_to_end(exc, "terminal")
 
         # The env's items, in the order and at the levels it published them. Keyed by name this
         # would be a *projection*, not a record: an env may publish a name twice, and a mapping
@@ -3110,8 +3353,17 @@ class TaskStream:
         # the env's headline is readable, and `observed` keeps every offending item either way.
         # `diagnostic` is what makes this legible in the file itself, which is the one thing
         # this commit can say that the one below it cannot.
+        #
+        # The *whole* boundary is contained, not only the malformed summary it is named for.
+        # Picking a headline runs the env's own code: the funnel matches published names, and a
+        # name is an object the env supplied, so the comparison that finds an item is that
+        # object's `__eq__`. Anything else out of here escapes the seal entirely — no row at all,
+        # and `reconcile` answers the dispense with a broker crash, so a task the agent solved is
+        # filed as an evaluator that fell over. A summary this record cannot read is not a
+        # different finding from one it cannot honour, and it gets the same answer.
         score: Optional[Score] = None
         if closure in _SCORED_CLOSURES:
+            unheadlinable: Optional[_MalformedSummary] = None
             try:
                 score = Score(
                     reward=_pick_float(observed, _REWARD_NAMES),
@@ -3119,8 +3371,21 @@ class TaskStream:
                     feedback=observed,
                 )
             except _MalformedSummary as exc:
-                live.summary_error = exc
-                diagnostic = f"the env published a summary value this record cannot headline: {exc}"
+                unheadlinable = exc
+            except BaseException as exc:  # noqa: BLE001 — the env's failure, never this row's
+                # Nothing in the funnel awaits, so no cancellation can be delivered into it and
+                # one observed here was raised where it was observed (see `_must_propagate`).
+                if _must_propagate(exc, None):
+                    raise
+                unheadlinable = _MalformedSummary(
+                    f"reading it raised {_rendered_failure(exc)}"
+                )
+            if unheadlinable is not None:
+                live.summary_error = unheadlinable
+                diagnostic = (
+                    "the env published a summary value this record cannot headline: "
+                    f"{unheadlinable}"
+                )
         # Extensions run here — after the outcome is decided, before the row is written, and
         # outside every lock. Whatever they return is namespaced; whatever they do wrong is
         # recorded in their own namespace and cannot stop the row. What they are *handed* is
@@ -3156,9 +3421,14 @@ class TaskStream:
         in it. It is the same failure :meth:`dispatch` already refuses to let an env answer with;
         the only difference is who made the call.
 
-        Only a raise that left the episode still OPEN is handed back. That one is the refusal
-        this fallback exists for — an env whose score terminal needs arguments the stream cannot
-        invent — and the reserved abort is what answers it.
+        Only a raise that left the episode still OPEN is handed back, so the caller can fall back
+        to the reserved abort rather than leaving a task nothing ended. What the fallback does
+        *not* do is settle it: an env whose score terminal raises has published no verdict for
+        this task and will publish none for the next, so the refusal outlives the abort that
+        answered it and the row is classified from it either way. The refusal this fallback is
+        for — a score terminal whose arguments the stream cannot invent — never arrives here at
+        all: missing arguments are refused against the advertised schema and come back as an
+        ordinary validation result, not as a raise.
 
         A ``CancelledError`` the env raises is that env failing and is classified with the rest
         (see :func:`_must_propagate`). Letting it through instead cancels the *seal task* this
@@ -3460,58 +3730,6 @@ class TaskStream:
             raise RuntimeError("this stream is closed")
 
 
-def _recorded_row(row: ResultRow) -> ResultRow:
-    """A composed row, re-read from the wire form the results file just committed — the run's
-    own canonical copy of what it recorded.
-
-    Composing a row leaves the env's values on it: ``observed`` holds the items the episode
-    published, and ``Score.feedback`` *is* that same list. So the row a seal builds is a handle
-    on env objects, and this is where the run stops holding one. Taken through the same strict
-    JSON the file holds — the same encoder and the same ``allow_nan`` :func:`_append_jsonl`
-    committed it with — so what stays in memory and what a later :func:`read_results` reads back
-    are the same row, and every view taken of it afterwards copies plain data (see
-    :func:`_detached_row`).
-
-    ``extensions`` comes through it too, and it has to: each namespace's halves are already
-    strict JSON (:func:`_strict_json_object`), but the mapping holding them is this seal's own
-    dict and ``to_wire`` copies only its top level. A snapshot that kept it would leave the run
-    reporting an extension's output that the file it committed does not have.
-
-    Called **after** the append, which is what makes it safe to run at all: those exact values
-    have just been serialised, so nothing here can fail that the write did not already fail. The
-    same call a step earlier would be a normalization that could suppress a row the run had
-    otherwise earned."""
-    return ResultRow.from_wire(json.loads(json.dumps(row.to_wire(), allow_nan=False)))
-
-
-def _detached_row(row: ResultRow) -> ResultRow:
-    """One recorded row, copied whole, for a reader that must not be able to reach the run's.
-
-    :class:`ResultRow` is frozen and *shallow*: ``observed`` is a list of dicts, ``extensions``
-    is a dict of them, and ``Score.feedback`` is a list of them too — so a reader handed the row
-    itself can edit what the run reports without touching what the file says, and every later
-    read would show the edit. A run's record is not a thing reading it may rewrite.
-
-    ``deepcopy`` here, for the reason :func:`_detached_manifest` gives and not despite the one
-    :func:`_detached_summary` gives: what is behind this is already plain data (see
-    :func:`_recorded_row`), so copying it copies data and runs no code an env wrote. That is what
-    makes the read total — a reader gets the row whatever the env published in it."""
-    return copy.deepcopy(row)
-
-
-def _detached_manifest(manifest: ToolManifest) -> ToolManifest:
-    """One advertised tool on a copy of its own schema, for a reader that must not be able to
-    reach the stream's.
-
-    The frozen contract is only frozen if reading it cannot rewrite it, and a ``ToolManifest`` is
-    a mutable model whose ``input_schema`` is a mutable dict — ``model_copy`` copies the model
-    and keeps the dict. Shared, the same object is what every task's framing advertises and what
-    a server registers, so a reader that edited it would change the contract the agent is shown
-    from the next dispense on, and the endpoint would register the edit if it were built
-    afterwards. The snapshot behind this is plain JSON (see the constructor), so copying it
-    copies data and runs no env code."""
-    return manifest.model_copy(update={"input_schema": copy.deepcopy(manifest.input_schema)})
-
 def _detached_summary(score: Optional[Score]) -> Optional[Score]:
     """A private copy of a row's summary, for a caller that must not be able to reach the row's.
 
@@ -3558,6 +3776,40 @@ def _detached_summary(score: Optional[Score]) -> Optional[Score]:
         success=score.success,
         feedback=json.loads(json.dumps(score.feedback, allow_nan=False)),
     )
+
+
+def _recorded_row(row: ResultRow) -> ResultRow:
+    """A composed row, re-read from the wire form the results file just committed — the run's
+    own canonical copy of what it recorded.
+
+    Composing a row leaves the env's values on it: ``observed`` holds the items the episode
+    published, and ``Score.feedback`` *is* that same list. So the row a seal builds is a handle
+    on env objects, and this is where the run stops holding one. Taken through the same strict
+    JSON the file holds — the same encoder and the same ``allow_nan`` :func:`_append_jsonl`
+    committed it with — so what stays in memory and what a later :func:`read_results` reads back
+    are the same row, and every view taken of it afterwards copies plain data (see
+    :func:`_detached_row`).
+
+    Called **after** the append, which is what makes it safe to run at all: those exact values
+    have just been serialised, so nothing here can fail that the write did not already fail. The
+    same call a step earlier would be a normalization that could suppress a row the run had
+    otherwise earned — the failure mode :func:`_detached_summary` refuses ``deepcopy`` for."""
+    return ResultRow.from_wire(json.loads(json.dumps(row.to_wire(), allow_nan=False)))
+
+
+def _detached_row(row: ResultRow) -> ResultRow:
+    """One recorded row, copied whole, for a reader that must not be able to reach the run's.
+
+    :class:`ResultRow` is frozen and shallow: ``observed`` is a list of dicts and ``extensions``
+    is a dict, so a reader handed the row itself can edit what the run reports without touching
+    what the file says — and both public accessors would show the edit, since they are two views
+    of one list. A run's record is not a thing reading it may rewrite.
+
+    ``deepcopy`` here, for the reason :func:`_detached_manifest` gives and not despite the one
+    :func:`_detached_summary` gives: what is behind this is already plain data (see
+    :func:`_recorded_row`), so copying it copies data and runs no code an env wrote. That is what
+    makes the read total — a reader gets the row whatever the env published in it."""
+    return copy.deepcopy(row)
 
 
 async def _close_episode(live: _Live) -> None:
@@ -3628,6 +3880,77 @@ def _stream_error(code: str, message: str) -> ToolResult:
     trajectory, and is never scored."""
     return ToolResult(
         content=json.dumps({"error": code, "message": message, "stream_error": True})
+    )
+
+
+def _unregistrable(name: str) -> Optional[str]:
+    """Why ``name`` cannot honestly be published as a tool name, or ``None`` if nothing is.
+
+    The protocol bounds what a tool name may be — one to 128 characters of letters, digits,
+    ``_``, ``-`` and ``.`` — and the bound is not enforced where a violation is created. FastMCP
+    logs a warning and registers the tool anyway, so an endpoint built from a name outside the
+    set looks healthy from inside this process and is refused somewhere the harness cannot see:
+    a strict client, or a provider that re-publishes the tool list to a model. That is why this
+    is a refusal at construction rather than a warning, and why the string it is asked about is
+    the *joined* one that actually goes on the wire rather than either half of it.
+
+    It says why rather than yes/no because the caller who has to fix it needs to be told what
+    is wrong with which name; the messages at the two call sites differ only in whose name it
+    was."""
+    if not name:
+        return "it is empty"
+    illegal = sorted({char for char in name if not _TOOL_NAME_CHAR.fullmatch(char)})
+    if illegal:
+        return (
+            f"it contains {', '.join(repr(char) for char in illegal)}, and a tool name may hold "
+            "only letters, digits, '_', '-' and '.'"
+        )
+    if len(name) > _TOOL_NAME_MAX:
+        return (
+            f"it is {len(name)} characters long, over the {_TOOL_NAME_MAX} a tool name may be"
+        )
+    return None
+
+
+def _naming_note(renamed: Sequence[Tuple[str, str]]) -> str:
+    """The stream's own sentence about what a task's tools are called here.
+
+    An env's ``instructions`` are its author's prose, and they name the env's tools by the env's
+    own names — "call ``submit`` with your final ``answer``" — because that is what an env author
+    was ever promised. Prefixing makes those names uncallable, and a framing that says ``submit``
+    beside a tool list that says ``answers__submit`` gives a literal instruction-follower two
+    incompatible commands, one of which the endpoint will refuse before this module is even
+    reached.
+
+    So the mapping is said *beside* the instructions rather than spliced into them. Rewriting the
+    env's prose is the alternative and it is worse in both directions: it makes the stream edit
+    text it did not write, on a guess about which words in free text are tool names, and a wrong
+    guess corrupts the task itself. Here the env's prose is untouched and the correction is
+    plainly the stream's.
+
+    Every name on the right-hand side comes from the same map :meth:`TaskStream._resolve` routes
+    on, so this can never point the agent at a name the endpoint does not register."""
+    mapping = ", ".join(f"`{native}` is called as `{public}`" for native, public in renamed)
+    return (
+        "This endpoint serves several envs and registers each tool name once, so this task's "
+        f"tools are registered under its env key: {mapping}. The instructions use the env's own "
+        "names; the names to call are the ones listed here, which are the names in `tools`."
+    )
+
+
+def _detached_manifest(manifest: ToolManifest) -> ToolManifest:
+    """One advertised tool on a copy of its own schema, for a reader that must not be able to
+    reach the stream's.
+
+    The frozen contract is only frozen if reading it cannot rewrite it, and a ``ToolManifest`` is
+    a mutable model whose ``input_schema`` is a mutable dict — ``model_copy`` copies the model
+    and keeps the dict. Shared, the same object is what a task's framing advertises, what a
+    server registered, and what a new episode's manifest is confirmed against: a reader that
+    edited it would change the contract the agent is shown *and* the one the drift check
+    compares against, so the two would still agree and nothing would notice. The snapshot behind
+    this is plain JSON (see the constructor), so copying it copies data and runs no env code."""
+    return manifest.model_copy(
+        update={"input_schema": copy.deepcopy(manifest.input_schema)}
     )
 
 
@@ -3716,6 +4039,24 @@ def _leased_manifest(manifest: ToolManifest) -> ToolManifest:
     return manifest.model_copy(update={"input_schema": schema})
 
 
+def _wire_json(value: Any) -> str:
+    """``value`` as the endpoint would put it on the wire — **proved**, not assumed.
+
+    Two things the type of a value does not settle. Strict JSON is the first: ``json.dumps``
+    accepts ``NaN`` and ``Infinity`` by default and writes them as bare tokens no JSON parser is
+    obliged to read, so a schema carrying one is advertised as something else entirely (FastMCP
+    sends ``null``) and the episode then refuses the value it advertised. UTF-8 is the second: a
+    Python ``str`` may hold an unpaired surrogate, which is text to every ``isinstance`` check and
+    a ``UnicodeEncodeError`` the moment a transport encodes it — and ``ensure_ascii`` would hide
+    exactly that by escaping it into ASCII, so the encode is done the way an endpoint does it.
+
+    Cheap to prove and expensive to assume: what fails here fails before anything is spent, and
+    what fails later fails after a task is out and its row is owed an outcome."""
+    text = json.dumps(value, allow_nan=False, ensure_ascii=False)
+    text.encode("utf-8")
+    return text
+
+
 def _strict_json_value(value: Any, enclosing: Tuple[int, ...]) -> Any:
     """One value on its way onto a row, **read exactly once** and rebuilt in plain containers,
     with every object name checked to be exact text.
@@ -3790,34 +4131,79 @@ def _strict_json_object(value: Any) -> Dict[str, Any]:
 _pending_closes: "set[asyncio.Task[None]]" = set()
 
 
-def _close_on_owning_loop(env: Env) -> bool:
-    """Close ``env`` from sync code **without moving it to a loop that does not own it**.
-    Returns True when the close was scheduled rather than completed.
+def _close_on_owning_loop(
+    catalog: Sequence[Tuple[str, Env]],
+) -> Tuple[bool, List[Tuple[str, Optional[BaseException]]]]:
+    """Close every env in ``catalog`` from sync code **without moving any of them to a loop that
+    does not own them**. Reports whether the closes were scheduled rather than completed, and
+    what each one raised.
 
     ``Env.close`` is a coroutine and the contract says nothing about loop affinity, while the
-    factory that built this env is explicitly allowed to provision resources — so an env built
+    factory that built these envs is explicitly allowed to provision resources — so an env built
     inside a running loop may hold objects belonging to *that* loop. Running its close on a
     private worker loop is therefore not a safe generalisation: at best it raises (a future
     attached to a different loop) and at worst it deadlocks, because the sync constructor
     waiting on the worker's result is blocking the very loop that close is waiting on.
 
-    So the close runs where the env was built. With no loop running there is nothing to conflict
-    with and this is a complete, synchronous close. Inside a running loop a *synchronous*
-    constructor cannot await one, so the close is scheduled on that loop and completes as soon
-    as the caller yields — after the error has propagated. That is the cost of validating in
-    ``__init__``: the alternative is an async construction boundary, which is a different API.
-    A caller that needs the close to be finished before it sees the error can construct outside
-    a loop; a caller inside one is told, on the error itself, that the cleanup is still in
-    flight."""
+    So the closes run where the envs were built. With no loop running there is nothing to
+    conflict with and these are complete, synchronous closes, run **together** on one temporary
+    loop: an env's close may block for as long as it likes, and started one at a time the first
+    one to do so would leave every env behind it open with nothing else holding it. Inside a
+    running loop a *synchronous* constructor cannot await one, so each close is scheduled on that
+    loop — already independent, since scheduling waits for nothing — and completes as soon as the
+    caller yields, after the error has propagated. That is the cost of validating in ``__init__``:
+    the alternative is an async construction boundary, which is a different API. A caller that
+    needs the closes to be finished before it sees the error can construct outside a loop; a
+    caller inside one is told, on the error itself, that the cleanup is still in flight.
+
+    Which of the two applies is a property of the calling frame, not of any env, so it is decided
+    once here rather than per env."""
     try:
-        loop = asyncio.get_running_loop()
+        loop: Optional[asyncio.AbstractEventLoop] = asyncio.get_running_loop()
     except RuntimeError:
-        asyncio.run(env.close())
-        return False
-    task = loop.create_task(env.close())
-    _pending_closes.add(task)
-    task.add_done_callback(_pending_closes.discard)
-    return True
+        loop = None
+    if loop is None:
+        try:
+            return False, asyncio.run(_close_together(catalog))
+        except BaseException as exc:  # noqa: BLE001 — never mask the failure being raised
+            # The batch shares one temporary loop, so a failure to run it at all is every env's
+            # and is reported against each of them.
+            return False, [(name, exc) for name, _ in catalog]
+    outcomes: List[Tuple[str, Optional[BaseException]]] = []
+    for name, env in catalog:
+        try:
+            task = loop.create_task(env.close())
+        except BaseException as exc:  # noqa: BLE001 — reported to the caller, never raised here
+            outcomes.append((name, exc))
+            continue
+        _pending_closes.add(task)
+        task.add_done_callback(_pending_closes.discard)
+        outcomes.append((name, None))
+    return True, outcomes
+
+
+async def _close_together(
+    catalog: Sequence[Tuple[str, Env]],
+) -> List[Tuple[str, Optional[BaseException]]]:
+    """Start every catalog env's close, then wait for all of them, pairing each outcome with the
+    env's name.
+
+    Each close is contained in its own task, so what ``gather`` waits for cannot fail: one env's
+    failure may not end the wait while the others are still running on a loop this call is about
+    to close, which is the whole point of starting them together. Classifying what came back is
+    the caller's — including a ``CancelledError``, which nothing here requests, so one that
+    arrives was raised by an env's own close."""
+    failures = await asyncio.gather(*(_close_contained(env) for _, env in catalog))
+    return [(name, failure) for (name, _), failure in zip(catalog, failures)]
+
+
+async def _close_contained(env: Env) -> Optional[BaseException]:
+    """Close one env, handing back what it raised instead of raising it."""
+    try:
+        await env.close()
+    except BaseException as exc:  # noqa: BLE001 — reported to the caller, never raised here
+        return exc
+    return None
 
 
 def _episode_items(feedback: Sequence[Dict[str, Any]], name: str) -> List[Dict[str, Any]]:
@@ -3938,11 +4324,12 @@ def build_stream_server(stream: TaskStream, *, name: Optional[str] = None) -> Fa
     async def get_task() -> Dict[str, Any]:
         """Take the next task off the queue and start it.
 
-        Returns the task framing — ``{env, instructions, budget, tools}`` — and never the task
-        index or the target. Returns ``{"done": true}`` once the queue is empty; any task
-        already dispensed to you is still yours to finish, and ``in_flight`` says how many of
-        them there are. Work the task with the native tools it lists; they route to it
-        automatically."""
+        Returns the task framing — ``{env, instructions, budget, tools}``, plus ``tool_naming``
+        when this endpoint serves several envs and renamed them — and never the task index or
+        the target. Returns ``{"done": true}`` once the queue is empty; any task already
+        dispensed to you is still yours to finish, and ``in_flight`` says how many of them there
+        are. Work the task with the tools it lists, by the names it lists them under; they route
+        to it automatically."""
         try:
             dispensed = await stream.get_task()
         except Exception:  # noqa: BLE001 — a stopped stream is the harness's business

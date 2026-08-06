@@ -36,7 +36,7 @@ from hgym.serve.stream import (
 from hgym.shared.terminate_mcp import TERMINATE_TOOL_NAME
 from hgym.task import TaskSpec, ToolManifest
 from hgym.types import EpisodeFeedback, FeedbackCollection
-from tests._fixtures.score_env import ENV_NAME, SUBMIT_TOOL, _FixtureScoreEnv
+from tests._fixtures.score_env import ENV_NAME, HORIZON, SUBMIT_TOOL, _FixtureScoreEnv
 
 TASKS = [
     {"id": "q0", "question": "2+2?", "answer": "4"},
@@ -272,6 +272,338 @@ async def test_a_forced_abort_the_env_fails_is_not_an_earned_give_up(tmp_path: P
     with pytest.raises(RuntimeError, match="failed while the stream ended a task") as end:
         await stream.aclose()
     assert isinstance(end.value.__cause__, ValueError)
+
+
+# ----- a call the harness could not carry -----
+
+
+def _rekeyed(schema: Dict[str, Any], wrap: Any) -> Dict[str, Any]:
+    """The same submit schema with its first property key replaced by an instance of ``wrap``.
+
+    A ``str`` subclass is how a plugin value of this shape reaches the serving layer: the models
+    coerce one away at construction and do not validate on assignment, so a manifest mutated after
+    it was built carries the subclass through verbatim. Both halves are rekeyed, because a key
+    named in ``required`` is looked up in ``properties`` and a schema names the same argument in
+    both."""
+    props = dict(schema.get("properties") or {})
+    key, value = next(iter(props.items()))
+    del props[key]
+    props[wrap(key)] = value
+    required = [wrap(name) if name == key else name for name in schema.get("required") or []]
+    return {**schema, "properties": props, "required": required}
+
+
+def _publishes_a_terminal_schema_that_cannot_be_used() -> Tuple[Any, Any]:
+    """An env whose submit schema is exactly what the wire carries and still cannot validate a
+    call: a ``$ref`` that points nowhere.
+
+    Nothing above notices — it is plain JSON, it serialises identically wherever the contract is
+    compared, and a server advertises it verbatim — and resolving it while checking a terminal
+    call raises out of the validator. So the agent is told to call a terminal that answers every
+    call with an exception, and so is the stream when it drives that same terminal itself.
+
+    Nothing is armed: this is what the env publishes from the start, which is the shape a real env
+    ships when a schema names a definition it never included. (A key whose *own* code misbehaved
+    would not reach here any more — an episode enforces the contract in wire form, so an env
+    object cannot be what a terminal call is validated against; see
+    :func:`hgym.serve.episode._wire_form`.)"""
+
+    class _Env(_FixtureScoreEnv):
+        def describe(self, task_id: Any = None) -> TaskSpec:
+            spec = super().describe(task_id)
+            for manifest in spec.tools:
+                if manifest.name == SUBMIT_TOOL:
+                    # At the top level, so it is resolved for *any* arguments — the agent's
+                    # own submission and the empty call the stream drives alike.
+                    manifest.input_schema = {"$ref": "#/definitions/answer"}
+            return spec
+
+    def arm() -> None:
+        return None
+
+    return (lambda _name: _Env(tasks=TASKS)), arm
+
+
+def _raises_verifying_mid_episode() -> Tuple[Any, Any]:
+    """An env whose ``verify`` raises on every non-terminal step. The step is already committed to
+    the trajectory when it runs, so the budget is spent on a call that produced nothing."""
+
+    class _Env(_FixtureScoreEnv):
+        def _verify(self, trajectory, task, *, terminated, evidence=None) -> FeedbackCollection:
+            if not terminated:
+                raise RuntimeError("this env cannot verify a step")
+            return super()._verify(trajectory, task, terminated=terminated, evidence=evidence)
+
+    return (lambda _name: _Env(tasks=TASKS)), (lambda: None)
+
+
+def _cannot_read_its_horizon() -> Tuple[Any, Any]:
+    """An env whose ``horizon`` raises once the task is out. The episode reads it on every
+    ordinary call to decide whether *that* call is the one that reaches the budget, so a horizon
+    that cannot be read is an episode that cannot tell whether the task just ended."""
+    armed = [False]
+
+    class _Env(_FixtureScoreEnv):
+        @property
+        def horizon(self) -> Any:
+            if armed[0]:
+                raise RuntimeError("this env cannot say what its budget is")
+            return HORIZON
+
+        @horizon.setter
+        def horizon(self, value: Any) -> None:
+            pass
+
+    def arm() -> None:
+        armed[0] = True
+
+    return (lambda _name: _Env(tasks=TASKS)), arm
+
+
+@pytest.mark.parametrize(
+    ("build", "tool", "args", "failure", "stops"),
+    [
+        pytest.param(
+            _publishes_a_terminal_schema_that_cannot_be_used,
+            SUBMIT_TOOL,
+            {"answer": "4"},
+            "definitions/answer",
+            True,
+            id="the terminal call cannot be validated",
+        ),
+        pytest.param(
+            _raises_verifying_mid_episode,
+            "noop",
+            {},
+            "this env cannot verify a step",
+            False,
+            id="an ordinary call cannot be verified",
+        ),
+        pytest.param(
+            _cannot_read_its_horizon,
+            "noop",
+            {},
+            "this env cannot say what its budget is",
+            False,
+            id="the budget cannot be read",
+        ),
+    ],
+)
+async def test_a_call_the_harness_lost_is_not_a_task_the_agent_played_out(
+    tmp_path: Path, build: Any, tool: str, args: Dict[str, Any], failure: str, stops: bool
+) -> None:
+    """A call that raises *before* the episode has ended, at each of the places the harness's own
+    machinery reads something the env published.
+
+    The exception is still the env's answer to a call the agent can make again, so it goes back
+    verbatim and the task stays live. What it may not also be is forgotten. The call reached no
+    result, so nothing it was for is on the episode's record — and if the agent never does end the
+    task, the drain drives the terminal itself and files the row in a *scored* closure. The first
+    of these cases is the sharpest: the agent submitted the right answer, the harness dropped it
+    validating it, and the run recorded a task the agent answered wrong.
+
+    What that costs is this task's score, and ``stops`` is which of these cases costs more than
+    that: the first case breaks the terminal the *stream* then drives as well, and an env that
+    cannot end this task will not end the next one either.
+
+    The class of what comes back is the env's business — a broken schema raises the validator's
+    error and a broken callback raises its own — so what is asserted here is that it comes back
+    at all, and that the row afterwards names it."""
+    factory, arm = build()
+    stream = _stream(tmp_path, [0], factory=factory)
+    await stream.get_task()
+    arm()
+    with pytest.raises(Exception):  # noqa: B017 — see above; the type is the env's, not ours
+        await stream.dispatch(tool, args)
+    # Nothing ended, so nothing is refused yet: the task is still the agent's to finish.
+    assert stream.queue_info().in_flight == 1
+    assert not stream.stopped
+
+    # It does not finish it, so the stream ends the task — and what the stream ends is not an
+    # outcome the agent produced.
+    if stops:
+        with pytest.raises(RuntimeError, match="failed while the stream ended a task"):
+            await stream.aclose()
+    else:
+        await stream.aclose()
+    (row,) = stream.results
+    assert row.closure == "finalize_error", "a call the harness lost is not a wrong answer"
+    assert row.score is None, "an unearned outcome may never be averaged in"
+    # What actually failed is on the row, which is the only place a maintainer will find it: the
+    # agent was answered with the redacted constant, and nothing else in the run says the call
+    # was ever made.
+    assert failure in (row.diagnostic or ""), "the row must name the failure behind it"
+    # And the row is the whole answer the lost call itself is owed. `score=None` cannot be
+    # averaged into anything, so the record is already honest about this task without the queue
+    # behind it paying for one mid-episode failure — the stop belongs to the terminal that also
+    # failed, not to the call that did.
+    assert stream.stopped is stops
+    # The durable record says the same, and it *answers* the dispense: a task handed out and left
+    # unscored is not something recovery has to find, because the row is right there.
+    durable = read_results(tmp_path / "prov")
+    assert [(r.closure, r.score) for r in durable] == [("finalize_error", None)]
+    assert reconcile(tmp_path / "prov") == []
+
+
+@pytest.mark.parametrize(
+    ("build", "failure"),
+    [
+        pytest.param(
+            _raises_verifying_mid_episode,
+            "cannot verify a step",
+            id="an ordinary call cannot be verified",
+        ),
+        pytest.param(
+            _cannot_read_its_horizon,
+            "cannot say what its budget is",
+            id="the budget cannot be read",
+        ),
+    ],
+)
+async def test_a_lost_call_the_agent_recovers_from_is_still_the_agent_s_task(
+    tmp_path: Path, build: Any, failure: str
+) -> None:
+    # The other side of that line, and the one over-correcting would cross. A mid-episode failure
+    # is not a verdict about anything: the agent calls again, ends the task itself, and what its
+    # own terminal says is what it earned. Refusing the task there would take a run the agent
+    # completed and record it as an infrastructure failure.
+    #
+    # Both boundaries a live call can be lost at, because the loss is kept on the entry and the
+    # seal reads it: one that stayed unrecovered lands `finalize_error` with the failure on the
+    # row (above), and the same kept loss must *not* follow the agent onto a task it went on to
+    # finish. A recovered task carries no scar — no diagnostic beside a score the agent earned,
+    # because a row that both scores a success and names a failure is one no reader can act on:
+    # it reads as a result arrived at unsoundly, and this one was not.
+    factory, arm = build()
+    stream = _stream(tmp_path, [0], factory=factory)
+    async with stream:
+        await stream.get_task()
+        arm()
+        with pytest.raises(RuntimeError, match=failure):
+            await stream.dispatch("noop", {})
+        await stream.dispatch(SUBMIT_TOOL, {"answer": "4"})
+    (row,) = stream.results
+    assert row.closure == "sealed"
+    assert row.score is not None and row.score.success is True
+    assert row.diagnostic is None, "a recovered task's earned row carries no failure"
+    assert not stream.stopped
+    # And the durable record is the same row: the scar would be there to read if it were kept.
+    (durable,) = read_results(tmp_path / "prov")
+    assert durable.closure == "sealed" and durable.diagnostic is None
+    assert durable.score is not None and durable.score.success is True
+
+
+def _loses_one_call() -> Tuple[Any, Any]:
+    """An env that drops exactly one call and then behaves — the transient fault a long run
+    actually meets (a session that hiccups once), as opposed to one that will lose a call in
+    every task it is given."""
+    armed = [False]
+
+    class _Env(_FixtureScoreEnv):
+        @property
+        def horizon(self) -> Any:
+            if armed[0]:
+                armed[0] = False  # one call is lost; the next one is answered
+                raise RuntimeError("this env lost one call")
+            return HORIZON
+
+        @horizon.setter
+        def horizon(self, value: Any) -> None:
+            pass
+
+    def arm() -> None:
+        armed[0] = True
+
+    return (lambda _name: _Env(tasks=TASKS)), arm
+
+
+async def test_a_lost_call_costs_its_own_task_and_not_the_queue_behind_it(
+    tmp_path: Path,
+) -> None:
+    """What the unscored row buys, and the reason it is the whole answer: `score=None` cannot be
+    averaged into anything, so the record is honest about the task that lost a call without the
+    tasks *after* it paying for that call. A stop here would read one blip mid-episode as a
+    verdict on every task still queued."""
+    factory, arm = _loses_one_call()
+    stream = _stream(tmp_path, [0, 1], factory=factory)
+    async with stream:
+        await stream.get_task()
+        arm()
+        with pytest.raises(RuntimeError, match="lost one call"):
+            await stream.dispatch("noop", {})
+        # The agent gives up on this one and pulls the next, so the stream ends the first itself.
+        await stream.get_task()
+        await stream.dispatch(SUBMIT_TOOL, {"answer": "6"})
+    lost, played = stream.results
+    assert lost.closure == "finalize_error" and lost.score is None, (
+        "the task whose call was lost is not scored"
+    )
+    assert played.closure == "sealed", "the next task was served, on a fresh episode"
+    assert played.score is not None and played.score.success is True, (
+        "and it is scored on what the agent actually did"
+    )
+    assert not stream.stopped
+    assert [(r.closure, r.score is None) for r in read_results(tmp_path / "prov")] == [
+        ("finalize_error", True),
+        ("sealed", False),
+    ]
+    assert reconcile(tmp_path / "prov") == []
+
+
+async def test_a_forced_score_terminal_that_raises_is_not_settled_by_the_abort(
+    tmp_path: Path,
+) -> None:
+    # The same env with no agent call anywhere in it. The drain drives the env's score terminal,
+    # which raises, and falls back to the reserved abort — which succeeds, and whose fail-closed
+    # `correct=False` is what the row would headline. Reading the abort as an answer to the
+    # refusal records a verdict for a task whose only scoring terminal cannot be called, for every
+    # task of that env in the queue.
+    factory, arm = _publishes_a_terminal_schema_that_cannot_be_used()
+    stream = _stream(tmp_path, [0], factory=factory)
+    await stream.get_task()
+    arm()
+    with pytest.raises(RuntimeError, match="failed while the stream ended a task"):
+        await stream.aclose()
+    (row,) = stream.results
+    assert row.closure == "finalize_error", "an abort the stream imposed is not a verdict"
+    assert row.score is None
+    assert "no verdict" in (row.diagnostic or "")
+    assert [r.closure for r in read_results(tmp_path / "prov")] == ["finalize_error"]
+
+
+async def test_a_required_key_this_schema_cannot_name_is_still_a_validation_error(
+    tmp_path: Path,
+) -> None:
+    # The narrow half: a schema key whose `repr` raises, reached only where a refusal names the
+    # argument it is about. Nothing about the contract is unusable here — the caller sent a blank
+    # string and can send a real one — so the refusal has to survive its own decoration. Unguarded
+    # it becomes an exception instead, and the submission the agent could have corrected is lost.
+    class _Key(str):
+        def __repr__(self) -> str:
+            raise RuntimeError("this schema key cannot be named")
+
+    class _Env(_FixtureScoreEnv):
+        def describe(self, task_id: Any = None) -> TaskSpec:
+            spec = super().describe(task_id)
+            for manifest in spec.tools:
+                if manifest.name == SUBMIT_TOOL:
+                    manifest.input_schema = _rekeyed(manifest.input_schema, _Key)
+            return spec
+
+    stream = _stream(tmp_path, [0], factory=lambda _name: _Env(tasks=TASKS))
+    async with stream:
+        await stream.get_task()
+        blank = await stream.dispatch(SUBMIT_TOOL, {"answer": "   "})
+        refusal = json.loads(json.loads(blank.content[0].text)["content"])
+        assert refusal["validation_error"] is True
+        assert refusal["error"].endswith("must be a non-blank string")
+        assert "cannot be named" not in refusal["error"], "the env's failure is not the caller's"
+        # The episode was never touched, so the answer the agent sends next still earns its score.
+        await stream.dispatch(SUBMIT_TOOL, {"answer": "4"})
+    (row,) = stream.results
+    assert row.closure == "sealed"
+    assert row.score is not None and row.score.success is True
+    assert not stream.stopped
 
 
 class _Unrenderable(RuntimeError):

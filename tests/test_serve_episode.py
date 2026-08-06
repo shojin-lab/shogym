@@ -192,3 +192,54 @@ async def test_horizon_terminates_env_side_without_a_terminate_call(tmp_path: Pa
 async def test_start_rejects_unknown_env() -> None:
     with pytest.raises(ValueError):
         await ServedEpisode.start("does_not_exist")
+
+
+async def test_an_episode_enforces_the_contract_it_advertises() -> None:
+    # The contract this episode publishes and the contract it enforces are one object: the score
+    # terminal is found by comparing the name a call arrives under against the names in it, and a
+    # terminal call's arguments are validated against the schema in it. Both of those are the
+    # env's own values, and a JSON scalar has subclasses the models coerce away at construction
+    # but not on assignment — so a name or a `const` can serialise as ordinary text and answer a
+    # comparison its own way.
+    #
+    # Advertised, they are what a client is shown and what an agent acts on. Enforced, the same
+    # values match nothing the agent can send: the terminal is dispatched as an ordinary step and
+    # seals nothing, or the argument the framing described is refused. Both end as a task the
+    # agent is recorded as having played badly. So the snapshot is normalised to the wire form.
+    from tests._fixtures.score_env import ENV_NAME, SUBMIT_TOOL, _FixtureScoreEnv
+
+    class _NeverEqual(str):
+        def __eq__(self, other: object) -> bool:
+            return False
+
+        def __ne__(self, other: object) -> bool:
+            return True
+
+        __hash__ = str.__hash__
+
+    class _PublishesSubclasses(_FixtureScoreEnv):
+        def describe(self, task_id=None):
+            spec = super().describe(task_id)
+            for manifest in spec.tools:
+                if manifest.name == SUBMIT_TOOL:
+                    manifest.name = _NeverEqual(SUBMIT_TOOL)
+                    schema = json.loads(json.dumps(manifest.input_schema))
+                    schema["properties"]["answer"]["const"] = _NeverEqual("4")
+                    manifest.input_schema = schema
+            return spec
+
+    tasks = [{"id": "q0", "question": "2+2?", "answer": "4"}]
+    ep = await ServedEpisode.open_env(
+        _PublishesSubclasses(tasks=tasks), env_name=ENV_NAME, task=0
+    )
+    try:
+        published = ep.describe()
+        assert all(type(tool.name) is str for tool in published.tools)
+        submit = next(t for t in published.tools if t.name == SUBMIT_TOOL)
+        assert type(submit.input_schema["properties"]["answer"]["const"]) is str
+        # The advertised terminal, called with the advertised-correct argument, ends the task.
+        result = await ep.call(SUBMIT_TOOL, {"answer": "4"})
+        assert result.terminated is True, "the advertised score terminal sealed nothing"
+        assert "validation_error" not in result.content
+    finally:
+        await ep.close()

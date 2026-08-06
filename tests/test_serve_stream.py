@@ -26,6 +26,8 @@ from hgym.serve.stream import (
     TaskStream,
     build_stream_server,
     read_dispenses,
+    read_results,
+    reconcile,
 )
 from hgym.shared.terminate_mcp import TERMINATE_TOOL_NAME
 from hgym.task import TaskSpec, ToolManifest
@@ -694,6 +696,69 @@ def test_a_failed_construction_outside_a_loop_closes_the_catalog_envs_there(
     assert not getattr(raised.value, "__notes__", [])
 
 
+def test_a_failed_construction_lets_every_catalog_env_go_independently(
+    tmp_path: Path,
+) -> None:
+    # `Env.close()` is third-party code that may block for as long as it likes — an MCP session
+    # that never answers, a subprocess that will not reap. Closed one at a time, the first such
+    # env decided whether any env after it was closed at all: they stayed open, holding whatever
+    # they hold, for exactly as long as it hung, with the constructor already committed to
+    # raising and nothing else left holding them. So every close is started before any of them is
+    # waited for.
+    #
+    # The first env below waits for the second one to *start* closing, which serially is a wait
+    # that can only time out. It is not a bound on teardown — there is none — it is how a test
+    # asks "did the second one get to start" without hanging when the answer is no.
+    gate: Dict[str, Any] = {}
+
+    class _WaitsForItsSibling(_FixtureScoreEnv):
+        def __init__(self, key: str, **kwargs: Any) -> None:
+            super().__init__(**kwargs)
+            self.key = key
+            self.saw_sibling: Any = None
+            self.closed = False
+
+        async def close(self) -> None:
+            started = gate.setdefault("started", asyncio.Event())
+            if self.key == "first":
+                try:
+                    await asyncio.wait_for(started.wait(), 5.0)
+                    self.saw_sibling = True
+                except (asyncio.TimeoutError, TimeoutError):
+                    self.saw_sibling = False
+            else:
+                started.set()
+            self.closed = True
+            await super().close()
+
+    built: List[_WaitsForItsSibling] = []
+
+    def factory(_name: str) -> _WaitsForItsSibling:
+        env = _WaitsForItsSibling(
+            key="first" if not built else "second", tasks=TASKS
+        )
+        built.append(env)
+        return env
+
+    # Refused after the catalog is built, so both envs exist and both are this cleanup's to
+    # release: a stored dispense naming a task this queue does not hold at that position.
+    (tmp_path / "prov").mkdir(parents=True)
+    (tmp_path / "prov" / "dispenses.jsonl").write_text(
+        json.dumps({"lease": "l", "seq": 1, "position": 1, "env": "a", "task_idx": 0}) + "\n"
+    )
+    with pytest.raises(ValueError, match="holds a dispense record"):
+        TaskStream(
+            factory,
+            [TaskRef("a", 0), TaskRef("b", 0)],
+            prov_dir=tmp_path / "prov",
+            resume=True,
+        )
+    assert len(built) == 2 and all(env.closed for env in built)
+    assert built[0].saw_sibling is True, (
+        "the second env's close did not start until the first one had finished"
+    )
+
+
 async def test_a_catalog_env_is_never_closed_on_a_foreign_loop(tmp_path: Path) -> None:
     # The failure this replaces: closing on a private worker loop. An env whose resources belong
     # to the loop that built it then fails to close (a future attached to a different loop), or
@@ -901,9 +966,9 @@ async def test_a_provenance_directory_the_run_created_is_synced_into_its_parent(
     #
     # Every level, not only the ones this run created: `mkdir` makes a level visible immediately
     # and durable never, so a directory that already existed says nothing about whether anyone
-    # ever published its entry. A harness that made the output path a moment earlier, or a writer
-    # that made it and died before its own sync, leaves a run that syncs nothing at all and
-    # reports every write a success over a record a crash can still take whole.
+    # ever published its entry. A harness that made the output path a moment earlier, or a
+    # writer that made it and died before its own sync, leaves a run that syncs nothing at all
+    # and reports every write a success over a record a crash can still take whole.
     real_fsync = os.fsync
     synced: List[Tuple[int, int]] = []
 
@@ -1290,6 +1355,116 @@ async def test_a_summary_value_that_cannot_be_described_still_fails_loudly(
     assert "RuntimeError: repr exploded" in str(end.value)
 
 
+async def test_a_feedback_name_that_cannot_be_compared_still_lands_the_row_it_earned(
+    tmp_path: Path,
+) -> None:
+    # The other half of the funnel, and the one that was left open. Finding a summary item
+    # *matches names*, and a name is an object the env supplied — the same post-construction
+    # `str` subclass the wire admits above, here with a raising `__eq__` instead of a raising
+    # `__repr__`. That raise is not a `_MalformedSummary`, so it escaped the one handler around
+    # the summary and took the whole seal with it: no row was ever composed, nothing reached the
+    # file, and the durable dispense went unanswered — so `reconcile` reported the run as a
+    # broker crash. The task below is *correct*, and a correct, sealed, graded task was being
+    # filed as an evaluator that fell over.
+    #
+    # A summary this record cannot read is the same finding as one it cannot honour, so it gets
+    # the same answer: the row lands with the env's evidence verbatim and no headline, and then
+    # the stream stops.
+    class _ExplodingName(str):
+        def __eq__(self, other: object) -> bool:
+            raise RuntimeError("eq exploded")
+
+        def __ne__(self, other: object) -> bool:
+            raise RuntimeError("eq exploded")
+
+        __hash__ = str.__hash__
+
+    class _NamesExplode(_FixtureScoreEnv):
+        def _verify(self, trajectory, task, *, terminated, evidence=None) -> FeedbackCollection:
+            fb = super()._verify(trajectory, task, terminated=terminated, evidence=evidence)
+            for item in fb.episode:
+                item.name = _ExplodingName(item.name)
+            return fb
+
+    clean = await _clean_terminal_response(tmp_path)
+    stream = TaskStream(
+        lambda _name: _NamesExplode(tasks=TASKS),
+        [TaskRef(ENV_NAME, 0), TaskRef(ENV_NAME, 1)],
+        prov_dir=tmp_path / "prov",
+    )
+    await stream.get_task()
+    assert _terminal_text(await stream.dispatch(SUBMIT_TOOL, {"answer": "4"})) == clean
+
+    (row,) = _rows(tmp_path)
+    assert row["closure"] == "sealed", "the agent's own seal was reclassified"
+    assert row["score"] is None, "a summary this record could not read was headlined anyway"
+    assert row["observed"] == [
+        _episode_item("correct", True)
+    ], "the evidence the agent earned must survive verbatim"
+    assert "cannot headline" in (row["diagnostic"] or ""), "the file must say why it is unscored"
+    # Serialised before it is compared, because the in-memory row keeps the env's items exactly
+    # as the env published them — the name in it is the object that raises.
+    assert json.loads(json.dumps(stream.results[0].to_wire())) == row
+    assert stream.queue_info().in_flight == 0, "the episode outlived its recorded row"
+    # The point of the row landing: the dispense is answered, so the run is not read back as a
+    # crash that never happened.
+    assert reconcile(tmp_path / "prov") == []
+    assert stream.stopped, "an env whose names cannot be compared may not serve the rest of a queue"
+    with pytest.raises(RuntimeError, match="cannot headline.*eq exploded"):
+        await stream.get_task()
+    with pytest.raises(RuntimeError, match="cannot headline.*eq exploded") as end:
+        await stream.aclose()
+    assert "RuntimeError: eq exploded" in str(end.value)
+
+
+async def test_a_verdict_this_record_cannot_read_still_lands_the_row_it_owes(
+    tmp_path: Path,
+) -> None:
+    # The same defect one step earlier, at the sibling read: the closure is classified from the
+    # core's terminal payload, which is the verdict dict *the env returned* with the core's flag
+    # written over it — so reading it compares this module's key against keys the env owns, and
+    # an env's `__eq__` is env code. Uncontained, that raise reached `_seal_redacted`, which
+    # stops the stream and swallows the exception, so no row was composed even though `dispatch`
+    # had already decided one was owed. The dispense went unanswered and `reconcile` called the
+    # run a broker crash.
+    #
+    # A verdict this record cannot read is a task with no verdict standing behind it, which is
+    # what a failed terminal already means — so it is recorded as one, and the row lands.
+    class _ExplodingKey(str):
+        def __eq__(self, other: object) -> bool:
+            raise RuntimeError("key eq exploded")
+
+        def __ne__(self, other: object) -> bool:
+            raise RuntimeError("key eq exploded")
+
+        __hash__ = str.__hash__
+
+    class _VerdictKeyExplodes(_FixtureScoreEnv):
+        async def finalize(self, req: FinalizeRequest) -> TerminalEvidence:
+            evidence = await super().finalize(req)
+            evidence.verdict = {_ExplodingKey("finalize_error"): False, "correct": True}
+            return evidence
+
+    clean = await _clean_terminal_response(tmp_path)
+    stream = TaskStream(
+        lambda _name: _VerdictKeyExplodes(tasks=TASKS),
+        [TaskRef(ENV_NAME, 0), TaskRef(ENV_NAME, 1)],
+        prov_dir=tmp_path / "prov",
+    )
+    await stream.get_task()
+    assert _terminal_text(await stream.dispatch(SUBMIT_TOOL, {"answer": "4"})) == clean
+
+    (row,) = _rows(tmp_path)
+    assert row["closure"] == "finalize_error", "a task with no readable verdict is not a seal"
+    assert row["score"] is None, "a task with no verdict behind it may not be scored"
+    assert "key eq exploded" in (row["diagnostic"] or ""), "the file must name what failed"
+    assert stream.results[0].to_wire() == row
+    assert reconcile(tmp_path / "prov") == [], "the durable dispense went unanswered"
+    assert stream.stopped
+    with pytest.raises(RuntimeError, match="key eq exploded"):
+        await stream.aclose()
+
+
 async def test_a_row_keeps_each_item_at_the_level_the_env_published_it(
     tmp_path: Path,
 ) -> None:
@@ -1346,49 +1521,12 @@ async def test_an_inference_item_never_headlines_a_row(tmp_path: Path) -> None:
     assert all(item["level"] == "inference" for item in row["observed"])
 
 
-async def test_reading_the_recorded_rows_cannot_rewrite_them(tmp_path: Path) -> None:
-    # `results` used to hand back the run's own rows: `results[0] is results[0]`. A `ResultRow` is
-    # frozen and *shallow*, so what a reader got was a handle on `observed` and on the one list
-    # that `score.feedback` also is — and an edit through either changed what the run reported
-    # while the file it had already committed said something else. That is the shape of the worst
-    # version: an in-memory row headlining `success=True` beside an `observed` item saying the
-    # answer was wrong, with the record on disk agreeing with neither.
-    #
-    # So the run keeps one canonical row — the wire form the file holds — and every read is a
-    # copy of it.
-    async with _stream(tmp_path, [0, 1]) as stream:
-        await stream.get_task()
-        await stream.dispatch(SUBMIT_TOOL, {"answer": "4"})
-        await stream.get_task()
-        await stream.dispatch(SUBMIT_TOOL, {"answer": "wrong"})
-
-    durable = _rows(tmp_path)
-    assert [row.to_wire() for row in stream.results] == durable, (
-        "what the run reports in memory and what it committed are one record"
-    )
-    first = stream.results[0]
-    assert first is not stream.results[0], "two reads of the record share one row"
-    assert first.score is not None
-    assert first.observed is not first.score.feedback, "one list is both halves of the row"
-
-    # A reader edits everything the frozen row leaves reachable, at every level.
-    for row in stream.results:
-        row.observed[0]["value"] = "invented"
-        row.observed.append(_episode_item("invented", True))
-        row.extensions["invented"] = True
-        if row.score is not None:
-            row.score.feedback[0]["value"] = "invented"
-
-    assert [row.to_wire() for row in stream.results] == durable, "the record was rewritten"
-    assert _rows(tmp_path) == durable
-    # The outcomes are still the ones the two episodes earned.
-    assert [row.score.success for row in stream.results if row.score] == [True, False]
-
-
 async def test_the_run_keeps_the_row_the_file_holds(tmp_path: Path) -> None:
-    # The other half of that, and the one a rewrite can drop without anything noticing: what the
-    # run *keeps* is the row re-read from the wire form it just committed, not the one it
-    # composed. Composed, the row is a handle on the env's own values — `observed` holds the
+    # What a reader is handed being a copy is half of it; the other half is what it is a copy
+    # *of*, and that half a rewrite can drop without anything noticing. What the run keeps is the
+    # row re-read from the wire form it just committed, not the one it composed (see
+    # `test_reading_the_recorded_rows_cannot_rewrite_them` for the reader's half). Composed, the
+    # row is a handle on the env's own values — `observed` holds the
     # items the episode published and `score.feedback` is that same list — so a reader that
     # copies it runs the env's code, on a run that is already over. A feedback value is allowed
     # to be a `str` subclass (the models do not validate on assignment), and one whose
@@ -1645,36 +1783,56 @@ async def test_an_episode_that_changes_a_schema_is_never_dispensed(tmp_path: Pat
 async def test_a_drifted_tool_name_that_cannot_be_described_still_stops_the_stream(
     tmp_path: Path,
 ) -> None:
-    # The refusal names the tools the two manifests disagree about, and naming them calls the
-    # env's own `__repr__`. Unguarded, the env decides whether its own refusal happens: the raise
-    # comes from *inside* the message, which is an argument to the stop, so `_stop` is never
-    # reached. The drift is still refused for this task — and nothing else. `stopped` stays
-    # false, so the next instance the factory builds is dispensed and scored against the very
-    # contract this call refused, and `aclose()` reports a clean run over it.
+    # The refusal names the tools the two manifests disagree about, and naming an env's object
+    # calls the env's own `__repr__`. Unguarded, that let the env decide whether its own refusal
+    # happened: the raise came from *inside* the message, which is an argument to the stop, so
+    # `_stop` was never reached — the drift was refused for this task and nothing else, and the
+    # rest of the queue was dispensed and scored against the very contract the call refused.
     #
-    # The refusal outranks its own decoration: the stop lands, and the name degrades to the
-    # failure that asking for it raised.
-    def add_an_undescribable_tool(spec: TaskSpec) -> None:
-        added = ToolManifest(
-            name="hint",
-            description="Ask for a hint.",
-            input_schema={"type": "object", "properties": {}},
-        )
-        # Assigned rather than constructed, for the reason `_publishes_undescribable` gives:
-        # the models coerce the subclass away at construction and do not validate on assignment.
-        added.name = _Undescribable("hint")
-        spec.tools = [*spec.tools, added]
+    # Neither half of the comparison is the env's object any more. The published side is frozen
+    # when it is read (`_frozen_manifest`) and the episode side is snapshotted in wire form
+    # (`hgym.serve.episode._wire_form`), so an undescribable name is plain text by the time
+    # anything here reads it: the drift is named plainly and the stop lands. The guard the name
+    # used to need is still what stands behind the values that *are* the env's — the published
+    # feedback a summary refusal is about (see `_pick_summary`).
+    #
+    # What this pins is the outcome, which is the same either way: a contract the endpoint does
+    # not serve stops the run rather than being scored against.
+    class _Undescribes(_TrackedEnv):
+        def __init__(self, undescribable: bool, **kwargs: Any) -> None:
+            self._undescribable = undescribable
+            super().__init__(**kwargs)
+
+        def describe(self, task_id: Any = None) -> TaskSpec:
+            spec = super().describe(task_id)
+            if not self._undescribable:
+                return spec
+            extra = ToolManifest(
+                name="hint",
+                description="Ask for a hint.",
+                input_schema={"type": "object", "properties": {}},
+            )
+            # Assigned rather than constructed, for the reason `_publishes_undescribable` gives:
+            # the models coerce the subclass away at construction and do not validate on
+            # assignment.
+            extra.name = _Undescribable("hint")
+            spec.tools = [*spec.tools, extra]
+            return spec
 
     built: List[_TrackedEnv] = []
+
+    def factory(_name: str) -> _Undescribes:
+        env = _Undescribes(undescribable=not built, tasks=TASKS)
+        built.append(env)
+        return env
+
     stream = TaskStream(
-        _drifting_factory(add_an_undescribable_tool, built),
+        factory,
         [TaskRef(ENV_NAME, 0), TaskRef(ENV_NAME, 1)],
         prov_dir=tmp_path / "prov",
     )
-    with pytest.raises(RuntimeError, match="different tool manifest.*cannot describe") as refused:
+    with pytest.raises(RuntimeError, match=r"different tool manifest.*removed \['hint'\]"):
         await stream.get_task()
-    # The env that published the name is pointed at, rather than the failure being swallowed.
-    assert "RuntimeError: repr exploded" in str(refused.value)
 
     # The stop is the whole point: the drift belongs to the factory, so without it the rest of
     # the queue is served against the same contract the endpoint does not expose.
@@ -1730,6 +1888,122 @@ async def test_an_episode_manifest_that_cannot_be_compared_still_stops_the_strea
     assert all(env.closed for env in built)
 
 
+async def test_an_episode_is_checked_against_the_contract_its_own_seal_enforces(
+    tmp_path: Path,
+) -> None:
+    # The check above reads the episode's manifest, and reading it used to be a *second* call
+    # into `Env.describe` — the first having already been spent capturing the schemas the seal
+    # validates a terminal call's arguments against. Nothing obliges two calls to agree. An env
+    # that answers the first with a private contract and every later one with the published
+    # contract therefore passed the drift check, was framed with the published tools, and then
+    # refused the agent's correctly-shaped submission against a schema it had never been shown:
+    # the task drained with `correct=False`, an advertised-correct action recorded as a wrong
+    # answer, with nothing anywhere saying the two contracts differed.
+    #
+    # One description per episode is what closes it. The contract the check confirms, the
+    # contract the framing is built from and the contract the seal enforces are the same object,
+    # so an env that publishes two of them is caught by the check that already exists instead of
+    # slipping between its two reads.
+    class _PrivateFirstDescription(_TrackedEnv):
+        """Publishes a contract of its own on its FIRST description and the published one after."""
+
+        def __init__(self, private: bool, **kwargs: Any) -> None:
+            super().__init__(**kwargs)
+            self._private = private
+            self.describes = 0
+
+        def describe(self, task_id: Any = None) -> TaskSpec:
+            spec = super().describe(task_id)
+            self.describes += 1
+            if self._private and self.describes == 1:
+                spec.tools = [
+                    m.model_copy(
+                        update={
+                            "input_schema": {
+                                "type": "object",
+                                "properties": {"choice": {"type": "integer"}},
+                                "required": ["choice"],
+                                "additionalProperties": False,
+                            }
+                        }
+                    )
+                    if m.name == SUBMIT_TOOL
+                    else m
+                    for m in spec.tools
+                ]
+            return spec
+
+    built: List[_PrivateFirstDescription] = []
+
+    def factory(_name: str) -> _PrivateFirstDescription:
+        # The catalog instance is described at construction; only the episodes drift.
+        env = _PrivateFirstDescription(private=bool(built), tasks=TASKS)
+        built.append(env)
+        return env
+
+    stream = TaskStream(
+        factory, [TaskRef(ENV_NAME, 0), TaskRef(ENV_NAME, 1)], prov_dir=tmp_path / "prov"
+    )
+    with pytest.raises(RuntimeError, match="different tool manifest.*changed"):
+        await stream.get_task()
+    # No task was handed out at all, so there is no framing to have been wrong about and no row
+    # to carry a number the agent could not have earned.
+    assert stream.results == ()
+    assert not (tmp_path / "prov" / "results.jsonl").exists()
+    assert stream.stopped, "an env that publishes two contracts may not serve the rest of a queue"
+    assert built[1].describes == 1, "the episode was described more than once"
+    assert built[1].closed, "the refused episode's env was never released"
+    with pytest.raises(RuntimeError, match="stopped before its queue was served"):
+        await stream.aclose()
+
+
+async def test_reading_the_published_contract_cannot_rewrite_it(tmp_path: Path) -> None:
+    # Both public readings of the frozen manifest used to hand back the stream's own schema
+    # object: `DispensedTask.tools[i]["input_schema"]` *was* `TaskStream.tools[i].input_schema`,
+    # and both were the dict the env returned. Editing either one edited the contract — the
+    # framing every later task is dispensed with, and the manifest a new episode is confirmed
+    # against, which is what makes it worse than a cosmetic leak: the drift check would compare
+    # a fresh episode against the rewritten schema and find them in agreement.
+    #
+    # So each read is its own detached view, and the endpoint goes on serving what it registered.
+    clean = await _clean_terminal_response(tmp_path)
+    async with _stream(tmp_path, [0, 1]) as stream:
+        first = await stream.get_task()
+        assert first is not None
+        published = {tool.name: tool.input_schema for tool in stream.tools}
+        framed = {tool["name"]: tool["input_schema"] for tool in first.tools}
+        assert published[SUBMIT_TOOL] == framed[SUBMIT_TOOL]
+        assert published[SUBMIT_TOOL] is not framed[SUBMIT_TOOL]
+        assert published[SUBMIT_TOOL] is not next(
+            tool.input_schema for tool in stream.tools if tool.name == SUBMIT_TOOL
+        ), "two reads of the manifest share one object"
+
+        # Two payloads built from one task do not share a schema either.
+        wire = first.to_wire()
+        next(t for t in wire["tools"] if t["name"] == SUBMIT_TOOL)["input_schema"]["required"] = [
+            "invented on the wire"
+        ]
+        again = next(t for t in first.to_wire()["tools"] if t["name"] == SUBMIT_TOOL)
+        assert again["input_schema"]["required"] == ["answer"], "two payloads share one schema"
+
+        framed[SUBMIT_TOOL]["required"] = ["invented"]
+        published[SUBMIT_TOOL]["required"] = ["also invented"]
+        served = {tool.name: tool.input_schema for tool in stream.tools}
+        assert served[SUBMIT_TOOL]["required"] == ["answer"], "the contract was rewritten"
+        # A server built after the edit registers what the stream froze, not what a reader wrote.
+        async with Client(build_stream_server(stream)) as client:
+            listed = {tool.name: tool.inputSchema for tool in await client.list_tools()}
+        assert listed[SUBMIT_TOOL]["required"] == ["answer"]
+        # The endpoint still honours it, and the next task is still framed with it.
+        assert _terminal_text(await stream.dispatch(SUBMIT_TOOL, {"answer": "4"})) == clean
+        second = await stream.get_task()
+        assert second is not None
+        assert {tool["name"]: tool["input_schema"] for tool in second.tools} == served
+
+    first_row = stream.results[0]
+    assert first_row.score is not None and first_row.score.success is True
+
+
 @pytest.mark.parametrize(
     ("break_spec", "defect"),
     [
@@ -1744,6 +2018,8 @@ async def test_an_episode_manifest_that_cannot_be_compared_still_stops_the_strea
             id="the budget is not a whole number of steps",
         ),
         pytest.param(
+            # `bool` is an `int` subclass, so an unguarded test would advertise `True` as a
+            # budget of one step.
             lambda spec: setattr(spec, "horizon", True),
             "budget is not a whole number",
             id="the budget is a bool",
@@ -1764,22 +2040,22 @@ async def test_an_episode_manifest_that_cannot_be_compared_still_stops_the_strea
 async def test_a_task_this_endpoint_cannot_hand_over_is_never_dispensed(
     tmp_path: Path, break_spec: Any, defect: str
 ) -> None:
-    # The framing is two values off the episode's own spec plus the published contract, and a
-    # model validates a field when it is built rather than when it is assigned — so an env that
-    # edits its spec afterwards publishes a framing nothing between here and the wire looks at.
+    # The framing is two values off the episode's own spec plus the frozen contract, and a model
+    # validates a field when it is built rather than when it is assigned — so an env that edits
+    # its spec afterwards publishes a framing nothing between here and the wire looks at.
     #
-    # Where that is found decides what it costs. Found after the position is consumed it is a
-    # dispensed task the agent was never answered for: the episode is live, the drain ends it,
-    # and the row says the agent played the task out and got it wrong — a wrong number standing
-    # where a missing one was the truth. So it is found first, and there is no task rather than a
-    # task nobody received.
+    # The dispense is durable *before* the task is handed out, so where that is found decides
+    # what it costs. Found afterwards it is a committed dispense the agent was never answered
+    # for: the episode is live, the drain ends it, and the row says the agent played the task out
+    # and got it wrong — a wrong number standing where a missing one was the truth. So it is
+    # found first, and there is no task rather than a task nobody received.
     class _Unframable(_TrackedEnv):
         def describe(self, task_id: Any = None) -> TaskSpec:
             spec = super().describe(task_id)
             break_spec(spec)
             return spec
 
-    built: List[_TrackedEnv] = []
+    built: List[_Unframable] = []
 
     def factory(_name: str) -> _Unframable:
         env = _Unframable(tasks=TASKS)
@@ -1790,15 +2066,13 @@ async def test_a_task_this_endpoint_cannot_hand_over_is_never_dispensed(
     stream = TaskStream(factory, [TaskRef(ENV_NAME, 0)], prov_dir=tmp_path / "prov")
     server = build_stream_server(stream)
     async with Client(server) as client:
-        out = await client.call_tool("get_task", {}, raise_on_error=False)
-        assert not out.is_error
-        answer = json.loads(out.content[0].text)  # type: ignore[union-attr]
-
+        answer = json.loads((await client.call_tool("get_task", {})).content[0].text)  # type: ignore[union-attr]
     # Nothing was handed out, so nothing was spent: no durable dispense for recovery to answer,
     # no row, and the position is still owed.
     assert not (tmp_path / "prov" / "dispenses.jsonl").exists()
     assert not (tmp_path / "prov" / "results.jsonl").exists()
     assert stream.results == ()
+    assert reconcile(tmp_path / "prov") == []
     assert stream.queue_info() == QueueInfo(remaining=1, consumed=0, in_flight=0)
     assert built[-1].closed, "the refused episode's env was never released"
     # An env that publishes a framing this endpoint cannot carry publishes it again next time it
@@ -1809,64 +2083,106 @@ async def test_a_task_this_endpoint_cannot_hand_over_is_never_dispensed(
     with pytest.raises(RuntimeError, match="framing this stream cannot hand out") as closing:
         await stream.aclose()
     assert defect in str(closing.value.__cause__)
-    assert all(env.closed for env in built)
 
 
-async def test_a_framing_that_cannot_be_read_still_stops_the_stream(tmp_path: Path) -> None:
-    # Confirming the framing reads the episode's own spec, and an attribute of an env's object
-    # is the env's code. Unguarded, the env decides whether its own refusal happens: the raise
-    # comes from inside the check, so the task is refused for this episode and nothing else —
-    # `stopped` stays false, the position is never advanced, and every later dispense meets the
-    # same env again while `aclose()` reports a clean run over a queue it never served.
-    #
-    # A framing this stream cannot read is one it cannot hand over, which is the finding this
-    # check already exists to act on.
-    class _UnreadableFraming:
-        """A spec whose instructions raise when they are read."""
+async def test_a_framing_is_plain_data_by_the_time_a_task_is_dispensed(
+    tmp_path: Path,
+) -> None:
+    # The sibling of the check above, on the half of the framing that comes from the frozen
+    # contract. A tool's name and description are the env's objects, and the stream used to keep
+    # them: `model_copy` is shallow, so the description an env published was the one every task's
+    # framing carried and `DispensedTask.to_wire` deep-copied — running the env's code long after
+    # the dispense was durable. A `str` subclass whose `__deepcopy__` raises therefore left a
+    # committed dispense with no task to answer it, and the drain scored the task the agent never
+    # received. (Only the catalog instance carries it here: an episode's own spec is deep-copied
+    # when it is described, so an episode that also held one would be refused before the dispense
+    # by the path above.)
+    class _Uncopyable(str):
+        def __deepcopy__(self, memo: Any) -> Any:
+            raise RuntimeError("this description cannot be copied")
 
-        def __init__(self, spec: TaskSpec) -> None:
-            self._spec = spec
+    class _PoisonsTheCatalogDescription(_TrackedEnv):
+        def __init__(self, poisoned: bool, **kwargs: Any) -> None:
+            super().__init__(**kwargs)
+            self._poisoned = poisoned
 
-        @property
-        def tools(self) -> Any:
-            return self._spec.tools
+        def describe(self, task_id: Any = None) -> TaskSpec:
+            spec = super().describe(task_id)
+            if self._poisoned:
+                for manifest in spec.tools:
+                    manifest.description = _Uncopyable(manifest.description)
+            return spec
 
-        @property
-        def horizon(self) -> Any:
-            return self._spec.horizon
+    built: List[_PoisonsTheCatalogDescription] = []
 
-        @property
-        def instructions(self) -> Any:
-            raise RuntimeError("instructions exploded")
-
-    class _Unreadable(_TrackedEnv):
-        def describe(self, task_id: Any = None) -> Any:
-            return _UnreadableFraming(super().describe(task_id))
-
-    built: List[_TrackedEnv] = []
-
-    def factory(_name: str) -> _Unreadable:
-        env = _Unreadable(tasks=TASKS)
+    def factory(_name: str) -> _PoisonsTheCatalogDescription:
+        # The catalog instance is the one whose manifest this stream freezes and advertises.
+        env = _PoisonsTheCatalogDescription(poisoned=not built, tasks=TASKS)
         built.append(env)
         return env
 
-    stream = TaskStream(
-        factory, [TaskRef(ENV_NAME, 0), TaskRef(ENV_NAME, 1)], prov_dir=tmp_path / "prov"
-    )
-    with pytest.raises(RuntimeError, match="cannot hand out.*reading it raised") as refused:
-        await stream.get_task()
-    # The env that published it is pointed at, rather than the failure being swallowed.
-    assert "RuntimeError: instructions exploded" in str(refused.value)
+    stream = TaskStream(factory, [TaskRef(ENV_NAME, 0)], prov_dir=tmp_path / "prov")
+    # Nothing the env kept reaches what the endpoint advertises, so nothing it kept can decide
+    # whether a dispensed task can be delivered.
+    assert all(type(tool.description) is str for tool in stream.tools)
+    async with stream:
+        task = await stream.get_task()
+        assert task is not None
+        wire = task.to_wire()
+        assert all(type(tool["description"]) is str for tool in wire["tools"])
+        assert {t["description"] for t in wire["tools"]} == {
+            t.description for t in stream.tools
+        }, "freezing the description changed what the endpoint says a tool is for"
+        await stream.dispatch(SUBMIT_TOOL, {"answer": "4"})
+    (row,) = stream.results
+    assert row.closure == "sealed" and row.score is not None and row.score.success is True
+    assert reconcile(tmp_path / "prov") == []
 
-    assert stream.stopped, "the stop the refusal owes was lost to reading the framing"
-    assert stream.queue_info() == QueueInfo(remaining=2, consumed=0, in_flight=0)
-    with pytest.raises(RuntimeError, match="could not be served past it"):
-        await stream.get_task()
-    with pytest.raises(RuntimeError, match="stopped before its queue was served"):
-        await stream.aclose()
-    assert stream.results == ()
-    assert not (tmp_path / "prov" / "results.jsonl").exists()
-    assert all(env.closed for env in built)
+
+async def test_an_episode_is_not_opened_on_whether_the_env_can_copy_its_own_schema(
+    tmp_path: Path,
+) -> None:
+    # An episode snapshots the contract it was opened on: normalized, so what it enforces is what
+    # a client is shown, and detached, so the env that published it cannot rewrite it afterwards.
+    # Which of those happens first decides whose code decides that an episode exists at all.
+    #
+    # Detached first, the copy is taken of the env's own objects — so a `__deepcopy__` an env
+    # wrote runs on a value the wire form replaces with plain data one line later, and a raise
+    # there comes back out of `get_task` as the env's own exception with the stream unstopped,
+    # `aclose` reporting a clean run, and the position still owed. Normalized first, the copy is
+    # of data the round trip already made plain, and that value's copy code is never reached.
+    #
+    # This is not decoration: the value is JSON-clean, so nothing at construction sees it — the
+    # frozen manifest is a JSON round trip and strips the subclass — and the episode is the only
+    # place it is copied.
+    class _Uncopyable(str):
+        def __deepcopy__(self, memo: Any) -> Any:
+            raise RuntimeError("this schema value cannot be copied")
+
+    class _PoisonsItsOwnSchema(_TrackedEnv):
+        def describe(self, task_id: Any = None) -> TaskSpec:
+            spec = super().describe(task_id)
+            for manifest in spec.tools:
+                if manifest.name == SUBMIT_TOOL:
+                    manifest.input_schema = {
+                        **manifest.input_schema,
+                        "title": _Uncopyable("submit your answer"),
+                    }
+            return spec
+
+    def factory(_name: str) -> _PoisonsItsOwnSchema:
+        return _PoisonsItsOwnSchema(tasks=TASKS)
+
+    stream = TaskStream(factory, [TaskRef(ENV_NAME, 0)], prov_dir=tmp_path / "prov")
+    async with stream:
+        task = await stream.get_task()
+        assert task is not None, "the env published nothing this endpoint could not carry"
+        assert stream.queue_info() == QueueInfo(remaining=0, consumed=1, in_flight=1)
+        await stream.dispatch(SUBMIT_TOOL, {"answer": "4"})
+    assert not stream.stopped
+    (row,) = stream.results
+    assert row.closure == "sealed" and row.score is not None and row.score.success is True
+    assert reconcile(tmp_path / "prov") == []
 
 
 @pytest.mark.parametrize(
@@ -1897,192 +2213,46 @@ async def test_a_framing_that_cannot_be_read_still_stops_the_stream(tmp_path: Pa
 async def test_a_tool_this_endpoint_could_not_advertise_is_refused_before_it_is_served(
     tmp_path: Path, break_tool: Any, match: str
 ) -> None:
-    # The other half of the framing: the contract the agent is shown. A tool's name and its
-    # description are the env's objects, they are what every task's framing carries and what the
-    # endpoint registers, and both are text on the wire — but neither type nor `json.dumps`
-    # settles what the endpoint can send. The stdlib encoder accepts `NaN` and writes a token no
-    # JSON parser must read (FastMCP sends `null`), and a `str` may hold an unpaired surrogate
-    # that is text to every check and a `UnicodeEncodeError` the moment a transport encodes it.
-    # Accepted, each one advertises a contract the episode then refuses the agent against — an
-    # advertised-correct action recorded as a wrong answer.
+    # The other half of freezing the advertised manifest: what the endpoint will actually send.
+    # A tool's name and description are text on the wire, and a value that is not text at all
+    # cannot be made into plain data — but neither type nor `json.dumps` settles it. The stdlib
+    # encoder accepts `NaN` and writes a token no JSON parser must read (FastMCP sends `null`),
+    # and a `str` may hold an unpaired surrogate that is text to every check and a
+    # `UnicodeEncodeError` the moment a transport encodes it. Accepted, each one advertises a
+    # contract the episode then refuses the agent against — an advertised-correct action recorded
+    # as a wrong answer.
     #
-    # So the contract is frozen through the encode the endpoint actually does, and one that will
-    # not go through it is refused at construction, where nothing has been served and no env
-    # holds a task.
-    class _Unadvertisable(_TrackedEnv):
+    # So the freeze proves the encode the endpoint does, and refuses at construction, where
+    # nothing has been served and no env holds a task.
+    class _CannotBeAdvertised(_FixtureScoreEnv):
         def describe(self, task_id: Any = None) -> TaskSpec:
             spec = super().describe(task_id)
             for manifest in spec.tools:
                 break_tool(manifest)
             return spec
 
-    built: List[_TrackedEnv] = []
-
-    def factory(_name: str) -> _Unadvertisable:
-        env = _Unadvertisable(tasks=TASKS)
-        built.append(env)
-        return env
-
     with pytest.raises(ValueError, match=match):
-        TaskStream(factory, [TaskRef(ENV_NAME, 0)], prov_dir=tmp_path / "prov")
-    # Nothing was spent: one catalog env was built to read the contract, and it is released with
-    # the failure rather than left holding its sessions.
-    await asyncio.sleep(0)  # the close is scheduled on this loop; let it run
-    assert all(env.closed for env in built)
+        TaskStream(
+            lambda _name: _CannotBeAdvertised(tasks=TASKS),
+            [TaskRef(ENV_NAME, 0)],
+            prov_dir=tmp_path / "prov",
+        )
     assert not (tmp_path / "prov").exists()
-
-
-async def test_a_framing_is_plain_data_by_the_time_a_task_is_dispensed(tmp_path: Path) -> None:
-    # The sibling of the refusal above, on a value that *is* text. `model_copy` is shallow, so
-    # the description an env published used to be the object every task's framing carried and
-    # every registration was built from — a `str` subclass carries the env's own code into both,
-    # long after the task was dispensed and with no boundary left to contain it.
-    #
-    # Freezing the contract through the wire's encoder leaves exactly what the wire carries: the
-    # same text, as plain data, with nothing of the env's behind it. (`_Undescribable` is the
-    # same `str` subclass the summary tests publish a feedback value as, and for the same
-    # reason: it is a JSON scalar to every boundary it crosses, and asking what it is raises.)
-    class _PoisonsTheCatalogDescription(_TrackedEnv):
-        def describe(self, task_id: Any = None) -> TaskSpec:
-            spec = super().describe(task_id)
-            for manifest in spec.tools:
-                manifest.description = _Undescribable(manifest.description)
-            return spec
-
-    stream = TaskStream(
-        lambda _name: _PoisonsTheCatalogDescription(tasks=TASKS),
-        [TaskRef(ENV_NAME, 0)],
-        prov_dir=tmp_path / "prov",
-    )
-    # Nothing the env kept reaches what the endpoint advertises, so nothing it kept can decide
-    # whether a dispensed task can be delivered.
-    assert all(type(tool.description) is str for tool in stream.tools)
-    async with stream:
-        task = await stream.get_task()
-        assert task is not None
-        wire = task.to_wire()
-        assert all(type(tool["description"]) is str for tool in wire["tools"])
-        assert {tool["description"] for tool in wire["tools"]} == {
-            tool.description for tool in stream.tools
-        }, "freezing the description changed what the endpoint says a tool is for"
-        await stream.dispatch(SUBMIT_TOOL, {"answer": "4"})
-    (row,) = stream.results
-    assert row.closure == "sealed" and row.score is not None and row.score.success is True
-
-
-async def test_reading_the_published_contract_cannot_rewrite_it(tmp_path: Path) -> None:
-    # Both public readings of the frozen manifest used to hand back the stream's own schema
-    # object: a task's `tools[i]["input_schema"]` *was* `TaskStream.tools[i].input_schema`, and
-    # both were the one dict the constructor froze. Editing either one edited the contract —
-    # what every later task is framed with, and what a server built after the edit registers —
-    # so an agent could be framed with a schema the endpoint never agreed to serve, or the
-    # endpoint made to serve one no episode was ever checked against.
-    #
-    # So each read is its own detached view, and the endpoint goes on serving what it froze.
-    clean = await _clean_terminal_response(tmp_path)
-    async with _stream(tmp_path, [0, 1]) as stream:
-        first = await stream.get_task()
-        assert first is not None
-        published = {tool.name: tool.input_schema for tool in stream.tools}
-        framed = {tool["name"]: tool["input_schema"] for tool in first.tools}
-        assert published[SUBMIT_TOOL] == framed[SUBMIT_TOOL]
-        assert published[SUBMIT_TOOL] is not framed[SUBMIT_TOOL]
-        assert published[SUBMIT_TOOL] is not next(
-            tool.input_schema for tool in stream.tools if tool.name == SUBMIT_TOOL
-        ), "two reads of the manifest share one object"
-
-        framed[SUBMIT_TOOL]["required"] = ["invented"]
-        published[SUBMIT_TOOL]["required"] = ["also invented"]
-        served = {tool.name: tool.input_schema for tool in stream.tools}
-        assert served[SUBMIT_TOOL]["required"] == ["answer"], "the contract was rewritten"
-        # A server built after the edit registers what the stream froze, not what a reader wrote.
-        async with Client(build_stream_server(stream)) as client:
-            listed = {tool.name: tool.inputSchema for tool in await client.list_tools()}
-        assert listed[SUBMIT_TOOL]["required"] == ["answer"]
-        # The endpoint still honours it, and the next task is still framed with it.
-        assert _terminal_text(await stream.dispatch(SUBMIT_TOOL, {"answer": "4"})) == clean
-        second = await stream.get_task()
-        assert second is not None
-        assert {tool["name"]: tool["input_schema"] for tool in second.tools} == served
-
-    first_row = stream.results[0]
-    assert first_row.score is not None and first_row.score.success is True
-
-
-async def test_the_whole_framing_is_proved_before_the_dispense_is_committed(
-    tmp_path: Path,
-) -> None:
-    # Two of the framing's fields were proved and the rest were assembled after the position was
-    # consumed. An env key is one of those: it is a caller's own string, checked to be exact
-    # non-empty text and nothing more, and a Python `str` may hold an unpaired surrogate that no
-    # transport can encode. The endpoint then answers `get_task` with a serialization error — the
-    # agent is handed nothing — while the stream has already counted the task out, so the drain
-    # ends a task nobody received and files it as one the agent played and lost.
-    #
-    # What is proved is therefore the object that will be returned, before the position moves. A
-    # field added to the framing later is covered the day it is added rather than the day someone
-    # remembers to list it.
-    stream = TaskStream(_env_for, [TaskRef("\ud800", 0)], prov_dir=tmp_path / "prov")
-    server = build_stream_server(stream)
-    async with Client(server) as client:
-        out = await client.call_tool("get_task", {}, raise_on_error=False)
-        assert not out.is_error, "the endpoint answered a dispense it could not encode"
-        seen = json.loads(out.content[0].text)  # type: ignore[union-attr]
-    # The agent reads a stopped stream as the end of the queue, and nothing was spent.
-    assert seen == await _reads_as_exhausted(tmp_path, consumed=0)
-    assert not (tmp_path / "prov" / "results.jsonl").exists()
-    assert stream.results == ()
-    assert stream.queue_info() == QueueInfo(remaining=1, consumed=0, in_flight=0)
-    # An env key is the run's, not this task's, so the queue cannot be served past it.
-    assert stream.stopped
-    with pytest.raises(RuntimeError, match="could not be put on the wire"):
-        await stream.aclose()
-
-
-async def test_a_queue_entry_is_the_identity_its_record_is_filed_under(tmp_path: Path) -> None:
-    # `TaskRef` annotates its fields and validates neither, so a queue could hold anything — and
-    # these two are identity, not payload. The episode coerces one to load a task (`int(1.9)` is
-    # task 1) while the row is appended carrying the caller's own value, so the run plays one task
-    # and records another, with nothing left to reconcile the two.
-    #
-    # Refused before an env is built, because an identity invented after the record is written is
-    # what put a number in the file that nothing else agrees with.
-    for bad, match in (
-        ((ENV_NAME, 1.9), "task index must be a whole number"),
-        ((ENV_NAME, True), "task index must be a whole number"),
-        ((ENV_NAME, "0"), "task index must be a whole number"),
-        (("", 0), "env must be a non-empty string"),
-        ((object(), 0), "env must be a non-empty string"),
-    ):
-        with pytest.raises(ValueError, match=match):
-            TaskStream(_env_for, [bad], prov_dir=tmp_path / "prov")  # type: ignore[list-item]
-    assert not (tmp_path / "prov").exists()
-
-    # And the ordinary entry still plays, with one identity from the queue to the file.
-    async with _stream(tmp_path, [1]) as stream:
-        await stream.get_task()
-        await stream.dispatch(SUBMIT_TOOL, {"answer": "6"})
-    (durable,) = _rows(tmp_path)
-    (row,) = stream.results
-    assert durable["task_idx"] == row.task_idx == 1, (
-        "the file and the run's own copy are two readings of one task"
-    )
-    assert row.score is not None and row.score.success is True
 
 
 async def test_the_episode_enforces_the_contract_the_endpoint_advertises(
     tmp_path: Path,
 ) -> None:
-    # The endpoint advertises this stream's frozen contract, and the episode validates a terminal
-    # call against the schema it captured from the env. A JSON scalar has subclasses and the
-    # models do not validate on assignment, so a `const` can be text that serialises as `"4"` and
-    # matches nothing once it is compared: advertised, the agent is shown `const: "4"`; enforced,
-    # the value it was shown is refused. The manifest check cannot see the difference, because it
-    # compares the serialised form too.
+    # The two ends of one contract: the endpoint advertises this stream's frozen copy, and the
+    # episode validates a terminal call against the schema it was opened on. A JSON scalar has
+    # subclasses and the models do not validate on assignment, so a `const` can be text that
+    # serialises as `"4"` and matches nothing once it is compared. Advertised, the agent is shown
+    # `const: "4"`; enforced, the value it was shown is refused — and the manifest check cannot
+    # see the difference, because it compares the serialised form too.
     #
-    # The agent then sends exactly the advertised-correct action, the seal refuses it, and the run
-    # records a task it answered wrong. So what an episode enforces is the wire form — the same
-    # value the endpoint published.
+    # The agent then sends exactly the advertised-correct action, the seal refuses it, and the
+    # run records a task it answered wrong. So what an episode enforces is the wire form, which
+    # is the same value the endpoint published.
     class _NeverEqual(str):
         def __eq__(self, other: Any) -> bool:
             return False
@@ -2105,11 +2275,12 @@ async def test_the_episode_enforces_the_contract_the_endpoint_advertises(
             return spec
 
     clean = await _clean_terminal_response(tmp_path)
-    async with TaskStream(
+    stream = TaskStream(
         lambda _name: _ConstIsNeverEqual(tasks=TASKS),
         [TaskRef(ENV_NAME, 0)],
         prov_dir=tmp_path / "prov",
-    ) as stream:
+    )
+    async with stream:
         task = await stream.get_task()
         assert task is not None
         framed = next(t for t in task.tools if t["name"] == SUBMIT_TOOL)
@@ -2122,6 +2293,184 @@ async def test_the_episode_enforces_the_contract_the_endpoint_advertises(
     assert row.closure == "sealed", "an advertised-correct action was refused"
     assert row.score is not None and row.score.success is True
     assert not stream.stopped
+
+
+async def test_a_queue_entry_is_the_identity_its_record_is_filed_under(tmp_path: Path) -> None:
+    # `TaskRef` annotates its fields and validates neither, so a queue could hold anything —
+    # and these two are identity, not payload. Several things coerce them and none of them agree:
+    # the episode loads `int(task_idx)`, the durable row is appended with the caller's own value,
+    # and the run's in-memory copy is re-read through `from_wire`, which coerces again. A `1.9`
+    # played task 1, was recorded as `1.9`, and came back as `1` — three readings of one task,
+    # with a resume refusing the run's own record as a queue it does not match.
+    #
+    # Refused before an env is built, because a canonical identity invented after the commit is
+    # what put a number in the file that nothing else agrees with.
+    for bad, match in (
+        ((ENV_NAME, 1.9), "task index must be a whole number"),
+        ((ENV_NAME, True), "task index must be a whole number"),
+        ((ENV_NAME, "0"), "task index must be a whole number"),
+        (("", 0), "env must be a non-empty string"),
+        ((object(), 0), "env must be a non-empty string"),
+    ):
+        with pytest.raises(ValueError, match=match):
+            TaskStream(_env_for, [bad], prov_dir=tmp_path / "prov")  # type: ignore[list-item]
+    assert not (tmp_path / "prov").exists()
+
+    # And the ordinary entry still plays, with one identity from the queue to the file.
+    async with _stream(tmp_path, [1]) as stream:
+        await stream.get_task()
+        await stream.dispatch(SUBMIT_TOOL, {"answer": "6"})
+    (durable,) = _rows(tmp_path)
+    (row,) = stream.results
+    assert durable["task_idx"] == row.task_idx == 1
+    assert read_results(tmp_path / "prov")[0].task_idx == 1
+
+
+async def test_a_call_is_routed_to_the_episode_by_a_name_this_stream_owns(
+    tmp_path: Path,
+) -> None:
+    # The endpoint advertises the frozen contract and the episode enforces its own wire-form
+    # snapshot, so both ends of a call are this stream's plain data. The route between them was
+    # not: it kept the env's own name object and passed that object into the episode. A name
+    # whose `__hash__` answers differently once the run is under way therefore loses the call —
+    # on a tool the endpoint published in plain text, that the agent called exactly as published.
+    #
+    # Nothing downstream can see it. The lost call is not an outcome, the agent goes on to end
+    # the task itself, and the rule that keeps a recovered task the agent's (correctly) declines
+    # to stop or unscore it — so the missing step is simply absent from the record and the score
+    # it changes looks fully earned. Two correct rules, one wrong number, and only the route to
+    # blame.
+    class _Unhashable(str):
+        """Ordinary text on the wire; a key that cannot be looked up once the run has started."""
+
+        _armed = False
+
+        def __hash__(self) -> int:
+            if type(self)._armed:
+                raise RuntimeError("this tool name cannot be hashed")
+            return str.__hash__(self)
+
+    class _NoopIsTheEnvsOwnObject(_FixtureScoreEnv):
+        def describe(self, task_id: Any = None) -> TaskSpec:
+            spec = super().describe(task_id)
+            for manifest in spec.tools:
+                if manifest.name == "noop":
+                    # Assigned rather than constructed: pydantic coerces the subclass away when
+                    # the model is built, and does not validate on assignment.
+                    manifest.name = _Unhashable("noop")
+            return spec
+
+    stream = TaskStream(
+        lambda _name: _NoopIsTheEnvsOwnObject(tasks=TASKS),
+        [TaskRef(ENV_NAME, 0)],
+        prov_dir=tmp_path / "prov",
+    )
+    try:
+        async with Client(build_stream_server(stream)) as client:
+            assert "noop" in {tool.name for tool in await client.list_tools()}
+            await client.call_tool("get_task", {})
+            _Unhashable._armed = True  # the contract is published; the run starts here
+            step = await client.call_tool("noop", {}, raise_on_error=False)
+            assert not step.is_error, "the advertised call never reached the episode"
+            assert json.loads(step.content[0].text)["terminated"] is False  # type: ignore[union-attr]
+            done = await client.call_tool(SUBMIT_TOOL, {"answer": "4"}, raise_on_error=False)
+            assert not done.is_error
+        await stream.aclose()
+    finally:
+        _Unhashable._armed = False
+
+    (row,) = stream.results
+    assert row.closure == "sealed"
+    assert row.score is not None and row.score.success is True
+    assert not stream.stopped
+    # The step the agent made is in the record, which is what a score computed from it needs.
+    assert [r["closure"] for r in _rows(tmp_path)] == ["sealed"]
+
+
+async def test_a_framing_that_cannot_be_read_still_stops_the_stream(tmp_path: Path) -> None:
+    # Confirming the framing reads the episode's own spec, and an attribute of an env's object
+    # is the env's code. Unguarded, the env decides whether its own refusal happens: the raise
+    # comes from inside the check, so the task is refused for this episode and nothing else —
+    # `stopped` stays false, the position is never advanced, and every later dispense meets the
+    # same env again while `aclose()` reports a clean run over a queue it never served.
+    #
+    # A framing this stream cannot read is one it cannot hand over, which is the finding this
+    # check already exists to act on.
+    #
+    # A subclass of the spec rather than a stand-in, because the episode snapshots the contract
+    # it was opened on with `model_copy(deep=True)` — a copy keeps the class, so what the check
+    # reads is still an object whose own code answers for the field.
+    class _UnreadableSpec(TaskSpec):
+        def __getattribute__(self, name: str) -> Any:
+            if name == "instructions":
+                raise RuntimeError("instructions exploded")
+            return super().__getattribute__(name)
+
+    class _Unreadable(_TrackedEnv):
+        def describe(self, task_id: Any = None) -> Any:
+            spec = super().describe(task_id)
+            return _UnreadableSpec.model_construct(**dict(spec))
+
+    built: List[_TrackedEnv] = []
+
+    def factory(_name: str) -> _Unreadable:
+        env = _Unreadable(tasks=TASKS)
+        built.append(env)
+        return env
+
+    stream = TaskStream(
+        factory, [TaskRef(ENV_NAME, 0), TaskRef(ENV_NAME, 1)], prov_dir=tmp_path / "prov"
+    )
+    with pytest.raises(RuntimeError, match="cannot hand out.*reading it raised") as refused:
+        await stream.get_task()
+    # The env that published it is pointed at, rather than the failure being swallowed.
+    assert "RuntimeError: instructions exploded" in str(refused.value)
+
+    assert stream.stopped, "the stop the refusal owes was lost to reading the framing"
+    assert stream.queue_info() == QueueInfo(remaining=2, consumed=0, in_flight=0)
+    with pytest.raises(RuntimeError, match="could not be served past it"):
+        await stream.get_task()
+    with pytest.raises(RuntimeError, match="stopped before its queue was served"):
+        await stream.aclose()
+    assert stream.results == ()
+    assert not (tmp_path / "prov" / "results.jsonl").exists()
+    assert reconcile(tmp_path / "prov") == []
+    assert all(env.closed for env in built)
+
+
+async def test_the_whole_framing_is_proved_before_the_dispense_is_committed(
+    tmp_path: Path,
+) -> None:
+    # Two of the framing's fields were proved and the rest were assembled after the dispense was
+    # durable. An env key is one of those: it is a caller's own string, checked to be exact
+    # non-empty text and nothing more, and a Python `str` may hold an unpaired surrogate that no
+    # transport can encode. The endpoint then answers `get_task` with a serialization error — the
+    # agent is handed nothing — while the dispense record already says a task went out, so the
+    # drain ends a task nobody received and files it as one the agent played and lost.
+    #
+    # What is proved is therefore the object that will be returned, in the wire form it will be
+    # returned as, before anything of the record is durable. A field added to the framing later
+    # is covered the day it is added rather than the day someone remembers to list it.
+    key = "\ud800"
+    exhausted = await _reads_as_exhausted(tmp_path, consumed=0)
+    stream = TaskStream(_env_for, [TaskRef(key, 0)], prov_dir=tmp_path / "prov")
+    server = build_stream_server(stream)
+    async with Client(server) as client:
+        out = await client.call_tool("get_task", {}, raise_on_error=False)
+        assert not out.is_error, "the endpoint answered a dispense it could not encode"
+        answer = json.loads(out.content[0].text)  # type: ignore[union-attr]
+
+    assert answer == exhausted
+    # Nothing was spent: no durable dispense for recovery to answer, no row, position still owed.
+    assert not (tmp_path / "prov" / "dispenses.jsonl").exists()
+    assert not (tmp_path / "prov" / "results.jsonl").exists()
+    assert stream.results == ()
+    assert reconcile(tmp_path / "prov") == []
+    assert stream.queue_info() == QueueInfo(remaining=1, consumed=0, in_flight=0)
+    # An env key is the run's, not this task's, so the queue cannot be served past it.
+    assert stream.stopped
+    with pytest.raises(RuntimeError, match="could not be put on the wire"):
+        await stream.aclose()
 
 
 async def test_the_stream_drives_the_terminal_it_published(tmp_path: Path) -> None:
@@ -2206,10 +2555,13 @@ async def test_rejects_unsupported_configurations(tmp_path: Path) -> None:
         _stream(tmp_path, [0], max_in_flight=0)
     with pytest.raises(ValueError, match="non-empty queue"):
         _stream(tmp_path, [])
-    with pytest.raises(ValueError, match="serves one env"):
+    # An env key is joined into a tool name only once a second env is in the queue, so that is
+    # also the only time its shape is anyone's business. One env, and the key stays the private
+    # label it has always been — `test_serve_stream_multi_env.py` holds the other half of this.
+    with pytest.raises(ValueError, match="ambiguous"):
         TaskStream(
             _env_for,
-            [TaskRef(ENV_NAME, 0), TaskRef("other", 0)],
+            [TaskRef("has__separator", 0), TaskRef("other", 0)],
             prov_dir=tmp_path / "prov",
         )
 
@@ -2482,112 +2834,12 @@ async def test_a_forced_terminal_that_fails_is_recorded_the_same_way_however_it_
     assert stream.stopped, "the queue may not be served on against an env that raises at the end"
 
 
-def _loses_the_agents_call(exc: BaseException) -> Any:
-    """A score-terminal env that fails every call made while the task is still live: the call
-    reaches no result, so nothing the agent asked for lands on the episode's record."""
-
-    class _RaisesMidEpisode(_FixtureScoreEnv):
-        def _verify(self, trajectory, task, *, terminated, evidence=None) -> FeedbackCollection:
-            if not terminated:
-                raise exc
-            return super()._verify(trajectory, task, terminated=terminated, evidence=evidence)
-
-    return lambda _name: _RaisesMidEpisode(tasks=TASKS)
-
-
-async def test_a_call_the_harness_lost_is_not_a_task_the_agent_played_out(
-    tmp_path: Path,
-) -> None:
-    # A call that raised reached no result, so nothing the agent asked for is on this episode's
-    # record. Forgotten, the drain then drives the terminal itself and files the task in a
-    # *scored* closure: an agent whose submission the harness dropped is recorded as one that
-    # answered wrong, and a run's mean averages that zero in. So the loss is kept on the entry
-    # and the seal reads it — the row lands unscored, saying which boundary lost the call.
-    #
-    # It is the row that pays and not the run. `score=None` is already unaggregatable, so the
-    # record is sound without a stop; and a mid-episode call is where a transient fault lands, so
-    # one session hiccup may not end a queue the rest of which is still playable.
-    stream = TaskStream(
-        _loses_the_agents_call(RuntimeError("the session dropped the call")),
-        [TaskRef(ENV_NAME, 0), TaskRef(ENV_NAME, 1)],
-        prov_dir=tmp_path / "prov",
-    )
-    async with stream:
-        await stream.get_task()
-        with pytest.raises(RuntimeError, match="dropped the call"):
-            await stream.dispatch("noop", {})
-        # The agent never ends this task; pulling the next one drains it.
-        await stream.get_task()
-        await stream.dispatch(SUBMIT_TOOL, {"answer": "6"})
-
-    lost, played = stream.results
-    assert lost.closure == "finalize_error", "a task the agent never played out is not a seal"
-    assert lost.score is None, "a call the harness lost may not be recorded as an answer"
-    assert "the agent never played it out" in (lost.diagnostic or "")
-    assert "dropped the call" in (lost.diagnostic or ""), "the failure must be on the row"
-    # The queue is served on, and the task after it is scored exactly as it was earned.
-    assert not stream.stopped, "one lost call ended a queue the agent could still play"
-    assert played.closure == "sealed"
-    assert played.score is not None and played.score.success is True
-    durable = _rows(tmp_path)
-    assert [row["closure"] for row in durable] == ["finalize_error", "sealed"]
-    assert durable[0]["score"] is None
-
-
-async def test_an_agent_that_recovers_from_a_lost_call_keeps_what_it_earned(
-    tmp_path: Path,
-) -> None:
-    # The loss is *kept*, not acted on. A task the agent goes on to end itself is the agent's,
-    # whatever failed on the way there — the terminal it called is a verdict the env stands
-    # behind, and a row that answered a dropped call by unscoring it would take away an outcome
-    # the agent actually earned.
-    async with TaskStream(
-        _loses_the_agents_call(RuntimeError("the session dropped the call")),
-        [TaskRef(ENV_NAME, 0)],
-        prov_dir=tmp_path / "prov",
-    ) as stream:
-        await stream.get_task()
-        with pytest.raises(RuntimeError, match="dropped the call"):
-            await stream.dispatch("noop", {})
-        await stream.dispatch(SUBMIT_TOOL, {"answer": "4"})
-
-    (row,) = stream.results
-    assert row.closure == "sealed", "the agent ended this task itself"
-    assert row.score is not None and row.score.success is True
-    assert row.diagnostic is None
-    assert not stream.stopped
-
-
-def _publishes_a_terminal_schema_that_cannot_be_used(for_task: "str | None" = None) -> Any:
-    """An env whose score terminal is exactly what the wire carries and still cannot validate a
-    call: a top-level ``$ref`` that points nowhere.
-
-    Nothing above notices — it is plain JSON, it serialises identically wherever the contract is
-    compared, and a server advertises it verbatim — and resolving it while checking a terminal
-    call raises out of the validator, for the agent's own submission and for the empty call the
-    stream drives alike. (A schema *key* whose own code misbehaved would not reach here any more:
-    an episode enforces the contract in wire form, so an env object is not what a terminal call is
-    validated against — see :func:`hgym.serve.episode._wire_form`.)"""
-
-    class _Unusable(_FixtureScoreEnv):
-        def describe(self, task_id: Any = None) -> TaskSpec:
-            spec = super().describe(task_id)
-            if for_task is not None and str(task_id) != for_task:
-                return spec
-            for manifest in spec.tools:
-                if manifest.name == SUBMIT_TOOL:
-                    manifest.input_schema = {"$ref": "#/definitions/answer"}
-            return spec
-
-    return lambda _name: _Unusable(tasks=TASKS)
-
-
 def _raises_one_object_at_both_boundaries(exc: BaseException) -> Any:
     """A non-seal env — ``verify`` runs inline on every call — that raises the **same object** on
     a call the agent makes mid-episode and on the terminal the stream drives afterwards.
 
-    One instance, two boundaries: which failure a `terminal_error` is cannot be read back off the
-    object, because nothing stops an env raising one twice."""
+    One instance, two boundaries: which failure a `terminal_error` is cannot be read back off
+    the object, because nothing stops an env raising one twice."""
 
     class _RaisesTheSameObject(_FixtureScoreEnv):
         score_terminal_tool = None
@@ -2596,34 +2848,6 @@ def _raises_one_object_at_both_boundaries(exc: BaseException) -> Any:
             raise exc
 
     return lambda _name: _RaisesTheSameObject(tasks=TASKS)
-
-
-async def test_a_score_terminal_the_abort_rescued_is_still_a_failed_terminal(
-    tmp_path: Path,
-) -> None:
-    # The abort is what *ended* this task; it is not what graded it. The score terminal is the
-    # only call that can produce a verdict for this env, so what the abort ended is a task with
-    # nothing behind it — and the abort's own fail-closed `correct=False` recorded as an outcome
-    # is an earned zero the agent never had a way to avoid. The refusal outlives the fallback
-    # that answered it: an env whose score terminal cannot be called will refuse the next task
-    # the same way, so the run stops here rather than scoring the rest of the queue that way.
-    stream = TaskStream(
-        # Every task of this env, because a stream registers one schema per tool name for the
-        # whole queue: a contract that varies by task is a different refusal, made earlier.
-        _publishes_a_terminal_schema_that_cannot_be_used(),
-        [TaskRef(ENV_NAME, 0), TaskRef(ENV_NAME, 1)],
-        prov_dir=tmp_path / "prov",
-    )
-    await stream.get_task()  # the agent does nothing; the drain ends the task
-
-    with pytest.raises(RuntimeError, match="failed while the stream ended a task"):
-        await stream.aclose()
-    (row,) = stream.results
-    assert row.closure == "finalize_error", "the abort ended the task; it did not grade it"
-    assert row.score is None, "a task with no verdict behind it may not be scored"
-    assert "definitions/answer" in (row.diagnostic or "")
-    assert stream.stopped, "the rest of the queue would be scored against the same refusal"
-    assert [r["closure"] for r in _rows(tmp_path)] == ["finalize_error"]
 
 
 async def test_one_failure_raised_on_both_boundaries_is_still_a_failed_terminal(
@@ -2649,8 +2873,8 @@ async def test_one_failure_raised_on_both_boundaries_is_still_a_failed_terminal(
     with pytest.raises(RuntimeError, match="the same object"):
         await stream.dispatch("noop", {})  # the agent's call is lost, and the entry keeps it
 
-    # The stream now ends the task itself: the forced score terminal raises that same object, and
-    # the abort brings the task to an end.
+    # The stream now has to end the task itself, and the terminal it drives raises that same
+    # object again — on its way out of a task it did end, which is the failure that stops a run.
     with pytest.raises(RuntimeError, match="no further task could be scored"):
         await stream.get_task()
     with pytest.raises(RuntimeError, match="failed while the stream ended a task"):
