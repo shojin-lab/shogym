@@ -119,9 +119,12 @@ asserts about it.
 the check and the write.** Ownership taken once covers a constructor; ownership re-read before a
 write covers everything except the write itself, which is where the second writer lands. So the
 two logs are appended to by one function, and it verifies inside the same critical section it
-writes in — against the token that says *which stream* and the pid that says *which process*, so
-that a stream inherited by ``fork`` fails the check its parent passes rather than filing rows
-under numbers its parent is also using.
+writes in — against the token that says *which stream*, the pid that says *which process* and a
+witness that says *which object*, so that a stream inherited by ``fork`` fails the check its
+parent passes rather than filing rows under numbers its parent is also using, and so does one
+duplicated inside a single process. **A stream cannot be copied at all**: ``copy``, ``deepcopy``
+and ``pickle`` are refused where the second object would be made, because an ownership identity
+is not a value and a copy of one is two streams serving one record.
 
 :class:`EvalStream` is that default made structural — it pins :class:`Never`, refuses a
 ``feedback`` argument outright, and enumerates what it does and does not guarantee.
@@ -277,6 +280,7 @@ import os
 import re
 import secrets
 import time
+import weakref
 from abc import ABC, abstractmethod
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -291,10 +295,12 @@ from typing import (
     List,
     Literal,
     NamedTuple,
+    NoReturn,
     Optional,
     Protocol,
     Sequence,
     Set,
+    SupportsIndex,
     Tuple,
 )
 
@@ -1959,6 +1965,19 @@ class TaskStream:
         # the pid in the claim, which this cannot supply — a token is a value in memory and `fork`
         # copies memory, so an inherited stream's token is its parent's (see `_holds_claim`).
         self._owner = secrets.token_hex(16)
+        # The third fact of the same identity, and the only one that is not a value: which
+        # *object* the token was minted for. Both of the others are copied by any duplication —
+        # the token is a string and the pid is an int, so a second object made out of this one's
+        # state carries both and answers `_holds_claim` exactly as this one does. A weak
+        # reference cannot be corrected that way: it is taken here, against this object, and a
+        # duplicate holds the *same reference*, which still names the original (`weakref.ref` is
+        # atomic to `deepcopy` and unpicklable, so no copier fixes it up), so `self._identity()
+        # is self` is true here and false in anything made out of this. Weak so that the witness
+        # costs the object no reference cycle; if it were ever dead the answer is `False`, which
+        # is a refusal, never a grant. The duplication protocols are refused outright before any
+        # of this is reached (see `_refuse_duplication`) — this is what makes the *append* sound
+        # against a duplicate built some way no protocol of ours is asked about.
+        self._identity: "weakref.ReferenceType[TaskStream]" = weakref.ref(self)
         self._claimed = False
         # The claim a `resume=True` took over, kept only until this constructor is past every
         # refusal: one that raises puts it back (see `_release_claim`).
@@ -2197,6 +2216,130 @@ class TaskStream:
                 error.add_note(note)
             raise
 
+    # ----- an ownership identity is not duplicable -----
+
+    def _refuse_duplication(self, attempted: str) -> NoReturn:
+        """Refuse to hand back a second object made out of this one — **the one refusal behind
+        every duplication surface below.**
+
+        A stream is not a value. It holds an ownership claim on a provenance directory, the queue
+        position it is up to, an unrepeatable ``seq``, the leases of the episodes that are live
+        right now, and a catalog of envs it will close. Every one of those means "this object";
+        none of them means anything when there are two. And the ownership machinery cannot tell
+        the two apart on its own: the token is a string and the pid is an int, so a duplicate
+        made inside this process carries both and passes :meth:`_holds_claim`, which is exactly
+        what makes this worse than a benign copy. Both objects dispense the same queue position,
+        both seal, and :meth:`_append_owned` — the check that makes "one record, one stream" true
+        of a *record* — authorises both appends, because each one honestly is the stream that
+        holds the claim. The record ends with two contradictory scored rows under one position and
+        one ``seq``, both stamped with the same regime, neither stream stopped and both closes
+        returning cleanly. That was reproduced through the public API with ``copy.copy`` and again
+        with ``pickle``, on an exact :class:`EvalStream`, with no private mutation anywhere.
+
+        So this is refused where a second usable object would be *created*, rather than caught
+        later at a write: a copy that survives its constructor is a copy something already holds,
+        and the loud refusal a caller can act on is the one that arrives before any task is
+        dispensed. It is a :class:`TypeError` because it is a statement about the type — this
+        operation does not exist for a stream, in the way :func:`pickle.dumps` refuses a lock.
+
+        There is no supported second object. Two streams serving one queue is not a thing to
+        arrange more carefully; the arrangements are: build the stream in the place that will
+        serve it (a process, a thread, an object graph — all the same statement), serve two
+        queues into two directories, or continue a record a stopped stream left behind with
+        ``resume=True``, which takes the directory over deliberately and mints an identity of its
+        own rather than borrowing one.
+
+        **What is refused is every duplication a stream would otherwise perform on request**, not
+        the one that was reported: ``copy``, ``deepcopy``, both halves of the pickle protocol, and
+        the state a duplicate would be rebuilt out of. The rest of the surface was swept and is
+        closed by absence rather than by a refusal, which is worth writing down so the next reader
+        does not have to re-derive it. ``__getnewargs__``/``__getnewargs_ex__`` are consulted only
+        by pickling, which stops above them. ``copy.replace`` (3.13, and this project pins below
+        it) dispatches to a ``__replace__`` a class must opt into, and refuses a class that has
+        none. There is no ``__setstate__`` either: nothing may be revived into a stream, so the
+        half of the protocol that would accept a state does not exist. And nothing in this module
+        builds a stream out of another stream — ``resume=True`` reads the *record* and mints a new
+        identity, and :func:`build_stream_server` closes over the one object it was handed.
+
+        This is the object-level twin of the ``fork`` refusal :meth:`_require_claim` explains, and
+        the two together are the whole of "one stream, one identity": ``fork`` duplicates the
+        object with the process, these duplicate it inside one. Neither is the last line of
+        defence: :meth:`_holds_claim` asks which *object* holds the claim, so a duplicate built by
+        some means neither of them is consulted about still cannot write."""
+        raise TypeError(
+            f"{attempted} of this {type(self).__name__} is refused: a stream is an ownership "
+            f"identity, not a value. It claims {self.prov_dir} for this object, and a duplicate "
+            "would carry its token, its queue position, its unrepeatable seq and its live leases "
+            "— so both objects pass every ownership check, hand out the same queue positions and "
+            "file contradictory rows under one seq, with nothing in the record saying which is "
+            "illegitimate. Build the stream where it will serve, or continue a record a stopped "
+            "stream left behind by constructing one with resume=True"
+        )
+
+    def __copy__(self) -> NoReturn:
+        """``copy.copy`` is refused: see :meth:`_refuse_duplication`.
+
+        Reached before ``copy`` falls back to the pickle protocol, so the message names the
+        operation the caller actually performed. Shallow is the dangerous one, not the safe one:
+        it shares the env catalog and the open episodes as well as duplicating the token, and it
+        keeps the *scalar* queue position and ``seq``, which is precisely how two objects come to
+        dispense position 0 twice."""
+        self._refuse_duplication("copy.copy")
+
+    def __deepcopy__(self, memo: Dict[int, Any]) -> NoReturn:
+        """``copy.deepcopy`` is refused: see :meth:`_refuse_duplication`.
+
+        A deep copy of the *stream* is not a way round the shallow refusal — it duplicates the
+        same token, and the envs and provenance extensions it would copy on the way are objects
+        with a live session and a directory behind them, which a copy does not get a second of.
+        Refused here rather than left to fail somewhere inside the copy, since a partial deep copy
+        of a serving stream is a mess with a claim in it. This also covers the case with no
+        ``copy`` call in sight: deep-copying any structure that merely *holds* a stream (a config
+        dict, a run record) arrives here, where the shallow copy of that same structure only
+        aliases the stream and is fine."""
+        self._refuse_duplication("copy.deepcopy")
+
+    def __reduce_ex__(self, protocol: SupportsIndex) -> NoReturn:
+        """Pickling is refused: see :meth:`_refuse_duplication`.
+
+        This is the surface with the longest reach, and the one nobody types: it is what
+        :mod:`pickle` calls at every protocol, and with it every library that moves an object
+        somewhere — a ``spawn``/``forkserver`` :mod:`multiprocessing` argument, a process pool, a
+        task queue, a cache. Unrefused it does not merely duplicate the identity, it *stores* it:
+        the token is in the bytes, and a stream revived from them holds a claim on a directory
+        whoever revived it may be serving right now, in this process, where the pid check matches
+        by construction — and in another one, one day, where a recycled pid could make it match by
+        accident. Reproduced before the refusal existed: the token was in the bytes, and the
+        :class:`EvalStream` revived from them served into the original's directory alongside it,
+        both closing cleanly over one queue position."""
+        self._refuse_duplication("pickle")
+
+    def __reduce__(self) -> NoReturn:
+        """Pickling is refused: see :meth:`_refuse_duplication`.
+
+        Redundant with :meth:`__reduce_ex__` for :mod:`pickle` itself, which never reaches here
+        once that one raises, and not redundant for a caller that asks this object for its
+        reconstructor directly: this is an ordinary method, the tuple it used to return rebuilds
+        the stream token and all, and a serialiser that calls it rather than going through
+        :mod:`pickle` never meets the method above. Both are defined because the surface being
+        closed is "hand out a recipe for a second one", not "run ``pickle``" — measured rather
+        than assumed, by deleting each in turn: without this one, ``stream.__reduce__()`` hands
+        back a working reconstructor again while ``pickle.dumps`` still refuses."""
+        self._refuse_duplication("pickle")
+
+    def __getstate__(self) -> NoReturn:
+        """Handing out this object's state is refused: see :meth:`_refuse_duplication`.
+
+        The last step of the same family, and the one that is a plain method call rather than an
+        operation: ``object.__getstate__`` returns the instance ``__dict__``, which is the token,
+        the queue position and the ``seq``, and ``object.__new__(cls).__dict__.update(state)``
+        turns that back into a serving stream. Unreachable through :mod:`copy` and :mod:`pickle`
+        now that both are refused above, and defined anyway, because a refusal that depends on
+        which door the caller came through is not a property of the object. There is deliberately
+        no ``__setstate__`` to go with it: nothing may be revived into a stream, so there is
+        nothing for one to do."""
+        self._refuse_duplication("reading the state")
+
     # ----- construction-time validation -----
 
     def _require_fresh_provenance(self, resume: bool) -> None:
@@ -2421,16 +2564,29 @@ class TaskStream:
         return held if isinstance(held, dict) else None
 
     def _holds_claim(self, held: Mapping[str, Any]) -> bool:
-        """Whether ``held`` — a claim as it is on disk right now — is *this stream, in this
-        process*.
+        """Whether ``held`` — a claim as it is on disk right now — is *this object, this stream,
+        in this process*.
 
-        Two facts, and neither is sufficient alone. The **token** says the claim was taken by this
-        object: unguessable, so no other stream can produce it and a directory taken over cannot
-        be mistaken for one still held. The **pid** says the process asking is the process that
-        took it, which the token cannot say, because a token is a value in memory and
+        Three facts, and no two of them are sufficient. The **token** says the claim was taken by
+        this stream: unguessable, so no other stream can produce it and a directory taken over
+        cannot be mistaken for one still held. The **pid** says the process asking is the process
+        that took it, which the token cannot say, because a token is a value in memory and
         :func:`os.fork` copies memory. After a fork the child holds a stream whose token matches a
         claim it never took, whose queue position, ``seq`` and lease counter are its parent's, and
         whose appends land in its parent's files.
+
+        The **object** says the same thing about a duplicate made *inside* one process, which
+        neither of the others can say, because both of them are values and a duplicate is made out
+        of this object's values: a ``copy.copy`` carries the identical token and runs under the
+        identical pid, so it answered this question "yes" and appended a second scored row for a
+        queue position the original was also serving. :meth:`_refuse_duplication` refuses the
+        duplication protocols outright, which is where a caller wants to hear about it; this is
+        the same statement made where the record is actually protected, at the append, so that a
+        duplicate built by some means no protocol of ours is consulted about — ``__new__`` plus a
+        copied ``__dict__`` — is caught by the ownership check rather than by an enumeration of
+        the ways it might have been built. The witness is a weak reference taken at construction
+        against the object it lives on, and a duplicate holds the original's reference rather than
+        one to itself (see ``_identity``). A dead one reads as "not mine", which refuses.
 
         This is identity, not liveness. It never asks whether the pid in the claim is running —
         that question has no honest answer across a container boundary or a pid wraparound, and
@@ -2441,7 +2597,11 @@ class TaskStream:
         :func:`_locked` by the two callers that act on it: a claim is a fact about the directory
         now, and a stream that consulted its own memory would answer this question with the
         moment it was constructed."""
-        return held.get("owner") == self._owner and held.get("pid") == os.getpid()
+        return (
+            self._identity() is self
+            and held.get("owner") == self._owner
+            and held.get("pid") == os.getpid()
+        )
 
     def _require_claim(self) -> None:
         """This stream still owns the directory it is about to write to, and this process is the
@@ -2451,16 +2611,18 @@ class TaskStream:
         The ``O_EXCL`` create at construction is what makes ownership exclusive; this is what
         makes it *cover the run*. A claim taken once and never looked at again is a statement
         about the moment of construction, and the thing it has to rule out — two streams
-        appending to one record — happens at every write after it. Three cases reach here, and
-        all three were reproduced through the public API:
+        appending to one record — happens at every write after it. Four cases reach here, and
+        all four were reproduced through the public API:
 
         * a ``resume=True`` that took the directory over from a stream still serving into it —
           including one with a task in flight, whose seal would otherwise append a second scored
           row for a position the taking-over stream replays;
         * two resumes racing, where one unlinks after the other has already created;
-        * a process that forked a live stream, where the token matches and nothing else does.
+        * a process that forked a live stream, where the token matches and nothing else does;
+        * an object duplicated out of a live stream, where the token *and* the pid match and only
+          the object differs.
 
-        All three end the same way: the stream that may not write finds out *before* its append
+        All four end the same way: the stream that may not write finds out *before* its append
         rather than after it, and says so loudly. There is no quiet path — no row is written, no
         answer to the agent changes shape, and the stream stops, so the drain reports it.
 
@@ -2470,10 +2632,26 @@ class TaskStream:
         numbers its parent is also using. If two processes are to serve, they serve two queues
         into two directories, or one crashes and the other resumes it with ``resume=True``. A
         ``fork`` for anything that does not touch the stream (a subprocess helper, say) is
-        untouched by this: nothing is checked until the child tries to write."""
+        untouched by this: nothing is checked until the child tries to write.
+
+        **Duplicating a live stream is refused the same way, and refused earlier.** The last case
+        is the fork's twin inside one process, and :meth:`_refuse_duplication` closes it at every
+        protocol a duplicate could be made through, so it is not a case a caller should ever reach
+        by accident. It is answered here as well because this is where the record is defended: an
+        ownership check that could be satisfied by an object made out of another object's state
+        would be checking a value, not an owner."""
         held = self._read_claim() or {}
         if self._holds_claim(held):
             return
+        if held.get("owner") == self._owner and held.get("pid") == os.getpid():
+            raise RuntimeError(
+                f"{self.prov_dir} is claimed by the stream this object was duplicated from"
+                + _claim_detail(held)
+                + f"; this is pid {os.getpid()}, the same process, so the claim was copied rather "
+                "than taken. Two objects holding one claim would hand out the same queue "
+                "positions and file contradictory rows under the same seq. A stream cannot be "
+                "duplicated: build the stream where it will serve"
+            )
         if held.get("owner") == self._owner:
             raise RuntimeError(
                 f"{self.prov_dir} is claimed by this stream in another process"
@@ -4879,6 +5057,15 @@ class EvalStream(TaskStream):
        exclusive lock on the directory at every dispense *and* every row, since a claim taken once
        says nothing about the writes that follow it and a claim merely re-read says nothing about
        the write it precedes.
+
+       *Two streams* is also the count that a second **object** would break, and ownership alone
+       cannot tell a duplicate apart: an evaluation stream copied with ``copy.copy`` or revived
+       from a pickle carries the same token under the same pid, so it passes every check above and
+       files a second scored row for a queue position the original is serving. Mechanism:
+       :meth:`TaskStream._refuse_duplication`, which refuses ``copy``, ``deepcopy``, pickling and
+       state extraction on this class as on its base, so no second object exists to check; and
+       :meth:`TaskStream._holds_claim`, which asks *which object* alongside which stream and which
+       process, so the append is defended even against a duplicate built without them.
 
     4. *Everything a stream already guarantees*, unchanged and named here because an evaluation
        rests on them: the framing has no field a task index or target could be written into; the

@@ -25,8 +25,10 @@ construction site, and these tests are the adversary that goes looking for the w
 from __future__ import annotations
 
 import asyncio
+import copy
 import json
 import os
+import pickle
 import subprocess
 import sys
 import textwrap
@@ -1340,6 +1342,211 @@ async def _serve_one(stream: TaskStream) -> None:
     async with stream:
         await stream.get_task()
         await stream.dispatch(SUBMIT_TOOL, {"answer": "4"})
+
+
+def _eval_stream(tmp_path: Path, indices: Sequence[int] = (0,), **kwargs: Any) -> EvalStream:
+    """The exact class an evaluation is served by, not a `TaskStream` standing in for one. The
+    refusals below live on the base, and "the base defines it" is not the property — "the object
+    an evaluation actually holds refuses" is, and only the concrete class can say so."""
+    return EvalStream(
+        _env_for,
+        [TaskRef(ENV_NAME, i) for i in indices],
+        prov_dir=tmp_path / "prov",
+        **kwargs,
+    )
+
+
+# A duplicate is a second stream with the first one's name. The `fork` refusal above closes the
+# version that copies the *process*; these close the version that copies the *object*, which is
+# strictly easier to reach — one stdlib call, no processes, nothing private touched — and lands in
+# the worse place, since the pid the fork check relies on matches by construction inside one
+# process. Reproduced before it was closed, on an exact `EvalStream`, with `copy.copy` and again
+# by pickling: two objects, one claim, two scored rows for queue position 0 under `seq` 1, one
+# `success=false` and one `success=true`, both stamped `never`, neither stream stopped and both
+# closes clean — one queued task averaging to 0.5 with nothing in the artifact saying so.
+
+
+async def test_a_stream_may_not_be_copied(tmp_path: Path) -> None:
+    # The reproduction, refused at the line that made the second object. `copy.copy` duplicates
+    # the ownership token, the pid it runs under is the same pid, and the queue position and `seq`
+    # are plain integers that come across with it — so the copy passed `_holds_claim` and
+    # `_append_owned` authorised its writes as honestly as it authorises the original's. Nothing
+    # downstream can tell the two apart, so the refusal has to be here, before a second usable
+    # object exists and before either of them has dispensed anything.
+    stream = _eval_stream(tmp_path, max_in_flight=2)
+    with pytest.raises(TypeError, match="copy.copy of this EvalStream is refused") as refused:
+        copy.copy(stream)
+    message = str(refused.value)
+    assert "ownership identity, not a value" in message
+    # The refusal names what a caller has to do instead, because "no" is not advice — and names
+    # the sanctioned second stream, which takes a directory over deliberately and mints an
+    # identity of its own rather than borrowing one.
+    assert "Build the stream where it will serve" in message
+    assert "resume=True" in message
+
+    # Refused before any dispense: no task was handed out, so there is no record to reconcile and
+    # nothing to tell apart. The claim is untouched — a refused copy costs the original nothing.
+    assert not (tmp_path / "prov" / "dispenses.jsonl").exists()
+    assert not (tmp_path / "prov" / "results.jsonl").exists()
+    assert _claim(tmp_path).is_file()
+
+    # Holding a stream is not copying one: the shallow copy of a *container* aliases it, which is
+    # the same object and the same identity, and is left alone. What is refused is making a second
+    # stream, not putting one in a list.
+    assert copy.copy([stream])[0] is stream
+    assert copy.copy({"stream": stream})["stream"] is stream
+
+    # And the stream the copy was taken of serves the queue it always would have, into a record
+    # that holds one row for the one queued task — including across the moment a copy would do the
+    # most damage, with a task dispensed and unsealed, where the duplicate would inherit the live
+    # lease as well as the position.
+    async with stream:
+        dispensed = await stream.get_task()
+        assert dispensed is not None
+        with pytest.raises(TypeError, match="copy.copy of this EvalStream is refused"):
+            copy.copy(stream)
+        await stream.dispatch(SUBMIT_TOOL, {"answer": "4"}, lease=dispensed.lease)
+    rows = _rows(tmp_path)
+    assert [row["position"] for row in rows] == [0]
+    assert [row["seq"] for row in rows] == [1]
+    # A property of the type and not of a state: a stream that has released its claim and has
+    # nothing left to serve is still not a thing there may be two of.
+    assert not _claim(tmp_path).exists()
+    with pytest.raises(TypeError, match="copy.copy of this EvalStream is refused"):
+        copy.copy(stream)
+
+
+async def test_a_stream_may_not_be_deep_copied(tmp_path: Path) -> None:
+    # The same refusal one level down, and not for the shallow copy's reason: a deep copy of a
+    # stream would duplicate the token just as exactly, while also copying a live env catalog and
+    # the episodes in flight, which are handles onto sessions and directories that no copy gets a
+    # second of. Refused whole rather than left to fail partway through a copy, since a
+    # half-copied serving stream is a mess with an ownership claim in it.
+    stream = _eval_stream(tmp_path, max_in_flight=2)
+    for duplicate in (
+        lambda: copy.deepcopy(stream),
+        # No `copy` call in sight at the call site: deep-copying anything that merely holds the
+        # stream arrives at the same place, which is the realistic way a run would do this to
+        # itself — a config dict or a run record snapshotted "safely".
+        lambda: copy.deepcopy({"stream": stream, "tag": "run-1"}),
+        lambda: copy.deepcopy([[stream]]),
+    ):
+        with pytest.raises(TypeError, match="copy.deepcopy of this EvalStream is refused"):
+            duplicate()
+
+    assert not (tmp_path / "prov" / "dispenses.jsonl").exists()
+    assert _claim(tmp_path).is_file()
+    await _serve_one(stream)
+    assert [row["position"] for row in _rows(tmp_path)] == [0]
+
+
+async def test_a_stream_may_not_be_pickled(tmp_path: Path) -> None:
+    # The duplication surface with the longest reach and the only one that *stores* the identity:
+    # before this, `pickle.dumps` returned a few kilobytes with the ownership token among them,
+    # and `pickle.loads` handed back an `EvalStream` that served into the original's directory
+    # beside it. Nobody types this; a `spawn` process argument, a process pool or a task queue
+    # does. Every protocol, because one that held at the default alone would be no refusal at all.
+    stream = _eval_stream(tmp_path, max_in_flight=2)
+    for protocol in range(pickle.HIGHEST_PROTOCOL + 1):
+        with pytest.raises(TypeError, match="pickle of this EvalStream is refused"):
+            pickle.dumps(stream, protocol=protocol)
+        # The protocol method itself, not only what `pickle` does with it: a serialiser that asks
+        # the object for its reconstructor directly gets the same answer.
+        with pytest.raises(TypeError, match="pickle of this EvalStream is refused"):
+            stream.__reduce_ex__(protocol)
+    with pytest.raises(TypeError, match="pickle of this EvalStream is refused"):
+        stream.__reduce__()
+
+    assert not (tmp_path / "prov" / "dispenses.jsonl").exists()
+    assert _claim(tmp_path).is_file()
+    await _serve_one(stream)
+    assert [row["position"] for row in _rows(tmp_path)] == [0]
+
+
+async def test_every_duplication_protocol_is_refused_on_the_class_that_serves(
+    tmp_path: Path,
+) -> None:
+    # The family, enumerated, on both classes. Two things are checked of each surface and the
+    # second is why this test exists: that the refusal is *defined* rather than reached through a
+    # neighbour. `copy.copy` falls back to the pickle protocol when `__copy__` is missing and
+    # pickling falls back between its own two methods, so a stream with a hole in it still refuses
+    # a lot of things — an enumeration that only called the stdlib verbs would go green with the
+    # method deleted. Called directly here, on the object, so each surface answers for itself.
+    #
+    # Both classes, because placement is the question this file settles: the refusals live on
+    # `TaskStream`, where the ownership machinery they defend lives, and `EvalStream` inherits
+    # them. Two rows for one queue position is a broken record under `immediate` exactly as it is
+    # under `never` — a training run's reward signal is the thing being poisoned there — so this
+    # is not an evaluation-grade guarantee bolted onto the evaluation-grade class.
+    surfaces = {
+        "__copy__": lambda stream: stream.__copy__(),
+        "__deepcopy__": lambda stream: stream.__deepcopy__({}),
+        "__reduce__": lambda stream: stream.__reduce__(),
+        "__reduce_ex__": lambda stream: stream.__reduce_ex__(pickle.HIGHEST_PROTOCOL),
+        # The state itself, which is the token and the queue position and the `seq`, and which
+        # `object.__new__(cls).__dict__.update(state)` turns back into a serving stream. Reachable
+        # through neither `copy` nor `pickle` now that both refuse above, and refused anyway: a
+        # guarantee that depends on which door the caller came through is not a property of the
+        # object.
+        "__getstate__": lambda stream: stream.__getstate__(),
+    }
+    for name in surfaces:
+        assert name in vars(TaskStream), f"{name} is not defined on TaskStream"
+
+    for stream in (_stream(tmp_path / "task", [0]), _eval_stream(tmp_path / "eval")):
+        for name, attempt in surfaces.items():
+            with pytest.raises(TypeError, match="is refused") as refused:
+                attempt(stream)
+            assert type(stream).__name__ in str(refused.value), name
+            assert "ownership identity, not a value" in str(refused.value), name
+        # There is nothing to revive a state into either, so the halves of the protocol agree:
+        # no `__setstate__` was added to accept what `__getstate__` refuses to produce.
+        assert not hasattr(stream, "__setstate__")
+        await stream.aclose()
+
+
+async def test_a_stream_duplicated_past_the_refusals_still_cannot_write(
+    tmp_path: Path,
+) -> None:
+    # The backstop, and the reason the ownership check asks *which object* and not only which
+    # stream and which process. Both of those are values — a token is a string, a pid is an int —
+    # so anything built out of a stream's state carries them and answers "yes". The refusals above
+    # close every protocol a duplicate is normally made through; this closes the answer itself, at
+    # the append, where the record is actually defended. Built the one way no protocol of ours is
+    # consulted about, which is deliberate: this test reaches into the object exactly as a cloner
+    # that bypasses `copy` and `pickle` would, and asserts that reaching in is not enough.
+    stream = _eval_stream(tmp_path, max_in_flight=2)
+    duplicate = object.__new__(type(stream))
+    duplicate.__dict__.update(stream.__dict__)
+
+    # It is not caught by being unrecognisable — it holds the claim's own token, under the claim's
+    # own pid. It is caught because it is not the object the claim was taken for.
+    held = json.loads(_claim(tmp_path).read_text(encoding="utf-8"))
+    assert duplicate._owner == held["owner"] and held["pid"] == os.getpid()
+
+    with pytest.raises(RuntimeError, match="duplicated from") as refused:
+        await duplicate.get_task()
+    # Not the fork message, which is what the token alone would have earned this object: the pid
+    # matches, so telling this caller they forked would send them looking for a second process
+    # that does not exist. The advice is the one that fits — build the stream where it serves.
+    assert "inherited across a fork" not in str(refused.value)
+    assert "build the stream where it will serve" in str(refused.value)
+    assert duplicate.stopped
+    # And the close reports it rather than succeeding quietly, naming the refusal underneath: a
+    # stream that could not record the task it was handed served nothing, whoever owns the
+    # directory.
+    with pytest.raises(RuntimeError, match="could not record a dispense") as drained:
+        await duplicate.aclose()
+    assert "duplicated from" in str(drained.value.__cause__)
+
+    # Nothing of the duplicate's reached the record — the refusal is before the append, not a
+    # repair after it — and the original serves its queue and closes clean.
+    assert not (tmp_path / "prov" / "results.jsonl").exists()
+    assert _claim(tmp_path).is_file()
+    await _serve_one(stream)
+    rows = _rows(tmp_path)
+    assert [(row["position"], row["seq"]) for row in rows] == [(0, 1)]
+    assert not _claim(tmp_path).exists()
 
 
 async def test_a_refused_resume_puts_back_the_claim_it_displaced(tmp_path: Path) -> None:
