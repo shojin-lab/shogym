@@ -31,6 +31,7 @@ import subprocess
 import sys
 import textwrap
 import time
+from abc import ABCMeta
 from pathlib import Path
 from typing import Any, ClassVar, Dict, List, Sequence
 
@@ -686,27 +687,118 @@ async def test_a_shipped_policy_is_served_as_itself_whatever_its_instance_says(
     assert stream.results[0].score is not None  # the task really was graded
 
 
+async def test_a_shipped_policy_cannot_supply_the_behaviour_its_regime_names(
+    tmp_path: Path,
+) -> None:
+    # The same shadowing, aimed at the method instead of the class variables — and this is the
+    # half that reaches the agent. A table that supplied `regime` and `reveals` but then called
+    # `policy.reveal(...)` would look up a name on an object the caller owns, and an instance
+    # dictionary is looked at first: an admitted `Immediate` answers the terminating call with
+    # items no env published, and can add ones the row never held, while the dispense before it,
+    # the row beside it and any resume after it all stamp `immediate`. Nothing in the artifact
+    # records the signal the agent was actually shown, and the next run's scores were earned
+    # under it. So the table supplies the behaviour the regime is a name for.
+    policy = Immediate()
+    object.__setattr__(
+        policy,
+        "reveal",
+        lambda published: [
+            {"name": "correct", "value": False, "level": "episode"},
+            {"name": "target", "value": "10", "level": "episode"},
+        ],
+    )
+    assert policy.reveal([])  # the shadowing really took: the lookup finds the caller's function
+
+    async with _stream(tmp_path, [0], feedback=policy) as stream:
+        await stream.get_task()
+        answer = _payload(await stream.dispatch(SUBMIT_TOOL, {"answer": "4"}))
+
+    # `immediate` means the sealed row's own episode-level items, verbatim: the answer is what
+    # the file holds, it is not what the caller's function returns, and it invents nothing.
+    row = _rows(tmp_path)[0]
+    assert answer["feedback"] == _episode_level(row["observed"])
+    assert answer["feedback"] == [{"name": "correct", "value": True, "level": "episode"}]
+    assert set(answer) == {"content", "terminated", "hint", "feedback"}
+    assert row["feedback_regime"] == "immediate"
+    # Ignored, not refused, and nothing about the run is disturbed by it: a stream reads no
+    # attribute of the object it was handed, so there is nothing here to detect or to report.
+    assert not stream.stopped
+    assert stream.results[0].score is not None
+
+
+class _Wearing:
+    """An object that answers ``isinstance`` and ``.__class__`` with :class:`Immediate`, and is
+    not one."""
+
+    @property  # type: ignore[misc]
+    def __class__(self) -> type:  # type: ignore[override]
+        return Immediate
+
+    def reveal(self, published: Sequence[Dict[str, Any]]) -> Sequence[Dict[str, Any]]:
+        return [{"name": "correct", "value": False, "level": "episode"}]
+
+
+class _Answering(ABCMeta):
+    """A metaclass that answers every class attribute lookup out of :class:`Immediate`."""
+
+    def __getattr__(cls, name: str) -> Any:
+        return getattr(Immediate, name)
+
+
+class _Costume(FeedbackPolicy, metaclass=_Answering):
+    """A policy whose *class* borrows `Immediate`'s regime, reveal flag and method."""
+
+    def reveal(self, published: Sequence[Dict[str, Any]]) -> Sequence[Dict[str, Any]]:
+        return [{"name": "correct", "value": False, "level": "episode"}]
+
+
+@pytest.mark.parametrize("costume", [_Wearing, _Costume])
+async def test_an_object_that_answers_like_a_policy_is_still_refused(
+    tmp_path: Path, costume: type
+) -> None:
+    # The two ways an object can *say* it is `Immediate` without being one, refused where every
+    # other impostor is. `_Wearing.__class__` is a property, so `isinstance` says yes and a check
+    # written with it would admit the object whole — its own `reveal` and all. `_Costume` hooks
+    # the lookup one level up: its metaclass answers `regime`, `reveals` and `reveal` out of
+    # `Immediate`, so every class-level read of it agrees with the real policy. `type(x) is C`
+    # consults neither, which is why the admission is spelled that way and why reading the
+    # behaviour off the admitted *class* is safe.
+    impostor = costume()
+    assert isinstance(impostor, FeedbackPolicy)  # both pass the check this module does not make
+    with pytest.raises(ValueError, match="feedback must be Never\\(\\) or Immediate\\(\\)"):
+        _stream(tmp_path, [0], feedback=impostor)
+    assert not (tmp_path / "prov").exists()
+
+
 async def test_the_policy_table_is_the_only_place_a_regime_is_named(tmp_path: Path) -> None:
     # The allow-list is what makes a regime name mean one policy, which is what the resume check
     # needs it to mean: two policies sharing a name would let a record be continued by a stream
     # that did not write it. Pinned here rather than in prose, because this is the invariant a
     # third entry has to preserve — and the table, not the class attribute, is what is served.
-    admitted = {policy: (regime, reveals) for policy, regime, reveals in stream_module._POLICIES}
+    admitted = {
+        policy: (regime, reveals) for policy, regime, reveals, _reveal in stream_module._POLICIES
+    }
     assert admitted == {Never: ("never", False), Immediate: ("immediate", True)}
-    regimes = [regime for _policy, regime, _reveals in stream_module._POLICIES]
+    regimes = [regime for _policy, regime, _reveals, _reveal in stream_module._POLICIES]
     assert len(set(regimes)) == len(regimes)
-    for policy, regime, reveals in stream_module._POLICIES:
+    for policy, regime, reveals, reveal in stream_module._POLICIES:
         assert type(regime) is str and regime
         assert type(reveals) is bool
         # The class still declares them, and the table still agrees with the class — the table
         # exists so that an *instance* cannot disagree, not so the class can.
         assert (policy.regime, policy.reveals) == (regime, reveals)
+        # The fourth member is the behaviour itself, snapshotted from the class: what a stream
+        # invokes is this function, applied to whatever instance it was handed, so a policy added
+        # later cannot be added as a name whose meaning is then supplied by the caller.
+        assert reveal is policy.__dict__["reveal"]
 
 
 def _admitting(monkeypatch: pytest.MonkeyPatch, policy: type, regime: str, reveals: bool) -> None:
     """Add a policy to the module's allow-list, which is how a real one is added too."""
     monkeypatch.setattr(
-        stream_module, "_POLICIES", stream_module._POLICIES + ((policy, regime, reveals),)
+        stream_module,
+        "_POLICIES",
+        stream_module._POLICIES + ((policy, regime, reveals, policy.reveal),),
     )
 
 
@@ -999,6 +1091,127 @@ async def test_a_stream_that_lost_its_directory_writes_nothing_more(tmp_path: Pa
     assert [row["position"] for row in _rows(tmp_path)] == [0, 1]
 
 
+async def test_a_displaced_stream_cannot_seal_the_task_it_still_holds(tmp_path: Path) -> None:
+    # A dispense is not the only thing a stream appends, and the *result* is the one that carries
+    # a score. A takeover displaces a stream that has a task in flight: that task's position has
+    # no row, so it is precisely the position the resuming stream replays, and both streams then
+    # seal into one record. Checked only where a task is dispensed, the displaced stream's seal
+    # went through — two scored rows for queue position 0, one wrong and one right, both honestly
+    # stamped, neither stream stopped, both closes returning normally, and a consumer averaging
+    # one queued task to 0.5 with nothing in the artifact saying so.
+    displaced = _stream(tmp_path, [0])
+    await displaced.get_task()
+    taker = _stream(tmp_path, [0], resume=True)
+    await taker.get_task()
+
+    # The agent is answered, as it is for every integrity failure here — loud to the harness,
+    # silent to the agent — and nothing at all is recorded for the task.
+    answer = _payload(await displaced.dispatch(SUBMIT_TOOL, {"answer": "not the answer"}))
+    assert set(answer) == {"content", "terminated", "hint"}
+    assert displaced.stopped
+    assert list(displaced.results) == []
+
+    async with taker:
+        await taker.dispatch(SUBMIT_TOOL, {"answer": "4"})
+    rows = _rows(tmp_path)
+    assert [row["position"] for row in rows] == [0]
+    assert rows[0]["score"]["success"] is True
+
+    # And the close reports it rather than succeeding quietly: a stream that could not record a
+    # task it was handed is a run whose record is incomplete, whoever else owns the directory.
+    with pytest.raises(RuntimeError, match="could not record every dispensed task") as drained:
+        await displaced.aclose()
+    assert "no longer claimed by this stream" in str(drained.value.__cause__)
+
+
+def test_a_stream_may_not_be_shared_across_a_fork(tmp_path: Path) -> None:
+    # Ownership is process-bound, and a token alone cannot make it so: the token is a value in
+    # memory and `fork` copies memory, so both children hold a stream whose `owner` matches the
+    # claim on disk. They also hold its queue position, its `seq` counter and its lease set — so
+    # both passed every check, both served position 0, both exited cleanly, and the record ended
+    # with two contradictory rows under one `seq` (and, since a record and its terminator are two
+    # writes, with lines from the two processes interleaved into JSON that will not parse at all).
+    # The claim records the pid that took it, and every append asks whether that pid is this one:
+    # not whether the other process is alive, which is a question with no honest answer here, but
+    # whether the process about to write is the one that owns the directory.
+    #
+    # Sync, and forking before any loop exists: a `TaskStream` is built by an ordinary
+    # constructor, and forking a process with a running event loop would leave each child holding
+    # the parent's loop state — a failure of its own, indistinguishable from the refusal under
+    # test.
+    stream = _stream(tmp_path, [0])
+    verdicts = [tmp_path / "child-0", tmp_path / "child-1"]
+
+    children = []
+    for verdict, answer in zip(verdicts, ("4", "not the answer")):
+
+        async def serve(answer: str = answer) -> None:
+            await stream.get_task()
+            await stream.dispatch(SUBMIT_TOOL, {"answer": answer})
+            await stream.aclose()
+
+        pid = os.fork()
+        if pid == 0:  # pragma: no cover - the child never returns to the test runner
+            outcome = "SERVED"
+            try:
+                asyncio.run(serve())
+            except BaseException as exc:  # noqa: BLE001 - reported to the parent, not raised
+                outcome = f"REFUSED {exc}"
+            try:
+                verdict.write_text(outcome, encoding="utf-8")
+            finally:
+                os._exit(0)
+        children.append(pid)
+
+    for pid in children:
+        os.waitpid(pid, 0)
+    outcomes = [verdict.read_text(encoding="utf-8") for verdict in verdicts]
+    assert all(outcome.startswith("REFUSED") for outcome in outcomes), outcomes
+    assert all("claimed by this stream in another process" in one for one in outcomes), outcomes
+    # The refusal names what a caller has to do about it, because "you forked" is not advice.
+    assert all("in the process that will serve it" in one for one in outcomes), outcomes
+    # Nothing was written by either child: the refusal is before the append, not a repair after
+    # it, so there is no dispense to reconcile and no row to disagree with another.
+    assert not (tmp_path / "prov" / "dispenses.jsonl").exists()
+    assert not (tmp_path / "prov" / "results.jsonl").exists()
+    # The parent still owns the directory a child could not take from it, and serves normally.
+    assert json.loads(_claim(tmp_path).read_text(encoding="utf-8"))["pid"] == os.getpid()
+    asyncio.run(_serve_one(stream))
+    assert [row["position"] for row in _rows(tmp_path)] == [0]
+
+
+async def _serve_one(stream: TaskStream) -> None:
+    """One task through a stream that is already built, and an orderly close."""
+    async with stream:
+        await stream.get_task()
+        await stream.dispatch(SUBMIT_TOOL, {"answer": "4"})
+
+
+async def test_a_refused_resume_puts_back_the_claim_it_displaced(tmp_path: Path) -> None:
+    # A resume takes the directory over on the way in — it has to, since everything after that
+    # point builds envs and reads the record it is continuing — so a construction that then
+    # refuses has displaced a claim it never got to use. Leaving it gone would let a mistyped
+    # queue stop a stream that was serving perfectly well: the dispossessed one can no longer
+    # record the task it is holding, and the run nobody asked to stop is the one that had done
+    # nothing wrong. A refusal changes nothing, and that now includes what it took over.
+    serving = _stream(tmp_path, [0, 1], feedback=Immediate())
+    await serving.get_task()
+    held = json.loads(_claim(tmp_path).read_text(encoding="utf-8"))
+
+    with pytest.raises(ValueError, match="dispense record"):
+        _stream(tmp_path, [2], resume=True, feedback=Immediate())  # a queue that disagrees
+    assert json.loads(_claim(tmp_path).read_text(encoding="utf-8")) == held
+
+    # ...so the stream that was serving still owns its directory: it records the task it was
+    # holding, serves the rest of its queue, and closes with the directory unclaimed.
+    async with serving:
+        await serving.dispatch(SUBMIT_TOOL, {"answer": "4"})
+        await serving.get_task()
+        await serving.dispatch(SUBMIT_TOOL, {"answer": "6"})
+    assert [row["position"] for row in _rows(tmp_path)] == [0, 1]
+    assert not _claim(tmp_path).exists()
+
+
 async def test_a_refused_construction_leaves_the_directory_as_it_found_it(
     tmp_path: Path,
 ) -> None:
@@ -1140,3 +1353,114 @@ async def test_only_one_of_many_processes_can_claim_one_directory(tmp_path: Path
     held = json.loads((tmp_path / "prov" / "claim.json").read_text(encoding="utf-8"))
     assert held["feedback_regime"] in {"never", "immediate"}
     assert held["pid"] in [process.pid for process in running]
+
+
+# Run by `test_a_takeover_cannot_land_between_a_check_and_its_append`, in its own interpreter:
+# the window it opens sits between two statements of one process, and only another process can
+# enter it.
+_INTERLEAVER = """
+import asyncio
+import sys
+import time
+from pathlib import Path
+
+from hgym.serve import stream as stream_module
+from hgym.serve.stream import TaskRef, TaskStream
+from tests._fixtures.score_env import ENV_NAME, _FixtureScoreEnv
+
+prov, role, verdict, inside = (
+    Path(sys.argv[1]), sys.argv[2], Path(sys.argv[3]), Path(sys.argv[4])
+)
+tasks = [{"id": "q0", "question": "2+2?", "answer": "4"}]
+appending = stream_module._append_jsonl
+
+
+def paused(path, record, *, durable=False):
+    # The window a check-then-append leaves open, held wide: the ownership check has returned and
+    # the record has not been written yet. Patched on the module's own append rather than on
+    # anything the fix introduced, so this test asks about the ordering and not about a shape.
+    if path.name == "dispenses.jsonl":
+        inside.write_text("dispensing", encoding="utf-8")
+        time.sleep(2.0)
+    return appending(path, record, durable=durable)
+
+
+async def main():
+    if role == "holder":
+        stream_module._append_jsonl = paused
+    else:
+        while not inside.exists():  # the takeover starts only once the holder is in the window
+            await asyncio.sleep(0.01)
+    try:
+        stream = TaskStream(
+            lambda _name: _FixtureScoreEnv(tasks=tasks),
+            [TaskRef(ENV_NAME, 0)],
+            prov_dir=prov,
+            resume=(role == "taker"),
+        )
+        await stream.get_task()
+    except BaseException as exc:
+        verdict.write_text("REFUSED " + str(exc), encoding="utf-8")
+    else:
+        verdict.write_text("DISPENSED", encoding="utf-8")
+
+
+asyncio.run(main())
+"""
+
+
+async def test_a_takeover_cannot_land_between_a_check_and_its_append(tmp_path: Path) -> None:
+    # Ownership re-read before a write is not ownership *of* the write. The check returns, the
+    # takeover lands, and the append the check authorised is still to come — so it goes through,
+    # on behalf of a stream that no longer owns the directory. The taking-over stream seeds its
+    # numbering from a record that does not hold the dispense yet, and both processes file
+    # `(seq=1, position=0)`: two dispenses under one identifier, which is exactly what the resume
+    # numbering exists to prevent, with `reconcile` owing a `broker_abort` it cannot tell apart.
+    #
+    # So the claim is verified inside the same exclusion the append happens in. Whichever process
+    # gets there first, the other is *ordered* behind it rather than interleaved with it: the
+    # takeover waits for the record it is about to continue, and the displaced stream finds a
+    # claim that is no longer its own the next time it writes.
+    interleaver = tmp_path / "interleaver.py"
+    interleaver.write_text(textwrap.dedent(_INTERLEAVER), encoding="utf-8")
+    environ = {**os.environ, "PYTHONPATH": str(Path(__file__).resolve().parent.parent)}
+    verdicts = {role: tmp_path / f"verdict-{role}" for role in ("holder", "taker")}
+    running = [
+        subprocess.Popen(
+            [
+                sys.executable,
+                str(interleaver),
+                str(tmp_path / "prov"),
+                role,
+                str(verdict),
+                str(tmp_path / "inside"),
+            ],
+            stderr=subprocess.PIPE,
+            text=True,
+            env=environ,
+        )
+        for role, verdict in verdicts.items()
+    ]
+    try:
+        for process in running:
+            assert process.communicate(timeout=120)[1] == "", process.args
+    finally:
+        for process in running:
+            if process.poll() is None:  # pragma: no cover - only for a wedged child
+                process.kill()
+                process.communicate()
+
+    outcomes = {role: verdict.read_text(encoding="utf-8") for role, verdict in verdicts.items()}
+    # Neither is refused here: the holder's dispense is its own, and the takeover is a call the
+    # human is entitled to make. What may not happen is the two of them numbering it together.
+    assert outcomes == {"holder": "DISPENSED", "taker": "DISPENSED"}, outcomes
+    dispenses = read_dispenses(tmp_path / "prov")
+    assert [record["position"] for record in dispenses] == [0, 0]
+    assert [record["seq"] for record in dispenses] == [1, 2], dispenses
+    assert len({record["lease"] for record in dispenses}) == 2
+    # ...and the file is one record per line. Two appends in flight at once interleave a record
+    # into the middle of another's line, since the record and the terminator that commits it are
+    # two writes — a record destroyed rather than merely doubled, which the same exclusion is
+    # what rules out.
+    lines = (tmp_path / "prov" / "dispenses.jsonl").read_text(encoding="utf-8").splitlines()
+    assert [json.loads(line)["seq"] for line in lines] == [1, 2]
