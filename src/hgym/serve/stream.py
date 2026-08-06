@@ -91,7 +91,10 @@ its answer is put inside the response shape above, under one added ``feedback`` 
 sees, and can never add, the lease, the position, the index, the closure, the queue counts or the
 stop — so the answer to "what else can an agent learn from this?" is a property of these few
 lines rather than of whatever policy is passed. That shape is also what makes ``Delayed(k)``,
-``Batched(n)`` and ``Noisy(p)`` arrive later as policies rather than as new surface.
+``Batched(n)`` and ``Noisy(p)`` arrive later as policies rather than as new surface — written
+here and added to the allow-list of exact policy types a stream will serve under, because a
+regime is the record's claim about how a row was produced and a claim an arbitrary subclass makes
+about itself is not one a reader can check.
 
 Which policy served a task is written into the record itself — ``feedback_regime`` on every
 dispense record and every result row — because "these scores were earned with no verdict
@@ -99,9 +102,18 @@ channel open" is a claim about how a row was produced, and a row that cannot mak
 reader has to take on trust from prose. It is stamped on the *dispense*, before the task is
 handed out and so before anything could have been revealed, and again on the row; a record with
 no stamp was written before this existed, when every stream was ``Never``, so the reader idiom is
-``row.get("feedback_regime", "never")``. One record never mixes regimes: a fresh stream refuses a
-directory that already holds records at all, and a resuming one refuses a directory whose records
-name a different regime.
+``row.get("feedback_regime", "never")``.
+
+One record never mixes regimes, and that takes three checks rather than one, because the first
+two are about the past and a record's second writer may not have one yet. A fresh stream refuses
+a directory that already holds records; a resuming one refuses a directory whose records name a
+different regime; and every stream, fresh or resuming, **claims the directory** with an
+exclusive create before it builds anything, so that two streams pointed at the same empty
+directory end with one serving and one refusing rather than with both appending. The claim names
+the regime too — a run killed before its first dispense leaves no record to compare against, and
+the claim is what a resume compares itself with there. It is released on an orderly close, so a
+claim left on disk means a stream that never finished, which is exactly what ``resume=True``
+asserts about it.
 
 :class:`EvalStream` is that default made structural — it pins :class:`Never`, refuses a
 ``feedback`` argument outright, and enumerates what it does and does not guarantee.
@@ -436,6 +448,11 @@ _TOOL_NAME_MAX = 128
 
 _RESULTS_FILE = "results.jsonl"
 _DISPENSES_FILE = "dispenses.jsonl"
+# Which stream owns this provenance directory, and under which regime. Not a record — nothing
+# reads it to score a run — so it is neither appended to nor fsynced: it exists for exactly as
+# long as a stream is serving into the directory, and a host crash that loses it loses a claim
+# whose owner the crash already killed. See `TaskStream._claim_provenance`.
+_CLAIM_FILE = "claim.json"
 
 # How far back a log is read to find its last committed record. Only a file whose final append
 # died partway is scanned at all, and only until the first terminator, so this bounds what a
@@ -514,6 +531,27 @@ def _require_task_ref(ref: Any) -> TaskRef:
             "what the queue plays has to be what the record says it played"
         )
     return TaskRef(env, task_idx)
+
+
+def _claim_detail(held: Mapping[str, Any]) -> str:
+    """What a refusal can say about the claim it is refusing over, for the human deciding whether
+    to pass ``resume=True``.
+
+    Every member is optional and none is trusted: the file may have been written by a version
+    that recorded different ones, or may not have parsed at all (see
+    :meth:`TaskStream._read_claim`), and a message is the one place where saying less is better
+    than guessing. Rendered with ``!r`` so a value that is not what it claims to be looks like
+    what it is rather than blending into the sentence."""
+    detail = [
+        f"{label} {held[member]!r}"
+        for label, member in (
+            ("under feedback regime", "feedback_regime"),
+            ("by pid", "pid"),
+            ("at", "claimed_at"),
+        )
+        if member in held
+    ]
+    return f" ({', '.join(detail)})" if detail else ""
 
 
 def _recorded_regime(record: Mapping[str, Any]) -> str:
@@ -1406,14 +1444,26 @@ class FeedbackPolicy(ABC):
     object a caller passed, and it is what will let ``Delayed(k)``, ``Batched(n)`` and
     ``Noisy(p)`` arrive as new policies rather than as new surface.
 
-    Two class attributes, both read once when a stream is constructed and kept (an attribute of
-    an object the caller owns can be rebound at any time, and these two decide a wire shape and a
-    value written into every record — see :class:`TaskStream`):
+    **Subclassing this is not how a policy is admitted.** A stream serves only the exact policy
+    types this module lists in :data:`_POLICIES`, and takes the two values below from that list
+    rather than from the object it was handed. Deriving from this class elsewhere produces
+    something a stream refuses, by name, at construction — because the pair below is not two
+    independent assertions a policy gets to make about itself, and a subclass free to make them
+    separately can reveal a verdict while stamping every row of the run with the regime that has
+    no channel. Adding ``Delayed(k)``, ``Batched(n)`` or ``Noisy(p)`` means writing it here and
+    listing it there; the envelope containment above is what keeps that a policy rather than new
+    surface. This class stays public because it is the type of :attr:`TaskStream.feedback` and the
+    name for the concept — not because it is an extension point.
+
+    Two class attributes, both taken once when a stream is constructed and kept (they decide a
+    wire shape and a value written into every record — see :class:`TaskStream`):
 
     ``regime``
         the name stamped onto every dispense record and every result row this policy serves.
         It is what makes "these scores were earned with no verdict channel open" checkable from
-        the artifact instead of from prose.
+        the artifact instead of from prose. One regime, one policy: it is what a resumed run
+        compares itself against, so two policies sharing a name would make that check pass over
+        a record they did not both write.
     ``reveals``
         whether a terminating call carries the feedback member **at all**. It is a property of
         the policy, never of the task: under a revealing policy the member is always present,
@@ -1480,6 +1530,67 @@ class Immediate(FeedbackPolicy):
 
     def reveal(self, published: Sequence[Dict[str, Any]]) -> Sequence[Dict[str, Any]]:
         return published
+
+
+# The policies a stream may serve under, and — the point of the table — the pair each one
+# decides. `(policy type, regime, reveals)`, snapshotted here at import from the classes above, so
+# there is exactly one place that says what "immediate" means and it is not an attribute of an
+# object a caller owns.
+#
+# **An allow-list rather than a base class, because `regime` and `reveals` are not independent
+# facts.** Trusted from the instance, a policy could name itself `never` and reveal anyway: the
+# terminal would carry the verdict while every dispense record and every result row stamped the
+# regime with no channel, and a later genuine `Never` resume would be waved through because the
+# resume check compares two caller-chosen strings rather than two policies. That is a record that
+# is wrong while looking correct, which is the one failure this file exists to make impossible —
+# so the regime a run is stamped with is derived from *which* policy it is, and the set of
+# policies is closed.
+#
+# **How a policy is admitted, and why that is the launch gate rather than the design.** `Delayed`,
+# `Batched` and `Noisy` are still policies rather than new surface — the envelope containment in
+# `_terminal_answer` is what makes that true and none of it changes. What changes is where a
+# policy comes from: it is written in this module, given a regime no other entry uses, and added
+# to this tuple. It is not subclassed downstream, because a stream cannot check a claim a
+# downstream class makes about itself, and the record's claim about the regime is exactly what a
+# reader has to be able to trust. #93 scopes launch to the two below; the third line of this tuple
+# is the whole of what a third costs.
+_POLICIES: Tuple[Tuple[type, str, bool], ...] = (
+    (Never, Never.regime, Never.reveals),
+    (Immediate, Immediate.regime, Immediate.reveals),
+)
+
+
+def _admitted(policy: Any) -> Optional[Tuple[str, bool]]:
+    """The ``(regime, reveals)`` pair ``policy`` is served under, or ``None`` if it is not one this
+    module admits (see :data:`_POLICIES`).
+
+    **Identity, scanned — never ``isinstance``, never a dict keyed by the type.** Each of the
+    other two is defeated by an object that merely says the right thing, and both were measured
+    rather than assumed. ``isinstance`` passes anything deriving from :class:`FeedbackPolicy`,
+    which is the hole itself, and it also passes an object whose ``__class__`` is a property
+    answering ``Never``; a ``dict`` lookup runs the type's *metaclass* ``__hash__`` and ``__eq__``,
+    so a class with a metaclass answering equal to :class:`Never` is handed :class:`Never`'s
+    regime. ``type(x) is C`` consults neither: ``type()`` reports the real type whatever
+    ``__class__`` says, and ``is`` cannot be hooked. It is the reason ``_require_task_ref`` and
+    the namespace check spell their type tests the same way.
+
+    **The pair comes from here and not from the object**, which is what makes the exact type
+    sufficient. ``Never`` and ``Immediate`` are frozen dataclasses whose ``regime`` and ``reveals``
+    are ``ClassVar`` — so neither is a constructor argument and ordinary assignment raises — but
+    frozen is not sealed: they inherit a ``__dict__``, and ``object.__setattr__(Never(), "reveals",
+    True)`` shadows the class attribute on that instance with no subclass in sight. A check that
+    admitted the exact type and *then* read the instance would still stamp ``never`` on a run that
+    revealed. Read from the table, that instance is served as the :class:`Never` it is.
+
+    What the instance is still asked for is :meth:`FeedbackPolicy.reveal`, and deliberately: a
+    shadowed ``reveal`` can only fill the one member the envelope already reserves for a policy
+    that says it reveals, under a regime the record already stamps as open. It can make the answer
+    wrong; it cannot make the record lie about which channel produced it, which is the property
+    this table is here to keep."""
+    for admitted, regime, reveals in _POLICIES:
+        if type(policy) is admitted:
+            return regime, reveals
+    return None
 
 
 class TaskStream:
@@ -1553,11 +1664,14 @@ class TaskStream:
         feedback: what a terminating call tells the agent about the task it just ended (see
             :class:`FeedbackPolicy`). :class:`Never` — the default — answers with the fixed
             payload and opens no verdict channel; :class:`Immediate` answers with the sealed
-            row's own episode-level feedback, verbatim. Whichever it is, its ``regime`` is
-            written into every dispense record and every result row, so the posture a run served
-            under is a property of the artifact. Use :class:`EvalStream` rather than this
-            argument for a run whose scores are meant to be evaluation-grade: the argument says
-            what this run did, and the construction says what no argument could undo.
+            row's own episode-level feedback, verbatim. Those two and nothing else: the policies
+            a stream serves under are an allow-list of exact types (see :data:`_POLICIES`), and
+            the regime written into every dispense record and every result row is taken from that
+            list rather than from the object passed here — so the posture a run served under is a
+            property of the artifact rather than a claim the argument made about itself. Use
+            :class:`EvalStream` rather than this argument for a run whose scores are meant to be
+            evaluation-grade: the argument says what this run did, and the construction says what
+            no argument could undo.
     """
 
     def __init__(
@@ -1611,40 +1725,29 @@ class TaskStream:
                 "provenance_timeout must be a finite positive number of seconds, got "
                 f"{provenance_timeout}; pass None to bound it at nothing"
             )
-        if not isinstance(feedback, FeedbackPolicy):
-            # An allow-list, and the family it admits is this module's own. What a policy decides
-            # is whether the agent is told its verdict, so anything that merely quacks like one —
-            # `True`, `"immediate"`, an object with a `reveal` — would decide that by whatever it
-            # happens to answer, and the shape it answered in would be on the wire before anyone
-            # noticed. A stream that cannot name its regime cannot stamp its rows either.
+        # An allow-list of exact types, and the pair it hands back is this module's rather than
+        # the object's (see `_admitted`). What a policy decides is whether the agent is told its
+        # verdict AND what every record of this run says about that, and those two may not be
+        # separately assertable: anything that merely quacks like a policy — `True`,
+        # `"immediate"`, an object with a `reveal`, a `FeedbackPolicy` subclass naming itself
+        # `never` — would decide the first by whatever it answers and the second by whatever it
+        # claims, with the answer already on the wire under a stamp denying it.
+        admitted = _admitted(feedback)
+        if admitted is None:
             raise ValueError(
-                f"feedback must be a {FeedbackPolicy.__name__} ({Never.__name__}() or "
-                f"{Immediate.__name__}()), got {feedback!r} ({type(feedback).__name__}); it "
-                "decides whether a terminating call carries the task's verdict, and its regime "
-                "is written into every record this run keeps"
+                f"feedback must be {Never.__name__}() or {Immediate.__name__}(), got "
+                f"{feedback!r} ({type(feedback).__name__}); a policy decides whether a "
+                "terminating call carries the task's verdict *and* names the regime stamped on "
+                "every record this run keeps, so only a policy this module defines can be "
+                "trusted to make those two say the same thing. A new policy is admitted by being "
+                f"added to this module, beside {Never.__name__} and {Immediate.__name__}, not by "
+                f"subclassing {FeedbackPolicy.__name__} elsewhere"
             )
-        # Read once, here, and kept — the rule `provenance` namespaces follow, and for a stricter
-        # reason: these two are class attributes of an object the caller owns, so re-reading them
-        # per task would let a run advertise one regime in its record while answering under
-        # another. Exact types, because both are identity rather than payload: `regime` is
-        # written into every dispense and every row and is compared against the record when a run
-        # resumes, and `reveals` decides whether a response carries the feedback member at all —
-        # a truthy non-bool would open the channel on a policy that never said it was open.
-        regime = feedback.regime
-        if type(regime) is not str or not regime:
-            raise ValueError(
-                f"a feedback policy's regime must be a non-empty string, got {regime!r} "
-                f"({type(regime).__name__}); it is stamped on every dispense record and every "
-                "result row, and is what a resumed run compares its own regime against"
-            )
-        reveals = feedback.reveals
-        if type(reveals) is not bool:
-            raise ValueError(
-                f"a feedback policy's `reveals` must be a bool, got {reveals!r} "
-                f"({type(reveals).__name__}); it decides whether a terminating call carries the "
-                "sealed task's feedback, so a value read by truthiness would open the verdict "
-                "channel on a policy that never claimed to open it"
-            )
+        # Taken once, here, and kept — the rule `provenance` namespaces follow, and for a stricter
+        # reason: re-deriving them per task would let a run advertise one regime in its record
+        # while answering under another, and this pair decides both a wire shape and a value
+        # written into every record.
+        regime, reveals = admitted
         # Read once, here, and kept: `namespace` is an ordinary attribute of an object the caller
         # owns and can rebind at any time, so re-reading it at every dispense would validate one
         # value and record under another. The names checked below are the names every row is
@@ -1734,9 +1837,21 @@ class TaskStream:
         self.prov_dir = Path(prov_dir)
         self.results_path = self.prov_dir / _RESULTS_FILE
         self.dispenses_path = self.prov_dir / _DISPENSES_FILE
+        self.claim_path = self.prov_dir / _CLAIM_FILE
+        # This stream's identity in the directory it owns, minted before the claim it goes into.
+        # Unguessable rather than merely unique because it is the whole of what "still mine"
+        # means at every later write: a counter or a pid would be reproduced by the next process
+        # to hold that number, and a directory taken over is exactly when that matters.
+        self._owner = secrets.token_hex(16)
+        self._claimed = False
+        self._made_prov_dir = False
         # Checked here, ahead of the catalog: it is a statement about the arguments, and refusing
-        # before a factory is called costs no env the caller would then have to see closed.
+        # before a factory is called costs no env the caller would then have to see closed. The
+        # claim is taken in the same breath and for the same reason — it is the cheapest refusal
+        # this constructor has, and it is the one that has to happen before a *second* stream
+        # could pass the check above.
         self._require_fresh_provenance(resume)
+        self._claim_provenance(resume)
 
         # One long-lived env per env name, used only to read the published contract (it never
         # begins a session, so closing it releases nothing an episode owns). Constructing it is
@@ -1745,7 +1860,8 @@ class TaskStream:
         # Everything from here to the end of construction runs under a cleanup guard: a factory
         # may provision real resources, and a constructor that raises hands back no object, so
         # nothing else could ever close what it built. That covers a partly-built catalog as
-        # well as any later check that refuses the queue.
+        # well as any later check that refuses the queue — and the claim just taken, which no
+        # `aclose` will ever come to release because there is no stream to call it on.
         self._catalog: Dict[str, Env] = {}
         try:
             for name in env_names:
@@ -1948,6 +2064,15 @@ class TaskStream:
             self._watchdog: Optional[asyncio.Task[None]] = None
             self._releasing: Optional[asyncio.Task[None]] = None
         except BaseException as error:
+            # Let the directory go before the envs, because this one cannot fail and cannot
+            # block: a constructor that raises hands back no object, so a claim left behind here
+            # is a directory nothing will ever serve and that only `resume=True` could reopen —
+            # a refusal the caller earns by *fixing* what this call complained about. And the
+            # directory itself, if this call is what made it: a refused construction has served
+            # nothing and recorded nothing, and it may not be the reason a later `resume=True`
+            # looks reasonable.
+            self._release_claim()
+            self._unmake_provenance()
             for note in self._close_catalog_now():
                 error.add_note(note)
             raise
@@ -1972,7 +2097,14 @@ class TaskStream:
 
         ``resume`` is what tells the two apart, and it is not a flag this can infer: continuing a
         record and rerunning into one by mistake are the same call otherwise. So the ambiguity is
-        refused at the one moment where nothing has been spent yet."""
+        refused at the one moment where nothing has been spent yet.
+
+        **This is a check about what the directory already holds, and that is only half of it.**
+        Two streams constructed against the same *empty* directory both pass it, because at the
+        moment each one looks there is nothing to find — and then both serve, and the record ends
+        up holding two runs' rows under one set of positions, in both regimes, with no stop
+        anywhere. What closes that is :meth:`_claim_provenance`, which follows immediately and
+        turns "nobody has recorded here" into "nobody else is serving here"."""
         if resume:
             return
         recorded = [
@@ -1989,6 +2121,193 @@ class TaskStream:
                 "positions with nothing to tell them apart. Serve this queue into a fresh "
                 "provenance directory, or pass resume=True to continue this one."
             )
+
+    def _claim_provenance(self, resume: bool) -> None:
+        """Take ownership of the provenance directory for as long as this stream serves into it,
+        and refuse to serve at all if another stream holds it.
+
+        **Why existence checks are not enough.** Everything :meth:`_require_fresh_provenance`
+        refuses, it refuses by reading the directory — so it is a statement about the past, and
+        two constructors reach it before either has a past. Both pass, both serve, and the record
+        ends with two rows for one queue position, one stamped ``never`` and one ``immediate``,
+        no stop raised and nothing on either row saying the other exists. Every guarantee this
+        module makes about a record is a guarantee about *one* record written by *one* stream, and
+        nothing so far said which stream that was.
+
+        **The claim is the creation.** ``O_CREAT | O_EXCL`` is one atomic operation on every POSIX
+        filesystem this serves from: of any number of processes attempting it, exactly one
+        returns a descriptor and the rest get ``EEXIST``. So the loser is not racing a check it
+        might win — there is no window in which both are owners, because ownership *is* the
+        create. It is taken before the catalog is built and long before any append, so a refusal
+        costs nothing and no directory is ever written to by a stream that did not own it first.
+
+        What goes inside is this stream's ``owner`` token, the regime it serves under, and — for
+        the human who has to decide what to do about it — the pid and the wall clock at the claim.
+        **The pid is never consulted.** Reading it would be inventing a liveness oracle out of a
+        number that means nothing across a container boundary, a host, or a pid wraparound, and
+        the one thing worse than refusing a stale claim is silently breaking a live one.
+
+        **Staleness is the human's call, spelled ``resume=True``.** A stream killed mid-run leaves
+        its claim behind, which is exactly the directory a crashed evaluation has to be resumed
+        into. This cannot tell that claim from a live one and does not try: ``resume`` already
+        means "I am continuing a run that stopped", which is the same assertion, made by the only
+        party who can check it. So resuming takes the claim over — and takes it over through the
+        same ``O_EXCL`` create, after unlinking the one it was shown, so that two callers who both
+        assert it are not both believed. The residue of that (one unlinking after the other has
+        already created) is caught at the first write instead, by :meth:`_require_claim`.
+
+        **A claim carries the regime because the records may not have one yet.** A run killed
+        between its claim and its first dispense leaves a directory with nothing in it to compare
+        against, so :meth:`_require_regime_matches` — which reads records — has nothing to say,
+        and a resume under the other posture would be waved through onto an empty file. The claim
+        is the record of the regime that exists before any record does."""
+        # The directory has to exist before a create in it can be exclusive. Made in two steps so
+        # that whether *this* call made it is knowable rather than inferred: a constructor that
+        # goes on to raise has to leave the filesystem as it found it, and `exist_ok=True` cannot
+        # tell "I made this" from "it was already here" — which is the difference between tidying
+        # up after a refusal and deleting a directory the caller had prepared. Not made durable:
+        # see `_CLAIM_FILE`.
+        self.prov_dir.parent.mkdir(parents=True, exist_ok=True)
+        try:
+            os.mkdir(self.prov_dir)
+        except FileExistsError:
+            pass
+        else:
+            self._made_prov_dir = True
+        if resume:
+            held = self._read_claim()
+            if held is not None:
+                # Checked before the takeover, not after: this is the only check that can see the
+                # regime of a run that was killed before it recorded anything, and once the claim
+                # is gone that evidence is gone with it.
+                self._require_regime_matches(
+                    str(held.get("feedback_regime", _NEVER_REGIME)), source="an ownership claim"
+                )
+                # The assertion `resume=True` makes, carried out. An unlink of a claim that has
+                # already gone is the same outcome as this one, so a lost race here is not a
+                # failure — the create below is what decides who owns the directory.
+                try:
+                    self.claim_path.unlink()
+                except FileNotFoundError:
+                    pass
+        try:
+            descriptor = os.open(self.claim_path, os.O_CREAT | os.O_EXCL | os.O_WRONLY, 0o644)
+        except FileExistsError:
+            held = self._read_claim() or {}
+            raise ValueError(
+                f"{self.prov_dir} is claimed by another stream"
+                + _claim_detail(held)
+                + "; two streams serving one provenance directory write two runs' rows under one "
+                "set of queue positions, and nothing on a row says which run wrote it. Serve "
+                "this queue into a fresh provenance directory — or, if that stream is gone and "
+                "this run is continuing its record, pass resume=True to take the directory over."
+            ) from None
+        with os.fdopen(descriptor, "w", encoding="utf-8") as handle:
+            handle.write(
+                json.dumps(
+                    {
+                        "owner": self._owner,
+                        "feedback_regime": self._regime,
+                        # Both for the human reading a refusal, neither ever read back by code.
+                        "pid": os.getpid(),
+                        "claimed_at": time.time(),
+                    },
+                    allow_nan=False,
+                )
+                + "\n"
+            )
+        self._claimed = True
+
+    def _read_claim(self) -> Optional[Dict[str, Any]]:
+        """Whatever is in the claim file, or ``None`` if there is nothing readable there.
+
+        Deliberately forgiving, because every caller is already deciding something safe on the
+        strength of it: a claim that will not parse still *exists*, so the fresh path refuses on
+        it (with a poorer message), and the ownership check treats it as not this stream's and
+        stops. A missing owner reads as no owner, which no stream's token equals. So the failure
+        mode of an unreadable claim is a refusal, never a silent grant."""
+        try:
+            held = json.loads(self.claim_path.read_text(encoding="utf-8"))
+        except (OSError, ValueError):
+            return None
+        return held if isinstance(held, dict) else None
+
+    def _require_claim(self) -> None:
+        """This stream still owns the directory it is about to write to.
+
+        The ``O_EXCL`` create at construction is what makes ownership exclusive; this is what
+        makes it *cover the run*. A claim taken once and never looked at again is a statement
+        about the moment of construction, and the thing it has to rule out — two streams
+        appending to one record — happens at every write after it. Two cases reach here: a
+        ``resume=True`` that took the directory over from a stream still serving into it, and the
+        narrow interleaving :meth:`_claim_provenance` cannot close on its own, where two
+        resumes each unlink and create and the second's unlink lands after the first's create.
+        Both end the same way — the stream that no longer owns the directory finds out before its
+        next append rather than after it.
+
+        Called from :meth:`_write_dispense`, which is where a task first becomes this record's:
+        raising there refuses the dispense with nothing handed out and stops the stream, the same
+        treatment a directory that cannot be appended to already gets. A task already in flight
+        keeps its seal, and its row is written under the regime its own dispense recorded — which
+        the taking-over stream had to match to be here at all."""
+        held = self._read_claim() or {}
+        if held.get("owner") == self._owner:
+            return
+        raise RuntimeError(
+            f"{self.prov_dir} is no longer claimed by this stream"
+            + _claim_detail(held)
+            + "; another stream took the directory over — with resume=True, which asserts this "
+            "one had stopped — so anything appended from here on would file two runs' records "
+            "under one set of queue positions"
+        )
+
+    def _release_claim(self) -> None:
+        """Let the provenance directory go, if this stream still holds it.
+
+        Removed rather than left behind, so that a claim on disk means a stream that never got to
+        finish. That is the whole of what makes ``resume=True`` an assertion about a *crash*: a
+        run that closed in an orderly way leaves nothing for a later one to take over, so the
+        only claim anyone is ever asked to break is one whose owner really did stop without
+        releasing it.
+
+        Only ever removes its own, checked immediately before: a stream that lost the directory to
+        a ``resume=True`` takeover has already stopped, and must not delete the live claim of
+        whoever took it. The check and the unlink are not atomic, and there is nothing to gain by
+        making them so — the loser of that race is a stream that stopped either way.
+
+        Never raises, and never masks. It runs in a failed constructor beside an error already on
+        its way out, and in the shutdown release, which may not raise at all (see
+        :meth:`_release_stream`). A claim that cannot be removed leaves a directory that
+        ``resume=True`` reopens, which is a worse morning than a clean one and a much better one
+        than a lost error."""
+        if not self._claimed:
+            return
+        self._claimed = False
+        try:
+            if (self._read_claim() or {}).get("owner") == self._owner:
+                self.claim_path.unlink()
+        except OSError:
+            pass
+
+    def _unmake_provenance(self) -> None:
+        """Remove the provenance directory again, if this constructor is what created it and
+        nothing was ever put in it. Only a failed construction calls this.
+
+        ``rmdir`` and not anything recursive, so this cannot destroy a record: a directory holding
+        so much as one file refuses to go, and the one file this call could have put there — the
+        claim — was just removed. A directory that existed before this constructor ran is left
+        alone whatever is in it, which is why whether this call made it is tracked rather than
+        guessed (see :meth:`_claim_provenance`).
+
+        Never raises, for :meth:`_release_claim`'s reason: it runs beside an error already on its
+        way out, and a directory left behind is untidy where a masked error is wrong."""
+        if not self._made_prov_dir:
+            return
+        self._made_prov_dir = False
+        try:
+            os.rmdir(self.prov_dir)
+        except OSError:
+            pass
 
     def _close_catalog_now(self) -> List[str]:
         """Release the catalog envs from *sync* code, which only a failed constructor needs:
@@ -2073,9 +2392,11 @@ class TaskStream:
 
         Only a resumed run can reach this, and that is the whole of the exposure — a stream that
         is not resuming refuses a directory holding *any* record (see
-        :meth:`_require_fresh_provenance`), so the two checks together are what make "one record,
-        one regime" true rather than conventional. Refused at construction, before anything is
-        spent, like the queue check beside it."""
+        :meth:`_require_fresh_provenance`). The record is not the only thing that can name a
+        regime, though: a run killed between its claim and its first dispense recorded nothing at
+        all, so the ownership claim carries the regime too and is compared here through the same
+        check (see :meth:`_claim_provenance`). Refused at construction, before anything is spent,
+        like the queue check beside it."""
         if recorded == self._regime:
             return
         raise ValueError(
@@ -2580,6 +2901,13 @@ class TaskStream:
                         "may never have been enforced"
                     ),
                 )
+        # Let the directory go, now that nothing is left that could write to it: the drain sealed
+        # and recorded every dispensed task before this ran, and the watchdog that could have
+        # sealed one more was just stopped. Above the catalog handover rather than below it
+        # because an env whose close fails must still leave the directory unclaimed — a catalog
+        # env never touches it — and because this cannot raise, so it takes nothing from the
+        # report those failures make (see :meth:`_release_claim`).
+        self._release_claim()
         # Popped and handed over in one statement with no await in it, so there is no state in
         # which some envs are the release's and the rest are still the registry's.
         closing = [
@@ -3275,13 +3603,16 @@ class TaskStream:
         never asked about a task other than the one this call ended — the row comes from *this*
         seal, never from the results list, which under concurrency would be a sibling's.
 
-        **A policy that cannot answer is a run-level failure, not a task-level one.** Composing
-        this runs caller-supplied code, and a policy that raises will raise on every task, so the
-        row already stamped with its regime is a row claiming a channel the agent was never told
-        through: the record would say a training run happened where none did. So the failure is
-        contained (this answer may not become a traceback at the agent, and the shape may not
-        change), the agent is told the task ended and nothing more, and the stream stops — loud
-        to the harness, silent to the agent, like every other integrity failure here.
+        **A policy that cannot answer is a run-level failure, not a task-level one.** No policy
+        this module admits today can fail here — :class:`Immediate` hands back items the record
+        already encoded with this same encoder and setting — so what follows is the containment a
+        policy added later inherits rather than a path a run reaches now. A policy that raises
+        would raise on every task, so the row already stamped with its regime is a row claiming a
+        channel the agent was never told through: the record would say a training run happened
+        where none did. So the failure is contained (this answer may not become a traceback at the
+        agent, and the shape may not change), the agent is told the task ended and nothing more,
+        and the stream stops — loud to the harness, silent to the agent, like every other
+        integrity failure here.
 
         Serialised here rather than by the caller, with the encoder and the ``allow_nan`` the
         record itself is committed with: a value the endpoint could not send has to be found
@@ -4088,7 +4419,15 @@ class TaskStream:
         is a detached copy that the exact call about to encode it has already encoded once. The
         ordering below it is untouched: still one synchronous append inside the same critical
         section, still the last thing before the clock starts and the counters commit, with no new
-        suspension point between the record landing and the bookkeeping that answers for it."""
+        suspension point between the record landing and the bookkeeping that answers for it.
+
+        The ownership check goes *above* the append rather than beside the construction that took
+        the claim, because this is the moment a task becomes part of this directory's record —
+        and a stream that has lost the directory must add nothing to it. It raises where a failed
+        append raises, so it is answered the same way: the dispense is refused with nothing handed
+        out, and the stream stops rather than serving the rest of its queue into a record that is
+        no longer its own (see :meth:`_require_claim`)."""
+        self._require_claim()
         _append_jsonl(
             self.dispenses_path,
             {
@@ -4156,9 +4495,13 @@ class EvalStream(TaskStream):
 
     3. *One record never mixes postures.* A stream that is not resuming refuses a provenance
        directory that already holds any record; a resuming one refuses a directory whose
-       dispenses or rows name a different regime. Mechanism:
-       :meth:`TaskStream._require_fresh_provenance` and
-       :meth:`TaskStream._require_regime_matches`, both at construction, before anything is spent.
+       dispenses, rows, or ownership claim name a different regime; and every stream takes
+       exclusive ownership of its directory before it builds anything, so two streams pointed at
+       the same empty one cannot both serve into it. Mechanism:
+       :meth:`TaskStream._require_fresh_provenance`, :meth:`TaskStream._require_regime_matches`
+       and :meth:`TaskStream._claim_provenance`, all at construction, before anything is spent —
+       with :meth:`TaskStream._require_claim` re-checking the ownership at every dispense, since
+       a claim taken once says nothing about the writes that follow it.
 
     4. *Everything a stream already guarantees*, unchanged and named here because an evaluation
        rests on them: the framing has no field a task index or target could be written into; the

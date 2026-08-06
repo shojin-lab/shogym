@@ -13,18 +13,31 @@ here about a task other than the one it just ended?
 :class:`EvalStream` is the other half — the default made structural, so that "this run was
 evaluation-grade" is a claim about a construction and about a stamp on every row, rather than
 about a value someone could have edited.
+
+The other half of that claim is about the *record*, and it is what the last two sections here are
+for. A stamp on every row is worth what the reader can conclude from it, so two things may never
+happen: a stream that reveals while its rows say it did not, and two streams writing one record.
+Neither is prevented by anything a row can say about itself — the first is a policy asserting its
+own regime, the second is two runs each honestly stamping their own — so both are refused at the
+construction site, and these tests are the adversary that goes looking for the way through.
 """
 
 from __future__ import annotations
 
 import asyncio
 import json
+import os
+import subprocess
+import sys
+import textwrap
+import time
 from pathlib import Path
 from typing import Any, ClassVar, Dict, List, Sequence
 
 import pytest
 from fastmcp import Client
 
+from hgym.serve import stream as stream_module
 from hgym.serve.stream import (
     EvalStream,
     FeedbackPolicy,
@@ -614,41 +627,128 @@ async def test_a_feedback_argument_that_is_not_a_policy_is_refused(
     # An allow-list, not a duck-type. What this argument decides is whether the agent is told its
     # verdict, and a value that merely looks usable would decide it by whatever it answers — with
     # the answer already on the wire by the time anyone noticed.
-    with pytest.raises(ValueError, match="feedback must be a FeedbackPolicy"):
+    with pytest.raises(ValueError, match="feedback must be Never\\(\\) or Immediate\\(\\)"):
         _stream(tmp_path, [0], feedback=bad)
 
 
-async def test_a_policy_that_cannot_name_its_regime_is_refused(tmp_path: Path) -> None:
-    # The regime is written into every record and compared against the record on resume, and
-    # `reveals` decides a wire shape. Both are read once, at construction, and both are exact
-    # types: a truthy non-bool would open the verdict channel on a policy that never said so.
-    class _Nameless(FeedbackPolicy):
-        regime: ClassVar[Any] = ""
-        reveals: ClassVar[bool] = False
+class _Liar(FeedbackPolicy):
+    """A policy that stamps the regime with no channel and then opens one."""
 
-        def reveal(self, published: Sequence[Dict[str, Any]]) -> Sequence[Dict[str, Any]]:
-            return ()
+    regime: ClassVar[str] = "never"
+    reveals: ClassVar[bool] = True
 
-    class _Truthy(FeedbackPolicy):
-        regime: ClassVar[str] = "truthy"
-        reveals: ClassVar[Any] = 1
+    def reveal(self, published: Sequence[Dict[str, Any]]) -> Sequence[Dict[str, Any]]:
+        return published
 
-        def reveal(self, published: Sequence[Dict[str, Any]]) -> Sequence[Dict[str, Any]]:
-            return published
 
-    with pytest.raises(ValueError, match="regime must be a non-empty string"):
-        _stream(tmp_path / "a", [0], feedback=_Nameless())
-    with pytest.raises(ValueError, match="`reveals` must be a bool"):
-        _stream(tmp_path / "b", [0], feedback=_Truthy())
+async def test_a_policy_that_would_reveal_under_another_regimes_name_is_refused(
+    tmp_path: Path,
+) -> None:
+    # THE defect this allow-list exists for. `regime` and `reveals` are not two independent facts
+    # a policy gets to assert about itself: a subclass naming itself `never` while revealing gets
+    # a run whose terminals carry the verdict and whose every dispense record and result row say
+    # no channel was open — a practice row that reads as evaluation-grade, with the documented
+    # reader check `row.get("feedback_regime", "never")` agreeing. Nothing downstream can catch
+    # it, because both halves of the record are internally consistent; the only place it can be
+    # caught is the construction site, and only by refusing to take the claim on trust.
+    with pytest.raises(ValueError, match="feedback must be Never\\(\\) or Immediate\\(\\)") as bad:
+        _stream(tmp_path, [0], feedback=_Liar())
+    # ...and the refusal says how a real new policy gets in, because the alternative reading of
+    # this error is "policies are closed", which is not what it means.
+    message = str(bad.value)
+    assert "added to this module" in message
+    assert "not by subclassing" in message
+    # Refused before anything was spent: no record, and nothing claimed.
+    assert not (tmp_path / "prov").exists()
+
+
+async def test_a_shipped_policy_is_served_as_itself_whatever_its_instance_says(
+    tmp_path: Path,
+) -> None:
+    # The hole an exact-type check does not close by itself, and the reason the regime is read
+    # from the module rather than from the object. `Never` is a frozen dataclass whose `regime`
+    # and `reveals` are ClassVars — no constructor argument, and `never.reveals = True` raises —
+    # but frozen is not sealed: the instance has a `__dict__`, and `object.__setattr__` shadows
+    # the class attribute on it with no subclass anywhere. A stream that admitted the exact type
+    # and then trusted the instance would reveal under a record stamped `never`, exactly as the
+    # subclass above would have.
+    liar = Never()
+    object.__setattr__(liar, "reveals", True)
+    assert liar.reveals is True and type(liar) is Never  # the shadowing really took
+
+    async with _stream(tmp_path, [0], feedback=liar) as stream:
+        await stream.get_task()
+        answer = _payload(await stream.dispatch(SUBMIT_TOOL, {"answer": "4"}))
+
+    # Served as the `Never` it is: the fixed payload, no feedback member, an honest stamp.
+    assert set(answer) == {"content", "terminated", "hint"}
+    assert [row["feedback_regime"] for row in _rows(tmp_path)] == ["never"]
+    assert stream.results[0].score is not None  # the task really was graded
+
+
+async def test_the_policy_table_is_the_only_place_a_regime_is_named(tmp_path: Path) -> None:
+    # The allow-list is what makes a regime name mean one policy, which is what the resume check
+    # needs it to mean: two policies sharing a name would let a record be continued by a stream
+    # that did not write it. Pinned here rather than in prose, because this is the invariant a
+    # third entry has to preserve — and the table, not the class attribute, is what is served.
+    admitted = {policy: (regime, reveals) for policy, regime, reveals in stream_module._POLICIES}
+    assert admitted == {Never: ("never", False), Immediate: ("immediate", True)}
+    regimes = [regime for _policy, regime, _reveals in stream_module._POLICIES]
+    assert len(set(regimes)) == len(regimes)
+    for policy, regime, reveals in stream_module._POLICIES:
+        assert type(regime) is str and regime
+        assert type(reveals) is bool
+        # The class still declares them, and the table still agrees with the class — the table
+        # exists so that an *instance* cannot disagree, not so the class can.
+        assert (policy.regime, policy.reveals) == (regime, reveals)
+
+
+def _admitting(monkeypatch: pytest.MonkeyPatch, policy: type, regime: str, reveals: bool) -> None:
+    """Add a policy to the module's allow-list, which is how a real one is added too."""
+    monkeypatch.setattr(
+        stream_module, "_POLICIES", stream_module._POLICIES + ((policy, regime, reveals),)
+    )
+
+
+class _Delayed(FeedbackPolicy):
+    """A stand-in for the policies the design says arrive later: holds every verdict back."""
+
+    regime: ClassVar[str] = "delayed"
+    reveals: ClassVar[bool] = True
+
+    def reveal(self, published: Sequence[Dict[str, Any]]) -> Sequence[Dict[str, Any]]:
+        return ()
+
+
+async def test_a_new_policy_is_admitted_by_being_added_to_the_module(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # The extension story, executed rather than promised. `Delayed(k)`, `Batched(n)` and
+    # `Noisy(p)` are still policies rather than new surface — what the allow-list changes is where
+    # one comes from, and this is the whole of what a third costs: a line in the table. The
+    # envelope containment is unchanged by it, which is the reason the list can grow safely.
+    _admitting(monkeypatch, _Delayed, "delayed", True)
+    async with _stream(tmp_path, [0], feedback=_Delayed()) as stream:
+        await stream.get_task()
+        answer = _payload(await stream.dispatch(SUBMIT_TOOL, {"answer": "4"}))
+
+    # Revealing, so the member is there; holding, so it is empty — and the record says `delayed`,
+    # never one of the two regimes it is not.
+    assert answer["feedback"] == []
+    assert set(answer) == {"content", "terminated", "hint", "feedback"}
+    assert [row["feedback_regime"] for row in _rows(tmp_path)] == ["delayed"]
+    assert read_dispenses(tmp_path / "prov")[0]["feedback_regime"] == "delayed"
 
 
 async def test_a_policy_that_cannot_answer_stops_the_run_and_says_nothing(
-    tmp_path: Path,
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    # Composing a revealing answer runs caller-supplied code, and one that raises will raise for
-    # every task — so the row already stamped with its regime would be claiming a channel the
-    # agent was never told through. The failure is contained (no traceback at the agent, no
-    # change of shape), and the stream stops: loud to the harness, silent to the agent.
+    # Containment for the policies the allow-list will admit later: composing a revealing answer
+    # runs the policy's own code, and one that raises will raise for every task — so the row
+    # already stamped with its regime would be claiming a channel the agent was never told
+    # through. The failure is contained (no traceback at the agent, no change of shape), and the
+    # stream stops: loud to the harness, silent to the agent. Neither shipped policy can reach
+    # this today, so the test admits one that can, the way a real one would be admitted.
     class _Exploding(FeedbackPolicy):
         regime: ClassVar[str] = "exploding"
         reveals: ClassVar[bool] = True
@@ -663,6 +763,8 @@ async def test_a_policy_that_cannot_answer_stops_the_run_and_says_nothing(
         def reveal(self, published: Sequence[Dict[str, Any]]) -> Sequence[Dict[str, Any]]:
             return [{"name": "nan", "value": float("nan"), "level": "episode"}]
 
+    _admitting(monkeypatch, _Exploding, "exploding", True)
+    _admitting(monkeypatch, _Unsendable, "unsendable", True)
     for policy, root in ((_Exploding(), "raises"), (_Unsendable(), "unsendable")):
         stream = _stream(tmp_path / root, [0, 1], feedback=policy)
         await stream.get_task()
@@ -678,7 +780,9 @@ async def test_a_policy_that_cannot_answer_stops_the_run_and_says_nothing(
         assert stream.results[0].feedback_regime == policy.regime
 
 
-async def test_a_policy_that_cannot_answer_is_reported_at_the_drain(tmp_path: Path) -> None:
+async def test_a_policy_that_cannot_answer_is_reported_at_the_drain(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
     # The other half of "silent to the agent": the harness has to be able to find out, and the
     # place it finds out is the same one every integrity failure here is reported at.
     class _Exploding(FeedbackPolicy):
@@ -688,6 +792,7 @@ async def test_a_policy_that_cannot_answer_is_reported_at_the_drain(tmp_path: Pa
         def reveal(self, published: Sequence[Dict[str, Any]]) -> Sequence[Dict[str, Any]]:
             raise RuntimeError("the policy could not be asked")
 
+    _admitting(monkeypatch, _Exploding, "exploding", True)
     stream = _stream(tmp_path, [0, 1], feedback=_Exploding())
     await stream.get_task()
     await stream.dispatch(SUBMIT_TOOL, {"answer": "4"})
@@ -759,3 +864,279 @@ async def test_eval_stream_passes_every_other_argument_through(tmp_path: Path) -
         assert stream.max_in_flight == 2
         await stream.dispatch(SUBMIT_TOOL, {"answer": "4", "lease": first.lease})
     assert {row.feedback_regime for row in stream.results} == {"never"}
+
+
+# ----- one record, one stream: the directory is owned, not merely unrecorded -----
+
+
+def _claim(tmp_path: Path) -> Path:
+    return tmp_path / "prov" / "claim.json"
+
+
+async def test_two_fresh_streams_cannot_serve_one_directory(tmp_path: Path) -> None:
+    # The other way a record ends up mixing regimes, and it needs no custom policy at all: the
+    # freshness check reads what the directory already holds, so two streams that reach it before
+    # either has written both pass it. Both then serve, and the file ends with two rows for queue
+    # position 0 — one `never`, one `immediate`, both seq 1 — with no stop, no exception, and
+    # nothing on either row saying the other exists. A consumer averages them as one run.
+    first = _stream(tmp_path, [0], feedback=Never())
+    with pytest.raises(ValueError, match="claimed by another stream") as refused:
+        _stream(tmp_path, [0], feedback=Immediate())
+    # The refusal is useful to the human who has to decide what to do about it: which regime the
+    # holder serves under, and the one flag that overrides it.
+    message = str(refused.value)
+    assert "'never'" in message
+    assert "resume=True" in message
+    assert "fresh provenance directory" in message
+
+    # ...and the one stream that did claim it serves normally, into a record of one regime.
+    async with first:
+        await first.get_task()
+        await first.dispatch(SUBMIT_TOOL, {"answer": "4"})
+    rows = _rows(tmp_path)
+    assert [row["position"] for row in rows] == [0]
+    assert {row["feedback_regime"] for row in rows} == {"never"}
+
+
+async def test_the_claim_is_taken_before_the_first_write_not_by_it(tmp_path: Path) -> None:
+    # Where the ownership has to be decided: a claim taken at the first append would leave the
+    # whole of construction — the env factory, the manifest validation, the replay — as a window
+    # in which two streams both believe they own the directory. So it is taken at construction,
+    # and the loser never reaches a factory call.
+    stream = _stream(tmp_path, [0])
+    assert _claim(tmp_path).is_file()
+    assert not (tmp_path / "prov" / "dispenses.jsonl").exists()
+
+    factories: List[str] = []
+
+    def _counting(name: str) -> _FixtureScoreEnv:
+        factories.append(name)
+        return _env_for(name)
+
+    with pytest.raises(ValueError, match="claimed by another stream"):
+        TaskStream(_counting, [TaskRef(ENV_NAME, 0)], prov_dir=tmp_path / "prov")
+    assert factories == []
+    await stream.aclose()
+
+
+async def test_an_orderly_close_leaves_the_directory_unclaimed(tmp_path: Path) -> None:
+    # What makes `resume=True` an assertion about a *crash* rather than a routine incantation: a
+    # run that finished releases the directory, so the only claim anyone is ever asked to break
+    # belongs to a stream that really did stop without letting go.
+    async with _stream(tmp_path, [0, 1]) as stream:
+        await stream.get_task()
+        await stream.dispatch(SUBMIT_TOOL, {"answer": "4"})
+    assert not _claim(tmp_path).exists()
+    # So a resume of a cleanly closed record breaks nothing: there is no claim to take over, and
+    # `resume=True` goes back to meaning only what the record needs it to mean.
+    async with _stream(tmp_path, [0, 1], resume=True) as resumed:
+        assert _claim(tmp_path).is_file()
+        await resumed.get_task()
+        await resumed.dispatch(SUBMIT_TOOL, {"answer": "6"})
+    assert not _claim(tmp_path).exists()
+    assert [row["position"] for row in _rows(tmp_path)] == [0, 1]
+
+
+async def test_a_crashed_run_is_resumed_into_its_own_directory(tmp_path: Path) -> None:
+    # The constraint the ownership claim may not break. A crashed evaluation resumes into the
+    # directory it crashed in, and the claim it left behind is exactly what makes that directory
+    # look owned. `resume=True` is the override — the human asserting the prior stream is dead,
+    # which is a fact no liveness oracle here could establish and the human already had to know
+    # to be passing the flag at all.
+    crashed = _stream(tmp_path, [0, 1], feedback=Immediate())
+    await crashed.get_task()
+    await crashed.dispatch(SUBMIT_TOOL, {"answer": "4"})
+    assert _claim(tmp_path).is_file()  # no `aclose`: the claim outlives the stream
+
+    async with _stream(tmp_path, [0, 1], resume=True, feedback=Immediate()) as resumed:
+        await resumed.get_task()
+        await resumed.dispatch(SUBMIT_TOOL, {"answer": "6"})
+    assert [row.position for row in resumed.results] == [1]
+    assert [row["position"] for row in _rows(tmp_path)] == [0, 1]
+    assert {row["feedback_regime"] for row in _rows(tmp_path)} == {"immediate"}
+
+
+async def test_the_claim_carries_the_regime_a_record_does_not_have_yet(tmp_path: Path) -> None:
+    # The gap between the claim and the first dispense, which the record cannot cover. A run
+    # killed in it wrote no dispense and no row, so the regime check — which reads records — has
+    # nothing to compare against, and a resume under the other posture would be waved through
+    # onto a file that starts empty and ends mixed. The claim is the only thing that names the
+    # regime before any record does, so the same check reads it.
+    _stream(tmp_path, [0, 1], feedback=Immediate())  # claimed, then killed
+    assert not (tmp_path / "prov" / "dispenses.jsonl").exists()
+    assert not (tmp_path / "prov" / "results.jsonl").exists()
+
+    with pytest.raises(ValueError, match="an ownership claim written under feedback regime"):
+        _stream(tmp_path, [0, 1], resume=True, feedback=Never())
+    # Resuming under the regime the claim names is what a crashed run actually needs.
+    async with _stream(tmp_path, [0, 1], resume=True, feedback=Immediate()) as resumed:
+        await resumed.get_task()
+        await resumed.dispatch(SUBMIT_TOOL, {"answer": "4"})
+    assert {row["feedback_regime"] for row in _rows(tmp_path)} == {"immediate"}
+
+
+async def test_a_stream_that_lost_its_directory_writes_nothing_more(tmp_path: Path) -> None:
+    # Ownership has to cover the run, not just its first instant. `resume=True` is a human
+    # assertion and a human can be wrong about it — the crashed stream was still alive — so the
+    # dispossessed stream has to find out. It finds out where a task would first become part of
+    # this record, which is before the task is handed out: no dispense, no episode, no row.
+    living = _stream(tmp_path, [0, 1])
+    await living.get_task()
+    await living.dispatch(SUBMIT_TOOL, {"answer": "4"})
+    taker = _stream(tmp_path, [0, 1], resume=True)
+
+    with pytest.raises(RuntimeError, match="no longer claimed by this stream"):
+        await living.get_task()
+    assert living.stopped
+    with pytest.raises(RuntimeError, match="could not record a dispense") as drained:
+        await living.aclose()
+    assert "no longer claimed by this stream" in str(drained.value.__cause__)
+
+    async with taker:
+        await taker.get_task()
+        await taker.dispatch(SUBMIT_TOOL, {"answer": "6"})
+    # Exactly one row per position: the dispossessed stream added nothing after it was displaced.
+    assert [row["position"] for row in _rows(tmp_path)] == [0, 1]
+
+
+async def test_a_refused_construction_leaves_the_directory_as_it_found_it(
+    tmp_path: Path,
+) -> None:
+    # A claim is only ever released by the stream that took it, and a constructor that raises
+    # hands back no stream — so a refusal that left its claim behind would make the next attempt,
+    # the corrected one, look like a crashed run needing `resume=True`. Whatever this constructor
+    # made, it unmakes. The refusal has to come from *after* the claim to be testing anything:
+    # the argument checks all run before it, so this one is a factory that will not build.
+    def _unbuildable(name: str) -> _FixtureScoreEnv:
+        raise RuntimeError("this env cannot be provisioned")
+
+    with pytest.raises(RuntimeError, match="cannot be provisioned"):
+        TaskStream(_unbuildable, [TaskRef(ENV_NAME, 0)], prov_dir=tmp_path / "prov")
+    assert not (tmp_path / "prov").exists()
+    # ...so the corrected attempt is an ordinary fresh run, needing no flag to get in.
+    async with _stream(tmp_path, [0]) as retried:
+        await retried.get_task()
+        await retried.dispatch(SUBMIT_TOOL, {"answer": "4"})
+    assert [row["position"] for row in _rows(tmp_path)] == [0]
+
+    # ...and a directory the caller prepared is left standing, because removing one this call did
+    # not create would be a refusal with a side effect.
+    prepared = tmp_path / "prepared"
+    prepared.mkdir()
+    with pytest.raises(RuntimeError, match="cannot be provisioned"):
+        TaskStream(_unbuildable, [TaskRef(ENV_NAME, 0)], prov_dir=prepared)
+    assert prepared.is_dir()
+    assert list(prepared.iterdir()) == []
+
+
+async def test_a_record_written_before_claims_existed_still_resumes(tmp_path: Path) -> None:
+    # Backward compatibility, in the direction that matters: a provenance directory recorded by a
+    # stream that never took a claim is a directory with no claim in it, and a resume must not
+    # require one to be there. Absent reads as unowned, exactly as an absent regime stamp reads
+    # as `never`.
+    async with _stream(tmp_path, [0, 1], feedback=Immediate()) as first:
+        await first.get_task()
+        await first.dispatch(SUBMIT_TOOL, {"answer": "4"})
+    _claim(tmp_path).unlink(missing_ok=True)  # as if written before ownership was recorded
+
+    async with _stream(tmp_path, [0, 1], resume=True, feedback=Immediate()) as resumed:
+        await resumed.get_task()
+        await resumed.dispatch(SUBMIT_TOOL, {"answer": "6"})
+    assert [row["position"] for row in _rows(tmp_path)] == [0, 1]
+
+
+async def test_an_unreadable_claim_refuses_rather_than_grants(tmp_path: Path) -> None:
+    # A claim that will not parse still says a stream was here. Every reading of it has to fail
+    # towards refusal: the fresh path refuses on the file's existence (with a poorer message
+    # than it would like), and an owner nobody can read is an owner no stream's token equals.
+    stream = _stream(tmp_path, [0])
+    _claim(tmp_path).write_text("{not json", encoding="utf-8")
+    with pytest.raises(ValueError, match="claimed by another stream"):
+        _stream(tmp_path, [0])
+    # The holder is dispossessed by it too, rather than reading its own name into the wreckage.
+    with pytest.raises(RuntimeError, match="no longer claimed by this stream"):
+        await stream.get_task()
+
+
+# Run by `test_only_one_of_many_processes_can_claim_one_directory`, in its own interpreter,
+# because that test is about an exclusion that has to hold between processes.
+_RACER = """
+import sys
+import time
+from pathlib import Path
+
+from hgym.serve.stream import Immediate, Never, TaskRef, TaskStream
+from tests._fixtures.score_env import ENV_NAME, _FixtureScoreEnv
+
+prov, regime, verdict, hold = (Path(sys.argv[1]), sys.argv[2], Path(sys.argv[3]), Path(sys.argv[4]))
+tasks = [{"id": "q0", "question": "2+2?", "answer": "4"}]
+try:
+    TaskStream(
+        lambda _name: _FixtureScoreEnv(tasks=tasks),
+        [TaskRef(ENV_NAME, 0)],
+        prov_dir=prov,
+        feedback=Immediate() if regime == "immediate" else Never(),
+    )
+except ValueError as exc:
+    verdict.write_text("REFUSED " + str(exc), encoding="utf-8")
+else:
+    verdict.write_text("CLAIMED", encoding="utf-8")
+    # Hold the directory rather than releasing it, so that no loser can win by arriving late:
+    # every refusal this test counts is a refusal against a claim that is still held.
+    while hold.exists():
+        time.sleep(0.01)
+"""
+
+
+async def test_only_one_of_many_processes_can_claim_one_directory(tmp_path: Path) -> None:
+    # Across processes, which is where this has to hold: a harness that launches two runs against
+    # one provenance directory does not do it from one interpreter, so an in-process registry
+    # would prove nothing — and neither would a lock that is per-process rather than per-open
+    # file. The exclusion is an `O_EXCL` create, one atomic operation of which exactly one caller
+    # returns holding a descriptor, so there is no window in which two streams are both owners
+    # and no check either of them could have won by racing.
+    racer = tmp_path / "racer.py"
+    racer.write_text(textwrap.dedent(_RACER), encoding="utf-8")
+    hold = tmp_path / "hold"
+    hold.write_text("serving", encoding="utf-8")
+    environ = {**os.environ, "PYTHONPATH": str(Path(__file__).resolve().parent.parent)}
+    # Both regimes, because mixing them is the damage a second writer does.
+    regimes = ["never", "immediate"] * 3
+    verdicts = [tmp_path / f"verdict-{number}" for number in range(len(regimes))]
+    running = [
+        subprocess.Popen(
+            [sys.executable, str(racer), str(tmp_path / "prov"), regime, str(verdict), str(hold)],
+            stderr=subprocess.PIPE,
+            text=True,
+            env=environ,
+        )
+        for regime, verdict in zip(regimes, verdicts)
+    ]
+    try:
+        # Each child records its verdict and only then holds, so waiting for the files is waiting
+        # for every constructor to have finished — the winner never exits on its own.
+        deadline = time.monotonic() + 60.0
+        while not all(verdict.exists() for verdict in verdicts):
+            assert time.monotonic() < deadline, [
+                verdict.name for verdict in verdicts if not verdict.exists()
+            ]
+            await asyncio.sleep(0.05)
+        outcomes = [verdict.read_text(encoding="utf-8") for verdict in verdicts]
+    finally:
+        hold.unlink(missing_ok=True)
+        for process in running:
+            try:
+                process.communicate(timeout=60)
+            except subprocess.TimeoutExpired:  # pragma: no cover - only for a wedged child
+                process.kill()
+                process.communicate()
+
+    claimed = [outcome for outcome in outcomes if outcome == "CLAIMED"]
+    refused = [outcome for outcome in outcomes if outcome.startswith("REFUSED")]
+    assert len(claimed) == 1, outcomes
+    assert len(refused) == len(running) - 1, outcomes
+    assert all("claimed by another stream" in outcome for outcome in refused), refused
+    # One claim on disk, and one regime in it — whichever process won.
+    held = json.loads((tmp_path / "prov" / "claim.json").read_text(encoding="utf-8"))
+    assert held["feedback_regime"] in {"never", "immediate"}
+    assert held["pid"] in [process.pid for process in running]
