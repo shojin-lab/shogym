@@ -20,6 +20,11 @@ tells the caller only that the task ended. For the same reason the server masks 
 an env that raises while loading a task can name it in the exception text, and MCP would
 otherwise relay that verbatim.
 
+That is the **default** and it is a policy, not a law of the object: ``feedback=Never()``. The
+whole of the next section is what that default buys and why an evaluation may not give it up;
+:class:`Immediate` is the other policy this module ships, and :class:`EvalStream` is the
+construction that takes the choice away.
+
 Failures are redacted on that same boundary and reported on the other one. Everything that can
 go wrong while a task ends — a row that cannot be recorded, a summary the record cannot
 headline, an env that raises on its way out — answers the agent with that same fixed payload.
@@ -61,6 +66,45 @@ instead of surfacing. Both channels are closed together: neither the env's termi
 the feedback sidecar it rides on crosses a terminating call, because ``correct`` is equally a
 verdict in either. Whether the env's terminal response happens to *be* a verdict is not
 something the serving layer can tell, so the boundary is the call, not the payload.
+
+**The verdict channel is a policy, and the record says which one was in force.** Everything
+above describes ``feedback=Never()``, the default, and it is the posture an evaluation needs.
+It is not the posture an agent *improving* needs: a run whose whole point is that the agent gets
+better between tasks has to tell it how each one went, and a stream that cannot do that is a
+stream every training loop has to be written around. So the choice is named at the construction
+site rather than buried:
+
+- :class:`Never` — the default. A terminating call answers with the fixed payload above, the
+  same bytes for every env, task and outcome.
+- :class:`Immediate` — the terminating call carries the **sealed row's own** episode-level
+  feedback, verbatim: the very items ``results.jsonl`` records under ``observed`` at
+  ``level == "episode"``, and nothing else. Episode level, because that is the same line
+  :func:`~hgym.feedback.wire.select_inband` already draws for a single served episode — a
+  stream's terminal reveals no more than that terminal would. Routed by the seal, so at capacity
+  above 1 what comes back is the feedback of the task the *call* ended and never a sibling's;
+  and only on that call, because a task the stream ended (a drain, the deadline, a displacing
+  pull) has no response to carry it.
+
+The envelope is this module's and only the item list is the policy's, which is what keeps a
+policy from becoming a channel of its own: it is handed the sealed row's episode-level items and
+its answer is put inside the response shape above, under one added ``feedback`` member. It never
+sees, and can never add, the lease, the position, the index, the closure, the queue counts or the
+stop — so the answer to "what else can an agent learn from this?" is a property of these few
+lines rather than of whatever policy is passed. That shape is also what makes ``Delayed(k)``,
+``Batched(n)`` and ``Noisy(p)`` arrive later as policies rather than as new surface.
+
+Which policy served a task is written into the record itself — ``feedback_regime`` on every
+dispense record and every result row — because "these scores were earned with no verdict
+channel open" is a claim about how a row was produced, and a row that cannot make it is a row a
+reader has to take on trust from prose. It is stamped on the *dispense*, before the task is
+handed out and so before anything could have been revealed, and again on the row; a record with
+no stamp was written before this existed, when every stream was ``Never``, so the reader idiom is
+``row.get("feedback_regime", "never")``. One record never mixes regimes: a fresh stream refuses a
+directory that already holds records at all, and a resuming one refuses a directory whose records
+name a different regime.
+
+:class:`EvalStream` is that default made structural — it pins :class:`Never`, refuses a
+``feedback`` argument outright, and enumerates what it does and does not guarantee.
 
 Ownership: ``env_for`` is a **factory**, not a shared instance. Each episode gets its own env
 and closes it, because ``ServedEpisode.close()`` closes its env and ``ToolUsingEnv.close()``
@@ -211,12 +255,16 @@ import os
 import re
 import secrets
 import time
+from abc import ABC, abstractmethod
 from dataclasses import dataclass, field
 from pathlib import Path
+from types import MappingProxyType
 from typing import (
     Any,
     Callable,
+    ClassVar,
     Dict,
+    Mapping,
     List,
     Literal,
     NamedTuple,
@@ -240,6 +288,10 @@ __all__ = [
     "Closure",
     "CompletedTask",
     "DispensedTask",
+    "EvalStream",
+    "FeedbackPolicy",
+    "Immediate",
+    "Never",
     "Provenance",
     "ProvenanceError",
     "ProvenanceSpan",
@@ -259,17 +311,48 @@ __all__ = [
 _GET_TASK_TOOL = "get_task"
 _QUEUE_INFO_TOOL = "queue_info"
 
-# The *entire* response to a terminating call — the same bytes for every env, every task and
-# every outcome. Serialized once, at import, so that invariance is structural rather than a
-# convention the next edit could quietly break: nothing about the sealed episode can be read
-# off a constant, including from which keys are present.
-_TASK_OVER = json.dumps(
+# The envelope a terminating call is answered in, whatever the feedback policy. A policy adds at
+# most the one member below to it and may change nothing else, so the shape of a terminal answer
+# is decided here rather than by whatever object a caller passed. Read-only, because every
+# revealing answer is composed from it at the moment it is sent: a plain dict would leave the one
+# invariant part of that answer editable by anything that can reach this module.
+_TASK_OVER_FIELDS: Mapping[str, Any] = MappingProxyType(
     {
         "content": "<task ended; the stream recorded the outcome>",
         "terminated": True,
         "hint": f"task over; call `{_GET_TASK_TOOL}` for the next one",
     }
 )
+
+# The *entire* response to a terminating call under the default `Never` policy — the same bytes
+# for every env, every task and every outcome. Serialized once, at import, so that invariance is
+# structural rather than a convention the next edit could quietly break: nothing about the sealed
+# episode can be read off a constant, including from which keys are present.
+_TASK_OVER = json.dumps({**_TASK_OVER_FIELDS})
+
+# The member a revealing policy's answer rides in, and the *only* one it may add.
+_FEEDBACK_MEMBER = "feedback"
+
+# The whole response under a revealing policy that revealed nothing — an env that published no
+# episode-level feedback, a policy holding this task's back, a seal that recorded no row, or a
+# policy that could not answer at all. Serialized at import for the reason `_TASK_OVER` is: under
+# a revealing policy this member is always present, so an empty list and a missing key are never
+# the same answer, and every reason for an empty one is the same bytes. A stream whose record
+# already lost a row may not be the one stream whose terminal answers in a different shape.
+_TASK_OVER_SILENT = json.dumps({**_TASK_OVER_FIELDS, _FEEDBACK_MEMBER: []})
+
+# What a row records about the policy that produced it (`ResultRow.feedback_regime`, and the same
+# member on a dispense record). A record written before this existed carries no such member and
+# was written by a stream that revealed nothing, so it reads back as `never` — the reader idiom is
+# `row.get("feedback_regime", "never")`.
+_NEVER_REGIME = "never"
+_IMMEDIATE_REGIME = "immediate"
+
+# The feedback level a terminal may reveal. `wire.select_inband` already draws this line for a
+# single served episode — episode-level items ride out on the terminal result, inference-level
+# ones are recorded but not surfaced — and a stream's terminal reveals no more than that one
+# would. Applied by the stream, above the policy, so no policy can widen it.
+_EPISODE_LEVEL = "episode"
 
 # Feedback names the stream reads a headline score from, in order. Everything an env emits is
 # kept verbatim, so these two are only the summary fields — and a missing one stays absent
@@ -433,6 +516,22 @@ def _require_task_ref(ref: Any) -> TaskRef:
     return TaskRef(env, task_idx)
 
 
+def _recorded_regime(record: Mapping[str, Any]) -> str:
+    """The feedback regime a stored dispense record or result row says it was written under.
+
+    A record carrying no such member predates the policy, and every stream that could have
+    written one revealed nothing — so it reads back as :class:`Never`'s regime rather than as
+    unknown, which is what makes ``row.get("feedback_regime", "never")`` the whole reader idiom.
+
+    Coerced with ``str`` for the reason every other field :meth:`ResultRow.from_wire` reads is:
+    this value is compared against the serving stream's own regime when a run resumes, and a
+    stored value that is not text would otherwise decide that comparison by its own ``__eq__``.
+    Coercion cannot launder a wrong value into a right one here — no non-string renders as
+    ``"never"`` — so a record this module did not write fails the comparison rather than
+    passing it."""
+    return str(record.get("feedback_regime", _NEVER_REGIME))
+
+
 @dataclass(frozen=True)
 class DispensedTask:
     """What the agent receives: enough to act, and nothing that identifies the task.
@@ -530,7 +629,15 @@ class ResultRow:
     ``dispensed`` is always present, because a span that would not open refuses the dispense
     outright. So a row written in-process always has exactly one of ``sealed`` or ``error``
     beside it, and only a reconciled row has neither — but the discriminator a consumer should
-    read is ``closure``, which is typed and says the same thing about the whole row."""
+    read is ``closure``, which is typed and says the same thing about the whole row.
+
+    ``feedback_regime`` names the :class:`FeedbackPolicy` the stream served this task under —
+    ``"never"`` for a run with no verdict channel open, and so the one thing a reader needs to
+    tell an evaluation-grade row from a practice one **without joining against anything**. It is
+    the row's own answer to a question the rest of the row cannot settle: a score is the same
+    number either way, and only the regime says whether the agent was told the last one. A row
+    written before this member existed came from a stream that revealed nothing, so absent reads
+    as ``"never"`` and the idiom is ``row.get("feedback_regime", "never")``."""
 
     seq: int
     lease: str
@@ -542,6 +649,10 @@ class ResultRow:
     observed: List[Dict[str, Any]] = field(default_factory=list)
     diagnostic: Optional[str] = None
     extensions: Dict[str, Any] = field(default_factory=dict)
+    # Defaulted, and defaulted to the regime that has no channel: every row this module wrote
+    # before the policy existed was written by a stream that revealed nothing, and a row built
+    # without saying otherwise — `reconcile`'s, a caller's — may not read as one that did.
+    feedback_regime: str = _NEVER_REGIME
 
     def to_wire(self) -> Dict[str, Any]:
         return {
@@ -555,6 +666,9 @@ class ResultRow:
             "observed": [dict(item) for item in self.observed],
             "diagnostic": self.diagnostic,
             "extensions": dict(self.extensions),
+            # Appended, never inserted: every member above is one an existing reader already
+            # keys on, and this one is additive so a `Never` row stays a row those readers parse.
+            "feedback_regime": self.feedback_regime,
         }
 
     @classmethod
@@ -579,6 +693,7 @@ class ResultRow:
             observed=[dict(item) for item in (row.get("observed") or [])],
             diagnostic=row.get("diagnostic"),
             extensions=dict(row.get("extensions") or {}),
+            feedback_regime=_recorded_regime(row),
         )
 
 
@@ -1260,10 +1375,111 @@ def reconcile(prov_dir: Path) -> List[ResultRow]:
                 namespace: {"dispensed": observed}
                 for namespace, observed in dict(record.get("extensions") or {}).items()
             },
+            # Taken from the dispense, which is the only thing this row is built from and the
+            # only place the regime could have been recorded before the crash. Defaulting it
+            # instead would make every abandoned task of a practice run read back as
+            # evaluation-grade — a row that is *more* trustworthy-looking than the run that
+            # produced it, which is the one direction this record may never round in.
+            feedback_regime=_recorded_regime(record),
         )
         for record in read_dispenses(prov_dir)
         if record["lease"] not in sealed
     ]
+
+
+class FeedbackPolicy(ABC):
+    """What a terminating call tells the agent about the task it just ended.
+
+    The two postures a run can be in are the same machinery with one thing swapped, so they are
+    one object rather than two servers: a training loop needs the graded record echoed back
+    (that dense signal is what an agent improves on), and an evaluation needs the channel shut.
+    Naming the choice at the construction site is what lets a review ask "is this surface
+    constructed as evaluation or as practice?" — a question a boolean buried in a config cannot
+    be asked.
+
+    **A policy decides which feedback items are revealed, and nothing else.** It is handed the
+    sealed row's episode-level items and its answer is placed inside an envelope this module
+    owns, under one added member (see :meth:`TaskStream._terminal_answer`). It is never given —
+    and so can never reveal — the lease, the queue position, the task index, the closure, the
+    diagnostic, the queue counts, or the fact that the stream has stopped. That containment is
+    what makes the security argument a property of a few lines here rather than of whichever
+    object a caller passed, and it is what will let ``Delayed(k)``, ``Batched(n)`` and
+    ``Noisy(p)`` arrive as new policies rather than as new surface.
+
+    Two class attributes, both read once when a stream is constructed and kept (an attribute of
+    an object the caller owns can be rebound at any time, and these two decide a wire shape and a
+    value written into every record — see :class:`TaskStream`):
+
+    ``regime``
+        the name stamped onto every dispense record and every result row this policy serves.
+        It is what makes "these scores were earned with no verdict channel open" checkable from
+        the artifact instead of from prose.
+    ``reveals``
+        whether a terminating call carries the feedback member **at all**. It is a property of
+        the policy, never of the task: under a revealing policy the member is always present,
+        so an empty list is the answer to "this task published nothing", "this policy is
+        holding it back" and "no row was recorded" alike, and none of those is readable off the
+        shape of the response.
+    """
+
+    #: See the class docstring. Declared, not defaulted: a policy that forgets to name its regime
+    #: would otherwise file its rows under some inherited name, and a run's record would say a
+    #: channel was closed that was open.
+    regime: ClassVar[str]
+    reveals: ClassVar[bool]
+
+    @abstractmethod
+    def reveal(self, published: Sequence[Dict[str, Any]]) -> Sequence[Dict[str, Any]]:
+        """What the terminating call reveals, given the sealed row's episode-level feedback.
+
+        ``published`` is a private copy of the items the row records under ``observed`` at
+        ``level == "episode"``, in publication order — the env's own values, in the form the
+        file holds them. Returning them is :class:`Immediate`; returning nothing is what a
+        holding policy does on a task it is not answering yet.
+
+        Called once per terminating call, synchronously, outside every lock, after the row is
+        durable. It is not called at all under a policy whose ``reveals`` is false."""
+        ...
+
+
+@dataclass(frozen=True)
+class Never(FeedbackPolicy):
+    """No verdict channel: a terminating call answers with the fixed payload, the same bytes for
+    every env, every task and every outcome. **The default**, and the only posture whose scores
+    this package calls defensible — see :class:`EvalStream`, which is this policy made structural.
+
+    :meth:`reveal` exists because the base class declares it and answers with nothing; the stream
+    never calls it, because ``reveals`` is what decides whether a response has the member at all
+    and a policy that never reveals has no answer to compose."""
+
+    regime: ClassVar[str] = _NEVER_REGIME
+    reveals: ClassVar[bool] = False
+
+    def reveal(self, published: Sequence[Dict[str, Any]]) -> Sequence[Dict[str, Any]]:
+        return ()
+
+
+@dataclass(frozen=True)
+class Immediate(FeedbackPolicy):
+    """The sealed task's own feedback comes back on the call that ended it — the training
+    posture, for a run whose point is that the agent improves between tasks.
+
+    Verbatim and nothing more: the env's published episode-level items, exactly as
+    ``results.jsonl`` records them. Not the :class:`Score` summary beside them, which is this
+    record's reading of those same items rather than a value the env published — reporting it
+    would put a number on the wire that no env ever emitted, and would make the response depend
+    on whether that reading succeeded.
+
+    What an env chooses to publish is still the env's own business: an env whose feedback names
+    its target hands that target over here, because that is the feedback. That is not a defect of
+    this policy, it is what "the verdict channel is open" means — and it is why :class:`Never` is
+    the default and why an evaluation is a construction rather than an argument."""
+
+    regime: ClassVar[str] = _IMMEDIATE_REGIME
+    reveals: ClassVar[bool] = True
+
+    def reveal(self, published: Sequence[Dict[str, Any]]) -> Sequence[Dict[str, Any]]:
+        return published
 
 
 class TaskStream:
@@ -1334,6 +1550,14 @@ class TaskStream:
             that never yields to the event loop at all cannot be pre-empted by anything
             in-process (see :meth:`_with_timeout`). Finite and positive, for the same reason
             ``deadline`` is; ``None`` waits indefinitely.
+        feedback: what a terminating call tells the agent about the task it just ended (see
+            :class:`FeedbackPolicy`). :class:`Never` — the default — answers with the fixed
+            payload and opens no verdict channel; :class:`Immediate` answers with the sealed
+            row's own episode-level feedback, verbatim. Whichever it is, its ``regime`` is
+            written into every dispense record and every result row, so the posture a run served
+            under is a property of the artifact. Use :class:`EvalStream` rather than this
+            argument for a run whose scores are meant to be evaluation-grade: the argument says
+            what this run did, and the construction says what no argument could undo.
     """
 
     def __init__(
@@ -1347,6 +1571,10 @@ class TaskStream:
         resume: bool = False,
         provenance: Sequence[Provenance] = (),
         provenance_timeout: Optional[float] = 30.0,
+        # One instance, built at import and shared by every stream that takes the default. Safe
+        # because `Never` is frozen and holds nothing per-run; a policy that ever holds state
+        # (a `Delayed` queue, a `Noisy` generator) may not be a default for exactly that reason.
+        feedback: FeedbackPolicy = Never(),
     ) -> None:
         if not isinstance(max_in_flight, int):
             # A capacity is a count of slots, and everything downstream reads it as one: it
@@ -1382,6 +1610,40 @@ class TaskStream:
             raise ValueError(
                 "provenance_timeout must be a finite positive number of seconds, got "
                 f"{provenance_timeout}; pass None to bound it at nothing"
+            )
+        if not isinstance(feedback, FeedbackPolicy):
+            # An allow-list, and the family it admits is this module's own. What a policy decides
+            # is whether the agent is told its verdict, so anything that merely quacks like one —
+            # `True`, `"immediate"`, an object with a `reveal` — would decide that by whatever it
+            # happens to answer, and the shape it answered in would be on the wire before anyone
+            # noticed. A stream that cannot name its regime cannot stamp its rows either.
+            raise ValueError(
+                f"feedback must be a {FeedbackPolicy.__name__} ({Never.__name__}() or "
+                f"{Immediate.__name__}()), got {feedback!r} ({type(feedback).__name__}); it "
+                "decides whether a terminating call carries the task's verdict, and its regime "
+                "is written into every record this run keeps"
+            )
+        # Read once, here, and kept — the rule `provenance` namespaces follow, and for a stricter
+        # reason: these two are class attributes of an object the caller owns, so re-reading them
+        # per task would let a run advertise one regime in its record while answering under
+        # another. Exact types, because both are identity rather than payload: `regime` is
+        # written into every dispense and every row and is compared against the record when a run
+        # resumes, and `reveals` decides whether a response carries the feedback member at all —
+        # a truthy non-bool would open the channel on a policy that never said it was open.
+        regime = feedback.regime
+        if type(regime) is not str or not regime:
+            raise ValueError(
+                f"a feedback policy's regime must be a non-empty string, got {regime!r} "
+                f"({type(regime).__name__}); it is stamped on every dispense record and every "
+                "result row, and is what a resumed run compares its own regime against"
+            )
+        reveals = feedback.reveals
+        if type(reveals) is not bool:
+            raise ValueError(
+                f"a feedback policy's `reveals` must be a bool, got {reveals!r} "
+                f"({type(reveals).__name__}); it decides whether a terminating call carries the "
+                "sealed task's feedback, so a value read by truthiness would open the verdict "
+                "channel on a policy that never claimed to open it"
             )
         # Read once, here, and kept: `namespace` is an ordinary attribute of an object the caller
         # owns and can rebind at any time, so re-reading it at every dispense would validate one
@@ -1457,6 +1719,11 @@ class TaskStream:
         self._queue: List[TaskRef] = queue
         self._max_in_flight = max_in_flight
         self._deadline = deadline
+        # The validated policy, bound to the two values it was validated for — the pair the rest
+        # of this object reads, so nothing it does can disagree with what was checked.
+        self._feedback = feedback
+        self._regime = regime
+        self._reveals = reveals
         # The validated names, bound to the extensions they were validated for. Uniqueness and
         # non-emptiness are properties of *these* strings, and these are the ones the spans and
         # the rows are keyed by — an extension that renames itself afterwards renames nothing.
@@ -1632,6 +1899,9 @@ class TaskStream:
                         TaskRef(str(record["env"]), int(record["task_idx"])),
                         source="a dispense record",
                     )
+                    self._require_regime_matches(
+                        _recorded_regime(record), source="a dispense record"
+                    )
                     lease = str(record["lease"])
                     if lease in self._issued:
                         # Already ambiguous on disk, before this run adds anything: the pairing
@@ -1650,6 +1920,7 @@ class TaskStream:
                     self._require_position_matches(
                         row.position, TaskRef(row.env, row.task_idx), source="a result row"
                     )
+                    self._require_regime_matches(row.feedback_regime, source="a result row")
                     # A row's lease is the dispense's, so this adds nothing to a record whose two
                     # files agree — and it is what keeps the guarantee if they ever do not.
                     self._issued.add(row.lease)
@@ -1788,6 +2059,31 @@ class TaskStream:
             )
             + "; resuming needs the queue the provenance was recorded against, or a fresh "
             "provenance directory"
+        )
+
+    def _require_regime_matches(self, recorded: str, *, source: str) -> None:
+        """A stored record must have been written under the regime this stream serves.
+
+        A record is read as one run. Its rows are averaged together, and the claim a mean of them
+        supports depends entirely on whether the agent was told the previous verdicts — that is
+        the difference between a benchmark number and a learning curve. So a directory holding
+        rows from both postures is a record whose parts are individually honest and whose whole
+        is not, which is precisely the failure a per-row stamp exists to make impossible: written
+        on every row, then contradicted by the row beside it.
+
+        Only a resumed run can reach this, and that is the whole of the exposure — a stream that
+        is not resuming refuses a directory holding *any* record (see
+        :meth:`_require_fresh_provenance`), so the two checks together are what make "one record,
+        one regime" true rather than conventional. Refused at construction, before anything is
+        spent, like the queue check beside it."""
+        if recorded == self._regime:
+            return
+        raise ValueError(
+            f"{self.prov_dir} holds {source} written under feedback regime {recorded!r}, but "
+            f"this stream serves under {self._regime!r}; the rows of one record are read "
+            "together, and whether the agent was told each verdict is what says which claim "
+            "their mean supports — resume under the regime the record was written with, or "
+            "serve into a fresh provenance directory"
         )
 
     def _validate_manifest(self, env_name: str) -> List[ToolManifest]:
@@ -2068,6 +2364,16 @@ class TaskStream:
     @property
     def max_in_flight(self) -> int:
         return self._max_in_flight
+
+    @property
+    def feedback(self) -> FeedbackPolicy:
+        """The policy this stream serves under (see :class:`FeedbackPolicy`).
+
+        Read-only, and read *once* at construction: what this hands back is the object the caller
+        passed, but the regime stamped on the record and the decision to reveal at all were taken
+        from it then and are not taken from it again. There is no setter, so the posture a run
+        started in is the posture its whole record was written in."""
+        return self._feedback
 
     @property
     def tools(self) -> Sequence[ToolManifest]:
@@ -2563,7 +2869,10 @@ class TaskStream:
 
         An ordinary call returns the env's own response: that *is* the agent's observation, and
         nothing but the env can produce it. A terminating call returns only the fact that the task
-        is over — a fixed payload identical for every task and every outcome.
+        is over — a fixed payload identical for every task and every outcome — plus, under a
+        revealing feedback policy, that task's own published episode-level feedback and nothing
+        else (see :meth:`_terminal_answer` and :class:`FeedbackPolicy`). Everything below
+        describes the default, :class:`Never`.
 
         Everything a terminal produces stays with the harness, not just the row the seal records
         (lease, position, task index, raw feedback). The env's terminal response is redacted too:
@@ -2575,8 +2884,9 @@ class TaskStream:
         ending: a caller able to tell an unscored infrastructure failure from an earned zero has a
         reason to cause one.
 
-        A call that ends the task answers with that payload *whatever happened while it ended*.
-        An exception is a different response shape, and the shape is the channel: an env that
+        A call that ends the task answers with that payload *whatever happened while it ended*,
+        and under a revealing policy with the same members in the same shape. An exception is a
+        different response shape, and the shape is the channel: an env that
         published a clean summary on one verdict and a malformed one on the other would tell the
         agent its verdict through whether the call succeeded. So a failed seal — and an env that
         raises once it has already ended the episode — are recorded on the stream and answered
@@ -2662,8 +2972,7 @@ class TaskStream:
                     f"({rendered})"
                 ),
             )
-            await self._seal_redacted(live)
-            return ToolResult(content=_TASK_OVER)
+            return ToolResult(content=self._terminal_answer(await self._seal_redacted(live)))
         if not call.terminated:
             return ToolResult(content=json.dumps({"content": call.content, "terminated": False}))
         if not call.tombstoned:
@@ -2676,8 +2985,7 @@ class TaskStream:
             # whoever claims the seal already sees it. The payload is not taken from here at
             # all: it is the core's to stamp, and `_record` reads it off the episode.
             live.terminal_tool = native
-        await self._seal_redacted(live)
-        return ToolResult(content=_TASK_OVER)
+        return ToolResult(content=self._terminal_answer(await self._seal_redacted(live)))
 
     # ----- routing -----
 
@@ -2906,8 +3214,9 @@ class TaskStream:
 
     # ----- sealing -----
 
-    async def _seal_redacted(self, live: _Live) -> None:
-        """Seal a task whose terminating call is being answered with the redacted payload.
+    async def _seal_redacted(self, live: _Live) -> Optional[ResultRow]:
+        """Seal a task whose terminating call is being answered, and hand back the row that seal
+        recorded — ``None`` when it recorded none.
 
         The row :meth:`_seal` records is for the harness, not the caller — and so is the
         exception it raises instead. Every failure it can raise is already recorded on the stream
@@ -2918,10 +3227,18 @@ class TaskStream:
         through: the caller it would have answered is already gone, and the claim hand-back needs
         it to.
 
+        **What is handed back is the row, not the outcome of the seal.** A seal can record a row
+        and still raise — an unheadlinable summary lands the row first and stops the stream after
+        the release (see :meth:`_run_seal`) — and on that path the task's feedback is durable and
+        is the same feedback the file holds. So the failure path answers with
+        :attr:`_Live.row`, which is that recorded row or ``None`` if the seal never got one
+        written. It is read off the entry rather than reconstructed: one seal, one row, and the
+        entry is where that row was published.
+
         The fallback ``_stop`` is belt and braces for a future edit that raises without recording
         one — the first cause wins, so it is a no-op on every path that exists today."""
         try:
-            await self._seal(live)
+            return await self._seal(live)
         except Exception as exc:  # noqa: BLE001 — reported on the stream, not to the agent
             self._stop(
                 exc,
@@ -2934,6 +3251,69 @@ class TaskStream:
                     "incomplete"
                 ),
             )
+            return live.row
+
+    def _terminal_answer(self, row: Optional[ResultRow]) -> str:
+        """The whole response to a call that ended a task: the fixed envelope, plus whatever the
+        feedback policy reveals about the row that seal recorded.
+
+        Under :class:`Never` — the default — this is the constant and nothing is computed at all,
+        so a run with no verdict channel is byte-for-byte the run this module served before
+        policies existed.
+
+        Under a revealing policy the envelope gains exactly one member, ``feedback``, and it is
+        **always present**: an env that published nothing at episode level, a policy holding this
+        task back, and a seal that recorded no row all answer with an empty list. That is the
+        whole of what keeps the channel to the one thing it is for. A member that appeared only
+        when there was something to say would let an agent read "the stream failed to record my
+        task" off the shape of a response — the stop channel this module closes everywhere else,
+        reopened at the one call that always knows.
+
+        What the policy is handed is a private copy of the sealed row's episode-level items, and
+        what it hands back goes inside the envelope rather than beside it. It cannot add a
+        member, cannot reach the lease, the position, the index, the closure or the queue, and is
+        never asked about a task other than the one this call ended — the row comes from *this*
+        seal, never from the results list, which under concurrency would be a sibling's.
+
+        **A policy that cannot answer is a run-level failure, not a task-level one.** Composing
+        this runs caller-supplied code, and a policy that raises will raise on every task, so the
+        row already stamped with its regime is a row claiming a channel the agent was never told
+        through: the record would say a training run happened where none did. So the failure is
+        contained (this answer may not become a traceback at the agent, and the shape may not
+        change), the agent is told the task ended and nothing more, and the stream stops — loud
+        to the harness, silent to the agent, like every other integrity failure here.
+
+        Serialised here rather than by the caller, with the encoder and the ``allow_nan`` the
+        record itself is committed with: a value the endpoint could not send has to be found
+        inside the containment, because outside it the failure is a traceback at the agent in
+        place of the answer every other ending returns."""
+        if not self._reveals:
+            return _TASK_OVER
+        try:
+            revealed = self._feedback.reveal(_revealable(row))
+            return json.dumps(
+                {**_TASK_OVER_FIELDS, _FEEDBACK_MEMBER: [dict(item) for item in revealed]},
+                allow_nan=False,
+            )
+        except BaseException as exc:  # noqa: BLE001 — the policy's failure, never this answer's
+            # Nothing here awaits, so no cancellation can be delivered into it and one observed
+            # was raised where it was observed (see :func:`_must_propagate`).
+            if _must_propagate(exc, None):
+                raise
+            rendered = _rendered_failure(exc)
+            self._stop(
+                exc,
+                dispensing=(
+                    f"this stream stopped: the {self._regime!r} feedback policy could not answer "
+                    f"a terminating call ({rendered}), so a task recorded under that regime was "
+                    "served with the channel its row claims closed"
+                ),
+                closing=(
+                    f"this stream stopped before its queue was served: the {self._regime!r} "
+                    f"feedback policy could not answer a terminating call ({rendered})"
+                ),
+            )
+            return _TASK_OVER_SILENT
 
     async def _seal(self, live: _Live, *, forced: Optional[Closure] = None) -> ResultRow:
         """End the episode authoritatively, classify how it ended, record the row, and release
@@ -3402,6 +3782,10 @@ class TaskStream:
             observed=observed,
             diagnostic=diagnostic,
             extensions=extensions,
+            # The regime this stream serves, validated at construction and never re-read from the
+            # policy object — the row says what the run was, not what the policy happens to
+            # answer at the moment the row is built.
+            feedback_regime=self._regime,
         )
 
     async def _force_terminal(
@@ -3714,6 +4098,11 @@ class TaskStream:
                 "env": live.ref.env,
                 "task_idx": live.ref.task_idx,
                 "dispensed_at": time.time(),
+                # Stamped HERE, before the task is handed out, so the regime is durable before
+                # anything could have been revealed under it — and so the one row a crash leaves
+                # this run to write, the `broker_abort` :func:`reconcile` builds, can say which
+                # posture it was dispensed under instead of defaulting to the safe-looking one.
+                "feedback_regime": self._regime,
                 # namespace -> what that extension observed at dispense. The `{"dispensed": ...}`
                 # wrapper the row carries is deliberately *not* here: it exists to sit beside
                 # `sealed`/`error`, which are outcomes, and a dispense record has no outcome.
@@ -3728,6 +4117,125 @@ class TaskStream:
             raise RuntimeError(self._stopped.dispensing) from self._stopped.cause
         if self._closed:
             raise RuntimeError("this stream is closed")
+
+
+# What :class:`EvalStream` was passed for an argument it refuses. A sentinel rather than a
+# default of `None`, because the refusal is about the argument being *supplied at all*: `None` is
+# a value a caller can pass, and one that would then be waved through as "not really a policy".
+_REFUSED: Any = object()
+
+
+class EvalStream(TaskStream):
+    """A :class:`TaskStream` whose evaluation posture is a construction rather than a
+    configuration: it pins ``feedback=Never()`` and refuses the argument outright.
+
+    The difference from ``TaskStream(..., feedback=Never())`` is not what the run does — the two
+    serve identically, and their rows are identical evidence — it is what a *reader of the code*
+    can conclude. One says this run had no verdict channel; the other says no argument at this
+    construction site could have opened one. A project whose self-improvement claims rest on its
+    evaluation credibility cannot have that credibility be a value someone can edit, so the name
+    is the guarantee and the guarantee has to be enumerated.
+
+    **Guaranteed, and by what mechanism.** Each of these is enforced here or inherited from a
+    mechanism named below it; nothing on this list is a convention.
+
+    1. *No verdict channel, and no way to ask for one.* ``feedback`` is pinned to
+       :class:`Never`, so a terminating call answers with the fixed payload — the same bytes for
+       every env, task and outcome. Mechanism: this constructor passes ``Never()`` to
+       :class:`TaskStream` and raises on any ``feedback`` argument, :class:`Never` included (see
+       below). There is no setter for :attr:`TaskStream.feedback`, and the regime and the decision
+       to reveal are read once at construction and kept, so nothing is re-read mid-run.
+
+    2. *Every record this stream writes says so.* ``feedback_regime="never"`` is stamped on each
+       dispense record, before the task is handed out, and on each result row — and on the
+       ``broker_abort`` row :func:`reconcile` builds from an abandoned dispense. Mechanism: the
+       stamp is taken from the validated regime of the pinned policy, at
+       :meth:`TaskStream._write_dispense` and :meth:`TaskStream._compose_row`. So
+       ``row.get("feedback_regime", "never") == "never"`` is the whole of the reader's check, on
+       the artifact, with no join against anything.
+
+    3. *One record never mixes postures.* A stream that is not resuming refuses a provenance
+       directory that already holds any record; a resuming one refuses a directory whose
+       dispenses or rows name a different regime. Mechanism:
+       :meth:`TaskStream._require_fresh_provenance` and
+       :meth:`TaskStream._require_regime_matches`, both at construction, before anything is spent.
+
+    4. *Everything a stream already guarantees*, unchanged and named here because an evaluation
+       rests on them: the framing has no field a task index or target could be written into; the
+       stream seals and scores every episode itself, never the agent; a dispense is durable before
+       the task is exposed, so a crash is reconcilable rather than silent; and an outcome the
+       agent did not earn lands unscored rather than as a zero. Mechanism: :class:`DispensedTask`,
+       :meth:`TaskStream._seal`, :meth:`TaskStream._write_dispense`, :data:`_SCORED_CLOSURES`.
+
+    **Not guaranteed, and deliberately not claimed.** These matter to an evaluation and none of
+    them is decidable here, so this class does not pretend to decide them:
+
+    - *That the queue is held out.* Which task indices belong to an evaluation pool is the
+      caller's split; this object is handed a materialised queue and cannot know what a training
+      run was shown.
+    - *That the agent cannot read the record.* ``prov_dir`` carries task indices and raw feedback
+      and belongs to the harness, but nothing here can prove it is off a filesystem the agent
+      under test can read.
+    - *That provenance extensions keep what they are shown.* An extension's ``finalize`` is handed
+      the task's score (see :class:`CompletedTask`), which is the verdict; what it then does with
+      it is outside this process's reach. Extensions are still permitted, because the snapshots a
+      real held-out run needs are provenance extensions.
+    - *That the env carries no state between tasks.* ``env_for`` is called once per dispensed task
+      and the episode closes what it was given, but a factory returning fresh handles onto one
+      shared backend satisfies that and shares everything. Identity-checking the returned envs
+      would prove non-identity, which is not the property, so nothing here claims it.
+
+    **Refused knobs.** Of :class:`TaskStream`'s arguments, exactly one decides posture, and it is
+    refused. The others are not posture questions and are passed through: ``max_in_flight`` and
+    ``deadline`` change how a queue is served, not what the agent is told; ``resume`` is the
+    only correct way to continue a crashed evaluation, and guarantee 3 is what makes it safe;
+    ``provenance`` records more about a run rather than revealing more of it.
+
+    Args:
+        Every :class:`TaskStream` argument except ``feedback``, with the same meanings.
+    """
+
+    def __init__(
+        self,
+        env_for: Callable[[str], Env],
+        tasks: Sequence[TaskRef],
+        *,
+        prov_dir: Path,
+        max_in_flight: int = 1,
+        deadline: Optional[float] = None,
+        resume: bool = False,
+        provenance: Sequence[Provenance] = (),
+        provenance_timeout: Optional[float] = 30.0,
+        # Accepted only in order to be refused. Left out of the signature entirely, the refusal
+        # would be Python's `unexpected keyword argument`, which says what happened and not one
+        # word about why — and a caller reading that has every reason to reach for `TaskStream`
+        # and pass the policy there, which is exactly the move this class exists to make visible.
+        feedback: Any = _REFUSED,
+    ) -> None:
+        if feedback is not _REFUSED:
+            # `Never()` is refused too, and that is the point rather than an oversight. A value
+            # that has to be passed is a value the next edit can change, and a construction site
+            # that reads `EvalStream(..., feedback=Never())` invites precisely that edit while
+            # looking like it was reviewed. The class is the statement; there is nothing to pass.
+            raise ValueError(
+                f"{type(self).__name__} takes no `feedback` policy, and refuses "
+                f"{feedback!r} for that reason rather than for what it is: an evaluation's "
+                "verdict channel is closed by construction, so there is no argument that could "
+                "open it and none that could confirm it is shut. Use "
+                f"`{TaskStream.__name__}(..., feedback=...)` for a run whose scores are not "
+                "meant to be evaluation-grade"
+            )
+        super().__init__(
+            env_for,
+            tasks,
+            prov_dir=prov_dir,
+            max_in_flight=max_in_flight,
+            deadline=deadline,
+            resume=resume,
+            provenance=provenance,
+            provenance_timeout=provenance_timeout,
+            feedback=Never(),
+        )
 
 
 def _detached_summary(score: Optional[Score]) -> Optional[Score]:
@@ -4204,6 +4712,29 @@ async def _close_contained(env: Env) -> Optional[BaseException]:
     except BaseException as exc:  # noqa: BLE001 — reported to the caller, never raised here
         return exc
     return None
+
+
+def _revealable(row: Optional[ResultRow]) -> List[Dict[str, Any]]:
+    """The most a terminating call could ever tell the agent about the task it ended: that row's
+    **episode-level** feedback, in publication order, as its own copy.
+
+    Episode level and no further, because that is the line
+    :func:`~hgym.feedback.wire.select_inband` already draws for a single served episode — the
+    terminal carries the values that scored the whole task, while inference-level items stay
+    recorded-but-not-surfaced. A stream that revealed those would be surfacing per-step shaping
+    a served episode withholds, at a boundary that is stricter rather than looser.
+
+    Taken from the row, so what can be revealed is exactly what was recorded: the values in the
+    file, read out of the run's own canonical copy of it (see :func:`_recorded_row`), which is
+    plain data by the time it arrives here. Copied per item because it is handed to
+    caller-supplied code — a policy may not be able to edit the record by editing what it was
+    shown — and the copy is cheap for the same reason the read is safe.
+
+    ``None`` is a seal that recorded no row at all, and answers with nothing rather than with
+    anything reconstructed: there is no verdict to reveal for a task the record does not hold."""
+    if row is None:
+        return []
+    return [dict(item) for item in row.observed if item.get("level") == _EPISODE_LEVEL]
 
 
 def _episode_items(feedback: Sequence[Dict[str, Any]], name: str) -> List[Dict[str, Any]]:
