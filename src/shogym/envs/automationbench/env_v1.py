@@ -33,8 +33,8 @@ from __future__ import annotations
 import json
 from typing import TYPE_CHECKING, Any, Dict, List, Optional
 
+from shogym.core import Env
 from shogym.envs.registration import register
-from shogym.envs.tool_using_env import ToolUsingEnv
 from shogym.mcp import MCPServerSpec
 from shogym.task import TaskSpec
 from shogym.trajectory import Trajectory
@@ -78,7 +78,7 @@ and no need to call `terminate` afterward)."""
 
 
 @register("automationbench")
-class AutomationBenchEnv(ToolUsingEnv):
+class AutomationBenchEnv(Env):
     """AutomationBench wrapped as an shogym env (the pinned ``api`` toolset).
 
     Config (all optional, via ``shogym.make("automationbench", config=...)`` / ``env_config``):

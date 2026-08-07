@@ -73,8 +73,9 @@ class TaskSpec(BaseModel):
     @model_validator(mode="after")
     def _enforce_terminal_kind_invariants(self) -> "TaskSpec":
         """Enforce the terminal-kind invariants on **every** published contract, not only the
-        ``ToolUsingEnv`` convenience path — a custom ``Env.describe()`` cannot slip two score
-        terminals (both would seal/finalize) or a scoring ``terminate`` past the serve layer.
+        one the base ``Env.describe()`` derives from ``score_terminal_tool`` — an env that
+        overrides ``describe()`` and hand-builds its manifest cannot slip two score terminals
+        (both would seal/finalize) or a scoring ``terminate`` past the serve layer.
         Exactly zero-or-one ``score`` terminal per env, and the reserved ``terminate`` must be
         ``abort`` (never ``score``)."""
         score = [t.name for t in self.tools if t.terminal_kind == "score"]

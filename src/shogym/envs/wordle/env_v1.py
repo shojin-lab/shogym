@@ -10,8 +10,8 @@ from __future__ import annotations
 
 from typing import Any, Dict, List, Optional, Tuple
 
+from shogym.core import Env
 from shogym.envs.registration import register
-from shogym.envs.tool_using_env import ToolUsingEnv
 from shogym.envs.wordle import mcp_server as wordle_mcp_server
 from shogym.envs.wordle.functions.guess.system_schema import WordleGuessSystemSchema
 from shogym.envs.wordle.functions.guess.user_schema import WordleGuessUserSchema
@@ -35,7 +35,7 @@ WORDLE_SPEC = MCPServerSpec(
 )
 
 
-class WordleV1Env(ToolUsingEnv):
+class WordleV1Env(Env):
     mcp_servers = (WORDLE_SPEC,)
     function_name = "guess"
     function = FunctionConfig(

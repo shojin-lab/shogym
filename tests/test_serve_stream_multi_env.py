@@ -1,6 +1,6 @@
 """Serving more than one env from one stream.
 
-Native tool names collide across envs — every ``ToolUsingEnv`` carries ``terminate``, and real
+Native tool names collide across envs — every env carries ``terminate``, and real
 envs share ``done`` and ``submit_answer`` with different schemas behind them — while an endpoint
 registers one schema per name. These tests pin that the collision is resolved by explicit
 routing, not by hoping the names differ.

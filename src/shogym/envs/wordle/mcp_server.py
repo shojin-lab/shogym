@@ -9,7 +9,7 @@ Lifecycle (in-process only for now):
     server when an episode's session starts, before any tool is called.
   - ``guess(word, _session_id)`` — scores the guess.
   - ``end_session(session_id)`` — the env drops the session's state on teardown
-    (via ``ToolUsingEnv.end_session`` / ``close``).
+    (via ``Env.end_session`` / ``close``).
 """
 
 from __future__ import annotations

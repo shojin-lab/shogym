@@ -15,8 +15,8 @@ from __future__ import annotations
 import asyncio
 from typing import Any, Dict, List, Optional
 
+from shogym.core import Env
 from shogym.envs.registration import _ENV_REGISTRY, register
-from shogym.envs.tool_using_env import ToolUsingEnv
 from shogym.mcp import MCPServerSpec
 from shogym.serve.lifecycle import FinalizeRequest, TerminalEvidence
 from shogym.trajectory import Trajectory
@@ -37,7 +37,7 @@ _SPEC = MCPServerSpec(
 _INSTRUCTIONS = "Answer the question, then call `submit` with your final `answer`."
 
 
-class _FixtureScoreEnv(ToolUsingEnv):
+class _FixtureScoreEnv(Env):
     """A score-terminal env with a deterministic offline finalizer.
 
     Config: ``tasks`` (list of ``{"id","question","answer"}``); optional ``finalize_hook`` — a

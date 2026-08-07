@@ -24,9 +24,9 @@ import asyncio
 import os
 from typing import Any, Dict, List, Optional
 
+from shogym.core import Env
 from shogym.envs.hle.judge import DEFAULT_JUDGE_MODEL, Judge, OpenAIJudge, exact_match
 from shogym.envs.registration import register
-from shogym.envs.tool_using_env import ToolUsingEnv
 from shogym.mcp import MCPServerSpec
 from shogym.serve.lifecycle import FinalizeRequest, TerminalEvidence
 from shogym.task import TaskSpec
@@ -58,7 +58,7 @@ _BASE_INSTRUCTIONS = (
 
 
 @register("hle")
-class HleEnv(ToolUsingEnv):
+class HleEnv(Env):
     """Humanity's Last Exam as a single-turn, model-graded shogym env.
 
     Config (all optional, via ``shogym.make("hle", config=...)`` / ``env_config``):

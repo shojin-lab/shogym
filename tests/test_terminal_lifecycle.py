@@ -88,7 +88,7 @@ def test_manifest_marks_exactly_one_score_terminal_and_abort() -> None:
 
 def test_taskspec_rejects_two_score_terminals_or_scoring_terminate() -> None:
     # The invariant is enforced in TaskSpec validation, so even a hand-rolled Env.describe()
-    # (bypassing ToolUsingEnv's convenience check) cannot publish two score terminals or a
+    # (bypassing the base class's convenience check) cannot publish two score terminals or a
     # scoring `terminate`.
     def _tool(name: str, kind: str) -> ToolManifest:
         return ToolManifest(name=name, description="d", input_schema={}, terminal_kind=kind)
@@ -1059,18 +1059,19 @@ async def test_a_replay_reports_the_outcome_the_live_path_published(tmp_path: Pa
     assert rec.to_evidence().finalize_error is False
 
 
-# ----- serve-boundary enforcement for a NON-ToolUsingEnv env -----
+# ----- serve-boundary enforcement for an env that hand-builds its manifest -----
 #
-# ToolUsingEnv rejects a score terminal that lacks a callable finalize at CONSTRUCTION, but a
-# non-ToolUsingEnv env that hand-builds its TaskSpec/manifest never runs that check. The
-# authoritative enforcement therefore lives at the serve boundary every env passes through
-# (`ServedEpisode.__init__`), and these tests prove it there — with an env that is NOT a
-# ToolUsingEnv.
+# `Env` rejects a declared `score_terminal_tool` that lacks a callable finalize at
+# CONSTRUCTION, but an env that overrides `describe()` and hand-builds its TaskSpec/manifest
+# declares no `score_terminal_tool`, so it never runs that check. The authoritative enforcement
+# therefore lives at the serve boundary every env passes through (`ServedEpisode.__init__`),
+# and these tests prove it there — with an env whose `score` terminal exists only in the
+# manifest it publishes by hand.
 
 
 def _raw_score_tools() -> list:
     """A hand-built manifest with exactly one `score` terminal + the reserved abort — the
-    contract a non-ToolUsingEnv env publishes directly."""
+    contract an env that writes its own ``describe()`` publishes directly."""
     return [
         ToolManifest(
             name="submit",
@@ -1090,10 +1091,13 @@ def _raw_score_tools() -> list:
 
 
 class _RawScoreEnvNoFinalize(Env):
-    """A NON-ToolUsingEnv that publishes a `score`-terminal manifest but provides NO callable
-    finalize — the exact configuration ToolUsingEnv's construction check would catch, but which
-    this env never runs. ``essential_specs`` is empty so ``start()`` reaches the constructor
-    guard without opening any MCP session."""
+    """An env that publishes a `score`-terminal manifest from a hand-written ``describe()`` but
+    provides NO callable finalize — the exact configuration the construction check would catch
+    if the env declared ``score_terminal_tool``, which it never does. ``essential_specs`` is
+    empty so ``start()`` reaches the constructor guard without opening any MCP session."""
+
+    def __init__(self) -> None:
+        super().__init__(horizon=3)
 
     def describe(self, task_id=None) -> TaskSpec:
         return TaskSpec(env_name="_raw_score", instructions="i", tools=_raw_score_tools())
@@ -1101,10 +1105,10 @@ class _RawScoreEnvNoFinalize(Env):
     def essential_specs(self):
         return []
 
-    def load_task(self, task_idx):
+    def _load_task(self, task_idx):
         return {"task_idx": 0}
 
-    def verify(self, trajectory, task, *, terminated, evidence=None) -> FeedbackCollection:
+    def _verify(self, trajectory, task, *, terminated) -> FeedbackCollection:
         return FeedbackCollection()
 
 
@@ -1122,15 +1126,15 @@ if "_raw_score_with_finalize" not in _ENV_REGISTRY:
 
 
 async def test_score_terminal_without_callable_finalize_rejected_at_serve_boundary() -> None:
-    # A non-ToolUsingEnv env that advertises a `score` terminal but has no callable finalize must
-    # be REJECTED loudly at the serve boundary — never silently downgraded to _seal_enabled=False
+    # An env whose hand-built manifest advertises a `score` terminal but has no callable
+    # finalize must be REJECTED loudly at the serve boundary — never silently downgraded to _seal_enabled=False
     # and routed through the legacy marker path (which would reopen the grade->read->fix->grade
     # exploit for an env that expected the seal to protect it).
     with pytest.raises(TypeError, match=r"score.*finalize"):
         await ServedEpisode.start("_raw_score_no_finalize", task=0)
 
 
-async def test_valid_non_tool_using_score_env_still_seals() -> None:
+async def test_valid_hand_built_score_env_still_seals() -> None:
     # The positive: the SAME hand-built score manifest WITH a callable finalize is accepted and
     # seals normally. The guard rejects only the misconfigured env; no valid env is broken.
     ep = await ServedEpisode.start("_raw_score_with_finalize", task=0)

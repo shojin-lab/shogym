@@ -55,7 +55,7 @@ print(result.value("check_answer"), result.feedback)
 
 ## How it works
 
-`WordleV1Env` is a `ToolUsingEnv`: it declares its MCP servers, its horizon
+`WordleV1Env` is an `Env`: it declares its MCP servers, its horizon
 (`MAX_GUESSES = 6`), and its advisory templates, and the base class probes the tool
 manifest once at construction.
 

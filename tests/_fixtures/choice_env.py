@@ -1,7 +1,7 @@
 """A second ``score``-terminal fixture env whose tool names collide with the first (tests only).
 
 Same names as :mod:`tests._fixtures.score_env` — ``submit``, ``noop``, plus the reserved
-``terminate`` every ``ToolUsingEnv`` carries — and a different schema behind ``submit``. Used to
+``terminate`` every env carries — and a different schema behind ``submit``. Used to
 pin multi-env routing: one endpoint cannot register two schemas under one name, and a call must
 reach the env its lease names.
 """
@@ -10,7 +10,7 @@ from __future__ import annotations
 
 from typing import Any, Dict, List, Optional
 
-from shogym.envs.tool_using_env import ToolUsingEnv
+from shogym.core import Env
 from shogym.mcp import MCPServerSpec
 from shogym.serve.lifecycle import FinalizeRequest, TerminalEvidence
 from shogym.trajectory import Trajectory
@@ -31,7 +31,7 @@ _SPEC = MCPServerSpec(
 _INSTRUCTIONS = "Pick the right option, then call `submit` with your final `choice`."
 
 
-class _FixtureChoiceEnv(ToolUsingEnv):
+class _FixtureChoiceEnv(Env):
     """A score-terminal env graded by an integer compare, offline and deterministic."""
 
     mcp_servers = (_SPEC,)

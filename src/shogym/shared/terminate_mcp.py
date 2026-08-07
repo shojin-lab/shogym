@@ -1,6 +1,6 @@
 """Built-in ``terminate`` tool — the reserved episode-completion signal.
 
-Every env serves this server (see ``ToolUsingEnv.essential_specs``). Calling ``terminate``
+Every env serves this server (see ``Env.essential_specs``). Calling ``terminate``
 signals the episode is over (alongside the horizon); the result is a no-op acknowledgement —
 the terminate call itself is the terminal signal, detected by name.
 
