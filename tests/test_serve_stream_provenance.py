@@ -15,8 +15,8 @@ from typing import Any, Callable, Dict, List, Optional
 
 import pytest
 
-from hgym.serve import stream as stream_module
-from hgym.serve.stream import (
+from shogym.serve import stream as stream_module
+from shogym.serve.stream import (
     _TASK_OVER,
     Closure,
     CompletedTask,
@@ -28,7 +28,7 @@ from hgym.serve.stream import (
     read_results,
     reconcile,
 )
-from hgym.types import EpisodeFeedback, FeedbackCollection
+from shogym.types import EpisodeFeedback, FeedbackCollection
 from tests._fixtures.score_env import ENV_NAME, SUBMIT_TOOL, _FixtureScoreEnv
 
 TASKS = [
@@ -1210,7 +1210,7 @@ class _Unwrappable(str):
     """A feedback value that is a JSON scalar to the record and a landmine to anything that
     tries to *copy* or *render* it.
 
-    Reachable, not exotic: ``hgym.feedback.wire`` types a feedback value as ``float | bool |
+    Reachable, not exotic: ``shogym.feedback.wire`` types a feedback value as ``float | bool |
     str``, the feedback models do not validate on assignment (``dump_item`` says so in as many
     words), and the wire dict carries the object itself. So an env that builds a value one way
     and rewrites it another puts a scalar *subclass* on the row, and it serialises like any

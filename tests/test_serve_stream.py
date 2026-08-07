@@ -1,4 +1,4 @@
-"""The task stream (``hgym.serve.stream``): dispense a queue, seal and score each task, and
+"""The task stream (``shogym.serve.stream``): dispense a queue, seal and score each task, and
 serve the whole thing over one MCP endpoint.
 
 Driven against the real score-terminal fixture env — a full episode per dispensed task, with
@@ -18,9 +18,9 @@ from typing import Any, Callable, Dict, List, Sequence, Tuple
 import pytest
 from fastmcp import Client
 
-import hgym.serve.stream as stream_module
-from hgym.serve.lifecycle import FinalizeRequest, TerminalEvidence
-from hgym.serve.stream import (
+import shogym.serve.stream as stream_module
+from shogym.serve.lifecycle import FinalizeRequest, TerminalEvidence
+from shogym.serve.stream import (
     QueueInfo,
     TaskRef,
     TaskStream,
@@ -29,9 +29,9 @@ from hgym.serve.stream import (
     read_results,
     reconcile,
 )
-from hgym.shared.terminate_mcp import TERMINATE_TOOL_NAME
-from hgym.task import TaskSpec, ToolManifest
-from hgym.types import EpisodeFeedback, FeedbackCollection, InferenceFeedback
+from shogym.shared.terminate_mcp import TERMINATE_TOOL_NAME
+from shogym.task import TaskSpec, ToolManifest
+from shogym.types import EpisodeFeedback, FeedbackCollection, InferenceFeedback
 from tests._fixtures.score_env import ENV_NAME, HORIZON, SUBMIT_TOOL, _FixtureScoreEnv
 
 TASKS = [
@@ -1791,7 +1791,7 @@ async def test_a_drifted_tool_name_that_cannot_be_described_still_stops_the_stre
     #
     # Neither half of the comparison is the env's object any more. The published side is frozen
     # when it is read (`_frozen_manifest`) and the episode side is snapshotted in wire form
-    # (`hgym.serve.episode._wire_form`), so an undescribable name is plain text by the time
+    # (`shogym.serve.episode._wire_form`), so an undescribable name is plain text by the time
     # anything here reads it: the drift is named plainly and the stop lands. The guard the name
     # used to need is still what stands behind the values that *are* the env's — the published
     # feedback a summary refusal is about (see `_pick_summary`).

@@ -1,7 +1,7 @@
 [project]
-name = "hgym"
+name = "shogym"
 version = "0.0.1"
-description = "Harness Gym — environments for agents whose policy boundary is the tool surface"
+description = "Environments for agents whose policy boundary is the tool surface"
 readme = "README.md"
 license = "Apache-2.0"
 license-files = ["LICENSE", "NOTICE"]
@@ -29,72 +29,72 @@ classifiers = [
 ]
 
 [project.urls]
-Homepage = "https://github.com/anndvision/hgym"
-Repository = "https://github.com/anndvision/hgym"
+Homepage = "https://github.com/shojin-lab/shogym"
+Repository = "https://github.com/shojin-lab/shogym"
 
 [project.scripts]
-hgym = "hgym.cli:main"
+shogym = "shogym.cli:main"
 
 [project.optional-dependencies]
 analysis = ["pandas>=2.2", "duckdb>=1.0"]
-# The tau2-bench port (src/hgym/envs/tau2), pinned to an upstream commit SHA: `[gym]` pulls
+# The tau2-bench port (src/shogym/envs/tau2), pinned to an upstream commit SHA: `[gym]` pulls
 # gymnasium (the GymAgent bridge needs it), `[knowledge]` pulls rank-bm25 (banking's offline
-# retrieval). Kept as an optional extra so `pip install hgym` (and the core test suite) stay
-# lean and never import tau2 — `import hgym` registers `tau2_*` envs without loading it.
+# retrieval). Kept as an optional extra so `pip install shogym` (and the core test suite) stay
+# lean and never import tau2 — `import shogym` registers `tau2_*` envs without loading it.
 # NOTE: tau2 does not ship its `data/` in the wheel, so it must be provisioned at runtime; the
 # tau2 example lazy-downloads it (or honor `TAU2_DATA_DIR`).
 tau2 = [
     "tau2[gym,knowledge] @ git+https://github.com/sierra-research/tau2-bench@1d244f5dca42944b67a379b44bfeb9f5748f189d",
 ]
-# The HLE env (src/hgym/envs/hle): `datasets` lazy-loads the gated `cais/hle` benchmark, and
+# The HLE env (src/shogym/envs/hle): `datasets` lazy-loads the gated `cais/hle` benchmark, and
 # `openai` backs the default model-graded judge (an OpenAI-compatible client, created only
-# when the judge is first called). Optional so `pip install hgym` (and the core offline test
-# suite) stay lean — `import hgym` registers `hle` without importing either. Offline tests
+# when the judge is first called). Optional so `pip install shogym` (and the core offline test
+# suite) stay lean — `import shogym` registers `hle` without importing either. Offline tests
 # inject their own tasks + a scripted judge, so they need neither the download nor a key.
 hle = [
     "datasets>=2.19",
     "openai>=1.99",
 ]
-# The YC-Bench port (src/hgym/envs/yc_bench), pinned to an upstream commit SHA. YC-Bench has no
+# The YC-Bench port (src/shogym/envs/yc_bench), pinned to an upstream commit SHA. YC-Bench has no
 # stable public API, so the port wraps its internal modules (sim engine, world seeder, config
 # loader, command policy, ORM) behind a thin adapter — pinning a SHA makes drift a one-file
-# maintenance cost. Kept as an optional extra so `pip install hgym` (and the core test suite)
-# stay lean and never import yc_bench — `import hgym` registers the `yc_bench` env without
+# maintenance cost. Kept as an optional extra so `pip install shogym` (and the core test suite)
+# stay lean and never import yc_bench — `import shogym` registers the `yc_bench` env without
 # loading it. YC-Bench generates its whole world deterministically from a seed, so (unlike
 # tau2) it needs no external data provisioned at runtime.
 yc_bench = [
     "yc-bench @ git+https://github.com/collinear-ai/yc-bench@e7d606789be4c52a34f9fa5b04ada4a2eaf9d731",
 ]
-# The Frontier-Bench port (src/hgym/envs/frontier_bench) is a faithful, pinned snapshot of the
+# The Frontier-Bench port (src/shogym/envs/frontier_bench) is a faithful, pinned snapshot of the
 # Harbor benchmark (release tag v0.1.0). Its only runtime dependency is a working local
 # **Docker** daemon (a system dependency, not a pip package): the env builds+runs the task's
 # environment container as the served agent's world and runs the task's own verifier container
 # for the 0/1 verdict. The Python code uses stdlib only (subprocess + tomllib), so this extra
 # carries no Python packages — it exists as a stable install/label target and a home for this
-# note. `import hgym` registers `frontier_bench` without importing Docker; only serving an
+# note. `import shogym` registers `frontier_bench` without importing Docker; only serving an
 # episode shells out to `docker`. Task files are vendored under the package (tiny), so
 # describe / verdict-parsing / the offline tests need neither Docker nor a network.
 frontier_bench = []
-# The AutomationBench port (src/hgym/envs/automationbench). Upstream (MIT, © Zapier) is pinned to
+# The AutomationBench port (src/shogym/envs/automationbench). Upstream (MIT, © Zapier) is pinned to
 # commit a321764 but **cannot be a git extra** like tau2/yc-bench: it declares `requires-python
-# >=3.13` (hgym is hard-pinned to <3.13 for tau2's `audioop`) and pulls the heavy `verifiers` /
+# >=3.13` (shogym is hard-pinned to <3.13 for tau2's `audioop`) and pulls the heavy `verifiers` /
 # `anthropic` agent-loop stack — an unsatisfiable resolve on 3.12. The env-as-center port needs
 # none of that loop, only the deterministic verifiers-free pieces (simulated tools + WorldState,
 # task defs, pure rubric), which import fine on 3.12 with just `pydantic` + `datasets`. So the
 # pinned upstream source is provisioned at runtime into a gitignored cache
-# (`~/.cache/hgym/automationbench/<sha>/`, honoring `AUTOMATIONBENCH_SRC` / `HGYM_CACHE`) — never
+# (`~/.cache/shogym/automationbench/<sha>/`, honoring `AUTOMATIONBENCH_SRC` / `SHOGYM_CACHE`) — never
 # vendored into the repo — and this extra only needs `datasets` (the domain loaders build a
-# HuggingFace `Dataset`). Kept optional so `pip install hgym` (and the core offline test suite)
-# stay lean — `import hgym` registers the `automationbench` env without provisioning or `datasets`.
+# HuggingFace `Dataset`). Kept optional so `pip install shogym` (and the core offline test suite)
+# stay lean — `import shogym` registers the `automationbench` env without provisioning or `datasets`.
 automationbench = [
     "datasets>=2.19",
 ]
-# The BrowseComp-Plus port (src/hgym/envs/browsecomp_plus), a faithful wrap pinned to upstream
+# The BrowseComp-Plus port (src/shogym/envs/browsecomp_plus), a faithful wrap pinned to upstream
 # commit 0469490. `datasets` lazy-loads the XOR-encrypted `Tevatron/browsecomp-plus` queries
 # (decrypted in memory only — never persisted), `openai` backs the default model-graded judge,
 # and `pyserini` (which also needs a Java 21 runtime) is the BM25/Lucene retriever over the
-# prebuilt corpus index. Optional so `pip install hgym` (and the core offline test suite) stay
-# lean — `import hgym` registers `browsecomp_plus` without importing any of them. Offline tests
+# prebuilt corpus index. Optional so `pip install shogym` (and the core offline test suite) stay
+# lean — `import shogym` registers `browsecomp_plus` without importing any of them. Offline tests
 # inject their own tasks + an in-memory searcher + a scripted judge, so they need none of it
 # (no download, no key, no Java).
 browsecomp_plus = [
@@ -105,19 +105,19 @@ browsecomp_plus = [
 
 [dependency-groups]
 # The dev group is synced by default (plain `uv run` / `uv sync`), so putting the env extras
-# here is what makes `uv run …` include them out of the box. `pip install hgym` never installs
+# here is what makes `uv run …` include them out of the box. `pip install shogym` never installs
 # dependency-groups, so the core pip install stays lean.
 dev = [
     "pytest>=8.0",
     "pytest-asyncio>=0.26",
     "ruff>=0.8",
     "pyright>=1.1.390",
-    "hgym[tau2]",
-    "hgym[hle]",
-    "hgym[yc_bench]",
-    "hgym[frontier_bench]",
-    "hgym[automationbench]",
-    "hgym[browsecomp_plus]",
+    "shogym[tau2]",
+    "shogym[hle]",
+    "shogym[yc_bench]",
+    "shogym[frontier_bench]",
+    "shogym[automationbench]",
+    "shogym[browsecomp_plus]",
 ]
 
 [build-system]
@@ -129,7 +129,7 @@ build-backend = "hatchling.build"
 allow-direct-references = true
 
 [tool.hatch.build.targets.wheel]
-packages = ["src/hgym"]
+packages = ["src/shogym"]
 
 [tool.pytest.ini_options]
 asyncio_mode = "auto"
@@ -141,13 +141,13 @@ pythonpath = ["."]
 line-length = 100
 target-version = "py312"
 # Vendored, pinned upstream benchmark task files (redistributed byte-for-byte with the canary):
-# not this project's code and never imported by hgym — they run only inside task containers.
-extend-exclude = ["src/hgym/envs/frontier_bench/tasks"]
+# not this project's code and never imported by shogym — they run only inside task containers.
+extend-exclude = ["src/shogym/envs/frontier_bench/tasks"]
 
 [tool.pyright]
 include = ["src"]
 pythonVersion = "3.12"
 # The vendored frontier_bench task files (solution/solve.py, tests/test_outputs.py) are pinned
-# upstream artifacts executed inside the task's Docker containers — not part of hgym's typed
+# upstream artifacts executed inside the task's Docker containers — not part of shogym's typed
 # surface and never imported by the port — so they are excluded from type-checking.
-exclude = ["src/hgym/envs/frontier_bench/tasks"]
+exclude = ["src/shogym/envs/frontier_bench/tasks"]

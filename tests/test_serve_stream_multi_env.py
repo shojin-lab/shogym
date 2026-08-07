@@ -18,7 +18,7 @@ import pytest
 from fastmcp import Client
 from mcp.shared.tool_name_validation import TOOL_NAME_REGEX, validate_tool_name
 
-from hgym.serve.stream import (
+from shogym.serve.stream import (
     _TOOL_NAME_CHAR,
     _TOOL_NAME_MAX,
     TaskRef,
@@ -26,7 +26,7 @@ from hgym.serve.stream import (
     build_stream_server,
     read_results,
 )
-from hgym.task import ToolManifest
+from shogym.task import ToolManifest
 from tests._fixtures.choice_env import _FixtureChoiceEnv
 from tests._fixtures.score_env import _FixtureScoreEnv
 

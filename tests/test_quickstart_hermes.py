@@ -12,16 +12,16 @@ import json
 from pathlib import Path
 from typing import Any, Dict
 
-import hgym
+import shogym
 
-# PyYAML is not an hgym dependency; it arrives with the default `dev` group (which CI syncs)
+# PyYAML is not an shogym dependency; it arrives with the default `dev` group (which CI syncs)
 # and is how the quickstart's Hermes config is read here.
 import yaml
 from fastmcp import Client
 
 from examples.quickstarts.hermes import results as results_mod
 from examples.quickstarts.hermes import serve as serve_mod
-from hgym.serve.stream import build_stream_server
+from shogym.serve.stream import build_stream_server
 
 _QUICKSTART = Path(__file__).resolve().parent.parent / "examples" / "quickstarts" / "hermes"
 
@@ -35,11 +35,11 @@ def _payload(result: Any) -> Dict[str, Any]:
 def test_checked_in_config_spawns_the_serve_script() -> None:
     config = yaml.safe_load((_QUICKSTART / "config.yaml").read_text())
     # Hermes has no project-local MCP file: this block is copied into $HERMES_HOME/config.yaml,
-    # and the server key is what Hermes namespaces tools under, so the README's `mcp__hgym__*`
-    # is only correct while this key is `hgym`.
+    # and the server key is what Hermes namespaces tools under, so the README's `mcp__shogym__*`
+    # is only correct while this key is `shogym`.
     assert list(config) == ["mcp_servers"]
-    assert list(config["mcp_servers"]) == ["hgym"]
-    server = config["mcp_servers"]["hgym"]
+    assert list(config["mcp_servers"]) == ["shogym"]
+    server = config["mcp_servers"]["shogym"]
     assert server["command"] == "uv"
     assert server["args"] == ["run", "python", "serve.py"]
     assert server["enabled"] is True
@@ -49,7 +49,7 @@ def test_checked_in_config_spawns_the_serve_script() -> None:
 
 
 def test_the_one_variable_names_a_registered_env() -> None:
-    assert serve_mod.ENV in hgym.registered_envs()
+    assert serve_mod.ENV in shogym.registered_envs()
     assert serve_mod.TASKS and all(type(i) is int for i in serve_mod.TASKS)
 
 
@@ -69,7 +69,7 @@ async def test_stream_serves_tasks_and_records_one_row_each(tmp_path: Path) -> N
     prov = tmp_path / "prov"
     stream = serve_mod.build_stream(env=TEST_ENV, tasks=[0, 1], prov_dir=prov)
     async with stream:
-        client_server = build_stream_server(stream, name="hgym")
+        client_server = build_stream_server(stream, name="shogym")
         async with Client(client_server) as client:
             names = {tool.name for tool in await client.list_tools()}
             # The stream's control tools plus the env's own surface, on one endpoint.

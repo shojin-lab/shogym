@@ -1,4 +1,4 @@
-"""End-to-end: drive a served ``hle`` episode through hgym's serve layer with a scripted
+"""End-to-end: drive a served ``hle`` episode through shogym's serve layer with a scripted
 policy + a scripted (injectable) judge, and check the seal-before-verdict terminal transaction
 and the model-graded score — without any network.
 
@@ -27,9 +27,9 @@ pytest.importorskip("datasets", reason="hle extra not installed")
 
 from fastmcp import Client  # noqa: E402
 
-from hgym.envs.hle.judge import JudgeResult  # noqa: E402
-from hgym.serve import LifecycleState, ServedEpisode  # noqa: E402
-from hgym.serve.server import build_server  # noqa: E402
+from shogym.envs.hle.judge import JudgeResult  # noqa: E402
+from shogym.serve import LifecycleState, ServedEpisode  # noqa: E402
+from shogym.serve.server import build_server  # noqa: E402
 
 _TASKS = [
     {
@@ -145,9 +145,9 @@ async def test_wrong_confident_answer_is_maximally_miscalibrated() -> None:
 
 async def test_negative_task_index_is_rejected() -> None:
     # A negative index must not silently serve `self._tasks[-1]` (a misattributed run).
-    import hgym
+    import shogym
 
-    env = hgym.make("hle", config=_config(_ScriptedJudge()))
+    env = shogym.make("hle", config=_config(_ScriptedJudge()))
     with pytest.raises(ValueError, match="out of range"):
         env._load_task(-1)
     with pytest.raises(Exception):
@@ -478,10 +478,10 @@ async def test_keyless_base_url_grades_via_llm_judge_not_error(monkeypatch) -> N
 async def test_make_and_describe_are_keyless(monkeypatch) -> None:
     # Constructing the env, reading describe(), and probing the tool manifest must stay offline
     # and keyless with the default judge — only session-begin preflights the key.
-    import hgym
+    import shogym
 
     monkeypatch.delenv("OPENAI_API_KEY", raising=False)
-    env = hgym.make("hle", config={"tasks": _TASKS})  # default judge, no key: must not raise
+    env = shogym.make("hle", config={"tasks": _TASKS})  # default judge, no key: must not raise
     spec = env.describe("0")
     assert "capital of France" in spec.instructions
     assert {"submit_answer", "terminate"} <= {t.name for t in spec.tools}

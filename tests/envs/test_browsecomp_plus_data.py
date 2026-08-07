@@ -13,8 +13,8 @@ from types import SimpleNamespace
 
 import pytest
 
-from hgym.envs.browsecomp_plus import data as bcp_data
-from hgym.envs.browsecomp_plus.data import (
+from shogym.envs.browsecomp_plus import data as bcp_data
+from shogym.envs.browsecomp_plus.data import (
     CANARY,
     HF_QUERIES_REVISION,
     INDEX_REPO,
@@ -51,15 +51,15 @@ def test_canary_constant_preserved() -> None:
 
 def test_cache_dir_precedence(monkeypatch, tmp_path) -> None:
     # Explicit override wins; then HF_HOME (honored, as the README/docstring promise); else default.
-    monkeypatch.setenv("HGYM_BROWSECOMP_PLUS_DATA_DIR", str(tmp_path / "explicit"))
+    monkeypatch.setenv("SHOGYM_BROWSECOMP_PLUS_DATA_DIR", str(tmp_path / "explicit"))
     monkeypatch.setenv("HF_HOME", str(tmp_path / "hf"))
     assert cache_dir() == (tmp_path / "explicit")
 
-    monkeypatch.delenv("HGYM_BROWSECOMP_PLUS_DATA_DIR", raising=False)
+    monkeypatch.delenv("SHOGYM_BROWSECOMP_PLUS_DATA_DIR", raising=False)
     assert cache_dir() == (tmp_path / "hf")  # HF_HOME honored, not bypassed
 
     monkeypatch.delenv("HF_HOME", raising=False)
-    assert cache_dir().name == "browsecomp_plus"  # default under ~/.cache/hgym
+    assert cache_dir().name == "browsecomp_plus"  # default under ~/.cache/shogym
 
 
 def test_parse_qrel_text() -> None:
@@ -166,8 +166,8 @@ def test_bm25_index_path_autodownloads_when_absent(monkeypatch, tmp_path) -> Non
     # No override + no cached index -> snapshot_download IS invoked with the upstream dataset repo
     # args, into cache_dir(); the returned path is the cached ``bm25`` dir. No network, no Java.
     pytest.importorskip("huggingface_hub")
-    monkeypatch.setenv("HGYM_BROWSECOMP_PLUS_DATA_DIR", str(tmp_path))
-    monkeypatch.delenv("HGYM_BROWSECOMP_PLUS_BM25_INDEX", raising=False)
+    monkeypatch.setenv("SHOGYM_BROWSECOMP_PLUS_DATA_DIR", str(tmp_path))
+    monkeypatch.delenv("SHOGYM_BROWSECOMP_PLUS_BM25_INDEX", raising=False)
     _stub_no_java_check(monkeypatch)
 
     calls: dict = {}
@@ -195,11 +195,11 @@ def test_index_revision_is_pinned() -> None:
 
 
 def test_bm25_index_path_uses_override_verbatim(monkeypatch, tmp_path) -> None:
-    # An explicit HGYM_BROWSECOMP_PLUS_BM25_INDEX is returned verbatim and SKIPS the download.
+    # An explicit SHOGYM_BROWSECOMP_PLUS_BM25_INDEX is returned verbatim and SKIPS the download.
     pytest.importorskip("huggingface_hub")
     _stub_no_java_check(monkeypatch)
     override = tmp_path / "my_prebuilt_index"
-    monkeypatch.setenv("HGYM_BROWSECOMP_PLUS_BM25_INDEX", str(override))
+    monkeypatch.setenv("SHOGYM_BROWSECOMP_PLUS_BM25_INDEX", str(override))
 
     def boom(**kwargs):
         raise AssertionError("snapshot_download must not run when the override is set")
@@ -213,8 +213,8 @@ def test_bm25_index_path_reuses_cached_index(monkeypatch, tmp_path) -> None:
     # A pre-existing cache_dir()/bm25 is reused and SKIPS the download.
     pytest.importorskip("huggingface_hub")
     _stub_no_java_check(monkeypatch)
-    monkeypatch.delenv("HGYM_BROWSECOMP_PLUS_BM25_INDEX", raising=False)
-    monkeypatch.setenv("HGYM_BROWSECOMP_PLUS_DATA_DIR", str(tmp_path))
+    monkeypatch.delenv("SHOGYM_BROWSECOMP_PLUS_BM25_INDEX", raising=False)
+    monkeypatch.setenv("SHOGYM_BROWSECOMP_PLUS_DATA_DIR", str(tmp_path))
     (tmp_path / "bm25").mkdir(parents=True)
 
     def boom(**kwargs):
@@ -229,8 +229,8 @@ def test_bm25_index_path_fails_fast_without_java(monkeypatch, tmp_path) -> None:
     # No working `java` on PATH -> raise the actionable error BEFORE any download (assert the
     # snapshot_download mock is never called). Uses the real assert_java_available with which->None.
     pytest.importorskip("huggingface_hub")
-    monkeypatch.setenv("HGYM_BROWSECOMP_PLUS_DATA_DIR", str(tmp_path))
-    monkeypatch.delenv("HGYM_BROWSECOMP_PLUS_BM25_INDEX", raising=False)
+    monkeypatch.setenv("SHOGYM_BROWSECOMP_PLUS_DATA_DIR", str(tmp_path))
+    monkeypatch.delenv("SHOGYM_BROWSECOMP_PLUS_BM25_INDEX", raising=False)
     monkeypatch.setattr(shutil, "which", lambda name: None)  # no java on PATH
 
     downloaded = {"called": False}

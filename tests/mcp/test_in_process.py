@@ -2,8 +2,8 @@
 
 import pytest
 
-from hgym.mcp import MCPServerSpec
-from hgym.mcp.transports import open_in_process
+from shogym.mcp import MCPServerSpec
+from shogym.mcp.transports import open_in_process
 
 FIXTURE_MODULE = "tests._mcp_fixtures.echo_mcp"
 
@@ -123,7 +123,7 @@ class _StubResult:
 
 
 def test_render_result_prefers_text_content():
-    from hgym.mcp.transports.in_process import _render_result
+    from shogym.mcp.transports.in_process import _render_result
 
     class _TextBlock:
         def __init__(self, text: str) -> None:
@@ -137,7 +137,7 @@ def test_render_result_prefers_text_content():
 
 
 def test_render_result_falls_back_to_structured_content():
-    from hgym.mcp.transports.in_process import _render_result
+    from shogym.mcp.transports.in_process import _render_result
 
     res = _StubResult(content=[], structured_content={"k": "v", "n": 1})
     rendered = _render_result(res)
@@ -147,7 +147,7 @@ def test_render_result_falls_back_to_structured_content():
 
 
 def test_render_result_falls_back_to_data():
-    from hgym.mcp.transports.in_process import _render_result
+    from shogym.mcp.transports.in_process import _render_result
 
     res = _StubResult(content=[], structured_content=None, data={"x": 42})
     rendered = _render_result(res)
@@ -155,7 +155,7 @@ def test_render_result_falls_back_to_data():
 
 
 def test_render_result_empty_when_nothing_set():
-    from hgym.mcp.transports.in_process import _render_result
+    from shogym.mcp.transports.in_process import _render_result
 
     res = _StubResult(content=[], structured_content=None, data=None)
     assert _render_result(res) == ""

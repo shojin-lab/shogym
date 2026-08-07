@@ -1,4 +1,4 @@
-"""End-to-end: drive a served ``automationbench`` episode through hgym's seal-before-verdict serve.
+"""End-to-end: drive a served ``automationbench`` episode through shogym's seal-before-verdict serve.
 
 The whole path — build a per-session ``WorldState``, discover an endpoint with ``api_search``,
 mutate state with ``api_fetch``, then call ``done`` (the ``score`` terminal, which seals + scores
@@ -21,11 +21,11 @@ import json
 import pytest
 
 try:
-    from hgym.envs.automationbench import adapter  # noqa: F401 — triggers provisioning
+    from shogym.envs.automationbench import adapter  # noqa: F401 — triggers provisioning
 except Exception as exc:  # pragma: no cover - network/provisioning failure
     pytest.skip(f"AutomationBench upstream source unavailable: {exc}", allow_module_level=True)
 
-from hgym.serve import ServedEpisode  # noqa: E402
+from shogym.serve import ServedEpisode  # noqa: E402
 
 # A minimal, self-contained task: a seeded Salesforce contact whose phone must be updated. The
 # assertion is initially failing (phone is +1-555-0000), so scoring is a clean 0 -> 1 signal.

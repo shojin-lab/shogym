@@ -6,8 +6,8 @@ from pathlib import Path
 
 import pytest
 
-from hgym.trace import TraceRecord, append_trace, load_traces, step_record
-from hgym.types import EpisodeFeedback, InferenceFeedback
+from shogym.trace import TraceRecord, append_trace, load_traces, step_record
+from shogym.types import EpisodeFeedback, InferenceFeedback
 
 
 def test_step_record_serializes_feedback_to_wire_form() -> None:

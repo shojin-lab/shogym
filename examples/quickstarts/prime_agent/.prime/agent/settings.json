@@ -1,9 +1,9 @@
 {
   "mcpServers": {
-    "hgym": {
+    "shogym": {
       "type": "http",
       "url": "http://127.0.0.1:8973/mcp",
-      "bearerTokenEnvVar": "HGYM_MCP_TOKEN"
+      "bearerTokenEnvVar": "SHOGYM_MCP_TOKEN"
     }
   }
 }

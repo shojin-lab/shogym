@@ -10,11 +10,11 @@ from __future__ import annotations
 
 from typing import Any, Dict, List, Optional
 
-from hgym.envs.tool_using_env import ToolUsingEnv
-from hgym.mcp import MCPServerSpec
-from hgym.serve.lifecycle import FinalizeRequest, TerminalEvidence
-from hgym.trajectory import Trajectory
-from hgym.types import EpisodeFeedback, FeedbackCollection, FunctionConfig
+from shogym.envs.tool_using_env import ToolUsingEnv
+from shogym.mcp import MCPServerSpec
+from shogym.serve.lifecycle import FinalizeRequest, TerminalEvidence
+from shogym.trajectory import Trajectory
+from shogym.types import EpisodeFeedback, FeedbackCollection, FunctionConfig
 
 from tests._fixtures import choice_mcp
 

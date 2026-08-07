@@ -14,7 +14,7 @@ from typing import List, Optional, Sequence
 
 import pytest
 
-from hgym.envs.frontier_bench import docker_backend as dk
+from shogym.envs.frontier_bench import docker_backend as dk
 
 
 def _capture_run_args(monkeypatch: pytest.MonkeyPatch) -> List[List[str]]:

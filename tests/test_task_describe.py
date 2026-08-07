@@ -6,12 +6,12 @@ model call.
 
 from __future__ import annotations
 
-import hgym
-from hgym.task import ReferenceTemplate, TaskSpec, ToolManifest
+import shogym
+from shogym.task import ReferenceTemplate, TaskSpec, ToolManifest
 
 
 def _spec() -> TaskSpec:
-    return hgym.make("wordle_v1").describe(task_id="7")
+    return shogym.make("wordle_v1").describe(task_id="7")
 
 
 def test_identity_and_horizon() -> None:

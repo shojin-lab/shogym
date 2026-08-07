@@ -1,4 +1,4 @@
-"""Offline served-episode tests for all five tau2 domains through hgym's serve layer.
+"""Offline served-episode tests for all five tau2 domains through shogym's serve layer.
 
 Every non-solo domain runs with a **deterministic, offline** user simulator via litellm's
 ``mock_response`` (no OpenAI key), so these live in the suite (gated on the tau2 extra). They
@@ -17,9 +17,9 @@ import pytest
 
 pytest.importorskip("tau2", reason="tau2 extra not installed")
 
-import hgym  # noqa: E402
-from hgym.envs.tau2 import mcp_server  # noqa: E402
-from hgym.serve import ServedEpisode  # noqa: E402
+import shogym  # noqa: E402
+from shogym.envs.tau2 import mcp_server  # noqa: E402
+from shogym.serve import ServedEpisode  # noqa: E402
 
 _MOCK_USER = "This is my request; please help."
 
@@ -37,7 +37,7 @@ _NON_SOLO = {
 
 def _skip_if_unconstructible(env_name: str) -> None:
     try:
-        hgym.make(env_name)
+        shogym.make(env_name)
     except Exception as exc:  # missing data / offline construction blocker
         pytest.skip(f"{env_name} not constructible offline: {exc}")
 
@@ -50,21 +50,21 @@ def test_env_task_ids_match_tau2_declared_split(env_name: str, domain: str) -> N
     # slice — so held-out test tasks never leak into the train env. (Airline/retail/telecom
     # all declare train+test; mock/banking declare no holdout and are excluded here.)
     _skip_if_unconstructible(env_name)
-    import hgym
+    import shogym
 
     loader = mcp_server._reg.get_tasks_loader(domain)
     for split in ("train", "test"):
-        env = hgym.make(env_name, {"task_split": split})
+        env = shogym.make(env_name, {"task_split": split})
         expected = [t.id for t in loader(task_split_name=split)]
         assert env._task_ids == expected, f"{domain} {split} split diverges from tau2"
     # And the two splits are disjoint (no leakage).
-    train = set(hgym.make(env_name, {"task_split": "train"})._task_ids)
-    test = set(hgym.make(env_name, {"task_split": "test"})._task_ids)
+    train = set(shogym.make(env_name, {"task_split": "train"})._task_ids)
+    test = set(shogym.make(env_name, {"task_split": "test"})._task_ids)
     assert train and test and train.isdisjoint(test)
     # An unsupported split for a canonical-split domain is rejected — never silently widened
     # to the full (test-leaking) set.
     with pytest.raises(ValueError):
-        hgym.make(env_name, {"task_split": "traim"})
+        shogym.make(env_name, {"task_split": "traim"})
 
 
 def test_non_solo_default_user_args_match_upstream() -> None:
@@ -112,7 +112,7 @@ async def test_non_solo_domain_round_trips_and_scores(env_name: str, cfg: dict) 
         assert verdict[mcp_server.VERDICT_MARKER] is True
         assert isinstance(verdict["db_match"], bool)  # DB scored offline
 
-        # `terminate` ends the hgym episode; verify parses the verdict into feedback.
+        # `terminate` ends the shogym episode; verify parses the verdict into feedback.
         term = await episode.call("terminate", {})
         assert term.terminated
         fb = {i["name"]: i["value"] for i in episode.terminal_feedback}
@@ -127,9 +127,9 @@ async def test_airline_gold_actions_satisfy_db() -> None:
     # tau2's DB check pass (db_match True). Robust to the split — finds a train task that has
     # replayable assistant actions.
     _skip_if_unconstructible("tau2_airline")
-    import hgym
+    import shogym
 
-    env = hgym.make("tau2_airline")
+    env = shogym.make("tau2_airline")
     by_id = {t.id: t for t in mcp_server.load_tasks("airline")}
     pick = None
     for idx, task_id in enumerate(env._task_ids):

@@ -19,12 +19,12 @@ from __future__ import annotations
 import pytest
 
 try:
-    from hgym.envs.automationbench import adapter
+    from shogym.envs.automationbench import adapter
 except Exception as exc:  # pragma: no cover - network/provisioning failure
     pytest.skip(f"AutomationBench upstream source unavailable: {exc}", allow_module_level=True)
 
-from hgym.envs.automationbench.env_v1 import AutomationBenchEnv, _as_unit  # noqa: E402
-from hgym.serve.lifecycle import TerminalEvidence  # noqa: E402
+from shogym.envs.automationbench.env_v1 import AutomationBenchEnv, _as_unit  # noqa: E402
+from shogym.serve.lifecycle import TerminalEvidence  # noqa: E402
 
 
 def _score_info(info: dict, mutate=None) -> tuple[float, float]:

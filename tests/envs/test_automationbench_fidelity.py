@@ -13,12 +13,12 @@ import pytest
 pytest.importorskip("datasets", reason="automationbench extra (datasets) not installed")
 
 try:
-    from hgym.envs.automationbench import adapter
+    from shogym.envs.automationbench import adapter
 except Exception as exc:  # pragma: no cover - network/provisioning failure
     pytest.skip(f"AutomationBench upstream source unavailable: {exc}", allow_module_level=True)
 
-import hgym  # noqa: E402,F401 — registers the env
-from hgym.envs.registration import make, registered_envs  # noqa: E402
+import shogym  # noqa: E402,F401 — registers the env
+from shogym.envs.registration import make, registered_envs  # noqa: E402
 
 
 def test_env_is_registered() -> None:

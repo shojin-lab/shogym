@@ -26,22 +26,22 @@ import pytest
 
 from fastmcp import Client
 
-from hgym.core import Env
-from hgym.envs.registration import _ENV_REGISTRY, register
-from hgym.serve import (
+from shogym.core import Env
+from shogym.envs.registration import _ENV_REGISTRY, register
+from shogym.serve import (
     FinalizationRecord,
     FinalizationStore,
     LifecycleState,
     ServedEpisode,
     TerminalEvidence,
 )
-from hgym.serve import lifecycle
-from hgym.serve.lifecycle import FinalizeRequest, fail_closed_verdict
-from hgym.serve.server import build_server
-from hgym.shared.terminate_mcp import TERMINATE_TOOL_NAME
-from hgym.task import TaskSpec, ToolManifest
-from hgym.trace import load_traces
-from hgym.types import FeedbackCollection
+from shogym.serve import lifecycle
+from shogym.serve.lifecycle import FinalizeRequest, fail_closed_verdict
+from shogym.serve.server import build_server
+from shogym.shared.terminate_mcp import TERMINATE_TOOL_NAME
+from shogym.task import TaskSpec, ToolManifest
+from shogym.trace import load_traces
+from shogym.types import FeedbackCollection
 
 import tests._fixtures.score_env as fixture  # registers `_fixture_score`
 from tests._fixtures import score_mcp
@@ -65,7 +65,7 @@ def _feedback(ep: ServedEpisode) -> dict:
 def _clean_sessions(tmp_path_factory, monkeypatch):
     # Redirect the no-trace durable fallback root off the real ~/.cache into a tmp dir, so
     # no-trace episodes don't pollute the home cache and the shared root is test-isolated.
-    root = tmp_path_factory.mktemp("hgym-sessions")
+    root = tmp_path_factory.mktemp("shogym-sessions")
     monkeypatch.setattr(lifecycle, "_sessions_cache_root", lambda: root)
     score_mcp.reset_state()
     yield
@@ -244,7 +244,7 @@ async def test_ingress_gate_tombstones_every_post_seal_call_but_allows_readonly(
             desc = await client.call_tool("describe", {})
             assert json.loads(desc.content[0].text)["contract_version"] == 2
             assert len(await client.list_tools()) == 4
-            res = await client.read_resource("hgym://task")
+            res = await client.read_resource("shogym://task")
             assert json.loads(res[0].text)["env_name"] == "_fixture_score"
     finally:
         await ep.close()
@@ -419,7 +419,7 @@ async def test_non_serializable_verdict_fails_closed_and_tears_down(tmp_path: Pa
     # A finalizer that returns a non-JSON verdict (NaN) must not strand a FINALIZED episode: the
     # commit/trace writes (allow_nan=False) would otherwise raise after the seal. Fail closed to
     # the canonical safe verdict, complete the transaction, and tear down.
-    from hgym.serve.lifecycle import TerminalEvidence
+    from shogym.serve.lifecycle import TerminalEvidence
 
     trace = tmp_path / "run.jsonl"
     ep = await ServedEpisode.start(
@@ -455,7 +455,7 @@ async def test_non_dict_verdict_fails_closed_and_records_finalized_not_pending(
     # record still PENDING. That would (a) surface an exception to the client instead of the
     # documented fail-closed result, and (b) strand the durable record at PENDING. The pre-commit
     # guard must reject a non-dict verdict and fail closed so neither happens.
-    from hgym.serve.lifecycle import TerminalEvidence
+    from shogym.serve.lifecycle import TerminalEvidence
 
     trace = tmp_path / "run.jsonl"
     ep = await ServedEpisode.start(
@@ -610,7 +610,7 @@ async def test_verify_sees_the_terminal_step_in_the_trajectory() -> None:
 
 async def test_recovery_runs_on_the_in_process_start_path(tmp_path: Path) -> None:
     # Restart recovery is transport-independent: a dangling record next to a trace is resolved
-    # by the next ServedEpisode.start (the evaluate()/in-process path), not only by `hgym serve`.
+    # by the next ServedEpisode.start (the evaluate()/in-process path), not only by `shogym serve`.
     trace = tmp_path / "run.jsonl"
     store = FinalizationStore(FinalizationStore.resolve_dir("prior", trace))
     store.write(
@@ -624,7 +624,7 @@ async def test_recovery_runs_on_the_in_process_start_path(tmp_path: Path) -> Non
     )
     try:
         rec = store.read("f-crash")
-        assert rec.status == "FAILED"  # resolved fail-closed at start(), no `hgym serve` needed
+        assert rec.status == "FAILED"  # resolved fail-closed at start(), no `shogym serve` needed
         assert rec.verdict["finalize_error"] is True
     finally:
         await ep.close()
@@ -684,7 +684,7 @@ async def test_verify_scores_from_core_evidence_not_agent_payload(tmp_path: Path
         assert json.loads(result.content)["correct"] is False
         assert ep._evidence is not None and ep._evidence.verdict["correct"] is False
         # Provenance is core-stamped (non-forgeable); the diagnostic is private.
-        assert ep._evidence.provenance["core"] == "hgym-serve"
+        assert ep._evidence.provenance["core"] == "shogym-serve"
         assert _feedback(ep)["correct"] is False
     finally:
         await ep.close()
@@ -709,7 +709,7 @@ async def test_durable_record_written_on_each_transition(tmp_path: Path) -> None
     assert rec.status == "FINALIZED"
     assert rec.source == "explicit_tool"
     assert rec.verdict == {"correct": True, "confidence": 60}
-    assert rec.provenance["core"] == "hgym-serve"  # confidential, lives only here
+    assert rec.provenance["core"] == "shogym-serve"  # confidential, lives only here
     assert rec.diagnostic  # private diagnostic persisted off-trace
 
 
@@ -874,15 +874,15 @@ def test_the_shared_fallback_root_is_durable_the_first_time_it_is_used(
         "tmp_path": tmp_path,
         "home": home,
         ".cache": home / ".cache",
-        "hgym": home / ".cache" / "hgym",
-        "sessions": home / ".cache" / "hgym" / "sessions",
+        "shogym": home / ".cache" / "shogym",
+        "sessions": home / ".cache" / "shogym" / "sessions",
     }
     synced = _fsync_spy(monkeypatch, watched)
 
     assert FinalizationStore.resolve_dir("sid-1", None) == watched["sessions"]
 
     for created, holder in (
-        ("sessions", "hgym"), ("hgym", ".cache"), (".cache", "home"), ("home", "tmp_path")
+        ("sessions", "shogym"), ("shogym", ".cache"), (".cache", "home"), ("home", "tmp_path")
     ):
         assert holder in synced, (
             f"{created}/ was created here, so the entry naming it — which lives in {holder}/ — "

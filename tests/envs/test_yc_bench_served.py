@@ -1,4 +1,4 @@
-"""End-to-end: drive a served ``yc_bench`` episode through hgym's serve layer and check that
+"""End-to-end: drive a served ``yc_bench`` episode through shogym's serve layer and check that
 YC-Bench's sim state flows back into episode feedback through the seal-before-verdict path.
 
 Requires the ``yc_bench`` extra — skipped otherwise, so the offline core suite stays green.
@@ -15,8 +15,8 @@ import pytest
 
 pytest.importorskip("yc_bench", reason="yc_bench extra not installed")
 
-from hgym.envs.yc_bench import mcp_server  # noqa: E402
-from hgym.serve import ServedEpisode  # noqa: E402
+from shogym.envs.yc_bench import mcp_server  # noqa: E402
+from shogym.serve import ServedEpisode  # noqa: E402
 
 
 def _stdout(result_content: str) -> dict:

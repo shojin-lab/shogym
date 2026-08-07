@@ -2,7 +2,7 @@
 
 import pytest
 
-from hgym.mcp import MCPServerSpec, ToolNameConflictError, UnknownToolError
+from shogym.mcp import MCPServerSpec, ToolNameConflictError, UnknownToolError
 
 
 class TestMCPServerSpec:

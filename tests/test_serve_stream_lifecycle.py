@@ -20,10 +20,10 @@ from typing import Any, Dict, List, Optional, Tuple
 
 import pytest
 
-import hgym.serve.stream as stream_module
-from hgym.serve.episode import ServedEpisode
-from hgym.serve.lifecycle import FinalizeRequest, TerminalEvidence
-from hgym.serve.stream import (
+import shogym.serve.stream as stream_module
+from shogym.serve.episode import ServedEpisode
+from shogym.serve.lifecycle import FinalizeRequest, TerminalEvidence
+from shogym.serve.stream import (
     _TASK_OVER,
     ResultRow,
     Score,
@@ -33,9 +33,9 @@ from hgym.serve.stream import (
     read_results,
     reconcile,
 )
-from hgym.shared.terminate_mcp import TERMINATE_TOOL_NAME
-from hgym.task import TaskSpec, ToolManifest
-from hgym.types import EpisodeFeedback, FeedbackCollection
+from shogym.shared.terminate_mcp import TERMINATE_TOOL_NAME
+from shogym.task import TaskSpec, ToolManifest
+from shogym.types import EpisodeFeedback, FeedbackCollection
 from tests._fixtures.score_env import ENV_NAME, HORIZON, SUBMIT_TOOL, _FixtureScoreEnv
 
 TASKS = [
@@ -306,7 +306,7 @@ def _publishes_a_terminal_schema_that_cannot_be_used() -> Tuple[Any, Any]:
     ships when a schema names a definition it never included. (A key whose *own* code misbehaved
     would not reach here any more — an episode enforces the contract in wire form, so an env
     object cannot be what a terminal call is validated against; see
-    :func:`hgym.serve.episode._wire_form`.)"""
+    :func:`shogym.serve.episode._wire_form`.)"""
 
     class _Env(_FixtureScoreEnv):
         def describe(self, task_id: Any = None) -> TaskSpec:
@@ -1601,7 +1601,7 @@ def test_a_killed_stream_leaves_a_reconcilable_dispense(tmp_path: Path) -> None:
     script = textwrap.dedent(
         f"""
         import asyncio, os
-        from hgym.serve.stream import TaskRef, TaskStream
+        from shogym.serve.stream import TaskRef, TaskStream
         from tests._fixtures.score_env import ENV_NAME, _FixtureScoreEnv
 
         async def main():

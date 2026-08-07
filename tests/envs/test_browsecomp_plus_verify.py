@@ -10,9 +10,9 @@ from __future__ import annotations
 import json
 from typing import Any, Dict, Optional
 
-from hgym.envs.browsecomp_plus.env_v1 import score_trajectory
-from hgym.serve.lifecycle import TerminalEvidence
-from hgym.trajectory import Step
+from shogym.envs.browsecomp_plus.env_v1 import score_trajectory
+from shogym.serve.lifecycle import TerminalEvidence
+from shogym.trajectory import Step
 
 # A task whose evidence qrels are docids 1 and 2.
 _TASK = {"query_id": "q1", "query": "?", "answer": "gold", "qrel_gold": ["1"], "qrel_evidence": ["1", "2"]}

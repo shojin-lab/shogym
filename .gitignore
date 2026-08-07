@@ -6,7 +6,7 @@ build/
 .venv/
 .pytest_cache/
 .ruff_cache/
-hgym_logs/
+shogym_logs/
 .env
 .envrc
 .direnv/

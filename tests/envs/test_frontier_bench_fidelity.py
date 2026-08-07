@@ -13,14 +13,14 @@ import re
 
 import pytest
 
-import hgym
-from hgym.envs.frontier_bench import manifest
+import shogym
+from shogym.envs.frontier_bench import manifest
 
 VENDORED = manifest.task_names()
 
 
 def test_env_is_registered() -> None:
-    assert "frontier_bench" in hgym.registered_envs()
+    assert "frontier_bench" in shogym.registered_envs()
 
 
 def test_upstream_pins_are_recorded() -> None:
@@ -44,7 +44,7 @@ def test_default_task_is_fin_saccr_at_index_zero() -> None:
 
 def test_num_tasks_matches_registry() -> None:
     assert manifest.num_tasks() == len(VENDORED)
-    assert hgym.make("frontier_bench").num_tasks == len(VENDORED)
+    assert shogym.make("frontier_bench").num_tasks == len(VENDORED)
 
 
 @pytest.mark.parametrize("name", VENDORED)
@@ -132,7 +132,7 @@ def test_selection_by_index_and_name_agree() -> None:
 
 
 def test_describe_returns_instruction_with_provenance() -> None:
-    env = hgym.make("frontier_bench")
+    env = shogym.make("frontier_bench")
     spec = env.describe("0")
     # The real upstream instruction (with its canary HTML comment) is published verbatim.
     assert manifest.CANARY_GUID in spec.instructions
@@ -146,7 +146,7 @@ def test_describe_returns_instruction_with_provenance() -> None:
 
 @pytest.mark.parametrize("name", VENDORED)
 def test_describe_by_name_and_index_resolve_the_task(name: str) -> None:
-    env = hgym.make("frontier_bench")
+    env = shogym.make("frontier_bench")
     idx = VENDORED.index(name)
     by_name = env.describe(name).instructions
     by_index = env.describe(str(idx)).instructions
@@ -157,26 +157,26 @@ def test_describe_by_name_and_index_resolve_the_task(name: str) -> None:
 def test_tool_manifest_lists_shell_surface_without_docker() -> None:
     # Probing the tool schemas lists tools only — it builds no container, so this needs no
     # Docker daemon. The served agent surface is exec/read_file/write_file/done + terminate.
-    env = hgym.make("frontier_bench")
+    env = shogym.make("frontier_bench")
     names = {t.name for t in env.describe("0").tools}
     assert {"exec", "read_file", "write_file", "done", "terminate"} <= names
 
 
 def test_config_rejects_bad_task_at_construction() -> None:
     with pytest.raises(ValueError, match="unknown frontier_bench task"):
-        hgym.make("frontier_bench", config={"task": "nope"})
+        shogym.make("frontier_bench", config={"task": "nope"})
 
 
 def test_config_default_task_by_name_and_index() -> None:
     # The `task` config sets the default task used when the serve/describe selector is omitted.
-    env = hgym.make("frontier_bench", config={"task": "interleaved-vigenere"})
+    env = shogym.make("frontier_bench", config={"task": "interleaved-vigenere"})
     assert env._load_task(None)["task_name"] == "interleaved-vigenere"
-    env2 = hgym.make("frontier_bench", config={"task": 2})
+    env2 = shogym.make("frontier_bench", config={"task": 2})
     assert env2._load_task(None)["task_name"] == VENDORED[2]
 
 
 def test_load_task_accepts_zero_and_none() -> None:
-    env = hgym.make("frontier_bench")
+    env = shogym.make("frontier_bench")
     for idx in (0, None):
         loaded = env._load_task(idx)
         assert loaded["task_idx"] == 0
@@ -186,7 +186,7 @@ def test_load_task_accepts_zero_and_none() -> None:
 def test_load_task_rejects_out_of_range_index() -> None:
     # Any index outside 0..N-1 must raise, not silently serve another task under a bogus public
     # id (a misattributed run). Negatives are rejected too.
-    env = hgym.make("frontier_bench")
+    env = shogym.make("frontier_bench")
     for bad in (len(VENDORED), len(VENDORED) + 1, -1):
         with pytest.raises(ValueError, match="out of range"):
             env._load_task(bad)

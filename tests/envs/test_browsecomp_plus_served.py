@@ -1,4 +1,4 @@
-"""End-to-end: drive a served ``browsecomp_plus`` episode through hgym's serve layer with an
+"""End-to-end: drive a served ``browsecomp_plus`` episode through shogym's serve layer with an
 in-memory searcher + a scripted (injectable) judge, and check that the served retrieval tools,
 the seal-before-verdict grade (``submit_answer`` seals → the env's ``finalize`` judges), and the
 deterministic retrieval/citation metrics all flow into episode feedback — exercising the whole
@@ -12,9 +12,9 @@ from __future__ import annotations
 
 import json
 
-from hgym.envs.browsecomp_plus.judge import JudgeResult
-from hgym.envs.browsecomp_plus.searcher import InMemorySearcher
-from hgym.serve import ServedEpisode
+from shogym.envs.browsecomp_plus.judge import JudgeResult
+from shogym.envs.browsecomp_plus.searcher import InMemorySearcher
+from shogym.serve import ServedEpisode
 
 # A tiny synthetic corpus: docids 1 and 2 are the evidence for the query; 9 is a distractor.
 _CORPUS = {
@@ -190,19 +190,19 @@ async def test_preflight_raises_without_key_for_default_judge(monkeypatch) -> No
 
 
 async def test_make_and_describe_are_keyless(monkeypatch) -> None:
-    import hgym
+    import shogym
 
     monkeypatch.delenv("OPENAI_API_KEY", raising=False)
-    env = hgym.make("browsecomp_plus", config={"tasks": _TASKS, "searcher": InMemorySearcher(_CORPUS)})
+    env = shogym.make("browsecomp_plus", config={"tasks": _TASKS, "searcher": InMemorySearcher(_CORPUS)})
     spec = env.describe("0")
     assert "Eiffel Tower" in spec.instructions
     assert {"search", "submit_answer", "terminate"} <= {t.name for t in spec.tools}
 
 
 async def test_negative_task_index_is_rejected() -> None:
-    import hgym
+    import shogym
 
-    env = hgym.make("browsecomp_plus", config=_config())
+    env = shogym.make("browsecomp_plus", config=_config())
     import pytest
 
     with pytest.raises(ValueError, match="out of range"):

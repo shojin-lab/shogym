@@ -8,13 +8,13 @@
 #     export HERMES_HOME="$PWD/.hermes"
 #     mkdir -p "$HERMES_HOME" && cp config.yaml "$HERMES_HOME/config.yaml"
 #
-# `hermes mcp add hgym --command uv --args run python serve.py --connect-timeout 90` writes the
+# `hermes mcp add shogym --command uv --args run python serve.py --connect-timeout 90` writes the
 # same block; this file is the shape it writes, checked in so you can read it before you run
 # anything. Hermes stamps a `_config_version:` line on configs it writes itself; it is not
 # required, and everything else in a Hermes config has a default -- this is the whole file.
 
 mcp_servers:
-  hgym:
+  shogym:
     # Relative because a stdio server inherits the cwd of the `hermes` process, and the README
     # runs hermes from this directory. Absolute paths if you run hermes from anywhere else --
     # a stdio server config takes no `cwd` key.

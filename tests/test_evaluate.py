@@ -10,9 +10,9 @@ from typing import Any, Awaitable, Callable, Dict, List, Tuple
 
 from fastmcp import Client
 
-import hgym
-from hgym.evaluate import result_from_trace
-from hgym.feedback import parse_meta
+import shogym
+from shogym.evaluate import result_from_trace
+from shogym.feedback import parse_meta
 
 ToolCall = Tuple[str, Dict[str, Any]]
 # (instructions, tools_manifest, transcript) -> the tool calls to issue this turn.
@@ -42,7 +42,7 @@ async def run_episode(client: Client, chat: ChatFn, *, max_steps: int = 30) -> N
 
 
 def _answer(task_idx: int) -> str:
-    return hgym.make("wordle_v1")._words[task_idx]
+    return shogym.make("wordle_v1")._words[task_idx]
 
 
 def _scripted_chat(answer: str):
@@ -64,7 +64,7 @@ async def test_evaluate_solves_wordle_offline(tmp_path: Path) -> None:
     async def harness(client) -> None:
         await run_episode(client, _scripted_chat(_answer(0)))
 
-    result = await hgym.evaluate("wordle_v1", task=0, harness=harness, trace_path=trace)
+    result = await shogym.evaluate("wordle_v1", task=0, harness=harness, trace_path=trace)
     assert result.env == "wordle_v1"
     assert result.task == "0"
     assert result.terminated is True
@@ -79,7 +79,7 @@ async def test_evaluate_without_trace_reports_terminal_feedback() -> None:
     async def harness(client) -> None:
         await run_episode(client, _scripted_chat(_answer(2)))
 
-    result = await hgym.evaluate("wordle_v1", task=2, harness=harness)
+    result = await shogym.evaluate("wordle_v1", task=2, harness=harness)
     assert result.terminated is True
     assert result.trace_path is None
     assert result.value("check_answer") is True
@@ -91,10 +91,10 @@ async def test_evaluate_closes_episode_when_build_server_fails(monkeypatch) -> N
     # must still close the episode (drop the pushed session state), not leak it.
     import importlib
 
-    from hgym.envs.wordle import mcp_server
+    from shogym.envs.wordle import mcp_server
 
-    # `hgym.evaluate` the attribute is the re-exported function, so reach the module.
-    ev = importlib.import_module("hgym.evaluate")
+    # `shogym.evaluate` the attribute is the re-exported function, so reach the module.
+    ev = importlib.import_module("shogym.evaluate")
 
     def boom(episode, **kwargs):
         raise ValueError("build failed")
@@ -106,7 +106,7 @@ async def test_evaluate_closes_episode_when_build_server_fails(monkeypatch) -> N
 
     before = set(mcp_server.sessions)
     with pytest.raises(ValueError, match="build failed"):
-        await hgym.evaluate("wordle_v1", task=0, harness=noop)
+        await shogym.evaluate("wordle_v1", task=0, harness=noop)
     assert set(mcp_server.sessions) == before  # episode.close() ran despite the failure
 
 
@@ -116,7 +116,7 @@ async def test_evaluate_scopes_result_to_its_own_session(tmp_path: Path) -> None
     async def solver(client) -> None:
         await run_episode(client, _scripted_chat(_answer(0)))
 
-    r0 = await hgym.evaluate("wordle_v1", task=0, harness=solver, trace_path=trace)
+    r0 = await shogym.evaluate("wordle_v1", task=0, harness=solver, trace_path=trace)
     assert r0.value("check_answer") is True  # first run wrote a solved terminal row
 
     async def noop(client) -> None:
@@ -124,7 +124,7 @@ async def test_evaluate_scopes_result_to_its_own_session(tmp_path: Path) -> None
 
     # Same append-only trace, but this run makes no calls — it must NOT inherit the
     # first run's terminal result.
-    r1 = await hgym.evaluate("wordle_v1", task=1, harness=noop, trace_path=trace)
+    r1 = await shogym.evaluate("wordle_v1", task=1, harness=noop, trace_path=trace)
     assert r1.task == "1"
     assert r1.terminated is False
     assert r1.value("check_answer") is None
@@ -133,8 +133,8 @@ async def test_evaluate_scopes_result_to_its_own_session(tmp_path: Path) -> None
 def test_result_from_trace_scopes_external_read_by_identity(tmp_path: Path) -> None:
     # The external path has no session id; env/task must still scope the read so a reused
     # append-only trace can't let a prior task's terminal row supply this task's result.
-    from hgym.trace import append_trace, step_record
-    from hgym.types import EpisodeFeedback
+    from shogym.trace import append_trace, step_record
+    from shogym.types import EpisodeFeedback
 
     trace = tmp_path / "shared.jsonl"
     append_trace(trace, step_record(  # a completed task-0 episode
@@ -151,8 +151,8 @@ def test_result_from_trace_scopes_external_read_by_identity(tmp_path: Path) -> N
 def test_result_from_trace_scopes_to_latest_same_task_episode(tmp_path: Path) -> None:
     # Two runs of the same env/task in one append-only trace: a read must reflect the
     # latest episode, not inherit an earlier run's terminal row (env/task aren't unique).
-    from hgym.trace import append_trace, step_record
-    from hgym.types import EpisodeFeedback
+    from shogym.trace import append_trace, step_record
+    from shogym.types import EpisodeFeedback
 
     trace = tmp_path / "shared.jsonl"
     append_trace(trace, step_record(  # run A: completed task 0
@@ -168,8 +168,8 @@ def test_result_from_trace_scopes_to_latest_same_task_episode(tmp_path: Path) ->
 
 
 def test_result_from_trace_reads_terminal_row(tmp_path: Path) -> None:
-    from hgym.trace import append_trace, step_record
-    from hgym.types import EpisodeFeedback
+    from shogym.trace import append_trace, step_record
+    from shogym.types import EpisodeFeedback
 
     trace = tmp_path / "ext.jsonl"
     append_trace(trace, step_record(session_id="s", env_name="wordle_v1", task_id="9",
