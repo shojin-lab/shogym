@@ -11,19 +11,20 @@ tombstoned, an explicit ``terminate`` is a no-score abort, and the **horizon** s
 partial state (``finalize_current_state``).
 
 The upstream source is provisioned lazily on first use; the module skips if it can't be fetched
-(offline + cold cache), like the tau2 tests skip without their extra.
+(offline + cold cache), like the tau2 and yc_bench tests.
 """
 
 from __future__ import annotations
 
 import json
 
-import pytest
+from tests._fixtures.upstream_gate import gate
 
-try:
-    from shogym.envs.automationbench import adapter  # noqa: F401 — triggers provisioning
-except Exception as exc:  # pragma: no cover - network/provisioning failure
-    pytest.skip(f"AutomationBench upstream source unavailable: {exc}", allow_module_level=True)
+gate(
+    "shogym.envs.automationbench.adapter",
+    package="automationbench",
+    extra="automationbench",
+)
 
 from shogym.serve import ServedEpisode  # noqa: E402
 

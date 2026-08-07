@@ -11,17 +11,18 @@ Two layers, both offline (no model, no key, no network beyond the one-time upstr
 
 The upstream source is provisioned lazily into a cache on first use (see
 ``adapter.ensure_source``); if it can't be fetched (offline + cold cache) the whole module skips,
-like the tau2 tests importorskip their extra — so the core offline suite stays green.
+like the tau2 and yc_bench tests — so the core offline suite stays green.
 """
 
 from __future__ import annotations
 
-import pytest
+from tests._fixtures.upstream_gate import gate
 
-try:
-    from shogym.envs.automationbench import adapter
-except Exception as exc:  # pragma: no cover - network/provisioning failure
-    pytest.skip(f"AutomationBench upstream source unavailable: {exc}", allow_module_level=True)
+adapter = gate(
+    "shogym.envs.automationbench.adapter",
+    package="automationbench",
+    extra="automationbench",
+)
 
 from shogym.envs.automationbench.env_v1 import AutomationBenchEnv, _as_unit  # noqa: E402
 from shogym.serve.lifecycle import TerminalEvidence  # noqa: E402

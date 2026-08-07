@@ -15,10 +15,15 @@ import json
 
 import pytest
 
-pytest.importorskip("tau2", reason="tau2 extra not installed")
+from tests._fixtures.upstream_gate import gate
+
+# Provisions the pinned upstream source (network on a cold cache) and imports tau2, so this is
+# also the check that the `tau2` extra is installed. A missing extra or an unreachable network
+# skips; anything else — upstream drift, a broken adapter, a corrupt cache — fails, so a
+# regression can never make this module's tests quietly disappear.
+mcp_server = gate("shogym.envs.tau2.mcp_server", package="tau2", extra="tau2")
 
 import shogym  # noqa: E402
-from shogym.envs.tau2 import mcp_server  # noqa: E402
 from shogym.serve import ServedEpisode  # noqa: E402
 
 _MOCK_USER = "This is my request; please help."

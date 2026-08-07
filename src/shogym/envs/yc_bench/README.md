@@ -71,10 +71,18 @@ The Python pin and the `uv sync` / `pip install` / `import shogym` mechanics are
 [requirements boilerplate](../README.md#requirements-boilerplate); the `yc_bench` extra is in
 the default `dev` group, so `uv sync` includes it. On top of that:
 
+- **The pinned upstream source is provisioned at runtime** into
+  `~/.cache/shogym/yc_bench/<sha>/` on first construction — a one-time network fetch (~4 MB
+  downloaded, ~700 KB kept). Set `YC_BENCH_SRC` to a local checkout (a dir containing the
+  `yc_bench` package) to skip the fetch, or `SHOGYM_CACHE` to relocate the cache. Upstream is
+  **not** a pip dependency: PyPI forbids direct (`@ git+…`) references, and the `yc-bench`
+  release on PyPI is not the pinned commit — so the port fetches and imports the pinned source
+  instead, exactly as `automationbench` does. The `yc_bench` extra declares upstream's own
+  runtime dependencies explicitly, since pip no longer resolves them transitively.
 - **No data, no API key** for a served episode. YC-Bench generates its world deterministically
-  from the seed and runs its sim in-process, so the whole served path (seed → commands →
-  verdict) is offline. (A YC-Bench *model* key is only needed by upstream's own agent loop,
-  which this port replaces with the harness.)
+  from the seed and runs its sim in-process, so once the source is cached the whole served path
+  (seed → commands → verdict) is offline. (A YC-Bench *model* key is only needed by upstream's
+  own agent loop, which this port replaces with the harness.)
 - **Heavy extra.** YC-Bench depends on litellm / streamlit / matplotlib / plotly (its own
   runner/dashboard). They install with the extra but are never imported by the served path
   (only the sim engine, CLI commands, and ORM are), so command execution stays light.
@@ -104,7 +112,10 @@ drops it on `end_session`. It exposes two tools:
 - **`run_command(command)`** — the faithful mirror of upstream's `run_command("yc-bench
   <cmd>")`: it validates the command with YC-Bench's own command policy, **allowlists the
   operational sub-command groups** (`company`, `employee`, `market`, `task`, `sim`, `finance`,
-  `report`, `scratchpad`, `client`), then runs the real `yc-bench` console-script against *this
+  `report`, `scratchpad`, `client`), then runs YC-Bench's real CLI entry point
+  (`python -P -m yc_bench`, i.e. the same `yc_bench.cli:app_main` its console script points at,
+  with the provisioned source on the subprocess's `PYTHONPATH` — `-P` keeps the working
+  directory off `sys.path`, where it would otherwise sit *ahead* of it) against *this
   session's* DB (`DATABASE_URL` injected explicitly per call — never via process-global env, so
   concurrent episodes can't race) and returns the CLI's JSON. Every observe / task / sim /
   memory command is reached through this one tool. `yc-bench run` (YC-Bench's own
