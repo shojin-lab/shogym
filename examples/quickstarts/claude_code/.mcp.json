@@ -1,0 +1,8 @@
+{
+  "mcpServers": {
+    "hgym": {
+      "command": "uv",
+      "args": ["run", "python", "serve.py"]
+    }
+  }
+}
