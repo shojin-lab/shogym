@@ -35,8 +35,12 @@ jobs:
 
       # The offline suite runs keyless: keyed tests (tau2 user-sim, hle judge) self-skip
       # without OPENAI_API_KEY. Unset it explicitly so nothing here depends on a secret.
+      # `-m "not network"` is the other half of the same promise: it deselects the tests that
+      # reach a third-party service while they run (see NETWORK_ORACLE_TASKS in
+      # tests/envs/test_frontier_bench_served.py), so a PR cannot go red because someone else's
+      # server had a bad minute. A plain `uv run pytest` still selects them.
       - name: Run tests (offline, keyless)
-        run: env -u OPENAI_API_KEY uv run pytest -q
+        run: env -u OPENAI_API_KEY uv run pytest -q -m "not network"
 
       - name: Lint (ruff)
         run: uv run ruff check .

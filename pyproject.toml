@@ -136,6 +136,17 @@ asyncio_mode = "auto"
 testpaths = ["tests"]
 # Repo root on sys.path so tests can import the `tests._mcp_fixtures` servers.
 pythonpath = ["."]
+# Unknown marks are an error, not a warning: a mistyped `network` mark would silently leave its
+# test in the suite the mark exists to keep it out of.
+addopts = "--strict-markers"
+markers = [
+    # A test that reaches a third party over the network while it runs. Everything else here is
+    # offline (vendored data, in-process fixtures, self-skipping keyed paths), so the CI step
+    # that promises "offline, keyless" deselects this with `-m "not network"`. A plain `pytest`
+    # run still selects it, which is where a live upstream dependency is meant to be checked,
+    # with a human reading the result.
+    "network: needs a live third-party service; deselected from the offline suite",
+]
 
 [tool.ruff]
 line-length = 100
