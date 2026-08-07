@@ -1535,6 +1535,215 @@ async def test_a_seal_retried_after_a_failed_append_records_what_it_first_reache
     assert [r.closure for r in read_results(prov)] == ["timeout"]
 
 
+class _Interrupted(BaseException):
+    """Not an ``Exception``, so every containment boundary in the stream lets it out — the shape
+    that fails a seal outright rather than being recorded inside the row it was composing."""
+
+
+class _RecordsThenInterruptsOnce:
+    """A span that reports the closure each seal hands it, and interrupts the first one."""
+
+    namespace = "test.interrupting"
+
+    def __init__(self) -> None:
+        self.closures: List[str] = []
+
+    async def begin(self, ref: TaskRef) -> Any:
+        return self
+
+    @property
+    def dispensed(self) -> Dict[str, Any]:
+        return {}
+
+    async def finalize(self, completed: Any) -> Dict[str, Any]:
+        self.closures.append(completed.closure)
+        if len(self.closures) == 1:
+            raise _Interrupted("the seal is interrupted while this span is closing")
+        return {}
+
+
+class _RecordsWhatItWasHanded:
+    """A span that closes cleanly and says so, in a payload naming the span that returned it."""
+
+    def __init__(self, namespace: str) -> None:
+        self.namespace = namespace
+        self.closures: List[str] = []
+
+    async def begin(self, ref: TaskRef) -> Any:
+        return self
+
+    @property
+    def dispensed(self) -> Dict[str, Any]:
+        return {"opened": self.namespace}
+
+    async def finalize(self, completed: Any) -> Dict[str, Any]:
+        self.closures.append(completed.closure)
+        return {"closed": self.namespace}
+
+
+class _InterruptsTheFirstTerminal(_FixtureScoreEnv):
+    """A non-seal env, so `_verify` runs inline and what it raises reaches the seal through the
+    tool call itself. It interrupts the first terminal the stream drives and answers every one
+    after it: what fails a seal *before* it has any verdict to compose a row from, and what a
+    recomposition would be answered by rather than interrupted."""
+
+    score_terminal_tool = None
+
+    def __init__(self, **kwargs: Any) -> None:
+        super().__init__(**kwargs)
+        self.terminals = 0
+
+    def _verify(
+        self, trajectory: Any, task: Any, *, terminated: bool, evidence: Any = None
+    ) -> FeedbackCollection:
+        if terminated:
+            self.terminals += 1
+            if self.terminals == 1:
+                raise _Interrupted("the seal is interrupted before it has a verdict")
+        return super()._verify(trajectory, task, terminated=terminated, evidence=evidence)
+
+
+async def test_a_seal_that_failed_before_its_row_is_not_recomposed_by_the_retry(
+    tmp_path: Path,
+) -> None:
+    # The sibling of the test above, one step earlier, and the worse half. A seal that fails at
+    # the *append* keeps its composed row, so the retry writes what the first attempt reached. A
+    # seal that fails before it has composed anything kept nothing, so the retry re-entered the
+    # composition: it drove a second terminal into an episode the first attempt had already
+    # ended, read the ending back off that, and filed a task the stream drained under a scored
+    # closure the agent never earned, running every span's `finalize` on the way. Composing is the
+    # half that may not run twice, so a failure in it stands an unscored row in and the retry
+    # writes that instead.
+    env = _InterruptsTheFirstTerminal(tasks=TASKS)
+    span = _RecordsWhatItWasHanded("test.span")
+    stream = _stream(tmp_path, [0], factory=lambda _n: env, provenance=[span])
+    assert await stream.get_task() is not None
+
+    with pytest.raises(_Interrupted):
+        await stream.aclose()  # the seal fails before it has read any verdict at all
+    (live,) = stream._live.values()  # noqa: SLF001
+    assert live.pending_row is not None, "a hand-back left the retry nothing but a recomposition"
+    # The hand-back is the claim and nothing else: the task stays *ended*, which is what a late
+    # call is refused on, so the drain window does not reopen from the inside.
+    assert live.ended is True and live.sealed is False
+
+    with pytest.raises(RuntimeError, match="seal failed before its row was recorded"):
+        await stream.aclose()  # the retry the hand-back exists for
+
+    assert env.terminals == 1, "the retry drove a second terminal"
+    assert span.closures == [], "the retry composed a second row"
+    assert [(r.closure, r.score) for r in stream.results] == [("finalize_error", None)], (
+        "a task the stream drained was recorded under a closure the agent earned"
+    )
+    assert [(r.closure, r.score) for r in read_results(tmp_path / "prov")] == [
+        ("finalize_error", None)
+    ]
+    # The row says the seal produced none, what failed it, and which ending it was reaching for —
+    # the drain's, here, which the closure alone can no longer say.
+    diagnostic = stream.results[0].diagnostic or ""
+    assert diagnostic.startswith("the seal failed before it composed a row")
+    assert "_Interrupted" in diagnostic and "sealing for 'drained'" in diagnostic
+    # One dispense, one row: `reconcile` has nothing left to answer as a crash, and the row's
+    # span entry keeps the shape an orderly row has — a `dispensed` with exactly one of `sealed`
+    # or `error` beside it.
+    assert reconcile(tmp_path / "prov") == []
+    (entry,) = stream.results[0].extensions.values()
+    assert set(entry) == {"dispensed", "error"}
+
+
+async def test_a_span_that_closed_before_the_seal_failed_keeps_what_it_returned(
+    tmp_path: Path,
+) -> None:
+    # The spans are closed one at a time, so a failure that escapes the finalization leaves three
+    # different spans behind: one that closed and returned its payload, the one the failure came
+    # out of, and one that was never called at all. Answering for all three with that one failure
+    # drops the payload the first span returned and files its namespace under a failure another
+    # extension raised, and records a span that was never asked as one whose `finalize` failed.
+    # The row is the only account these extensions get, and both of those are false in it.
+    closed = _RecordsWhatItWasHanded("test.closed")
+    interrupting = _RecordsThenInterruptsOnce()
+    unreached = _RecordsWhatItWasHanded("test.unreached")
+    stream = _stream(tmp_path, [0], provenance=[closed, interrupting, unreached])
+    assert await stream.get_task() is not None
+
+    with pytest.raises(_Interrupted):
+        await stream.aclose()  # the seal fails inside the finalization, with one span closed
+    with pytest.raises(RuntimeError, match="seal failed before its row was recorded"):
+        await stream.aclose()  # the retry the hand-back exists for
+
+    assert closed.closures == ["drained"], "a span that had closed was finalized a second time"
+    assert unreached.closures == [], "a span the seal never reached was finalized anyway"
+    (row,) = read_results(tmp_path / "prov")
+    assert row.extensions["test.closed"] == {
+        "dispensed": {"opened": "test.closed"},
+        "sealed": {"closed": "test.closed"},
+    }, "a span that closed was recorded under a failure another extension raised"
+    interrupted = row.extensions["test.interrupting"]
+    assert "sealed" not in interrupted, "a span that never returned was recorded as if it had"
+    assert "_Interrupted" in interrupted["error"]
+    never = row.extensions["test.unreached"]
+    assert "sealed" not in never
+    assert never["error"].startswith("the seal failed before this span was finalized"), (
+        "a span whose `finalize` was never called was recorded as one that failed"
+    )
+
+
+async def test_a_seal_the_extensions_could_not_finish_keeps_the_outcome_it_earned(
+    tmp_path: Path,
+) -> None:
+    # The extensions are the last thing a seal runs, so a failure that escapes them arrives with
+    # the episode already sealed, its verdict already read and its closure already classified. An
+    # extension may not change a task's outcome, which is what finalizing them after the
+    # classification is for, and neither may a failure the stream cannot contain. Standing an
+    # unscored row in over the top of one files a task the agent solved as an infrastructure
+    # failure, for a verdict the seal was holding when it failed.
+    span = _RecordsThenInterruptsOnce()
+    stream = _stream(tmp_path, [0], provenance=[span])
+    assert await stream.get_task() is not None
+
+    with pytest.raises(_Interrupted):
+        await stream.dispatch(SUBMIT_TOOL, {"answer": "4"})
+    with pytest.raises(RuntimeError, match="seal failed before its row was recorded"):
+        await stream.aclose()  # the retry the hand-back exists for
+
+    assert span.closures == ["sealed"], "the retry finalized the span a second time"
+    (row,) = read_results(tmp_path / "prov")
+    assert row.closure == "sealed", "a task the agent sealed was recorded as a failed seal"
+    assert row.score is not None and row.score.success is True, (
+        "an outcome the agent earned was dropped by an extension that could not be finalized"
+    )
+    assert reconcile(tmp_path / "prov") == []
+
+
+async def test_a_seal_that_failed_short_of_its_row_is_not_reported_as_a_storage_failure(
+    tmp_path: Path,
+) -> None:
+    # A failed seal and a failed *write* stop the stream for different reasons, and the stop's
+    # words are all an operator gets. A seal that failed above the append leaves its row on the
+    # entry and the retry writes it: the storage never refused anything, `reconcile` has nothing
+    # left to answer, and the record the run ends with is complete. Reported as the append's
+    # failure it sends that operator to `results.jsonl` for the one part of this that worked, and
+    # goes on calling the record incomplete after the row completing it has landed.
+    span = _RecordsThenInterruptsOnce()
+    stream = _stream(tmp_path, [0], provenance=[span])
+    assert await stream.get_task() is not None
+
+    with pytest.raises(_Interrupted):
+        await stream.aclose()
+    with pytest.raises(RuntimeError, match="seal failed before its row was recorded") as closing:
+        await stream.aclose()  # the retry writes the row, and the stop is still owed
+    assert isinstance(closing.value.__cause__, _Interrupted)
+    assert "results.jsonl" not in str(closing.value)
+    assert "record is incomplete" not in str(closing.value)
+    # The record it stopped over is complete: the row is durable, and no dispense is unanswered.
+    assert len(read_results(tmp_path / "prov")) == 1
+    assert reconcile(tmp_path / "prov") == []
+    # The same failure in the same words at the other boundary a stop is reported from.
+    with pytest.raises(RuntimeError, match="seal failed before its row was recorded") as pulling:
+        await stream.get_task()
+    assert "results.jsonl" not in str(pulling.value)
+
+
 async def test_a_released_episode_owing_only_a_row_is_not_reported_in_flight(
     tmp_path: Path,
 ) -> None:
