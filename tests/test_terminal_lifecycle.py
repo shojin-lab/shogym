@@ -351,10 +351,11 @@ async def test_finalize_deadline_fails_closed_and_drains_evaluator_before_teardo
         "_fixture_score", task=0, env_config=_config(), finalize_deadline=0.05
     )
     real_finalize = ep._finalize
+    release = asyncio.Event()  # only this test can let the evaluator finish
     evaluator_done = {"flag": False, "at_end_session": None}
 
     async def slow(req):
-        await asyncio.sleep(0.2)  # exceeds the 0.05s deadline
+        await release.wait()  # outlives the 0.05s deadline by construction, not by clock
         ev = await real_finalize(req)
         evaluator_done["flag"] = True
         return ev
@@ -369,25 +370,32 @@ async def test_finalize_deadline_fails_closed_and_drains_evaluator_before_teardo
     ep._finalize = slow  # type: ignore[assignment]
     ep._env.end_session = observing_end_session  # type: ignore[method-assign]
     try:
-        loop = asyncio.get_event_loop()
-        t0 = loop.time()
-        result = await ep.call("submit", {"answer": "4", "confidence": 50})
-        elapsed = loop.time() - t0
+        # The DEADLINE bounds caller latency: the fail-closed result returns while the evaluator
+        # is STILL RUNNING, rather than teardown blocking on it. Asserted as ordering (the
+        # evaluator provably cannot have finished, since only this test can release it) instead
+        # of as a stopwatch: a wall-clock margin measures the runner, not the deadline, and a
+        # loaded one broke a 0.15s bound on a test whose every behavioural assertion passed.
+        # `wait_for` is only a hang detector: a deadline that never fires would wait on the
+        # evaluator forever, and a bound this generous turns that into a failure here rather
+        # than a job-level CI timeout.
+        result = await asyncio.wait_for(
+            ep.call("submit", {"answer": "4", "confidence": 50}), timeout=10.0
+        )
+        assert evaluator_done["flag"] is False  # returned BEFORE the evaluator finished
         assert result.terminated is True
         payload = json.loads(result.content)
         assert payload["correct"] is False
         assert payload["finalize_error"] is True  # fail-closed, flagged
         assert _feedback(ep)["finalize_error"] is True
-        # The DEADLINE bounds caller latency: the fail-closed result returns at ~0.05s, NOT
-        # after the 0.2s evaluator. (Generous upper bound to stay robust on slow CI.)
-        assert elapsed < 0.15
         # ...yet env state is not dropped until the evaluator has drained (no use-after-free):
         # the drain+teardown runs in the background; close() waits for it.
         assert ep._env.end_session is observing_end_session
+        release.set()
         await ep.close()
         assert evaluator_done["at_end_session"] is True
         assert ep._env.finalize_calls == 1  # exactly one evaluation, never a second
     finally:
+        release.set()  # never leave close() waiting on an evaluator this test still holds
         await ep.close()
 
 
