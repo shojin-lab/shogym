@@ -21,8 +21,8 @@ from __future__ import annotations
 import math
 from typing import TYPE_CHECKING, Any, Dict, List, Optional
 
+from shogym.core import Env
 from shogym.envs.registration import register
-from shogym.envs.tool_using_env import ToolUsingEnv
 from shogym.mcp import MCPServerSpec
 from shogym.task import TaskSpec
 from shogym.trajectory import Trajectory
@@ -96,7 +96,7 @@ company is still solvent *before* the horizon scores zero, so only submit once t
 actually ended."""
 
 
-class YcBenchEnv(ToolUsingEnv):
+class YcBenchEnv(Env):
     """YC-Bench wrapped as an shogym env.
 
     Config (all optional, via ``shogym.make("yc_bench", config=...)`` / ``env_config``):

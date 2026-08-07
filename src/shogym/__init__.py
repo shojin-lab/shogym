@@ -1,7 +1,6 @@
 from shogym import feedback, mcp, serve, trace, types
 from shogym.core import Env
 from shogym.envs import make, register, registered_envs
-from shogym.envs.tool_using_env import ToolUsingEnv
 from shogym.evaluate import EvalResult, evaluate, result_from_trace
 from shogym.serve import ServedEpisode
 from shogym.task import ReferenceTemplate, TaskSpec, ToolManifest
@@ -15,7 +14,6 @@ __all__ = [
     "Step",
     "TaskSpec",
     "ToolManifest",
-    "ToolUsingEnv",
     "Trajectory",
     "evaluate",
     "feedback",

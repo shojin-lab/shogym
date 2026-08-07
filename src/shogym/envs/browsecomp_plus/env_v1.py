@@ -32,6 +32,7 @@ import asyncio
 import json
 from typing import Any, Dict, List, Optional
 
+from shogym.core import Env
 from shogym.envs.browsecomp_plus import mcp_server as bcp_mcp_server
 from shogym.envs.browsecomp_plus.judge import DEFAULT_JUDGE_MODEL, Judge, OpenAIJudge
 from shogym.envs.browsecomp_plus.metrics import (
@@ -41,7 +42,6 @@ from shogym.envs.browsecomp_plus.metrics import (
 )
 from shogym.envs.browsecomp_plus.searcher import Searcher
 from shogym.envs.registration import register
-from shogym.envs.tool_using_env import ToolUsingEnv
 from shogym.mcp import MCPServerSpec
 from shogym.serve.lifecycle import FinalizeRequest, TerminalEvidence
 from shogym.task import TaskSpec
@@ -83,7 +83,7 @@ _BASE_INSTRUCTIONS = (
 )
 
 
-class BrowseCompPlusEnv(ToolUsingEnv):
+class BrowseCompPlusEnv(Env):
     """BrowseComp-Plus wrapped as an shogym env.
 
     Config (all optional, via ``shogym.make("browsecomp_plus", config=...)`` / ``env_config``):

@@ -106,7 +106,7 @@ class MCPServerSpec(BaseModel):
 class ToolNameConflictError(ValueError):
     """Raised when two MCP servers expose tools with the same name.
 
-    The base class raises this at ``ToolUsingEnv.__init__`` time so the user
+    ``Env.__init__`` raises this while probing the tool manifest, so the user
     sees the conflict before any agent or gateway is built.
     """
 

@@ -23,8 +23,8 @@ import asyncio
 import json
 from typing import TYPE_CHECKING, Any, Dict, List, Optional
 
+from shogym.core import Env
 from shogym.envs.registration import register
-from shogym.envs.tool_using_env import ToolUsingEnv
 from shogym.mcp import MCPServerSpec
 from shogym.task import TaskSpec
 from shogym.trajectory import Trajectory
@@ -58,7 +58,7 @@ _BASE_INSTRUCTIONS_USER = (
 )
 
 
-class Tau2Env(ToolUsingEnv):
+class Tau2Env(Env):
     """Base for tau2 domain envs. Subclasses set ``domain``, ``server_module``, and (for
     non-solo domains) ``solo_mode = False``.
 

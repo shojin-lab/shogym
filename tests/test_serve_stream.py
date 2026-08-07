@@ -2567,7 +2567,7 @@ async def test_rejects_unsupported_configurations(tmp_path: Path) -> None:
 
 
 async def test_each_episode_gets_its_own_env(tmp_path: Path) -> None:
-    # Sealing an episode closes its env, and closing a ToolUsingEnv ends EVERY session it
+    # Sealing an episode closes its env, and closing an env ends EVERY session it
     # tracks — so the stream must hand each episode a fresh instance.
     built: List[_FixtureScoreEnv] = []
 

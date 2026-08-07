@@ -34,8 +34,8 @@ import asyncio
 import math
 from typing import TYPE_CHECKING, Any, Dict, Optional
 
+from shogym.core import Env
 from shogym.envs.registration import register
-from shogym.envs.tool_using_env import ToolUsingEnv
 from shogym.mcp import MCPServerSpec
 from shogym.task import TaskSpec
 from shogym.trajectory import Trajectory
@@ -44,7 +44,7 @@ from shogym.types import EpisodeFeedback, FeedbackCollection, FunctionConfig
 if TYPE_CHECKING:
     # Only for annotations â€” imported lazily at runtime inside `finalize` so `import shogym`
     # (which imports this module to register the env) never pulls in the serve layer, avoiding
-    # the envs<->serve import cycle (mirrors ToolUsingEnv).
+    # the envs<->serve import cycle (mirrors `shogym.core`).
     from shogym.serve.lifecycle import FinalizeRequest, TerminalEvidence
 
 # The score terminal: calling `done` seals the episode and runs the verifier in `finalize`.
@@ -76,7 +76,7 @@ The score is the task verifier's 0/1 verdict read off the container end-state â€
 transcript. Do not fetch online solutions or task-specific hints."""
 
 
-class FrontierBenchEnv(ToolUsingEnv):
+class FrontierBenchEnv(Env):
     """A Frontier-Bench task suite wrapped as an shogym env (Docker-backed, sealed verdict).
 
     Exposes the N vendored CPU tasks as ``num_tasks``, selectable by index (``0..N-1``) or name.

@@ -130,7 +130,7 @@ is not a value and a copy of one is two streams serving one record.
 ``feedback`` argument outright, and enumerates what it does and does not guarantee.
 
 Ownership: ``env_for`` is a **factory**, not a shared instance. Each episode gets its own env
-and closes it, because ``ServedEpisode.close()`` closes its env and ``ToolUsingEnv.close()``
+and closes it, because ``ServedEpisode.close()`` closes its env and ``Env.close()``
 ends *every* session that env tracks — a shared instance would let one sealing episode tear
 down its siblings.
 
@@ -208,7 +208,7 @@ core stamps onto its terminal payload. So a value published under a reserved nam
 or wrong-typed, without being able to reclassify the row it sits on — and the one place where a
 published value does become a number validates it rather than coercing it.
 
-**Several envs at once.** Native tool names collide across envs — every ``ToolUsingEnv`` has
+**Several envs at once.** Native tool names collide across envs — every env has
 ``terminate``, and ``done`` and ``submit_answer`` each appear in more than one env with
 different schemas behind the same name — while a server registers one schema per name. So with
 more than one env in the queue the stream advertises ``<env>__<tool>``, and routing uses an

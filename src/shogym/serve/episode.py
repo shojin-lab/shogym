@@ -244,12 +244,13 @@ class ServedEpisode:
         self._finalize = getattr(env, "finalize", None)
         # A published `score` terminal is a promise: this call is authoritatively sealed and
         # finalized. Enforce that promise HERE — the single boundary every served env passes
-        # through — not only in ToolUsingEnv's construction check. A non-ToolUsingEnv env that
-        # builds its TaskSpec/manifest directly would otherwise slip a score terminal past the
-        # serve layer with no callable finalize, silently leaving `_seal_enabled` False and
-        # routing its advertised, authoritative scoring through the legacy marker/trajectory
-        # path — reopening the grade->read->fix->grade exploit for an env that expected the seal
-        # to protect it. Refuse to run, loudly, rather than downgrade.
+        # through — not only in the env's construction check. An env that hand-builds its
+        # TaskSpec/manifest in `describe()` instead of declaring `score_terminal_tool` never runs
+        # that check, and would otherwise slip a score terminal past the serve layer with no
+        # callable finalize, silently leaving `_seal_enabled` False and routing its advertised,
+        # authoritative scoring through the legacy marker/trajectory path — reopening the
+        # grade->read->fix->grade exploit for an env that expected the seal to protect it. Refuse
+        # to run, loudly, rather than downgrade.
         if self._score_schemas and not callable(self._finalize):
             name = next(iter(self._score_schemas))
             raise TypeError(
@@ -343,8 +344,8 @@ class ServedEpisode:
         a name, which lets a caller that serves several episodes at once give each one its own
         env. Ownership transfers: :meth:`close` closes this env, and a failure during setup
         closes it here — so the caller must hand over a *fresh* instance per episode rather
-        than a shared one (``Env.close`` on a ``ToolUsingEnv`` ends **every** session it
-        tracks, which would tear down any sibling episode sharing the instance).
+        than a shared one (``Env.close`` ends **every** session the instance tracks, which
+        would tear down any sibling episode sharing the instance).
         """
         opened: List[MCPSession] = []
         env_name = env_name if env_name is not None else env.name

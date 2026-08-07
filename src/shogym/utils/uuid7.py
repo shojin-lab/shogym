@@ -1,6 +1,6 @@
 """Minimal UUIDv7 (RFC 9562) generator.
 
-`ToolUsingEnv` mints one per episode as the `_session_id` that keys
+The serve layer mints one per episode as the `_session_id` that keys
 per-episode state on stateful MCP servers. Time-ordered, so session ids sort
 by creation time. Local implementation because the stdlib gains `uuid.uuid7`
 only in Python 3.14.

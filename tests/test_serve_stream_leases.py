@@ -234,9 +234,9 @@ async def test_a_lease_is_looked_up_once_and_the_entry_found_is_the_one_used(
 
 
 async def test_two_live_episodes_interleave(tmp_path: Path) -> None:
-    # Two episodes of the same ToolUsingEnv, live at once. Each owns its own env instance, so
+    # Two episodes of the same env class, live at once. Each owns its own env instance, so
     # sealing one must not disturb the other — the failure this design exists to prevent, since
-    # ToolUsingEnv.close() ends every session its instance tracks.
+    # Env.close() ends every session its instance tracks.
     async with _stream(tmp_path, [0, 1], max_in_flight=2) as stream:
         first = await stream.get_task()
         second = await stream.get_task()
