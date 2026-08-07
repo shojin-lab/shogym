@@ -831,6 +831,60 @@ async def test_a_task_finished_in_time_is_not_timed_out(tmp_path: Path) -> None:
     assert [row.closure for row in stream.results] == ["sealed"]
 
 
+class _StreamClock:
+    """The stream's monotonic clock, moved by the test instead of by the runner.
+
+    What the test below is about is *when* the deadline's clock starts, so what it needs is a
+    dispense write slower than the deadline, not real seconds spent on one. Left on the wall
+    clock it also has to complete its own work inside that same deadline, and that margin is not
+    a property of the code under test: a loaded runner loses it and files the passing behaviour
+    as a `timeout`. Here the budget is spent only by :meth:`advance`, so load cannot decide the
+    outcome in either direction, and the case the test exists to catch (the write's latency
+    charged to the agent) is decided by arithmetic rather than by a race.
+
+    Only the stream's own reads move: ``shogym.serve.stream`` reads this clock in exactly two
+    places, the dispense that stamps an episode's start and the watchdog scan that enforces the
+    deadline against it, which are the two ends of the property. Every other attribute is the
+    real module's, `time.time` for the record timestamps included, and everything outside that
+    module (this file's `asyncio.sleep`s, the event loop itself) is untouched.
+    """
+
+    def __init__(self) -> None:
+        # From zero, not from `time.monotonic()`: differences of small exact-ish floats stay
+        # exact, where the same additions on top of a six-figure uptime can land a hair under
+        # the deadline they were meant to be one whole budget past.
+        self._now = 0.0
+        self.reads = 0
+
+    def monotonic(self) -> float:
+        self.reads += 1
+        return self._now
+
+    def advance(self, seconds: float) -> None:
+        self._now += seconds
+
+    def __getattr__(self, name: str) -> Any:
+        return getattr(time, name)
+
+
+async def _a_watchdog_scan(clock: _StreamClock) -> None:
+    """Wait until the deadline watchdog has read ``clock`` once, so that an assertion about what
+    it left alone is about a scan that happened.
+
+    While the test is awaiting, the watchdog is the only reader of the stream's clock, and one
+    scan considers every live entry inside a single critical section, so a read is proof this
+    episode was weighed at the current time. Without that proof the assertion after it is
+    vacuous: an episode nothing looked at is not an episode that survived. Bounded, and loud when
+    the bound elapses, for the same reason.
+    """
+    seen = clock.reads
+    for _ in range(400):
+        if clock.reads > seen:
+            break
+        await asyncio.sleep(0.01)
+    assert clock.reads > seen, "the deadline watchdog never read the clock"
+
+
 async def test_the_deadline_starts_when_the_task_is_handed_out(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -838,11 +892,13 @@ async def test_the_deadline_starts_when_the_task_is_handed_out(
     # it happens before `get_task` returns, so the agent cannot see the task, act on it, or wait
     # it out. A clock started before that write charges storage latency to the agent, and a
     # volume slower than the deadline hands out a task that has already run out of time.
+    clock = _StreamClock()
+    monkeypatch.setattr(stream_module, "time", clock)
     real_append = stream_module._append_jsonl
 
     def _slow_dispense(path: Path, record: Any, **kwargs: Any) -> None:
         if path.name == "dispenses.jsonl":
-            time.sleep(0.6)  # well past the deadline below
+            clock.advance(0.6)  # a volume well past the deadline below, at no real cost
         real_append(path, record, **kwargs)
 
     monkeypatch.setattr(stream_module, "_append_jsonl", _slow_dispense)
@@ -850,15 +906,24 @@ async def test_the_deadline_starts_when_the_task_is_handed_out(
     async with stream:
         task = await stream.get_task()
         assert task is not None
-        await asyncio.sleep(0.05)  # the agent thinking, comfortably inside its budget
+        # Waited for rather than assumed: the watchdog now weighs this episode with the whole
+        # write behind it, and charged to the agent the task is 0.6s old against a 0.25s deadline
+        # before it is ever handed out, so this is the scan that reaps it.
+        await _a_watchdog_scan(clock)
+        assert stream.results == (), "the write the agent waited on spent the agent's clock"
+        # The budget is the agent's to spend, however long the runner takes to get here: no
+        # amount of real time moves this clock.
         await stream.dispatch(SUBMIT_TOOL, {"answer": "4"})
         (row,) = stream.results
-        assert row.closure == "sealed", "the write the agent waited on spent the agent's clock"
+        assert row.closure == "sealed"
         assert row.score is not None and row.score.success is True
 
         # ...and the clock is started, not skipped: the next task, left unanswered, still ends.
+        # Its budget is spent outright here rather than waited out, which is the same enforcement
+        # the runner's load used to have a say in.
         assert await stream.get_task() is not None
-        for _ in range(200):
+        clock.advance(0.3)  # past the whole deadline, with no call back from the agent
+        for _ in range(400):
             await asyncio.sleep(0.01)
             if len(stream.results) == 2:
                 break
