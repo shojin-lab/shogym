@@ -1,0 +1,4 @@
+# The isolated HERMES_HOME the README creates: config, sessions, logs, state.db. Throwaway.
+.hermes/
+# `hermes -z --usage-file usage.json` -- one run's token/cost report.
+usage.json
