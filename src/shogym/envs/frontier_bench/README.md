@@ -12,7 +12,7 @@ Like every shogym env this **describes** a task, **serves** its tools over MCP, 
 recorded trajectory while an external harness drives the tools — see [`../README.md`](../README.md).
 The verdict is computed server-side by the task's own verifier over the container end-state, so
 the pure `verify` stays a function over the sealed episode's evidence. The runnable demo is
-[`examples/quickstarts/`](../../../../examples/quickstarts/).
+[`examples/`](../../../../examples/).
 
 This slice ports the **CPU-only, single-container, `separate`-mode, pytest-verified,
 small-bundled-data** tasks — **5** of them, exposed as `num_tasks` and selectable by **index**
@@ -75,7 +75,7 @@ debugging).
 
 ### Quickstart
 
-Any quickstart under [`examples/quickstarts/`](../../../../examples/quickstarts/) serves this env: one MCP endpoint
+Any quickstart under [`examples/`](../../../../examples/) serves this env: one MCP endpoint
 hands out a queue of tasks and scores each one server-side. Point it here with the single
 variable at the top of its `serve.py`:
 

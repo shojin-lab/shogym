@@ -22,7 +22,7 @@ Three moves, and the whole quickstart is these three:
   npm here: Prime Agent's source tree still carries Pi's workspace identity (`package.json` is
   `@earendil-works/pi-coding-agent`, and its `bin` is `pi`), and their quickstart says outright
   that "the inherited npm workspace identifiers in the source tree are not the public install
-  path". `npm i -g @earendil-works/pi-coding-agent` is what `examples/quickstarts/pi/` installs,
+  path". `npm i -g @earendil-works/pi-coding-agent` is what `examples/pi/` installs,
   and it gets you Pi, which has no MCP client at all.
 - Credentials, and a provider named explicitly: `--provider anthropic` with `ANTHROPIC_API_KEY`,
   `--provider openai` with `OPENAI_API_KEY`, and so on. `/login` stores a subscription or an API
@@ -44,14 +44,14 @@ Two shells, because nothing here spawns the server for you.
 
 ```bash
 # --- shell 1: the stream. Leave it running. ---
-cd examples/quickstarts/prime_agent
+cd examples/prime_agent
 uv sync                                # install (from anywhere in the repo)
 uv run python serve.py                 # serves 127.0.0.1:8973/mcp until you stop it
 ```
 
 ```bash
 # --- shell 2: the agent, from THIS directory (settings and skills are cwd-scoped) ---
-cd examples/quickstarts/prime_agent
+cd examples/prime_agent
 export SHOGYM_MCP_TOKEN=local            # any non-empty value; serve.py never reads it
 
 #   -p                    -> print mode: run the prompt to completion and exit
@@ -268,6 +268,6 @@ task is recorded unscored), `max_in_flight=` serves several tasks concurrently, 
 
 ## The other quickstarts
 
-`examples/quickstarts/` holds one directory per harness, each idiomatic to that harness rather
+`examples/` holds one directory per harness, each idiomatic to that harness rather
 than squeezed into a shared abstraction. `claude_code/` is the reference implementation;
 `codex/`, `pi/` and `hermes/` demonstrate the same three moves in their own idiom.

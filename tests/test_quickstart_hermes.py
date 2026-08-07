@@ -19,11 +19,11 @@ import shogym
 import yaml
 from fastmcp import Client
 
-from examples.quickstarts.hermes import results as results_mod
-from examples.quickstarts.hermes import serve as serve_mod
+from examples.hermes import results as results_mod
+from examples.hermes import serve as serve_mod
 from shogym.serve.stream import build_stream_server
 
-_QUICKSTART = Path(__file__).resolve().parent.parent / "examples" / "quickstarts" / "hermes"
+_QUICKSTART = Path(__file__).resolve().parent.parent / "examples" / "hermes"
 
 TEST_ENV = "wordle_v1"
 

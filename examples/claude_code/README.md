@@ -27,7 +27,7 @@ Three moves, and the whole quickstart is these three:
 ## Run it
 
 ```bash
-cd examples/quickstarts/claude_code
+cd examples/claude_code
 
 # 1. install (from anywhere in the repo)
 uv sync
@@ -157,6 +157,6 @@ task is recorded unscored), `max_in_flight=` serves several tasks concurrently, 
 
 ## The other quickstarts
 
-`examples/quickstarts/` holds one directory per harness, each idiomatic to that harness rather
+`examples/` holds one directory per harness, each idiomatic to that harness rather
 than squeezed into a shared abstraction. [`codex/`](../codex/README.md), `pi/` and `hermes/`
 follow this one and demonstrate the same three moves in their own idiom.

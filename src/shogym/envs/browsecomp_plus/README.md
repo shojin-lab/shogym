@@ -13,7 +13,7 @@ surface with both a model judge *and* deterministic retrieval metrics.
 Like every shogym env this **describes** a task, **serves** its tools over MCP, and **verifies** a
 recorded trajectory while an external harness drives the tools — see
 [`../README.md`](../README.md). The runnable demo is
-[`examples/quickstarts/`](../../../../examples/quickstarts/).
+[`examples/`](../../../../examples/).
 
 ## Running it
 
@@ -56,7 +56,7 @@ knobs; upstream defaults 5 / 512), and `max_turns` (the tool-call horizon).
 
 ### Quickstart
 
-Any quickstart under [`examples/quickstarts/`](../../../../examples/quickstarts/) serves this env: one MCP endpoint
+Any quickstart under [`examples/`](../../../../examples/) serves this env: one MCP endpoint
 hands out a queue of tasks and scores each one server-side. Point it here with the single
 variable at the top of its `serve.py`:
 

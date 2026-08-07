@@ -11,4 +11,4 @@ shogym_logs/
 .envrc
 .direnv/
 .DS_Store
-examples/quickstarts/*/runs/
+examples/*/runs/
