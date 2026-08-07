@@ -5,9 +5,9 @@
 # when you run `codex` from this directory, and `~/.codex/config.toml` is never written to: your
 # own servers, model and plugins are untouched.
 #
-# `hgym` is the server name, and Codex namespaces this server's tools under it.
+# `shogym` is the server name, and Codex namespaces this server's tools under it.
 
-[mcp_servers.hgym]
+[mcp_servers.shogym]
 command = "uv"
 args = ["run", "python", "serve.py"]
 # `serve.py` is relative to the directory you launch Codex from, which is this one.
@@ -18,7 +18,7 @@ args = ["run", "python", "serve.py"]
 # concludes the stream is broken. This is the one knob to reach for when that happens.
 default_tools_approval_mode = "approve"
 
-# Startup imports hgym and opens the queue. The 10s default is tight for a cold venv.
+# Startup imports shogym and opens the queue. The 10s default is tight for a cold venv.
 startup_timeout_sec = 60.0
 
 # One tool call is one step of an episode, and the first `get_task` of an env that fetches its

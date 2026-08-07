@@ -4,7 +4,7 @@
 Covers the tau2-specific migration onto the terminal-seal substrate: the manifest marks
 ``done`` as the single ``score`` terminal (``terminate`` = abort); an explicit ``done`` seals
 the episode and ``_verify`` scores from core-owned evidence (never marker JSON); a tau2
-autonomous max-step stop is preserved and scored via the evaluator; reaching the hgym horizon
+autonomous max-step stop is preserved and scored via the evaluator; reaching the shogym horizon
 runs the evaluator over the completed run (**preserve_upstream_maxstep**), not a premature
 zero; and ``close()`` waits for an in-flight finalize before tearing down (tau2's
 ``end_session``/``abort`` can't race the finalizer).
@@ -21,15 +21,15 @@ import pytest
 
 pytest.importorskip("tau2", reason="tau2 extra not installed")
 
-import hgym  # noqa: E402
-from hgym.envs.tau2 import mcp_server  # noqa: E402
-from hgym.serve import LifecycleState, ServedEpisode  # noqa: E402
-from hgym.shared.terminate_mcp import TERMINATE_TOOL_NAME  # noqa: E402
+import shogym  # noqa: E402
+from shogym.envs.tau2 import mcp_server  # noqa: E402
+from shogym.serve import LifecycleState, ServedEpisode  # noqa: E402
+from shogym.shared.terminate_mcp import TERMINATE_TOOL_NAME  # noqa: E402
 
 
 def _mock_task_index(task_id: str) -> int:
     try:
-        env = hgym.make("tau2_mock")
+        env = shogym.make("tau2_mock")
     except Exception as exc:  # missing data etc.
         pytest.skip(f"tau2 mock env not constructible offline: {exc}")
     if task_id not in env._task_ids:
@@ -77,7 +77,7 @@ async def test_explicit_done_seals_and_verify_consumes_core_evidence() -> None:
         assert episode._evidence is not None
         assert episode._evidence.verdict["reward"] == 1.0
         # Provenance is core-stamped (non-forgeable) — proof _verify scored trusted evidence.
-        assert episode._evidence.provenance["core"] == "hgym-serve"
+        assert episode._evidence.provenance["core"] == "shogym-serve"
         assert episode._evidence.provenance["sealed_source"] == "explicit_tool"
         fb = _feedback(episode)
         assert fb["reward"] == 1.0 and fb["success"] is True and fb["db_match"] is True
@@ -122,11 +122,11 @@ async def test_autonomous_maxstep_stop_verdict_is_preserved_through_the_seal() -
         await episode.close()
 
 
-# ----- hgym horizon: preserve_upstream_maxstep (evaluator over the completed run) -----
+# ----- shogym horizon: preserve_upstream_maxstep (evaluator over the completed run) -----
 
 
 async def test_horizon_runs_the_evaluator_finalize_not_a_premature_zero() -> None:
-    # Drive past the hgym horizon: the budget-reaching step seals with source="horizon" and runs
+    # Drive past the shogym horizon: the budget-reaching step seals with source="horizon" and runs
     # this env's finalize (tau2's evaluator over the completed run) — NOT an independent premature
     # zero. Proof is deterministic and value-independent: finalize IS invoked with source=horizon
     # (an `abort`/`terminate` would instead have core synthesize no-score evidence WITHOUT calling

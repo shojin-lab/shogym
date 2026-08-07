@@ -5,14 +5,14 @@ from __future__ import annotations
 
 import pytest
 
-from hgym.feedback import (
+from shogym.feedback import (
     FEEDBACK_META_KEY,
     TERMINATE_META_KEY,
     build_meta,
     parse_meta,
     select_inband,
 )
-from hgym.types import EpisodeFeedback, InferenceFeedback
+from shogym.types import EpisodeFeedback, InferenceFeedback
 
 
 def test_build_meta_empty_is_empty() -> None:

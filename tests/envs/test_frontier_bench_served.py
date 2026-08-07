@@ -18,16 +18,16 @@ import json
 
 import pytest
 
-from hgym.envs.frontier_bench import docker_backend as dk
-from hgym.envs.frontier_bench import manifest
+from shogym.envs.frontier_bench import docker_backend as dk
+from shogym.envs.frontier_bench import manifest
 
 pytestmark = pytest.mark.skipif(
     not dk.docker_available(),
     reason="Docker daemon not available; frontier_bench end-to-end path is Docker-gated",
 )
 
-from hgym.envs.frontier_bench import mcp_server  # noqa: E402
-from hgym.serve import ServedEpisode  # noqa: E402
+from shogym.envs.frontier_bench import mcp_server  # noqa: E402
+from shogym.serve import ServedEpisode  # noqa: E402
 
 VENDORED = manifest.task_names()
 

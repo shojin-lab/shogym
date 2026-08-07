@@ -4,7 +4,7 @@
 
 from __future__ import annotations
 
-from hgym.envs.browsecomp_plus.metrics import (
+from shogym.envs.browsecomp_plus.metrics import (
     compute_citation_metrics,
     extract_citations_from_response,
     retrieval_recall,

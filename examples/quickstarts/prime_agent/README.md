@@ -1,6 +1,6 @@
 # Prime Agent quickstart
 
-Point the `prime-agent` CLI you already use at a **stream of hgym tasks**. The agent pulls a
+Point the `prime-agent` CLI you already use at a **stream of shogym tasks**. The agent pulls a
 task, plays it with the env's own tools, pulls the next one, and stops when the queue is empty.
 The server scores every task as it ends; you read the scores back afterwards, out of a durable
 record the agent never sees.
@@ -29,9 +29,9 @@ Three moves, and the whole quickstart is these three:
   key in `~/.prime/agent/auth.json` instead. `prime-agent model list` prints what your
   credentials unlock.
 - [uv](https://docs.astral.sh/uv/), for the pinned Python 3.12 venv. `uv sync` at the repo root
-  installs hgym with every env extra (the default dev group), which is what the default env
+  installs shogym with every env extra (the default dev group), which is what the default env
   below needs. On its first run `automationbench` also fetches its pinned upstream source into
-  `~/.cache/hgym` once; after that it is fully offline and needs no key.
+  `~/.cache/shogym` once; after that it is fully offline and needs no key.
 - Room for Prime Agent's own kernel: the first session bootstraps `~/.prime/agent/kernel-venv`
   (uv, Python 3.11, `ipykernel`, `prime-agent-runtime`, and a dozen default packages) and needs
   the network once to do it. If you have `PRIME_AGENT_KERNEL_PYTHON` set, unset it for this
@@ -52,7 +52,7 @@ uv run python serve.py                 # serves 127.0.0.1:8973/mcp until you sto
 ```bash
 # --- shell 2: the agent, from THIS directory (settings and skills are cwd-scoped) ---
 cd examples/quickstarts/prime_agent
-export HGYM_MCP_TOKEN=local            # any non-empty value; serve.py never reads it
+export SHOGYM_MCP_TOKEN=local            # any non-empty value; serve.py never reads it
 
 #   -p                    -> print mode: run the prompt to completion and exit
 #   --mode json           -> stream events as they happen. Without it -p prints only the final
@@ -69,7 +69,7 @@ uv run python results.py
 ```
 
 `/mcp` inside an interactive session lists the integration and whether it is connected, which is
-the cheapest check that the wiring took: with `HGYM_MCP_TOKEN` exported it reports `hgym` as
+the cheapest check that the wiring took: with `SHOGYM_MCP_TOKEN` exported it reports `shogym` as
 enabled, without it as disabled. `prime-agent --verbose` lists the skills it loaded at startup.
 
 Two things about that command are easy to get wrong:
@@ -87,35 +87,35 @@ continuations (`--autonomous-max-continuations`, default 3; `--autonomous-max-tu
 12). The prompt asks it to drive itself; the flag is what keeps the host asking.
 
 There is no way to fence the affordances here, and it is worth being blunt about that. The
-other quickstarts end this section with a deny list (`--disallowedTools`, `-t hgym`,
+other quickstarts end this section with a deny list (`--disallowedTools`, `-t shogym`,
 `--no-builtin-tools`) so that the served tools are the only thing the agent can reach. Prime
 Agent has one built-in tool and the stream lives *inside* it: `--no-builtin-tools` and
 `--no-tools` both remove `ipython`, which removes the kernel, which removes the stream. So the
 same kernel that plays the task can read the env's task definitions off disk, and no flag
 separates the two. For scores you intend to defend, run this in a container that does not have
-hgym's source in it.
+shogym's source in it.
 
 ## Swap the env
 
 Either set it for one run, without touching a tracked file:
 
 ```bash
-HGYM_ENV=wordle_v1 HGYM_TASKS=0,1 <the command above>
+SHOGYM_ENV=wordle_v1 SHOGYM_TASKS=0,1 <the command above>
 ```
 
 or change the default, which is one line in `serve.py`:
 
 ```python
-ENV = os.environ.get("HGYM_ENV") or "automationbench"   # "wordle_v1", "hle", "yc_bench", ...
+ENV = os.environ.get("SHOGYM_ENV") or "automationbench"   # "wordle_v1", "hle", "yc_bench", ...
 ```
 
-`HGYM_ENV` wins when it is set, so the environment variable is the one to reach for while you are
+`SHOGYM_ENV` wins when it is set, so the environment variable is the one to reach for while you are
 trying envs out and the literal is the one to edit when you have picked.
 
 Nothing else changes. Not the settings, not the skill, not the prompt, not `results.py`, not the
 command above. `TASKS = [0, 1, 2]` is the other constant, and the only thing to check when you
 swap: task index ranges differ per env, and some envs need their extra installed and a key
-exported (see `src/hgym/envs/<env>/README.md`; the key reaches this server because you started
+exported (see `src/shogym/envs/<env>/README.md`; the key reaches this server because you started
 it). `wordle_v1` needs neither and is the cheapest place to start.
 
 `PORT` is the third constant, and the one thing two other files name: `.prime/agent/settings.json`
@@ -154,7 +154,7 @@ The rows are JSONL on disk under `runs/<env>-<stamp>/`, so any reader will do:
 
 ```bash
 uv run python -c "
-from hgym.serve.stream import read_results
+from shogym.serve.stream import read_results
 for r in read_results('runs/wordle_v1-<stamp>'):
     print(r.position, r.env, r.task_idx, r.closure, r.score and r.score.reward)"
 ```
@@ -174,7 +174,7 @@ reading before you run anything. From Prime Agent's own docs:
 > the IPython kernel.
 
 The model has exactly one built-in tool, `ipython`. An MCP server is reached by writing Python
-inside that kernel (`await hgym_stream.get_task()`), and the MCP client is the `mcp` SDK
+inside that kernel (`await shogym_stream.get_task()`), and the MCP client is the `mcp` SDK
 running kernel-side, not a host-managed tool bridge. Three consequences, all load-bearing:
 
 **HTTP only, and you start it.** The host skips every `mcpServers` entry that is not HTTP
@@ -189,20 +189,20 @@ needs `OPENAI_API_KEY` gets your environment, because it is your process.
 token before every connection and raises `NotEnabled` when there is none; there is no
 unauthenticated branch through it. The two ways to have one are browser OAuth (which needs the
 server to support OAuth 2.1 dynamic client registration, which a local script does not) and a
-static `bearerTokenEnvVar`. So this quickstart declares `HGYM_MCP_TOKEN`, you export any non-empty
+static `bearerTokenEnvVar`. So this quickstart declares `SHOGYM_MCP_TOKEN`, you export any non-empty
 value, the kernel sends it as `Authorization: Bearer ...`, and `serve.py` never looks at it. One
-trap comes with it: `NotEnabled`'s message says to run `/mcp login hgym`, which for a
+trap comes with it: `NotEnabled`'s message says to run `/mcp login shogym`, which for a
 bearer-only server reports "Unknown MCP integration". `SKILL.md` contradicts that message on
 purpose, because the model will otherwise relay it.
 
-**A skill package, not a config entry.** `.prime/agent/skills/hgym-stream/` is a Python package
+**A skill package, not a config entry.** `.prime/agent/skills/shogym-stream/` is a Python package
 with a `SKILL.md`; Prime Agent installs it editable into the kernel venv at session start and
-exposes it as `hgym_stream`. It is about forty lines and the class body is three attributes.
+exposes it as `shogym_stream`. It is about forty lines and the class body is three attributes.
 Unlike the built-in Linear/Notion integrations it is not auth-gated: a skill you drop in a skills
 directory loads whether or not credentials exist, and only fails at call time.
 
 One more thing to expect at the keyboard: every tool answers with a **JSON string**, not a dict.
-hgym's tools return text content, and the integration's result parser hands text back verbatim.
+shogym's tools return text content, and the integration's result parser hands text back verbatim.
 `PROMPT.txt` and `SKILL.md` both say to `json.loads` it.
 
 ### What was checked, and how
@@ -212,7 +212,7 @@ The attachment above was run, not inferred: the skill's own client code (Prime A
 `wordle_v1`, and it discovered the tools, played two tasks and got its verdict back:
 
 ```
-NO-TOKEN: NotEnabled -> The 'hgym' integration is not enabled: no credentials found. ...
+NO-TOKEN: NotEnabled -> The 'shogym' integration is not enabled: no credentials found. ...
 TOKEN: tools = ['get_task', 'guess', 'queue_info', 'terminate']
 get_task: type=str  ->  keys=['budget', 'env', 'instructions', 'tools']
 terminate: type=str ->  keys=['content', 'feedback', 'hint', 'terminated']
@@ -223,7 +223,7 @@ That covers both branches the client takes: the URL resolved from the host's `mc
 settings entry below) and the fallback to the skill's own `url` when the host has no entry.
 What it does **not** cover is the host half, Prime Agent installing this package into its
 kernel venv and importing it, which was read out of `bootstrap.ts` and `skills.md` rather than
-run. If the model reports that `hgym_stream` does not exist, that seam is where to look:
+run. If the model reports that `shogym_stream` does not exist, that seam is where to look:
 `/reload` rediscovers skill metadata, but a *new* Python-backed skill needs a fresh session so
 kernel setup can install it.
 
@@ -249,7 +249,7 @@ lease (above 1, the served tools gain a `lease` argument).
 |---|---|
 | `serve.py` | the MCP endpoint **you** run: builds the `TaskStream`, serves it over streamable HTTP |
 | `.prime/agent/settings.json` | the `mcpServers` entry: HTTP, the URL, and the name of the token env var |
-| `.prime/agent/skills/hgym-stream/` | the integration: `SKILL.md`, `pyproject.toml`, and the `McpIntegration` subclass the kernel imports as `hgym_stream` |
+| `.prime/agent/skills/shogym-stream/` | the integration: `SKILL.md`, `pyproject.toml`, and the `McpIntegration` subclass the kernel imports as `shogym_stream` |
 | `PROMPT.txt` | the loop the agent runs: `get_task`, play, end, repeat |
 | `results.py` | reads the durable rows back out after the run |
 | `runs/` | one directory per run (`results.jsonl` + `dispenses.jsonl`). Gitignored. |
@@ -257,7 +257,7 @@ lease (above 1, the served tools gain a `lease` argument).
 The settings entry and the skill overlap on purpose, and it is fair to ask what each buys. The
 skill can connect on its own: when the host has no entry for the server, `mcp.config` fails and
 the client falls back to the `url` on the class. The entry is what makes the host's answer
-authoritative instead, so the URL can move without editing the package, and what puts `hgym`
+authoritative instead, so the URL can move without editing the package, and what puts `shogym`
 in `/mcp` with a connection status. Delete it and the run still works; delete the skill and
 there is nothing to import.
 

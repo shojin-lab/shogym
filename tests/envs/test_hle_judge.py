@@ -7,7 +7,7 @@ from __future__ import annotations
 
 import pytest
 
-from hgym.envs.hle.judge import (
+from shogym.envs.hle.judge import (
     OpenAIJudge,
     exact_match,
     normalize_answer,

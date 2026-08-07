@@ -9,20 +9,20 @@ import pytest
 
 from fastmcp import Client, FastMCP
 
-import hgym
-from hgym.feedback import parse_meta
-from hgym.serve import ServedEpisode
-from hgym.serve.server import build_server
+import shogym
+from shogym.feedback import parse_meta
+from shogym.serve import ServedEpisode
+from shogym.serve.server import build_server
 
 
 def _answer(task_idx: int) -> str:
-    return hgym.make("wordle_v1")._words[task_idx]
+    return shogym.make("wordle_v1")._words[task_idx]
 
 
 def test_build_server_rejects_describe_tool_collision() -> None:
     # `describe` is a reserved control tool; an env that declares one would have it
     # silently replaced by FastMCP, so build_server must reject the collision.
-    from hgym.task import TaskSpec, ToolManifest
+    from shogym.task import TaskSpec, ToolManifest
 
     class _FakeEpisode:
         def describe(self):
@@ -45,8 +45,8 @@ async def test_passthrough_tool_handles_nonidentifier_and_optional_args() -> Non
     # (the old signature-synthesis raised SyntaxError / forwarded {"note": None}).
     from fastmcp.tools import ToolResult
 
-    from hgym.serve.server import _build_tool
-    from hgym.task import ToolManifest
+    from shogym.serve.server import _build_tool
+    from shogym.task import ToolManifest
 
     seen: dict = {}
 
@@ -89,7 +89,7 @@ async def test_describe_tool_and_resource_agree() -> None:
     try:
         async with Client(build_server(episode)) as client:
             from_tool = (await client.call_tool("describe", {})).data
-            resource = await client.read_resource("hgym://task")
+            resource = await client.read_resource("shogym://task")
             from_resource = json.loads(resource[0].text)
             assert from_tool["env_name"] == "wordle_v1"
             assert from_tool == from_resource

@@ -23,16 +23,16 @@ from typing import Any, Dict, List
 import pytest
 from fastmcp import Client
 
-from hgym.mcp import MCPServerSpec
-from hgym.serve import stream as stream_module
-from hgym.serve.stream import (
+from shogym.mcp import MCPServerSpec
+from shogym.serve import stream as stream_module
+from shogym.serve.stream import (
     TaskRef,
     TaskStream,
     build_stream_server,
     read_dispenses,
     reconcile,
 )
-from hgym.types import FeedbackCollection
+from shogym.types import FeedbackCollection
 from tests._fixtures.score_env import ENV_NAME, SUBMIT_TOOL, _FixtureScoreEnv
 
 TASKS = [
@@ -619,7 +619,7 @@ def _payload_from_tool(result: Any) -> Dict[str, Any]:
 
 
 async def test_a_tool_named_lease_cannot_be_wrapped(tmp_path: Path) -> None:
-    from hgym.task import TaskSpec, ToolManifest
+    from shogym.task import TaskSpec, ToolManifest
 
     class _Colliding(_FixtureScoreEnv):
         def describe(self, task_id=None) -> TaskSpec:
@@ -650,7 +650,7 @@ async def test_a_tool_named_lease_cannot_be_wrapped(tmp_path: Path) -> None:
 def _env_whose_submit_schema_is(schema: Dict[str, Any]) -> Any:
     """A factory for the fixture env with one hand-written schema on its score terminal. Only
     the *advertised* schema changes: the tool, the handler and the grading are the fixture's."""
-    from hgym.task import TaskSpec
+    from shogym.task import TaskSpec
 
     class _CustomSchema(_FixtureScoreEnv):
         def describe(self, task_id: Any = None) -> TaskSpec:

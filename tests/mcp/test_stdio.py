@@ -10,8 +10,8 @@ from pathlib import Path
 
 import pytest
 
-from hgym.mcp import MCPServerSpec
-from hgym.mcp.transports import open_stdio
+from shogym.mcp import MCPServerSpec
+from shogym.mcp.transports import open_stdio
 
 FIXTURE = Path(__file__).resolve().parents[1] / "_mcp_fixtures" / "echo_stdio_server.py"
 

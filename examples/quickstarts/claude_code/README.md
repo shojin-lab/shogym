@@ -1,6 +1,6 @@
 # Claude Code quickstart
 
-Point the `claude` CLI you already use at a **stream of hgym tasks**. The agent pulls a task,
+Point the `claude` CLI you already use at a **stream of shogym tasks**. The agent pulls a task,
 plays it with the env's own tools, pulls the next one, and stops when the queue is empty. The
 server scores every task as it ends; you read the scores back afterwards, out of a durable record
 the agent never sees.
@@ -20,9 +20,9 @@ Three moves, and the whole quickstart is these three:
 - The `claude` CLI on `PATH` (`claude --version`).
 - Credentials for it: `ANTHROPIC_API_KEY`, or an OAuth session from `claude /login`.
 - [uv](https://docs.astral.sh/uv/), for the pinned Python 3.12 venv. `uv sync` at the repo root
-  installs hgym with every env extra (the default dev group), which is what the default env
+  installs shogym with every env extra (the default dev group), which is what the default env
   below needs. On its first run `automationbench` also fetches its pinned upstream source into
-  `~/.cache/hgym` once; after that it is fully offline and needs no key.
+  `~/.cache/shogym` once; after that it is fully offline and needs no key.
 
 ## Run it
 
@@ -33,15 +33,15 @@ cd examples/quickstarts/claude_code
 uv sync
 
 # 2. play the stream
-#   --mcp-config .mcp.json      -> spawns serve.py (server key "hgym", so its tools are mcp__hgym__*)
+#   --mcp-config .mcp.json      -> spawns serve.py (server key "shogym", so its tools are mcp__shogym__*)
 #   --strict-mcp-config         -> only this config; your own MCP servers stay out of the run
-#   --allowedTools mcp__hgym__* -> pre-approve the stream's tools so nothing stops to ask
+#   --allowedTools mcp__shogym__* -> pre-approve the stream's tools so nothing stops to ask
 #   --permission-mode dontAsk   -> never block on a permission prompt
 #   --model / --effort           -> pinned and cheap for a first run
 #   --output-format stream-json --verbose -> watch the tool calls go by
 claude -p "$(cat PROMPT.txt)" \
     --mcp-config .mcp.json --strict-mcp-config \
-    --allowedTools 'mcp__hgym__*' \
+    --allowedTools 'mcp__shogym__*' \
     --permission-mode dontAsk \
     --model sonnet --effort low \
     --output-format stream-json --verbose
@@ -67,22 +67,22 @@ Do NOT use `--tools ""` to strip built-ins: it strips the MCP tools too.
 Either set it for one run, without touching a tracked file:
 
 ```bash
-HGYM_ENV=wordle_v1 HGYM_TASKS=0,1 <the command above>
+SHOGYM_ENV=wordle_v1 SHOGYM_TASKS=0,1 <the command above>
 ```
 
 or change the default, which is one line in `serve.py`:
 
 ```python
-ENV = os.environ.get("HGYM_ENV") or "automationbench"   # "wordle_v1", "hle", "yc_bench", ...
+ENV = os.environ.get("SHOGYM_ENV") or "automationbench"   # "wordle_v1", "hle", "yc_bench", ...
 ```
 
-`HGYM_ENV` wins when it is set, so the environment variable is the one to reach for while you are
+`SHOGYM_ENV` wins when it is set, so the environment variable is the one to reach for while you are
 trying envs out and the literal is the one to edit when you have picked.
 
 Nothing else changes. Not `.mcp.json`, not the prompt, not `results.py`, not the command above.
 `TASKS = [0, 1, 2]` is the other constant, and the only thing to check when you swap: task index
 ranges differ per env, and some envs need their extra installed and a key exported (see
-`src/hgym/envs/<env>/README.md`). `wordle_v1` needs neither and is the cheapest place to start.
+`src/shogym/envs/<env>/README.md`). `wordle_v1` needs neither and is the cheapest place to start.
 
 ## Read the results
 
@@ -114,7 +114,7 @@ The rows are JSONL on disk under `runs/<env>-<stamp>/`, so any reader will do:
 
 ```bash
 uv run python -c "
-from hgym.serve.stream import read_results
+from shogym.serve.stream import read_results
 for r in read_results('runs/automationbench-<stamp>'):
     print(r.position, r.env, r.task_idx, r.closure, r.score and r.score.reward)"
 ```
@@ -145,7 +145,7 @@ lease (above 1, the served tools gain a `lease` argument).
 | File | What it is |
 |---|---|
 | `serve.py` | the MCP endpoint Claude Code spawns: builds the `TaskStream`, serves it over stdio |
-| `.mcp.json` | tells Claude Code how to spawn it, under the server key `hgym` |
+| `.mcp.json` | tells Claude Code how to spawn it, under the server key `shogym` |
 | `PROMPT.txt` | the loop the agent runs: `get_task`, play, end, repeat |
 | `results.py` | reads the durable rows back out after the run |
 | `runs/` | one directory per run (`results.jsonl` + `dispenses.jsonl`). Gitignored. |

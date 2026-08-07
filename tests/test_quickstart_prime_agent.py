@@ -7,7 +7,7 @@ spends a token; the harness half is checked as configuration.
 
 The skill package is read rather than imported. It is the only Python in this repo written for
 somebody else's interpreter: it lives in Prime Agent's kernel venv and imports ``rlm``, which
-is not an hgym dependency and is not on PyPI at all. ``ast`` gets the same facts without it.
+is not an shogym dependency and is not on PyPI at all. ``ast`` gets the same facts without it.
 """
 
 from __future__ import annotations
@@ -17,16 +17,16 @@ import json
 from pathlib import Path
 from typing import Any, Dict
 
-import hgym
+import shogym
 from fastmcp import Client
 
 from examples.quickstarts.prime_agent import results as results_mod
 from examples.quickstarts.prime_agent import serve as serve_mod
-from hgym.serve.stream import build_stream_server
+from shogym.serve.stream import build_stream_server
 
 _QUICKSTART = Path(__file__).resolve().parent.parent / "examples" / "quickstarts" / "prime_agent"
 _SETTINGS = _QUICKSTART / ".prime" / "agent" / "settings.json"
-_SKILL = _QUICKSTART / ".prime" / "agent" / "skills" / "hgym-stream"
+_SKILL = _QUICKSTART / ".prime" / "agent" / "skills" / "shogym-stream"
 
 TEST_ENV = "wordle_v1"
 
@@ -37,7 +37,7 @@ def _payload(result: Any) -> Dict[str, Any]:
 
 def _skill_class_attrs() -> Dict[str, str]:
     """The `McpIntegration` subclass's string attributes, read out of the source."""
-    module = ast.parse((_SKILL / "src" / "hgym_stream" / "__init__.py").read_text())
+    module = ast.parse((_SKILL / "src" / "shogym_stream" / "__init__.py").read_text())
     classes = [node for node in module.body if isinstance(node, ast.ClassDef)]
     assert len(classes) == 1, "the skill is one integration class"
     return {
@@ -57,8 +57,8 @@ def test_the_server_is_http_because_stdio_is_dropped() -> None:
     streamable HTTP. A stdio entry here would be silently ignored, not rejected."""
     settings = json.loads(_SETTINGS.read_text())
     assert list(settings) == ["mcpServers"], "the quickstart's whole config surface"
-    assert list(settings["mcpServers"]) == ["hgym"]
-    server = settings["mcpServers"]["hgym"]
+    assert list(settings["mcpServers"]) == ["shogym"]
+    server = settings["mcpServers"]["shogym"]
     assert server["type"] == "http"
     assert server["url"].startswith("http://127.0.0.1:")
 
@@ -69,8 +69,8 @@ def test_a_static_bearer_token_is_declared_on_both_sides() -> None:
     so the token is a formality -- but a formality both sides have to name identically."""
     settings = json.loads(_SETTINGS.read_text())
     attrs = _skill_class_attrs()
-    assert settings["mcpServers"]["hgym"]["bearerTokenEnvVar"] == attrs["bearer_token_env"]
-    assert "oauth" not in settings["mcpServers"]["hgym"], "no browser login in a quickstart"
+    assert settings["mcpServers"]["shogym"]["bearerTokenEnvVar"] == attrs["bearer_token_env"]
+    assert "oauth" not in settings["mcpServers"]["shogym"], "no browser login in a quickstart"
 
 
 def test_the_skill_settings_and_server_agree_on_one_url() -> None:
@@ -78,9 +78,9 @@ def test_the_skill_settings_and_server_agree_on_one_url() -> None:
     wins when the settings entry is present, the skill's own is the fallback when it is not."""
     settings = json.loads(_SETTINGS.read_text())
     attrs = _skill_class_attrs()
-    assert attrs["url"] == settings["mcpServers"]["hgym"]["url"]
+    assert attrs["url"] == settings["mcpServers"]["shogym"]["url"]
     assert attrs["url"] == f"http://127.0.0.1:{serve_mod.PORT}/mcp"
-    assert attrs["server"] == "hgym"
+    assert attrs["server"] == "shogym"
 
 
 def test_the_skill_is_discoverable_as_a_python_backed_skill() -> None:
@@ -88,9 +88,9 @@ def test_the_skill_is_discoverable_as_a_python_backed_skill() -> None:
     frontmatter ``name`` matches it, a ``pyproject.toml`` (which is what makes it Python-backed),
     and ``src/<import name>/__init__.py`` where the import name is the directory name with
     hyphens turned into underscores."""
-    assert _SKILL.name == "hgym-stream"
+    assert _SKILL.name == "shogym-stream"
     assert (_SKILL / "pyproject.toml").is_file()
-    assert (_SKILL / "src" / "hgym_stream" / "__init__.py").is_file()
+    assert (_SKILL / "src" / "shogym_stream" / "__init__.py").is_file()
 
     front = (_SKILL / "SKILL.md").read_text().split("---")[1]
     fields = dict(
@@ -101,7 +101,7 @@ def test_the_skill_is_discoverable_as_a_python_backed_skill() -> None:
 
 
 def test_the_one_variable_names_a_registered_env() -> None:
-    assert serve_mod.ENV in hgym.registered_envs()
+    assert serve_mod.ENV in shogym.registered_envs()
     assert serve_mod.TASKS and all(type(i) is int for i in serve_mod.TASKS)
 
 
@@ -110,7 +110,7 @@ def test_prompt_drives_the_stream_loop_from_the_kernel() -> None:
     assert "get_task" in prompt and "done" in prompt
     # The agent is never handed tools here: it imports the skill and calls it in Python, and
     # every answer arrives as a JSON string it has to parse.
-    assert "hgym_stream" in prompt and "json.loads" in prompt
+    assert "shogym_stream" in prompt and "json.loads" in prompt
 
 
 def test_run_dirs_are_fresh_per_run(tmp_path: Path) -> None:
@@ -124,7 +124,7 @@ async def test_stream_serves_tasks_and_records_one_row_each(tmp_path: Path) -> N
     prov = tmp_path / "prov"
     stream = serve_mod.build_stream(env=TEST_ENV, tasks=[0, 1], prov_dir=prov)
     async with stream:
-        client_server = build_stream_server(stream, name="hgym")
+        client_server = build_stream_server(stream, name="shogym")
         async with Client(client_server) as client:
             names = {tool.name for tool in await client.list_tools()}
             # The stream's control tools plus the env's own surface, on one endpoint.

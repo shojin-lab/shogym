@@ -1,6 +1,6 @@
 {
   "mcpServers": {
-    "hgym": {
+    "shogym": {
       "transport": "stdio",
       "command": "uv",
       "args": ["run", "python", "serve.py"],

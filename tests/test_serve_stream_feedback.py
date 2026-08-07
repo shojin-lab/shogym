@@ -41,8 +41,8 @@ from typing import Any, ClassVar, Dict, List, Sequence
 import pytest
 from fastmcp import Client
 
-from hgym.serve import stream as stream_module
-from hgym.serve.stream import (
+from shogym.serve import stream as stream_module
+from shogym.serve.stream import (
     EvalStream,
     FeedbackPolicy,
     Immediate,
@@ -55,7 +55,7 @@ from hgym.serve.stream import (
     read_results,
     reconcile,
 )
-from hgym.types import EpisodeFeedback, FeedbackCollection, InferenceFeedback
+from shogym.types import EpisodeFeedback, FeedbackCollection, InferenceFeedback
 from tests._fixtures.choice_env import _FixtureChoiceEnv
 from tests._fixtures.score_env import ENV_NAME, SUBMIT_TOOL, _FixtureScoreEnv
 
@@ -1640,7 +1640,7 @@ import sys
 import time
 from pathlib import Path
 
-from hgym.serve.stream import Immediate, Never, TaskRef, TaskStream
+from shogym.serve.stream import Immediate, Never, TaskRef, TaskStream
 from tests._fixtures.score_env import ENV_NAME, _FixtureScoreEnv
 
 prov, regime, verdict, hold = (Path(sys.argv[1]), sys.argv[2], Path(sys.argv[3]), Path(sys.argv[4]))
@@ -1726,8 +1726,8 @@ import sys
 import time
 from pathlib import Path
 
-from hgym.serve import stream as stream_module
-from hgym.serve.stream import TaskRef, TaskStream
+from shogym.serve import stream as stream_module
+from shogym.serve.stream import TaskRef, TaskStream
 from tests._fixtures.score_env import ENV_NAME, _FixtureScoreEnv
 
 prov, role, verdict, inside = (

@@ -8,8 +8,8 @@ one-shot); this scorer only *parses* it, so it is Docker-free and runs in the of
 
 from __future__ import annotations
 
-from hgym.envs.frontier_bench.env_v1 import score_evidence
-from hgym.serve.lifecycle import TerminalEvidence, fail_closed_verdict
+from shogym.envs.frontier_bench.env_v1 import score_evidence
+from shogym.serve.lifecycle import TerminalEvidence, fail_closed_verdict
 
 
 def _verdict_evidence(

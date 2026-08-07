@@ -5,7 +5,7 @@ offline core suite.
 
 from __future__ import annotations
 
-from hgym.envs.browsecomp_plus.judge import create_judge_prompt, parse_judge_response
+from shogym.envs.browsecomp_plus.judge import create_judge_prompt, parse_judge_response
 
 
 def test_parse_plain_yes_no() -> None:

@@ -1,4 +1,4 @@
-"""End-to-end: drive a served ``tau2_mock`` episode through hgym's serve layer and check
+"""End-to-end: drive a served ``tau2_mock`` episode through shogym's serve layer and check
 that tau2's evaluator verdict flows back into episode feedback.
 
 Requires the ``tau2`` extra (Python <3.14) and a loadable tau2 ``mock`` data set — skipped
@@ -14,15 +14,15 @@ import pytest
 
 pytest.importorskip("tau2", reason="tau2 extra not installed")
 
-import hgym  # noqa: E402
-from hgym.envs.tau2 import mcp_server  # noqa: E402
-from hgym.serve import ServedEpisode  # noqa: E402
+import shogym  # noqa: E402
+from shogym.envs.tau2 import mcp_server  # noqa: E402
+from shogym.serve import ServedEpisode  # noqa: E402
 
 
 def _mock_task_index(task_id: str) -> int:
     """Resolve a tau2 mock task id to its index in the env's train split, or skip."""
     try:
-        env = hgym.make("tau2_mock")
+        env = shogym.make("tau2_mock")
     except Exception as exc:  # missing data etc.
         pytest.skip(f"tau2 mock env not constructible offline: {exc}")
     if task_id not in env._task_ids:
@@ -73,7 +73,7 @@ async def test_served_mock_episode_scores_success() -> None:
 async def test_upstream_auto_termination_reaches_terminal_feedback() -> None:
     # When tau2 auto-terminates on a domain-tool step (here: max_steps exhausted during the
     # `create_task` action), the verdict must not be lost. The bridge stashes it and surfaces
-    # it on the `done` step, so hgym's terminal feedback equals the evaluator's verdict — not
+    # it on the `done` step, so shogym's terminal feedback equals the evaluator's verdict — not
     # a silent premature zero produced independently by the verifier.
     idx = _mock_task_index("create_task_1")
     episode = await ServedEpisode.start("tau2_mock", task=idx, env_config={"max_steps": 1})

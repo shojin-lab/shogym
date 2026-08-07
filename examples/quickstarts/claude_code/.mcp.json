@@ -1,6 +1,6 @@
 {
   "mcpServers": {
-    "hgym": {
+    "shogym": {
       "command": "uv",
       "args": ["run", "python", "serve.py"]
     }

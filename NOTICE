@@ -1,8 +1,8 @@
-hgym (Harness Gym)
+shōgym
 Copyright 2026 Andrew Jesson
 
 This product includes software developed as part of the llmgym project
 (https://github.com/tensorzero/llmgym), Copyright TensorZero, licensed under the
-Apache License, Version 2.0. Portions of hgym are derived from llmgym, including its
+Apache License, Version 2.0. Portions of shōgym are derived from llmgym, including its
 unmerged v1 pull-request stack (ToolUsingEnv + MCP architecture), authored principally
 by Andrew Jesson.

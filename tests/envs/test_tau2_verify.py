@@ -11,9 +11,9 @@ from __future__ import annotations
 
 import json
 
-from hgym.envs.tau2.env_v1 import VERDICT_MARKER, score_evidence, score_trajectory
-from hgym.serve.lifecycle import TerminalEvidence
-from hgym.trajectory import Step
+from shogym.envs.tau2.env_v1 import VERDICT_MARKER, score_evidence, score_trajectory
+from shogym.serve.lifecycle import TerminalEvidence
+from shogym.trajectory import Step
 
 
 def _verdict_step(

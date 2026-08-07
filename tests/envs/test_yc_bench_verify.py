@@ -8,7 +8,7 @@ offline core suite. The terminal-state gate (credit a solvent state only on a ge
 
 from __future__ import annotations
 
-from hgym.envs.yc_bench.env_v1 import score_verdict
+from shogym.envs.yc_bench.env_v1 import score_verdict
 
 _UNSET = object()
 

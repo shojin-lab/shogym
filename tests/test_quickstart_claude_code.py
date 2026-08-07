@@ -12,12 +12,12 @@ import json
 from pathlib import Path
 from typing import Any, Dict
 
-import hgym
+import shogym
 from fastmcp import Client
 
 from examples.quickstarts.claude_code import results as results_mod
 from examples.quickstarts.claude_code import serve as serve_mod
-from hgym.serve.stream import build_stream_server
+from shogym.serve.stream import build_stream_server
 
 _QUICKSTART = Path(__file__).resolve().parent.parent / "examples" / "quickstarts" / "claude_code"
 
@@ -30,17 +30,17 @@ def _payload(result: Any) -> Dict[str, Any]:
 
 def test_checked_in_mcp_config_spawns_the_serve_script() -> None:
     config = json.loads((_QUICKSTART / ".mcp.json").read_text())
-    # The server key is what Claude Code namespaces tools under, so `mcp__hgym__*` in the
-    # README's --allowedTools is only correct while this key is `hgym`.
-    assert list(config["mcpServers"]) == ["hgym"]
-    server = config["mcpServers"]["hgym"]
+    # The server key is what Claude Code namespaces tools under, so `mcp__shogym__*` in the
+    # README's --allowedTools is only correct while this key is `shogym`.
+    assert list(config["mcpServers"]) == ["shogym"]
+    server = config["mcpServers"]["shogym"]
     assert server["command"] == "uv"
     assert server["args"] == ["run", "python", "serve.py"]
     assert (_QUICKSTART / "serve.py").is_file()
 
 
 def test_the_one_variable_names_a_registered_env() -> None:
-    assert serve_mod.ENV in hgym.registered_envs()
+    assert serve_mod.ENV in shogym.registered_envs()
     assert serve_mod.TASKS and all(type(i) is int for i in serve_mod.TASKS)
 
 
@@ -60,7 +60,7 @@ async def test_stream_serves_tasks_and_records_one_row_each(tmp_path: Path) -> N
     prov = tmp_path / "prov"
     stream = serve_mod.build_stream(env=TEST_ENV, tasks=[0, 1], prov_dir=prov)
     async with stream:
-        client_server = build_stream_server(stream, name="hgym")
+        client_server = build_stream_server(stream, name="shogym")
         async with Client(client_server) as client:
             names = {tool.name for tool in await client.list_tools()}
             # The stream's control tools plus the env's own surface, on one endpoint.

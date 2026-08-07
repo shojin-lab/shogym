@@ -22,8 +22,8 @@ if not os.getenv("OPENAI_API_KEY"):
         allow_module_level=True,
     )
 
-from hgym.envs.browsecomp_plus.searcher import InMemorySearcher  # noqa: E402
-from hgym.serve import ServedEpisode  # noqa: E402
+from shogym.envs.browsecomp_plus.searcher import InMemorySearcher  # noqa: E402
+from shogym.serve import ServedEpisode  # noqa: E402
 
 _CORPUS = {"1": "Paris is the capital of France.", "2": "France is a country in Europe."}
 _TASKS = [

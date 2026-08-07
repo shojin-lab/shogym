@@ -10,14 +10,14 @@ from pathlib import Path
 
 import pytest
 
-import hgym
-from hgym.feedback import parse_meta
-from hgym.serve import ServedEpisode
-from hgym.trace import load_traces
+import shogym
+from shogym.feedback import parse_meta
+from shogym.serve import ServedEpisode
+from shogym.trace import load_traces
 
 
 def _answer(task_idx: int) -> str:
-    return hgym.make("wordle_v1")._words[task_idx]
+    return shogym.make("wordle_v1")._words[task_idx]
 
 
 async def test_describe_available_after_start() -> None:
@@ -127,7 +127,7 @@ async def test_start_cleans_up_env_when_setup_fails(monkeypatch) -> None:
     # If setup raises after begin_session pushed per-episode state, start() returns no
     # ServedEpisode for the caller to close — so it must close the env itself, dropping
     # that state. Otherwise the in-process server leaks a session entry permanently.
-    from hgym.envs.wordle import env_v1, mcp_server
+    from shogym.envs.wordle import env_v1, mcp_server
 
     original = env_v1.WordleV1Env._begin_session
 

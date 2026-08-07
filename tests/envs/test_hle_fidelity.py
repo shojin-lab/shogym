@@ -1,6 +1,6 @@
 """Keyed fidelity check: the real ``OpenAIJudge`` grades a served HLE episode as a human would.
 
-Issue #33 asks HLE to give hgym its first *model-graded* verifier. The offline suite proves
+Issue #33 asks HLE to give shogym its first *model-graded* verifier. The offline suite proves
 the plumbing with a scripted judge; this test proves the **real LLM judge** actually
 distinguishes right from wrong on a served episode: a paraphrased-but-correct answer whose
 surface form defeats the exact-match fast path must be graded ``correct``, and a clearly
@@ -23,7 +23,7 @@ pytest.importorskip("openai", reason="hle extra not installed")
 if not os.getenv("OPENAI_API_KEY"):
     pytest.skip("OPENAI_API_KEY not set; keyed HLE judge test skipped", allow_module_level=True)
 
-from hgym.serve import ServedEpisode  # noqa: E402
+from shogym.serve import ServedEpisode  # noqa: E402
 
 # A fact unambiguous enough that a competent judge grades it deterministically, with a gold
 # answer whose exact string differs from the (correct) response we submit — so the judge, not

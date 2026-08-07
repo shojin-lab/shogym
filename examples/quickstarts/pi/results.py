@@ -19,7 +19,7 @@ import sys
 from pathlib import Path
 from typing import List, Optional, Sequence
 
-from hgym.serve.stream import ResultRow, read_results, reconcile
+from shogym.serve.stream import ResultRow, read_results, reconcile
 
 RUNS = Path(__file__).resolve().parent / "runs"
 

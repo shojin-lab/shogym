@@ -1,6 +1,6 @@
 # Hermes quickstart
 
-Point the `hermes` CLI you already use at a **stream of hgym tasks**. The agent pulls a task,
+Point the `hermes` CLI you already use at a **stream of shogym tasks**. The agent pulls a task,
 plays it with the env's own tools, pulls the next one, and stops when the queue is empty. The
 server scores every task as it ends; you read the scores back afterwards, out of a durable record
 the agent never sees.
@@ -21,9 +21,9 @@ Three moves, and the whole quickstart is these three:
   below, which is less obvious than it looks.
 - Credentials for it. See [Providers](#providers) below, which has one trap worth reading.
 - [uv](https://docs.astral.sh/uv/), for the pinned Python 3.12 venv. `uv sync` at the repo root
-  installs hgym with every env extra (the default dev group), which is what the default env
+  installs shogym with every env extra (the default dev group), which is what the default env
   below needs. On its first run `automationbench` also fetches its pinned upstream source into
-  `~/.cache/hgym` once; after that it is fully offline and needs no key.
+  `~/.cache/shogym` once; after that it is fully offline and needs no key.
 
 ### Installing Hermes
 
@@ -73,7 +73,7 @@ cp config.yaml "$HERMES_HOME/config.yaml"
 uv sync
 
 # 4. check the wiring -- connects, lists tools, disconnects. No model, no spend, no run recorded
-hermes mcp test hgym
+hermes mcp test shogym
 
 # 5. play the stream
 #   -z                    -> one-shot: run the prompt to completion, print only the final text
@@ -88,12 +88,12 @@ hermes -z "$(cat PROMPT.txt)" \
 uv run python results.py
 ```
 
-`hermes mcp test hgym` is the cheapest thing in this directory and worth running first. It
+`hermes mcp test shogym` is the cheapest thing in this directory and worth running first. It
 spawns `serve.py`, completes the MCP handshake and prints the tool list, which is exactly what
 the agent will be handed:
 
 ```
-  Testing 'hgym'...
+  Testing 'shogym'...
   Transport: stdio → uv
   Auth: none
   ✓ Connected (12642ms)
@@ -119,23 +119,23 @@ disk. Hermes makes that an allowlist rather than a deny list, because **each MCP
 itself a toolset**, registered as `mcp-<server>` with the bare server name as an alias:
 
 ```bash
-hermes -z "$(cat PROMPT.txt)" -t hgym        # the stream, and nothing else
+hermes -z "$(cat PROMPT.txt)" -t shogym        # the stream, and nothing else
 ```
 
-`-t/--toolsets` replaces the enabled set outright, so naming only `hgym` turns every built-in
+`-t/--toolsets` replaces the enabled set outright, so naming only `shogym` turns every built-in
 toolset off. What survives is the stream plus Hermes's own tool-calling surface, verified by
-asking a run under `-t hgym` to list its tools:
+asking a run under `-t shogym` to list its tools:
 
 ```
 tool_search  tool_describe  tool_call  parallel
-mcp__hgym__get_task     mcp__hgym__queue_info    mcp__hgym__terminate
-mcp__hgym__api_search   mcp__hgym__api_fetch     mcp__hgym__base64_encode   mcp__hgym__done
-mcp__hgym__get_prompt   mcp__hgym__list_prompts  mcp__hgym__list_resources  mcp__hgym__read_resource
+mcp__shogym__get_task     mcp__shogym__queue_info    mcp__shogym__terminate
+mcp__shogym__api_search   mcp__shogym__api_fetch     mcp__shogym__base64_encode   mcp__shogym__done
+mcp__shogym__get_prompt   mcp__shogym__list_prompts  mcp__shogym__list_resources  mcp__shogym__read_resource
 ```
 
 (Real output, reflowed; `ENV = "automationbench"`.) `mcp__<server>__<tool>` is the wire name, so
 the server key in `config.yaml` is what the model sees. The four `get_prompt`/`list_*`/
-`read_resource` entries are the MCP protocol surface Hermes registers per server; hgym publishes
+`read_resource` entries are the MCP protocol surface Hermes registers per server; shogym publishes
 neither prompts nor resources, so they return nothing. `hermes tools disable <toolset>` makes the
 same choice persistent in this `HERMES_HOME` instead of per-invocation.
 
@@ -153,14 +153,14 @@ and point the same server key at it. No `command`, no `args`, no `env` block:
 
 ```yaml
 mcp_servers:
-  hgym:
+  shogym:
     url: http://127.0.0.1:8973/mcp
     connect_timeout: 60.0
     enabled: true
 ```
 
-`hermes mcp add hgym --url http://127.0.0.1:8973/mcp` is the `mcp add` form of the same entry.
-Hermes also supports `transport: sse` for SSE servers; hgym serves streamable HTTP, so leave it
+`hermes mcp add shogym --url http://127.0.0.1:8973/mcp` is the `mcp add` form of the same entry.
+Hermes also supports `transport: sse` for SSE servers; shogym serves streamable HTTP, so leave it
 off.
 
 ## Swap the env
@@ -168,22 +168,22 @@ off.
 Either set it for one run, without touching a tracked file:
 
 ```bash
-HGYM_ENV=wordle_v1 HGYM_TASKS=0,1 <the command above>
+SHOGYM_ENV=wordle_v1 SHOGYM_TASKS=0,1 <the command above>
 ```
 
 or change the default, which is one line in `serve.py`:
 
 ```python
-ENV = os.environ.get("HGYM_ENV") or "automationbench"   # "wordle_v1", "hle", "yc_bench", ...
+ENV = os.environ.get("SHOGYM_ENV") or "automationbench"   # "wordle_v1", "hle", "yc_bench", ...
 ```
 
-`HGYM_ENV` wins when it is set, so the environment variable is the one to reach for while you are
+`SHOGYM_ENV` wins when it is set, so the environment variable is the one to reach for while you are
 trying envs out and the literal is the one to edit when you have picked.
 
 Nothing else changes. Not `config.yaml`, not the prompt, not `results.py`, not the command above.
 `TASKS = [0, 1, 2]` is the other constant, and the only thing to check when you swap: task index
 ranges differ per env, and some envs need their extra installed and a key exported (see
-`src/hgym/envs/<env>/README.md`, and the `env:` block above for how a key reaches a stdio
+`src/shogym/envs/<env>/README.md`, and the `env:` block above for how a key reaches a stdio
 server). `wordle_v1` needs neither and is the cheapest place to start.
 
 ## Read the results
@@ -224,7 +224,7 @@ The rows are JSONL on disk under `runs/<env>-<stamp>/`, so any reader will do:
 
 ```bash
 uv run python -c "
-from hgym.serve.stream import read_results
+from shogym.serve.stream import read_results
 for r in read_results('runs/wordle_v1-<stamp>'):
     print(r.position, r.env, r.task_idx, r.closure, r.score and r.score.reward)"
 ```
@@ -254,7 +254,7 @@ The checked-in `config.yaml` is the whole configuration and is deliberately shor
 
 ```yaml
 mcp_servers:
-  hgym:
+  shogym:
     command: uv
     args: ["run", "python", "serve.py"]
     connect_timeout: 90.0
@@ -262,9 +262,9 @@ mcp_servers:
 ```
 
 That is the whole file, and Hermes accepts it as-is: everything else in a Hermes config has a
-default. `hermes mcp add hgym --command uv --args run python serve.py --connect-timeout 90`
+default. `hermes mcp add shogym --command uv --args run python serve.py --connect-timeout 90`
 writes the same block (plus a `_config_version:` line and a commented template of every other
-setting), and `hermes mcp list` / `hermes mcp test` / `hermes mcp remove hgym` manage it. Note
+setting), and `hermes mcp list` / `hermes mcp test` / `hermes mcp remove shogym` manage it. Note
 that `mcp add` is discovery-first (it connects, lists the tools, and asks which to enable), so
 it wants a TTY; copying the file is the headless path. Two things about the block are
 load-bearing:
@@ -324,7 +324,7 @@ lease (above 1, the served tools gain a `lease` argument).
 | File | What it is |
 |---|---|
 | `serve.py` | the MCP endpoint Hermes spawns: builds the `TaskStream`, serves it over stdio (or HTTP) |
-| `config.yaml` | the `mcp_servers` block, copied into an isolated `$HERMES_HOME`, server key `hgym` |
+| `config.yaml` | the `mcp_servers` block, copied into an isolated `$HERMES_HOME`, server key `shogym` |
 | `PROMPT.txt` | the loop the agent runs: `get_task`, play, end, repeat |
 | `results.py` | reads the durable rows back out after the run |
 | `.hermes/` | the throwaway Hermes home this quickstart creates. Gitignored. |

@@ -22,8 +22,8 @@ datasets = pytest.importorskip("datasets", reason="hle extra not installed")
 import pyarrow as pa  # noqa: E402  (comes with datasets)
 from datasets import Dataset, DatasetInfo, Features, Image, Value  # noqa: E402
 
-from hgym.envs.hle import data as hle_data  # noqa: E402
-from hgym.envs.hle.data import is_gating_error  # noqa: E402
+from shogym.envs.hle import data as hle_data  # noqa: E402
+from shogym.envs.hle.data import is_gating_error  # noqa: E402
 
 # Marker bytes standing in for an encoded image; never decoded (that would need Pillow).
 _FAKE_IMAGE_BYTES = b"\x89PNG\r\n\x1a\n not-a-real-image"

@@ -1,6 +1,6 @@
 # Pi quickstart
 
-Point the `pi` CLI you already use at a **stream of hgym tasks**. The agent pulls a task, plays it
+Point the `pi` CLI you already use at a **stream of shogym tasks**. The agent pulls a task, plays it
 with the env's own tools, pulls the next one, and stops when the queue is empty. The server scores
 every task as it ends; you read the scores back afterwards, out of a durable record the agent
 never sees.
@@ -33,9 +33,9 @@ Three moves, and the whole quickstart is these three:
   login bills per token out of extra usage rather than against plan limits. Either way this run
   spends API money, not subscription allowance.
 - [uv](https://docs.astral.sh/uv/), for the pinned Python 3.12 venv. `uv sync` at the repo root
-  installs hgym with every env extra (the default dev group), which is what the default env
+  installs shogym with every env extra (the default dev group), which is what the default env
   below needs. On its first run `automationbench` also fetches its pinned upstream source into
-  `~/.cache/hgym` once; after that it is fully offline and needs no key.
+  `~/.cache/shogym` once; after that it is fully offline and needs no key.
 
 ## Run it
 
@@ -50,8 +50,8 @@ uv sync
 pi install npm:pi-mcp-extension@1.5.0 -l -a
 
 # 3. play the stream
-#   .pi/mcp.json is found by cwd -> no flag; it spawns serve.py under the server key "hgym",
-#                                   so the stream's tools are mcp_hgym_*
+#   .pi/mcp.json is found by cwd -> no flag; it spawns serve.py under the server key "shogym",
+#                                   so the stream's tools are mcp_shogym_*
 #   -p                           -> non-interactive: run the prompt to completion and exit
 #   --approve                    -> trust this project's .pi/ for the run (it is code, so Pi asks)
 #   --provider / --model         -> not optional: Pi's default provider is google
@@ -76,7 +76,7 @@ bridge's:
 ```
 
 That flag is the whole answer here: it disables the built-ins and leaves extension-registered
-tools enabled, so `mcp_hgym_*` is the entire affordance set and an agent with `read` cannot go
+tools enabled, so `mcp_shogym_*` is the entire affordance set and an agent with `read` cannot go
 find the env's task definitions on disk. Do NOT reach for `--no-tools` instead: that one strips
 everything, the bridge's tools included.
 
@@ -85,22 +85,22 @@ everything, the bridge's tools included.
 Either set it for one run, without touching a tracked file:
 
 ```bash
-HGYM_ENV=wordle_v1 HGYM_TASKS=0,1 <the command above>
+SHOGYM_ENV=wordle_v1 SHOGYM_TASKS=0,1 <the command above>
 ```
 
 or change the default, which is one line in `serve.py`:
 
 ```python
-ENV = os.environ.get("HGYM_ENV") or "automationbench"   # "wordle_v1", "hle", "yc_bench", ...
+ENV = os.environ.get("SHOGYM_ENV") or "automationbench"   # "wordle_v1", "hle", "yc_bench", ...
 ```
 
-`HGYM_ENV` wins when it is set, so the environment variable is the one to reach for while you are
+`SHOGYM_ENV` wins when it is set, so the environment variable is the one to reach for while you are
 trying envs out and the literal is the one to edit when you have picked.
 
 Nothing else changes. Not `.pi/mcp.json`, not the prompt, not `results.py`, not the command above.
 `TASKS = [0, 1, 2]` is the other constant, and the only thing to check when you swap: task index
 ranges differ per env, and some envs need their extra installed and a key exported (see
-`src/hgym/envs/<env>/README.md`). `wordle_v1` needs neither and is the cheapest place to start.
+`src/shogym/envs/<env>/README.md`). `wordle_v1` needs neither and is the cheapest place to start.
 
 ## Read the results
 
@@ -132,7 +132,7 @@ The rows are JSONL on disk under `runs/<env>-<stamp>/`, so any reader will do:
 
 ```bash
 uv run python -c "
-from hgym.serve.stream import read_results
+from shogym.serve.stream import read_results
 for r in read_results('runs/automationbench-<stamp>'):
     print(r.position, r.env, r.task_idx, r.closure, r.score and r.score.reward)"
 ```
@@ -180,7 +180,7 @@ lease (above 1, the served tools gain a `lease` argument).
 | File | What it is |
 |---|---|
 | `serve.py` | the MCP endpoint the bridge spawns: builds the `TaskStream`, serves it over stdio |
-| `.pi/mcp.json` | tells the bridge how to spawn it, under the server key `hgym` (hence `mcp_hgym_*`) |
+| `.pi/mcp.json` | tells the bridge how to spawn it, under the server key `shogym` (hence `mcp_shogym_*`) |
 | `.pi/settings.json` | the bridge itself, pinned, project-scoped so `~/.pi` is untouched |
 | `PROMPT.txt` | the loop the agent runs: `get_task`, play, end, repeat |
 | `results.py` | reads the durable rows back out after the run |

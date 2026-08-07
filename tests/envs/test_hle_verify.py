@@ -9,8 +9,8 @@ from __future__ import annotations
 
 from typing import Optional
 
-from hgym.envs.hle.env_v1 import score_evidence
-from hgym.serve.lifecycle import TerminalEvidence
+from shogym.envs.hle.env_v1 import score_evidence
+from shogym.serve.lifecycle import TerminalEvidence
 
 
 def _evidence(

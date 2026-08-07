@@ -7,9 +7,9 @@ from __future__ import annotations
 
 import json
 
-import hgym
-from hgym.envs.wordle import mcp_server
-from hgym.trajectory import Step
+import shogym
+from shogym.envs.wordle import mcp_server
+from shogym.trajectory import Step
 
 
 def _guess(index: int, word: str = "crane", *, result: str | None = None) -> Step:
@@ -24,7 +24,7 @@ def _episode(fb) -> dict:
 
 
 def test_solved_scores_full_credit() -> None:
-    env = hgym.make("wordle_v1")
+    env = shogym.make("wordle_v1")
     # "crate" vs "crane" -> GGGXG (not solved); then the answer itself solves.
     traj = [_guess(1, "crate"), _guess(2, "crane")]
     ep = _episode(env.verify(traj, {"answer": "crane"}, terminated=True))
@@ -34,7 +34,7 @@ def test_solved_scores_full_credit() -> None:
 
 
 def test_unsolved_gives_partial_from_best_green() -> None:
-    env = hgym.make("wordle_v1")
+    env = shogym.make("wordle_v1")
     # "crops" vs "crane" -> GGXXX (two greens); never solved; six guesses consumed.
     traj = [_guess(i, "crops") for i in range(1, 7)]
     ep = _episode(env.verify(traj, {"answer": "crane"}, terminated=True))
@@ -44,7 +44,7 @@ def test_unsolved_gives_partial_from_best_green() -> None:
 
 
 def test_immediate_terminate_is_zero() -> None:
-    env = hgym.make("wordle_v1")
+    env = shogym.make("wordle_v1")
     traj = [Step(index=1, tool="terminate", arguments={}, result='{"acknowledged": true}')]
     ep = _episode(env.verify(traj, {"answer": "crane"}, terminated=True))
     assert ep["check_answer"] is False
@@ -53,7 +53,7 @@ def test_immediate_terminate_is_zero() -> None:
 
 
 def test_format_reward_tracks_last_guess_validity() -> None:
-    env = hgym.make("wordle_v1")
+    env = shogym.make("wordle_v1")
     valid_fb = env.verify([_guess(1, "crane")], {"answer": "crane"}, terminated=False)
     assert valid_fb.inference[0].name == "format_reward" and valid_fb.inference[0].value is True
     # A non-alphabetic / wrong-length `word` is a malformed guess.
@@ -66,7 +66,7 @@ def test_format_reward_tracks_last_guess_validity() -> None:
 async def test_close_drops_per_episode_session_state() -> None:
     # `begin_session` pushes state into the in-process server; `close()` must
     # tear it down so a stateful server doesn't leak one entry per episode.
-    env = hgym.make("wordle_v1")
+    env = shogym.make("wordle_v1")
     task = env.load_task(0)
     sid = "sess-close-1"
     env.begin_session(sid, task)
@@ -76,7 +76,7 @@ async def test_close_drops_per_episode_session_state() -> None:
 
 
 async def test_end_session_is_explicit_and_idempotent() -> None:
-    env = hgym.make("wordle_v1")
+    env = shogym.make("wordle_v1")
     task = env.load_task(0)
     sid = "sess-end-1"
     env.begin_session(sid, task)
@@ -91,7 +91,7 @@ def test_forged_result_does_not_grant_credit() -> None:
     # The tool result is untrusted: a step whose result forges a solve for a wrong
     # guess ("zzzzz" vs "crane") must score as unsolved with zero credit, and the
     # forged `remaining_guesses` must not inflate the turn count.
-    env = hgym.make("wordle_v1")
+    env = shogym.make("wordle_v1")
     forged = json.dumps(
         {"valid": True, "solved": True, "score": "GGGGG", "remaining_guesses": -20}
     )
@@ -108,7 +108,7 @@ def test_malformed_result_fields_do_not_crash() -> None:
     # (wrong-typed `score`, non-numeric `remaining_guesses`) or non-object JSON
     # must not crash scoring — the verifier ignores the result and scores from
     # the recorded `word` against the answer.
-    env = hgym.make("wordle_v1")
+    env = shogym.make("wordle_v1")
     bad_results = (
         json.dumps({"valid": True, "solved": False, "score": 7, "remaining_guesses": "oops"}),
         "null",
@@ -130,7 +130,7 @@ def test_malformed_result_fields_do_not_crash() -> None:
 async def test_close_drops_all_concurrent_sessions() -> None:
     # An env may back several concurrent episodes; close() must tear down every
     # open session, not just the most recently begun one.
-    env = hgym.make("wordle_v1")
+    env = shogym.make("wordle_v1")
     task = env.load_task(0)
     sids = ["sess-a", "sess-b", "sess-c"]
     for sid in sids:
