@@ -934,6 +934,25 @@ async def _block_the_forced_terminal(live: Any, gate: asyncio.Event) -> asyncio.
     return entered
 
 
+def _arm_deadline(stream: TaskStream, deadline: float) -> None:
+    """Turn the deadline on *after* the test's setup is in place.
+
+    An episode's clock starts the moment it is dispensed, so a stream constructed with a live
+    deadline is racing the rest of the setup below: the watchdog can reap the first episode,
+    dropping its entry from `_live`, before the test has taken the handle it installs its block
+    on. That window is not made safe by a faster machine; it depends on the scheduler never
+    handing the watchdog a turn at the wrong moment, which is exactly what a loaded runner does
+    differently (a 60ms yield between the two dispenses reproduces the `KeyError` every time).
+
+    Arming here instead means no wall clock decides whether the setup completes. It costs the
+    tests nothing: what they are about is *which* tasks the watchdog claims in one scan and in
+    what order it waits on them, and they already choose the moment of expiry themselves, so the
+    deadline only has to be enforced once the episodes they mean to expire exist.
+    """
+    stream._deadline = deadline  # noqa: SLF001
+    stream._start_watchdog()  # noqa: SLF001
+
+
 async def test_every_expired_task_is_claimed_before_any_seal_is_waited_on(
     tmp_path: Path,
 ) -> None:
@@ -943,7 +962,7 @@ async def test_every_expired_task_is_claimed_before_any_seal_is_waited_on(
     # still unclaimed — and an unclaimed task is one `_resolve` keeps routing calls to, so the
     # agent could earn a scored, `sealed` row on a task whose clock ran out.
     gate = asyncio.Event()
-    async with _stream(tmp_path, [0, 1], max_in_flight=2, deadline=0.05) as stream:
+    async with _stream(tmp_path, [0, 1], max_in_flight=2) as stream:
         first = await stream.get_task()
         second = await stream.get_task()
         assert first is not None and second is not None
@@ -957,6 +976,8 @@ async def test_every_expired_task_is_claimed_before_any_seal_is_waited_on(
         started = min(live.started for live in stream._live.values())  # noqa: SLF001
         for live in stream._live.values():  # noqa: SLF001
             live.started = started - 1.0
+        # Both are already out of time before the clock exists, so the first scan meets both.
+        _arm_deadline(stream, 0.05)
         await asyncio.wait_for(entered.wait(), timeout=5)  # the watchdog is stuck on the first
 
         payload = _payload(
@@ -978,12 +999,17 @@ async def test_a_blocked_seal_does_not_stop_the_clock_for_a_later_task(
     # loop would never even look at the task dispensed after it. At capacity 1 there is nothing
     # to lose — a stuck seal blocks the next pull too — which is why this only exists here.
     gate = asyncio.Event()
-    async with _stream(tmp_path, [0, 1, 2], max_in_flight=3, deadline=0.05) as stream:
+    async with _stream(tmp_path, [0, 1, 2], max_in_flight=3) as stream:
         first = await stream.get_task()
         assert first is not None
         entered = await _block_the_forced_terminal(
             stream._live[first.lease], gate  # noqa: SLF001
         )
+        # The clock starts here, on an episode this test still holds: the block is installed, so
+        # the seal the deadline forces is the one that gets stuck. `first` was dispensed a moment
+        # ago, so its deadline is a real one; what the arming removes is only the race between
+        # the watchdog and the lookup above.
+        _arm_deadline(stream, 0.05)
         await asyncio.wait_for(entered.wait(), timeout=5)
 
         later = await stream.get_task()  # dispensed while the first seal is stuck
