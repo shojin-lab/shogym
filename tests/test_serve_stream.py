@@ -468,9 +468,17 @@ async def test_an_env_that_raises_while_ending_a_task_is_redacted_and_stops_the_
 
     # A task was still dispensed, so exactly one row is owed and lands — unscored, with the
     # feedback that never serialized absent from it, which is what makes the loss legible.
+    #
+    # It is unscored the strong way now. The terminal transaction commits fail-closed before it
+    # hands the serializer failure to this stream (see `shogym.serve.episode._run_finalize`), so
+    # the core's own stamp says the finalization failed and the closure says the same, instead of
+    # the row reading as a task the stream drained to an end that merely published no headline.
+    # The durable record underneath says `FAILED`, and the two now agree about one task.
     (row,) = _rows(tmp_path / "right")
     assert row["observed"] == [], "feedback that never serialized cannot be on the row"
-    assert row["score"] == {"reward": None, "success": None, "feedback": []}
+    assert row["score"] is None, "a task whose finalization failed closed was headlined"
+    assert row["closure"] == "finalize_error"
+    assert "failed closed" in (row["diagnostic"] or ""), "the file must say why it is unscored"
     assert right.stopped, "a run that lost an outcome reported itself complete"
     with pytest.raises(RuntimeError, match="raised while ending a task.*must be finite") as end:
         await right.aclose()
@@ -1285,9 +1293,13 @@ def _publishes_undescribable(items: List[Tuple[str, Any]]) -> Callable[[str], _F
 
     The assignment is the point and it is not a contrivance: pydantic coerces a `str` subclass
     back to a plain `str` at construction, so a value published the ordinary way never reaches
-    the record as a subclass. The models are mutable and do not validate on assignment — the
-    hole `dump_item`'s own docstring names — and `dump_item` then carries the value through
-    verbatim, because the wire dict is built from `item.value` and it validates a *copy*."""
+    the *episode* as a subclass. The models are mutable and do not validate on assignment (the
+    hole `dump_item`'s own docstring names), so this is how an env hands one over.
+
+    What the episode does with it changed: it renders its terminal feedback once and retains only
+    the rendering (`shogym.serve.episode._core_feedback`), so the subclass stops there and what
+    reaches this record is plain data. The refusals below are about the *value*, which survives
+    the rendering, so they are unchanged; describing it no longer runs the env's own code."""
 
     class _Published(_FixtureScoreEnv):
         def _verify(self, trajectory, task, *, terminated, evidence=None) -> FeedbackCollection:
@@ -1303,29 +1315,41 @@ def _publishes_undescribable(items: List[Tuple[str, Any]]) -> Callable[[str], _F
 
 
 @pytest.mark.parametrize(
-    "items, refusal",
+    "items, refusal, described",
     [
         # Wrong-typed: the refusal names what the value must be, and the value is the decoration.
-        ([("success", _Undescribable("false"))], "'success' must be true or false"),
+        (
+            [("success", _Undescribable("false"))],
+            "'success' must be true or false",
+            "got 'false' (str)",
+        ),
         # Duplicated: the refusal is about the count, which no env code is needed to know.
         (
             [("success", _Undescribable("x")), ("success", True)],
             "'success' was published 2 times",
+            "('x', True)",
         ),
     ],
 )
 async def test_a_summary_value_that_cannot_be_described_still_fails_loudly(
-    tmp_path: Path, items: List[Tuple[str, Any]], refusal: str
+    tmp_path: Path, items: List[Tuple[str, Any]], refusal: str, described: str
 ) -> None:
     # `_pick_summary` refuses a summary value by building a message *about* it, and building it
-    # calls the env's own `__repr__`. Unguarded, the value decides whether its own refusal
-    # happens: the raise escaped the `_MalformedSummary` handler, so the row was never composed,
+    # calls the env's own `__repr__`. Unguarded, the value decided whether its own refusal
+    # happened: the raise escaped the `_MalformedSummary` handler, so the row was never composed,
     # no evidence reached the file, and the run reported "a dispensed task could not be recorded"
     # — a storage failure that never happened, sending an operator to the provenance volume for
     # something that never touched it.
     #
-    # The refusal outranks its own decoration. The row lands first with the value verbatim, the
-    # stream stops loudly, and the description degrades to the failure that asking raised.
+    # The refusal outranks its own decoration. The row lands first with the value verbatim and
+    # the stream stops loudly, whatever describing it costs.
+    #
+    # The env's object no longer gets this far: the episode renders its terminal feedback once
+    # and retains the rendering, so what this record describes is a plain `str` and the
+    # description is of the value the file holds. What is being *refused* is unchanged, because
+    # a wrong type and a duplicate name both survive a rendering intact, which is the point of
+    # the two arms. The containment around the description is kept and is now belt and braces;
+    # nothing this side of the episode can reach it.
     clean = await _clean_terminal_response(tmp_path)
     stream = TaskStream(
         _publishes_undescribable(items),
@@ -1350,26 +1374,33 @@ async def test_a_summary_value_that_cannot_be_described_still_fails_loudly(
         await stream.get_task()
     with pytest.raises(RuntimeError, match=f"cannot headline.*{refusal}") as end:
         await stream.aclose()
-    # The env's own failure is named rather than swallowed, so the operator is pointed at the
-    # env that published the value and not at the filesystem.
-    assert "RuntimeError: repr exploded" in str(end.value)
+    # The operator is pointed at the env that published the value and not at the filesystem, and
+    # the value is named: the record describes its own rendering, so asking what it is cannot
+    # raise and cannot be answered with a degraded stand-in either.
+    assert described in str(end.value)
+    assert "repr exploded" not in str(end.value)
 
 
-async def test_a_feedback_name_that_cannot_be_compared_still_lands_the_row_it_earned(
+async def test_a_feedback_name_this_record_could_not_read_never_reaches_the_record(
     tmp_path: Path,
 ) -> None:
-    # The other half of the funnel, and the one that was left open. Finding a summary item
-    # *matches names*, and a name is an object the env supplied — the same post-construction
-    # `str` subclass the wire admits above, here with a raising `__eq__` instead of a raising
-    # `__repr__`. That raise is not a `_MalformedSummary`, so it escaped the one handler around
-    # the summary and took the whole seal with it: no row was ever composed, nothing reached the
-    # file, and the durable dispense went unanswered — so `reconcile` reported the run as a
-    # broker crash. The task below is *correct*, and a correct, sealed, graded task was being
-    # filed as an evaluator that fell over.
+    # The sibling of the verdict key below, and the same defect closed the same way: at its
+    # source rather than in this record's containment. Finding a summary item *matches names*,
+    # and a name used to be an object the env supplied. The wire dict was built by reading each
+    # field once and putting the object it read into a new dict, so a post-construction `str`
+    # subclass rode into the episode's retained terminal feedback and this record compared
+    # against it. With a raising `__eq__` that took the whole seal with it (no row composed,
+    # nothing in the file, the dispense unanswered and `reconcile` calling the run a broker
+    # crash); contained here, it cost a correctly graded task its score.
     #
-    # A summary this record cannot read is the same finding as one it cannot honour, so it gets
-    # the same answer: the row lands with the env's evidence verbatim and no headline, and then
-    # the stream stops.
+    # The episode now renders its terminal feedback to plain data once and retains only the
+    # rendering (`shogym.serve.episode._core_feedback`), so the name this record reads is a
+    # `str` and the subclass reaches nothing that compares it. The task below is correct, and
+    # what it earned is what the file says. That is the better of the two outcomes, which is why
+    # this test asserts it instead of the containment it used to prove.
+    #
+    # The containment itself is untouched and still covers the funnel; what it no longer has is
+    # an env-shaped way in, exactly as the sibling below records for the verdict key.
     class _ExplodingName(str):
         def __eq__(self, other: object) -> bool:
             raise RuntimeError("eq exploded")
@@ -1397,39 +1428,49 @@ async def test_a_feedback_name_that_cannot_be_compared_still_lands_the_row_it_ea
 
     (row,) = _rows(tmp_path)
     assert row["closure"] == "sealed", "the agent's own seal was reclassified"
-    assert row["score"] is None, "a summary this record could not read was headlined anyway"
+    assert row["score"] is not None and row["score"]["success"] is True, (
+        "a correctly graded task was unscored over a name object beside its evidence"
+    )
     assert row["observed"] == [
         _episode_item("correct", True)
     ], "the evidence the agent earned must survive verbatim"
-    assert "cannot headline" in (row["diagnostic"] or ""), "the file must say why it is unscored"
-    # Serialised before it is compared, because the in-memory row keeps the env's items exactly
-    # as the env published them — the name in it is the object that raises.
-    assert json.loads(json.dumps(stream.results[0].to_wire())) == row
+    assert row["diagnostic"] is None, "an earned row carries no failure"
+    # Compared directly, because the row this run keeps holds the rendering and not the object:
+    # there is nothing left in it for a serialization to flatten first.
+    assert stream.results[0].to_wire() == row
     assert stream.queue_info().in_flight == 0, "the episode outlived its recorded row"
-    # The point of the row landing: the dispense is answered, so the run is not read back as a
-    # crash that never happened.
+    # The dispense is answered, so the run is not read back as a crash that never happened.
     assert reconcile(tmp_path / "prov") == []
-    assert stream.stopped, "an env whose names cannot be compared may not serve the rest of a queue"
-    with pytest.raises(RuntimeError, match="cannot headline.*eq exploded"):
-        await stream.get_task()
-    with pytest.raises(RuntimeError, match="cannot headline.*eq exploded") as end:
-        await stream.aclose()
-    assert "RuntimeError: eq exploded" in str(end.value)
+    assert not stream.stopped, "nothing failed: the name never reached anything that reads it"
+    # And the run goes on, because the feedback this record holds is plain data.
+    assert await stream.get_task() is not None
+    await stream.aclose()
 
 
-async def test_a_verdict_this_record_cannot_read_still_lands_the_row_it_owes(
+async def test_a_verdict_key_this_record_could_not_read_never_reaches_the_record(
     tmp_path: Path,
 ) -> None:
-    # The same defect one step earlier, at the sibling read: the closure is classified from the
-    # core's terminal payload, which is the verdict dict *the env returned* with the core's flag
-    # written over it — so reading it compares this module's key against keys the env owns, and
-    # an env's `__eq__` is env code. Uncontained, that raise reached `_seal_redacted`, which
-    # stops the stream and swallows the exception, so no row was composed even though `dispatch`
-    # had already decided one was owed. The dispense went unanswered and `reconcile` called the
-    # run a broker crash.
+    # The same defect one step earlier, at the sibling read, and now closed at its source rather
+    # than contained here. The closure is classified from the core's terminal payload, and that
+    # payload used to be the verdict dict *the env returned* with the core's flag written over
+    # it — so reading it compared this module's key against keys the env owned, and an env's
+    # `__eq__` is env code. Uncontained, that raise reached `_seal_redacted`, which stops the
+    # stream and swallows the exception, so no row was composed even though `dispatch` had
+    # already decided one was owed; the dispense went unanswered and `reconcile` called the run a
+    # broker crash. Contained, it cost the task its score: a correctly graded submission was
+    # filed `finalize_error` and unscored because of a key object beside the verdict.
     #
-    # A verdict this record cannot read is a task with no verdict standing behind it, which is
-    # what a failed terminal already means — so it is recorded as one, and the row lands.
+    # The episode now renders the env's verdict to plain data at the evaluator boundary (see
+    # `shogym.serve.episode._wire_verdict`), so what this record reads is the wire form of the
+    # verdict and never the env's own objects. There is nothing left here to compare against a
+    # key that raises, and the task is recorded as what the agent earned.
+    #
+    # The containment this test used to prove was, for a while, still proved by the sibling above
+    # it, because feedback items stayed the env's objects deliberately. They do not any more: the
+    # episode renders them once and retains the rendering, so that sibling now asserts the same
+    # earned row this one does. The containment in the funnel is kept and has no env-shaped way
+    # in; what still reaches it is a summary that is wrong-typed or published twice, which is
+    # what `test_a_summary_value_that_cannot_be_described_still_fails_loudly` holds.
     class _ExplodingKey(str):
         def __eq__(self, other: object) -> bool:
             raise RuntimeError("key eq exploded")
@@ -1455,14 +1496,17 @@ async def test_a_verdict_this_record_cannot_read_still_lands_the_row_it_owes(
     assert _terminal_text(await stream.dispatch(SUBMIT_TOOL, {"answer": "4"})) == clean
 
     (row,) = _rows(tmp_path)
-    assert row["closure"] == "finalize_error", "a task with no readable verdict is not a seal"
-    assert row["score"] is None, "a task with no verdict behind it may not be scored"
-    assert "key eq exploded" in (row["diagnostic"] or ""), "the file must name what failed"
+    assert row["closure"] == "sealed", "the agent's own seal was reclassified"
+    assert row["score"] is not None and row["score"]["success"] is True, (
+        "a correctly graded task was unscored over a key object beside its verdict"
+    )
+    assert row["diagnostic"] is None, "an earned row carries no failure"
     assert stream.results[0].to_wire() == row
-    assert reconcile(tmp_path / "prov") == [], "the durable dispense went unanswered"
-    assert stream.stopped
-    with pytest.raises(RuntimeError, match="key eq exploded"):
-        await stream.aclose()
+    assert reconcile(tmp_path / "prov") == []
+    assert not stream.stopped, "nothing failed: the key never reached anything that reads it"
+    # And the run goes on, because the verdict this record holds is plain data.
+    assert await stream.get_task() is not None
+    await stream.aclose()
 
 
 async def test_a_row_keeps_each_item_at_the_level_the_env_published_it(
@@ -1533,6 +1577,11 @@ async def test_the_run_keeps_the_row_the_file_holds(tmp_path: Path) -> None:
     # `__deepcopy__` raises turns reading a finished run's results into an exception.
     #
     # Re-read, the same row is plain data: the copies below are of what the file holds.
+    #
+    # The episode closed that particular door on its own side afterwards: it renders its terminal
+    # feedback once and retains the rendering, so the subclass below no longer reaches even the
+    # composed row. What still separates the two rows is the aliasing at the end of this test, and
+    # that is what it is here to hold now.
     class _Uncopyable(str):
         def __deepcopy__(self, memo: Any) -> Any:
             raise RuntimeError("this value cannot be copied")
@@ -1791,7 +1840,7 @@ async def test_a_drifted_tool_name_that_cannot_be_described_still_stops_the_stre
     #
     # Neither half of the comparison is the env's object any more. The published side is frozen
     # when it is read (`_frozen_manifest`) and the episode side is snapshotted in wire form
-    # (`shogym.serve.episode._wire_form`), so an undescribable name is plain text by the time
+    # (`shogym.serve.episode._core_spec`), so an undescribable name is plain text by the time
     # anything here reads it: the drift is named plainly and the stop lands. The guard the name
     # used to need is still what stands behind the values that *are* the env's — the published
     # feedback a summary refusal is about (see `_pick_summary`).
@@ -1860,6 +1909,15 @@ async def test_an_episode_manifest_that_cannot_be_compared_still_stops_the_strea
     # A manifest this stream cannot compare is one it cannot confirm, which is the finding this
     # check already exists to act on: the published signature is only ever a schema that
     # serialized, so one that does not is a different manifest and is refused like any other.
+    #
+    # Closed at its source since. A schema the wire cannot carry is refused by the episode when
+    # it builds its contract, because deferring that to whoever could compare it only worked
+    # where such a layer existed, and `ServedEpisode` is also the transport-independent engine.
+    # So this shape never reaches the comparison any more, and what is asserted is the same thing
+    # one layer earlier: the refusal names the env, the stop is latched, the position is still
+    # owed, `aclose()` does not report a clean run, and both envs are closed. The comparison
+    # keeps its own coverage through manifests that serialize and *differ*, which is the test
+    # above this one.
     def make_the_schema_unserializable(spec: TaskSpec) -> None:
         for manifest in spec.tools:
             if manifest.name == SUBMIT_TOOL:
@@ -1871,7 +1929,7 @@ async def test_an_episode_manifest_that_cannot_be_compared_still_stops_the_strea
         [TaskRef(ENV_NAME, 0), TaskRef(ENV_NAME, 1)],
         prov_dir=tmp_path / "prov",
     )
-    with pytest.raises(RuntimeError, match="different tool manifest.*not be compared") as refused:
+    with pytest.raises(RuntimeError, match="cannot take as a contract") as refused:
         await stream.get_task()
     # The env's own failure is named rather than swallowed, so the operator is pointed at the
     # schema that could not be read.
@@ -2008,26 +2066,27 @@ async def test_reading_the_published_contract_cannot_rewrite_it(tmp_path: Path) 
     ("break_spec", "defect"),
     [
         pytest.param(
-            lambda spec: setattr(spec, "instructions", object()),
-            "instructions are not the text",
-            id="the instructions are not text",
+            # Text that is text and cannot be encoded stays here; text that is not text at all is
+            # refused by the episode when it builds its contract, one layer earlier, and is
+            # covered there (`test_a_contract_field_the_wire_cannot_carry_is_refused_in_the_env_s_name`).
+            lambda spec: setattr(spec, "instructions", "answer this \udfff question"),
+            "could not put it on the wire",
+            id="the instructions are text with a second unencodable code point",
         ),
-        pytest.param(
-            lambda spec: setattr(spec, "horizon", 2.5),
-            "budget is not a whole number",
-            id="the budget is not a whole number of steps",
-        ),
-        pytest.param(
-            # `bool` is an `int` subclass, so an unguarded test would advertise `True` as a
-            # budget of one step.
-            lambda spec: setattr(spec, "horizon", True),
-            "budget is not a whole number",
-            id="the budget is a bool",
-        ),
+        # The two budget arms that stood here (`horizon=2.5`, `horizon=True`) have moved to the
+        # episode, for the same reason the instructions arm above did. The budget is a value the
+        # episode *runs on*, so letting a wrong-typed one through to be refused here left the
+        # transport-independent engine that `evaluate()` drives with no gate at all: it enforced
+        # `horizon=True` as a budget of one step. They are covered by
+        # `test_a_contract_this_layer_runs_on_is_refused_by_every_surface_alike` in
+        # tests/test_serve_episode_fail_closed.py, which holds both surfaces to one answer, and by
+        # one arm of the class-A stream test there. `_require_framable` keeps the check itself:
+        # it re-reads the spec where the framing is built, and a second read of an env's object is
+        # a second value.
         pytest.param(
             # Text to every `isinstance` check, and a `UnicodeEncodeError` the moment the
             # endpoint encodes it — a framing whose type is right and whose bytes do not exist.
-            # The three above are settled by the declared types; this one is only settled by
+            # The declared types are settled one layer earlier now; this one is only settled by
             # actually encoding the two values, which is what the check proves rather than
             # assumes. The phrasing is the spec-side one: a failure the whole-object proof
             # caught instead would blame the framing, not the env that published it.
@@ -2397,9 +2456,17 @@ async def test_a_framing_that_cannot_be_read_still_stops_the_stream(tmp_path: Pa
     # A framing this stream cannot read is one it cannot hand over, which is the finding this
     # check already exists to act on.
     #
-    # A subclass of the spec rather than a stand-in, because the episode snapshots the contract
-    # it was opened on with `model_copy(deep=True)` — a copy keeps the class, so what the check
-    # reads is still an object whose own code answers for the field.
+    # Closed at its source since. The episode no longer hands this check anything whose own code
+    # answers for a field: it rebuilds the published contract as a core `TaskSpec` out of one
+    # reading of each part, and a part it cannot read is refused there, in the env's name, as a
+    # `TaskContractError` the stream stops the run on. So the shape below never reaches
+    # `_require_framable` any more, and what this asserts is the same thing one layer earlier:
+    # the refusal names the env, the stop is latched, the position is still owed, and `aclose()`
+    # does not report a clean run over a queue nothing served.
+    #
+    # `_require_framable`'s own containment keeps its coverage through the framings that are
+    # readable and unusable, which is the whole of
+    # `test_a_task_this_endpoint_cannot_hand_over_is_never_dispensed`.
     class _UnreadableSpec(TaskSpec):
         def __getattribute__(self, name: str) -> Any:
             if name == "instructions":
@@ -2421,14 +2488,14 @@ async def test_a_framing_that_cannot_be_read_still_stops_the_stream(tmp_path: Pa
     stream = TaskStream(
         factory, [TaskRef(ENV_NAME, 0), TaskRef(ENV_NAME, 1)], prov_dir=tmp_path / "prov"
     )
-    with pytest.raises(RuntimeError, match="cannot hand out.*reading it raised") as refused:
+    with pytest.raises(RuntimeError, match="cannot take as a contract") as refused:
         await stream.get_task()
     # The env that published it is pointed at, rather than the failure being swallowed.
     assert "RuntimeError: instructions exploded" in str(refused.value)
 
     assert stream.stopped, "the stop the refusal owes was lost to reading the framing"
     assert stream.queue_info() == QueueInfo(remaining=2, consumed=0, in_flight=0)
-    with pytest.raises(RuntimeError, match="could not be served past it"):
+    with pytest.raises(RuntimeError, match="no further task can be scored"):
         await stream.get_task()
     with pytest.raises(RuntimeError, match="stopped before its queue was served"):
         await stream.aclose()

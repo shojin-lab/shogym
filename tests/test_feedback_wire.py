@@ -180,3 +180,58 @@ def test_visibility_rule_default_and_optin() -> None:
     # Explicit per-tool opt-in surfaces inference; episode still only at terminal.
     assert select_inband(items, terminal=False, surface_inference=True) == [inf]
     assert select_inband(items, terminal=True, surface_inference=True) == [inf, ep]
+
+
+@pytest.mark.parametrize(
+    "value",
+    [
+        pytest.param(7, id="an ordinary integer"),
+        pytest.param(9007199254740993, id="an integer past float precision"),
+        pytest.param(10**400, id="an integer past float range"),
+    ],
+)
+def test_an_integer_value_survives_the_wire_as_the_integer_it_was(value: int) -> None:
+    """The wire admits any JSON scalar, and the models it was rebuilt through admitted fewer.
+
+    ``value`` is declared ``float | bool | str`` on the models, so building an item through the
+    *constructor* handed the annotation the last word over a contract that says ``int`` is a
+    scalar like any other. A value published as ``9007199254740993`` came back as
+    ``9007199254740992.0``, and one past the float range came back as nothing at all: the item was
+    refused, on both boundaries, because the serializer validates through the same rebuild.
+
+    So the rebuild carries what the checks passed. Value **and type**, because equality alone
+    cannot see this: ``9007199254740992.0 == 9007199254740992`` is true, and the two numbers a
+    reward could be here differ in the last place."""
+    item = EpisodeFeedback(name="reward", value=1.0)
+    item.value = value  # assignment validation is off, so the integer reaches the wire as one
+    step_item = InferenceFeedback(name="reward", value=1.0, step=1)
+    step_item.value = value
+
+    meta = build_meta([step_item, item])
+    (dumped_step, dumped) = meta[FEEDBACK_META_KEY]
+    assert dumped["value"] == value and type(dumped["value"]) is int
+    assert dumped_step["value"] == value and type(dumped_step["value"]) is int
+
+    parsed, _ = parse_meta(meta)
+    assert [p.value for p in parsed] == [value, value]
+    assert [type(p.value) for p in parsed] == [int, int]
+    # And the round trip is closed: what a consumer rebuilds serializes to what it was given.
+    assert build_meta(parsed)[FEEDBACK_META_KEY] == meta[FEEDBACK_META_KEY]
+
+
+def test_a_feedback_name_that_is_not_text_is_still_refused() -> None:
+    """The check the models used to make, now made here.
+
+    Rebuilding with ``model_construct`` skips the annotation, which is the point: the annotation
+    was narrower than the wire for ``value``. It was exactly right for ``name``, which is the key
+    a record is composed and headlined by, so that check is written down rather than inherited."""
+    item = EpisodeFeedback(name="reward", value=1.0)
+    item.name = 7  # type: ignore[assignment]  # off-wire, like every other mutation here
+    with pytest.raises(ValueError, match="name must be text"):
+        build_meta([item])
+    with pytest.raises(ValueError, match="name must be text"):
+        parse_meta({FEEDBACK_META_KEY: [{"name": 7, "value": 1.0, "level": "episode"}]})
+    with pytest.raises(ValueError, match="name must be text"):
+        parse_meta(
+            {FEEDBACK_META_KEY: [{"name": None, "value": 1.0, "level": "inference", "step": 1}]}
+        )
