@@ -37,9 +37,6 @@ hgym = "hgym.cli:main"
 
 [project.optional-dependencies]
 analysis = ["pandas>=2.2", "duckdb>=1.0"]
-# Only the real OpenAI model path in examples/openai_harness.py needs this — the core and
-# the offline tests never import openai.
-examples = ["openai>=1.99"]
 # The tau2-bench port (src/hgym/envs/tau2), pinned to an upstream commit SHA: `[gym]` pulls
 # gymnasium (the GymAgent bridge needs it), `[knowledge]` pulls rank-bm25 (banking's offline
 # retrieval). Kept as an optional extra so `pip install hgym` (and the core test suite) stay

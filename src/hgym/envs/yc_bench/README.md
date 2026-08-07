@@ -13,7 +13,7 @@ a recorded trajectory while an external harness drives the tools — see
 *external driver* to advance the sim, feed CLI results back, and collect the next commands.
 hgym's harness *is* that driver, so the port is a clean wrap — only the *agent* is replaced (by
 the harness, through the served tools). The runnable demo is
-[`examples/yc_bench/claude_code/`](../../../../examples/yc_bench/claude_code/).
+[`examples/quickstarts/`](../../../../examples/quickstarts/).
 
 ## Running it
 
@@ -52,16 +52,18 @@ reads the verdict off the trace via `hgym.result_from_trace(...)`.
 `sim.horizon_years`), `start_date` / `company_name` (seeding params, defaults match
 `yc-bench run`), and `command_timeout_seconds`.
 
-### Claude Code example
+### Quickstart
 
-The runnable end-to-end demo (Claude Code plays a served YC-Bench year; hgym scores off the
-trace) lives in [`examples/yc_bench/claude_code/`](../../../../examples/yc_bench/claude_code/):
+Any quickstart under [`examples/quickstarts/`](../../../../examples/quickstarts/) serves this env: one MCP endpoint
+hands out a queue of tasks and scores each one server-side. Point it here with the single
+variable at the top of its `serve.py`:
 
-```bash
-# Fully offline sim — no OpenAI/YC-Bench key (the Claude harness still makes model calls):
-uv run python examples/yc_bench/claude_code/run.py --task 0
-uv run python examples/yc_bench/claude_code/run.py --task 0 --transcript
+```python
+ENV = "yc_bench"
 ```
+
+The sim itself is fully offline and needs no OpenAI or YC-Bench key; the harness still
+makes its own model calls.
 
 ## Requirements
 

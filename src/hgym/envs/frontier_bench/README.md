@@ -12,7 +12,7 @@ Like every hgym env this **describes** a task, **serves** its tools over MCP, an
 recorded trajectory while an external harness drives the tools — see [`../README.md`](../README.md).
 The verdict is computed server-side by the task's own verifier over the container end-state, so
 the pure `verify` stays a function over the sealed episode's evidence. The runnable demo is
-[`examples/frontier_bench/claude_code/`](../../../../examples/frontier_bench/claude_code/).
+[`examples/quickstarts/`](../../../../examples/quickstarts/).
 
 This slice ports the **CPU-only, single-container, `separate`-mode, pytest-verified,
 small-bundled-data** tasks — **5** of them, exposed as `num_tasks` and selectable by **index**
@@ -73,15 +73,17 @@ debugging).
 
 ### Claude Code example
 
-The runnable end-to-end demo (Claude Code operates the served container; hgym scores off the
-trace) lives in
-[`examples/frontier_bench/claude_code/`](../../../../examples/frontier_bench/claude_code/):
+### Quickstart
 
-```bash
-# Needs Docker + Claude credentials (the Claude harness makes model calls):
-uv run python examples/frontier_bench/claude_code/run.py --task 0
-uv run python examples/frontier_bench/claude_code/run.py --task 0 --transcript
+Any quickstart under [`examples/quickstarts/`](../../../../examples/quickstarts/) serves this env: one MCP endpoint
+hands out a queue of tasks and scores each one server-side. Point it here with the single
+variable at the top of its `serve.py`:
+
+```python
+ENV = "frontier_bench"
 ```
+
+Needs a local Docker daemon; the harness supplies its own model credentials.
 
 ## Requirements
 

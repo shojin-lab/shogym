@@ -1,16 +1,44 @@
 """Harness-agnostic evaluation (RFC 008 §7): evaluate() drives a served env with an
-in-process harness and reads the terminal feedback off the trace. Offline — the example
-harness loop runs against a scripted policy (no network)."""
+in-process harness and reads the terminal feedback off the trace. Offline — the harness
+loop below runs against a scripted policy (no network)."""
 
 from __future__ import annotations
 
 import pytest
 from pathlib import Path
-from typing import Any, Dict, List
+from typing import Any, Awaitable, Callable, Dict, List, Tuple
+
+from fastmcp import Client
 
 import hgym
-from examples.openai_harness import run_episode
 from hgym.evaluate import result_from_trace
+from hgym.feedback import parse_meta
+
+ToolCall = Tuple[str, Dict[str, Any]]
+# (instructions, tools_manifest, transcript) -> the tool calls to issue this turn.
+ChatFn = Callable[[str, List[Dict[str, Any]], List[Dict[str, Any]]], Awaitable[List[ToolCall]]]
+
+
+async def run_episode(client: Client, chat: ChatFn, *, max_steps: int = 30) -> None:
+    """Drive a served env as an MCP client: read the task, then loop model -> tool calls ->
+    tool results until the env terminates (or ``max_steps``). The model is injected as a
+    ``chat`` coroutine so the loop runs offline against a scripted policy."""
+    spec = (await client.call_tool("describe", {})).data
+    instructions: str = spec["instructions"]
+    tools: List[Dict[str, Any]] = spec["tools"]
+    transcript: List[Dict[str, Any]] = []
+
+    for _ in range(max_steps):
+        calls = await chat(instructions, tools, transcript)
+        if not calls:
+            break
+        for name, args in calls:
+            result = await client.call_tool(name, args, raise_on_error=False)
+            content = result.content[0].text if result.content else ""
+            _, terminated = parse_meta(result.meta or {})
+            transcript.append({"tool": name, "args": args, "result": content})
+            if terminated:
+                return
 
 
 def _answer(task_idx: int) -> str:

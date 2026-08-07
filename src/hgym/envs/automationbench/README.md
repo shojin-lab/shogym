@@ -13,7 +13,7 @@ a recorded trajectory while an external harness drives the tools — see
 `StatefulToolEnv`); this port throws that away and reuses only the three deterministic,
 `verifiers`-free pieces (the simulated tools + `WorldState` engine, the typed task defs, and
 the pure rubric). The runnable demo is
-[`examples/automationbench/claude_code/`](../../../../examples/automationbench/claude_code/README.md).
+[`examples/quickstarts/`](../../../../examples/quickstarts/).
 
 ## Running it
 
@@ -52,11 +52,16 @@ tests), and `max_steps` (the tool-call budget; the hgym horizon is `max_steps + 
 task prompts advertise; the `+2` keeps the horizon a hair above the budget so a run can still
 call `done` explicitly).
 
-### Claude Code example
+### Quickstart
 
-The runnable end-to-end demo (Claude Code plays a served episode end-to-end; hgym scores off the
-trace) lives in
-[`examples/automationbench/claude_code/`](../../../../examples/automationbench/claude_code/README.md).
+Any quickstart under [`examples/quickstarts/`](../../../../examples/quickstarts/) serves this env: one MCP endpoint
+hands out a queue of tasks and scores each one server-side. Point it here with the single
+variable at the top of its `serve.py`:
+
+```python
+ENV = "automationbench"
+```
+
 Score an in-process episode directly:
 
 ```python

@@ -34,8 +34,7 @@ Or evaluate a harness in-process and read the terminal feedback:
 ```python
 import hgym
 
-# `harness` is an async callable given a FastMCP client connected to the served env;
-# see examples/openai_harness.py for a runnable one.
+# `harness` is an async callable given a FastMCP client connected to the served env.
 result = await hgym.evaluate("wordle_v1", task=17, harness=my_harness)
 print(result.value("check_answer"))
 ```
@@ -83,23 +82,13 @@ env-README template.
   own verifier over the container end-state. A CPU-only, single-container slice (5 tasks). Needs
   the `frontier_bench` extra and a local Docker daemon (no key or data download).
 
-Runnable end-to-end demos (Claude Code drives a served env; hgym scores off the trace):
+Runnable end-to-end quickstarts live under [`examples/quickstarts/`](examples/quickstarts/),
+one per harness. Each publishes a **stream** of tasks: one MCP endpoint serves a whole queue,
+the agent pulls a task, plays it with the env's own tools, and pulls the next until the queue
+is empty. The server scores every task as it ends, into a durable record the agent never sees.
 
-- **[`examples/wordle/claude_code/`](examples/wordle/claude_code/README.md)** — Claude Code
-  plays Wordle through a served hgym env.
-- **[`examples/tau2/claude_code/`](examples/tau2/claude_code/README.md)** — Claude Code plays
-  a tau2 domain; hgym scores it with tau2's evaluator.
-- **[`examples/yc_bench/claude_code/`](examples/yc_bench/claude_code/README.md)** — Claude Code
-  operates the YC-Bench startup sim; hgym scores the run off the trace.
-- **[`examples/hle/claude_code/`](examples/hle/claude_code/README.md)** — Claude Code answers an
-  HLE question through a served hgym env; hgym grades it server-side.
-- **[`examples/browsecomp_plus/claude_code/`](examples/browsecomp_plus/claude_code/README.md)** —
-  Claude Code answers a BrowseComp-Plus query against the fixed corpus; hgym grades it and scores
-  retrieval off the trace.
-- **[`examples/automationbench/claude_code/`](examples/automationbench/claude_code/README.md)** —
-  Claude Code runs an AutomationBench workflow through a served env; hgym scores the end-state.
-- **[`examples/frontier_bench/claude_code/`](examples/frontier_bench/claude_code/README.md)** —
-  Claude Code operates a served Frontier-Bench container; hgym scores off the task's own verifier.
+Swapping the environment is one variable at the top of `serve.py`, so any quickstart runs any
+env in the catalogue above.
 
 ## License
 

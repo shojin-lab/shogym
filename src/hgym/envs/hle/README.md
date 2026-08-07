@@ -10,7 +10,7 @@ Like every hgym env this **describes** a task, **serves** its tools over MCP, an
 a recorded trajectory while an external harness drives the tools — see
 [`../README.md`](../README.md). Here the single tool grades server-side, so the verifier stays
 a pure function over the sealed episode's evidence. The runnable demo is
-[`examples/hle/claude_code/`](../../../../examples/hle/claude_code/).
+[`examples/quickstarts/`](../../../../examples/quickstarts/).
 
 ## Running it
 
@@ -46,15 +46,18 @@ reads the verdict off the trace via `hgym.result_from_trace(...)`.
 `judge` (an injected [`Judge`](judge.py) — a scripted judge for offline runs), and
 `judge_model` / `judge_base_url` (the default judge's model + endpoint).
 
-### Claude Code example
+### Quickstart
 
-The runnable end-to-end demo (Claude Code answers a served HLE question; hgym scores it with
-the LLM judge) lives in [`examples/hle/claude_code/`](../../../../examples/hle/claude_code/):
+Any quickstart under [`examples/quickstarts/`](../../../../examples/quickstarts/) serves this env: one MCP endpoint
+hands out a queue of tasks and scores each one server-side. Point it here with the single
+variable at the top of its `serve.py`:
 
-```bash
-export OPENAI_API_KEY=sk-...
-uv run python examples/hle/claude_code/run.py --task 0 --transcript
+```python
+ENV = "hle"
 ```
+
+The default judge is model-graded, so this needs `OPENAI_API_KEY` set in the environment
+the server runs in.
 
 ## Requirements
 

@@ -5,7 +5,7 @@ This is the reference implementation of hgym's **env-as-center** design: an envi
 with a pure function — see [`../README.md`](../README.md). Wordle shows each step in the
 smallest honest form: a `guess` tool, the reserved `terminate`, and a pure trajectory
 verifier. The end-to-end demo lives at
-[`examples/wordle/claude_code/`](../../../../examples/wordle/claude_code/README.md).
+[`examples/quickstarts/`](../../../../examples/quickstarts/).
 
 `wordle_v1` is a **marker/trivial** env: it has no `finalize` hook — the episode ends on
 `terminate` or the horizon and `verify` scores the recorded guesses directly (see the
@@ -29,15 +29,15 @@ env_test = hgym.make("wordle_v1", config={"task_split": "test"})
 hgym serve wordle_v1 --task 0 --trace ./hgym_logs/wordle.jsonl
 ```
 
-**Drive it with Claude Code** (the reference external harness):
+**Drive it with Claude Code** (the reference external harness) via the quickstart at
+[`examples/quickstarts/claude_code/`](../../../../examples/quickstarts/claude_code/), with one variable set:
 
-```bash
-python examples/wordle/claude_code/run.py --task 0
+```python
+ENV = "wordle_v1"
 ```
 
-Claude Code spawns `hgym serve` as its MCP server, plays the episode through
-`describe`/`guess`/`terminate`, and writes the JSONL trace; hgym never sees its model,
-prompt, or loop. See [`examples/wordle/claude_code/README.md`](../../../../examples/wordle/claude_code/README.md).
+Claude Code spawns the quickstart's `serve.py` as its MCP server and plays each task through
+`get_task` plus the env's own tools; hgym never sees its model, prompt, or loop.
 
 **Drive it in-process** with `hgym.evaluate` — hand it an async harness callable that
 receives a FastMCP `Client` connected to the served env:

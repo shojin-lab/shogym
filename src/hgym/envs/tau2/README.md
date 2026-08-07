@@ -11,7 +11,7 @@ a recorded trajectory while an external harness drives the tools — see
 [`../README.md`](../README.md). tau2's own contract is different (its `Orchestrator` *drives
 the agent*); this port bridges the two by replacing only the agent, keeping tau2's benchmark
 intact. The runnable demo is
-[`examples/tau2/claude_code/`](../../../../examples/tau2/claude_code/).
+[`examples/quickstarts/`](../../../../examples/quickstarts/).
 
 ## Running it
 
@@ -45,19 +45,18 @@ reads the verdict off the trace via `hgym.result_from_trace(...)`.
 simulator — pass `user_llm_args={"mock_response": "…"}` for a deterministic **offline** user),
 and `evaluation_type` (default `"all"`; use `"env"` for an offline run of an NL-basis domain).
 
-### Claude Code example
+### Quickstart
 
-The runnable end-to-end demo (Claude Code plays a served tau2 env; hgym scores off the
-trace) lives in [`examples/tau2/claude_code/`](../../../../examples/tau2/claude_code/):
+Any quickstart under [`examples/quickstarts/`](../../../../examples/quickstarts/) serves this env: one MCP endpoint
+hands out a queue of tasks and scores each one server-side. Point it here with the single
+variable at the top of its `serve.py`:
 
-```bash
-# mock domain — offline (no OpenAI key, no user-sim cost); auto-downloads tau2 data:
-uv run python examples/tau2/claude_code/run.py --task 0
-
-# a real (non-solo) domain — needs OPENAI_API_KEY for tau2's user simulator (real cost):
-export OPENAI_API_KEY=sk-...
-uv run python examples/tau2/claude_code/run.py --domain telecom --task 0 --transcript
+```python
+ENV = "tau2_mock"
 ```
+
+The mock domain is fully offline and auto-downloads tau2's data. A real (non-solo) domain
+additionally needs `OPENAI_API_KEY` for tau2's own user simulator, which is a real cost.
 
 ## Requirements
 
