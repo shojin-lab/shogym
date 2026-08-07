@@ -12,10 +12,13 @@ import pytest
 
 pytest.importorskip("datasets", reason="automationbench extra (datasets) not installed")
 
-try:
-    from shogym.envs.automationbench import adapter
-except Exception as exc:  # pragma: no cover - network/provisioning failure
-    pytest.skip(f"AutomationBench upstream source unavailable: {exc}", allow_module_level=True)
+from tests._fixtures.upstream_gate import gate
+
+adapter = gate(
+    "shogym.envs.automationbench.adapter",
+    package="automationbench",
+    extra="automationbench",
+)
 
 import shogym  # noqa: E402,F401 — registers the env
 from shogym.envs.registration import make, registered_envs  # noqa: E402

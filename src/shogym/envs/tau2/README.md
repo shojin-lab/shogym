@@ -15,8 +15,9 @@ intact. The runnable demo is
 
 ## Running it
 
-> Requires **Python 3.12 + the `tau2` extra** and tau2 data — see [Requirements](#requirements)
-> below. The Claude Code example handles both for you.
+> Requires **Python 3.12 + the `tau2` extra**, tau2 data (`TAU2_DATA_DIR`), and a one-time
+> fetch of the pinned upstream source on first construction — see
+> [Requirements](#requirements) below.
 
 ### Construct + serve
 
@@ -55,8 +56,9 @@ variable at the top of its `serve.py`:
 ENV = "tau2_mock"
 ```
 
-The mock domain is fully offline and auto-downloads tau2's data. A real (non-solo) domain
-additionally needs `OPENAI_API_KEY` for tau2's own user simulator, which is a real cost.
+The mock domain is fully offline once `TAU2_DATA_DIR` points at a tau2-bench `data/` checkout.
+A real (non-solo) domain additionally needs `OPENAI_API_KEY` for tau2's own user simulator,
+which is a real cost.
 
 ## Requirements
 
@@ -64,9 +66,19 @@ The Python pin and the `uv sync` / `pip install` / `import shogym` mechanics are
 [requirements boilerplate](../README.md#requirements-boilerplate); the `tau2` extra is in the
 default `dev` group, so `uv sync` includes it. On top of that:
 
-- **tau2 data.** tau2 does **not** ship its `data/` in the install, so it must be
-  provisioned: either set `TAU2_DATA_DIR` to a tau2 data checkout, or use the Claude Code
-  example, which **lazy-downloads** the pinned data to `~/.cache/shogym/tau2-bench` on first run.
+- **The pinned upstream source is provisioned at runtime** into `~/.cache/shogym/tau2/<sha>/`
+  on first construction — a one-time network fetch (~93 MB downloaded, ~5 MB kept; only
+  `src/tau2` is extracted, the archive's ~700 MB of benchmark `data/` is filtered out). Set
+  `TAU2_SRC` to a local checkout (a dir containing the `tau2` package) to skip the fetch, or
+  `SHOGYM_CACHE` to relocate the cache. Upstream is **not** a pip dependency: PyPI forbids
+  direct (`@ git+…`) references, and the `tau2` name on PyPI belongs to an unrelated
+  magnetochemistry library — so the port fetches and imports the pinned source instead, exactly
+  as `automationbench` does. The `tau2` extra declares upstream's own runtime dependencies
+  explicitly (its base deps plus its `[gym]` and `[knowledge]` extras), since pip no longer
+  resolves them transitively.
+- **tau2 data**, separately. tau2 does **not** ship its `data/` in the install, and the runtime
+  source fetch deliberately does not carry it either, so it must be provisioned: set
+  `TAU2_DATA_DIR` to a tau2-bench `data/` checkout.
 - **`OPENAI_API_KEY`** — required for the **default/live user simulator** on non-solo domains
   (it's an OpenAI LLM), and for evaluator paths that call a judge (NL assertions) or dense
   retrieval (retail, banking). It is *not* needed to run a non-solo domain with a scripted

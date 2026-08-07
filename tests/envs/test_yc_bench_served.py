@@ -1,19 +1,24 @@
 """End-to-end: drive a served ``yc_bench`` episode through shogym's serve layer and check that
 YC-Bench's sim state flows back into episode feedback through the seal-before-verdict path.
 
-Requires the ``yc_bench`` extra — skipped otherwise, so the offline core suite stays green.
-YC-Bench generates its whole world deterministically from the seed and runs its sim in
-process, so the entire path (seed → CLI commands → sealed finalize → verdict) runs offline,
-with no model calls or API keys.
+Requires the ``yc_bench`` extra and the provisioned upstream source — skipped otherwise (naming
+the reason), so the offline core suite stays green. YC-Bench generates its whole world
+deterministically from the seed and runs its sim in process, so once the source is cached the
+entire path (seed → CLI commands → sealed finalize → verdict) runs offline, with no model calls
+or API keys.
 """
 
 from __future__ import annotations
 
 import json
 
-import pytest
+from tests._fixtures.upstream_gate import gate
 
-pytest.importorskip("yc_bench", reason="yc_bench extra not installed")
+# Provisions the pinned upstream source (network on a cold cache) and imports yc_bench, so this is
+# also the check that the `yc_bench` extra is installed. A missing extra or an unreachable network
+# skips; anything else — upstream drift, a broken adapter, a corrupt cache — fails, so a
+# regression can never make this module's tests quietly disappear.
+gate("shogym.envs.yc_bench.adapter", package="yc_bench", extra="yc_bench")
 
 from shogym.envs.yc_bench import mcp_server  # noqa: E402
 from shogym.serve import ServedEpisode  # noqa: E402

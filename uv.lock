@@ -2380,10 +2380,38 @@ hle = [
     { name = "openai" },
 ]
 tau2 = [
-    { name = "tau2", extra = ["gym", "knowledge"] },
+    { name = "addict" },
+    { name = "deepdiff" },
+    { name = "docstring-parser" },
+    { name = "fastapi" },
+    { name = "gymnasium" },
+    { name = "httpx" },
+    { name = "litellm" },
+    { name = "loguru" },
+    { name = "numpy" },
+    { name = "openai" },
+    { name = "pandas" },
+    { name = "psutil" },
+    { name = "python-dotenv" },
+    { name = "pyyaml" },
+    { name = "rank-bm25" },
+    { name = "requests" },
+    { name = "rich" },
+    { name = "tabulate" },
+    { name = "tenacity" },
+    { name = "toml" },
+    { name = "typer" },
+    { name = "uvicorn" },
 ]
 yc-bench = [
-    { name = "yc-bench" },
+    { name = "litellm" },
+    { name = "matplotlib" },
+    { name = "plotly" },
+    { name = "pydantic" },
+    { name = "python-dotenv" },
+    { name = "sqlalchemy" },
+    { name = "streamlit" },
+    { name = "typer" },
 ]
 
 [package.dev-dependencies]
@@ -2397,21 +2425,49 @@ dev = [
 
 [package.metadata]
 requires-dist = [
+    { name = "addict", marker = "extra == 'tau2'", specifier = ">=2.4.0" },
     { name = "datasets", marker = "extra == 'automationbench'", specifier = ">=2.19" },
     { name = "datasets", marker = "extra == 'browsecomp-plus'", specifier = ">=2.19" },
     { name = "datasets", marker = "extra == 'hle'", specifier = ">=2.19" },
+    { name = "deepdiff", marker = "extra == 'tau2'", specifier = ">=8.4.2" },
+    { name = "docstring-parser", marker = "extra == 'tau2'", specifier = ">=0.16" },
     { name = "duckdb", marker = "extra == 'analysis'", specifier = ">=1.0" },
+    { name = "fastapi", marker = "extra == 'tau2'", specifier = ">=0.115.11" },
     { name = "fastmcp", specifier = ">=3.2" },
+    { name = "gymnasium", marker = "extra == 'tau2'", specifier = ">=1.2.2" },
+    { name = "httpx", marker = "extra == 'tau2'", specifier = ">=0.24.0" },
     { name = "jsonschema", specifier = ">=4.20" },
+    { name = "litellm", marker = "extra == 'tau2'", specifier = ">=1.80.15,<1.82.7" },
+    { name = "litellm", marker = "extra == 'yc-bench'", specifier = ">=1.40" },
+    { name = "loguru", marker = "extra == 'tau2'", specifier = ">=0.7.3" },
+    { name = "matplotlib", marker = "extra == 'yc-bench'", specifier = ">=3.10.8" },
     { name = "minijinja", specifier = ">=2.0" },
     { name = "numpy", specifier = ">=1.26" },
+    { name = "numpy", marker = "extra == 'tau2'", specifier = ">=1.24.0" },
     { name = "openai", marker = "extra == 'browsecomp-plus'", specifier = ">=1.99" },
     { name = "openai", marker = "extra == 'hle'", specifier = ">=1.99" },
+    { name = "openai", marker = "extra == 'tau2'", specifier = ">=1.0.0" },
     { name = "pandas", marker = "extra == 'analysis'", specifier = ">=2.2" },
+    { name = "pandas", marker = "extra == 'tau2'", specifier = ">=2.2.3" },
+    { name = "plotly", marker = "extra == 'yc-bench'", specifier = ">=6.6.0" },
+    { name = "psutil", marker = "extra == 'tau2'", specifier = ">=7.0.0" },
     { name = "pydantic", specifier = ">=2.7" },
+    { name = "pydantic", marker = "extra == 'yc-bench'", specifier = ">=2.0" },
     { name = "pyserini", marker = "extra == 'browsecomp-plus'", specifier = ">=0.22" },
-    { name = "tau2", extras = ["gym", "knowledge"], marker = "extra == 'tau2'", git = "https://github.com/sierra-research/tau2-bench?rev=1d244f5dca42944b67a379b44bfeb9f5748f189d" },
-    { name = "yc-bench", marker = "extra == 'yc-bench'", git = "https://github.com/collinear-ai/yc-bench?rev=e7d606789be4c52a34f9fa5b04ada4a2eaf9d731" },
+    { name = "python-dotenv", marker = "extra == 'tau2'", specifier = ">=1.0.0" },
+    { name = "python-dotenv", marker = "extra == 'yc-bench'", specifier = ">=1.0" },
+    { name = "pyyaml", marker = "extra == 'tau2'", specifier = ">=6.0.2" },
+    { name = "rank-bm25", marker = "extra == 'tau2'", specifier = ">=0.2.2" },
+    { name = "requests", marker = "extra == 'tau2'", specifier = ">=2.31.0" },
+    { name = "rich", marker = "extra == 'tau2'" },
+    { name = "sqlalchemy", marker = "extra == 'yc-bench'", specifier = ">=2.0" },
+    { name = "streamlit", marker = "extra == 'yc-bench'", specifier = ">=1.55.0" },
+    { name = "tabulate", marker = "extra == 'tau2'", specifier = ">=0.9.0" },
+    { name = "tenacity", marker = "extra == 'tau2'", specifier = ">=9.0.0" },
+    { name = "toml", marker = "extra == 'tau2'", specifier = ">=0.10.2" },
+    { name = "typer", marker = "extra == 'tau2'", specifier = ">=0.12.5" },
+    { name = "typer", marker = "extra == 'yc-bench'", specifier = ">=0.9" },
+    { name = "uvicorn", marker = "extra == 'tau2'", specifier = ">=0.34.0" },
 ]
 provides-extras = ["analysis", "tau2", "hle", "yc-bench", "frontier-bench", "automationbench", "browsecomp-plus"]
 
@@ -2555,41 +2611,6 @@ source = { registry = "https://pypi.org/simple" }
 sdist = { url = "https://files.pythonhosted.org/packages/46/58/8c37dea7bbf769b20d58e7ace7e5edfe65b849442b00ffcdd56be88697c6/tabulate-0.10.0.tar.gz", hash = "sha256:e2cfde8f79420f6deeffdeda9aaec3b6bc5abce947655d17ac662b126e48a60d", size = 91754, upload-time = "2026-03-04T18:55:34.402Z" }
 wheels = [
     { url = "https://files.pythonhosted.org/packages/99/55/db07de81b5c630da5cbf5c7df646580ca26dfaefa593667fc6f2fe016d2e/tabulate-0.10.0-py3-none-any.whl", hash = "sha256:f0b0622e567335c8fabaaa659f1b33bcb6ddfe2e496071b743aa113f8774f2d3", size = 39814, upload-time = "2026-03-04T18:55:31.284Z" },
-]
-
-[[package]]
-name = "tau2"
-version = "1.0.1"
-source = { git = "https://github.com/sierra-research/tau2-bench?rev=1d244f5dca42944b67a379b44bfeb9f5748f189d#1d244f5dca42944b67a379b44bfeb9f5748f189d" }
-dependencies = [
-    { name = "addict" },
-    { name = "deepdiff" },
-    { name = "docstring-parser" },
-    { name = "fastapi" },
-    { name = "httpx" },
-    { name = "litellm" },
-    { name = "loguru" },
-    { name = "numpy" },
-    { name = "pandas" },
-    { name = "psutil" },
-    { name = "python-dotenv" },
-    { name = "pyyaml" },
-    { name = "requests" },
-    { name = "rich" },
-    { name = "tabulate" },
-    { name = "tenacity" },
-    { name = "toml" },
-    { name = "typer" },
-    { name = "uvicorn" },
-]
-
-[package.optional-dependencies]
-gym = [
-    { name = "gymnasium" },
-]
-knowledge = [
-    { name = "openai" },
-    { name = "rank-bm25" },
 ]
 
 [[package]]
@@ -2946,21 +2967,6 @@ wheels = [
     { url = "https://files.pythonhosted.org/packages/c4/27/41eb51bbd1b8d89546b83897cfb0164f1e109304fd408dbb151b639eec0f/yarl-1.24.5-cp312-cp312-win_amd64.whl", hash = "sha256:a929d878fec099030c292803b31e5d5540a7b6a31e6a3cc76cb4685fc2a2f51b", size = 97618, upload-time = "2026-07-20T02:05:55.57Z" },
     { url = "https://files.pythonhosted.org/packages/3c/25/b2553764b3d65db711d8f45416351ec4f420847558eb669edcbcaadf5780/yarl-1.24.5-cp312-cp312-win_arm64.whl", hash = "sha256:7ce27823052e2013b597e0c738b13e7e36b8ccb9400df8959417b052ab0fd92c", size = 93018, upload-time = "2026-07-20T02:05:57.554Z" },
     { url = "https://files.pythonhosted.org/packages/61/02/962c1cbfc401a30c1d034dc67ff395f64b52302c6d62de556c1fca99acc0/yarl-1.24.5-py3-none-any.whl", hash = "sha256:a33700d13d9b7d84fd10947b09ff69fb9a792e519c8cb9764a3ca70baa6c23a7", size = 58612, upload-time = "2026-07-20T02:07:43.461Z" },
-]
-
-[[package]]
-name = "yc-bench"
-version = "0.1.0"
-source = { git = "https://github.com/collinear-ai/yc-bench?rev=e7d606789be4c52a34f9fa5b04ada4a2eaf9d731#e7d606789be4c52a34f9fa5b04ada4a2eaf9d731" }
-dependencies = [
-    { name = "litellm" },
-    { name = "matplotlib" },
-    { name = "plotly" },
-    { name = "pydantic" },
-    { name = "python-dotenv" },
-    { name = "sqlalchemy" },
-    { name = "streamlit" },
-    { name = "typer" },
 ]
 
 [[package]]

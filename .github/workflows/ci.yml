@@ -21,15 +21,16 @@ jobs:
         uses: actions/checkout@v4
 
       # setup-uv reads the committed .python-version (3.12); the project is pinned
-      # >=3.12,<3.13 because the tau2 git dependency imports stdlib `audioop`, removed in 3.13.
+      # >=3.12,<3.13 because the pinned tau2 revision imports stdlib `audioop`, removed in 3.13.
       - name: Set up uv
         uses: astral-sh/setup-uv@v6
         with:
           enable-cache: true
 
       # Installs the project plus the default `dev` dependency group, which pulls the env
-      # extras on main (tau2 — a git dependency — and hle). Network/git access is available
-      # on the runner for the tau2 git ref.
+      # extras. The tau2 / yc_bench / automationbench upstreams are *not* pip dependencies —
+      # each port fetches its SHA-pinned source into ~/.cache/shogym on first use, so the
+      # runner needs plain HTTPS access to codeload.github.com when those tests run.
       - name: Install dependencies
         run: uv sync
 
@@ -39,8 +40,13 @@ jobs:
       # reach a third-party service while they run (see NETWORK_ORACLE_TASKS in
       # tests/envs/test_frontier_bench_served.py), so a PR cannot go red because someone else's
       # server had a bad minute. A plain `uv run pytest` still selects them.
+      #
+      # SHOGYM_REQUIRE_UPSTREAM removes the runtime-provisioned envs' escape hatch. Their test
+      # modules must import a production adapter before they can collect, and a laptop with no
+      # extras or no network is allowed to skip that; this runner has both, so here any failure to
+      # provision and import — upstream drift, a gap in a hand-maintained extra, a corrupt
       - name: Run tests (offline, keyless)
-        run: env -u OPENAI_API_KEY uv run pytest -q -m "not network"
+        run: env -u OPENAI_API_KEY SHOGYM_REQUIRE_UPSTREAM=1 uv run pytest -q -m "not network"
 
       - name: Lint (ruff)
         run: uv run ruff check .

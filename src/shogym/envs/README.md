@@ -77,6 +77,15 @@ mechanics are identical and defined once here:
 - **`import shogym` registers without importing.** Importing shogym registers every env but
   imports **none** of the optional deps — an env's heavy/optional imports happen lazily only
   when that env is constructed or served, so `import shogym` works offline without any extra.
+- **Some upstreams are fetched, not installed.** The `tau2`, `yc_bench`, and `automationbench`
+  ports declare no pip dependency on their upstream: shogym cannot carry a direct (`@ git+…`)
+  requirement and still publish to PyPI, so each fetches its SHA-pinned upstream source once
+  into `~/.cache/shogym/<package>/<sha>/` when the env is first constructed or served, and its
+  extra declares upstream's own runtime dependencies explicitly. `<PACKAGE>_SRC` points at a
+  local checkout instead; `SHOGYM_CACHE` relocates the cache. Provisioning **refuses** to bind an
+  upstream name that is already imported from somewhere else rather than reporting success over
+  the top of it — `tau2` on PyPI is an unrelated project, so "a module called `tau2` is
+  importable" is not the same claim as "the pinned tau2-bench is loaded".
 
 ## Tests: offline vs keyed
 
@@ -86,6 +95,14 @@ in-memory searcher, or a deterministic in-process sim) run in the core offline s
 API key; a **keyed fidelity test** — the real model judge or live user simulator grading a
 served episode — is skipped unless `OPENAI_API_KEY` is set. So the core 3.12 suite stays green
 offline.
+
+The three runtime-provisioned envs add one wrinkle: their test modules must import a production
+adapter before they can collect anything, and that import needs the extra and (on a cold cache)
+the network. Those two failures skip the module, and **nothing else does** — upstream drift, a
+gap in a hand-maintained extra, a corrupt cache or a plain `NameError` all fail, because a
+regression that deletes an env's tests while the run stays green is worse than a red one. CI sets
+`SHOGYM_REQUIRE_UPSTREAM=1`, which removes even the environmental skip: that runner has the
+extras and the network, so there is nothing left for it to legitimately skip.
 
 ## Available environments
 

@@ -1,6 +1,6 @@
-# yc-bench is an optional extra (the `yc_bench` install group); it is intentionally absent
-# from the base type-check / offline environment, so its imports are expected to be
-# unresolved there.
+# yc-bench's source is provisioned at runtime into a cache dir (see `ensure_source`); it is
+# intentionally absent from the base type-check / offline environment, so its imports are
+# expected to be unresolved there.
 # pyright: reportMissingImports=false
 """The single seam between shogym and yc-bench's *internal* modules.
 
@@ -14,36 +14,76 @@ here, behind a small, stable surface the rest of the env calls:
     ``_init_simulation``, so seeding is bit-identical to ``yc-bench run`` for a given
     seed/config/start-date).
   - :func:`run_cli` — execute one ``yc-bench <cmd>`` against the session DB, reusing
-    yc-bench's command-validation policy and its real console-script entry point.
+    yc-bench's command-validation policy and its real CLI entry point.
   - :func:`read_final_state` — read the authoritative terminal metrics (funds, survival,
     task outcomes) off the sim DB.
 
-Importing this module imports ``yc_bench``, so it requires the ``yc_bench`` extra — but it is
-only ever imported when a ``yc_bench`` env is *constructed* (manifest probe) or *served*,
-never by ``import shogym``.
+The port used to pin the upstream commit as a direct (``@ git+https://``) requirement, which
+PyPI rejects outright and which therefore made all of shogym unpublishable. So this adapter
+**provisions the pinned upstream source at runtime** into a gitignored cache
+(``~/.cache/shogym/yc_bench/<sha>/``, overridable via ``YC_BENCH_SRC`` / ``SHOGYM_CACHE``) and
+registers it directly in ``sys.modules`` — never onto ``sys.path``, because the yc-bench archive
+root carries sibling top-level dirs (``docs/``, ``scripts/``, ``system_design/``, ``imgs/``) that
+would shadow shogym's own packages. Only ``src/yc_bench`` is extracted, so the cache dir holds the
+package and nothing else — which is what makes it safe to hand to the CLI subprocess on
+``PYTHONPATH`` (see :func:`run_cli`). The mechanics live in :mod:`shogym.envs._upstream`, shared
+with the automationbench and tau2 ports. Nothing from upstream is committed to shogym, and the SHA
+pin — hence the fidelity guarantee — is unchanged; it just moved from a requirement string to
+:data:`UPSTREAM_SHA` here.
+
+yc-bench's *own* runtime dependencies used to be resolved transitively by pip through that direct
+requirement. They are now declared explicitly by the ``yc_bench`` extra in ``pyproject.toml``
+(the upstream's ``[project] dependencies``, verbatim at the pinned SHA), so
+``pip install shogym[yc_bench]`` still installs exactly the same set.
+
+Importing this module triggers provisioning (a one-time network fetch if the cache is cold) and
+imports ``yc_bench``, so it is only ever imported when a ``yc_bench`` env is *constructed*
+(manifest probe) or *served*, never by ``import shogym``.
 """
 
 from __future__ import annotations
 
+import os
 import subprocess
 import sys
 from contextlib import contextmanager
 from pathlib import Path
 from typing import Any, Dict, Iterator, List, Optional, Tuple
 
-from yc_bench.agent.commands.policy import parse_bench_command
-from yc_bench.config import load_config
-from yc_bench.db.models.company import Company
-from yc_bench.db.models.sim_state import SimState
-from yc_bench.db.models.task import Task, TaskStatus
-from yc_bench.db.session import (
+from shogym.envs._upstream import ensure_package
+
+# Fidelity pin: the upstream commit this port reproduces.
+UPSTREAM_SHA = "e7d606789be4c52a34f9fa5b04ada4a2eaf9d731"
+_TARBALL_URL = f"https://github.com/collinear-ai/yc-bench/archive/{UPSTREAM_SHA}.tar.gz"
+
+
+def ensure_source() -> Path:
+    """Ensure the upstream source is available and importable; return its containing directory.
+
+    Idempotent and thread-safe. ``YC_BENCH_SRC`` overrides the cache with an existing checkout (a
+    dir that *contains* a ``yc_bench`` package), so a provisioned/offline environment needs no
+    network; otherwise the pinned tarball is fetched on the first call and reused thereafter.
+    yc-bench is a src-layout project, so the package sits at ``<archive root>/src/yc_bench``."""
+    return ensure_package(
+        package="yc_bench", sha=UPSTREAM_SHA, tarball_url=_TARBALL_URL, archive_subdir="src"
+    )
+
+
+_SOURCE_DIR = ensure_source()
+
+from yc_bench.agent.commands.policy import parse_bench_command  # noqa: E402
+from yc_bench.config import load_config  # noqa: E402
+from yc_bench.db.models.company import Company  # noqa: E402
+from yc_bench.db.models.sim_state import SimState  # noqa: E402
+from yc_bench.db.models.task import Task, TaskStatus  # noqa: E402
+from yc_bench.db.session import (  # noqa: E402
     build_engine,
     build_session_factory,
     init_db,
     session_scope,
 )
-from yc_bench.runner.args import RunArgs
-from yc_bench.runner.main import _init_simulation
+from yc_bench.runner.args import RunArgs  # noqa: E402
+from yc_bench.runner.main import _init_simulation  # noqa: E402
 
 # yc-bench's ORM/runtime helpers are dynamically typed at these call sites; treat the few
 # attribute reads as ``Any`` rather than fighting upstream annotations. Runtime is covered by
@@ -120,13 +160,39 @@ def seed_session(
     return str(company_id)
 
 
-def _resolve_yc_bench_script() -> str:
-    """Locate the ``yc-bench`` console script installed alongside the current interpreter.
+# How the CLI subprocess is launched. yc-bench's `yc-bench` console script is generated by an
+# *install* of the distribution, and the port no longer installs one (the source is provisioned
+# into a cache instead), so the equivalent invocation is used: `python -m yc_bench` runs upstream's
+# `yc_bench/__main__.py`, which calls the very same `yc_bench.cli:app_main` the console script
+# points at. Same entry point, same argument parsing, same JSON on stdout.
+#
+# `-P` is the subprocess half of this package's sys.path hygiene, and it is not optional. `-m`
+# prepends the *working directory* to sys.path, ahead of everything PYTHONPATH contributes — so a
+# harness whose cwd happens to hold a `yc_bench/` directory would shadow the pinned source
+# completely and silently, which is the same class of bug the parent process avoids by binding
+# through sys.modules instead of sys.path. `-P` suppresses that prepend, leaving the provisioned
+# source (below) as the first place the name resolves.
+_CLI_LAUNCH = (sys.executable, "-P", "-m", "yc_bench")
 
-    The ``yc_bench`` extra installs the ``yc-bench`` entry point into the same venv as shogym,
-    so it sits next to ``sys.executable``. Falls back to a bare ``yc-bench`` on ``PATH``."""
-    candidate = Path(sys.executable).parent / "yc-bench"
-    return str(candidate) if candidate.exists() else "yc-bench"
+
+def _subprocess_env(base_env: Dict[str, str]) -> Dict[str, str]:
+    """The subprocess environment, with the provisioned source reachable by ``python -m``.
+
+    The cache dir contains the ``yc_bench`` package and nothing else (only ``src/yc_bench`` is
+    extracted), so prepending it to ``PYTHONPATH`` can shadow nothing — while still letting the
+    subprocess import upstream from the same pinned source this process registered in
+    ``sys.modules``. An inherited ``PYTHONPATH`` is preserved after it. (A ``YC_BENCH_SRC``
+    override points somewhere the caller controls; upstream's own layout puts nothing but
+    ``yc_bench`` beside it either.)
+
+    ``PYTHONPATH`` alone would not be enough — see :data:`_CLI_LAUNCH` for why the subprocess also
+    runs under ``-P``."""
+    existing = base_env.get("PYTHONPATH")
+    source = str(_SOURCE_DIR)
+    return {
+        **base_env,
+        "PYTHONPATH": f"{source}{os.pathsep}{existing}" if existing else source,
+    }
 
 
 def validate_command(command: Any) -> Tuple[bool, Optional[str], Optional[List[str]]]:
@@ -147,8 +213,8 @@ def run_cli(
     Mirrors upstream ``yc_bench.agent.commands.executor.run_command`` (same validation, same
     result shape) but injects ``DATABASE_URL`` / ``YC_BENCH_EXPERIMENT`` *explicitly* via the
     subprocess ``env`` rather than mutating ``os.environ`` — so concurrent sessions can never
-    race on process-global state. The real console-script CLI runs the command, so command
-    parsing, execution, and JSON output are yc-bench's own."""
+    race on process-global state. yc-bench's real CLI entry point runs the command (see
+    :data:`_CLI_LAUNCH`), so command parsing, execution, and JSON output are yc-bench's own."""
     ok, err, argv = validate_command(command)
     if not ok or argv is None:
         return {
@@ -176,8 +242,14 @@ def run_cli(
             ),
             "command": command,
         }
-    argv[0] = _resolve_yc_bench_script()
-    env = {**base_env, "DATABASE_URL": db_url, "YC_BENCH_EXPERIMENT": config_name}
+    # `argv[0]` is the literal "yc-bench" the policy parsed; swap it for the equivalent
+    # `python -m yc_bench` launch, leaving the parsed arguments untouched.
+    argv = [*_CLI_LAUNCH, *argv[1:]]
+    env = {
+        **_subprocess_env(base_env),
+        "DATABASE_URL": db_url,
+        "YC_BENCH_EXPERIMENT": config_name,
+    }
 
     try:
         proc = subprocess.run(
@@ -276,6 +348,8 @@ def read_final_state(session_factory: Any) -> Dict[str, Any]:
 
 __all__ = [
     "ALLOWED_COMMAND_GROUPS",
+    "UPSTREAM_SHA",
+    "ensure_source",
     "build_db",
     "seed_session",
     "run_cli",

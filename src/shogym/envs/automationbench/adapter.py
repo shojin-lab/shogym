@@ -4,11 +4,11 @@
 # pyright: reportMissingImports=false
 """The single seam between shogym and the upstream ``automationbench`` package.
 
-AutomationBench (MIT, © Zapier) can't be taken as an ordinary pinned git extra the way the
-yc-bench and tau2 ports are: it declares ``requires-python >=3.13`` (shogym is hard-pinned to 3.12
-because tau2 needs the stdlib ``audioop`` module removed in 3.13), and it depends on Prime
-Intellect's heavy ``verifiers`` / ``anthropic`` agent-loop stack. So a ``pip``/``uv`` resolve of
-``automation-bench`` under 3.12 is *unsatisfiable*.
+AutomationBench (MIT, © Zapier) cannot be resolved by ``pip`` at all under shogym's Python pin: it
+declares ``requires-python >=3.13`` (shogym is hard-pinned to 3.12 because tau2 needs the stdlib
+``audioop`` module removed in 3.13), and it depends on Prime Intellect's heavy ``verifiers`` /
+``anthropic`` agent-loop stack. So a ``pip``/``uv`` resolve of ``automation-bench`` under 3.12 is
+*unsatisfiable*.
 
 The env-as-center port needs none of that loop. It reuses only the three deterministic,
 ``verifiers``-free pieces — the simulated tools + ``WorldState`` engine, the typed task defs, and
@@ -16,8 +16,9 @@ the pure rubric (all of which import fine on 3.12 with just ``pydantic`` + ``dat
 adapter **provisions the pinned upstream source at runtime** into a gitignored cache
 (``~/.cache/shogym/automationbench/<sha>/``, overridable via ``AUTOMATIONBENCH_SRC`` /
 ``SHOGYM_CACHE``), registers it directly in ``sys.modules`` (never onto ``sys.path``, so the
-checkout's sibling dirs can't shadow shogym's own packages), and imports from it — the same "fetch
-upstream at runtime, never vendor it into the repo" shape the tau2 port uses for its data. Nothing
+checkout's sibling dirs can't shadow shogym's own packages), and imports from it. The mechanics
+live in :mod:`shogym.envs._upstream`, shared with the tau2 and yc_bench ports (which adopted the
+same pattern so shogym carries no direct-URL requirement and can be published to PyPI). Nothing
 from upstream is committed to shogym.
 
 It also re-hosts the two small, ``verifiers``-free helpers from upstream's ``runner.py``
@@ -32,111 +33,27 @@ imports ``automationbench``, so it is only ever imported when an ``automationben
 from __future__ import annotations
 
 import copy
-import importlib
-import importlib.util
-import io
-import os
-import sys
-import tarfile
-import tempfile
-import threading
-import urllib.request
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
+
+from shogym.envs._upstream import ensure_package
 
 # Fidelity pin: the upstream commit this port reproduces (AutomationBench has no release tags).
 UPSTREAM_SHA = "a321764ace3cfbe42289e6a13abef2f0f4f56fad"
 _TARBALL_URL = f"https://github.com/zapier/AutomationBench/archive/{UPSTREAM_SHA}.tar.gz"
-_DOWNLOAD_TIMEOUT_SECONDS = 120.0
-
-_provision_lock = threading.Lock()
-
-
-def _cache_root() -> Path:
-    base = os.environ.get("SHOGYM_CACHE")
-    root = Path(base) if base else Path.home() / ".cache" / "shogym"
-    return root / "automationbench" / UPSTREAM_SHA
-
-
-def _source_dir() -> Path:
-    """The directory that *contains* the ``automationbench`` package.
-
-    Honors ``AUTOMATIONBENCH_SRC`` (an existing checkout — a repo root, or a dir holding the
-    package) so a provisioned/offline environment needs no network."""
-    override = os.environ.get("AUTOMATIONBENCH_SRC")
-    if override:
-        return Path(override).expanduser().resolve()
-    return _cache_root()
-
-
-def _register_package(pkg_dir: Path) -> None:
-    """Import the ``automationbench`` package from ``pkg_dir`` into ``sys.modules`` directly.
-
-    Deliberately does **not** put ``pkg_dir``'s parent on ``sys.path``: the upstream checkout root
-    can carry sibling top-level dirs (``tests/`` / ``visualizer/``) that would shadow shogym's own
-    ``tests`` package. Registering the top package with its ``__path__`` set means every absolute
-    ``from automationbench.x import y`` resolves through the package's own ``__path__`` — nothing
-    leaks onto ``sys.path``. Idempotent."""
-    if "automationbench" in sys.modules:
-        return
-    init = pkg_dir / "__init__.py"
-    spec = importlib.util.spec_from_file_location(
-        "automationbench", init, submodule_search_locations=[str(pkg_dir)]
-    )
-    if spec is None or spec.loader is None:
-        raise RuntimeError(f"could not load the automationbench package from {pkg_dir}")
-    module = importlib.util.module_from_spec(spec)
-    sys.modules["automationbench"] = module
-    spec.loader.exec_module(module)
-
-
-def _download_source(dest: Path) -> None:
-    """Fetch the pinned upstream tarball and extract it so ``dest/automationbench`` exists.
-
-    Only the ``automationbench`` **package** is kept — the archive also carries top-level
-    ``tests/`` / ``visualizer/`` dirs, which must never land on ``sys.path`` and shadow shogym's own
-    ``tests`` package. Extracts atomically (temp dir + ``os.replace``) so concurrent provisioners
-    can't observe a half-written tree, and uses tarfile's ``data`` filter to reject path
-    traversal."""
-    with urllib.request.urlopen(_TARBALL_URL, timeout=_DOWNLOAD_TIMEOUT_SECONDS) as resp:
-        raw = resp.read()
-    dest.parent.mkdir(parents=True, exist_ok=True)
-    with tempfile.TemporaryDirectory(dir=str(dest.parent), prefix=".dl-") as tmp:
-        tmp_path = Path(tmp)
-        with tarfile.open(fileobj=io.BytesIO(raw), mode="r:gz") as tf:
-            tf.extractall(tmp_path, filter="data")
-        # The archive extracts to a single `AutomationBench-<sha>/` root; keep only its package.
-        roots = [p for p in tmp_path.iterdir() if p.is_dir()]
-        if len(roots) != 1 or not (roots[0] / "automationbench").is_dir():
-            raise RuntimeError(
-                f"unexpected AutomationBench archive layout: {[p.name for p in roots]}"
-            )
-        staged = tmp_path / ".staged"
-        staged.mkdir()
-        os.replace(roots[0] / "automationbench", staged / "automationbench")
-        if dest.exists():  # a concurrent provisioner won the race — keep theirs
-            return
-        os.replace(staged, dest)
 
 
 def ensure_source() -> Path:
     """Ensure the upstream source is available and importable; return its containing directory.
 
-    Idempotent and thread-safe. If ``AUTOMATIONBENCH_SRC`` is set it is used as-is (no network).
-    Otherwise the pinned tarball is downloaded into the cache on the first call and reused
-    thereafter — so only the very first construction on a cold cache touches the network. The
-    ``automationbench`` package is then registered directly in ``sys.modules`` (never onto
-    ``sys.path``)."""
-    src = _source_dir()
-    with _provision_lock:
-        if not (src / "automationbench").is_dir():
-            if os.environ.get("AUTOMATIONBENCH_SRC"):
-                raise RuntimeError(
-                    f"AUTOMATIONBENCH_SRC={src} does not contain an 'automationbench' package"
-                )
-            _download_source(src)
-        _register_package(src / "automationbench")
-    return src
+    Idempotent and thread-safe. See :mod:`shogym.envs._upstream`: ``AUTOMATIONBENCH_SRC`` overrides
+    the cache (no network), otherwise the pinned tarball is fetched into
+    ``~/.cache/shogym/automationbench/<sha>/`` on the first call and reused thereafter, and the
+    ``automationbench`` package is registered directly in ``sys.modules`` (never onto
+    ``sys.path``). AutomationBench uses a flat layout, so the package sits at the archive root."""
+    return ensure_package(
+        package="automationbench", sha=UPSTREAM_SHA, tarball_url=_TARBALL_URL
+    )
 
 
 ensure_source()

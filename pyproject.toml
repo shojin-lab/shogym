@@ -1,7 +1,7 @@
 [project]
 name = "shogym"
 version = "0.0.1"
-description = "Environments for agents whose policy boundary is the tool surface"
+description = "Environments that meet an agent at the tool surface"
 readme = "README.md"
 license = "Apache-2.0"
 license-files = ["LICENSE", "NOTICE"]
@@ -37,14 +37,46 @@ shogym = "shogym.cli:main"
 
 [project.optional-dependencies]
 analysis = ["pandas>=2.2", "duckdb>=1.0"]
-# The tau2-bench port (src/shogym/envs/tau2), pinned to an upstream commit SHA: `[gym]` pulls
-# gymnasium (the GymAgent bridge needs it), `[knowledge]` pulls rank-bm25 (banking's offline
-# retrieval). Kept as an optional extra so `pip install shogym` (and the core test suite) stay
-# lean and never import tau2 — `import shogym` registers `tau2_*` envs without loading it.
-# NOTE: tau2 does not ship its `data/` in the wheel, so it must be provisioned at runtime; the
-# tau2 example lazy-downloads it (or honor `TAU2_DATA_DIR`).
+# The tau2-bench port (src/shogym/envs/tau2). Upstream is pinned to commit 1d244f5 but **cannot be
+# a requirement**: PyPI forbids direct (`@ git+https://`) references, and the `tau2` name on PyPI
+# belongs to an unrelated magnetochemistry library, so a plain `tau2` requirement would silently
+# install the wrong package (there is no tau2-bench release matching the pin under any name). So
+# the pinned upstream source is provisioned at runtime into a gitignored cache
+# (`~/.cache/shogym/tau2/<sha>/`, honoring `TAU2_SRC` / `SHOGYM_CACHE`) — see
+# src/shogym/envs/tau2/adapter.py — and this extra declares the dependencies pip used to resolve
+# transitively through that direct requirement: upstream's `[project] dependencies` verbatim at
+# the pinned SHA, plus its `[gym]` extra (gymnasium, for the GymAgent bridge) and `[knowledge]`
+# extra (rank-bm25 + openai, for banking's offline retrieval). Kept optional so `pip install
+# shogym` (and the core test suite) stay lean and never import tau2 — `import shogym` registers
+# `tau2_*` envs without provisioning or loading it.
+# NOTE: tau2's `data/` is a separate provisioning concern and is unchanged — a tau2 env still
+# needs `TAU2_DATA_DIR` pointing at a tau2-bench data checkout.
 tau2 = [
-    "tau2[gym,knowledge] @ git+https://github.com/sierra-research/tau2-bench@1d244f5dca42944b67a379b44bfeb9f5748f189d",
+    # upstream [project] dependencies @ 1d244f5
+    "addict>=2.4.0",
+    "deepdiff>=8.4.2",
+    "docstring-parser>=0.16",
+    "fastapi>=0.115.11",
+    "httpx>=0.24.0",
+    "litellm>=1.80.15,<1.82.7",
+    "loguru>=0.7.3",
+    "numpy>=1.24.0",
+    "pandas>=2.2.3",
+    "psutil>=7.0.0",
+    "python-dotenv>=1.0.0",
+    "PyYAML>=6.0.2",
+    "requests>=2.31.0",
+    "rich",
+    "tabulate>=0.9.0",
+    "tenacity>=9.0.0",
+    "toml>=0.10.2",
+    "typer>=0.12.5",
+    "uvicorn>=0.34.0",
+    # upstream [gym] extra
+    "gymnasium>=1.2.2",
+    # upstream [knowledge] extra
+    "openai>=1.0.0",
+    "rank-bm25>=0.2.2",
 ]
 # The HLE env (src/shogym/envs/hle): `datasets` lazy-loads the gated `cais/hle` benchmark, and
 # `openai` backs the default model-graded judge (an OpenAI-compatible client, created only
@@ -55,15 +87,29 @@ hle = [
     "datasets>=2.19",
     "openai>=1.99",
 ]
-# The YC-Bench port (src/shogym/envs/yc_bench), pinned to an upstream commit SHA. YC-Bench has no
-# stable public API, so the port wraps its internal modules (sim engine, world seeder, config
-# loader, command policy, ORM) behind a thin adapter — pinning a SHA makes drift a one-file
-# maintenance cost. Kept as an optional extra so `pip install shogym` (and the core test suite)
-# stay lean and never import yc_bench — `import shogym` registers the `yc_bench` env without
-# loading it. YC-Bench generates its whole world deterministically from a seed, so (unlike
-# tau2) it needs no external data provisioned at runtime.
+# The YC-Bench port (src/shogym/envs/yc_bench). YC-Bench has no stable public API, so the port
+# wraps its internal modules (sim engine, world seeder, config loader, command policy, ORM) behind
+# a thin adapter — pinning a SHA makes drift a one-file maintenance cost. Upstream is pinned to
+# commit e7d6067 but **cannot be a requirement**: PyPI forbids direct (`@ git+https://`)
+# references, and the `yc-bench` 0.1.0 release on PyPI is not the pinned commit. So the pinned
+# upstream source is provisioned at runtime into a gitignored cache
+# (`~/.cache/shogym/yc_bench/<sha>/`, honoring `YC_BENCH_SRC` / `SHOGYM_CACHE`) — see
+# src/shogym/envs/yc_bench/adapter.py — and this extra declares the dependencies pip used to
+# resolve transitively through that direct requirement: upstream's `[project] dependencies`
+# verbatim at the pinned SHA. Kept optional so `pip install shogym` (and the core test suite) stay
+# lean and never import yc_bench — `import shogym` registers the `yc_bench` env without
+# provisioning or loading it. YC-Bench generates its whole world deterministically from a seed, so
+# (unlike tau2) it needs no external data provisioned at runtime.
 yc_bench = [
-    "yc-bench @ git+https://github.com/collinear-ai/yc-bench@e7d606789be4c52a34f9fa5b04ada4a2eaf9d731",
+    # upstream [project] dependencies @ e7d6067
+    "litellm>=1.40",
+    "matplotlib>=3.10.8",
+    "plotly>=6.6.0",
+    "pydantic>=2.0",
+    "python-dotenv>=1.0",
+    "sqlalchemy>=2.0",
+    "streamlit>=1.55.0",
+    "typer>=0.9",
 ]
 # The Frontier-Bench port (src/shogym/envs/frontier_bench) is a faithful, pinned snapshot of the
 # Harbor benchmark (release tag v0.1.0). Its only runtime dependency is a working local
@@ -76,12 +122,13 @@ yc_bench = [
 # describe / verdict-parsing / the offline tests need neither Docker nor a network.
 frontier_bench = []
 # The AutomationBench port (src/shogym/envs/automationbench). Upstream (MIT, © Zapier) is pinned to
-# commit a321764 but **cannot be a git extra** like tau2/yc-bench: it declares `requires-python
-# >=3.13` (shogym is hard-pinned to <3.13 for tau2's `audioop`) and pulls the heavy `verifiers` /
-# `anthropic` agent-loop stack — an unsatisfiable resolve on 3.12. The env-as-center port needs
-# none of that loop, only the deterministic verifiers-free pieces (simulated tools + WorldState,
-# task defs, pure rubric), which import fine on 3.12 with just `pydantic` + `datasets`. So the
-# pinned upstream source is provisioned at runtime into a gitignored cache
+# commit a321764 and, on top of the PyPI direct-reference ban that rules out a git requirement for
+# tau2/yc-bench, cannot be resolved by pip at all: it declares `requires-python >=3.13` (shogym is
+# hard-pinned to <3.13 for tau2's `audioop`) and pulls the heavy `verifiers` / `anthropic`
+# agent-loop stack — an unsatisfiable resolve on 3.12. The env-as-center port needs none of that
+# loop, only the deterministic verifiers-free pieces (simulated tools + WorldState, task defs, pure
+# rubric), which import fine on 3.12 with just `pydantic` + `datasets`. So the pinned upstream
+# source is provisioned at runtime into a gitignored cache
 # (`~/.cache/shogym/automationbench/<sha>/`, honoring `AUTOMATIONBENCH_SRC` / `SHOGYM_CACHE`) — never
 # vendored into the repo — and this extra only needs `datasets` (the domain loaders build a
 # HuggingFace `Dataset`). Kept optional so `pip install shogym` (and the core offline test suite)
@@ -124,9 +171,11 @@ dev = [
 requires = ["hatchling"]
 build-backend = "hatchling.build"
 
-[tool.hatch.metadata]
-# The `tau2` optional extra pins upstream to a git commit SHA (a direct reference).
-allow-direct-references = true
+# NOTE: `[tool.hatch.metadata] allow-direct-references` is deliberately absent. PyPI rejects any
+# distribution whose metadata carries a direct (`@ git+https://` / URL) requirement, so leaving it
+# off makes hatchling fail the *build* if one is ever reintroduced — an early, local error instead
+# of a 400 at upload time. Pinned upstream sources are provisioned at runtime instead; see the
+# `tau2`, `yc_bench`, and `automationbench` extras above and src/shogym/envs/_upstream.py.
 
 [tool.hatch.build.targets.wheel]
 packages = ["src/shogym"]

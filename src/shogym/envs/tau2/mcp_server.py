@@ -1,5 +1,6 @@
-# tau2 is an optional extra (the `tau2` install group); it is intentionally absent from the
-# base type-check / offline environment, so its imports are expected to be unresolved there.
+# tau2's source is provisioned at runtime into a cache dir (see `shogym.envs.tau2.adapter`); it is
+# intentionally absent from the base type-check / offline environment, so its imports are expected
+# to be unresolved there.
 # pyright: reportMissingImports=false
 """The tau2 control-inversion bridge, hosted as an shogym in-process MCP server.
 
@@ -20,8 +21,10 @@ call becomes the agent's next action:
 
 Only the *agent* is replaced; tau2's Orchestrator, user simulator, domains/tools/tasks, and
 evaluator are reused verbatim. State is keyed by ``_session_id`` (shogym injects it for tools
-that declare it), so several episodes can share this module safely. tau2 is imported at
-module load, so this module is only importable with the ``tau2`` extra — but it is *only ever
+that declare it), so several episodes can share this module safely. This is the one module in
+shogym that imports ``tau2``; it provisions the pinned upstream source first (see
+:mod:`shogym.envs.tau2.adapter` — shogym declares no ``pip`` dependency on tau2-bench), so
+importing it needs the ``tau2`` extra and, on a cold cache, the network — but it is *only ever
 imported when a tau2 env is constructed or served*, never by ``import shogym``.
 """
 
@@ -39,14 +42,19 @@ from fastmcp.tools import Tool, ToolResult
 from loguru import logger
 from pydantic import PrivateAttr
 
-from tau2.config import DEFAULT_LLM_ARGS_USER, DEFAULT_LLM_USER
-from tau2.data_model.message import AssistantMessage, ToolCall
-from tau2.environment.tool import as_tool
-from tau2.evaluator.evaluator import EvaluationType, evaluate_simulation
-from tau2.gym.gym_agent import GymAgent, done as _done_fn
-from tau2.orchestrator.orchestrator import Orchestrator
-from tau2.registry import registry
-from tau2.user.user_simulator import DummyUser, UserSimulator
+from shogym.envs.tau2.adapter import ensure_source
+
+# Bind the pinned upstream source into `sys.modules` before any `tau2` import below resolves.
+ensure_source()
+
+from tau2.config import DEFAULT_LLM_ARGS_USER, DEFAULT_LLM_USER  # noqa: E402
+from tau2.data_model.message import AssistantMessage, ToolCall  # noqa: E402
+from tau2.environment.tool import as_tool  # noqa: E402
+from tau2.evaluator.evaluator import EvaluationType, evaluate_simulation  # noqa: E402
+from tau2.gym.gym_agent import GymAgent, done as _done_fn  # noqa: E402
+from tau2.orchestrator.orchestrator import Orchestrator  # noqa: E402
+from tau2.registry import registry  # noqa: E402
+from tau2.user.user_simulator import DummyUser, UserSimulator  # noqa: E402
 
 # tau2's registry is dynamically typed (its loader/constructor annotations don't reflect the
 # actual call surface — e.g. the `solo_mode`/`retrieval_variant` kwargs), so treat it as `Any`
