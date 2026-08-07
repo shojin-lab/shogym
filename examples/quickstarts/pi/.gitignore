@@ -1,0 +1,3 @@
+# Where `pi install -l` materialises the pinned bridge. The pin lives in .pi/settings.json;
+# the tree of node_modules under it does not belong in this repo.
+.pi/npm/

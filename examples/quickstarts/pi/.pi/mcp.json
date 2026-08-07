@@ -1,0 +1,10 @@
+{
+  "mcpServers": {
+    "hgym": {
+      "transport": "stdio",
+      "command": "uv",
+      "args": ["run", "python", "serve.py"],
+      "lifecycle": "eager"
+    }
+  }
+}
