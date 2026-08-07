@@ -13,7 +13,7 @@ a recorded trajectory while an external harness drives the tools — see
 `StatefulToolEnv`); this port throws that away and reuses only the three deterministic,
 `verifiers`-free pieces (the simulated tools + `WorldState` engine, the typed task defs, and
 the pure rubric). The runnable demo is
-[`examples/quickstarts/`](../../../../examples/quickstarts/).
+[`examples/`](../../../../examples/).
 
 ## Running it
 
@@ -54,7 +54,7 @@ call `done` explicitly).
 
 ### Quickstart
 
-Any quickstart under [`examples/quickstarts/`](../../../../examples/quickstarts/) serves this env: one MCP endpoint
+Any quickstart under [`examples/`](../../../../examples/) serves this env: one MCP endpoint
 hands out a queue of tasks and scores each one server-side. Point it here with the single
 variable at the top of its `serve.py`:
 

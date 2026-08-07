@@ -33,7 +33,7 @@ Three moves, and the whole quickstart is these three:
 ## Run it
 
 ```bash
-cd examples/quickstarts/codex
+cd examples/codex
 
 # 1. install (from anywhere in the repo)
 uv sync
@@ -168,7 +168,7 @@ does **not** work, because trust is resolved before `-c` overrides apply. Either
 `~/.codex/config.toml` yourself:
 
 ```toml
-[projects."/absolute/path/to/examples/quickstarts/codex"]
+[projects."/absolute/path/to/examples/codex"]
 trust_level = "trusted"
 ```
 
@@ -230,7 +230,7 @@ task is recorded unscored), `max_in_flight=` serves several tasks concurrently, 
 
 ## The other quickstarts
 
-`examples/quickstarts/` holds one directory per harness, each idiomatic to that harness rather
+`examples/` holds one directory per harness, each idiomatic to that harness rather
 than squeezed into a shared abstraction. [`claude_code/`](../claude_code/README.md) is the
 reference implementation, and `pi/` and `hermes/` demonstrate the same three moves in their own
 idiom.

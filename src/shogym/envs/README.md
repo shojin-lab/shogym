@@ -1,8 +1,7 @@
 # shogym environments
 
-This directory holds shogym's environments. Every env follows the **env-as-center** design
-([RFC 008](https://github.com/shojin-lab/shogym/wiki/RFC-008-Environment-as-Center-of-Gravity)):
-an environment does exactly three things —
+This directory holds shogym's environments. Every env follows the same **env-as-center** design,
+in which an environment does exactly three things:
 
 1. **describe** a task — publish a `TaskSpec` (instructions + tool manifest + horizon);
 2. **serve** its essential tools over [MCP](https://modelcontextprotocol.io) (in-process,
@@ -101,7 +100,7 @@ offline.
 | `frontier_bench` | A faithful shogym port of [Frontier-Bench](https://github.com/harbor-framework/frontier-bench) — operate a per-task Docker container through a shell (`exec` / `read_file` / `write_file` / `done`), scored by the task's own verifier over the container end-state. A CPU-only, single-container slice (5 tasks). Needs the `frontier_bench` extra + a local Docker daemon (no key or data download). | [`frontier_bench/README.md`](frontier_bench/README.md) |
 
 Runnable end-to-end demos (Claude Code drives a served env; shogym scores off the trace) live
-under [`examples/quickstarts/`](../../../examples/quickstarts/), one per harness. Each serves a
+under [`examples/`](../../../examples/), one per harness. Each serves a
 whole queue over a single MCP endpoint, and the environment it serves is one variable at the top
 of its `serve.py` — so every env listed above runs from any of them.
 

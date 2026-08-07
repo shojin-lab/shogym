@@ -40,7 +40,7 @@ Three moves, and the whole quickstart is these three:
 ## Run it
 
 ```bash
-cd examples/quickstarts/pi
+cd examples/pi
 
 # 1. install (from anywhere in the repo)
 uv sync
@@ -197,6 +197,6 @@ for `/mcp:start` in an interactive session), and `"requestTimeoutMs"` bounds a s
 
 ## The other quickstarts
 
-`examples/quickstarts/` holds one directory per harness, each idiomatic to that harness rather
+`examples/` holds one directory per harness, each idiomatic to that harness rather
 than squeezed into a shared abstraction. `claude_code/` is the reference implementation; `codex/`
 and `hermes/` demonstrate the same three moves in their own idiom.

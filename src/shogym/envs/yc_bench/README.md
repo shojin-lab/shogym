@@ -13,7 +13,7 @@ a recorded trajectory while an external harness drives the tools — see
 *external driver* to advance the sim, feed CLI results back, and collect the next commands.
 shogym's harness *is* that driver, so the port is a clean wrap — only the *agent* is replaced (by
 the harness, through the served tools). The runnable demo is
-[`examples/quickstarts/`](../../../../examples/quickstarts/).
+[`examples/`](../../../../examples/).
 
 ## Running it
 
@@ -54,7 +54,7 @@ reads the verdict off the trace via `shogym.result_from_trace(...)`.
 
 ### Quickstart
 
-Any quickstart under [`examples/quickstarts/`](../../../../examples/quickstarts/) serves this env: one MCP endpoint
+Any quickstart under [`examples/`](../../../../examples/) serves this env: one MCP endpoint
 hands out a queue of tasks and scores each one server-side. Point it here with the single
 variable at the top of its `serve.py`:
 

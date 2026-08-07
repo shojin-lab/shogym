@@ -5,7 +5,7 @@ This is the reference implementation of shogym's **env-as-center** design: an en
 with a pure function — see [`../README.md`](../README.md). Wordle shows each step in the
 smallest honest form: a `guess` tool, the reserved `terminate`, and a pure trajectory
 verifier. The end-to-end demo lives at
-[`examples/quickstarts/`](../../../../examples/quickstarts/).
+[`examples/`](../../../../examples/).
 
 `wordle_v1` is a **marker/trivial** env: it has no `finalize` hook — the episode ends on
 `terminate` or the horizon and `verify` scores the recorded guesses directly (see the
@@ -30,7 +30,7 @@ shogym serve wordle_v1 --task 0 --trace ./shogym_logs/wordle.jsonl
 ```
 
 **Drive it with Claude Code** (the reference external harness) via the quickstart at
-[`examples/quickstarts/claude_code/`](../../../../examples/quickstarts/claude_code/), with one variable set:
+[`examples/claude_code/`](../../../../examples/claude_code/), with one variable set:
 
 ```python
 ENV = "wordle_v1"

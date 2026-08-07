@@ -16,11 +16,11 @@ from typing import Any, Dict
 import shogym
 from fastmcp import Client
 
-from examples.quickstarts.pi import results as results_mod
-from examples.quickstarts.pi import serve as serve_mod
+from examples.pi import results as results_mod
+from examples.pi import serve as serve_mod
 from shogym.serve.stream import build_stream_server
 
-_QUICKSTART = Path(__file__).resolve().parent.parent / "examples" / "quickstarts" / "pi"
+_QUICKSTART = Path(__file__).resolve().parent.parent / "examples" / "pi"
 
 TEST_ENV = "wordle_v1"
 

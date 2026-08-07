@@ -10,7 +10,7 @@ Like every shogym env this **describes** a task, **serves** its tools over MCP, 
 a recorded trajectory while an external harness drives the tools — see
 [`../README.md`](../README.md). Here the single tool grades server-side, so the verifier stays
 a pure function over the sealed episode's evidence. The runnable demo is
-[`examples/quickstarts/`](../../../../examples/quickstarts/).
+[`examples/`](../../../../examples/).
 
 ## Running it
 
@@ -48,7 +48,7 @@ reads the verdict off the trace via `shogym.result_from_trace(...)`.
 
 ### Quickstart
 
-Any quickstart under [`examples/quickstarts/`](../../../../examples/quickstarts/) serves this env: one MCP endpoint
+Any quickstart under [`examples/`](../../../../examples/) serves this env: one MCP endpoint
 hands out a queue of tasks and scores each one server-side. Point it here with the single
 variable at the top of its `serve.py`:
 

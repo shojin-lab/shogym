@@ -11,7 +11,7 @@ a recorded trajectory while an external harness drives the tools — see
 [`../README.md`](../README.md). tau2's own contract is different (its `Orchestrator` *drives
 the agent*); this port bridges the two by replacing only the agent, keeping tau2's benchmark
 intact. The runnable demo is
-[`examples/quickstarts/`](../../../../examples/quickstarts/).
+[`examples/`](../../../../examples/).
 
 ## Running it
 
@@ -47,7 +47,7 @@ and `evaluation_type` (default `"all"`; use `"env"` for an offline run of an NL-
 
 ### Quickstart
 
-Any quickstart under [`examples/quickstarts/`](../../../../examples/quickstarts/) serves this env: one MCP endpoint
+Any quickstart under [`examples/`](../../../../examples/) serves this env: one MCP endpoint
 hands out a queue of tasks and scores each one server-side. Point it here with the single
 variable at the top of its `serve.py`:
 

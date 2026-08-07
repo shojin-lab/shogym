@@ -61,7 +61,7 @@ Two things that will otherwise cost you an afternoon:
 ```bash
 # 1. run from this directory: the server's `serve.py` path is relative, and a stdio MCP
 #    server inherits the cwd of the `hermes` process (its config takes no `cwd` key)
-cd examples/quickstarts/hermes
+cd examples/hermes
 
 # 2. give the quickstart its own Hermes home, so your real ~/.hermes is untouched
 #    (see "An isolated HERMES_HOME" below for why this is not optional)
@@ -337,6 +337,6 @@ task is recorded unscored), `max_in_flight=` serves several tasks concurrently, 
 
 ## The other quickstarts
 
-`examples/quickstarts/` holds one directory per harness, each idiomatic to that harness rather
+`examples/` holds one directory per harness, each idiomatic to that harness rather
 than squeezed into a shared abstraction. `claude_code/` is the reference implementation; this one
 and `codex/` and `pi/` demonstrate the same three moves in their own idiom.
