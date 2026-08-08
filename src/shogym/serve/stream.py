@@ -678,7 +678,11 @@ class ResultRow:
     ``extensions[namespace]``     what it means
     ============================  ==========================================================
     ``{dispensed, sealed}``       both halves ran; ``sealed`` is what ``finalize`` returned
-    ``{dispensed, error}``        ``finalize`` failed; ``error`` renders its failure
+    ``{dispensed, error}``        no ``finalize`` result reached this row, and ``error`` says
+                                  which of the three reasons it was: ``finalize`` failed, the
+                                  seal failed while it was running, or the seal failed before
+                                  this span was reached and it was never called (see
+                                  :meth:`TaskStream._unclosed_spans`)
     ``{dispensed}``               nothing was recorded after the dispense — the row came from
                                   :func:`reconcile`, so ``closure`` is ``broker_abort``
     ============================  ==========================================================
@@ -880,6 +884,12 @@ class _Live:
     # lands (unscored, with a diagnostic); the stop is raised *after* the release, because a
     # row that landed makes the seal final and this entry is the only handle on its episode.
     summary_error: Optional[_MalformedSummary] = None
+    # Set when this task's seal failed in its composing half, above the durable append. The row
+    # the retry then writes is one this seal composed or stood in rather than one the storage
+    # refused, so the stop such a failure owes is not the append's (see
+    # `TaskStream._join_seal`). Kept as state for the reason the source beside `terminal_error`
+    # is: the exception alone cannot say which half of the seal it came out of.
+    compose_error: Optional[BaseException] = None
     # The single per-task finalization transition: the seal itself, held as a task. Whoever
     # creates it owns the seal and everyone else awaits *that* task rather than starting their
     # own, so a terminal call, the deadline and the drain — which all race for this — produce
@@ -891,10 +901,24 @@ class _Live:
     # would call every extension's `finalize` again, and would re-read an episode the first
     # attempt already force-terminated, filing a task the stream drained as one the agent ended
     # itself. So the retry picks this up and goes straight to the write (see `_run_seal`).
+    #
+    # **A hand-back always has one.** A seal that failed short of the append cannot leave this
+    # empty for the same reason: a retry that found nothing here would compose that second row. So
+    # a failure in the composing half leaves the row it had reached: the real one when the outcome
+    # was already classified, and an unscored `finalize_error` row saying the seal produced none
+    # when it was not (see `TaskStream._retained_row`). The write a retry retries is always a
+    # write and never a composition.
     pending_row: Optional[ResultRow] = None
     # namespace -> the open span, and what it observed at dispense.
     spans: Dict[str, ProvenanceSpan] = field(default_factory=dict)
     dispensed_extensions: Dict[str, Any] = field(default_factory=dict)
+    # namespace -> what closing that span recorded, filled in one span at a time as they close
+    # (see `TaskStream._finalize_spans`). Kept on the entry rather than in that call's own dict
+    # because a failure it must let out takes a local one with it: the row the seal still owes
+    # would then have nothing to say about the spans that had already closed, and would answer
+    # for their namespaces with a failure they never raised (see
+    # `TaskStream._unclosed_spans`).
+    finalized_extensions: Dict[str, Any] = field(default_factory=dict)
 
     def failed_to_end(self, exc: BaseException, source: _TerminalErrorSource) -> None:
         """Remember that this task has no verdict behind it, and where that came from.
@@ -4217,7 +4241,10 @@ class TaskStream:
         What that retry retries is the durable append and nothing above it. Both objections in
         the paragraph above are just as true of a seal that failed on the storage as of one whose
         caller was cancelled, so the composed row is retained on the entry across the hand-back
-        and the retry starts at the write (see :meth:`_run_seal`).
+        and the retry starts at the write (see :meth:`_run_seal`). **Every hand-back carries a
+        row**, including one from a seal that failed short of composing its own: that one leaves
+        the row it had reached, or an unscored stand-in if it had reached none, rather than
+        leaving the retry to compose a second (see :meth:`_retained_row`).
 
         **What a later caller joins is the claim, never the row.** The row becomes durable in the
         middle of the seal — the episode is still open behind it and any stop it owes is still
@@ -4281,6 +4308,13 @@ class TaskStream:
         force-terminated, its row composed, its spans finalized — and no retry undoes any of
         that, so :attr:`_Live.ended` stays set and a call naming it is still refused as over.
 
+        **Two failures reach here and the stop says which.** One is the durable append refusing a
+        row the seal had ready, which is a failure of the storage and leaves the record short an
+        outcome until some retry lands it. The other is the seal failing above that append, which
+        touched no storage at all and leaves its row on the entry for the retry to write (see
+        :meth:`_retained_row`). They send an operator to different places, so they are not
+        reported in the same words.
+
         Split from :meth:`_claim_seal` so the two can happen at different moments; joining is
         what may block, and nothing here holds the registry lock while it does."""
         try:
@@ -4296,22 +4330,46 @@ class TaskStream:
                     if live.sealing is sealing and live.row is None:
                         live.sealing = None
                         live.sealed = False
-                # The seal *failed* rather than being deferred, so a row is lost: stop
-                # dispensing, or the rest of the queue is served over a record missing an
-                # outcome the agent earned. A merely cancelled seal never reaches here — that
-                # one is finished by whoever drains next.
-                self._stop(
-                    failure,  # the first loss is the one that explains the run
-                    dispensing=(
-                        "this stream stopped: a dispensed task could not be recorded to "
-                        f"{self.results_path}, so the run's record is missing an outcome the "
-                        "agent actually earned"
-                    ),
-                    closing=(
-                        "this stream could not record every dispensed task to "
-                        f"{self.results_path}; the run's record is incomplete"
-                    ),
-                )
+                # The seal *failed* rather than being deferred, so the queue stops: served on, the
+                # rest of it is served over a record that may be missing an outcome the agent
+                # earned. A merely cancelled seal never reaches here: that one is finished by
+                # whoever drains next.
+                composing = live.compose_error
+                if composing is None:
+                    self._stop(
+                        failure,  # the first loss is the one that explains the run
+                        dispensing=(
+                            "this stream stopped: a dispensed task could not be recorded to "
+                            f"{self.results_path}, so the run's record is missing an outcome the "
+                            "agent actually earned"
+                        ),
+                        closing=(
+                            "this stream could not record every dispensed task to "
+                            f"{self.results_path}; the run's record is incomplete"
+                        ),
+                    )
+                else:
+                    # The other failure a hand-back can carry, and neither half of the message
+                    # above is true of it: nothing was written, so nothing about the storage
+                    # failed, and the row this seal owes is on the entry for the retry, which may
+                    # well land it and leave a complete record behind a stopped run. Pointing an
+                    # operator at `results.jsonl` names the one part of this that worked, and
+                    # calling the record incomplete is a claim about a write that has not been
+                    # attempted yet. What is true whichever way that write goes is that this
+                    # task's seal did not finish and the queue stopped there.
+                    rendered = _rendered_failure(composing)
+                    self._stop(
+                        composing,  # the failure the row's own diagnostic names
+                        dispensing=(
+                            "this stream stopped: a dispensed task's seal failed before its row "
+                            f"was recorded ({rendered}), so no further task could be sealed "
+                            "either"
+                        ),
+                        closing=(
+                            "this stream stopped before its queue was served: a dispensed task's "
+                            f"seal failed before its row was recorded ({rendered})"
+                        ),
+                    )
             raise
 
     async def _release(self, live: _Live) -> None:
@@ -4379,6 +4437,13 @@ class TaskStream:
         sealed or aborted itself, in the scored closures, exactly as a restarted seal would (see
         :meth:`_seal`). The retry therefore starts at the append.
 
+        **A seal that failed short of a row is retried the same way, and for the same reasons.**
+        The objections above are about re-composing, not about how the first attempt ended, so an
+        entry may never hand its claim back with nothing on it: a failure in the composing half
+        leaves a row and re-raises, and the retry writes *that* (see :meth:`_retained_row`). Which
+        row depends on how far the seal got: its own, when the outcome was already read and only
+        the extensions were left, and an unscored stand-in when nothing was.
+
         If no retry ever comes — the caller abandons the stream without closing it — the row is
         lost with the process, as it is today: nothing durable was written, so the dispense record
         goes unanswered and :func:`reconcile` reports the crash it actually was. What the retained
@@ -4404,7 +4469,7 @@ class TaskStream:
         try:
             row = live.pending_row
             if row is None:
-                row = live.pending_row = await self._compose_row(live, forced)
+                row = await self._retained_row(live, forced)
             async with self._lock:
                 # Durable before the row counts anywhere else. `reconcile` reads a missing result
                 # as a crash, so a row that only reached the page cache would turn a sealed,
@@ -4506,9 +4571,122 @@ class TaskStream:
             if live.row is not None:
                 self._retire_settled(live)
 
+    async def _retained_row(self, live: _Live, forced: Optional[Closure]) -> ResultRow:
+        """Compose this task's row, and leave a row on the entry **either way**.
+
+        The hand-back in :meth:`_join_seal` exists so a later drain can retry the append, and what
+        makes that retry safe is the retained row: composing is the half that may not run twice
+        (see :meth:`_run_seal`). A seal that failed *before* it had a row therefore cannot simply
+        hand its claim back — a retry finding no row composes a second one, and both halves of
+        that are the very things the retention exists to prevent. Measured: every span's
+        ``finalize`` runs again, and the classification is re-read from an episode the first
+        attempt already force-terminated, so a task the stream **drained** is recorded under a
+        *scored* closure the agent never earned.
+
+        So a failure here composes nothing further and stands a row in instead. It is unscored and
+        says why (see :meth:`_unsealed_row`), which is the honest reading: the seal did not finish,
+        so no verdict stands behind this task — the same answer a terminal the stream drove and the
+        env failed on already gets, reached one step earlier. The failure is then re-raised
+        unchanged, so the claim still goes back, the stream still stops, and a later drain still
+        retries the *append*, of this row and never of the composition.
+
+        **A failure that had reached an outcome first keeps it.** The composition decides the
+        closure and the score before it runs the extensions, so a failure out of *those* leaves a
+        seal that knows exactly how the task ended; that one composes its real row and leaves it
+        here (see :meth:`_compose_row`), and the stand-in below is for a failure that reached no
+        outcome at all. Standing an unscored row in over both would answer a task the agent
+        solved with an infrastructure failure."""
+        try:
+            live.pending_row = await self._compose_row(live, forced)
+        except BaseException as exc:  # noqa: BLE001 — a row stands in below, and this re-raises
+            # Recorded so the stop this owes is the one it is: what failed is the composing half,
+            # and storage is the append's business (see :meth:`_join_seal`).
+            live.compose_error = exc
+            if live.pending_row is None:
+                live.pending_row = self._unsealed_row(live, forced, exc)
+            raise
+        return live.pending_row
+
+    def _unsealed_row(
+        self, live: _Live, forced: Optional[Closure], cause: BaseException
+    ) -> ResultRow:
+        """The row a seal that failed before composing one leaves for the retry to write.
+
+        Built from the entry alone — the position, the lease and the queue reference the dispense
+        already recorded — because everything else a row carries is read off the episode, and
+        reading the episode is what just failed. So this cannot fail in turn: the one value it
+        takes from outside is the failure's own description, and that is rendered through the
+        guard every other message about a caught failure uses (see :func:`_rendered_failure`).
+
+        Unscored, and ``finalize_error`` rather than whatever the seal was forcing: a closure is
+        a claim about how the task ended, and a seal that produced no row is a task whose ending
+        this record cannot vouch for. The reason the stream reached for the seal — a drain, a
+        deadline — is not lost; it is simply not a verdict, and the diagnostic carries it.
+
+        ``observed`` is empty, which is the true statement about *this row*: nothing the env
+        published reached it. The spans are recorded the way any failed seal records them (see
+        :meth:`_unclosed_spans`), and a failure this early has closed none of them, so what that
+        says here is that none was ever finalized."""
+        rendered = _rendered_failure(cause)
+        # What the seal was reaching for when it failed. Not a closure — this row's closure says
+        # the seal produced none — but the one fact about the ending that is still knowable here,
+        # and the reader of a `finalize_error` row wants to know which of them it was.
+        sealing_for = "the agent's own terminal" if forced is None else repr(forced)
+        return ResultRow(
+            seq=live.seq,
+            lease=live.lease,
+            position=live.position,
+            env=live.ref.env,
+            task_idx=live.ref.task_idx,
+            closure="finalize_error",
+            score=None,
+            observed=[],
+            diagnostic=(
+                "the seal failed before it composed a row, so this task has no verdict behind "
+                f"it ({rendered}); it was sealing for {sealing_for}"
+            ),
+            extensions=self._unclosed_spans(live, cause),
+            # The regime this stream serves, exactly as a composed row records it.
+            feedback_regime=self._regime,
+        )
+
+    def _unclosed_spans(self, live: _Live, cause: BaseException) -> Dict[str, Any]:
+        """The span entries for a row a seal that could not finish leaves behind: what each span
+        that closed actually recorded, and, for the rest, that nothing of theirs is in this row.
+
+        A span that closed keeps its own entry. It ran exactly once, its side effects are out in
+        the world and what it returned is provenance the seal already collected, so rewriting it
+        would drop that payload and file the namespace under a failure the extension never raised.
+        A namespace this seal never reached at all would be recorded, by that same rewrite, as one
+        whose ``finalize`` failed. Neither is true, and the row is the only account these
+        extensions get.
+
+        The member is still ``error``, for both. An orderly row's entry is a ``dispensed`` with
+        exactly one of ``sealed`` or ``error`` beside it, and that shape is what tells it from a
+        reconciled one (see :class:`ResultRow`); a third member would widen a wire contract for
+        every consumer, on the rarest path this module has, to say what the entry's own text says
+        and what ``closure`` says about the whole row. So ``error`` carries the truth that a span
+        was never asked, in its own words."""
+        unreached = (
+            "the seal failed before this span was finalized, so its finalize was never called: "
+            f"{_rendered_failure(cause)}"
+        )
+        entries: Dict[str, Any] = {}
+        for namespace in live.spans:
+            entry = live.finalized_extensions.get(namespace)
+            if entry is None:
+                entry = {
+                    "dispensed": live.dispensed_extensions.get(namespace),
+                    "error": unreached,
+                }
+            entries[namespace] = entry
+        return entries
+
     async def _compose_row(self, live: _Live, forced: Optional[Closure]) -> ResultRow:
         """Everything a seal does exactly once: end the episode, read its verdict, classify it,
-        close the spans, and build the row from all of it. Nothing here is retried."""
+        close the spans, and build the row from all of it. Nothing here is retried, so a failure
+        in the last of those steps still builds the row from the ones before it, and leaves it on
+        the entry for the retry that may not run them again."""
         episode = live.episode
         # A terminal call whose caller was cancelled leaves its finalization running: the episode
         # is already sealed while its verdict is still landing. Adopt that outcome rather than
@@ -4653,8 +4831,24 @@ class TaskStream:
         # outside every lock. Whatever they return is namespaced; whatever they do wrong is
         # recorded in their own namespace and cannot stop the row. What they are *handed* is
         # built per extension and detached from `score`, which is the row's own summary object.
-        extensions = await self._finalize_spans(live, closure, score)
-        return ResultRow(
+        #
+        # **A failure they let out does not take the outcome with it either.** The one shape that
+        # reaches here is a failure no containment holds (a non-`Exception` `BaseException`, or
+        # this seal's own cancellation), and it arrives with the episode sealed, its verdict read
+        # and its closure classified. An extension may not change a task's outcome, which is the
+        # whole reason they run after the classification, and a failure the stream cannot contain
+        # is not the extension's licence to: standing an unscored row in over the top of it files
+        # a task the agent solved as an infrastructure failure, for a verdict this seal was
+        # holding as it failed. So the row is composed from what is already in hand and from the
+        # spans that did close, and it is the *failure* that goes on out, to stop the stream and
+        # hand the claim back as before.
+        unfinished: Optional[BaseException] = None
+        try:
+            extensions = await self._finalize_spans(live, closure, score)
+        except BaseException as exc:  # noqa: BLE001 (the row is composed below, then re-raised)
+            unfinished = exc
+            extensions = self._unclosed_spans(live, exc)
+        row = ResultRow(
             seq=live.seq,
             lease=live.lease,
             position=live.position,
@@ -4670,6 +4864,14 @@ class TaskStream:
             # answer at the moment the row is built.
             feedback_regime=self._regime,
         )
+        if unfinished is not None:
+            # The seal's answer is already reached, so what is left is the failure. The row goes
+            # on the entry for the retry to write, exactly as one whose append failed is retained
+            # (see :meth:`_retained_row`), and the failure is re-raised unchanged: the claim goes
+            # back and the stream stops, as it does for any seal that could not finish.
+            live.pending_row = row
+            raise unfinished
+        return row
 
     async def _force_terminal(
         self, live: _Live, tool: str
@@ -4790,8 +4992,17 @@ class TaskStream:
         Without the count, an extension could raise ``CancelledError`` and cancel the seal task
         out from under the row: ``_seal`` would see a cancelled claim, record no stop, and leave
         the entry sealed with no row, so every retry re-awaits the same cancelled task, the
-        durable dispense is never answered, and an orderly shutdown reconciles as a crash."""
-        extensions: Dict[str, Any] = {}
+        durable dispense is never answered, and an orderly shutdown reconciles as a crash.
+
+        **The spans close one at a time, and what each one recorded is kept as it goes.** A
+        failure this may not contain still leaves a row owed: the seal fails, its claim goes back,
+        and a later drain writes what the seal had reached (see :meth:`_compose_row`). So the
+        entries are accumulated on the entry rather than in a local map the raise would take with
+        it. Recomposing them from the open spans instead answers for every namespace with the one
+        failure that escaped: a span that closed loses the payload it returned and is filed under
+        a failure another extension raised, and a span this never reached is recorded as one whose
+        ``finalize`` failed."""
+        extensions = live.finalized_extensions
         cancellation = _Cancellation()
         for namespace, span in live.spans.items():
             entry: Dict[str, Any] = {"dispensed": live.dispensed_extensions.get(namespace)}
@@ -4811,6 +5022,18 @@ class TaskStream:
                 )
             except BaseException as exc:  # noqa: BLE001 — an extension may not break a row
                 if _must_propagate(exc, cancellation):
+                    # Out of here the failure is the seal's rather than this span's, and it is
+                    # recorded as one: this span did not return, which is a different statement
+                    # from a `finalize` that failed on its own and is worded as one, because the
+                    # failure may be this seal's cancellation arriving inside the callback. The
+                    # entry is still kept, because dropping it would leave the row owing an
+                    # account of a span it opened, and the row is where an extension's half of
+                    # the task is answered for.
+                    entry["error"] = (
+                        "the seal failed while this span was finalizing, so nothing it returned "
+                        f"was recorded: {_rendered_failure(exc)}"
+                    )
+                    extensions[namespace] = entry
                     raise
                 entry["error"] = _rendered_failure(exc)
             extensions[namespace] = entry
@@ -5160,8 +5383,10 @@ def _detached_summary(score: Optional[Score]) -> Optional[Score]:
     scalar reaches ``observed`` and is written to the row like any other string or number. Its
     ``__deepcopy__`` raising would take down a row this same run records without provenance — the
     copy is built here, above the boundary that contains a failing extension, so nothing catches
-    it, the seal fails, and ``_compose_row`` is retried, finalizing a second time every span that
-    had already closed. One that blocks would wedge the seal where no extension bound applies.
+    it, the seal fails before it has classified anything, and what the run records for the task is
+    the unscored row a seal that reached no outcome stands in (see
+    :meth:`TaskStream._retained_row`). One that blocks would wedge the seal where no extension
+    bound applies.
     Merely turning provenance on would then suppress a row the stream would otherwise have
     scored, with every extension behaving perfectly.
 
