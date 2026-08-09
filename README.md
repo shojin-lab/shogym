@@ -157,6 +157,12 @@ result = await shogym.evaluate("wordle_v1", task=17, harness=my_harness)
 print(result.value("check_answer"))
 ```
 
+## Reviewing
+
+Serve-layer and env changes are reviewed adversarially: reproduce first, fail first, one mutation
+entry per fix hunk, and re-review until a pass is clean. [`REVIEWING.md`](REVIEWING.md) is the
+method, with four PR threads as its worked examples.
+
 ## License
 
 Apache-2.0. Portions derived from [llmgym](https://github.com/tensorzero/llmgym)
