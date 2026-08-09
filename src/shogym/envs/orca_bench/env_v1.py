@@ -10,8 +10,8 @@ plausible root cause.
     ``task.toml`` carries the full answer, so the redaction is the load-bearing property here,
     not a nicety (see :mod:`shogym.envs.orca_bench.tasks`).
   - **serve** exposes ``exec`` / ``read_file`` / ``write_file`` on the task container, plus
-    ``submit_report`` as the ``score`` terminal. **Phase 2**: constructing the backend raises
-    today (see :mod:`shogym.envs.orca_bench.backend`).
+    ``submit_report`` as the ``score`` terminal, over the live compose stack (see
+    :mod:`shogym.envs.orca_bench.compose_backend`).
   - **finalize (sealed)** runs the task's own verifier over ``/app/report.md`` and turns its
     two output files into a verdict, mapping a judge failure to an **explicit** judge-error grade
     rather than the honest-looking zero upstream writes.
@@ -264,7 +264,17 @@ class OrcaBenchEnv(Env):
         self._grading[session_id] = _Grading(
             is_control=bool(task.get("is_control")), judge=resolved
         )
-        mcp_server.begin_session(session_id, task_dir=Path(task["task_dir"]), judge=resolved)
+        # `snapshot` is what makes the stack this task's rather than some other's: the entrypoint
+        # restores exactly that recorded telemetry. The stack's clock is real; what restores the
+        # paper's telemetry window is the lookback override, not a pinned time (issue #77, see
+        # `compose_backend.install_clock_override`).
+        task_dir = Path(task["task_dir"])
+        mcp_server.begin_session(
+            session_id,
+            task_dir=task_dir,
+            judge=resolved,
+            snapshot=str(task["snapshot"]),
+        )
 
     def _end_session(self, session_id: str) -> None:
         from shogym.envs.orca_bench import mcp_server

@@ -12,18 +12,16 @@ recorded trajectory while an external harness drives the tools. See
 [`../README.md`](../README.md). The runnable demos live in
 [`examples/`](../../../../examples/).
 
-> **This port lands in two phases (issue #77). Phase 1 is what is here**: the dataset loader, the
-> task index, the redacted `describe()`, the judge preflight, and the judge's verdict parsing,
-> all offline. **Phase 2 adds the compose backend** that brings a task's 28-service stack up; the
-> calls it needed are settled (see [Decisions](#decisions)), so what remains there is
-> implementation. Until it lands, constructing and describing tasks works and *serving* an episode
-> raises `BackendUnavailableError` with a message that says why.
+> **Serving an episode runs the benchmark's real stack** (issue #77): a 28-service compose
+> project the task image starts on your Docker daemon, behind a ~87 GB image and a ~46 GB
+> snapshot cache. Everything else about this env, including `describe` and the whole test suite,
+> works with no Docker at all. See [Requirements](#requirements) before the first run.
 
 ## Running it
 
-> Needs **Python 3.12**. Phase 1 needs no key and no Docker; it downloads the dataset (~192 MB)
-> on first construction. Serving an episode (phase 2) will additionally need a Docker daemon and
-> ~133 GB of disk. See [Requirements](#requirements).
+> Needs **Python 3.12**. Constructing and describing tasks needs no key and no Docker; it
+> downloads the dataset (~192 MB) on first construction. Serving an episode additionally needs a
+> Docker daemon and ~140 GB of disk **on the daemon**. See [Requirements](#requirements).
 
 ### Construct + serve
 
@@ -36,15 +34,24 @@ spec = env.describe("0")                 # task 0: its instruction.md + the tool
 
 # Slice the 755 tasks by the labels the benchmark publishes numbers for.
 hard = tasks.select(env.refs, difficulty="hard", is_control=False)
-by_snapshot = tasks.group_by_snapshot(env.refs)   # 125 groups: the phase-2 staging unit
+by_snapshot = tasks.group_by_snapshot(env.refs)   # 125 groups: the staging unit
 ```
 
-Serving is the phase-2 path. Once the backend lands it is the usual one:
+Serve it as a stdio MCP server any harness can drive. The first run stages the stack, which is
+slow and enormous; every later one reuses it:
 
 ```bash
 export OPENAI_API_KEY=sk-...             # the task's own verifier is an LLM judge
 uv run python -m shogym.cli serve orca_bench --task 0 --trace ./shogym_logs/orca.jsonl
 ```
+
+What happens on that first call, in order: the pinned image is pulled **by digest** for
+`linux/amd64` (the only platform it is published for, so on Apple Silicon it runs emulated);
+its `/app` tree is copied once into a named Docker volume; and then, per episode, a privileged
+container starts with the daemon socket mounted and brings the 28 services up as its **siblings**.
+Keep `max_in_flight` at its default of 1: one episode at a time per host, because the stack is the
+host's resources rather than the container's. The staged cache also carries the clock override that restores the
+benchmark's expired telemetry window; see [The clock](#the-clock-and-why-the-stack-needs-one).
 
 The harness reads the instruction via `describe`, investigates through `exec` / `read_file` /
 `write_file`, writes its report to `/app/report.md`, and calls **`submit_report`**, the **score
@@ -60,8 +67,8 @@ snapshot's group), `judge_model` / `judge_effort` / `judge_base_url`, and `max_s
 
 ### Claude Code example
 
-Any quickstart under [`examples/`](../../../../examples/) serves this env once phase 2 lands.
-Point it here with the single variable at the top of its `serve.py`:
+Any quickstart under [`examples/`](../../../../examples/) serves this env. Point it here with
+the single variable at the top of its `serve.py`:
 
 ```python
 ENV = "orca_bench"
@@ -86,15 +93,40 @@ the LLM judge ships inside every task. On top of that:
   the port then hands the verifier a placeholder credential, because the verifier constructs its
   SDK client unconditionally and the SDK refuses a missing or empty key before it ever reaches the
   endpoint. With no endpoint named there is nowhere keyless to point at, so the key is required.
-- **Docker + ~133 GB of disk, to serve (phase 2).** The environment image is ~86.8 GB and carries
-  a ~46 GB telemetry snapshot cache. Measured on one host: 4.10 GiB RSS for the running stack, 3.4
-  GB of disk per trial, ~135 s warm start, ~8 s teardown.
+  The verifier runs inside the task container, so the key has to reach it; it is forwarded by name
+  (`docker run -e OPENAI_API_KEY`) rather than written into an argument list, because a benchmark
+  host is shared and argv is readable by every local `ps`.
+- **Docker, and about 140 GB on the daemon, to serve.** The pinned image is ~87 GB and carries a
+  ~46 GB telemetry snapshot cache that is staged into a named volume beside it. The number that
+  matters is the **daemon's** free space, not the host's: on Docker Desktop those are different
+  disks. Both halves are guarded, because they are separately reachable: a pull is refused below
+  ~140 GB free, and the copy is refused below ~50 GB, which is the case a host that already holds
+  the image runs into. A daemon that fills up does not fail politely, it stops working.
+  Measured by this port on an 8-CPU emulated daemon: staging the cache once takes ~125 s, a warm
+  start is 120 to 161 s to the entrypoint's ready marker, the running stack is 29 containers at
+  3.3 to 3.6 GiB, and teardown is 7 to 10 s leaving nothing behind.
+- **The image is `linux/amd64` only.** On an arm64 host the daemon refuses the pull outright
+  without an explicit platform, so this port always passes one, and the 28 services then run
+  emulated. It works; it is slower than the spike's numbers, which were taken on amd64.
+- **One episode at a time per host.** `max_in_flight` defaults to 1 in the serve layer and this
+  env must not be raised above it: the services are siblings on the host daemon rather than
+  children of the agent's container, so two episodes are two 28-service stacks on one machine
+  competing for the same memory, and their per-trial contexts are distinct only by name.
 - **CI runs the offline half only, and always will.** A hosted runner has ~14 GB of disk, so the
-  live path cannot run there at any budget, and no longer timeout changes that. Everything phase 1
+  live path cannot run there at any budget, and no longer timeout changes that. The live tests
+  carry the `docker` mark and CI deselects it alongside `network`; everything else about this env,
+  including the whole backend's decision logic, is offline and does run there. Everything phase 1
   ships (loading, indexing, `describe`, the preflight, verdict parsing) is tested offline against
   synthetic fixtures and runs in the core suite; one `network`-marked test downloads a single real
   task (~30 KB) to exercise provisioning against real bytes and is deselected by `-m "not
-  network"`.
+  network"`. On a host that *has* staged the stack, the live half runs by hand and one of its
+  tests is a whole keyless episode (start, readiness, Grafana answering, a non-ASCII report
+  captured back byte for byte, teardown with nothing of that trial left):
+
+  ```bash
+  SHOGYM_ORCA_BENCH_DATA_DIR=<a provisioned dataset> \
+    uv run pytest tests/envs/test_orca_bench_compose.py -m docker
+  ```
 
 ## How it works
 
@@ -127,6 +159,54 @@ apart: it is provenance (it rides along in the loaded task as `dataset_index`), 
 Interchanging the two is silent when the wrong number happens to be in range, so the round trip
 the serve layer performs, load a task and then describe the id it reported, is pinned by a test
 over a non-trivial slice.
+
+### The clock, and why the stack needs one
+
+The recorded telemetry is from 2026-04-19..23 and the published Jaeger config sets
+`max_span_age: 2160h` (90 days), so from about 2026-07-22 onward a live stack answers
+`GET /api/services` with an **empty list**: an agent's first move sees a system with no services,
+and no run is comparable to the paper's numbers.
+
+The fix is **two runtime knobs**, and they are one decision rather than two. Jaeger's OpenSearch
+reader turns the lookback into one daily index name per day of the window and puts every one of
+them in the HTTP request line, so a longer lookback is literally a longer URL:
+
+| | |
+|---|---|
+| `opensearch` | `http.max_initial_line_length=512kb`, against a 4 KB default |
+| `jaeger` | `--config` pointed at a shadow copy of its own config with `max_span_age: 87600h` (10 years) |
+
+At ~40 bytes per index name, 10 years is ~3650 names and ~146 KB of request line, which is why
+**neither knob works alone**: widening the lookback by itself dies with
+`An HTTP line is larger than 4096 bytes [type=too_long_http_line_exception]`, and raising the limit
+by itself changes nothing. A test pins the two constants against each other so they cannot drift
+apart in a later edit.
+
+Both knobs are runtime-scoped. The compose override and the shadow config land in the staged cache
+that the entrypoint already copies out and hands to `docker compose`, so **the image and its digest
+are untouched** and the published config stays mounted and unread. The shadow is derived from the
+published file by substituting one line, so it tracks every other setting in it.
+
+Measured on the live stack: the service list comes back **populated with 19 services**, an
+explicit-window trace query returns traces (24 spans in the first), Grafana's own `webstore-traces`
+datasource proxies the same populated list, and `telemetry_reach()` reports full reach.
+
+**Two earlier mechanisms are dead, and the decision record was wrong about both.** They are
+recorded here because the evidence cost a stack each:
+
+- **`libfaketime` is inert.** It preloads over libc's time calls, and the Jaeger query service is
+  `jaegertracing/jaeger:2.12.0`, a statically linked Go binary the loader refuses outright:
+  `/lib/ld-musl-x86_64.so.1: /cmd/jaeger/jaeger-linux: Not a valid dynamic program`. A live run
+  with the pin installed still returned an empty service list.
+- **Widening the lookback alone** (the option rejected as re-expiring "around day 135") fails
+  **immediately**, not later: at both 2760h and 4000h the query dies on the request-line limit.
+
+**One residual difference from the paper's runs**, stated rather than papered over: the stack's
+clock is real, so a query with **no explicit window** resolves to "recently" and returns nothing,
+cleanly and without error. The paper's runs had `now` inside the incident. Every task's instruction
+states the incident time in prose, so an agent that forms an explicit window sees exactly what the
+paper's agents saw; an agent that relies on a default window sees an empty result. Pinning the
+stack's clock would close this, and that is the mechanism proven dead above.
 
 ### Tools (served over MCP)
 
@@ -169,8 +249,10 @@ belongs to something that did not exist at the seal. The report is therefore **c
 the seal, through a single descriptor (symlinks refused rather than resolved, and the open is
 non-blocking so a named pipe or device at that path is refused instead of stranding the terminal
 call until a writer appears), validated against those bytes, and held where no agent process can
-reach it; the verifier is pointed at the capture and never at the live path. The backend protocol states this as a requirement, since phase 2 is
-where the container work happens.
+reach it; the verifier is pointed at the capture and never at the live path. Live, that is one
+`docker cp` out of the container at the seal, and one back in to a path outside the agent's tree
+for grading. Both move **bytes**: a report is agent-authored prose, and pushing it through a text
+pipe would re-encode it in whatever the harness process's locale says.
 
 **A judge failure is an explicit grade, never a silent zero.** Upstream's verifier writes
 `{"reward": 0.0}` when the judge itself raises, byte-identical to what it writes for a wrong
@@ -181,6 +263,12 @@ was scored); everything else grades as `judge_error=True`, which `verify` emits 
 feedback field so grading-infra failures can be filtered out instead of averaged in. The
 preflight is the other half: the retired model is refused **by name** at construction, and a
 missing key at session start.
+
+**The judge is stochastic, so one episode is not a measurement.** The same oracle report on the
+same task graded `0.25` on one live run and `0.583` on the next, `rca_accuracy=False` both times.
+Rubric-scored rewards from a sampled model vary by construction; read this env in aggregate, and
+read it alongside [The clock](#the-clock-and-why-the-stack-needs-one), which is currently the
+larger effect on the number.
 
 ## Tasks
 
@@ -281,26 +369,26 @@ control as a failure. Upstream never mixes them either: the published metrics re
 - **`describe` publishes strictly less than upstream's task directory contains**, see
   [describe → TaskSpec](#describe--taskspec). This is a deliberate divergence from a benchmark
   whose safety here depended on a runner's incidental behavior.
-- **The benchmark has already silently degraded, and this port does not yet fix it.**
+- **The benchmark had silently degraded, and this port repairs it at runtime.**
   `jaeger-config-snapshot.yml` pins `max_span_age: 2160h` (90 days) and the snapshot data is from
-  2026-04-19..23, so it aged out of Jaeger's lookback around 2026-07-22. Live, `GET /api/services`
-  now returns empty: an agent's natural first move sees a system with no services, while
-  explicit-window queries still work. It worsens daily, and **any run today is not comparable to
-  the paper's numbers**, which predate the expiry. Phase 2 pins the Jaeger query service's clock
-  to restore them; see [Decisions](#decisions).
+  2026-04-19..23, so it aged out of Jaeger's lookback around 2026-07-22 and `GET /api/services`
+  returned empty on every stack after that date. Two runtime knobs restore the pre-expiry window
+  without editing the artifact, leaving one residual difference (queries with no explicit window),
+  all under [The clock](#the-clock-and-why-the-stack-needs-one).
 
 ## Decisions
 
-The five calls this port needed are settled (owner, issue #77 and this PR's thread). They are
-recorded here because each one changes what a number from this env means.
+The five calls this port needed were settled by the owner (issue #77 and this PR's thread), and
+phase 2 reopened the first of them by trying it. They are recorded here because each one changes
+what a number from this env means.
 
-1. **The `max_span_age` expiry: pinned clock.** The snapshot data is from 2026-04-19..23 and aged
-   out of Jaeger's 90-day lookback around 2026-07-22, so a live stack answers `GET /api/services`
-   with an empty list and no run is comparable to the paper's numbers. Phase 2 pins fake time
-   inside the Jaeger query service with `libfaketime`, scoped to that service alone, so the stack
-   behaves as it did during the paper's runs. The artifact is not edited, and the pinned time and
-   mechanism are recorded in run provenance. A lookback patch was rejected: it re-expires once the
-   per-day index names exceed OpenSearch's 4096-byte URL limit, around day 135.
+1. **The `max_span_age` expiry: a two-knob runtime override.** The snapshot data aged out of
+   Jaeger's 90-day lookback around 2026-07-22, so a live stack answered `GET /api/services` with an
+   empty list. The original decision (pin fake time with `libfaketime`) and the option it rejected
+   (widen the lookback alone) were both tried against the real image and **both are dead**; the
+   pair that works is a raised OpenSearch request-line limit plus a widened lookback in a shadow
+   config, neither of which touches the image. Evidence, measurements and the one residual
+   difference are under [The clock](#the-clock-and-why-the-stack-needs-one).
 2. **No service trimming.** 21 of the 28 services produce no telemetry in replay and dropping them
    would save ~4 GB of RSS, but the agent's world stays identical to the paper's. Fidelity first.
 3. **No image re-derivation.** A smaller image would cut the ~133 GB floor, but it cannot be
@@ -313,8 +401,8 @@ recorded here because each one changes what a number from this env means.
 5. **CI runs the offline half only.** A hosted runner has ~14 GB of disk against this env's ~133
    GB floor, so the live path cannot run there at any budget.
 
-What is left for phase 2 is implementation, not deliberation: the compose backend, the
-named-volume staging of the snapshot cache, and the clock pin above.
+Phase 2 implemented the compose backend, the named-volume staging of the snapshot cache, and the
+clock override, the last of which corrected the decision record rather than following it.
 
 ## Gotchas
 
@@ -407,5 +495,6 @@ named-volume staging of the snapshot cache, and the clock pin above.
 | [`dataset.py`](dataset.py) | The pins and the on-demand download: resolve the revision, list its tasks, fetch and publish each one into the cache. |
 | [`tasks.py`](tasks.py) | The task model and index over a cached dataset directory: labels, slicing, snapshot grouping, and `answer_strings`. |
 | [`judge.py`](judge.py) | The judge's configuration and preflight, and the verdict parsing that makes a judge failure explicit. |
-| [`backend.py`](backend.py) | The phase-2 seam: the backend protocol, the pinned image digest, the staging contract. No Docker code. |
+| [`backend.py`](backend.py) | The backend contract: the protocol an implementation fills, the pinned image digest, the staging and capture requirements. No Docker code. |
+| [`compose_backend.py`](compose_backend.py) | The live implementation: image pull by digest, snapshot staging into a named volume, the clock seam, the container lifecycle, capture and verify, teardown. |
 | [`mcp_server.py`](mcp_server.py) | The served tools (`exec` / `read_file` / `write_file` / `submit_report`) and the session registry. |

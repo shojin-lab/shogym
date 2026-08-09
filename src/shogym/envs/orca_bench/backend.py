@@ -2,12 +2,11 @@
 
 Running an ORCA-bench task means bringing up the benchmark's recorded observability stack (28
 services replaying a frozen telemetry snapshot behind Grafana), letting an agent query it, and
-then running the task's own verifier over the report it wrote. That backend is **phase 2** of
-this port (issue #77). The calls it needed are settled and recorded in the env README; it is not
-implemented here, and this module contains no Docker code.
+then running the task's own verifier over the report it wrote. That backend lives in
+:mod:`shogym.envs.orca_bench.compose_backend`; this module contains no Docker code, so everything
+the env does without a stack stays importable on a machine that has none.
 
-What is here is the shape it must fill, and the measurements phase 1 established so phase 2 does
-not have to rediscover them:
+What is here is the shape it fills, and the measurements phase 1 established:
 
   - :class:`OrcaBackend`, the protocol the env drives: bring a task's stack up, act on the
     agent's container, run the verifier, tear down.
@@ -121,20 +120,17 @@ class OrcaBackend(Protocol):
         ...
 
 
-def create_backend(task_dir: Any, **_kwargs: Any) -> OrcaBackend:
-    """Bring up a backend for one task. Raises until the compose backend lands (phase 2).
+def create_backend(task_dir: Any, **kwargs: Any) -> OrcaBackend:
+    """Bring up a backend for one task: the live compose stack.
 
-    Phase 1 ships the dataset loader, the redacted task contract, the judge preflight, and the
-    verdict parsing: everything that is correct to build and test without the stack. Serving an
-    episode needs the stack itself, including the pinned clock that restores the benchmark's
-    expired snapshot lookback (see the env README).
+    Imported lazily so that everything phase 1 does (describe, loading, verdict parsing) stays
+    reachable on a machine with no Docker at all, which is also what keeps the offline test suite
+    honest. Serving an episode needs the stack itself: see :data:`DISK_REQUIRED_GB` and
+    :data:`WARM_START_SECONDS`.
     """
-    raise BackendUnavailableError(
-        "the orca_bench compose backend is not implemented yet: this port's phase 1 covers "
-        "describe / dataset loading / judge preflight / verdict parsing, all offline. Running an "
-        f"episode needs the {SNAPSHOT_IMAGE} stack (~{DISK_REQUIRED_GB} GB of disk, "
-        f"~{WARM_START_SECONDS} s warm start), which is phase 2 of this port (issue #77)."
-    )
+    from shogym.envs.orca_bench.compose_backend import create_backend as create_live_backend
+
+    return create_live_backend(task_dir, **kwargs)
 
 
 __all__ = [

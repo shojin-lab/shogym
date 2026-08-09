@@ -36,6 +36,9 @@ jobs:
 
       # The offline suite runs keyless: keyed tests (tau2 user-sim, hle judge) self-skip
       # without OPENAI_API_KEY. Unset it explicitly so nothing here depends on a secret.
+      # `not docker` deselects the orca_bench live-stack tests: that env's environment is a
+      # 28-service compose project behind a ~133 GB image, which a hosted runner (~14 GB of disk)
+      # cannot hold at any timeout. Everything else about that port is offline and does run here.
       # `-m "not network"` is the other half of the same promise: it deselects the tests that
       # reach a third-party service while they run (see NETWORK_ORACLE_TASKS in
       # tests/envs/test_frontier_bench_served.py), so a PR cannot go red because someone else's
@@ -46,7 +49,7 @@ jobs:
       # extras or no network is allowed to skip that; this runner has both, so here any failure to
       # provision and import — upstream drift, a gap in a hand-maintained extra, a corrupt
       - name: Run tests (offline, keyless)
-        run: env -u OPENAI_API_KEY SHOGYM_REQUIRE_UPSTREAM=1 uv run pytest -q -m "not network"
+        run: env -u OPENAI_API_KEY SHOGYM_REQUIRE_UPSTREAM=1 uv run pytest -q -m "not network and not docker"
 
       - name: Lint (ruff)
         run: uv run ruff check .

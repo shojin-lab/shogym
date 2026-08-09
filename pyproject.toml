@@ -206,6 +206,11 @@ markers = [
     # run still selects it, which is where a live upstream dependency is meant to be checked,
     # with a human reading the result.
     "network: needs a live third-party service; deselected from the offline suite",
+    # A test that needs a local Docker daemon AND the ~133 GB orca_bench stack staged on it. CI
+    # cannot run these at any budget (a hosted runner has ~14 GB of disk), and neither can a
+    # laptop that has not staged the image, so they are deselected alongside `network` and are
+    # meant to be run by hand on a host that has.
+    "docker: needs a local Docker daemon with the orca_bench stack staged; deselected from the offline suite",
 ]
 
 [tool.ruff]

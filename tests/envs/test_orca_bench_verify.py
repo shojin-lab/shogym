@@ -1049,9 +1049,23 @@ def test_a_resolved_judge_freezes_the_endpoint_it_was_resolved_with() -> None:
 # ----- the phase-2 seam -----
 
 
-def test_the_compose_backend_is_a_declared_gap_not_a_crash(tmp_path: Path) -> None:
-    with pytest.raises(backend.BackendUnavailableError, match="phase 1"):
-        backend.create_backend(tmp_path)
+def test_the_backend_seam_reaches_the_live_stack(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """`backend.create_backend` is the seam phase 1 declared and phase 2 fills.
+
+    The live implementation is imported lazily, so everything else about this env stays reachable
+    on a machine with no Docker; asked to serve without a daemon, it says which piece is missing
+    rather than failing somewhere further in."""
+    from shogym.envs.orca_bench import compose_backend
+
+    monkeypatch.setattr(compose_backend, "docker_available", lambda: False)
+    with pytest.raises(backend.BackendUnavailableError, match="Docker daemon"):
+        backend.create_backend(
+            tmp_path,
+            judge=judge.JudgeConfig().resolve({"OPENAI_API_KEY": "sk-test"}),
+                snapshot="20260423T050139Z-4f4aceafe624e619",
+        )
 
 
 def test_the_environment_image_is_pinned_by_digest() -> None:
