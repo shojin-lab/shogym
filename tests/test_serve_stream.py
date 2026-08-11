@@ -2613,6 +2613,63 @@ async def test_mcp_end_to_end(tmp_path: Path) -> None:
     assert [row["score"]["success"] for row in _rows(tmp_path)] == [True, True]
 
 
+@pytest.mark.parametrize("max_in_flight", [1, 3])
+async def test_the_advertised_get_task_says_what_a_pull_at_capacity_costs(
+    tmp_path: Path, max_in_flight: int
+) -> None:
+    """The rule the agent is scored against, in the text the agent is given to read.
+
+    A pull with every slot full seals the oldest live task and scores it as an ordinary loss, and
+    the row that lands is indistinguishable from a task the agent played and lost. So the
+    description has to name the capacity it was built with and say what a pull at that capacity
+    costs; a capacity-agnostic one bills the agent for a protocol nothing told it.
+
+    Asserted against the behaviour in the same test, at one slot and at several, so this pins
+    what the text has to *say* rather than the sentence it currently says it in.
+
+    Said as mechanics, never as advice. What a call costs is a fact about the endpoint; how to
+    spend a queue is the agent's, and prose telling it lands in every run served through this
+    module, including the ones whose own instructions were written to leave that choice open."""
+    # One task per slot, then one pull too many: the last one is the pull the description is about.
+    indices = [*range(max_in_flight), 0]
+    async with _stream(tmp_path, indices, max_in_flight=max_in_flight) as stream:
+        server = build_stream_server(stream)
+        async with Client(server) as client:
+            tools = {
+                tool.name: (tool.description or "").lower() for tool in await client.list_tools()
+            }
+            advertised = tools["get_task"]
+            assert str(max_in_flight) in advertised, "the capacity is not a number the agent sees"
+            assert "forfeit" in advertised and "loss" in advertised, (
+                "the advertised text does not say a pull at capacity is scored against the caller"
+            )
+            # The sentence this replaced. It read as a promise that pulling ahead is free, which
+            # at capacity 1 is false of every pull the agent can make.
+            assert "still yours to finish" not in advertised
+            # Neither the old sentence nor a new one may coach: a description that says what to do
+            # is a treatment this endpoint applies to every agent it serves.
+            assert "work the task" not in advertised and "first, then" not in advertised
+            if max_in_flight == 1:
+                assert "at most one task may be held" in advertised
+            else:
+                assert "oldest" in advertised, "which task gives way is left for the agent to find"
+                assert "a pull is free" in advertised, "a pull below the limit costs nothing"
+            assert str(max_in_flight) in tools["queue_info"], (
+                "`in_flight` is advertised without the limit it is measured against"
+            )
+
+            for _ in indices:
+                pulled = json.loads((await client.call_tool("get_task", {})).content[0].text)  # type: ignore[union-attr]
+                assert "done" not in pulled, "the queue ran out before the pull under test"
+
+            # Read while the stream is still open, so this is the displacing pull's own row and
+            # not one the drain would have written anyway.
+            (row,) = _rows(tmp_path)
+            assert row["position"] == 0, "the displaced task was not the oldest live one"
+            assert row["closure"] == "drained"
+            assert row["score"]["success"] is False
+
+
 async def test_server_rejects_a_control_tool_collision(tmp_path: Path) -> None:
     class _Colliding(_FixtureScoreEnv):
         def describe(self, task_id=None) -> TaskSpec:

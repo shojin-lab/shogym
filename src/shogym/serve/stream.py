@@ -5971,6 +5971,62 @@ def _pick_bool(feedback: Sequence[Dict[str, Any]], names: Sequence[str]) -> Opti
     return value if isinstance(value, bool) else None
 
 
+def _get_task_description(max_in_flight: int) -> str:
+    """The ``get_task`` description an agent reads, written for the capacity the stream was
+    actually constructed with.
+
+    The displacement rule is the agent's to know, and this text is the only place it can learn
+    it: a pull made while every slot is full seals the oldest live task and scores it as an
+    ordinary loss (see :meth:`TaskStream.get_task`), and that row is indistinguishable from a
+    task the agent played and lost. A description written capacity-agnostically therefore
+    charges the agent for a protocol it was never told, and leaves an earned-looking closure on
+    the row: the exact failure the redactions elsewhere in this module exist to prevent. So the
+    number of slots is named, and what a pull at it costs is stated outright.
+
+    **Mechanics and consequences only, and in the indicative rather than the imperative.** What
+    the tool does, what a call costs and what the numbers mean are facts about the endpoint;
+    "end the task you hold first" and "work the task with the tools it lists" are advice about
+    how to behave, and advice given here is a treatment applied to every agent this module serves
+    and carried into every row. A run measuring how an agent chooses to spend a queue would then
+    be measuring prose no harness chose, and one whose own instructions were written to leave
+    that choice open would have the nudge reinstated underneath it, by the tool it has to call to
+    get a task at all. So a consequence is stated ("calling ``get_task`` while a task is live
+    forfeits that task") and the choice is left where it belongs.
+
+    Built at registration, from the concrete stream, because the capacity cannot change
+    afterwards: a description is advertised once and a caller may cache it, so one that named a
+    number the run could move would be worse than one that named none.
+
+    The one-slot wording is separate rather than a plural of the general case. At one slot there
+    is no "oldest" to speak of and no free pull to distinguish from a costly one: every pull made
+    while a task is live forfeits that task, which is a simpler and much sharper rule than the
+    general one, and it is the capacity a stream is built with unless a caller asks otherwise."""
+    if max_in_flight == 1:
+        capacity = (
+            "At most one task may be held at a time (``max_in_flight`` is 1). Calling "
+            "``get_task`` while a task is live forfeits that task: the stream seals it and "
+            "scores it as a loss. Ending a task frees its slot."
+        )
+    else:
+        capacity = (
+            f"Up to {max_in_flight} tasks may be held at once (``max_in_flight`` is "
+            f"{max_in_flight}). Below that limit a pull is free and displaces nothing. Calling "
+            f"``get_task`` while {max_in_flight} tasks are live forfeits the oldest of them: the "
+            "stream seals that task and scores it as a loss. Ending a task frees its slot."
+        )
+    return (
+        "Takes the next task off the queue and starts it.\n\n"
+        "Returns the task framing (``{env, instructions, budget, tools}``, plus ``tool_naming`` "
+        "when this endpoint serves several envs and renamed them) and never the task index or "
+        "the target. A task can be completed with the tools it lists, by the names it lists them "
+        "under; calls to those tools route to it automatically.\n\n"
+        f"{capacity}\n\n"
+        'Returns ``{"done": true}`` once the queue is empty. That answer is about the queue and '
+        "nothing else: a pull the queue cannot answer displaces nothing, so a live task stays "
+        "live, and ``in_flight`` says how many are live."
+    )
+
+
 def build_stream_server(stream: TaskStream, *, name: Optional[str] = None) -> FastMCP:
     """Wrap ``stream`` in a FastMCP server: ``get_task``/``queue_info`` plus the env's native
     tools, routed to whichever episode is live. Constructs the server; it neither runs it nor
@@ -5983,16 +6039,13 @@ def build_stream_server(stream: TaskStream, *, name: Optional[str] = None) -> Fa
     # the feedback it needs to correct its own call.
     server: FastMCP = FastMCP(name=name or "shogym:tasks", mask_error_details=True)
 
-    @server.tool(name=_GET_TASK_TOOL)
+    # The advertised text is passed rather than left to this function's docstring, because what
+    # it has to say depends on the capacity this particular stream was built with (see
+    # :func:`_get_task_description`) and a docstring is fixed at import.
+    @server.tool(name=_GET_TASK_TOOL, description=_get_task_description(stream.max_in_flight))
     async def get_task() -> Dict[str, Any]:
-        """Take the next task off the queue and start it.
-
-        Returns the task framing — ``{env, instructions, budget, tools}``, plus ``tool_naming``
-        when this endpoint serves several envs and renamed them — and never the task index or
-        the target. Returns ``{"done": true}`` once the queue is empty; any task already
-        dispensed to you is still yours to finish, and ``in_flight`` says how many of them there
-        are. Work the task with the tools it lists, by the names it lists them under; they route
-        to it automatically."""
+        """Dispense the next task over MCP: the stream's own :meth:`TaskStream.get_task`, with an
+        exhausted queue and a stopped stream answered alike."""
         try:
             dispensed = await stream.get_task()
         except Exception:  # noqa: BLE001 — a stopped stream is the harness's business
@@ -6031,9 +6084,18 @@ def build_stream_server(stream: TaskStream, *, name: Optional[str] = None) -> Fa
             }
         return dispensed.to_wire()
 
-    @server.tool(name=_QUEUE_INFO_TOOL)
+    @server.tool(
+        name=_QUEUE_INFO_TOOL,
+        # `in_flight` is the count the displacement rule is written in terms of, so the capacity
+        # it is measured against is named here too: a caller polling this one is exactly the
+        # caller deciding whether its next pull is free.
+        description=(
+            "Reports ``{remaining, consumed, in_flight}`` for the task queue. ``in_flight`` "
+            f"counts the tasks currently live, against a limit of {stream.max_in_flight}."
+        ),
+    )
     async def queue_info() -> Dict[str, Any]:
-        """Report ``{remaining, consumed, in_flight}`` for the task queue."""
+        """Reports the queue's counts over MCP: the stream's own :meth:`TaskStream.queue_info`."""
         return stream.queue_info().to_wire()
 
     reserved = {_GET_TASK_TOOL, _QUEUE_INFO_TOOL}
