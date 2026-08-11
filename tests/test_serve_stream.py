@@ -2625,26 +2625,35 @@ async def test_the_advertised_get_task_says_what_a_pull_at_capacity_costs(
     costs; a capacity-agnostic one bills the agent for a protocol nothing told it.
 
     Asserted against the behaviour in the same test, at one slot and at several, so this pins
-    what the text has to *say* rather than the sentence it currently says it in."""
+    what the text has to *say* rather than the sentence it currently says it in.
+
+    Said as mechanics, never as advice. What a call costs is a fact about the endpoint; how to
+    spend a queue is the agent's, and prose telling it lands in every run served through this
+    module, including the ones whose own instructions were written to leave that choice open."""
     # One task per slot, then one pull too many: the last one is the pull the description is about.
     indices = [*range(max_in_flight), 0]
     async with _stream(tmp_path, indices, max_in_flight=max_in_flight) as stream:
         server = build_stream_server(stream)
         async with Client(server) as client:
-            tools = {tool.name: tool.description or "" for tool in await client.list_tools()}
+            tools = {
+                tool.name: (tool.description or "").lower() for tool in await client.list_tools()
+            }
             advertised = tools["get_task"]
             assert str(max_in_flight) in advertised, "the capacity is not a number the agent sees"
             assert "forfeit" in advertised and "loss" in advertised, (
-                "the advertised text does not say a pull at capacity is scored against you"
+                "the advertised text does not say a pull at capacity is scored against the caller"
             )
             # The sentence this replaced. It read as a promise that pulling ahead is free, which
             # at capacity 1 is false of every pull the agent can make.
             assert "still yours to finish" not in advertised
+            # Neither the old sentence nor a new one may coach: a description that says what to do
+            # is a treatment this endpoint applies to every agent it serves.
+            assert "work the task" not in advertised and "first, then" not in advertised
             if max_in_flight == 1:
-                assert "at most one task" in advertised
+                assert "at most one task may be held" in advertised
             else:
                 assert "oldest" in advertised, "which task gives way is left for the agent to find"
-                assert "free" in advertised, "a pull below the limit costs nothing, and says so"
+                assert "a pull is free" in advertised, "a pull below the limit costs nothing"
             assert str(max_in_flight) in tools["queue_info"], (
                 "`in_flight` is advertised without the limit it is measured against"
             )

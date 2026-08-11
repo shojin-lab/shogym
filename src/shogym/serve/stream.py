@@ -5981,8 +5981,17 @@ def _get_task_description(max_in_flight: int) -> str:
     task the agent played and lost. A description written capacity-agnostically therefore
     charges the agent for a protocol it was never told, and leaves an earned-looking closure on
     the row: the exact failure the redactions elsewhere in this module exist to prevent. So the
-    number of slots is named rather than described, and the rule is stated in the terms a pull is
-    made in ("before you end the task you are holding") rather than in the stream's vocabulary.
+    number of slots is named, and what a pull at it costs is stated outright.
+
+    **Mechanics and consequences only, and in the indicative rather than the imperative.** What
+    the tool does, what a call costs and what the numbers mean are facts about the endpoint;
+    "end the task you hold first" and "work the task with the tools it lists" are advice about
+    how to behave, and advice given here is a treatment applied to every agent this module serves
+    and carried into every row. A run measuring how an agent chooses to spend a queue would then
+    be measuring prose no harness chose, and one whose own instructions were written to leave
+    that choice open would have the nudge reinstated underneath it, by the tool it has to call to
+    get a task at all. So a consequence is stated ("calling ``get_task`` while a task is live
+    forfeits that task") and the choice is left where it belongs.
 
     Built at registration, from the concrete stream, because the capacity cannot change
     afterwards: a description is advertised once and a caller may cache it, so one that named a
@@ -5994,30 +6003,27 @@ def _get_task_description(max_in_flight: int) -> str:
     general one, and it is the capacity a stream is built with unless a caller asks otherwise."""
     if max_in_flight == 1:
         capacity = (
-            "You hold at most one task at a time (``max_in_flight`` is 1). Calling ``get_task`` "
-            "before you end the task you are holding forfeits that task: the stream seals it for "
-            "you and scores it as a loss, and you do not get it back. End the task you hold "
-            "first, then pull the next one."
+            "At most one task may be held at a time (``max_in_flight`` is 1). Calling "
+            "``get_task`` while a task is live forfeits that task: the stream seals it and "
+            "scores it as a loss. Ending a task frees its slot."
         )
     else:
         capacity = (
-            f"You may hold up to {max_in_flight} tasks at once (``max_in_flight`` is "
-            f"{max_in_flight}). While you hold fewer than {max_in_flight}, a pull is free and "
-            f"displaces nothing. Calling ``get_task`` while you already hold {max_in_flight} "
-            "live tasks forfeits the oldest of them: the stream seals that task for you and "
-            "scores it as a loss, and you do not get it back. End a task you hold first, then "
-            "pull the next one."
+            f"Up to {max_in_flight} tasks may be held at once (``max_in_flight`` is "
+            f"{max_in_flight}). Below that limit a pull is free and displaces nothing. Calling "
+            f"``get_task`` while {max_in_flight} tasks are live forfeits the oldest of them: the "
+            "stream seals that task and scores it as a loss. Ending a task frees its slot."
         )
     return (
-        "Take the next task off the queue and start it.\n\n"
+        "Takes the next task off the queue and starts it.\n\n"
         "Returns the task framing (``{env, instructions, budget, tools}``, plus ``tool_naming`` "
         "when this endpoint serves several envs and renamed them) and never the task index or "
-        "the target. Work the task with the tools it lists, by the names it lists them under; "
-        "they route to it automatically.\n\n"
+        "the target. A task can be completed with the tools it lists, by the names it lists them "
+        "under; calls to those tools route to it automatically.\n\n"
         f"{capacity}\n\n"
         'Returns ``{"done": true}`` once the queue is empty. That answer is about the queue and '
-        "nothing else: a pull the queue cannot answer displaces nothing, so any task you are "
-        "still holding is yours to end, and ``in_flight`` says how many of them there are."
+        "nothing else: a pull the queue cannot answer displaces nothing, so a live task stays "
+        "live, and ``in_flight`` says how many are live."
     )
 
 
@@ -6084,12 +6090,12 @@ def build_stream_server(stream: TaskStream, *, name: Optional[str] = None) -> Fa
         # it is measured against is named here too: a caller polling this one is exactly the
         # caller deciding whether its next pull is free.
         description=(
-            "Report ``{remaining, consumed, in_flight}`` for the task queue. ``in_flight`` "
-            f"counts the tasks you are holding, against a limit of {stream.max_in_flight}."
+            "Reports ``{remaining, consumed, in_flight}`` for the task queue. ``in_flight`` "
+            f"counts the tasks currently live, against a limit of {stream.max_in_flight}."
         ),
     )
     async def queue_info() -> Dict[str, Any]:
-        """Report the queue's counts over MCP: the stream's own :meth:`TaskStream.queue_info`."""
+        """Reports the queue's counts over MCP: the stream's own :meth:`TaskStream.queue_info`."""
         return stream.queue_info().to_wire()
 
     reserved = {_GET_TASK_TOOL, _QUEUE_INFO_TOOL}
