@@ -2469,7 +2469,7 @@ requires-dist = [
     { name = "typer", marker = "extra == 'yc-bench'", specifier = ">=0.9" },
     { name = "uvicorn", marker = "extra == 'tau2'", specifier = ">=0.34.0" },
 ]
-provides-extras = ["analysis", "tau2", "hle", "yc-bench", "frontier-bench", "automationbench", "browsecomp-plus", "orca-bench"]
+provides-extras = ["analysis", "tau2", "hle", "yc-bench", "frontier-bench", "automationbench", "browsecomp-plus"]
 
 [package.metadata.requires-dev]
 dev = [
@@ -2481,7 +2481,6 @@ dev = [
     { name = "shogym", extras = ["browsecomp-plus"] },
     { name = "shogym", extras = ["frontier-bench"] },
     { name = "shogym", extras = ["hle"] },
-    { name = "shogym", extras = ["orca-bench"] },
     { name = "shogym", extras = ["tau2"] },
     { name = "shogym", extras = ["yc-bench"] },
 ]
