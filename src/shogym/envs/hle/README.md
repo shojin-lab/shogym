@@ -45,12 +45,13 @@ reads the verdict off the trace via `shogym.result_from_trace(...)`.
 `tasks` (an explicit task list — bypasses the dataset download, used by the offline tests),
 `judge` (an injected [`Judge`](judge.py), a scripted judge for offline runs),
 `judge_model` / `judge_base_url` (the default judge's model + endpoint), and `judge_kwargs`
-(extra fields for the default judge's chat-completions request, e.g.
+(sampling fields for the default judge's chat-completions request, e.g.
 `{"reasoning_effort": "low"}`, sent verbatim and omitted entirely when unset). `judge_kwargs`
-carries sampling settings only: the judge owns what it asks and the shape of the reply it
-parses, so `model`, `messages`, the `extra_*` hatches, and anything that changes the reply's
-form (`stream`, `n`, `response_format`, `stop`, the token caps, `tools`) are refused when the
-episode starts rather than silently mis-grading it.
+takes sampling and nothing else (`reasoning_effort`, `temperature`, `top_p`, `seed`,
+`frequency_penalty`, `presence_penalty`): the judge owns what it asks and the shape of the reply
+it parses, so every other name is refused when the episode starts. It is an allowlist because
+the failure it prevents is silent, and a name nobody thought to exclude, a legacy one or a new
+SDK one, would otherwise arrive already permitted.
 
 ### Quickstart
 
@@ -137,7 +138,10 @@ Feedback emitted on termination (episode-level):
   (a judge exception, or a serve-layer finalize deadline/crash), so an analyst can filter those
   out of the genuine zeros.
 - **`judge_model`** (and **`judge_effort`**, when `judge_kwargs` set a `reasoning_effort`):
-  which model graded, so a score read back off the trace says what produced it. Emitted only
+  which model graded, so a score read back off the trace says what produced it. It is the model
+  the response reported, not the id that was requested, since an alias, a router, or a
+  `judge_base_url` endpoint can answer as something else; the configured id stands in only when
+  the judge failed before there was a response. Emitted only
   when the env built the judge itself: an exact-match episode was read by no model, and an
   injected `judge` is the caller's to describe, so both stay silent rather than guess.
 

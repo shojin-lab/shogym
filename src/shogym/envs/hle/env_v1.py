@@ -26,7 +26,13 @@ import os
 from typing import Any, Dict, List, Optional
 
 from shogym.core import Env
-from shogym.envs.hle.judge import DEFAULT_JUDGE_MODEL, Judge, OpenAIJudge, exact_match
+from shogym.envs.hle.judge import (
+    DEFAULT_JUDGE_MODEL,
+    Judge,
+    JudgeResult,
+    OpenAIJudge,
+    exact_match,
+)
 from shogym.envs.registration import register
 from shogym.mcp import MCPServerSpec
 from shogym.serve.lifecycle import FinalizeRequest, TerminalEvidence
@@ -71,9 +77,9 @@ class HleEnv(Env):
         offline tests). Default: :class:`~shogym.envs.hle.judge.OpenAIJudge`.
       - ``judge_model`` / ``judge_base_url``: the default judge's model id + endpoint.
       - ``judge_kwargs``: sampling fields for the default judge's chat-completions request
-        (``{"reasoning_effort": "low"}``, say). Sent verbatim; omitted entirely when unset. What
-        the judge owns is refused when the episode starts: its model and prompt, the SDK's
-        ``extra_*`` hatches, and anything that changes the shape of the reply it parses.
+        (``{"reasoning_effort": "low"}``, say). Sent verbatim; omitted entirely when unset.
+        Sampling is all it takes: any other name is refused when the episode starts, because
+        the judge owns what it asks and the shape of the reply it parses.
     """
 
     mcp_servers = (HLE_SPEC,)
@@ -161,14 +167,20 @@ class HleEnv(Env):
             request_kwargs=self._judge_kwargs,
         )
 
-    def _judge_provenance(self) -> Dict[str, str]:
-        """The model this env's own judge grades with, plus its ``reasoning_effort`` when set.
+    def _judge_provenance(self, verdict: Optional[JudgeResult] = None) -> Dict[str, str]:
+        """The model this env's own judge graded with, plus its ``reasoning_effort`` when set.
+
+        What the response reports wins over what was configured: an alias, a router, or a
+        ``judge_base_url`` endpoint can answer as something other than what was asked for, and a
+        score belongs to whatever ran. The configured id is the fallback, for a judge that failed
+        before there was any response to read.
 
         Empty for an injected ``judge=``: only the caller knows what that is, so the env names
         nothing rather than guessing."""
         if self._judge is not None:
             return {}
-        provenance = {"judge_model": self._judge_model}
+        ran = str(getattr(verdict, "model", "") or "")
+        provenance = {"judge_model": ran or self._judge_model}
         effort = self._judge_kwargs.get("reasoning_effort")
         if effort:
             provenance["judge_effort"] = str(effort)
@@ -261,7 +273,6 @@ class HleEnv(Env):
 
         judge: Judge = state["judge"]
         question = state["question"]
-        provenance = self._judge_provenance()
         try:
             # Offload the (possibly blocking, network-bound) judge to a worker thread so it
             # neither wedges the event loop for concurrent episodes nor defeats the serve
@@ -274,8 +285,9 @@ class HleEnv(Env):
                 source=req.source,
                 status="finalize_error",
                 # Provenance rides on a fail-closed grade too: which judge could not be reached
-                # is what an analyst filtering these zeros needs.
-                verdict={"correct": False, "judge_error": True, **provenance},
+                # is what an analyst filtering these zeros needs. There is no response here, so
+                # it names what was configured.
+                verdict={"correct": False, "judge_error": True, **self._judge_provenance()},
                 # Exception text is PRIVATE — it may echo the answer/gold; keep it off the wire.
                 diagnostic=f"judge error: {type(exc).__name__}: {exc}",
             )
@@ -285,7 +297,7 @@ class HleEnv(Env):
             verdict={
                 "correct": bool(verdict.correct),
                 "judge_error": False,
-                **provenance,
+                **self._judge_provenance(verdict),
             },
             # extracted_answer / reasoning are answer oracles — private diagnostic only.
             diagnostic=(

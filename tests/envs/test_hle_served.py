@@ -481,11 +481,12 @@ async def test_keyless_base_url_grades_via_llm_judge_not_error(monkeypatch) -> N
 # ----- what the default judge is asked, and what the score says graded it -----
 
 
-def _patch_openai_recording_the_request(monkeypatch, calls: list) -> None:
+def _patch_openai_recording_the_request(monkeypatch, calls: list, reported_model=None) -> None:
     """Point the default judge at a stand-in client that records the request it is sent.
 
     The judge builds its client with ``from openai import OpenAI`` at call time, so patching the
-    SDK constructor is what keeps these tests off the network."""
+    SDK constructor is what keeps these tests off the network. The response reports
+    ``reported_model``, or echoes the requested id the way a provider does."""
     pytest.importorskip("openai")
 
     reply = (
@@ -499,7 +500,10 @@ def _patch_openai_recording_the_request(monkeypatch, calls: list) -> None:
         # A deep copy, so a recording is a snapshot of that request rather than a view of
         # whatever the env's judge holds now.
         calls.append(copy.deepcopy(kwargs))
-        return SimpleNamespace(choices=[SimpleNamespace(message=SimpleNamespace(content=reply))])
+        return SimpleNamespace(
+            model=reported_model if reported_model is not None else kwargs.get("model", ""),
+            choices=[SimpleNamespace(message=SimpleNamespace(content=reply))],
+        )
 
     def _fake_openai(*, base_url=None, api_key=None):
         return SimpleNamespace(chat=SimpleNamespace(completions=SimpleNamespace(create=create)))
@@ -507,10 +511,12 @@ def _patch_openai_recording_the_request(monkeypatch, calls: list) -> None:
     monkeypatch.setattr("openai.OpenAI", _fake_openai)
 
 
-async def _grade_with_default_judge(monkeypatch, calls: list, **config) -> dict:
+async def _grade_with_default_judge(
+    monkeypatch, calls: list, reported_model=None, **config
+) -> dict:
     """Grade one non-exact submission with the env's own judge; return the terminal feedback."""
     monkeypatch.setenv("OPENAI_API_KEY", "sk-test-not-used")
-    _patch_openai_recording_the_request(monkeypatch, calls)
+    _patch_openai_recording_the_request(monkeypatch, calls, reported_model=reported_model)
     episode = await ServedEpisode.start("hle", task=0, env_config={"tasks": _TASKS, **config})
     try:
         result = await episode.call(
@@ -552,6 +558,51 @@ async def test_judge_kwargs_reach_the_request_and_ride_out_with_the_score(monkey
     assert fb["judge_effort"] == "low"
 
 
+async def test_the_score_names_the_model_that_answered_not_the_one_requested(monkeypatch) -> None:
+    # An alias, a router, or a judge_base_url endpoint can answer as something other than what
+    # was asked for. The score belongs to whatever ran, so that is what the trace has to name.
+    calls: list = []
+    fb = await _grade_with_default_judge(
+        monkeypatch,
+        calls,
+        reported_model="actually-ran",
+        judge_model="configured-alias",
+    )
+
+    assert calls[0]["model"] == "configured-alias"  # what was asked for
+    assert fb["judge_model"] == "actually-ran"  # what answered
+
+
+async def test_a_judge_that_never_answered_is_named_from_the_configuration(monkeypatch) -> None:
+    # A fail-closed grade has no response to read a model off, so provenance falls back to what
+    # was configured: which judge could not be reached is the useful fact there.
+    pytest.importorskip("openai")
+    monkeypatch.setenv("OPENAI_API_KEY", "sk-test-not-used")
+
+    def create(**kwargs):
+        raise RuntimeError("judge unavailable")
+
+    monkeypatch.setattr(
+        "openai.OpenAI",
+        lambda *, base_url=None, api_key=None: SimpleNamespace(
+            chat=SimpleNamespace(completions=SimpleNamespace(create=create))
+        ),
+    )
+
+    config = {"tasks": _TASKS, "judge_model": "configured-alias"}
+    episode = await ServedEpisode.start("hle", task=0, env_config=config)
+    try:
+        result = await episode.call(
+            "submit_answer", {"answer": "The City of Light", "confidence": 40}
+        )
+        assert json.loads(result.content)["judge_error"] is True
+        fb = _feedback(episode)
+        assert fb["judge_error"] is True
+        assert fb["judge_model"] == "configured-alias"
+    finally:
+        await episode.close()
+
+
 async def test_a_refused_judge_kwarg_stops_the_episode_before_any_tool_runs(monkeypatch) -> None:
     # The refusal has to reach the caller as an error. Left to grading time, `stop` would cut the
     # verdict line off the reply and the episode would score as a plain wrong answer.
@@ -563,24 +614,28 @@ async def test_a_refused_judge_kwarg_stops_the_episode_before_any_tool_runs(monk
 
 
 async def test_the_env_keeps_its_own_copy_of_judge_kwargs(monkeypatch) -> None:
-    # Two episodes of one env, with the caller editing a nested value of its own config mapping
-    # in between: both requests must be the request the env was built with, or the scoring
-    # function changed mid-run with nothing in either score to show it.
+    # Two episodes of one env, with the caller editing its own config mapping in between: both
+    # requests must be the request the env was built with, and the score must go on naming the
+    # effort it was built with, or the scoring function changed mid-run with nothing in either
+    # score to show it. (The allowlist admits only scalars, so this is the whole surface.)
     calls: list = []
-    caller_kwargs = {"metadata": {"run": "a"}}
+    caller_kwargs = {"reasoning_effort": "low"}
     monkeypatch.setenv("OPENAI_API_KEY", "sk-test-not-used")
     _patch_openai_recording_the_request(monkeypatch, calls)
 
     env = HleEnv(tasks=_TASKS, judge_kwargs=caller_kwargs)
-    caller_kwargs["metadata"]["run"] = "b"
+    caller_kwargs["reasoning_effort"] = "xhigh"
+    efforts = []
     for _ in range(2):
         episode = await ServedEpisode.open_env(env, env_name="hle", task=0)
         try:
             await episode.call("submit_answer", {"answer": "The City of Light", "confidence": 40})
+            efforts.append(_feedback(episode)["judge_effort"])
         finally:
             await episode.close()
 
-    assert [call["metadata"] for call in calls] == [{"run": "a"}, {"run": "a"}]
+    assert [call["reasoning_effort"] for call in calls] == ["low", "low"]
+    assert efforts == ["low", "low"]
 
 
 async def test_injected_judge_and_the_fast_path_claim_no_judge_model() -> None:

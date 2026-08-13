@@ -9,11 +9,12 @@ from __future__ import annotations
 
 import copy
 import json
-from types import SimpleNamespace
-from typing import Any, Dict, List
+from types import MappingProxyType, SimpleNamespace
+from typing import Any, Dict, List, Optional
 
 import pytest
 
+from shogym.envs.hle import judge as judge_module
 from shogym.envs.hle.judge import (
     DEFAULT_JUDGE_MODEL,
     OpenAIJudge,
@@ -28,33 +29,46 @@ _REPLY = (
 )
 
 
-def _recording_client(calls: List[Dict[str, Any]], reply: str = _REPLY) -> Any:
+def _recording_client(
+    calls: List[Dict[str, Any]], reply: str = _REPLY, reported_model: Optional[str] = None
+) -> Any:
     """A stand-in OpenAI client that records each request and answers with ``reply``.
 
     Injected as ``client=``, so nothing imports ``openai`` or reaches the network. Each request
     is recorded as a deep copy, so a recording is a snapshot of that call rather than a view of
-    whatever the judge holds now."""
+    whatever the judge holds now. The response reports ``reported_model``, or echoes the
+    requested id the way a provider does."""
 
     def create(**kwargs: Any) -> Any:
         calls.append(copy.deepcopy(kwargs))
         return SimpleNamespace(
-            choices=[SimpleNamespace(message=SimpleNamespace(content=reply))]
+            model=reported_model if reported_model is not None else kwargs.get("model", ""),
+            choices=[SimpleNamespace(message=SimpleNamespace(content=reply))],
         )
 
     return SimpleNamespace(chat=SimpleNamespace(completions=SimpleNamespace(create=create)))
 
 
 def _wire_probe(reply: str = _REPLY):
-    """A real SDK client over an httpx ``MockTransport``: the bodies it records are what was
-    serialized onto the wire, not what was handed to ``create``. Still no network."""
+    """A real SDK client over an httpx ``MockTransport``: what it records is the request that was
+    serialized, not what was handed to ``create``. Still no network.
+
+    The body is recorded parsed, so tests over it assert the request field for field rather than
+    byte for byte."""
     pytest.importorskip("openai")
     import httpx
     from openai import OpenAI
 
-    bodies: List[Dict[str, Any]] = []
+    requests: List[Dict[str, Any]] = []
 
     def handler(request: httpx.Request) -> httpx.Response:
-        bodies.append(json.loads(request.content))
+        requests.append(
+            {
+                "method": request.method,
+                "path": request.url.path,
+                "body": json.loads(request.content),
+            }
+        )
         return httpx.Response(
             200,
             json={
@@ -77,7 +91,7 @@ def _wire_probe(reply: str = _REPLY):
         base_url="http://probe.invalid/v1",
         http_client=httpx.Client(transport=httpx.MockTransport(handler)),
     )
-    return client, bodies
+    return client, requests
 
 
 def test_exact_match_normalizes_case_space_and_punctuation() -> None:
@@ -161,8 +175,8 @@ def test_request_kwargs_reach_the_create_call() -> None:
 
 
 def test_without_request_kwargs_the_request_carries_only_model_and_messages() -> None:
-    # The no-kwargs request must stay byte-identical to the pre-pass-through one: no extra field
-    # and no null, for endpoints behind `base_url` that reject a field they do not implement.
+    # The no-kwargs request must carry the same fields the pre-pass-through one did: no extra
+    # field and no null, for endpoints behind `base_url` that reject fields they do not know.
     calls: List[Dict[str, Any]] = []
     judge = OpenAIJudge(model="judge-model-x", client=_recording_client(calls))
 
@@ -172,32 +186,41 @@ def test_without_request_kwargs_the_request_carries_only_model_and_messages() ->
     assert calls[0]["messages"][0]["role"] == "user"
 
 
-def test_the_wire_body_is_the_judge_prompt_plus_exactly_what_was_configured() -> None:
-    # What `create` is handed is not the request: the SDK builds the body, and its `extra_*`
-    # hatches merge over the named parameters. So this reads the serialized body itself, which
-    # is the only place a rewritten model or prompt would be visible.
-    client, bodies = _wire_probe()
+def test_the_wire_request_is_the_judge_prompt_plus_exactly_what_was_configured() -> None:
+    # What `create` is handed is not the request: the SDK builds it, and its `extra_*` hatches
+    # merge over the named parameters. So this reads the serialized request, which is the only
+    # place a rewritten model or prompt would be visible. The body is compared as parsed JSON,
+    # so what is pinned is the request field for field, not its exact bytes.
+    client, requests = _wire_probe()
     OpenAIJudge(model="judge-model-x", client=client)(
         question="Capital of France?", correct_answer="Paris", response="Paris"
     )
-    assert set(bodies[0]) == {"model", "messages"}
-    assert bodies[0]["model"] == "judge-model-x"
-    assert "[correct_answer]: Paris" in bodies[0]["messages"][0]["content"]
+    assert requests[0]["method"] == "POST"
+    assert requests[0]["path"] == "/v1/chat/completions"
+    assert set(requests[0]["body"]) == {"model", "messages"}
+    assert requests[0]["body"]["model"] == "judge-model-x"
+    assert "[correct_answer]: Paris" in requests[0]["body"]["messages"][0]["content"]
 
-    client, bodies = _wire_probe()
+    # An allowlisted sampling field reaches the wire, and nothing else joins it.
+    client, requests = _wire_probe()
     OpenAIJudge(
         model="judge-model-x", client=client, request_kwargs={"reasoning_effort": "low"}
     )(question="Capital of France?", correct_answer="Paris", response="Paris")
-    assert set(bodies[0]) == {"model", "messages", "reasoning_effort"}
-    assert bodies[0]["model"] == "judge-model-x"
-    assert bodies[0]["reasoning_effort"] == "low"
+    assert set(requests[0]["body"]) == {"model", "messages", "reasoning_effort"}
+    assert requests[0]["body"]["model"] == "judge-model-x"
+    assert requests[0]["body"]["reasoning_effort"] == "low"
+
+    # A field outside the allowlist never gets as far as a request.
+    client, requests = _wire_probe()
+    with pytest.raises(ValueError):
+        OpenAIJudge(model="judge-model-x", client=client, request_kwargs={"functions": []})
+    assert requests == []
 
 
 @pytest.mark.parametrize(
     "field, value",
     [
-        # What the judge asks. A collision raises inside the call, and a judge that raises fails
-        # closed on every non-exact answer.
+        # What the judge asks.
         ("model", "someone-elses-model"),
         ("messages", []),
         # The SDK merges these over the named parameters, so they can rewrite the model, the
@@ -215,44 +238,118 @@ def test_the_wire_body_is_the_judge_prompt_plus_exactly_what_was_configured() ->
         ("max_completion_tokens", 4),
         ("tools", []),
         ("tool_choice", "required"),
+        # The legacy function-calling API: the same content-less reply as `tools`, under names
+        # an exclusion list written against the current API does not mention.
+        ("functions", [{"name": "grade", "parameters": {}}]),
+        ("function_call", {"name": "grade"}),
+        # Other ways to be answered with something that is not the text the parser reads.
+        ("audio", {"voice": "alloy", "format": "wav"}),
+        ("modalities", ["text", "audio"]),
+        ("prediction", {"type": "content", "content": "correct: yes"}),
+        ("web_search_options", {}),
+        # A token ban is a stop sequence by another route: it can remove the verdict's own words.
+        ("logit_bias", {"9891": -100}),
+        # Not a request field at all, and not sampling either.
+        ("timeout", 0.001),
+        # The point of an allowlist: a name that does not exist yet is refused by default.
+        ("some_future_sdk_parameter", "whatever"),
     ],
 )
-def test_request_kwargs_refuse_the_fields_the_judge_owns(field, value) -> None:
+def test_only_sampling_settings_are_settable(field, value) -> None:
     with pytest.raises(ValueError) as excinfo:
         OpenAIJudge(request_kwargs={field: value})
-    assert field in str(excinfo.value)
+    message = str(excinfo.value)
+    assert repr(field) in message
+    # The error has to say what IS allowed, or a caller cannot act on it.
+    assert "reasoning_effort" in message and "temperature" in message
 
 
-def test_sampling_kwargs_are_still_accepted() -> None:
-    # The refusal is a line around the judge's own contract, not a whitelist: how the model is
-    # sampled stays the caller's to set.
+def test_every_allowlisted_sampling_setting_reaches_the_call() -> None:
     calls: List[Dict[str, Any]] = []
-    judge = OpenAIJudge(
-        client=_recording_client(calls),
-        request_kwargs={"reasoning_effort": "low", "temperature": 0, "seed": 7},
-    )
+    sampling: Dict[str, Any] = {
+        "reasoning_effort": "low",
+        "temperature": 0,
+        "top_p": 0.9,
+        "seed": 7,
+        "frequency_penalty": 0.1,
+        "presence_penalty": 0.2,
+    }
+    judge = OpenAIJudge(client=_recording_client(calls), request_kwargs=dict(sampling))
 
     judge(question="q", correct_answer="Paris", response="Paris")
 
-    assert calls[0]["temperature"] == 0
-    assert calls[0]["seed"] == 7
+    assert {k: calls[0][k] for k in sampling} == sampling
+    assert set(sampling) == set(judge_module._ALLOWED_REQUEST_FIELDS), (
+        "the allowlist grew or shrank; decide deliberately and update this test"
+    )
 
 
-def test_request_kwargs_are_deep_copied_at_construction() -> None:
+def _allow_a_structured_sampling_field(monkeypatch) -> None:
+    """Widen the allowlist for one test, so the copying is tested rather than today's list.
+
+    Every field the allowlist admits is a scalar right now, which closes the nested-sharing hole
+    structurally. The copies are what keep it closed if a structured sampling field is ever
+    added, and that is what these two tests are for."""
+    monkeypatch.setattr(
+        judge_module,
+        "_ALLOWED_REQUEST_FIELDS",
+        MappingProxyType({**judge_module._ALLOWED_REQUEST_FIELDS, "logit_bias": "test only"}),
+    )
+
+
+def test_request_kwargs_are_deep_copied_at_construction(monkeypatch) -> None:
     # A shallow copy leaves nested values shared: editing one after construction would change
     # what a later episode is scored with, and no score would show it.
+    _allow_a_structured_sampling_field(monkeypatch)
     calls: List[Dict[str, Any]] = []
-    kwargs: Dict[str, Any] = {"metadata": {"run": "a"}}
+    kwargs: Dict[str, Any] = {"logit_bias": {"9891": -1}}
     judge = OpenAIJudge(client=_recording_client(calls), request_kwargs=kwargs)
 
     judge(question="q", correct_answer="Paris", response="Paris")
-    kwargs["metadata"]["run"] = "b"  # the caller's copy
-    judge.request_kwargs["metadata"]["run"] = "c"  # what the property handed back
+    kwargs["logit_bias"]["9891"] = -2  # the caller's copy
+    judge.request_kwargs["logit_bias"]["9891"] = -3  # what the property handed back
     judge(question="q", correct_answer="Paris", response="Paris")
 
-    assert calls[0]["metadata"] == {"run": "a"}
-    assert calls[1]["metadata"] == {"run": "a"}
-    assert judge.request_kwargs["metadata"] == {"run": "a"}
+    assert calls[0]["logit_bias"] == {"9891": -1}
+    assert calls[1]["logit_bias"] == {"9891": -1}
+    assert judge.request_kwargs["logit_bias"] == {"9891": -1}
+
+
+def test_a_client_that_edits_what_it_is_handed_cannot_change_a_later_request(monkeypatch) -> None:
+    # The client is arbitrary (an injected one is caller code), and it is handed the kwargs
+    # themselves. Without a copy per call, one request rewrites the next.
+    _allow_a_structured_sampling_field(monkeypatch)
+    sent: List[Any] = []
+
+    def create(**kwargs: Any) -> Any:
+        sent.append(copy.deepcopy(kwargs["logit_bias"]))
+        kwargs["logit_bias"]["9891"] = -100
+        return SimpleNamespace(
+            model="probe", choices=[SimpleNamespace(message=SimpleNamespace(content=_REPLY))]
+        )
+
+    client = SimpleNamespace(chat=SimpleNamespace(completions=SimpleNamespace(create=create)))
+    judge = OpenAIJudge(client=client, request_kwargs={"logit_bias": {"9891": -1}})
+
+    judge(question="q", correct_answer="Paris", response="Paris")
+    judge(question="q", correct_answer="Paris", response="Paris")
+
+    assert sent == [{"9891": -1}, {"9891": -1}]
+
+
+def test_the_verdict_carries_the_model_that_answered() -> None:
+    # Provenance names what ran, so the judge has to read it off the response rather than repeat
+    # the id it asked for: an alias, a router, or a local endpoint can answer as something else.
+    calls: List[Dict[str, Any]] = []
+    judge = OpenAIJudge(
+        model="configured-alias",
+        client=_recording_client(calls, reported_model="actually-ran"),
+    )
+
+    verdict = judge(question="q", correct_answer="Paris", response="Paris")
+
+    assert calls[0]["model"] == "configured-alias"  # what was asked for
+    assert verdict.model == "actually-ran"  # what answered
 
 
 def test_ensure_client_uses_placeholder_key_for_keyless_base_url(monkeypatch) -> None:

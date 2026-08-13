@@ -24,7 +24,7 @@ from __future__ import annotations
 import copy
 import os
 import re
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from types import MappingProxyType
 from typing import Any, Mapping, Optional, Protocol, runtime_checkable
 
@@ -49,12 +49,15 @@ class JudgeResult:
 
     ``correct`` is authoritative; ``extracted_answer`` / ``reasoning`` are advisory
     diagnostics the LLM judge fills in (empty for a scripted judge that returns a bare
-    verdict).
+    verdict). ``model`` is what the judge reports having graded with, which is what a score's
+    provenance names: an alias, a router, or a local endpoint can answer as something other
+    than what was asked for, and the score belongs to whatever actually ran.
     """
 
     correct: bool
     extracted_answer: str = ""
     reasoning: str = ""
+    model: str = ""
 
 
 @runtime_checkable
@@ -131,10 +134,9 @@ class OpenAIJudge:
     ``hle`` env can be built and its manifest probed without a key. Pass a ready ``client``
     (or ``base_url``) to point at any OpenAI-compatible endpoint.
 
-    ``request_kwargs`` are extra chat-completions fields (``reasoning_effort``, say), sent
-    verbatim and only when given: with none, the request is byte-identical to the one this judge
-    made before the parameter existed. The fields the judge owns are refused at construction
-    (see :data:`_REFUSED_REQUEST_FIELDS`).
+    ``request_kwargs`` are sampling fields (``reasoning_effort``, say), sent verbatim and only
+    when given: with none, the request carries the same fields it did before the parameter
+    existed. Anything outside :data:`_ALLOWED_REQUEST_FIELDS` is refused at construction.
     """
 
     def __init__(
@@ -184,35 +186,33 @@ class OpenAIJudge:
         completion = client.chat.completions.create(
             model=self._model,
             messages=[{"role": "user", "content": content}],
-            # Unset means absent, not null: with no kwargs this request is byte-identical to the
-            # pre-parameter one, which keeps endpoints that reject unknown fields working.
-            **self._request_kwargs,
+            # Unset means absent, not null: with no kwargs this request carries the same fields
+            # it did before the parameter existed, which keeps endpoints that reject unknown
+            # fields working. A copy per call, because the client is arbitrary and one it can
+            # edit would let one request change the next.
+            **copy.deepcopy(dict(self._request_kwargs)),
         )
         text = completion.choices[0].message.content or ""
-        return parse_judge_response(text)
+        # The model that answered, not the one that was asked for: provenance names what ran.
+        return replace(
+            parse_judge_response(text), model=str(getattr(completion, "model", "") or "")
+        )
 
 
-# What `request_kwargs` may not set, and why. The judge owns what it asks and the shape of the
-# reply its parser reads; the caller owns how the model is sampled. Each of these fails silently
-# at grading time otherwise: it raises inside the call, or leaves a reply with no verdict line,
-# which fails closed as a wrong answer rather than as a judge error.
-_REFUSED_REQUEST_FIELDS: Mapping[str, str] = MappingProxyType(
+# Everything `request_kwargs` may set, and what each one does. The judge owns what it asks and
+# the shape of the reply its parser reads; the caller owns how the model is sampled, which is
+# this list. It is an allowlist and not a list of exclusions because the failure is silent and
+# the surface grows: a request field that costs the reply its verdict line is scored as a wrong
+# answer, not as a judge error, and any name nobody thought to exclude (a legacy one, a new SDK
+# one) would arrive already permitted. Default-deny makes that a constructor error instead.
+_ALLOWED_REQUEST_FIELDS: Mapping[str, str] = MappingProxyType(
     {
-        "model": "the judge supplies it; pass model=... to choose the model",
-        "messages": "the judge supplies HLE's own judge prompt",
-        # The SDK merges the `extra_*` hatches over the named parameters, so one of them can
-        # rewrite the model, the prompt, or the effort that provenance still reports as set.
-        "extra_body": "the SDK merges it over every field the judge sets",
-        "extra_headers": "the SDK merges it over the request the judge builds",
-        "extra_query": "the SDK merges it over the request the judge builds",
-        "stream": "the judge reads one whole completion, not a stream",
-        "n": "the judge reads one completion; further choices are dropped unread",
-        "response_format": "the judge parses HLE's own plain-text fields",
-        "stop": "a stop sequence can cut the reply before its verdict line",
-        "max_tokens": "a truncated reply loses its verdict line",
-        "max_completion_tokens": "a truncated reply loses its verdict line",
-        "tools": "a tool call is not the text verdict the judge parses",
-        "tool_choice": "a tool call is not the text verdict the judge parses",
+        "reasoning_effort": "how much the model reasons before it answers",
+        "temperature": "how sharply the next token is drawn",
+        "top_p": "how much of the distribution the next token is drawn from",
+        "seed": "which draw the sampler makes",
+        "frequency_penalty": "how much a token's own count discourages drawing it again",
+        "presence_penalty": "how much a token having appeared discourages drawing it again",
     }
 )
 
@@ -220,16 +220,18 @@ _REFUSED_REQUEST_FIELDS: Mapping[str, str] = MappingProxyType(
 def _validated_request_kwargs(
     request_kwargs: Optional[Mapping[str, Any]],
 ) -> Mapping[str, Any]:
-    """Deep-copy the caller's extra request fields, refusing the ones the judge owns.
+    """Deep-copy the caller's sampling fields, refusing every name that is not one.
 
     Deep, because a shallow copy leaves nested values shared with the caller: editing one after
     construction changes what a later episode is scored with, and no score shows it."""
     fields = copy.deepcopy(dict(request_kwargs or {}))
-    refused = [
-        f"{name} ({reason})" for name, reason in _REFUSED_REQUEST_FIELDS.items() if name in fields
-    ]
-    if refused:
-        raise ValueError("judge request kwargs may not set " + ", ".join(refused))
+    unknown = sorted(name for name in fields if name not in _ALLOWED_REQUEST_FIELDS)
+    if unknown:
+        raise ValueError(
+            f"judge request kwargs may not set {', '.join(repr(name) for name in unknown)}: only "
+            f"sampling settings are settable ({', '.join(sorted(_ALLOWED_REQUEST_FIELDS))}). The "
+            "judge owns the rest of the request and the shape of the reply it parses."
+        )
     return MappingProxyType(fields)
 
 
