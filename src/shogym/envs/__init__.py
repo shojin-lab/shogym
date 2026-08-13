@@ -25,11 +25,6 @@ from shogym.envs.browsecomp_plus import env_v1 as browsecomp_plus_env_v1  # noqa
 # episode is served — so `import shogym` stays offline without a Docker daemon.
 from shogym.envs.frontier_bench import env_v1 as frontier_bench_env_v1  # noqa: F401 — registration
 from shogym.envs.hle import env_v1 as hle_env_v1  # noqa: F401 — triggers registration
-
-# `shogym.envs.orca_bench.env_v1` imports neither the dataset nor the (phase-2) compose backend at
-# top level (the pinned dataset downloads on env construction and the backend is touched only when
-# an episode is served), so `import shogym` stays offline, keyless, and Docker-free.
-from shogym.envs.orca_bench import env_v1 as orca_bench_env_v1  # noqa: F401 — registration
 from shogym.envs.tau2 import env_v1 as tau2_env_v1  # noqa: F401 — triggers registration
 from shogym.envs.wordle import env_v1 as wordle_env_v1  # noqa: F401 — triggers registration
 from shogym.envs.yc_bench import env_v1 as yc_bench_env_v1  # noqa: F401 — triggers registration
@@ -40,7 +35,6 @@ __all__ = [
     "frontier_bench_env_v1",
     "hle_env_v1",
     "make",
-    "orca_bench_env_v1",
     "register",
     "registered_envs",
     "tau2_env_v1",
