@@ -69,6 +69,8 @@ class HleEnv(Env):
       - ``judge``: an injected :class:`~shogym.envs.hle.judge.Judge` (a scripted judge for
         offline tests). Default: :class:`~shogym.envs.hle.judge.OpenAIJudge`.
       - ``judge_model`` / ``judge_base_url``: the default judge's model id + endpoint.
+      - ``judge_kwargs``: extra fields for the default judge's chat-completions request
+        (``{"reasoning_effort": "low"}``, say). Sent verbatim; omitted entirely when unset.
     """
 
     mcp_servers = (HLE_SPEC,)
@@ -85,11 +87,13 @@ class HleEnv(Env):
         judge: Optional[Judge] = None,
         judge_model: str = DEFAULT_JUDGE_MODEL,
         judge_base_url: Optional[str] = None,
+        judge_kwargs: Optional[Dict[str, Any]] = None,
     ) -> None:
         self._task_split = task_split
         self._judge = judge
         self._judge_model = judge_model
         self._judge_base_url = judge_base_url
+        self._judge_kwargs: Dict[str, Any] = dict(judge_kwargs or {})
         self._tasks: List[Dict[str, Any]] = (
             list(tasks) if tasks is not None else _load_default_tasks(task_split)
         )
@@ -146,7 +150,31 @@ class HleEnv(Env):
                 "keyless OpenAI-compatible endpoint, or inject judge=... . Without it only exact "
                 "string matches score correct and every other answer is scored incorrect."
             )
-        return OpenAIJudge(model=self._judge_model, base_url=self._judge_base_url)
+        return OpenAIJudge(
+            model=self._judge_model,
+            base_url=self._judge_base_url,
+            request_kwargs=self._judge_kwargs,
+        )
+
+    def _judge_provenance(self) -> Dict[str, str]:
+        """Which scoring function graded this episode, when the env is the one that built it.
+
+        A judge model is a scoring function, so two scores are only comparable when both say
+        which one produced them. Nothing in a run artifact says it today: a reader can recover
+        the judge only from the shogym revision the run was pinned to, and that stops working the
+        moment a default changes. So the resolved model rides out with the verdict, and the
+        ``reasoning_effort`` from ``judge_kwargs`` with it when one is set, since the same model
+        at two efforts is two scoring functions.
+
+        An injected ``judge=`` gets nothing: only the caller knows what it is, and a guess about
+        it recorded next to a score would be worse than the silence."""
+        if self._judge is not None:
+            return {}
+        provenance = {"judge_model": self._judge_model}
+        effort = self._judge_kwargs.get("reasoning_effort")
+        if effort:
+            provenance["judge_effort"] = str(effort)
+        return provenance
 
     def _begin_session(self, session_id: str, task: Dict[str, Any]) -> None:
         # Grading runs in `finalize` (on the env), not in the tool handler, so the per-episode
@@ -198,11 +226,16 @@ class HleEnv(Env):
 
         Runs HLE's grading on the sealed submission: a normalized exact-match fast path first
         (offline, free) and, on a miss, the session's injectable LLM judge. The returned
-        ``verdict`` is **public-safe** — only ``correct`` and ``judge_error`` — and is the sole
+        ``verdict`` is **public-safe** (``correct``, ``judge_error``, and, when the env built the
+        judge itself, which model graded: see :meth:`_judge_provenance`) and is the sole
         thing the agent ever sees (the serve layer stamps provenance / finalization_id / source
         and appends its own ``finalize_error`` flag). The judge's ``reasoning`` /
         ``extracted_answer`` and any exception text are answer oracles: they go **only** in the
         private ``diagnostic`` (durable store / server logs), never in the verdict.
+
+        Only a model-graded episode names a judge. The exact-match fast path is not a model and
+        does not claim to be one, so it publishes no judge, and the absence is the record: no
+        model read that answer.
 
         A judge failure fails **closed** — ``correct=False`` with ``status='finalize_error'`` —
         so a grading-infra failure is a distinguishable, non-oracle zero rather than a crash. A
@@ -232,6 +265,7 @@ class HleEnv(Env):
 
         judge: Judge = state["judge"]
         question = state["question"]
+        provenance = self._judge_provenance()
         try:
             # Offload the (possibly blocking, network-bound) judge to a worker thread so it
             # neither wedges the event loop for concurrent episodes nor defeats the serve
@@ -243,14 +277,20 @@ class HleEnv(Env):
             return TerminalEvidence(
                 source=req.source,
                 status="finalize_error",
-                verdict={"correct": False, "judge_error": True},
+                # The provenance rides on a fail-closed grade too: which judge could not be
+                # reached is exactly what an analyst filtering these zeros needs to know.
+                verdict={"correct": False, "judge_error": True, **provenance},
                 # Exception text is PRIVATE — it may echo the answer/gold; keep it off the wire.
                 diagnostic=f"judge error: {type(exc).__name__}: {exc}",
             )
         return TerminalEvidence(
             source=req.source,
             status="ok",
-            verdict={"correct": bool(verdict.correct), "judge_error": False},
+            verdict={
+                "correct": bool(verdict.correct),
+                "judge_error": False,
+                **provenance,
+            },
             # extracted_answer / reasoning are answer oracles — private diagnostic only.
             diagnostic=(
                 f"graded llm_judge correct={bool(verdict.correct)} "
@@ -295,7 +335,12 @@ def score_evidence(
     ``finalize_error``) also emits ``judge_error = True`` so an analyst can filter grading-infra
     failures out instead of counting them as legitimate zeros. A clean grade emits no
     ``judge_error`` (mirroring how tau2's verifier only emits its optional flags when
-    relevant)."""
+    relevant).
+
+    A model-graded episode also emits the **judge provenance** the verdict carries
+    (``judge_model``, plus ``judge_effort`` when one was configured). The trace is where a score
+    is read back from, so what scored it belongs on that surface rather than only in the config
+    that started the run."""
     fb = FeedbackCollection()
     if not terminated:
         return fb
@@ -310,6 +355,10 @@ def score_evidence(
     if evidence.finalize_error or bool(verdict.get("judge_error")):
         # A grading-infra failure fail-closed to `correct=False`, not a genuine wrong answer.
         fb.episode.append(EpisodeFeedback(name="judge_error", value=True))
+    for key in ("judge_model", "judge_effort"):
+        value = verdict.get(key)
+        if value:
+            fb.episode.append(EpisodeFeedback(name=key, value=str(value)))
     # Confidence rides on the validated submit args (explicit_tool only). A no-submission
     # terminal carries none, so there is nothing to calibrate.
     args = evidence.args

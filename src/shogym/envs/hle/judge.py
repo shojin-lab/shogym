@@ -24,11 +24,15 @@ from __future__ import annotations
 import os
 import re
 from dataclasses import dataclass
-from typing import Any, Optional, Protocol, runtime_checkable
+from types import MappingProxyType
+from typing import Any, Mapping, Optional, Protocol, runtime_checkable
 
-# The registered `hle` env's default judge model. A cheap, current OpenAI model (the same
-# family the repo's quickstart uses); override via `judge_model` env config.
-DEFAULT_JUDGE_MODEL = "gpt-5.4-nano"
+# The registered `hle` env's default judge model. Picked on measured grading quality rather than
+# on price: over 873 real calls through this judge, the previous default returned a run of false
+# negatives on multiple-choice items (a gold letter read against a lowercase candidate, or against
+# an option's text rather than its letter) that this model does not, at the same latency and
+# effectively the same cost. Override via `judge_model` env config.
+DEFAULT_JUDGE_MODEL = "gpt-5.6-luna"
 
 # A non-secret stand-in api_key. Local OpenAI-compatible servers (Ollama/vLLM/LM Studio) need
 # no real key, but the OpenAI SDK still refuses to construct without *some* non-empty api_key —
@@ -127,6 +131,12 @@ class OpenAIJudge:
     Constructed offline (no network): the client is created lazily on the first call, so an
     ``hle`` env can be built and its manifest probed without a key. Pass a ready ``client``
     (or ``base_url``) to point at any OpenAI-compatible endpoint.
+
+    ``request_kwargs`` are extra fields for the chat-completions request (``reasoning_effort``,
+    say). They exist so how the judge is *called* is configurable, not only which model it calls:
+    a grading setting that cannot be reached is a grading setting nobody can record either. They
+    are sent verbatim and only when given, so a judge constructed without them makes exactly the
+    request it made before the parameter existed.
     """
 
     def __init__(
@@ -135,10 +145,26 @@ class OpenAIJudge:
         *,
         base_url: Optional[str] = None,
         client: Any = None,
+        request_kwargs: Optional[Mapping[str, Any]] = None,
     ) -> None:
         self._model = model
         self._base_url = base_url
         self._client = client
+        self._request_kwargs = _validated_request_kwargs(request_kwargs)
+
+    @property
+    def model(self) -> str:
+        """The model id this judge grades with, readable so a score can name what produced it."""
+        return self._model
+
+    @property
+    def request_kwargs(self) -> Mapping[str, Any]:
+        """The extra request fields this judge sends, frozen at construction.
+
+        Frozen because grading has to stay one function for the length of a run: a mapping the
+        caller can still edit could change what scored episode 400 relative to episode 1, and the
+        difference would not be visible in either score."""
+        return self._request_kwargs
 
     def _ensure_client(self) -> Any:
         if self._client is None:
@@ -161,9 +187,36 @@ class OpenAIJudge:
         completion = client.chat.completions.create(
             model=self._model,
             messages=[{"role": "user", "content": content}],
+            # Nothing is unpacked here when no request kwargs were given, so an unset field is
+            # absent from the wire rather than sent as a null. A local OpenAI-compatible server
+            # behind `base_url` may reject a field it does not implement, and a rejected request
+            # is a judge error, which fails closed to `correct=False` on an answer nobody read.
+            **self._request_kwargs,
         )
         text = completion.choices[0].message.content or ""
         return parse_judge_response(text)
+
+
+# The two request fields the judge supplies itself. Setting either through ``request_kwargs``
+# would collide with the judge's own argument and raise inside the call, and a judge that raises
+# fails closed, so the mistake would land as a whole benchmark of honest-looking zeros rather
+# than as an error anyone reads. Refused at construction instead, which for the registered env
+# is the start of the episode.
+_RESERVED_REQUEST_FIELDS = ("model", "messages")
+
+
+def _validated_request_kwargs(
+    request_kwargs: Optional[Mapping[str, Any]],
+) -> Mapping[str, Any]:
+    """Copy the caller's extra request fields into a frozen mapping, refusing the reserved ones."""
+    fields = dict(request_kwargs or {})
+    reserved = [name for name in _RESERVED_REQUEST_FIELDS if name in fields]
+    if reserved:
+        raise ValueError(
+            f"judge request kwargs may not set {reserved}: the judge supplies them itself "
+            "(pass model=... to choose the model)"
+        )
+    return MappingProxyType(fields)
 
 
 def parse_judge_response(text: str) -> JudgeResult:

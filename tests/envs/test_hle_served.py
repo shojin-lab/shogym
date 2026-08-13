@@ -20,6 +20,7 @@ from __future__ import annotations
 import asyncio
 import json
 import time
+from types import SimpleNamespace
 
 import pytest
 
@@ -27,7 +28,7 @@ pytest.importorskip("datasets", reason="hle extra not installed")
 
 from fastmcp import Client  # noqa: E402
 
-from shogym.envs.hle.judge import JudgeResult  # noqa: E402
+from shogym.envs.hle.judge import DEFAULT_JUDGE_MODEL, JudgeResult  # noqa: E402
 from shogym.serve import LifecycleState, ServedEpisode  # noqa: E402
 from shogym.serve.server import build_server  # noqa: E402
 
@@ -471,6 +472,99 @@ async def test_keyless_base_url_grades_via_llm_judge_not_error(monkeypatch) -> N
         fb = _feedback(episode)
         assert fb["correct"] is True
         assert "judge_error" not in fb
+    finally:
+        await episode.close()
+
+
+# ----- what the default judge is asked, and what the score says graded it -----
+
+
+def _patch_openai_recording_the_request(monkeypatch, calls: list) -> None:
+    """Point the default judge at a stand-in client that records the request it is sent.
+
+    The judge builds its client with ``from openai import OpenAI`` at call time, so patching the
+    SDK constructor is what stands between these tests and the network. The recorded kwargs are
+    the request the env's own judge actually built, config and all."""
+    pytest.importorskip("openai")
+
+    reply = (
+        "extracted_final_answer: The City of Light\n"
+        "reasoning: matches the gold answer Paris\n"
+        "correct: yes\n"
+        "confidence: 95"
+    )
+
+    def create(**kwargs):
+        calls.append(kwargs)
+        return SimpleNamespace(choices=[SimpleNamespace(message=SimpleNamespace(content=reply))])
+
+    def _fake_openai(*, base_url=None, api_key=None):
+        return SimpleNamespace(chat=SimpleNamespace(completions=SimpleNamespace(create=create)))
+
+    monkeypatch.setattr("openai.OpenAI", _fake_openai)
+
+
+async def _grade_with_default_judge(monkeypatch, calls: list, **config) -> dict:
+    """Grade one non-exact submission with the env's own judge; return the terminal feedback."""
+    monkeypatch.setenv("OPENAI_API_KEY", "sk-test-not-used")
+    _patch_openai_recording_the_request(monkeypatch, calls)
+    episode = await ServedEpisode.start("hle", task=0, env_config={"tasks": _TASKS, **config})
+    try:
+        result = await episode.call(
+            "submit_answer", {"answer": "The City of Light", "confidence": 40}
+        )
+        assert result.terminated
+        assert json.loads(result.content)["judge_error"] is False
+        return _feedback(episode)
+    finally:
+        await episode.close()
+
+
+async def test_unconfigured_env_grades_with_the_default_model_and_records_it(monkeypatch) -> None:
+    # Nothing specified: the env resolves DEFAULT_JUDGE_MODEL, sends the same two fields it has
+    # always sent (no effort, and no null standing in for one), and the score names what graded.
+    calls: list = []
+    fb = await _grade_with_default_judge(monkeypatch, calls)
+
+    assert calls[0]["model"] == DEFAULT_JUDGE_MODEL
+    assert set(calls[0]) == {"model", "messages"}
+    assert fb["judge_model"] == DEFAULT_JUDGE_MODEL
+    assert "judge_effort" not in fb  # nothing was configured, so nothing is claimed
+
+
+async def test_judge_kwargs_reach_the_request_and_ride_out_with_the_score(monkeypatch) -> None:
+    # An explicit judge_model still overrides the default, and judge_kwargs reach the request
+    # they were always meant to reach. Both are scoring decisions, so both are recorded.
+    calls: list = []
+    fb = await _grade_with_default_judge(
+        monkeypatch,
+        calls,
+        judge_model="judge-model-x",
+        judge_kwargs={"reasoning_effort": "low"},
+    )
+
+    assert calls[0]["model"] == "judge-model-x"
+    assert calls[0]["reasoning_effort"] == "low"
+    assert fb["judge_model"] == "judge-model-x"
+    assert fb["judge_effort"] == "low"
+
+
+async def test_injected_judge_and_the_fast_path_claim_no_judge_model() -> None:
+    # The env only names a judge it built itself. An injected judge is the caller's to describe,
+    # and an exact match was read by no model at all: neither may borrow a model's name.
+    judge = _ScriptedJudge()
+    episode = await ServedEpisode.start("hle", task=0, env_config=_config(judge))
+    try:
+        await episode.call("submit_answer", {"answer": "The City of Light", "confidence": 40})
+        assert judge.calls == 1
+        assert "judge_model" not in _feedback(episode)
+    finally:
+        await episode.close()
+
+    episode = await ServedEpisode.start("hle", task=0, env_config=_config(_ScriptedJudge()))
+    try:
+        await episode.call("submit_answer", {"answer": "Paris", "confidence": 90})
+        assert "judge_model" not in _feedback(episode)
     finally:
         await episode.close()
 
