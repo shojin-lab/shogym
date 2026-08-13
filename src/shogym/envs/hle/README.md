@@ -43,8 +43,15 @@ reads the verdict off the trace via `shogym.result_from_trace(...)`.
 
 **Config** (via `shogym.make(name, config)` / `env_config`): `task_split` (`"train"`/`"test"`),
 `tasks` (an explicit task list — bypasses the dataset download, used by the offline tests),
-`judge` (an injected [`Judge`](judge.py) — a scripted judge for offline runs), and
-`judge_model` / `judge_base_url` (the default judge's model + endpoint).
+`judge` (an injected [`Judge`](judge.py), a scripted judge for offline runs),
+`judge_model` / `judge_base_url` (the default judge's model + endpoint), and `judge_kwargs`
+(sampling fields for the default judge's chat-completions request, e.g.
+`{"reasoning_effort": "low"}`, sent verbatim and omitted entirely when unset). `judge_kwargs`
+takes sampling and nothing else (`reasoning_effort`, `temperature`, `top_p`, `seed`,
+`frequency_penalty`, `presence_penalty`): the judge owns what it asks and the shape of the reply
+it parses, so every other name is refused when the episode starts. It is an allowlist because
+the failure it prevents is silent, and a name nobody thought to exclude, a legacy one or a new
+SDK one, would otherwise arrive already permitted.
 
 ### Quickstart
 
@@ -130,6 +137,13 @@ Feedback emitted on termination (episode-level):
 - **`judge_error`** — set (`True`) only when the grade fail-closed on a grading-infra failure
   (a judge exception, or a serve-layer finalize deadline/crash), so an analyst can filter those
   out of the genuine zeros.
+- **`judge_model`** (and **`judge_effort`**, when `judge_kwargs` set a `reasoning_effort`):
+  which model graded, so a score read back off the trace says what produced it. It is the model
+  the response reported, not the id that was requested, since an alias, a router, or a
+  `judge_base_url` endpoint can answer as something else; the configured id stands in only when
+  the judge failed before there was a response. Emitted only
+  when the env built the judge itself: an exact-match episode was read by no model, and an
+  injected `judge` is the caller's to describe, so both stay silent rather than guess.
 
 Termination happens when the `submit_answer` score terminal seals the episode, when `terminate`
 is called, **or** when the horizon (1) is reached — whichever comes first. Reaching the horizon
@@ -161,9 +175,13 @@ semantics (give each run its own trace file for a guaranteed 1:1 mapping).
 ## Fidelity & deviations
 
 - **Grading is HLE's own.** The judge uses HLE's own judge prompt; the registered env defaults
-  to `OpenAIJudge` (overridable via `judge_model` / `judge_base_url`, or a fully injected
-  `judge`). The exact-match fast path is a free, offline pre-check that never changes a correct
-  verdict.
+  to `OpenAIJudge` (overridable via `judge_model` / `judge_kwargs` / `judge_base_url`, or a
+  fully injected `judge`). The exact-match fast path is a free, offline pre-check that never
+  changes a correct verdict.
+- **The default judge model is a scoring decision.** It is `gpt-5.6-luna`, at that model's own
+  default reasoning effort, chosen on grading quality measured against the previous default
+  (issue #122). Changing it changes measured accuracy, which is why every model-graded episode
+  now records the model that graded it.
 - **Text-only for now.** Questions carrying an image are filtered out; multimodal is a
   follow-up.
 - **Judge fail-closed.** A grading-infra failure scores `correct = False` with `judge_error =
