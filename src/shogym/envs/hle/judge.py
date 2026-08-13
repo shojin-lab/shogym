@@ -21,6 +21,7 @@ so ``import shogym`` (which imports the env to register it) stays offline and le
 
 from __future__ import annotations
 
+import copy
 import os
 import re
 from dataclasses import dataclass
@@ -132,7 +133,8 @@ class OpenAIJudge:
 
     ``request_kwargs`` are extra chat-completions fields (``reasoning_effort``, say), sent
     verbatim and only when given: with none, the request is byte-identical to the one this judge
-    made before the parameter existed.
+    made before the parameter existed. The fields the judge owns are refused at construction
+    (see :data:`_REFUSED_REQUEST_FIELDS`).
     """
 
     def __init__(
@@ -155,9 +157,11 @@ class OpenAIJudge:
 
     @property
     def request_kwargs(self) -> Mapping[str, Any]:
-        """The extra request fields this judge sends, frozen at construction so grading stays
-        one function for the length of a run."""
-        return self._request_kwargs
+        """A copy of the extra request fields this judge sends.
+
+        A copy all the way down, so neither what the caller still holds nor what it reads back
+        here can change the request: grading stays one function for the length of a run."""
+        return MappingProxyType(copy.deepcopy(dict(self._request_kwargs)))
 
     def _ensure_client(self) -> Any:
         if self._client is None:
@@ -188,23 +192,44 @@ class OpenAIJudge:
         return parse_judge_response(text)
 
 
-# The two request fields the judge supplies itself. Passing either through `request_kwargs`
-# raises inside the call, and a judge that raises fails closed, so it is refused at construction
-# rather than landing as a run of honest-looking zeros.
-_RESERVED_REQUEST_FIELDS = ("model", "messages")
+# What `request_kwargs` may not set, and why. The judge owns what it asks and the shape of the
+# reply its parser reads; the caller owns how the model is sampled. Each of these fails silently
+# at grading time otherwise: it raises inside the call, or leaves a reply with no verdict line,
+# which fails closed as a wrong answer rather than as a judge error.
+_REFUSED_REQUEST_FIELDS: Mapping[str, str] = MappingProxyType(
+    {
+        "model": "the judge supplies it; pass model=... to choose the model",
+        "messages": "the judge supplies HLE's own judge prompt",
+        # The SDK merges the `extra_*` hatches over the named parameters, so one of them can
+        # rewrite the model, the prompt, or the effort that provenance still reports as set.
+        "extra_body": "the SDK merges it over every field the judge sets",
+        "extra_headers": "the SDK merges it over the request the judge builds",
+        "extra_query": "the SDK merges it over the request the judge builds",
+        "stream": "the judge reads one whole completion, not a stream",
+        "n": "the judge reads one completion; further choices are dropped unread",
+        "response_format": "the judge parses HLE's own plain-text fields",
+        "stop": "a stop sequence can cut the reply before its verdict line",
+        "max_tokens": "a truncated reply loses its verdict line",
+        "max_completion_tokens": "a truncated reply loses its verdict line",
+        "tools": "a tool call is not the text verdict the judge parses",
+        "tool_choice": "a tool call is not the text verdict the judge parses",
+    }
+)
 
 
 def _validated_request_kwargs(
     request_kwargs: Optional[Mapping[str, Any]],
 ) -> Mapping[str, Any]:
-    """Copy the caller's extra request fields into a frozen mapping, refusing the reserved ones."""
-    fields = dict(request_kwargs or {})
-    reserved = [name for name in _RESERVED_REQUEST_FIELDS if name in fields]
-    if reserved:
-        raise ValueError(
-            f"judge request kwargs may not set {reserved}: the judge supplies them itself "
-            "(pass model=... to choose the model)"
-        )
+    """Deep-copy the caller's extra request fields, refusing the ones the judge owns.
+
+    Deep, because a shallow copy leaves nested values shared with the caller: editing one after
+    construction changes what a later episode is scored with, and no score shows it."""
+    fields = copy.deepcopy(dict(request_kwargs or {}))
+    refused = [
+        f"{name} ({reason})" for name, reason in _REFUSED_REQUEST_FIELDS.items() if name in fields
+    ]
+    if refused:
+        raise ValueError("judge request kwargs may not set " + ", ".join(refused))
     return MappingProxyType(fields)
 
 

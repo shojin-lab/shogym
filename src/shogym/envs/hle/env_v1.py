@@ -21,6 +21,7 @@ network client only when it is first *called*.
 from __future__ import annotations
 
 import asyncio
+import copy
 import os
 from typing import Any, Dict, List, Optional
 
@@ -69,8 +70,10 @@ class HleEnv(Env):
       - ``judge``: an injected :class:`~shogym.envs.hle.judge.Judge` (a scripted judge for
         offline tests). Default: :class:`~shogym.envs.hle.judge.OpenAIJudge`.
       - ``judge_model`` / ``judge_base_url``: the default judge's model id + endpoint.
-      - ``judge_kwargs``: extra fields for the default judge's chat-completions request
-        (``{"reasoning_effort": "low"}``, say). Sent verbatim; omitted entirely when unset.
+      - ``judge_kwargs``: sampling fields for the default judge's chat-completions request
+        (``{"reasoning_effort": "low"}``, say). Sent verbatim; omitted entirely when unset. What
+        the judge owns is refused when the episode starts: its model and prompt, the SDK's
+        ``extra_*`` hatches, and anything that changes the shape of the reply it parses.
     """
 
     mcp_servers = (HLE_SPEC,)
@@ -93,7 +96,9 @@ class HleEnv(Env):
         self._judge = judge
         self._judge_model = judge_model
         self._judge_base_url = judge_base_url
-        self._judge_kwargs: Dict[str, Any] = dict(judge_kwargs or {})
+        # Deep, so an edit to the config mapping the caller still holds cannot change what a
+        # later episode of this env is scored with.
+        self._judge_kwargs: Dict[str, Any] = copy.deepcopy(dict(judge_kwargs or {}))
         self._tasks: List[Dict[str, Any]] = (
             list(tasks) if tasks is not None else _load_default_tasks(task_split)
         )

@@ -46,7 +46,11 @@ reads the verdict off the trace via `shogym.result_from_trace(...)`.
 `judge` (an injected [`Judge`](judge.py), a scripted judge for offline runs),
 `judge_model` / `judge_base_url` (the default judge's model + endpoint), and `judge_kwargs`
 (extra fields for the default judge's chat-completions request, e.g.
-`{"reasoning_effort": "low"}`, sent verbatim and omitted entirely when unset).
+`{"reasoning_effort": "low"}`, sent verbatim and omitted entirely when unset). `judge_kwargs`
+carries sampling settings only: the judge owns what it asks and the shape of the reply it
+parses, so `model`, `messages`, the `extra_*` hatches, and anything that changes the reply's
+form (`stream`, `n`, `response_format`, `stop`, the token caps, `tools`) are refused when the
+episode starts rather than silently mis-grading it.
 
 ### Quickstart
 
@@ -172,8 +176,8 @@ semantics (give each run its own trace file for a guaranteed 1:1 mapping).
   changes a correct verdict.
 - **The default judge model is a scoring decision.** It is `gpt-5.6-luna`, at that model's own
   default reasoning effort, chosen on grading quality measured against the previous default
-  (issue #122). Changing it changes measured accuracy, which is why every graded episode now
-  records the model that graded it.
+  (issue #122). Changing it changes measured accuracy, which is why every model-graded episode
+  now records the model that graded it.
 - **Text-only for now.** Questions carrying an image are filtered out; multimodal is a
   follow-up.
 - **Judge fail-closed.** A grading-infra failure scores `correct = False` with `judge_error =

@@ -18,6 +18,7 @@ so nothing here downloads the gated ``cais/hle`` dataset or needs an API key.
 from __future__ import annotations
 
 import asyncio
+import copy
 import json
 import time
 from types import SimpleNamespace
@@ -28,6 +29,7 @@ pytest.importorskip("datasets", reason="hle extra not installed")
 
 from fastmcp import Client  # noqa: E402
 
+from shogym.envs.hle.env_v1 import HleEnv  # noqa: E402
 from shogym.envs.hle.judge import DEFAULT_JUDGE_MODEL, JudgeResult  # noqa: E402
 from shogym.serve import LifecycleState, ServedEpisode  # noqa: E402
 from shogym.serve.server import build_server  # noqa: E402
@@ -494,7 +496,9 @@ def _patch_openai_recording_the_request(monkeypatch, calls: list) -> None:
     )
 
     def create(**kwargs):
-        calls.append(kwargs)
+        # A deep copy, so a recording is a snapshot of that request rather than a view of
+        # whatever the env's judge holds now.
+        calls.append(copy.deepcopy(kwargs))
         return SimpleNamespace(choices=[SimpleNamespace(message=SimpleNamespace(content=reply))])
 
     def _fake_openai(*, base_url=None, api_key=None):
@@ -546,6 +550,37 @@ async def test_judge_kwargs_reach_the_request_and_ride_out_with_the_score(monkey
     assert calls[0]["reasoning_effort"] == "low"
     assert fb["judge_model"] == "judge-model-x"
     assert fb["judge_effort"] == "low"
+
+
+async def test_a_refused_judge_kwarg_stops_the_episode_before_any_tool_runs(monkeypatch) -> None:
+    # The refusal has to reach the caller as an error. Left to grading time, `stop` would cut the
+    # verdict line off the reply and the episode would score as a plain wrong answer.
+    monkeypatch.setenv("OPENAI_API_KEY", "sk-test-not-used")
+    config = {"tasks": _TASKS, "judge_kwargs": {"stop": ["correct:"]}}
+    with pytest.raises(ValueError) as excinfo:
+        await ServedEpisode.start("hle", task=0, env_config=config)
+    assert "stop" in str(excinfo.value)
+
+
+async def test_the_env_keeps_its_own_copy_of_judge_kwargs(monkeypatch) -> None:
+    # Two episodes of one env, with the caller editing a nested value of its own config mapping
+    # in between: both requests must be the request the env was built with, or the scoring
+    # function changed mid-run with nothing in either score to show it.
+    calls: list = []
+    caller_kwargs = {"metadata": {"run": "a"}}
+    monkeypatch.setenv("OPENAI_API_KEY", "sk-test-not-used")
+    _patch_openai_recording_the_request(monkeypatch, calls)
+
+    env = HleEnv(tasks=_TASKS, judge_kwargs=caller_kwargs)
+    caller_kwargs["metadata"]["run"] = "b"
+    for _ in range(2):
+        episode = await ServedEpisode.open_env(env, env_name="hle", task=0)
+        try:
+            await episode.call("submit_answer", {"answer": "The City of Light", "confidence": 40})
+        finally:
+            await episode.close()
+
+    assert [call["metadata"] for call in calls] == [{"run": "a"}, {"run": "a"}]
 
 
 async def test_injected_judge_and_the_fast_path_claim_no_judge_model() -> None:
