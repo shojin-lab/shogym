@@ -27,11 +27,9 @@ from dataclasses import dataclass
 from types import MappingProxyType
 from typing import Any, Mapping, Optional, Protocol, runtime_checkable
 
-# The registered `hle` env's default judge model. Picked on measured grading quality rather than
-# on price: over 873 real calls through this judge, the previous default returned a run of false
-# negatives on multiple-choice items (a gold letter read against a lowercase candidate, or against
-# an option's text rather than its letter) that this model does not, at the same latency and
-# effectively the same cost. Override via `judge_model` env config.
+# The registered `hle` env's default judge model, at that model's own default reasoning effort.
+# A judge model is a scoring function, so this default is picked on measured grading quality (the
+# measurement is in issue #122), not on price. Override via `judge_model` env config.
 DEFAULT_JUDGE_MODEL = "gpt-5.6-luna"
 
 # A non-secret stand-in api_key. Local OpenAI-compatible servers (Ollama/vLLM/LM Studio) need
@@ -132,11 +130,9 @@ class OpenAIJudge:
     ``hle`` env can be built and its manifest probed without a key. Pass a ready ``client``
     (or ``base_url``) to point at any OpenAI-compatible endpoint.
 
-    ``request_kwargs`` are extra fields for the chat-completions request (``reasoning_effort``,
-    say). They exist so how the judge is *called* is configurable, not only which model it calls:
-    a grading setting that cannot be reached is a grading setting nobody can record either. They
-    are sent verbatim and only when given, so a judge constructed without them makes exactly the
-    request it made before the parameter existed.
+    ``request_kwargs`` are extra chat-completions fields (``reasoning_effort``, say), sent
+    verbatim and only when given: with none, the request is byte-identical to the one this judge
+    made before the parameter existed.
     """
 
     def __init__(
@@ -154,16 +150,13 @@ class OpenAIJudge:
 
     @property
     def model(self) -> str:
-        """The model id this judge grades with, readable so a score can name what produced it."""
+        """The model id this judge grades with."""
         return self._model
 
     @property
     def request_kwargs(self) -> Mapping[str, Any]:
-        """The extra request fields this judge sends, frozen at construction.
-
-        Frozen because grading has to stay one function for the length of a run: a mapping the
-        caller can still edit could change what scored episode 400 relative to episode 1, and the
-        difference would not be visible in either score."""
+        """The extra request fields this judge sends, frozen at construction so grading stays
+        one function for the length of a run."""
         return self._request_kwargs
 
     def _ensure_client(self) -> Any:
@@ -187,21 +180,17 @@ class OpenAIJudge:
         completion = client.chat.completions.create(
             model=self._model,
             messages=[{"role": "user", "content": content}],
-            # Nothing is unpacked here when no request kwargs were given, so an unset field is
-            # absent from the wire rather than sent as a null. A local OpenAI-compatible server
-            # behind `base_url` may reject a field it does not implement, and a rejected request
-            # is a judge error, which fails closed to `correct=False` on an answer nobody read.
+            # Unset means absent, not null: with no kwargs this request is byte-identical to the
+            # pre-parameter one, which keeps endpoints that reject unknown fields working.
             **self._request_kwargs,
         )
         text = completion.choices[0].message.content or ""
         return parse_judge_response(text)
 
 
-# The two request fields the judge supplies itself. Setting either through ``request_kwargs``
-# would collide with the judge's own argument and raise inside the call, and a judge that raises
-# fails closed, so the mistake would land as a whole benchmark of honest-looking zeros rather
-# than as an error anyone reads. Refused at construction instead, which for the registered env
-# is the start of the episode.
+# The two request fields the judge supplies itself. Passing either through `request_kwargs`
+# raises inside the call, and a judge that raises fails closed, so it is refused at construction
+# rather than landing as a run of honest-looking zeros.
 _RESERVED_REQUEST_FIELDS = ("model", "messages")
 
 

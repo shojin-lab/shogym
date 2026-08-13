@@ -157,17 +157,10 @@ class HleEnv(Env):
         )
 
     def _judge_provenance(self) -> Dict[str, str]:
-        """Which scoring function graded this episode, when the env is the one that built it.
+        """The model this env's own judge grades with, plus its ``reasoning_effort`` when set.
 
-        A judge model is a scoring function, so two scores are only comparable when both say
-        which one produced them. Nothing in a run artifact says it today: a reader can recover
-        the judge only from the shogym revision the run was pinned to, and that stops working the
-        moment a default changes. So the resolved model rides out with the verdict, and the
-        ``reasoning_effort`` from ``judge_kwargs`` with it when one is set, since the same model
-        at two efforts is two scoring functions.
-
-        An injected ``judge=`` gets nothing: only the caller knows what it is, and a guess about
-        it recorded next to a score would be worse than the silence."""
+        Empty for an injected ``judge=``: only the caller knows what that is, so the env names
+        nothing rather than guessing."""
         if self._judge is not None:
             return {}
         provenance = {"judge_model": self._judge_model}
@@ -231,10 +224,8 @@ class HleEnv(Env):
         thing the agent ever sees (the serve layer stamps provenance / finalization_id / source
         and appends its own ``finalize_error`` flag). The judge's ``reasoning`` /
         ``extracted_answer`` and any exception text are answer oracles: they go **only** in the
-        private ``diagnostic`` (durable store / server logs), never in the verdict.
-
-        Only a model-graded episode names a judge. The exact-match fast path is not a model and
-        does not claim to be one, so it publishes no judge, and the absence is the record: no
+        private ``diagnostic`` (durable store / server logs), never in the verdict. Only a
+        model-graded episode names a judge: the exact-match fast path publishes none, since no
         model read that answer.
 
         A judge failure fails **closed** — ``correct=False`` with ``status='finalize_error'`` —
@@ -277,8 +268,8 @@ class HleEnv(Env):
             return TerminalEvidence(
                 source=req.source,
                 status="finalize_error",
-                # The provenance rides on a fail-closed grade too: which judge could not be
-                # reached is exactly what an analyst filtering these zeros needs to know.
+                # Provenance rides on a fail-closed grade too: which judge could not be reached
+                # is what an analyst filtering these zeros needs.
                 verdict={"correct": False, "judge_error": True, **provenance},
                 # Exception text is PRIVATE — it may echo the answer/gold; keep it off the wire.
                 diagnostic=f"judge error: {type(exc).__name__}: {exc}",
@@ -338,9 +329,8 @@ def score_evidence(
     relevant).
 
     A model-graded episode also emits the **judge provenance** the verdict carries
-    (``judge_model``, plus ``judge_effort`` when one was configured). The trace is where a score
-    is read back from, so what scored it belongs on that surface rather than only in the config
-    that started the run."""
+    (``judge_model``, plus ``judge_effort`` when one was configured), so a score read back off
+    the trace says what produced it."""
     fb = FeedbackCollection()
     if not terminated:
         return fb

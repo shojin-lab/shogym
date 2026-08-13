@@ -46,8 +46,7 @@ reads the verdict off the trace via `shogym.result_from_trace(...)`.
 `judge` (an injected [`Judge`](judge.py), a scripted judge for offline runs),
 `judge_model` / `judge_base_url` (the default judge's model + endpoint), and `judge_kwargs`
 (extra fields for the default judge's chat-completions request, e.g.
-`{"reasoning_effort": "low"}`; sent verbatim, and omitted from the request entirely when unset,
-so a local endpoint that rejects unknown fields still works).
+`{"reasoning_effort": "low"}`, sent verbatim and omitted entirely when unset).
 
 ### Quickstart
 
@@ -134,11 +133,9 @@ Feedback emitted on termination (episode-level):
   (a judge exception, or a serve-layer finalize deadline/crash), so an analyst can filter those
   out of the genuine zeros.
 - **`judge_model`** (and **`judge_effort`**, when `judge_kwargs` set a `reasoning_effort`):
-  which model graded, on the episodes a model actually graded. A judge model is a scoring
-  function, so a score is only comparable next to the one that produced it, and a run artifact
-  otherwise names the shogym pin rather than the judge. Emitted only when the env built the judge
-  itself: an exact-match episode was read by no model, and an injected `judge` is the caller's
-  to describe, so both stay silent rather than guess.
+  which model graded, so a score read back off the trace says what produced it. Emitted only
+  when the env built the judge itself: an exact-match episode was read by no model, and an
+  injected `judge` is the caller's to describe, so both stay silent rather than guess.
 
 Termination happens when the `submit_answer` score terminal seals the episode, when `terminate`
 is called, **or** when the horizon (1) is reached — whichever comes first. Reaching the horizon
@@ -173,12 +170,10 @@ semantics (give each run its own trace file for a guaranteed 1:1 mapping).
   to `OpenAIJudge` (overridable via `judge_model` / `judge_kwargs` / `judge_base_url`, or a
   fully injected `judge`). The exact-match fast path is a free, offline pre-check that never
   changes a correct verdict.
-- **The default judge model is a scoring decision.** It is `gpt-5.6-luna`, at whatever
-  reasoning effort that model defaults to. It was measured against the previous default over
-  873 real calls through this judge: same latency, effectively the same cost, and no repeat of
-  the false negatives the old default returned on multiple-choice items whose gold letter had
-  to be matched against a lowercase candidate or against an option's text. Changing it changes
-  measured accuracy, which is why every graded episode now records the model that graded it.
+- **The default judge model is a scoring decision.** It is `gpt-5.6-luna`, at that model's own
+  default reasoning effort, chosen on grading quality measured against the previous default
+  (issue #122). Changing it changes measured accuracy, which is why every graded episode now
+  records the model that graded it.
 - **Text-only for now.** Questions carrying an image are filtered out; multimodal is a
   follow-up.
 - **Judge fail-closed.** A grading-infra failure scores `correct = False` with `judge_error =

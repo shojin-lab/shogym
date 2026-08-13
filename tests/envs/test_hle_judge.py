@@ -1,7 +1,7 @@
 """Unit tests for the HLE judge's pure pieces: the exact-match fast path, the parser for the
 LLM judge's structured reply, and the request the judge builds. All dependency-free (no
-``datasets``, no network: the request tests drive an injected stand-in client), so they run in
-the offline core suite.
+``datasets``, no network: the request tests inject a stand-in client), so they run in the
+offline core suite.
 """
 
 from __future__ import annotations
@@ -26,10 +26,9 @@ _REPLY = (
 
 
 def _recording_client(calls: List[Dict[str, Any]], reply: str = _REPLY) -> Any:
-    """A stand-in for the OpenAI client that records each request and answers with ``reply``.
+    """A stand-in OpenAI client that records each request and answers with ``reply``.
 
-    Injected as ``client=``, so nothing imports ``openai`` or reaches the network, and the
-    recorded kwargs are the request the judge actually built."""
+    Injected as ``client=``, so nothing imports ``openai`` or reaches the network."""
 
     def create(**kwargs: Any) -> Any:
         calls.append(kwargs)
@@ -98,9 +97,8 @@ def test_parse_judge_fails_closed_on_conflicting_verdicts() -> None:
 
 
 def test_default_judge_model_is_the_measured_one() -> None:
-    # The default judge model is a scoring function, not a preference: changing it changes every
-    # HLE number a caller who does not pin one will measure. Pinned here so the change is a
-    # deliberate edit to a test that says so, never a drive-by.
+    # Changing the default changes every HLE number a caller who pins no judge will measure, so
+    # it is pinned here: moving it takes a deliberate edit to this test.
     assert DEFAULT_JUDGE_MODEL == "gpt-5.6-luna"
     assert OpenAIJudge().model == DEFAULT_JUDGE_MODEL
 
@@ -122,9 +120,8 @@ def test_request_kwargs_reach_the_create_call() -> None:
 
 
 def test_without_request_kwargs_the_request_carries_only_model_and_messages() -> None:
-    # The no-kwargs request must be exactly what it was before the pass-through existed: no
-    # extra field, and no null standing in for an unset one. An OpenAI-compatible server behind
-    # `base_url` can reject a field it does not implement, and a rejected request grades nothing.
+    # The no-kwargs request must stay byte-identical to the pre-pass-through one: no extra field
+    # and no null, for endpoints behind `base_url` that reject a field they do not implement.
     calls: List[Dict[str, Any]] = []
     judge = OpenAIJudge(model="judge-model-x", client=_recording_client(calls))
 
@@ -135,8 +132,8 @@ def test_without_request_kwargs_the_request_carries_only_model_and_messages() ->
 
 
 def test_request_kwargs_refuse_the_fields_the_judge_supplies_itself() -> None:
-    # A colliding key raises a TypeError inside the call, and a judge that raises fails closed,
-    # so the run would land as a page of zeros. It has to be an error at construction instead.
+    # A colliding key raises inside the call, and a judge that raises fails closed, so it has to
+    # be an error at construction instead.
     with pytest.raises(ValueError) as excinfo:
         OpenAIJudge(request_kwargs={"model": "someone-elses-model"})
     assert "model" in str(excinfo.value)
@@ -145,8 +142,7 @@ def test_request_kwargs_refuse_the_fields_the_judge_supplies_itself() -> None:
 
 
 def test_request_kwargs_are_frozen_at_construction() -> None:
-    # Grading has to stay one function for the length of a run, so the judge holds its own copy:
-    # editing the mapping afterwards cannot change what the next episode is scored with.
+    # The judge holds its own copy, so grading stays one function for the length of a run.
     kwargs: Dict[str, Any] = {"reasoning_effort": "low"}
     judge = OpenAIJudge(client=_recording_client([]), request_kwargs=kwargs)
     kwargs["reasoning_effort"] = "xhigh"

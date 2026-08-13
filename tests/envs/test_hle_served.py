@@ -483,8 +483,7 @@ def _patch_openai_recording_the_request(monkeypatch, calls: list) -> None:
     """Point the default judge at a stand-in client that records the request it is sent.
 
     The judge builds its client with ``from openai import OpenAI`` at call time, so patching the
-    SDK constructor is what stands between these tests and the network. The recorded kwargs are
-    the request the env's own judge actually built, config and all."""
+    SDK constructor is what keeps these tests off the network."""
     pytest.importorskip("openai")
 
     reply = (
@@ -521,8 +520,8 @@ async def _grade_with_default_judge(monkeypatch, calls: list, **config) -> dict:
 
 
 async def test_unconfigured_env_grades_with_the_default_model_and_records_it(monkeypatch) -> None:
-    # Nothing specified: the env resolves DEFAULT_JUDGE_MODEL, sends the same two fields it has
-    # always sent (no effort, and no null standing in for one), and the score names what graded.
+    # Nothing configured: the env resolves DEFAULT_JUDGE_MODEL, sends only the two fields it has
+    # always sent, and the score names what graded.
     calls: list = []
     fb = await _grade_with_default_judge(monkeypatch, calls)
 
@@ -533,8 +532,8 @@ async def test_unconfigured_env_grades_with_the_default_model_and_records_it(mon
 
 
 async def test_judge_kwargs_reach_the_request_and_ride_out_with_the_score(monkeypatch) -> None:
-    # An explicit judge_model still overrides the default, and judge_kwargs reach the request
-    # they were always meant to reach. Both are scoring decisions, so both are recorded.
+    # An explicit judge_model still overrides the default, judge_kwargs reach the request, and
+    # both are recorded.
     calls: list = []
     fb = await _grade_with_default_judge(
         monkeypatch,
@@ -550,8 +549,8 @@ async def test_judge_kwargs_reach_the_request_and_ride_out_with_the_score(monkey
 
 
 async def test_injected_judge_and_the_fast_path_claim_no_judge_model() -> None:
-    # The env only names a judge it built itself. An injected judge is the caller's to describe,
-    # and an exact match was read by no model at all: neither may borrow a model's name.
+    # The env only names a judge it built itself: an injected judge is the caller's to describe,
+    # and an exact match was read by no model at all.
     judge = _ScriptedJudge()
     episode = await ServedEpisode.start("hle", task=0, env_config=_config(judge))
     try:
