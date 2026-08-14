@@ -12,11 +12,18 @@ direction.
 ### `hle`: the default judge is now `gpt-5.6-luna`
 
 It was `gpt-5.4-nano`. **This changes measured HLE accuracy for anyone who upgrades without
-pinning a judge**, and the direction is worth stating plainly: it removes false negatives, so
-scores go up rather than down, and they go up unevenly.
+pinning a judge.** The direction, stated no more strongly than it was measured: the two judges
+disagreed on 19 of 367 probe cases, 18 of those disagreements had a knowable right answer, and
+luna was right in all 18, every time because nano had returned a false negative. That predicts an
+upward and uneven shift rather than a constant offset. Predicted, not promised: the probe's
+candidate answers were constructed to exercise the judge rather than sampled from a consumer's
+run, 18 is a small number of cases, and a workload whose items differ from the probe's can move by
+a different amount, or in a way this measurement does not cover. The part that is not in doubt is
+that the number moves: an unpinned run is graded by a different model than it was on 0.0.1.
 
-The measurement is in [#122](https://github.com/shojin-lab/shogym/issues/122): 873 real calls
-through this repo's own judge path, real prompt, real client, real `parse_judge_response`.
+The measurement is in [#122](https://github.com/shojin-lab/shogym/issues/122): 1,746 real calls
+through this repo's own judge path, 873 per model, real prompt, real client, real
+`parse_judge_response`.
 
 | | `gpt-5.6-luna` | `gpt-5.4-nano` |
 |---|---|---|
@@ -25,12 +32,12 @@ through this repo's own judge path, real prompt, real client, real `parse_judge_
 | verdict flips across repeat draws | 2 / 307 | 16 / 307 |
 | median latency at concurrency 8 | 1.09s | 1.10s |
 
-Every disagreement with a knowable answer went luna's way, and every nano error was the same
-mode: multiple-choice matching. Gold `F` against a candidate reading "The answer is f." was
-judged incorrect on the letter case. Gold `M`, whose option text is "15", against a candidate
-reading "15" was judged incorrect on letter versus option text. Nano was also unstable across
-repeat draws on roughly 10% of multiple-choice items, which is why the old default depressed
-scores unevenly rather than by a constant.
+Every nano error was the same mode, multiple-choice matching. Gold `F` against a candidate
+reading "The answer is f." was judged incorrect on the letter case. Gold `M`, whose option text
+is "15", against a candidate reading "15" was judged incorrect on letter versus option text. Nano
+was also unstable across repeat draws on roughly 10% of the probe's multiple-choice items, which
+is the reason to expect an uneven shift rather than a fixed one: how much a run moves depends on
+how many items of that shape it happens to contain.
 
 Price and latency are a wash. Input costs the same per token, output is 4% cheaper, and median
 latency matched at concurrency 8, so nothing here is a cost or speed change.
