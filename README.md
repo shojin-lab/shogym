@@ -93,6 +93,12 @@ README covers the model and the shared env-README template.
   container through a shell (`exec` / `read_file` / `write_file` / `done`), scored by the task's
   own verifier over the container end-state. A CPU-only, single-container slice (5 tasks). Needs
   the `frontier_bench` extra and a local Docker daemon (no key or data download).
+- **[`orca_bench`](src/shogym/envs/orca_bench/README.md)**: a port of
+  [ORCA-bench](https://github.com/ORCA-bench/ORCA-bench). Find the root cause of an incident by
+  querying a recorded observability stack (metrics, traces, logs) and writing an RCA report,
+  graded by the LLM judge that ships inside each of the 755 tasks. Needs the `orca_bench` extra
+  and the on-demand dataset download; `OPENAI_API_KEY` and Docker only to serve. Phase 1: the
+  loader, `describe` and verdict parsing are complete and offline; the compose backend is phase 2.
 
 ## The task server
 
