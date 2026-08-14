@@ -97,8 +97,10 @@ README covers the model and the shared env-README template.
   [ORCA-bench](https://github.com/ORCA-bench/ORCA-bench). Find the root cause of an incident by
   querying a recorded observability stack (metrics, traces, logs) and writing an RCA report,
   graded by the LLM judge that ships inside each of the 755 tasks. Needs the `orca_bench` extra
-  and the on-demand dataset download; `OPENAI_API_KEY` and Docker only to serve. Phase 1: the
-  loader, `describe` and verdict parsing are complete and offline; the compose backend is phase 2.
+  and the on-demand dataset download; `OPENAI_API_KEY` and Docker only to serve. Serving runs the
+  benchmark's real 28-service stack, which needs ~140 GB on the daemon. A runtime override repairs
+  the benchmark's expired telemetry window; see the env README's clock section for the one residual
+  difference from the paper's runs.
 
 ## The task server
 
