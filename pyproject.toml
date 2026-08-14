@@ -1,6 +1,6 @@
 [project]
 name = "shogym"
-version = "0.0.1"
+version = "0.1.0"
 description = "Environments that meet an agent at the tool surface"
 readme = "README.md"
 license = "Apache-2.0"
