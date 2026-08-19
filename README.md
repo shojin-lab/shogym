@@ -151,6 +151,10 @@ result = await shogym.evaluate("wordle_v1", task=17, harness=my_harness)
 print(result.value("check_answer"))
 ```
 
+## Community
+
+Questions, results, and replications: [the shōjin Discord](https://discord.gg/cRmZYt5smz).
+
 ## License
 
 Apache-2.0. Portions derived from [llmgym](https://github.com/tensorzero/llmgym)
