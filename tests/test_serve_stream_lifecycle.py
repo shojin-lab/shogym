@@ -141,18 +141,18 @@ async def test_a_failed_finalization_is_unscored(tmp_path: Path) -> None:
     assert "RuntimeError" in row.diagnostic
 
 
-async def test_a_structured_failure_names_its_locations_on_the_row(tmp_path: Path) -> None:
-    # A failure that reports *where* it happened puts those field paths on the row, which is what
-    # separates an env defect in one field from a wholesale evaluator failure. The paths are the
-    # whole of it: a failure's message renders the values it objected to, and for an env whose
-    # state is the thing being graded those values can be the answer.
+async def test_a_structured_failure_names_its_kind_on_the_row(tmp_path: Path) -> None:
+    # A failure that reports *how* it failed puts that kind on the row, which is what separates a
+    # malformed-value defect from a wholesale evaluator failure. The kind and a count are the
+    # whole of it. Everything else such a failure reports is drawn from the data being validated,
+    # and for an env whose state is the thing being graded that data can be the answer.
     from pydantic import BaseModel
 
     class _Verdict(BaseModel):
-        depth: int
+        answers: Dict[str, int]
 
     def invalid(_req: FinalizeRequest, _correct: bool) -> None:
-        _Verdict(depth="not-an-int")  # type: ignore[arg-type]
+        _Verdict(answers={"gold-answer-42": "not-an-int"})  # type: ignore[dict-item]
 
     stream = _stream(
         tmp_path, [0], factory=lambda _n: _FixtureScoreEnv(tasks=TASKS, finalize_hook=invalid)
@@ -165,8 +165,29 @@ async def test_a_structured_failure_names_its_locations_on_the_row(tmp_path: Pat
     assert row.score is None
     assert row.diagnostic is not None
     assert "ValidationError" in row.diagnostic
-    assert "depth" in row.diagnostic
+    assert "int_parsing" in row.diagnostic
     assert "not-an-int" not in row.diagnostic, "a diagnostic may not carry the offending value"
+    assert "gold-answer-42" not in row.diagnostic, "nor a key the failing input supplied"
+
+
+async def test_a_raising_verifier_is_named_on_the_row(tmp_path: Path) -> None:
+    # The verifier runs at its own fail-closed boundary, after the evaluator has already produced
+    # a verdict. It owes the row the same account: a verifier defect and an evaluator defect are
+    # different repairs, and a row that named neither made them look alike.
+    class _RaisingVerifyEnv(_FixtureScoreEnv):
+        def _verify(self, *args: Any, **kwargs: Any) -> FeedbackCollection:
+            raise LookupError("verifier exploded")
+
+    stream = _stream(tmp_path, [0], factory=lambda _n: _RaisingVerifyEnv(tasks=TASKS))
+    async with stream:
+        await stream.get_task()
+        await stream.dispatch(SUBMIT_TOOL, {"answer": "4"})
+    (row,) = stream.results
+    assert row.closure == "finalize_error"
+    assert row.score is None
+    assert row.observed == [], "a verifier that raised published nothing"
+    assert row.diagnostic is not None
+    assert "LookupError" in row.diagnostic
 
 
 async def test_a_call_that_ended_nothing_cannot_say_how_the_task_ended(tmp_path: Path) -> None:

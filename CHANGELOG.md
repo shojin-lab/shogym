@@ -55,10 +55,19 @@ is unchanged, since a failed transaction was never a scored closure.
 
 The row's diagnostic read "the terminal transaction failed closed; the env published no verdict"
 for every cause alike, so acting on one meant reproducing a failure the harness had already
-caught. It now appends the failure's type and, for a failure that reports them, the field
-locations it objected to. Never the message: a message renders the values it objected to, and for
-an env whose state is what is being graded those values can be the answer. The summary travels on
-a harness-side channel, so the agent-facing terminal payload and the public trace are unchanged.
+caught. It now appends the failure's type and, for a failure that reports structured errors, how
+many there were and which kinds: `(ValidationError: 17 errors; extra_forbidden)`. Both fail-closed
+boundaries carry it, the evaluator's and the verifier's.
+
+Everything published there is a count or a term from the validator's own fixed vocabulary.
+Nothing that could have come from the data being validated is included, because for an env whose
+state is what is being graded that data can be the answer. That rules out the message, which
+renders the offending values, and it also rules out the field locations: a reported location
+descends into the input rather than the schema, so a failure inside a mapping contributes that
+mapping's keys and a rejected unknown key contributes the key itself. The full diagnostic,
+locations and values included, is still written to the private durable record. The summary travels
+on a harness-side channel, so the agent-facing terminal payload and the public trace are
+unchanged.
 
 ## 0.1.0
 

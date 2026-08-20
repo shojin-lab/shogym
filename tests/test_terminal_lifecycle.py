@@ -1153,9 +1153,10 @@ def test_failure_summary_names_the_type() -> None:
     }
 
 
-def test_failure_summary_keeps_locations_and_drops_the_message() -> None:
-    # A structured failure contributes the field paths it objected to, and nothing else: the
-    # values behind those paths are the env's state, which is the thing being graded.
+def test_failure_summary_keeps_the_kind_and_count_and_drops_the_message() -> None:
+    # A structured failure contributes how many errors there were and which kinds, and nothing
+    # else: everything else it reports is drawn from the data being validated, which for an env
+    # is the thing being graded.
     from pydantic import BaseModel, ValidationError
 
     class _Verdict(BaseModel):
@@ -1166,27 +1167,68 @@ def test_failure_summary_keeps_locations_and_drops_the_message() -> None:
         _Verdict(depth="not-an-int", label=None)  # type: ignore[arg-type]
     summary = lifecycle.failure_summary(caught.value)
     assert summary["error"] == "ValidationError"
-    assert summary["locations"] == ["depth", "label"]
-    assert summary["location_count"] == 2
+    assert summary["error_count"] == 2
+    assert summary["error_kinds"] == ["int_parsing", "string_type"]
     assert "not-an-int" not in json.dumps(summary)
 
 
-def test_failure_summary_truncates_but_still_counts() -> None:
-    # One structured failure can carry a location per record in a collection. The list is capped
-    # and the true count travels beside it, so a truncated summary is short without being wrong.
+def test_failure_summary_never_publishes_a_mapping_key() -> None:
+    # A reported location descends into the INPUT, not the schema: a failure inside a mapping
+    # contributes that mapping's own keys. Those keys are the env's data, so a summary that
+    # published locations would put answer-bearing state into a record that outlives the episode.
     from pydantic import BaseModel, ValidationError
+    from typing import Dict
 
-    class _Item(BaseModel):
-        depth: int
-
-    class _Batch(BaseModel):
-        items: list[_Item]
+    class _Verdict(BaseModel):
+        answers: Dict[str, int]
 
     with pytest.raises(ValidationError) as caught:
-        _Batch(items=[{"depth": "x"} for _ in range(20)])
+        _Verdict(answers={"gold-answer-42": "not-an-int", "the capital is paris": "nope"})
+    # The location really does carry the keys, which is what this guards against.
+    assert ("answers", "gold-answer-42") in [err["loc"] for err in caught.value.errors()]
+    blob = json.dumps(lifecycle.failure_summary(caught.value))
+    assert "gold-answer-42" not in blob
+    assert "paris" not in blob
+    assert "not-an-int" not in blob
+
+
+def test_failure_summary_refuses_an_error_kind_the_validator_invented() -> None:
+    # A kind is a bare string, and only the library's own documentation link says where it came
+    # from. One supplied by whoever wrote the validator has no link and is dropped, so a kind
+    # built out of the data cannot ride out on this channel either.
+    from pydantic import BaseModel, ValidationError, field_validator
+    from pydantic_core import PydanticCustomError
+
+    class _Verdict(BaseModel):
+        label: str
+
+        @field_validator("label")
+        @classmethod
+        def _reject(cls, value: str) -> str:
+            raise PydanticCustomError("the_answer_is_paris", "boom")
+
+    with pytest.raises(ValidationError) as caught:
+        _Verdict(label="anything")
     summary = lifecycle.failure_summary(caught.value)
-    assert summary["location_count"] == 20
-    assert len(summary["locations"]) == lifecycle._MAX_FAILURE_LOCATIONS
+    assert summary == {"error": "ValidationError", "error_count": 1}
+    assert "paris" not in json.dumps(summary)
+
+
+def test_failure_summary_caps_the_kinds_it_lists() -> None:
+    # A pathological failure reporting many distinct kinds is bounded rather than unbounded; the
+    # true count travels beside the list, so a capped summary is short without being wrong.
+    cap = lifecycle._MAX_FAILURE_ERROR_KINDS
+
+    class _Many(Exception):
+        def errors(self):
+            return [
+                {"type": f"kind_{i}", "url": f"https://errors.pydantic.dev/2.13/v/kind_{i}"}
+                for i in range(cap + 5)
+            ]
+
+    summary = lifecycle.failure_summary(_Many())
+    assert summary["error_count"] == cap + 5
+    assert len(summary["error_kinds"]) == cap
 
 
 def test_failure_summary_contains_a_failure_that_cannot_describe_itself() -> None:

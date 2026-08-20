@@ -856,11 +856,11 @@ class _Live:
     # `finalize_error` stamp the closure is classified from, and no env-supplied content may
     # stand in for it (see `_finalize_failed`).
     terminal_payload: Optional[Dict[str, Any]] = None
-    # What the core said failed, when the terminal transaction failed closed: the failure's type
-    # and the field locations it named, never its message. Read off the episode on its own
-    # channel because it is a harness-side fact rather than part of the payload a terminal call
-    # answers the agent with, and it is what turns an unscored row from a report that something
-    # went wrong into one that says what.
+    # What the core said failed, when the terminal transaction failed closed: the failure's type,
+    # how many errors it reported and which kinds, never its message and never a field location.
+    # Read off the episode on its own channel because it is a harness-side fact rather than part
+    # of the payload a terminal call answers the agent with, and it is what turns an unscored row
+    # from a report that something went wrong into one that says what.
     terminal_failure: Optional[Dict[str, Any]] = None
     # Set when a terminal the *stream* drove failed after ending the task, could not end it at
     # all, or ended it and left a verdict this record could not read off the episode. An
@@ -1140,29 +1140,31 @@ def _described_failure(failure: Optional[Dict[str, Any]]) -> str:
 
     A row that only says a transaction failed closed leaves its reader with nowhere to start:
     every cause reads identically, so the first move is always to go and reproduce the failure
-    that the harness had already caught. This appends what the core kept of it (the failure's type,
-    and the field locations it named), which is enough to tell an env defect from an evaluator
-    timeout without rerunning anything.
+    that the harness had already caught. This appends what the core kept of it (the failure's
+    type, how many errors it reported, and which kinds), which is enough to tell an env defect
+    from an evaluator timeout without rerunning anything.
 
     Empty when there is nothing to add, so the sentence it extends stands alone, unchanged, for a
     failure that could not describe itself or for a core that recorded none. Nothing here formats
     an exception or an env value: the summary is built once, at the point the failure was caught,
-    out of the failure's own type name and its field paths (see ``failure_summary``), so by the
-    time it reaches this module it is strings this package made.
+    out of a fixed vocabulary and a count (see ``failure_summary``), so by the time it reaches
+    this module it carries nothing that came from the data the env was holding.
     """
     if not isinstance(failure, dict):
         return ""
     name = failure.get("error")
     if not isinstance(name, str) or not name:
         return ""
-    locations = failure.get("locations")
-    if not isinstance(locations, list) or not locations:
+    parts: List[str] = []
+    count = failure.get("error_count")
+    if isinstance(count, int) and count > 0:
+        parts.append(f"{count} error{'' if count == 1 else 's'}")
+    kinds = failure.get("error_kinds")
+    if isinstance(kinds, list) and kinds:
+        parts.append(", ".join(str(kind) for kind in kinds))
+    if not parts:
         return f" ({name})"
-    shown = ", ".join(str(location) for location in locations)
-    total = failure.get("location_count")
-    hidden = total - len(locations) if isinstance(total, int) else 0
-    more = f", and {hidden} more" if hidden > 0 else ""
-    return f" ({name} at {shown}{more})"
+    return f" ({name}: {'; '.join(parts)})"
 
 
 def _described(render: Callable[[], str]) -> str:

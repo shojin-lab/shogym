@@ -461,8 +461,9 @@ class ServedEpisode:
         Read by the **harness**, and deliberately not part of :attr:`terminal_payload`: that
         payload is what a terminal call answers the agent with, and this says something about the
         env's own state. It is safe for a row and not for a reply, so it travels on its own
-        channel rather than being widened into the shared one. It carries no message text either
-        way (see ``failure_summary``): only the failure's type and the field locations it named.
+        channel rather than being widened into the shared one. It carries neither message text nor
+        field locations either way (see ``failure_summary``): only the failure's type, a count,
+        and error kinds drawn from the validator's own fixed vocabulary.
         """
         return None if self._evidence is None else self._evidence.failure
 
@@ -829,8 +830,8 @@ class ServedEpisode:
                 diagnostic=f"finalize failed: {type(exc).__name__}: {exc}",
                 # The same failure, structurally, for the harness-side row. The diagnostic above
                 # stays private because it renders the failure's values; the summary carries only
-                # the type and the field locations, which is what a reader of an unscored row
-                # needs and all they may safely be told.
+                # a type, a count and a fixed vocabulary, which is what a reader of an unscored
+                # row needs and all they may safely be told.
                 failure=failure_summary(exc),
             )
 
@@ -906,7 +907,7 @@ class ServedEpisode:
                         self._trajectory, self._task, terminated=True, evidence=evidence
                     )
                     items = [*feedback.inference, *feedback.episode]
-                except Exception:  # noqa: BLE001 — verifier failure => fail closed
+                except Exception as exc:  # noqa: BLE001 (verifier failure => fail closed)
                     evidence = TerminalEvidence(
                         source=source,  # type: ignore[arg-type]
                         status="finalize_error",
@@ -914,6 +915,10 @@ class ServedEpisode:
                         provenance=evidence.provenance,
                         finalization_id=finalization_id,
                         diagnostic="verify() raised while scoring the terminal evidence",
+                        # This boundary fails closed like the evaluator's, so it owes the row the
+                        # same account of what happened. A verifier defect and an evaluator defect
+                        # are different repairs, and a row that named neither made them look alike.
+                        failure=failure_summary(exc),
                     )
                     self._evidence = evidence
                     items = []
