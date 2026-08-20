@@ -112,6 +112,9 @@ class TerminalEvidence:
     finalization_id: Optional[str] = None
     # Private diagnostic (never surfaced to the agent).
     diagnostic: Optional[str] = None
+    # Structural description of the failure behind a `finalize_error`, for the harness-side
+    # record only (see `failure_summary`). Like `diagnostic`, never surfaced to the agent.
+    failure: Optional[Dict[str, Any]] = None
     schema_version: int = EVIDENCE_SCHEMA_VERSION
 
     @property
@@ -129,6 +132,59 @@ def fail_closed_verdict(confidence: Optional[Any] = None) -> Dict[str, Any]:
     if confidence is not None:
         verdict["confidence"] = confidence
     return verdict
+
+
+# How many field locations a failure summary keeps. One structured failure can carry a location
+# per record in a collection, and the summary exists to say what *shape* of failure happened, not
+# to enumerate every instance of it. The full count is reported beside the list, so a truncated
+# list still reads honestly.
+_MAX_FAILURE_LOCATIONS = 8
+
+
+def failure_summary(exc: BaseException) -> Dict[str, Any]:
+    """A structural description of a contained failure, for the harness-side record.
+
+    Names the exception type that ended the terminal transaction and, when the exception reports
+    structured validation errors, the field locations it objected to. That is enough to act on:
+    a type and a path say which layer failed and where, which is what a reader of an unscored row
+    has to know before they can do anything about it.
+
+    **Deliberately not the exception's message.** A message renders the offending *values*, and
+    for an env whose state is the thing being graded those values can be the answer. A location
+    is a field path: it says where the failure is without saying what was there, so this can be
+    published beside a row without reopening the channel the sanitized terminal payload closes.
+
+    Every read of the exception is contained. Describing a caught failure runs code belonging to
+    whoever raised it, a second time and outside the ``except`` that just caught it, so an
+    accident in here would not stay caught. It would leave carrying the caller's job with it,
+    and the caller's job at this point is committing a fail-closed verdict. ``SystemExit`` and
+    ``KeyboardInterrupt`` still propagate, the same line the rest of this package holds: an
+    interpreter-level signal costs the record loudly rather than being swallowed in a summary.
+    """
+    try:
+        name = type(exc).__name__
+    except (SystemExit, KeyboardInterrupt):
+        raise
+    except BaseException:  # noqa: BLE001 (a contained failure may not escape through its type)
+        return {"error": "<unreadable>"}
+    summary: Dict[str, Any] = {"error": name}
+    try:
+        # Structured errors are duck-typed rather than isinstance-checked against pydantic:
+        # anything that reports its failures this way describes them the same useful way, and
+        # anything that does not simply keeps the type-only summary.
+        reported = exc.errors()  # type: ignore[attr-defined]
+        locations = [
+            ".".join(str(part) for part in (entry.get("loc") or ())) for entry in reported
+        ]
+    except (SystemExit, KeyboardInterrupt):
+        raise
+    except BaseException:  # noqa: BLE001 (not a structured failure, or one that cannot say so)
+        return summary
+    locations = [location for location in locations if location]
+    if locations:
+        summary["locations"] = locations[:_MAX_FAILURE_LOCATIONS]
+        summary["location_count"] = len(locations)
+    return summary
 
 
 def args_digest(args: Optional[Dict[str, Any]]) -> Optional[str]:

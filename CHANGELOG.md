@@ -7,6 +7,17 @@ Versions before 1.0 keep the usual pre-1.0 promise, which is a modest one: a min
 change behavior a consumer depends on, and this file exists to say which behavior and in which
 direction.
 
+## Unreleased
+
+### `serve`: a fail-closed row names the failure
+
+The row's diagnostic read "the terminal transaction failed closed; the env published no verdict"
+for every cause alike, so acting on one meant reproducing a failure the harness had already
+caught. It now appends the failure's type and, for a failure that reports them, the field
+locations it objected to. Never the message: a message renders the values it objected to, and for
+an env whose state is what is being graded those values can be the answer. The summary travels on
+a harness-side channel, so the agent-facing terminal payload and the public trace are unchanged.
+
 ## 0.1.0
 
 ### `hle`: the default judge is now `gpt-5.6-luna`

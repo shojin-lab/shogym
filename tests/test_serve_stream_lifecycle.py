@@ -136,6 +136,37 @@ async def test_a_failed_finalization_is_unscored(tmp_path: Path) -> None:
     # The fail-closed verdict is still on the row, as evidence — just not as a score.
     assert {"name": "correct", "value": False, "level": "episode"} in row.observed
     assert row.diagnostic is not None
+    # And the row says which failure it was. Every fail-closed row reads alike otherwise, so the
+    # first move on one would always be to reproduce a failure the harness had already caught.
+    assert "RuntimeError" in row.diagnostic
+
+
+async def test_a_structured_failure_names_its_locations_on_the_row(tmp_path: Path) -> None:
+    # A failure that reports *where* it happened puts those field paths on the row, which is what
+    # separates an env defect in one field from a wholesale evaluator failure. The paths are the
+    # whole of it: a failure's message renders the values it objected to, and for an env whose
+    # state is the thing being graded those values can be the answer.
+    from pydantic import BaseModel
+
+    class _Verdict(BaseModel):
+        depth: int
+
+    def invalid(_req: FinalizeRequest, _correct: bool) -> None:
+        _Verdict(depth="not-an-int")  # type: ignore[arg-type]
+
+    stream = _stream(
+        tmp_path, [0], factory=lambda _n: _FixtureScoreEnv(tasks=TASKS, finalize_hook=invalid)
+    )
+    async with stream:
+        await stream.get_task()
+        await stream.dispatch(SUBMIT_TOOL, {"answer": "4"})
+    (row,) = stream.results
+    assert row.closure == "finalize_error"
+    assert row.score is None
+    assert row.diagnostic is not None
+    assert "ValidationError" in row.diagnostic
+    assert "depth" in row.diagnostic
+    assert "not-an-int" not in row.diagnostic, "a diagnostic may not carry the offending value"
 
 
 async def test_a_call_that_ended_nothing_cannot_say_how_the_task_ended(tmp_path: Path) -> None:

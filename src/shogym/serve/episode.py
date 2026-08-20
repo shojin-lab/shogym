@@ -47,6 +47,7 @@ from shogym.serve.lifecycle import (
     TerminalEvidence,
     args_digest,
     fail_closed_verdict,
+    failure_summary,
 )
 from shogym.shared.terminate_mcp import TERMINATE_TOOL_NAME
 from shogym.task import TaskSpec
@@ -452,6 +453,19 @@ class ServedEpisode:
         returns — or ``None`` until the terminal transaction has committed its evidence."""
         return None if self._evidence is None else self._sanitize_terminal(self._evidence)
 
+    @property
+    def terminal_failure(self) -> Optional[Dict[str, Any]]:
+        """What failed, structurally, when the terminal transaction failed closed. ``None`` when
+        it did not, or when it has not committed yet.
+
+        Read by the **harness**, and deliberately not part of :attr:`terminal_payload`: that
+        payload is what a terminal call answers the agent with, and this says something about the
+        env's own state. It is safe for a row and not for a reply, so it travels on its own
+        channel rather than being widened into the shared one. It carries no message text either
+        way (see ``failure_summary``): only the failure's type and the field locations it named.
+        """
+        return None if self._evidence is None else self._evidence.failure
+
     async def wait_finalized(self) -> None:
         """Wait for an in-flight terminal transaction to commit, if there is one.
 
@@ -813,6 +827,11 @@ class ServedEpisode:
                 status="finalize_error",
                 verdict=fail_closed_verdict(confidence),
                 diagnostic=f"finalize failed: {type(exc).__name__}: {exc}",
+                # The same failure, structurally, for the harness-side row. The diagnostic above
+                # stays private because it renders the failure's values; the summary carries only
+                # the type and the field locations, which is what a reader of an unscored row
+                # needs and all they may safely be told.
+                failure=failure_summary(exc),
             )
 
         # A verdict that isn't a JSON-object dict — a non-dict (e.g. a list, which

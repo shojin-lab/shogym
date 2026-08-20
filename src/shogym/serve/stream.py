@@ -856,6 +856,12 @@ class _Live:
     # `finalize_error` stamp the closure is classified from, and no env-supplied content may
     # stand in for it (see `_finalize_failed`).
     terminal_payload: Optional[Dict[str, Any]] = None
+    # What the core said failed, when the terminal transaction failed closed: the failure's type
+    # and the field locations it named, never its message. Read off the episode on its own
+    # channel because it is a harness-side fact rather than part of the payload a terminal call
+    # answers the agent with, and it is what turns an unscored row from a report that something
+    # went wrong into one that says what.
+    terminal_failure: Optional[Dict[str, Any]] = None
     # Set when a terminal the *stream* drove failed after ending the task, could not end it at
     # all, or ended it and left a verdict this record could not read off the episode. An
     # exception raised at a boundary the harness drove, never a value the env published — so the
@@ -1127,6 +1133,36 @@ def _rendered_failure(exc: BaseException) -> str:
         raise
     except BaseException:  # noqa: BLE001 — a contained failure may not escape through its message
         return f"{name}: <unrenderable message>"
+
+
+def _described_failure(failure: Optional[Dict[str, Any]]) -> str:
+    """The core's structural summary of a failed terminal transaction, as a diagnostic suffix.
+
+    A row that only says a transaction failed closed leaves its reader with nowhere to start:
+    every cause reads identically, so the first move is always to go and reproduce the failure
+    that the harness had already caught. This appends what the core kept of it (the failure's type,
+    and the field locations it named), which is enough to tell an env defect from an evaluator
+    timeout without rerunning anything.
+
+    Empty when there is nothing to add, so the sentence it extends stands alone, unchanged, for a
+    failure that could not describe itself or for a core that recorded none. Nothing here formats
+    an exception or an env value: the summary is built once, at the point the failure was caught,
+    out of the failure's own type name and its field paths (see ``failure_summary``), so by the
+    time it reaches this module it is strings this package made.
+    """
+    if not isinstance(failure, dict):
+        return ""
+    name = failure.get("error")
+    if not isinstance(name, str) or not name:
+        return ""
+    locations = failure.get("locations")
+    if not isinstance(locations, list) or not locations:
+        return f" ({name})"
+    shown = ", ".join(str(location) for location in locations)
+    total = failure.get("location_count")
+    hidden = total - len(locations) if isinstance(total, int) else 0
+    more = f", and {hidden} more" if hidden > 0 else ""
+    return f" ({name} at {shown}{more})"
 
 
 def _described(render: Callable[[], str]) -> str:
@@ -4776,10 +4812,15 @@ class TaskStream:
             live.terminal_payload = (
                 None if payload is None else {str(key): value for key, value in payload.items()}
             )
+            # Read in the same contained block, though its contents are the core's own strings
+            # rather than the env's values: it comes off the same object, and a read of that
+            # object that cannot be trusted is not one this row should trust for either field.
+            live.terminal_failure = episode.terminal_failure
         except BaseException as exc:  # noqa: BLE001 — the env's failure, never this row's
             if _must_propagate(exc, None):
                 raise
             live.terminal_payload = None
+            live.terminal_failure = None
             live.failed_to_end(exc, "terminal")
 
         # The env's items, in the order and at the levels it published them. Keyed by name this
@@ -5127,7 +5168,8 @@ class TaskStream:
         if self._finalize_failed(live):
             return (
                 "finalize_error",
-                "the terminal transaction failed closed; the env published no verdict",
+                "the terminal transaction failed closed; the env published no verdict"
+                + _described_failure(live.terminal_failure),
             )
         if forced is not None:
             return forced, None

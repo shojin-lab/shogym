@@ -1142,3 +1142,75 @@ async def test_valid_hand_built_score_env_still_seals() -> None:
         assert ep.seal_enabled is True
     finally:
         await ep.close()
+
+
+# ----- what a fail-closed terminal transaction is allowed to say about itself -----
+
+
+def test_failure_summary_names_the_type() -> None:
+    assert lifecycle.failure_summary(RuntimeError("evaluator exploded")) == {
+        "error": "RuntimeError"
+    }
+
+
+def test_failure_summary_keeps_locations_and_drops_the_message() -> None:
+    # A structured failure contributes the field paths it objected to, and nothing else: the
+    # values behind those paths are the env's state, which is the thing being graded.
+    from pydantic import BaseModel, ValidationError
+
+    class _Verdict(BaseModel):
+        depth: int
+        label: str
+
+    with pytest.raises(ValidationError) as caught:
+        _Verdict(depth="not-an-int", label=None)  # type: ignore[arg-type]
+    summary = lifecycle.failure_summary(caught.value)
+    assert summary["error"] == "ValidationError"
+    assert summary["locations"] == ["depth", "label"]
+    assert summary["location_count"] == 2
+    assert "not-an-int" not in json.dumps(summary)
+
+
+def test_failure_summary_truncates_but_still_counts() -> None:
+    # One structured failure can carry a location per record in a collection. The list is capped
+    # and the true count travels beside it, so a truncated summary is short without being wrong.
+    from pydantic import BaseModel, ValidationError
+
+    class _Item(BaseModel):
+        depth: int
+
+    class _Batch(BaseModel):
+        items: list[_Item]
+
+    with pytest.raises(ValidationError) as caught:
+        _Batch(items=[{"depth": "x"} for _ in range(20)])
+    summary = lifecycle.failure_summary(caught.value)
+    assert summary["location_count"] == 20
+    assert len(summary["locations"]) == lifecycle._MAX_FAILURE_LOCATIONS
+
+
+def test_failure_summary_contains_a_failure_that_cannot_describe_itself() -> None:
+    # Describing a caught failure runs the raiser's code a second time, outside the `except` that
+    # contained it. One that raises again must not escape carrying the fail-closed commit with it.
+    class _Hostile(Exception):
+        def errors(self):
+            raise ValueError("asking costs you the row")
+
+    assert lifecycle.failure_summary(_Hostile()) == {"error": "_Hostile"}
+
+
+async def test_terminal_failure_is_not_in_the_payload_the_agent_gets() -> None:
+    # The summary is safe for a row and not for a reply: it describes the env's own state, so it
+    # travels on the harness-side channel and never widens the sanitized terminal payload.
+    def explode(_req: FinalizeRequest, _correct: bool) -> None:
+        raise RuntimeError("evaluator exploded")
+
+    ep = await _start(finalize_hook=explode)
+    try:
+        await ep.call("submit", {"answer": "4"})
+        assert ep.terminal_payload is not None
+        assert ep.terminal_failure == {"error": "RuntimeError"}
+        assert "failure" not in ep.terminal_payload
+        assert not any("RuntimeError" in str(value) for value in ep.terminal_payload.values())
+    finally:
+        await ep.close()
