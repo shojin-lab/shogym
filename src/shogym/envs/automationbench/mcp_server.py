@@ -101,13 +101,15 @@ def score_session(session_id: Optional[str]) -> Tuple[float, float]:
     Scored against this session's private world, so it can't be forged through the tool surface.
     ``partial_credit`` runs first inside :func:`adapter.score_state` (it caches its score for the
     pass-rate metric); the negative-assertion "must not shotgun" gate is enforced there verbatim.
+
+    The **live** world object is handed to the rubric, never a serialized copy of it: a
+    tool-mutated world does not always survive re-validation, and part of what the rubric reads
+    is recorded outside the model's declared fields (see :func:`adapter.score_state`).
     """
     session = _session_for(session_id)
     if session is None:
         return 0.0, 0.0
-    return adapter.score_state(
-        session.world.model_dump(mode="json"), session.initial_state, session.assertions
-    )
+    return adapter.score_state(session.world, session.initial_state, session.assertions)
 
 
 def _no_session_error() -> str:

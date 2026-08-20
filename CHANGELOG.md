@@ -9,6 +9,48 @@ direction.
 
 ## Unreleased
 
+### `automationbench`: the rubric scores the live world, not a rebuilt copy of it
+
+Scoring used to serialize the session's `WorldState` and re-validate it back into a model before
+running the rubric. It now runs the rubric against the live object the served tools mutated, which
+is what upstream's own runner does. **This changes measured automationbench scores.**
+
+The round trip was not a no-op in either direction. It could raise, which left the episode
+unscored: the tools mutate the model in place and pydantic validates on construction rather than
+on assignment, so a live world legitimately holds values re-validation rejects. Two shapes of that
+occur in the shipped pool. A `linkedin` company record's size field validates under one name and
+serializes under another, and the containing model forbids unknown keys, so **any** world holding
+a company could never be rebuilt. Six of the 600 public tasks seed one, and they were
+unscoreable for every agent on every run regardless of what the agent did. Separately, several endpoints
+assign a request value straight into a field narrower than `str`, so an accepted, echoed-back tool
+call could leave the world unrebuildable; 273 of 600 tasks reach at least one such endpoint.
+
+It could also lose evidence without raising, which is the part that silently moved numbers.
+Whether a spreadsheet row was *written to* is recorded by the tool layer outside the model's
+declared fields, so it did not survive serialization. 24 of the 600 tasks carry an assertion
+scored purely off that record. On those, a `google_sheets_row_not_updated` guard the agent had
+broken read as intact and was credited, and a `google_sheets_row_updated` the agent had earned was
+denied.
+
+Measured by replaying 492 archived episodes against both scoring paths: 476 score identically, 9
+were previously unscoreable and now score, and **7 change, all downward**, all of them the guard
+case above. Expect a small downward correction concentrated on tasks with those assertions, and
+no change at all elsewhere.
+
+`adapter.score_state` now takes the live `WorldState`. It still accepts a mapping, so callers
+written against the older signature keep working, but that path re-validates and is therefore
+lossy in both ways above; its first parameter is renamed `world_dump` -> `world`, which matters
+only to a caller passing it by keyword.
+
+### `automationbench`: a fail-closed finalize publishes no score
+
+An episode whose terminal transaction failed closed published `reward` / `partial_credit` /
+`success` defaulted to zero beside its `finalize_error` flag. The row's own `score` was already
+`None` for that closure, so the defaults only contradicted it, and anything reading the feedback
+by name, including an agent under an immediate-feedback regime, could not tell the fabricated zero
+from a scored one. Those names are now omitted entirely; the flag is published alone. Row `score`
+is unchanged, since a failed transaction was never a scored closure.
+
 ### `serve`: a fail-closed row names the failure
 
 The row's diagnostic read "the terminal transaction failed closed; the env published no verdict"
