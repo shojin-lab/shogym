@@ -917,7 +917,7 @@ class ServedEpisode:
                         diagnostic="verify() raised while scoring the terminal evidence",
                         # This boundary fails closed like the evaluator's, so it owes the row the
                         # same account of what happened. A verifier defect and an evaluator defect
-                        # are different repairs, and a row that named neither made them look alike.
+                        # are different repairs, and a row that names neither makes them look alike.
                         failure=failure_summary(exc),
                     )
                     self._evidence = evidence

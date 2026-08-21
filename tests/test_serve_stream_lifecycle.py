@@ -173,7 +173,7 @@ async def test_a_structured_failure_names_its_kind_on_the_row(tmp_path: Path) ->
 async def test_a_raising_verifier_is_named_on_the_row(tmp_path: Path) -> None:
     # The verifier runs at its own fail-closed boundary, after the evaluator has already produced
     # a verdict. It owes the row the same account: a verifier defect and an evaluator defect are
-    # different repairs, and a row that named neither made them look alike.
+    # different repairs, and a row that names neither makes them look alike.
     class _RaisingVerifyEnv(_FixtureScoreEnv):
         def _verify(self, *args: Any, **kwargs: Any) -> FeedbackCollection:
             raise LookupError("verifier exploded")

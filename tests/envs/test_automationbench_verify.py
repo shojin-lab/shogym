@@ -337,7 +337,7 @@ def public_tasks() -> list[dict]:
 
 # Every public-pool task seeded with at least one LinkedIn company. Their end-states are
 # unscoreable whenever scoring has to rebuild the world, whatever the agent did, because the seed
-# alone is enough, so they are the cheapest possible check that it no longer has to.
+# alone is enough, so they are the cheapest possible check that it does not have to.
 _SEEDED_LINKEDIN_COMPANY_TASKS = (28, 36, 49, 58, 193, 504)
 
 
