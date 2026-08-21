@@ -149,6 +149,16 @@ browsecomp_plus = [
     "openai>=1.99",
     "pyserini>=0.22",
 ]
+# The ORCA-bench port (src/shogym/envs/orca_bench), pinned to dataset revision 2 of
+# `orca-bench/orca-bench` (CC BY 4.0). The port needs no Python package upstream does not already
+# ship inside every task: the LLM judge is `tests/check_prediction.py`, byte-identical across all
+# 755 tasks, so nothing is fetched from the upstream repo. The dataset itself is downloaded on
+# demand into `~/.cache/shogym/orca_bench/<revision>/` (honoring `SHOGYM_ORCA_BENCH_DATA_DIR` /
+# `SHOGYM_CACHE`) and never vendored, using stdlib HTTP only. Running an episode additionally
+# needs a Docker daemon and ~133 GB of disk for the recorded telemetry stack: a system dependency,
+# not a pip package, and phase 2 of the port. So this extra carries no Python packages: it exists
+# as a stable install/label target and a home for this note.
+orca_bench = []
 
 [dependency-groups]
 # The dev group is synced by default (plain `uv run` / `uv sync`), so putting the env extras
@@ -165,6 +175,7 @@ dev = [
     "shogym[frontier_bench]",
     "shogym[automationbench]",
     "shogym[browsecomp_plus]",
+    "shogym[orca_bench]",
 ]
 
 [build-system]
