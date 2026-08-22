@@ -33,6 +33,7 @@ from shogym.serve import (
     FinalizationStore,
     LifecycleState,
     ServedEpisode,
+    TaskContractError,
     TerminalEvidence,
 )
 from shogym.serve import lifecycle
@@ -472,7 +473,7 @@ async def test_non_dict_verdict_fails_closed_and_records_finalized_not_pending(
 
     async def list_verdict(req):
         # A misbehaving env: a non-dict (list) verdict. json.dumps([...]) succeeds, so the old
-        # `_json_safe`-only guard let it through to `dict(evidence.verdict)`, which raises.
+        # serializability-only guard let it through to `dict(evidence.verdict)`, which raises.
         return TerminalEvidence(
             source=req.source, status="ok", verdict=["correct", True]  # type: ignore[arg-type]
         )
@@ -1130,7 +1131,12 @@ async def test_score_terminal_without_callable_finalize_rejected_at_serve_bounda
     # finalize must be REJECTED loudly at the serve boundary — never silently downgraded to _seal_enabled=False
     # and routed through the legacy marker path (which would reopen the grade->read->fix->grade
     # exploit for an env that expected the seal to protect it).
-    with pytest.raises(TypeError, match=r"score.*finalize"):
+    #
+    # Refused as a `TaskContractError`, which is the class the layer above reads to tell an
+    # env-wide contract failure from a task-local one: an advertised terminal that cannot seal is
+    # equally unusable on the next task from that env, so a stream stops the run rather than
+    # refusing this dispense and meeting the same env again on the next pull.
+    with pytest.raises(TaskContractError, match=r"score.*finalize"):
         await ServedEpisode.start("_raw_score_no_finalize", task=0)
 
 

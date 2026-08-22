@@ -308,7 +308,7 @@ from fastmcp import FastMCP
 from fastmcp.tools import ToolResult
 
 from shogym.core import Env
-from shogym.serve.episode import ServedEpisode
+from shogym.serve.episode import ServedEpisode, contract_refusal
 from shogym.serve.server import build_tool
 from shogym.shared.terminate_mcp import TERMINATE_TOOL_NAME
 from shogym.task import TaskSpec, ToolManifest
@@ -2224,6 +2224,13 @@ class TaskStream:
             self._stopped: Optional[_Stopped] = None
             self._watchdog: Optional[asyncio.Task[None]] = None
             self._releasing: Optional[asyncio.Task[None]] = None
+            # The join of the closes claimed after that one-shot release has already run. Claimed
+            # like the release itself, and for the same reason: see `_drained`.
+            self._draining: Optional[asyncio.Task[None]] = None
+            # The pre-dispense episode closes still running. An episode a pull created and never
+            # handed out is in no registry, so this set is the only thing holding its release:
+            # see `_released_episode`.
+            self._cleanups: "Set[asyncio.Task[None]]" = set()
         except BaseException as error:
             # Let the directory go before the envs, because this one cannot fail and cannot
             # block: a constructor that raises hands back no object, so a claim left behind here
@@ -3364,11 +3371,169 @@ class TaskStream:
 
     async def _released(self) -> None:
         """Wait for the shutdown release — **without being able to abandon it**. Claimed once;
-        every later arrival joins the same task, so it never runs twice."""
+        every later arrival joins the same task, so it never runs twice.
+
+        Claimed once is right for what the release *holds* (the watchdog and the catalog envs are
+        let go exactly once), and it is not enough for what shutdown *owes*: a pre-dispense close
+        can be claimed after that one release has already finished, and joining a completed task
+        again waits for nothing. So the closes are joined separately, on every arrival, and
+        :meth:`_drained` is what makes a nonempty set impossible to shut down over."""
         releasing = self._releasing
         if releasing is None:
             releasing = self._releasing = asyncio.ensure_future(self._release_stream())
         await asyncio.shield(releasing)
+        await self._drained()
+
+    async def _drained(self) -> None:
+        """Join every pre-dispense close this stream still holds, whenever it was claimed.
+
+        The release above is memoized, which is the whole of this method's reason to exist. This
+        module deliberately lets an ``aclose()`` complete while a pull is still opening its
+        episode (see :meth:`_drain_cleanups`), and such a pull then finds ``_closed``, abandons the
+        episode it built and claims a close of its own, *after* the drain inside the release has
+        run. Cancel that pull and the close is left in :attr:`_cleanups` with nobody waiting, and
+        every later ``aclose`` awaited the same already-finished release task and returned over it:
+        the episode stayed ``OPEN`` for the life of the process, its env session live, and a
+        failure from that close was never read or promoted to a stop. A completed release may not
+        make a nonempty set invisible.
+
+        A barrier against dispenses in flight would close the same hole and is the wrong shape
+        here: shutdown is neither bypassed by nor blocked on a dispense in flight, which is this
+        module's own line (``test_shutdown_is_not_bypassed_by_a_dispense_in_flight``), and holding
+        the dispense lock to take a snapshot deadlocks against exactly that. What is owed is
+        narrower than synchronization: every close that was *handed to* this stream is joined
+        before it says it has let go of anything, whenever it arrived. So a later ``aclose`` runs
+        a fresh drain, which already loops until the set is empty and is idempotent over one that
+        is.
+
+        **Claimed and shielded**, like the release and like the closes themselves: the drain
+        removes what it is about to read, so a caller cancelled inside the join would be the
+        second way an entry leaves the set with nobody having read it. A cancellation ends that
+        caller's ``aclose`` and leaves the join running, and the next arrival joins that same task
+        rather than starting a second one over a set it has already emptied."""
+        while True:
+            draining = self._draining
+            if draining is None or draining.done():
+                if not self._cleanups:
+                    return
+                draining = self._draining = asyncio.ensure_future(self._drain_cleanups())
+            await asyncio.shield(draining)
+
+    async def _released_episode(self, episode: ServedEpisode) -> None:
+        """Close an episode this pull created and never dispensed, **without being able to
+        abandon it**. The same rule as :meth:`_released`, and the same reason.
+
+        A pull that opens an episode and then refuses it owns that episode: it is in no registry,
+        no caller was handed it, and this close is the only thing that will ever release its env
+        and its MCP sessions. Awaited inline, the release was as durable as the caller's patience:
+        a cancellation delivered while ``close()`` was suspended ended the only coroutine doing it,
+        and the episode was left OPEN with its session state held, before and after ``aclose()``,
+        which cannot recover what it was never told about.
+
+        So the close is a task and the join is shielded. A caller's cancellation is delivered to
+        this join, ends this pull exactly as before, and leaves the release running. The set is
+        what keeps that true rather than probable: the loop holds only a weak reference to a
+        running task, so a release nobody is awaiting any more is a release that may simply stop
+        existing.
+
+        **And the set is a claim, not a parking space.** Retaining the task kept it alive; it did
+        not give it an owner. Once the pull that started it is cancelled there is nobody left
+        waiting, so an orderly ``aclose()`` returned over an episode still ``OPEN`` with its env
+        session live, and a failure from that background close was discarded from the set with
+        nobody to read it. Shutdown joins these before it says this stream let go of anything
+        (:meth:`_drain_cleanups`).
+
+        **An entry leaves this set exactly once, and only when an owner has read it.** Dropping it
+        on completion made the whole policy an accident of timing: a close that finished before
+        shutdown looked was gone from the set with its failure unread, so the same fault stopped
+        the run when it was slow and vanished when it was quick, leaving asyncio's
+        "exception was never retrieved" as the only trace of it and the run reporting itself
+        clean. There is no done callback now; :meth:`_drain_cleanups` is the remover, and it
+        removes only what it has just retrieved. The set is bounded by the pulls that built an
+        episode and never dispensed it, which the queue bounds."""
+        cleanup: "asyncio.Task[None]" = asyncio.ensure_future(episode.close())
+        self._cleanups.add(cleanup)
+        await asyncio.shield(cleanup)
+
+    async def _drain_cleanups(self) -> None:
+        """Join every pre-dispense episode close this stream still holds, and read what it raised.
+
+        These are the closes of episodes a pull built and never handed out. Nothing else will
+        wait for them: they are in no registry, `_release` never sees them, and the pull that
+        started one may be long cancelled. Left unjoined, `aclose()` could report an orderly
+        shutdown while an episode was still ``OPEN`` and its env session still live, which is the
+        same claim about released resources that this whole path exists to make true.
+
+        **This is also the only remover**, which is what makes the policy below a policy rather
+        than a race: a task dropped from the set when it finished took its failure with it, so an
+        env that could not be released stopped the run when its close was slow and was forgotten
+        when it was quick. Every pass therefore takes tasks that are already done as well, and
+        reads each one before letting it go.
+
+        **Drained until there is nothing left, not snapshotted once.** A snapshot is not
+        synchronization: joining one takes as long as an env's ``close`` takes, and a pull that
+        was already inside ``get_task`` when shutdown began can claim its own close in that time,
+        one statement behind the look that found nothing. So each pass takes what is there and the
+        loop ends only on a pass that finds the set empty, which terminates because the pulls that
+        can still claim one are the ones already in flight: ``_closed`` is latched under
+        :attr:`_lock` before this task exists, so every later pull is refused at ``_require_open``
+        and never builds an episode at all.
+
+        **What this does not do is wait for a dispense that is still in flight**, and that is this
+        module's own line rather than an omission: shutdown completing inside the window where a
+        pull is opening spans and an episode is exactly what
+        ``test_shutdown_is_not_bypassed_by_a_dispense_in_flight`` requires, because a task
+        published after the drain is one nothing would ever seal. Such a pull finds ``_closed``,
+        abandons the episode it built, and releases it itself on the way out, which is the same
+        answer this module gives for the registry (see the ``undispensed`` branch of
+        :meth:`get_task`). What shutdown owes is every close that was *handed to it*, and this
+        joins all of them.
+
+        **A close that fails stops the stream**, which is what this module already does with every
+        other teardown failure it cannot hand to a caller (the deadline watchdog above, and a
+        catalog env through :meth:`_close_catalog_env`). The failure is recorded rather than
+        raised: raising here would replace the run-level report the drain is about to make, and
+        would do it from a task that stays claimed, so every later ``aclose`` would raise the same
+        thing again. Recorded, it reaches the same two places every other stop does, in the same
+        words: ``aclose()`` raises it once the release is done, and any later pull is answered by
+        it. What may not happen is that it goes unread, which is what the discard did.
+
+        ``CancelledError`` from one of these is contained like any other failure, for
+        :meth:`_close_catalog_env`'s reason: nothing in this module cancels a cleanup task, so one
+        observed here was raised by the env's own close. Only the two interpreter-level signals
+        leave."""
+        while True:
+            async with self._lock:
+                claimed = list(self._cleanups)
+                self._cleanups.clear()
+            if not claimed:
+                return
+            await self._join_cleanups(claimed)
+
+    async def _join_cleanups(self, claimed: "List[asyncio.Task[None]]") -> None:
+        """Wait for one pass of :meth:`_drain_cleanups`, reading every outcome.
+
+        Gathered rather than awaited one at a time, for :meth:`_release_stream`'s reason: an
+        episode whose close hangs must not decide whether any other episode is released at all.
+        Every result is read, because an unread failure is both a fault nobody heard about and
+        asyncio's unretrieved-exception warning."""
+        for outcome in await asyncio.gather(*claimed, return_exceptions=True):
+            if isinstance(outcome, (SystemExit, KeyboardInterrupt)):
+                raise outcome
+            if isinstance(outcome, BaseException):
+                self._stop(
+                    outcome,
+                    dispensing=(
+                        "this stream stopped: an episode it opened and never dispensed could not "
+                        "be closed, so the env behind it may still hold a session this run was "
+                        "told it had released"
+                    ),
+                    closing=(
+                        "this stream could not close an episode it opened and never dispensed; "
+                        "the env behind it may still hold a session this run was told it had "
+                        "released"
+                    ),
+                )
 
     async def _release_stream(self) -> None:
         """Let go of what only this stream holds: its deadline watchdog, then its catalog envs.
@@ -3420,6 +3585,11 @@ class TaskStream:
                         "may never have been enforced"
                     ),
                 )
+        # The episodes this stream opened and never dispensed, before the envs it keeps: each of
+        # those episodes owns an env of its own and the sessions that went with it, and a shutdown
+        # that returned while one was still closing would be reporting a release it had not seen
+        # (see `_drain_cleanups`).
+        await self._drain_cleanups()
         # Popped and handed over in one statement with no await in it, so there is no state in
         # which some envs are the release's and the rest are still the registry's.
         closing = [
@@ -3543,10 +3713,20 @@ class TaskStream:
             # yet: if a span refuses to open, the episode never starts and the position is
             # still owed. Spans first, so nothing needs cleaning up when one fails.
             spans, dispensed_extensions = await self._begin_spans(ref)
-            episode = await ServedEpisode.open_env(
-                self._env_for(ref.env), env_name=ref.env, task=ref.task_idx
-            )
+            # **Every pre-dispense use of the episode's contract is inside this one boundary.**
+            # Opening the episode, reading its snapshot, confirming the manifest and building the
+            # framing all run code the env supplied, and each of them can find the same thing: a
+            # contract the serve layer cannot take as a contract. Covering only the first of them
+            # left the rest raising past the classification, so the position stayed owed, the
+            # caller retried into an identical failure against a freshly built env, and
+            # `aclose()` reported a clean run over a queue nothing had served. One boundary
+            # rather than one per call site, because the next call site added here would
+            # otherwise have to remember.
+            episode: Optional[ServedEpisode] = None
             try:
+                episode = await ServedEpisode.open_env(
+                    self._env_for(ref.env), env_name=ref.env, task=ref.task_idx
+                )
                 # The episode's own snapshot, taken when it was opened and the same for every
                 # reader (see :meth:`ServedEpisode.describe`). That is what makes the check below
                 # worth making: the manifest confirmed here, the framing built from it, and the
@@ -3562,7 +3742,7 @@ class TaskStream:
                 # confirmed is what the framing below is built from — a second read of the spec
                 # would be a second value, and an unchecked one.
                 instructions, budget = self._require_framable(ref.env, spec)
-            except BaseException:
+            except BaseException as failure:
                 # Nothing has been exposed, so this is the same cleanup the closed-mid-dispense
                 # path below does: release the episode and drop the spans without finalizing —
                 # no task was dispensed, so there is no outcome to close them against. The check
@@ -3573,12 +3753,51 @@ class TaskStream:
                 # close: a cancellation delivered *before* it is already the exception being
                 # re-raised below, and one the env's close merely raised would otherwise replace
                 # the refusal every caller of `get_task` is told to expect.
+                # Classified **first**, before anything that can be cancelled. A contract the
+                # serve layer cannot take as a contract is a fact about the *env* and not about
+                # this task: the next task of this env is described by the same code and refused
+                # the same way, so the run stops here rather than spending the queue discovering
+                # it once per position. That is the same line `_require_published_manifest`
+                # draws, on the same evidence. Every other way this block can fail is about this
+                # task and still costs only this dispense.
+                #
+                # Order is the whole of it. Latching after the cleanup made the record of a fault
+                # this stream had *already found* depend on an `await` a caller can cancel: a
+                # pull cancelled while the episode was closing propagated the cancellation, which
+                # is right, and took the finding with it, which is not. The stop is bookkeeping
+                # about something that already happened, so nothing about it needs the cleanup
+                # done, and a caller's cancellation still ends this call either way.
+                # `contract_refusal` rather than `isinstance`, because a refusal can be
+                # discovered and then interrupted before it reaches here: `open_env` releases
+                # what it took ownership of before re-raising, and a caller cancelled during that
+                # release gets its cancellation while the refusal it replaced is still a fact
+                # about the env. The finding travels with the interruption, and this reads it.
+                refusal = contract_refusal(failure)
+                if refusal is not None:
+                    self._stop(
+                        refusal,
+                        dispensing=(
+                            f"this stream stopped: env {ref.env!r} published a task contract "
+                            "the serve layer could not take as a contract, so no further task "
+                            "can be scored against it"
+                        ),
+                        closing=(
+                            f"this stream stopped before its queue was served: env {ref.env!r} "
+                            "published a task contract the serve layer could not take as a "
+                            "contract"
+                        ),
+                    )
+                # Claimed rather than awaited inline, for the ownership half of the same rule:
+                # this pull created the episode and nothing else holds it, so a cancellation
+                # arriving during the close ends the pull (right) and used to end the only
+                # release there was (wrong). See :meth:`_released_episode`.
                 cancellation = _Cancellation()
-                try:
-                    await episode.close()
-                except BaseException as exc:  # noqa: BLE001 — teardown must not mask the failure
-                    if _must_propagate(exc, cancellation):
-                        raise
+                if episode is not None:
+                    try:
+                        await self._released_episode(episode)
+                    except BaseException as exc:  # noqa: BLE001 — teardown may not mask this
+                        if _must_propagate(exc, cancellation):
+                            raise
                 raise
 
             undispensed: Optional[ServedEpisode] = None
@@ -3678,10 +3897,12 @@ class TaskStream:
             if undispensed is not None:
                 # Same shape as the manifest refusal above: this close is teardown, and its
                 # failure — cancellation included — may not stand in for the answer the caller
-                # is owed just below.
+                # is owed just below. Claimed for the same reason too: this episode was built by
+                # this pull and never published, so nothing but this release will ever let go of
+                # what it holds (see :meth:`_released_episode`).
                 cancellation = _Cancellation()
                 try:
-                    await undispensed.close()
+                    await self._released_episode(undispensed)
                 except BaseException as exc:  # noqa: BLE001 — teardown of a task nobody ever saw
                     if _must_propagate(exc, cancellation):
                         raise

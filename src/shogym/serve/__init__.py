@@ -7,7 +7,7 @@ a FastMCP stdio server (`shogym serve`); the engine itself is exercised in-proce
 subprocess required.
 """
 
-from shogym.serve.episode import CallResult, ServedEpisode
+from shogym.serve.episode import CallResult, ServedEpisode, TaskContractError
 from shogym.serve.lifecycle import (
     FinalizationRecord,
     FinalizationStore,
@@ -57,6 +57,7 @@ __all__ = [
     "ResultRow",
     "Score",
     "ServedEpisode",
+    "TaskContractError",
     "TaskRef",
     "TaskStream",
     "TerminalEvidence",

@@ -306,22 +306,22 @@ def _publishes_a_terminal_schema_that_cannot_be_used() -> Tuple[Any, Any]:
     ships when a schema names a definition it never included. (A key whose *own* code misbehaved
     would not reach here any more — an episode enforces the contract in wire form, so an env
     object cannot be what a terminal call is validated against; see
-    :func:`shogym.serve.episode._wire_form`.)"""
+    :func:`shogym.serve.episode._core_spec`.)"""
 
-    class _Env(_FixtureScoreEnv):
-        def describe(self, task_id: Any = None) -> TaskSpec:
-            spec = super().describe(task_id)
-            for manifest in spec.tools:
-                if manifest.name == SUBMIT_TOOL:
-                    # At the top level, so it is resolved for *any* arguments — the agent's
-                    # own submission and the empty call the stream drives alike.
-                    manifest.input_schema = {"$ref": "#/definitions/answer"}
-            return spec
+    def arm(stream: Any = None) -> None:
+        # Injected onto the live episode rather than published, because a contract whose schema
+        # this layer cannot *execute* is refused at construction now: a document that raises out
+        # of the validator will raise on every call any agent can make, so it is an env-wide
+        # contract failure rather than a task-local one, and no task is dispensed on it (see
+        # `test_a_schema_this_layer_cannot_execute_is_refused_before_it_is_advertised`). What is
+        # under test here is what happens when a terminal call raises *mid-episode*, so the
+        # unusable schema is put where the seal reads it, on a task that was properly dispensed.
+        # Same reasoning as the injections rounds six and ten introduced: the rule is what is
+        # under test, and it has to hold for whichever input reaches it next.
+        for live in stream._live.values():
+            live.episode._score_schemas[SUBMIT_TOOL] = {"$ref": "#/definitions/answer"}
 
-    def arm() -> None:
-        return None
-
-    return (lambda _name: _Env(tasks=TASKS)), arm
+    return (lambda _name: _FixtureScoreEnv(tasks=TASKS)), arm
 
 
 def _raises_verifying_mid_episode() -> Tuple[Any, Any]:
@@ -334,7 +334,7 @@ def _raises_verifying_mid_episode() -> Tuple[Any, Any]:
                 raise RuntimeError("this env cannot verify a step")
             return super()._verify(trajectory, task, terminated=terminated, evidence=evidence)
 
-    return (lambda _name: _Env(tasks=TASKS)), (lambda: None)
+    return (lambda _name: _Env(tasks=TASKS)), (lambda stream=None: None)
 
 
 def _cannot_read_its_horizon() -> Tuple[Any, Any]:
@@ -354,7 +354,7 @@ def _cannot_read_its_horizon() -> Tuple[Any, Any]:
         def horizon(self, value: Any) -> None:
             pass
 
-    def arm() -> None:
+    def arm(stream: Any = None) -> None:
         armed[0] = True
 
     return (lambda _name: _Env(tasks=TASKS)), arm
@@ -412,7 +412,7 @@ async def test_a_call_the_harness_lost_is_not_a_task_the_agent_played_out(
     factory, arm = build()
     stream = _stream(tmp_path, [0], factory=factory)
     await stream.get_task()
-    arm()
+    arm(stream)
     with pytest.raises(Exception):  # noqa: B017 — see above; the type is the env's, not ours
         await stream.dispatch(tool, args)
     # Nothing ended, so nothing is refused yet: the task is still the agent's to finish.
@@ -478,7 +478,7 @@ async def test_a_lost_call_the_agent_recovers_from_is_still_the_agent_s_task(
     stream = _stream(tmp_path, [0], factory=factory)
     async with stream:
         await stream.get_task()
-        arm()
+        arm(stream)
         with pytest.raises(RuntimeError, match=failure):
             await stream.dispatch("noop", {})
         await stream.dispatch(SUBMIT_TOOL, {"answer": "4"})
@@ -511,7 +511,7 @@ def _loses_one_call() -> Tuple[Any, Any]:
         def horizon(self, value: Any) -> None:
             pass
 
-    def arm() -> None:
+    def arm(stream: Any = None) -> None:
         armed[0] = True
 
     return (lambda _name: _Env(tasks=TASKS)), arm
@@ -528,7 +528,7 @@ async def test_a_lost_call_costs_its_own_task_and_not_the_queue_behind_it(
     stream = _stream(tmp_path, [0, 1], factory=factory)
     async with stream:
         await stream.get_task()
-        arm()
+        arm(stream)
         with pytest.raises(RuntimeError, match="lost one call"):
             await stream.dispatch("noop", {})
         # The agent gives up on this one and pulls the next, so the stream ends the first itself.
@@ -561,7 +561,7 @@ async def test_a_forced_score_terminal_that_raises_is_not_settled_by_the_abort(
     factory, arm = _publishes_a_terminal_schema_that_cannot_be_used()
     stream = _stream(tmp_path, [0], factory=factory)
     await stream.get_task()
-    arm()
+    arm(stream)
     with pytest.raises(RuntimeError, match="failed while the stream ended a task"):
         await stream.aclose()
     (row,) = stream.results

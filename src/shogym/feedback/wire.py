@@ -50,6 +50,18 @@ def _require_scalar_value(value: Any) -> None:
         raise ValueError(f"feedback value must be finite, got {value!r}")
 
 
+def _require_name(name: Any) -> None:
+    """A feedback name is text, and this is where that is decided.
+
+    The models used to decide it: building one through the constructor rejected a non-string
+    ``name`` on the way past. The rebuild below no longer runs that constructor (see
+    :func:`_load_item`), so the check that was implicit in it is written down here instead. A
+    name is a key a record is composed and headlined by, so a number pretending to be one is a
+    malformed item on either boundary, exactly as it was."""
+    if not isinstance(name, str):
+        raise ValueError(f"feedback name must be text, got {name!r}")
+
+
 def dump_item(item: FeedbackItem) -> Dict[str, Any]:
     """Serialize one feedback item to its wire dict.
 
@@ -69,6 +81,22 @@ def dump_item(item: FeedbackItem) -> Dict[str, Any]:
         data["level"] = "episode"
     _load_item(data)
     return data
+
+
+def load_item(raw: Mapping[str, Any]) -> FeedbackItem:
+    """Rebuild one feedback item from its wire dict: the inverse of :func:`dump_item`, and the
+    way a consumer gets an item it *owns*.
+
+    An item an env supplied answers every read with the env's own code, so serializing one twice
+    asks it twice and nothing obliges the two answers to agree. A consumer that renders once and
+    rebuilds from the rendering has a value that cannot change under it, which is what every
+    later sink here wants: the trace row and the in-band sidecar are then two renderings of one
+    value rather than two questions to one object.
+
+    The rebuild carries the wire's values as they are and never converts one (see
+    :func:`_load_item`), because a rebuild that changed a value would defeat the very thing a
+    caller renders once for."""
+    return _load_item(raw)
 
 
 # The exact wire key set per level. dump_item emits exactly these; parse requires
@@ -91,11 +119,29 @@ def _require_exact_keys(raw: Mapping[str, Any], allowed: frozenset, level: str) 
 
 
 def _load_item(raw: Mapping[str, Any]) -> FeedbackItem:
+    """Check one wire item against this contract and rebuild it, **without coercing it**.
+
+    The checks above are the contract, and the item is built from the values they just passed.
+    Handing them to the model *constructor* instead made the model's annotation the last word,
+    and the annotation is narrower than the wire: the value union is ``float | bool | str`` while
+    this contract admits any JSON scalar, ``int`` included. Pydantic therefore rewrote a legal
+    integer as a float, so an item published as ``9007199254740993`` was retained as that and
+    served to the trace and to the in-band sidecar as ``9007199254740992.0``: one rendering, two
+    values, one of them a reward nobody earned. An integer past the float *range* fared worse and
+    was refused outright, which turned recordable feedback into a terminal ``finalize_error`` on
+    both boundaries, since ``dump_item`` validates through here too.
+
+    So the rebuild is a ``model_construct`` over the checked fields. What that skips is validation
+    this function has already done in stricter terms, with one exception, which is the ``name``
+    the constructor used to type-check and :func:`_require_name` now does. The values are carried
+    exactly as they arrived, which is what makes the wire form and the rebuilt item two shapes of
+    one value rather than two answers about it."""
     if not isinstance(raw, Mapping):
         raise ValueError(f"feedback item must be a mapping, got {raw!r}")
     level = raw.get("level")
     if level == "inference":
         _require_exact_keys(raw, _INFERENCE_KEYS, "inference")
+        _require_name(raw["name"])
         _require_scalar_value(raw["value"])  # JSON scalar only; json.loads/Pydantic are laxer
         step = raw["step"]
         # bool is an int subclass; the contract says step is a plain integer, so
@@ -103,11 +149,14 @@ def _load_item(raw: Mapping[str, Any]) -> FeedbackItem:
         # string steps (coerced to int) — both are malformed producer messages.
         if isinstance(step, bool) or not isinstance(step, int):
             raise ValueError(f"inference feedback 'step' must be an int, got {step!r}")
-        return InferenceFeedback(name=raw["name"], value=raw["value"], step=step)
+        return InferenceFeedback.model_construct(
+            name=raw["name"], value=raw["value"], step=step
+        )
     if level == "episode":
         _require_exact_keys(raw, _EPISODE_KEYS, "episode")
+        _require_name(raw["name"])
         _require_scalar_value(raw["value"])
-        return EpisodeFeedback(name=raw["name"], value=raw["value"])
+        return EpisodeFeedback.model_construct(name=raw["name"], value=raw["value"])
     # Reject rather than defaulting: silently treating an unknown level (a typo
     # like "inferencee") as episode feedback would flip its mid-episode visibility.
     raise ValueError(f"unknown feedback level {level!r}; expected 'inference' or 'episode'")
