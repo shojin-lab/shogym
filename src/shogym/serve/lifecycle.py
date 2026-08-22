@@ -112,6 +112,9 @@ class TerminalEvidence:
     finalization_id: Optional[str] = None
     # Private diagnostic (never surfaced to the agent).
     diagnostic: Optional[str] = None
+    # Structural description of the failure behind a `finalize_error`, for the harness-side
+    # record only (see `failure_summary`). Like `diagnostic`, never surfaced to the agent.
+    failure: Optional[Dict[str, Any]] = None
     schema_version: int = EVIDENCE_SCHEMA_VERSION
 
     @property
@@ -129,6 +132,95 @@ def fail_closed_verdict(confidence: Optional[Any] = None) -> Dict[str, Any]:
     if confidence is not None:
         verdict["confidence"] = confidence
     return verdict
+
+
+# How many distinct error kinds a failure summary keeps. One structured failure reports an entry
+# per offending value, but the kinds behind them are few, so this bounds a pathological case
+# rather than an ordinary one.
+_MAX_FAILURE_ERROR_KINDS = 6
+
+
+def _certified_error_kind(entry: Any) -> Optional[str]:
+    """The error kind of one structured entry, but only when the validator itself vouches for it.
+
+    A reported kind is a bare string, and a string is only safe to publish if something other than
+    this function's optimism says where it came from. The validator's own documentation link is
+    that witness: it is built from the fixed set of error kinds the library defines, so a link
+    ending in the kind it reports proves the kind is one of them. An entry whose kind was supplied
+    by whoever wrote the validator carries no link, and is refused.
+
+    The witness holds against a genuine validation error, which is the case this exists for: the
+    library builds the link and no caller can hand it one. It does not hold against an object that
+    forges both halves, because a duck-typed ``errors()`` is the env's own code. That is the same
+    trust boundary the verdict already sits on, and it is a different failure from the one guarded
+    here: an env cannot leak its state through this by accident, only by writing something whose
+    purpose is to.
+    """
+    kind = entry.get("type")
+    url = entry.get("url")
+    if not isinstance(kind, str) or not isinstance(url, str):
+        return None
+    return kind if url.endswith("/v/" + kind) else None
+
+
+def failure_summary(exc: BaseException) -> Dict[str, Any]:
+    """A structural description of a contained failure, for the harness-side record.
+
+    Names the exception type that ended the terminal transaction and, when the exception reports
+    structured validation errors, how many there were and which kinds of error they were. That is
+    enough to act on: a type plus a kind says which layer failed and how, which is what a reader
+    of an unscored row has to know before they can do anything about it.
+
+    **Everything published here is drawn from a fixed vocabulary or is a count.** Nothing that
+    could have originated in the data being validated is included, because for an env whose state
+    is the thing being graded that data can be the answer, and this summary is written to a record
+    that outlives the episode. Two exclusions carry that guarantee:
+
+    - **Not the message.** It renders the offending values directly.
+    - **Not the field locations.** They read like schema paths and are not: a location descends
+      into the *input*, so a failure inside a mapping contributes that mapping's keys, and a
+      rejected unknown key contributes the key itself. Either is a value wearing a field name's
+      clothes, and neither can be told from a real field name without the model, which a caught
+      exception does not carry.
+
+    The kinds that do survive are filtered through :func:`_certified_error_kind`, so an error kind
+    invented by whoever wrote the validator is dropped rather than trusted.
+
+    What is left out of the row is not lost: the full diagnostic, locations and values included,
+    is written to the private durable record, which is reachable by whoever runs the harness and
+    by no one else.
+
+    Every read of the exception is contained. Describing a caught failure runs code belonging to
+    whoever raised it, a second time and outside the ``except`` that just caught it, so an
+    accident in here would not stay caught. It would leave carrying the caller's job with it,
+    and the caller's job at this point is committing a fail-closed verdict. ``SystemExit`` and
+    ``KeyboardInterrupt`` still propagate, the same line the rest of this package holds: an
+    interpreter-level signal costs the record loudly rather than being swallowed in a summary.
+    """
+    try:
+        name = type(exc).__name__
+    except (SystemExit, KeyboardInterrupt):
+        raise
+    except BaseException:  # noqa: BLE001 (a contained failure may not escape through its type)
+        return {"error": "<unreadable>"}
+    summary: Dict[str, Any] = {"error": name}
+    try:
+        # Structured errors are duck-typed rather than isinstance-checked against pydantic:
+        # anything that reports its failures this way describes them the same useful way, and
+        # anything that does not simply keeps the type-only summary.
+        reported = list(exc.errors())  # type: ignore[attr-defined]
+        kinds = sorted(
+            {kind for kind in (_certified_error_kind(entry) for entry in reported) if kind}
+        )
+    except (SystemExit, KeyboardInterrupt):
+        raise
+    except BaseException:  # noqa: BLE001 (not a structured failure, or one that cannot say so)
+        return summary
+    if reported:
+        summary["error_count"] = len(reported)
+    if kinds:
+        summary["error_kinds"] = kinds[:_MAX_FAILURE_ERROR_KINDS]
+    return summary
 
 
 def args_digest(args: Optional[Dict[str, Any]]) -> Optional[str]:

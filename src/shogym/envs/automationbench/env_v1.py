@@ -225,11 +225,22 @@ class AutomationBenchEnv(Env):
         immutable :class:`TerminalEvidence`; this only reads its numbers. Emits ``reward``
         (== ``partial_credit``), ``partial_credit``, and ``success`` (``task_completed_correctly``:
         True iff every scored assertion passed). A missing/abort verdict (no ``partial_credit``,
-        e.g. an explicit ``terminate``) coerces to a clean zero. When the finalizer failed closed,
-        an extra ``finalize_error`` flag is emitted so infra failures are filterable from honest
-        zeros."""
+        e.g. an explicit ``terminate``) coerces to a clean zero. The episode ended without a
+        grade *because the agent ended it that way*, which is an outcome it earned.
+
+        A finalizer that **failed closed** is the opposite case and is answered differently: no
+        verdict was computed at all, so this publishes the ``finalize_error`` flag and **no**
+        score names. Defaulting them would put a number on the record that nothing measured, and
+        one indistinguishable by name from a scored zero. The row's own ``score`` is already
+        ``None`` for this closure, so a default only contradicts it, and under an immediate
+        feedback regime it reaches the agent as a grade the env never produced. Absent is the
+        one reading that stays true."""
         fb = FeedbackCollection()
         if not terminated:
+            return fb
+
+        if evidence is not None and evidence.finalize_error:
+            fb.episode.append(EpisodeFeedback(name="finalize_error", value=True))
             return fb
 
         verdict = evidence.verdict if evidence is not None else {}
@@ -239,8 +250,6 @@ class AutomationBenchEnv(Env):
         fb.episode.append(
             EpisodeFeedback(name="success", value=_as_unit(verdict.get("success")) == 1.0)
         )
-        if evidence is not None and evidence.finalize_error:
-            fb.episode.append(EpisodeFeedback(name="finalize_error", value=True))
         return fb
 
 

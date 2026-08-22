@@ -1142,3 +1142,117 @@ async def test_valid_hand_built_score_env_still_seals() -> None:
         assert ep.seal_enabled is True
     finally:
         await ep.close()
+
+
+# ----- what a fail-closed terminal transaction is allowed to say about itself -----
+
+
+def test_failure_summary_names_the_type() -> None:
+    assert lifecycle.failure_summary(RuntimeError("evaluator exploded")) == {
+        "error": "RuntimeError"
+    }
+
+
+def test_failure_summary_keeps_the_kind_and_count_and_drops_the_message() -> None:
+    # A structured failure contributes how many errors there were and which kinds, and nothing
+    # else: everything else it reports is drawn from the data being validated, which for an env
+    # is the thing being graded.
+    from pydantic import BaseModel, ValidationError
+
+    class _Verdict(BaseModel):
+        depth: int
+        label: str
+
+    with pytest.raises(ValidationError) as caught:
+        _Verdict(depth="not-an-int", label=None)  # type: ignore[arg-type]
+    summary = lifecycle.failure_summary(caught.value)
+    assert summary["error"] == "ValidationError"
+    assert summary["error_count"] == 2
+    assert summary["error_kinds"] == ["int_parsing", "string_type"]
+    assert "not-an-int" not in json.dumps(summary)
+
+
+def test_failure_summary_never_publishes_a_mapping_key() -> None:
+    # A reported location descends into the INPUT, not the schema: a failure inside a mapping
+    # contributes that mapping's own keys. Those keys are the env's data, so a summary that
+    # published locations would put answer-bearing state into a record that outlives the episode.
+    from pydantic import BaseModel, ValidationError
+    from typing import Dict
+
+    class _Verdict(BaseModel):
+        answers: Dict[str, int]
+
+    with pytest.raises(ValidationError) as caught:
+        _Verdict(answers={"gold-answer-42": "not-an-int", "the capital is paris": "nope"})
+    # The location really does carry the keys, which is what this guards against.
+    assert ("answers", "gold-answer-42") in [err["loc"] for err in caught.value.errors()]
+    blob = json.dumps(lifecycle.failure_summary(caught.value))
+    assert "gold-answer-42" not in blob
+    assert "paris" not in blob
+    assert "not-an-int" not in blob
+
+
+def test_failure_summary_refuses_an_error_kind_the_validator_invented() -> None:
+    # A kind is a bare string, and only the library's own documentation link says where it came
+    # from. One supplied by whoever wrote the validator has no link and is dropped, so a kind
+    # built out of the data cannot ride out on this channel either.
+    from pydantic import BaseModel, ValidationError, field_validator
+    from pydantic_core import PydanticCustomError
+
+    class _Verdict(BaseModel):
+        label: str
+
+        @field_validator("label")
+        @classmethod
+        def _reject(cls, value: str) -> str:
+            raise PydanticCustomError("the_answer_is_paris", "boom")
+
+    with pytest.raises(ValidationError) as caught:
+        _Verdict(label="anything")
+    summary = lifecycle.failure_summary(caught.value)
+    assert summary == {"error": "ValidationError", "error_count": 1}
+    assert "paris" not in json.dumps(summary)
+
+
+def test_failure_summary_caps_the_kinds_it_lists() -> None:
+    # A pathological failure reporting many distinct kinds is bounded rather than unbounded; the
+    # true count travels beside the list, so a capped summary is short without being wrong.
+    cap = lifecycle._MAX_FAILURE_ERROR_KINDS
+
+    class _Many(Exception):
+        def errors(self):
+            return [
+                {"type": f"kind_{i}", "url": f"https://errors.pydantic.dev/2.13/v/kind_{i}"}
+                for i in range(cap + 5)
+            ]
+
+    summary = lifecycle.failure_summary(_Many())
+    assert summary["error_count"] == cap + 5
+    assert len(summary["error_kinds"]) == cap
+
+
+def test_failure_summary_contains_a_failure_that_cannot_describe_itself() -> None:
+    # Describing a caught failure runs the raiser's code a second time, outside the `except` that
+    # contained it. One that raises again must not escape carrying the fail-closed commit with it.
+    class _Hostile(Exception):
+        def errors(self):
+            raise ValueError("asking costs you the row")
+
+    assert lifecycle.failure_summary(_Hostile()) == {"error": "_Hostile"}
+
+
+async def test_terminal_failure_is_not_in_the_payload_the_agent_gets() -> None:
+    # The summary is safe for a row and not for a reply: it describes the env's own state, so it
+    # travels on the harness-side channel and never widens the sanitized terminal payload.
+    def explode(_req: FinalizeRequest, _correct: bool) -> None:
+        raise RuntimeError("evaluator exploded")
+
+    ep = await _start(finalize_hook=explode)
+    try:
+        await ep.call("submit", {"answer": "4"})
+        assert ep.terminal_payload is not None
+        assert ep.terminal_failure == {"error": "RuntimeError"}
+        assert "failure" not in ep.terminal_payload
+        assert not any("RuntimeError" in str(value) for value in ep.terminal_payload.values())
+    finally:
+        await ep.close()

@@ -34,7 +34,7 @@ from __future__ import annotations
 
 import copy
 from pathlib import Path
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Dict, List, Optional, Tuple, Union
 
 from shogym.envs._upstream import ensure_package
 
@@ -207,22 +207,44 @@ def base64_encode(text: str) -> str:
 
 
 def score_state(
-    world_dump: Dict[str, Any],
+    world: Union[WorldState, Dict[str, Any]],
     initial_state: Dict[str, Any],
     assertions: List[Dict[str, Any]],
 ) -> Tuple[float, float]:
-    """Score an end-state with the **reused** upstream rubric. Pure.
+    """Score an end-state with the **reused** upstream rubric.
 
-    Rebuilds ``WorldState`` from the recorded end-state dump, assembles the ``state`` dict shape
-    ``partial_credit`` reads (``world`` / ``initial_state`` / ``info.assertions``), and calls the
-    upstream ``partial_credit`` then ``task_completed_correctly`` — so the negative-assertion
-    "must not shotgun" gate (negatives pass free in the initial world and only count when broken)
-    and the pass-rate metric are byte-identical to ``auto-bench``. ``partial_credit`` must run
-    first: it caches its score on the state, which ``task_completed_correctly`` reads back.
+    Assembles the ``state`` dict shape ``partial_credit`` reads (``world`` / ``initial_state`` /
+    ``info.assertions``) and calls the upstream ``partial_credit`` then
+    ``task_completed_correctly``, so the negative-assertion "must not shotgun" gate (negatives
+    pass free in the initial world and only count when broken) and the pass-rate metric are
+    byte-identical to ``auto-bench``. ``partial_credit`` must run first: it caches its score on
+    the state, which ``task_completed_correctly`` reads back.
+
+    ``world`` is the **live** :class:`WorldState` the served tools mutated, scored as-is. That is
+    what upstream's own runner does, and a serialize/revalidate round trip in between is not a
+    no-op in either direction:
+
+    - It can **raise.** The tools mutate the model in place, and pydantic validates on
+      construction rather than on assignment, so a live world legitimately holds values that
+      re-validation rejects: a field whose validation alias differs from the name it dumps under
+      (rejected outright under ``extra="forbid"``), or a narrower-than-``str`` field a tool
+      assigned a value from the request. A raise here scores nothing at all.
+    - It can **lose evidence.** Part of what the rubric reads is recorded by the tool layer
+      *outside* the model's declared fields, so it does not survive ``model_dump``. Scoring a
+      reconstruction silently reads a world that has forgotten writes the agent made.
+
+    The rubric only reads the world (its handlers are pure and it caches its score on ``state``),
+    and this runs on an already-sealed episode whose world is discarded immediately afterwards,
+    so scoring the caller's object in place is safe and no defensive copy is taken.
+
+    A mapping is still accepted, and is revalidated into a ``WorldState`` before scoring. That
+    path is **lossy** for the two reasons above and exists only so callers written against the
+    older dump-taking signature keep working; prefer passing the live object.
 
     Returns ``(partial_credit, task_completed_correctly)``.
     """
-    world = WorldState(**world_dump)
+    if not isinstance(world, WorldState):
+        world = WorldState(**world)
     state: Dict[str, Any] = {
         "world": world,
         "initial_state": copy.deepcopy(initial_state),
