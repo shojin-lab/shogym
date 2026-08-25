@@ -99,6 +99,12 @@ README covers the model and the shared env-README template.
   graded by the LLM judge that ships inside each of the 755 tasks. Needs the `orca_bench` extra
   and the on-demand dataset download; `OPENAI_API_KEY` and Docker only to serve. Phase 1: the
   loader, `describe` and verdict parsing are complete and offline; the compose backend is phase 2.
+- **[`latentgym`](src/shogym/envs/latentgym/README.md)**: a port of
+  [LatentGym](https://github.com/namkoong-lab/LatentGym). Play a run of small text games drawn
+  under one hidden rule, one episode per task, and infer the rule from the early episodes to
+  exploit it in the later ones. Its end-of-episode report rides the feedback channel rather than
+  the observation stream, so the `Information` / `Placebo` policies can pair a graded ending
+  against a matched inert one. Deterministic and offline (no key). Needs the `latentgym` extra.
 
 ## The task server
 

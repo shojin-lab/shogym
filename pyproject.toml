@@ -87,6 +87,31 @@ hle = [
     "datasets>=2.19",
     "openai>=1.99",
 ]
+# The LatentGym port (src/shogym/envs/latentgym). LatentGym publishes no distribution at all: it is
+# a research checkout whose package sits at the repository root beside two vendored dependencies it
+# imports (`TextArena/textarena` and `skyrl-gym/skyrl_gym`), neither of which is pinned to a PyPI
+# release. So the pinned upstream source is provisioned at runtime into a gitignored cache
+# (`~/.cache/shogym/{latentgym,textarena,skyrl_gym}/<sha>/`, honoring `LATENTGYM_SRC` /
+# `TEXTARENA_SRC` / `SKYRL_GYM_SRC` / `SHOGYM_CACHE`; see src/shogym/envs/latentgym/adapter.py).
+# This extra declares what those two vendored packages need to import: TextArena's `[project]
+# dependencies` (the bandits and secretary core envs import it, and its package `__init__` pulls in
+# the whole set) plus skyrl-gym's (`latentgym.core`'s own `__init__` imports it). Kept optional so
+# `pip install shogym` (and the core test suite) stay lean: `import shogym` registers `latentgym`
+# without provisioning or importing any of it.
+latentgym = [
+    # TextArena [project] dependencies
+    "chess>=1.11",
+    "nltk>=3.9",
+    "openai>=1.99",
+    "python-dotenv>=1.0",
+    "requests>=2.31",
+    "rich",
+    "websockets>=12.0",
+    # skyrl-gym [project] dependencies
+    "func_timeout>=4.3",
+    "omegaconf>=2.3",
+    "pandas>=2.2",
+]
 # The YC-Bench port (src/shogym/envs/yc_bench). YC-Bench has no stable public API, so the port
 # wraps its internal modules (sim engine, world seeder, config loader, command policy, ORM) behind
 # a thin adapter — pinning a SHA makes drift a one-file maintenance cost. Upstream is pinned to
@@ -171,6 +196,7 @@ dev = [
     "pyright>=1.1.390",
     "shogym[tau2]",
     "shogym[hle]",
+    "shogym[latentgym]",
     "shogym[yc_bench]",
     "shogym[frontier_bench]",
     "shogym[automationbench]",

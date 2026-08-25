@@ -26,6 +26,11 @@ from shogym.envs.browsecomp_plus import env_v1 as browsecomp_plus_env_v1  # noqa
 from shogym.envs.frontier_bench import env_v1 as frontier_bench_env_v1  # noqa: F401 — registration
 from shogym.envs.hle import env_v1 as hle_env_v1  # noqa: F401 — triggers registration
 
+# `shogym.envs.latentgym.env_v1` imports nothing from the `latentgym` extra at top level. The
+# pinned upstream source (LatentGym plus the two packages it vendors) is provisioned and imported
+# only when the env is *constructed*, so `import shogym` stays offline and needs no checkout.
+from shogym.envs.latentgym import env_v1 as latentgym_env_v1  # noqa: F401 (registration)
+
 # `shogym.envs.orca_bench.env_v1` imports neither the dataset nor the (phase-2) compose backend at
 # top level (the pinned dataset downloads on env construction and the backend is touched only when
 # an episode is served), so `import shogym` stays offline, keyless, and Docker-free.
@@ -39,6 +44,7 @@ __all__ = [
     "browsecomp_plus_env_v1",
     "frontier_bench_env_v1",
     "hle_env_v1",
+    "latentgym_env_v1",
     "make",
     "orca_bench_env_v1",
     "register",

@@ -46,7 +46,9 @@ from shogym.serve.stream import (
     EvalStream,
     FeedbackPolicy,
     Immediate,
+    Information,
     Never,
+    Placebo,
     ResultRow,
     TaskRef,
     TaskStream,
@@ -601,9 +603,10 @@ async def test_every_row_and_dispense_records_the_regime(tmp_path: Path) -> None
                 await stream.dispatch(SUBMIT_TOOL, {"answer": answer})
         assert [row["feedback_regime"] for row in _rows(root)] == [regime, regime]
         assert [row.feedback_regime for row in stream.results] == [regime, regime]
-        assert [
-            record["feedback_regime"] for record in read_dispenses(root / "prov")
-        ] == [regime, regime]
+        assert [record["feedback_regime"] for record in read_dispenses(root / "prov")] == [
+            regime,
+            regime,
+        ]
         assert [row.feedback_regime for row in read_results(root / "prov")] == [regime, regime]
 
 
@@ -723,7 +726,7 @@ async def test_a_feedback_argument_that_is_not_a_policy_is_refused(
     # An allow-list, not a duck-type. What this argument decides is whether the agent is told its
     # verdict, and a value that merely looks usable would decide it by whatever it answers — with
     # the answer already on the wire by the time anyone noticed.
-    with pytest.raises(ValueError, match="feedback must be Never\\(\\) or Immediate\\(\\)"):
+    with pytest.raises(ValueError, match="feedback must be one of "):
         _stream(tmp_path, [0], feedback=bad)
 
 
@@ -747,7 +750,7 @@ async def test_a_policy_that_would_reveal_under_another_regimes_name_is_refused(
     # reader check `row.get("feedback_regime", "never")` agreeing. Nothing downstream can catch
     # it, because both halves of the record are internally consistent; the only place it can be
     # caught is the construction site, and only by refusing to take the claim on trust.
-    with pytest.raises(ValueError, match="feedback must be Never\\(\\) or Immediate\\(\\)") as bad:
+    with pytest.raises(ValueError, match="feedback must be one of ") as bad:
         _stream(tmp_path, [0], feedback=_Liar())
     # ...and the refusal says how a real new policy gets in, because the alternative reading of
     # this error is "policies are closed", which is not what it means.
@@ -860,7 +863,7 @@ async def test_an_object_that_answers_like_a_policy_is_still_refused(
     # behaviour off the admitted *class* is safe.
     impostor = costume()
     assert isinstance(impostor, FeedbackPolicy)  # both pass the check this module does not make
-    with pytest.raises(ValueError, match="feedback must be Never\\(\\) or Immediate\\(\\)"):
+    with pytest.raises(ValueError, match="feedback must be one of "):
         _stream(tmp_path, [0], feedback=impostor)
     assert not (tmp_path / "prov").exists()
 
@@ -873,7 +876,12 @@ async def test_the_policy_table_is_the_only_place_a_regime_is_named(tmp_path: Pa
     admitted = {
         policy: (regime, reveals) for policy, regime, reveals, _reveal in stream_module._POLICIES
     }
-    assert admitted == {Never: ("never", False), Immediate: ("immediate", True)}
+    assert admitted == {
+        Never: ("never", False),
+        Immediate: ("immediate", True),
+        Information: ("information", True),
+        Placebo: ("placebo", True),
+    }
     regimes = [regime for _policy, regime, _reveals, _reveal in stream_module._POLICIES]
     assert len(set(regimes)) == len(regimes)
     for policy, regime, reveals, reveal in stream_module._POLICIES:

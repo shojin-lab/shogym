@@ -121,6 +121,12 @@ wheels = [
 ]
 
 [[package]]
+name = "antlr4-python3-runtime"
+version = "4.9.3"
+source = { registry = "https://pypi.org/simple" }
+sdist = { url = "https://files.pythonhosted.org/packages/3e/38/7859ff46355f76f8d19459005ca000b6e7012f2f1ca597746cbcd1fbfe5e/antlr4-python3-runtime-4.9.3.tar.gz", hash = "sha256:f224469b4168294902bb1efa80a8bf7855f24c99aef99cbefc1bcd3cce77881b", size = 117034, upload-time = "2021-11-06T17:52:23.524Z" }
+
+[[package]]
 name = "anyio"
 version = "4.13.0"
 source = { registry = "https://pypi.org/simple" }
@@ -270,6 +276,12 @@ wheels = [
     { url = "https://files.pythonhosted.org/packages/f0/e6/0386d43a261ff4e4b30c5857af7df877254b46bec7b9d1b74b6bf969a90b/charset_normalizer-3.4.9-cp312-cp312-win_arm64.whl", hash = "sha256:78fa18e436a1a0e58dbd7e02fc4473f3f32cceb12df9dfca542d075961c307d2", size = 152665, upload-time = "2026-07-07T14:33:33.711Z" },
     { url = "https://files.pythonhosted.org/packages/98/2b/f97f1c193fb855c345d678f5077d6926034db0722df74c8f057020e05a25/charset_normalizer-3.4.9-py3-none-any.whl", hash = "sha256:68e5f26a1ad57ded6d1cfb85331d1c1a195314756471d97758c48498bb4dcdf5", size = 64538, upload-time = "2026-07-07T14:34:56.993Z" },
 ]
+
+[[package]]
+name = "chess"
+version = "1.11.2"
+source = { registry = "https://pypi.org/simple" }
+sdist = { url = "https://files.pythonhosted.org/packages/93/09/7d04d7581ae3bb8b598017941781bceb7959dd1b13e3ebf7b6a2cd843bc9/chess-1.11.2.tar.gz", hash = "sha256:a8b43e5678fdb3000695bdaa573117ad683761e5ca38e591c4826eba6d25bb39", size = 6131385, upload-time = "2025-02-25T19:10:27.328Z" }
 
 [[package]]
 name = "click"
@@ -491,6 +503,15 @@ dependencies = [
 sdist = { url = "https://files.pythonhosted.org/packages/f9/6b/6a4a5aaf38535eb332c2856aa08e73ed7c549d0851b1215401af0a2db1a7/deepdiff-9.1.0.tar.gz", hash = "sha256:07e9e366fab4297755153c4eab795ad4ef3cbd0d51660e847f5751c6bd727687", size = 382149, upload-time = "2026-05-15T20:18:05.751Z" }
 wheels = [
     { url = "https://files.pythonhosted.org/packages/c7/26/4a2bad8eb430d8d805a4642c4bff25103a37548d74ab346f8b1e024abcc5/deepdiff-9.1.0-py3-none-any.whl", hash = "sha256:80c0460e1993b04f6f0ca79abf25548b129fd218478c4ebb08f80560f5d10610", size = 184662, upload-time = "2026-05-15T20:18:03.956Z" },
+]
+
+[[package]]
+name = "defusedxml"
+version = "0.7.1"
+source = { registry = "https://pypi.org/simple" }
+sdist = { url = "https://files.pythonhosted.org/packages/0f/d5/c66da9b79e5bdb124974bfe172b4daf3c984ebd9c2a06e2b8a4dc7331c72/defusedxml-0.7.1.tar.gz", hash = "sha256:1bb3032db185915b62d7c6209c5a8792be6a32ab2fedacc84e01b52c51aa3e69", size = 75520, upload-time = "2021-03-08T10:59:26.269Z" }
+wheels = [
+    { url = "https://files.pythonhosted.org/packages/07/6c/aa3f2f849e01cb6a001cd8554a88d4c77c5c1a31c95bdf1cf9301e6d9ef4/defusedxml-0.7.1-py2.py3-none-any.whl", hash = "sha256:a352e7e428770286cc899e2542b6cdaedb2b4953ff269a210103ec58f6198a61", size = 25604, upload-time = "2021-03-08T10:59:24.45Z" },
 ]
 
 [[package]]
@@ -765,6 +786,12 @@ wheels = [
 http = [
     { name = "aiohttp" },
 ]
+
+[[package]]
+name = "func-timeout"
+version = "4.3.5"
+source = { registry = "https://pypi.org/simple" }
+sdist = { url = "https://files.pythonhosted.org/packages/b3/0d/bf0567477f7281d9a3926c582bfef21bff7498fc0ffd3e9de21811896a0b/func_timeout-4.3.5.tar.gz", hash = "sha256:74cd3c428ec94f4edfba81f9b2f14904846d5ffccc27c92433b8b5939b5575dd", size = 44264, upload-time = "2019-08-19T21:32:07.43Z" }
 
 [[package]]
 name = "gitdb"
@@ -1387,6 +1414,22 @@ wheels = [
 ]
 
 [[package]]
+name = "nltk"
+version = "3.10.3"
+source = { registry = "https://pypi.org/simple" }
+dependencies = [
+    { name = "click" },
+    { name = "defusedxml" },
+    { name = "joblib" },
+    { name = "regex" },
+    { name = "tqdm" },
+]
+sdist = { url = "https://files.pythonhosted.org/packages/e0/e6/fe51d2bb1a3b446f59c5c8165999a9fee208bc346af90a7cbf7657bc0d75/nltk-3.10.3.tar.gz", hash = "sha256:bb9327a461c3811c2fa4900e03840401f2126adfb30c0072827c433bd2444ea4", size = 5137152, upload-time = "2026-08-12T23:46:37.258Z" }
+wheels = [
+    { url = "https://files.pythonhosted.org/packages/b6/6d/ebd2af4640b12168fdf0cb74b6118df2f32a2f62ec7e0c06fbfd80706639/nltk-3.10.3-py3-none-any.whl", hash = "sha256:ff9598a8e20518ee0d557745890cc4435b9578489e2dcbc69c4f81fa060caf7c", size = 1798643, upload-time = "2026-08-12T23:44:13.478Z" },
+]
+
+[[package]]
 name = "nodeenv"
 version = "1.10.0"
 source = { registry = "https://pypi.org/simple" }
@@ -1564,6 +1607,19 @@ source = { registry = "https://pypi.org/simple" }
 wheels = [
     { url = "https://files.pythonhosted.org/packages/c2/f3/d86c845465a2723ad7e1e5c36dcd75ddb82898b3f53be47ebd429fb2fa5d/nvidia_nvtx-13.0.85-py3-none-manylinux1_x86_64.manylinux_2_5_x86_64.whl", hash = "sha256:4936d1d6780fbe68db454f5e72a42ff64d1fd6397df9f363ae786930fd5c1cd4", size = 148047, upload-time = "2025-09-04T08:29:01.761Z" },
     { url = "https://files.pythonhosted.org/packages/a8/64/3708a90d1ebe202ffdeb7185f878a3c84d15c2b2c31858da2ce0583e2def/nvidia_nvtx-13.0.85-py3-none-manylinux2014_aarch64.manylinux_2_17_aarch64.whl", hash = "sha256:cb7780edb6b14107373c835bf8b72e7a178bac7367e23da7acb108f973f157a6", size = 148878, upload-time = "2025-09-04T08:28:53.627Z" },
+]
+
+[[package]]
+name = "omegaconf"
+version = "2.3.1"
+source = { registry = "https://pypi.org/simple" }
+dependencies = [
+    { name = "antlr4-python3-runtime" },
+    { name = "pyyaml" },
+]
+sdist = { url = "https://files.pythonhosted.org/packages/ce/3d/e4b57b8d9008c6ebe0d5eff901f91d5700cf7bdb8c8863df817463a7fd5e/omegaconf-2.3.1.tar.gz", hash = "sha256:e5e7de64aeebeddaf8e6d3f7a783b32ac2a01c0fbd9c878012caecb891a1f42a", size = 3298472, upload-time = "2026-06-11T05:05:12.885Z" }
+wheels = [
+    { url = "https://files.pythonhosted.org/packages/a4/0e/152509871bf30df6fc38569f52a2db9b55dd41aae957adae50a053ac7778/omegaconf-2.3.1-py3-none-any.whl", hash = "sha256:3d701d14e9a8828f1edd28bb70b725908b34277cdd72cf7d6a83f94dadc6b6a0", size = 79502, upload-time = "2026-06-11T05:05:09.954Z" },
 ]
 
 [[package]]
@@ -2379,6 +2435,18 @@ hle = [
     { name = "datasets" },
     { name = "openai" },
 ]
+latentgym = [
+    { name = "chess" },
+    { name = "func-timeout" },
+    { name = "nltk" },
+    { name = "omegaconf" },
+    { name = "openai" },
+    { name = "pandas" },
+    { name = "python-dotenv" },
+    { name = "requests" },
+    { name = "rich" },
+    { name = "websockets" },
+]
 tau2 = [
     { name = "addict" },
     { name = "deepdiff" },
@@ -2420,12 +2488,13 @@ dev = [
     { name = "pytest" },
     { name = "pytest-asyncio" },
     { name = "ruff" },
-    { name = "shogym", extra = ["automationbench", "browsecomp-plus", "hle", "tau2", "yc-bench"] },
+    { name = "shogym", extra = ["automationbench", "browsecomp-plus", "hle", "latentgym", "tau2", "yc-bench"] },
 ]
 
 [package.metadata]
 requires-dist = [
     { name = "addict", marker = "extra == 'tau2'", specifier = ">=2.4.0" },
+    { name = "chess", marker = "extra == 'latentgym'", specifier = ">=1.11" },
     { name = "datasets", marker = "extra == 'automationbench'", specifier = ">=2.19" },
     { name = "datasets", marker = "extra == 'browsecomp-plus'", specifier = ">=2.19" },
     { name = "datasets", marker = "extra == 'hle'", specifier = ">=2.19" },
@@ -2434,6 +2503,7 @@ requires-dist = [
     { name = "duckdb", marker = "extra == 'analysis'", specifier = ">=1.0" },
     { name = "fastapi", marker = "extra == 'tau2'", specifier = ">=0.115.11" },
     { name = "fastmcp", specifier = ">=3.2" },
+    { name = "func-timeout", marker = "extra == 'latentgym'", specifier = ">=4.3" },
     { name = "gymnasium", marker = "extra == 'tau2'", specifier = ">=1.2.2" },
     { name = "httpx", marker = "extra == 'tau2'", specifier = ">=0.24.0" },
     { name = "jsonschema", specifier = ">=4.20" },
@@ -2442,23 +2512,30 @@ requires-dist = [
     { name = "loguru", marker = "extra == 'tau2'", specifier = ">=0.7.3" },
     { name = "matplotlib", marker = "extra == 'yc-bench'", specifier = ">=3.10.8" },
     { name = "minijinja", specifier = ">=2.0" },
+    { name = "nltk", marker = "extra == 'latentgym'", specifier = ">=3.9" },
     { name = "numpy", specifier = ">=1.26" },
     { name = "numpy", marker = "extra == 'tau2'", specifier = ">=1.24.0" },
+    { name = "omegaconf", marker = "extra == 'latentgym'", specifier = ">=2.3" },
     { name = "openai", marker = "extra == 'browsecomp-plus'", specifier = ">=1.99" },
     { name = "openai", marker = "extra == 'hle'", specifier = ">=1.99" },
+    { name = "openai", marker = "extra == 'latentgym'", specifier = ">=1.99" },
     { name = "openai", marker = "extra == 'tau2'", specifier = ">=1.0.0" },
     { name = "pandas", marker = "extra == 'analysis'", specifier = ">=2.2" },
+    { name = "pandas", marker = "extra == 'latentgym'", specifier = ">=2.2" },
     { name = "pandas", marker = "extra == 'tau2'", specifier = ">=2.2.3" },
     { name = "plotly", marker = "extra == 'yc-bench'", specifier = ">=6.6.0" },
     { name = "psutil", marker = "extra == 'tau2'", specifier = ">=7.0.0" },
     { name = "pydantic", specifier = ">=2.7" },
     { name = "pydantic", marker = "extra == 'yc-bench'", specifier = ">=2.0" },
     { name = "pyserini", marker = "extra == 'browsecomp-plus'", specifier = ">=0.22" },
+    { name = "python-dotenv", marker = "extra == 'latentgym'", specifier = ">=1.0" },
     { name = "python-dotenv", marker = "extra == 'tau2'", specifier = ">=1.0.0" },
     { name = "python-dotenv", marker = "extra == 'yc-bench'", specifier = ">=1.0" },
     { name = "pyyaml", marker = "extra == 'tau2'", specifier = ">=6.0.2" },
     { name = "rank-bm25", marker = "extra == 'tau2'", specifier = ">=0.2.2" },
+    { name = "requests", marker = "extra == 'latentgym'", specifier = ">=2.31" },
     { name = "requests", marker = "extra == 'tau2'", specifier = ">=2.31.0" },
+    { name = "rich", marker = "extra == 'latentgym'" },
     { name = "rich", marker = "extra == 'tau2'" },
     { name = "sqlalchemy", marker = "extra == 'yc-bench'", specifier = ">=2.0" },
     { name = "streamlit", marker = "extra == 'yc-bench'", specifier = ">=1.55.0" },
@@ -2468,8 +2545,9 @@ requires-dist = [
     { name = "typer", marker = "extra == 'tau2'", specifier = ">=0.12.5" },
     { name = "typer", marker = "extra == 'yc-bench'", specifier = ">=0.9" },
     { name = "uvicorn", marker = "extra == 'tau2'", specifier = ">=0.34.0" },
+    { name = "websockets", marker = "extra == 'latentgym'", specifier = ">=12.0" },
 ]
-provides-extras = ["analysis", "tau2", "hle", "yc-bench", "frontier-bench", "automationbench", "browsecomp-plus", "orca-bench"]
+provides-extras = ["analysis", "tau2", "hle", "latentgym", "yc-bench", "frontier-bench", "automationbench", "browsecomp-plus", "orca-bench"]
 
 [package.metadata.requires-dev]
 dev = [
@@ -2481,6 +2559,7 @@ dev = [
     { name = "shogym", extras = ["browsecomp-plus"] },
     { name = "shogym", extras = ["frontier-bench"] },
     { name = "shogym", extras = ["hle"] },
+    { name = "shogym", extras = ["latentgym"] },
     { name = "shogym", extras = ["orca-bench"] },
     { name = "shogym", extras = ["tau2"] },
     { name = "shogym", extras = ["yc-bench"] },
