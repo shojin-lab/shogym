@@ -214,9 +214,13 @@ core-owned terminal evidence, so the transcript cannot influence it.
   recorded in upstream `tasks/dataset.toml`, and vendors the runtime files under
   [`tasks/`](tasks/) (upstream's `maintainer/` tooling is not carried). The repository has since
   moved to `harbor-framework/terminal-bench` and the `v0.1.0` tag no longer resolves there; the
-  commit does, which is why it is the anchor. The upstream digest is an OCI/packaging digest
-  (from `harbor add`) recorded as provenance; the loader independently verifies the vendored
-  bytes against a recomputed content hash, and re-pins are deliberate.
+  commit does, which is why it is the anchor. `describe()` still stamps the recorded label in
+  each TaskSpec's provenance footer (`pinned: frontier-bench v0.1.0 · <digest>`); moving that
+  footer onto the commit changes a served string, so it is
+  [issue #136](https://github.com/shojin-lab/shogym/issues/136) rather than part of this pass.
+  The upstream digest is an OCI/packaging digest (from `harbor add`) recorded as provenance; the
+  loader independently verifies the vendored bytes against a recomputed content hash, and re-pins
+  are deliberate.
 - **Sanity-gated slice.** Only tasks this port could Docker-validate ship: for **every**
   vendored task, its own `solution/solve.sh` (the oracle) scores **1** through this port's
   verifier and an empty run (`nop`) scores **0** — the Docker-gated end-to-end test asserts both,

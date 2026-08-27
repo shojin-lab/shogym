@@ -185,7 +185,9 @@ semantics (give each run its own trace file for a guaranteed 1:1 mapping).
 - **Pinned to source commit `1d244f5`.** The pin covers tau2's Python source only. Domain
   policies, tasks and DBs are loaded from the `TAU2_DATA_DIR` checkout the caller provides, and
   shogym checks no revision or hash on it, so two runs under the same commit label can serve
-  different benchmark content.
+  different benchmark content. The commit is pinned by the default runtime provisioner;
+  `TAU2_SRC` swaps in a local checkout whose revision nothing checks, so that documented
+  override is a trusted, unversioned path.
 - **Python 3.12 pin rationale.** The pinned tau2 revision imports the stdlib `audioop` module,
   removed in 3.13 — this is why the shared project pin is `>=3.12,<3.13`.
 - **banking uses `bm25_grep`.** `tau2_banking_knowledge` is pinned to the offline `bm25_grep`

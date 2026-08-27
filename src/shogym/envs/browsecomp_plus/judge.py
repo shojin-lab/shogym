@@ -6,13 +6,15 @@ answer match the gold answer for the query? As with the HLE port, the judge is u
 ``_verify`` stays a pure function over the recorded trajectory — the handler runs the judge and
 records its verdict on the terminal step; the verifier only *parses* it.
 
-The grading prompt (:data:`GRADER_TEMPLATE`) and the reply parser (:func:`parse_judge_response`)
-are ported **verbatim** from upstream ``scripts_evaluation/evaluate_run.py`` (BrowseComp-Plus
-commit ``0469490``), so the grading criteria match the benchmark's own. Upstream grades with
-Qwen3-32B (vLLM, temp 0.7) or GPT-4.1 (the paper); shogym canonicalizes an OpenAI-compatible
-judge at **temperature 0** for deterministic verification, defaulting to the paper's GPT-4.1
-and overridable via ``judge_model`` / ``judge_base_url`` (point the base URL at a vLLM
-Qwen3-32B for exact upstream fidelity).
+The grading prompt (:data:`GRADER_TEMPLATE`) is **verbatim** from upstream
+``scripts_evaluation/evaluate_run.py`` (BrowseComp-Plus commit ``0469490``), so the grading
+criteria match the benchmark's own. The reply parser (:func:`parse_judge_response`) is adapted
+from upstream's: it reads a line-anchored verdict and fails closed (see its docstring).
+
+Upstream grades with Qwen3-32B (vLLM, temp 0.7) or GPT-4.1 (the paper); shogym canonicalizes an
+OpenAI-compatible judge at **temperature 0** for deterministic verification, defaulting to the
+paper's GPT-4.1 and overridable via ``judge_model`` / ``judge_base_url`` (point the base URL at
+a vLLM Qwen3-32B for exact upstream fidelity).
 
 Nothing here imports ``openai`` at module load — the client is created lazily on first use —
 so ``import shogym`` (which imports the env to register it) stays offline and lean.

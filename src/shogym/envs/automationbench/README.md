@@ -175,7 +175,9 @@ semantics (give each run its own trace file for a guaranteed 1:1 mapping).
 - **Pinned upstream source.** The port provisions and imports the pinned upstream commit
   [`a321764`](https://github.com/zapier/AutomationBench/commit/a321764ace3cfbe42289e6a13abef2f0f4f56fad),
   reusing only the `verifiers`-free pieces (simulated tools + `WorldState`, typed task defs, the
-  pure rubric); upstream's `verifiers` / `anthropic` agent loop is discarded.
+  pure rubric); upstream's `verifiers` / `anthropic` agent loop is discarded. The pin is the
+  default runtime provisioner's; `AUTOMATIONBENCH_SRC` points at a local checkout whose revision
+  nothing checks, so that documented override is a trusted, unversioned path.
 - **End-state-only scoring, verbatim rubric.** Scoring is AutomationBench's own rubric run over
   the sealed end-state — no LLM judge, no live SaaS. The free/negative-assertion gate is preserved.
 - **Public set only.** The 600 public-domain tasks are distributed; the private leaderboard set

@@ -1,13 +1,15 @@
 # `browsecomp_plus` — BrowseComp-Plus, a Deep-Research retrieval env ("HLE with a fixed corpus")
 
 [**BrowseComp-Plus**](https://github.com/texttron/BrowseComp-Plus) (ACL 2026) served through
-shogym at upstream commit `0469490` — answer OpenAI BrowseComp's reasoning-heavy queries against
-a **fixed, human-verified ~100K-doc corpus** served as `search` / `get_document` tools, instead
-of the live web. Freezing the corpus isolates search + reasoning from web noise and makes runs
-reproducible. `submit_answer`
-is the **score terminal**: submitting seals the episode and the env's `finalize` hook grades the
-sealed answer with an LLM judge (as in the [HLE](../hle/README.md) port), and the env adds
-deterministic **retrieval-recall** and **citation** metrics computed purely off the recorded
+shogym at upstream commit `0469490`, which covers the qrels and the evaluation / judge code this
+port copies; the encrypted queries and the BM25 index carry their own Hugging Face revisions
+(see [Fidelity & deviations](#fidelity--deviations)). The task: answer OpenAI BrowseComp's
+reasoning-heavy queries against a **fixed, human-verified ~100K-doc corpus** served as
+`search` / `get_document` tools, instead of the live web. Freezing the corpus isolates search +
+reasoning from web noise and makes runs reproducible. `submit_answer` is the **score terminal**:
+submitting seals the episode and the env's `finalize` hook grades the sealed answer with an LLM
+judge (as in the [HLE](../hle/README.md) port), and the env adds deterministic
+**retrieval-recall** and **citation** metrics computed purely off the recorded
 trajectory against the query's relevance judgements (qrels) — so it exercises shogym's verification
 surface with both a model judge *and* deterministic retrieval metrics.
 
@@ -174,9 +176,17 @@ semantics (give each run its own trace file for a guaranteed 1:1 mapping).
 
 ## Fidelity & deviations
 
-- **Upstream pin.** Upstream commit `0469490` (MIT). The auto-downloaded BM25 index is pinned to
-  an immutable commit of `Tevatron/browsecomp-plus-indexes` (`INDEX_REVISION` in `data.py`), so a
-  cold-cache download is reproducible and can't drift with an upstream index replacement.
+- **Three separate pins.** GitHub commit `0469490` (MIT) covers the qrels and the evaluation /
+  judge code this port copies. The encrypted queries are pinned to Hugging Face revision
+  `144cff8e35b5eaef7e526346aa60774a9deb941f` of `Tevatron/browsecomp-plus`, and the prebuilt
+  BM25 index to revision `b3f37f70c33829eb09d04784a54277a31871fd63` of
+  `Tevatron/browsecomp-plus-indexes` (`HF_QUERIES_REVISION` and `INDEX_REVISION` in `data.py`),
+  so a cold-cache download is reproducible and cannot drift with an upstream replacement.
+- **The index pin binds only a cold download.** `bm25_index_path()` uses
+  `SHOGYM_BROWSECOMP_PLUS_BM25_INDEX` as given, and reuses an existing `cache_dir()/bm25` if one
+  is already there, neither of them checked against `INDEX_REVISION`. Only the download path
+  applies the pin, so a pre-provisioned or previously cached index is a trusted, unversioned
+  input.
 - **Retriever pinned to BM25.** The retriever materially changes scores (BM25 vs dense
   Qwen3-Embedding), so the backend is named in the TaskSpec and this first cut pins **BM25**
   (CPU/Java-only; the dense path needs Faiss + GPU — a deferred follow-up).
@@ -211,7 +221,9 @@ semantics (give each run its own trace file for a guaranteed 1:1 mapping).
 - `mcp_server.py` — the in-process MCP server: `search` / `get_document` / `submit_answer` (the
   score terminal, never dispatched inward once sealed).
 - `searcher.py` — the `Searcher` seam: `InMemorySearcher` (fixtures) + `BM25Searcher` (pyserini).
-- `judge.py` — the LLM judge (`GRADER_TEMPLATE` + `parse_judge_response`, upstream verbatim).
-- `metrics.py` — pure retrieval-recall + citation precision/recall (upstream verbatim).
+- `judge.py` — the LLM judge: `GRADER_TEMPLATE` verbatim from upstream, `parse_judge_response`
+  adapted from it (line-anchored verdict, fails closed).
+- `metrics.py` — pure retrieval-recall + citation precision/recall, adapted from upstream
+  (set-size denominators).
 - `data.py` — in-memory decryption (canary preserved), qrel + lazy BM25-index auto-download, and
   the Java-21 fast-check (before any multi-GB download).

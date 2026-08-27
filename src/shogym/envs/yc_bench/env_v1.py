@@ -6,10 +6,12 @@ discrete-event simulation — accepting tasks from a marketplace, assigning empl
 advancing the clock with ``sim resume``, and managing cash flow — until bankruptcy (funds < 0)
 or the one-year horizon. The score is how the company ends up.
 
-YC-Bench ships **no agent loop**: it expects an external driver to advance the sim, feed CLI
-results back, and collect the next commands. shogym's harness is that driver. This port is a
-clean wrap — the sim engine, command execution/validation, SQLite state, seeding, and scoring
-are reused verbatim (via :mod:`shogym.envs.yc_bench.adapter`); only the *agent* is replaced.
+YC-Bench ships its own LLM agent loop (``agent/loop.py``, driven by ``runner/main.py``) over a
+sim built to take an external driver: something has to advance the clock, feed CLI results
+back, and collect the next commands. shogym's harness is that driver. The sim engine, CLI entry
+point and command validation, SQLite state/ORM, and ``_init_simulation`` seeding are reused
+verbatim (via :mod:`shogym.envs.yc_bench.adapter`); the agent loop is replaced, and shogym
+supplies the command, terminal and scoring layers around them (see :func:`score_verdict`).
 
 This module imports **nothing** from ``yc_bench`` at load time, so ``import shogym`` (which
 imports this module to register the env) stays offline. yc-bench is imported lazily — only

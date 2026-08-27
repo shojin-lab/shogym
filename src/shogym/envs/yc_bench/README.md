@@ -192,7 +192,9 @@ semantics (give each run its own trace file for a guaranteed 1:1 mapping).
   from the sim's own rows; the shaping into episode feedback is shogym's. There are **zero
   shogym core changes**; the whole port is additive under `src/shogym/envs/yc_bench/`.
 - **Pinned to commit `e7d6067`.** YC-Bench has no stable public API, so a commit pin makes
-  upstream drift a contained maintenance cost.
+  upstream drift a contained maintenance cost. The pin is the default runtime provisioner's;
+  `YC_BENCH_SRC` points the port at a local checkout whose revision nothing checks, so that
+  documented override is a trusted, unversioned path.
 - **`run` / `start` rejected.** `run_command` allowlists only the operational sub-command
   groups; `yc-bench run` (upstream's own credential-inheriting LLM agent loop) and `yc-bench
   start` (interactive) are rejected before any subprocess spawns — that agent loop is exactly

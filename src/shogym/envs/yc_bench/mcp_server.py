@@ -4,9 +4,10 @@
 # pyright: reportMissingImports=false
 """In-process MCP server for the ``yc_bench`` env — yc-bench's command surface, wrapped.
 
-yc-bench has **no built-in agent loop**: it expects an external driver to issue CLI commands
-against its deterministic sim, feed the JSON results back, and collect the next commands. shogym
-*is* that driver. This server exposes that command surface as two MCP tools:
+yc-bench ships its own LLM agent loop (``agent/loop.py``), but its sim is built to take an
+external driver: something has to issue CLI commands against the deterministic sim, feed the
+JSON results back, and collect the next commands. shogym *is* that driver, in place of that
+loop. This server exposes the command surface as two MCP tools:
 
   - **``run_command(command)``** — mirrors upstream's
     ``run_command("yc-bench <cmd>")``: it runs one yc-bench CLI command against *this
