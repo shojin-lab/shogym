@@ -27,6 +27,22 @@ from shogym.types import EpisodeFeedback, InferenceFeedback
 FEEDBACK_META_KEY = "shogym/feedback"
 TERMINATE_META_KEY = "shogym/terminate"
 
+# The two episode-feedback names a *paired* pair of feedback policies is written against: one
+# policy reveals the item published under `REPORT_FEEDBACK_NAME`, its twin the item published
+# under `NOTICE_FEEDBACK_NAME`, and neither reveals anything else. They live here, beside the wire
+# keys, because they are the one part of the feedback contract an env and a policy must agree on
+# by name: an env publishes under them, a policy selects by them, and neither may import the
+# other.
+#
+# `report` carries whatever the env decided the ending is worth saying; `notice` carries the
+# env's own inert, length-matched stand-in for it. Both names are six characters, so two arms
+# whose values are the same length *as the answer encodes them* answer a terminating call with
+# byte-identical payloads apart from the value itself: the channel a run served under is a
+# property of its record rather than something readable off the shape of what the agent was
+# handed. Matching the values is the env's job, not this contract's.
+REPORT_FEEDBACK_NAME = "report"
+NOTICE_FEEDBACK_NAME = "notice"
+
 FeedbackItem = Union[InferenceFeedback, EpisodeFeedback]
 
 

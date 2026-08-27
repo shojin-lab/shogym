@@ -308,6 +308,7 @@ from fastmcp import FastMCP
 from fastmcp.tools import ToolResult
 
 from shogym.core import Env
+from shogym.feedback.wire import NOTICE_FEEDBACK_NAME, REPORT_FEEDBACK_NAME
 from shogym.serve.episode import ServedEpisode
 from shogym.serve.server import build_tool
 from shogym.shared.terminate_mcp import TERMINATE_TOOL_NAME
@@ -320,7 +321,9 @@ __all__ = [
     "EvalStream",
     "FeedbackPolicy",
     "Immediate",
+    "Information",
     "Never",
+    "Placebo",
     "Provenance",
     "ProvenanceError",
     "ProvenanceSpan",
@@ -377,6 +380,8 @@ _TASK_OVER_SILENT = json.dumps({**_TASK_OVER_FIELDS, _FEEDBACK_MEMBER: []})
 # `row.get("feedback_regime", "never")`.
 _NEVER_REGIME = "never"
 _IMMEDIATE_REGIME = "immediate"
+_INFORMATION_REGIME = "information"
+_PLACEBO_REGIME = "placebo"
 
 # The feedback level a terminal may reveal. `wire.select_inband` already draws this line for a
 # single served episode — episode-level items ride out on the terminal result, inference-level
@@ -1690,6 +1695,66 @@ class Immediate(FeedbackPolicy):
         return published
 
 
+def _channel(published: Sequence[Dict[str, Any]], name: str) -> List[Dict[str, Any]]:
+    """The published items filed under ``name``, in publication order, and nothing else.
+
+    What the two policies below are made of. Selection by name rather than by position, because
+    an env publishes what it publishes: a run whose env emitted the summary numbers first and a
+    run whose env emitted them last must open the same channel, and an index would make the
+    answer depend on an ordering nothing in the contract fixes."""
+    return [dict(item) for item in published if item.get("name") == name]
+
+
+@dataclass(frozen=True)
+class Information(FeedbackPolicy):
+    """One channel open: the item the env published under
+    :data:`~shogym.feedback.wire.REPORT_FEEDBACK_NAME`, and nothing beside it.
+
+    The treatment half of a matched pair (see :class:`Placebo`). Where :class:`Immediate` hands
+    back everything the row records (the summary numbers included), this hands back the single
+    item the env wrote *for the agent to read*, so what a graded ending tells the agent is
+    something the env composed rather than a list whose length and contents vary with how many
+    metrics that env happens to publish. An env with nothing under that name answers with an
+    empty member, exactly as a holding policy would.
+
+    The channel is the env's to fill and the env's to be honest about: an env that names the
+    answer in its report hands the answer over here. That is what an open channel is, and it is
+    why :class:`Never` remains the default."""
+
+    regime: ClassVar[str] = _INFORMATION_REGIME
+    reveals: ClassVar[bool] = True
+
+    def reveal(self, published: Sequence[Dict[str, Any]]) -> Sequence[Dict[str, Any]]:
+        return _channel(published, REPORT_FEEDBACK_NAME)
+
+
+@dataclass(frozen=True)
+class Placebo(FeedbackPolicy):
+    """The same channel, filled with the env's inert stand-in: the item published under
+    :data:`~shogym.feedback.wire.NOTICE_FEEDBACK_NAME`, and nothing beside it.
+
+    The control half of the pair. It exists because "told nothing" and "told something that says
+    nothing" are different treatments, and :class:`Never` can only serve the first: a run under
+    it answers with a member-less envelope, so an agent under :class:`Information` is handed both
+    a verdict *and* a channel that a :class:`Never` agent never sees at all. This keeps the
+    channel, the member and the shape, and changes only what is in it, which is the comparison a
+    paired design is trying to make.
+
+    **The match is the env's to hold up.** Nothing here checks that the notice an env published is
+    the length of its report or that it says nothing evaluative; a policy reveals, it does not
+    author (see :class:`FeedbackPolicy`). What this side of it guarantees is that the two arms
+    differ in the value and in nothing else: one item, the same member, and, the two names being
+    the same length, the same number of bytes around it."""
+
+    regime: ClassVar[str] = _PLACEBO_REGIME
+    reveals: ClassVar[bool] = True
+
+    def reveal(self, published: Sequence[Dict[str, Any]]) -> Sequence[Dict[str, Any]]:
+        return _channel(published, NOTICE_FEEDBACK_NAME)
+
+
+
+
 # The policies a stream may serve under, and — the point of the table — everything each one
 # decides: `(policy type, regime, reveals, reveal)`, snapshotted here at import from the classes
 # above, so there is exactly one place that says what "immediate" means and it is not an attribute
@@ -1721,13 +1786,14 @@ class Immediate(FeedbackPolicy):
 # policy comes from: it is written in this module, given a regime no other entry uses, and added
 # to this tuple. It is not subclassed downstream, because a stream cannot check a claim a
 # downstream class makes about itself, and the record's claim about the regime is exactly what a
-# reader has to be able to trust. #93 scopes launch to the two below; the third line of this tuple
-# is the whole of what a third costs.
+# reader has to be able to trust. One line of this tuple is the whole of what the next one costs.
 _Reveal = Callable[[Any, Sequence[Dict[str, Any]]], Sequence[Dict[str, Any]]]
 
 _POLICIES: Tuple[Tuple[type, str, bool, _Reveal], ...] = (
     (Never, Never.regime, Never.reveals, Never.reveal),
     (Immediate, Immediate.regime, Immediate.reveals, Immediate.reveal),
+    (Information, Information.regime, Information.reveals, Information.reveal),
+    (Placebo, Placebo.regime, Placebo.reveals, Placebo.reveal),
 )
 
 
@@ -1913,7 +1979,8 @@ class TaskStream:
         admitted = _admitted(feedback)
         if admitted is None:
             raise ValueError(
-                f"feedback must be {Never.__name__}() or {Immediate.__name__}(), got "
+                "feedback must be one of "
+                f"{', '.join(policy.__name__ + '()' for policy, *_ in _POLICIES)}, got "
                 f"{feedback!r} ({type(feedback).__name__}); a policy decides whether a "
                 "terminating call carries the task's verdict *and* names the regime stamped on "
                 "every record this run keeps, so only a policy this module defines can be "
