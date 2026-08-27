@@ -424,20 +424,35 @@ print(json.dumps({"root": root, "guess": _os.path.exists(root.replace("seeded", 
     assert seen["guess"] in (False, None)
 
 
-async def test_an_ordinary_episode_leaves_a_journal_a_reader_could_use() -> None:
-    """The journal is the port's answer to what it cannot prevent, and its only value is that a
-    reader can tell an ordinary episode from one that went looking. So the floor has to be low: an
-    interpreter opens its own libraries thousands of times, and a journal recording those would
-    drown the line that matters.
+@pytest.mark.xfail(
+    strict=True,
+    reason=(
+        "shojin-lab/shogym#138: the worker is a scrubbed process and not an OS namespace, so "
+        "agent-authored code reads whatever the user running the port can read. The containerised "
+        "worker turns this green; remove the marker with it."
+    ),
+)
+async def test_a_read_outside_the_served_tree_is_refused() -> None:
+    """The property the closed routes do not give, reproduced so it cannot be forgotten.
 
-    **What this does not assert is that an agent's own read is caught, because it is not.** The
-    hook records opens made by this process, and in isolation it records opens made inside an
-    embedded shell, but a file read through a served `execute` call in a live world did not appear
-    and the reason is not yet understood. A non-empty journal is evidence; an empty one is
-    evidence of nothing. The README and the open issue say so."""
-    played = await play(['print(apis.supervisor.show_profile())'])
-    # Small enough to read by eye: the platform's own version file and a timezone table.
-    assert played["feedback"]["opened_outside"] <= 8.0
+    Everything the served tree could have led to has been taken out of it: no answers, no symlink
+    ancestry, no neighbouring grader. None of that stops a read of a path an agent names outright,
+    because the code it writes runs as the worker, with the worker's filesystem, as the same user
+    as the run. A mount namespace is what makes this fail; nothing short of one does.
+
+    Expected to fail today, and strictly: when it starts passing, the boundary exists and the
+    marker is what should go."""
+    probe = """
+_io = __import__("io")
+try:
+    _io.open("/etc/hosts").read()
+    print(json.dumps({"read": True}))
+except Exception as failure:
+    print(json.dumps({"read": False, "why": type(failure).__name__}))
+"""
+    played = await play([probe])
+    seen = json.loads(json.loads(played["outputs"][0]["content"])["output"])
+    assert seen["read"] is False
 
 
 async def test_the_answers_are_not_in_the_process_that_runs_agent_code() -> None:

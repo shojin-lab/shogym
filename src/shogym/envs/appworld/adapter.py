@@ -41,7 +41,7 @@ import urllib.request
 from dataclasses import dataclass
 from functools import lru_cache
 from pathlib import Path
-from typing import Any, Dict, List, Sequence, Tuple
+from typing import Any, Dict, Sequence, Tuple
 
 from shogym.envs._upstream import _locked
 
@@ -411,7 +411,6 @@ class Worker:
     port: int
     token: str
     scratch: Path
-    journal: Path
 
     @classmethod
     def spawn(cls, root: Path) -> "Worker":
@@ -422,10 +421,6 @@ class Worker:
         the life of it."""
         token = secrets.token_urlsafe(32)
         scratch = Path(tempfile.mkdtemp(prefix="shogym-appworld-"))
-        # Beside the worker's working directory rather than inside it: the working directory is
-        # the agent's own, and a record of what an agent did that the agent can rewrite is not a
-        # record.
-        journal = Path(tempfile.mkdtemp(prefix="shogym-appworld-journal-")) / "opened.jsonl"
         process = subprocess.Popen(
             [str(runtime()), str(WORKER), "serve"],
             stdin=subprocess.PIPE,
@@ -436,9 +431,7 @@ class Worker:
             env=_worker_environment(scratch),
         )
         assert process.stdin is not None
-        process.stdin.write(
-            json.dumps({"root": str(root), "token": token, "journal": str(journal)}) + "\n"
-        )
+        process.stdin.write(json.dumps({"root": str(root), "token": token}) + "\n")
         process.stdin.flush()
         process.stdin.close()
         assert process.stdout is not None
@@ -447,7 +440,6 @@ class Worker:
             process.kill()
             process.wait(timeout=10)
             shutil.rmtree(scratch, ignore_errors=True)
-            shutil.rmtree(journal.parent, ignore_errors=True)
             raise WorkerError(
                 "the appworld worker never bound a port "
                 f"(status {process.returncode}, waited {_SPAWN_TIMEOUT_SECONDS:.0f}s)"
@@ -458,7 +450,6 @@ class Worker:
             port=int(json.loads(line)["port"]),
             token=token,
             scratch=scratch,
-            journal=journal,
         )
 
     def call(self, command: str, **body: Any) -> Any:
@@ -475,22 +466,6 @@ class Worker:
         except urllib.error.HTTPError as exc:
             detail = exc.read().decode(errors="replace")
             raise WorkerError(f"appworld worker refused {command!r}: {detail}") from exc
-
-    def opened_outside(self) -> List[str]:
-        """Every path this episode opened from outside the tree it was served.
-
-        Empty on an ordinary episode. Non-empty is not proof of anything on its own: a library
-        reads its own files. It is the record a post-hoc check reads to ask whether an agent went
-        looking, which is a question a run has no other way to answer."""
-        if not self.journal.exists():
-            return []
-        out = []
-        for line in self.journal.read_text().splitlines():
-            try:
-                out.append(json.loads(line)["opened"])
-            except Exception:
-                continue
-        return out
 
     def close(self) -> None:
         """Stop the worker, promptly and with a bound.
@@ -516,7 +491,6 @@ class Worker:
                 except Exception:
                     pass
         shutil.rmtree(self.scratch, ignore_errors=True)
-        shutil.rmtree(self.journal.parent, ignore_errors=True)
 
 
 def grade(

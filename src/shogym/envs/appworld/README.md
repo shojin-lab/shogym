@@ -311,14 +311,15 @@ routes are closed and the expensive one is visible, each tested by running the p
 | the answers, as files | the served tree contains no `ground_truth` and **no symlink into the corpus**: every file in it is a hard link or a copy, so no path in it names a directory the answers are a sibling of |
 | the grader's tree | a directory with an unguessable name under a private parent, not a neighbour of the served root |
 | the drawn key | never sent to either process: the protocol has no field for one |
-| going looking | an audit hook installed before any agent code runs journals files opened from outside the served tree, and the count rides on the result row as `opened_outside`. **Unverified on the agent's own path**: see below |
 
-**The journal does not yet do the job it is there for.** The hook records opens made by the
-worker process, and in isolation it records opens made inside an embedded IPython shell. It did
-not record a file read through a served `execute` call in a live world, and why is not understood.
-So a non-empty journal is evidence that something was opened, and an empty one is evidence of
-nothing. It is shipped because it costs nothing and its baseline is readable (an ordinary episode
-journals two platform files), and it is not counted as a control until that gap is closed.
+**There is no file-access audit, and a run must not be read as though there were one.** An earlier
+revision of this port installed an audit hook to journal files opened from outside the served tree.
+It recorded opens made by the worker process, and in isolation it recorded opens made inside an
+embedded IPython shell, but it did not record a file read through a served `execute` call in a live
+world. A control that works on some paths and not the one that matters is worse than none, because
+an empty journal reads as "file access was audited and nothing was found" when it means nothing of
+the kind. It has been removed rather than shipped with a caveat. Nothing here records what an
+agent's code opens.
 
 **The residual, stated exactly.** The private tree is hard to guess and not hard to read: it is the
 same uid, so its 0700 mode stops other users and stops nothing else. The port's own source is
@@ -331,8 +332,9 @@ not configuration. The existing agent image mounts `/root`, `/work` and a read-o
 publishes no ports, so it needs a new image (the pinned interpreter baked in), a new argument
 builder, a fixed container port published to host loopback and read back with `docker port`
 (a container-loopback listener cannot be forwarded, and `--network none` and `-p` are mutually
-exclusive), and container-aware teardown. Until then the journal is what a post-hoc cheat check
-reads, and a run whose scores must survive an adversary needs that container.
+exclusive), and container-aware teardown. Until it lands there is no mitigation, only the closed
+routes above: a run whose scores must survive an adversary needs that container, and a run made
+before it should be read knowing that nothing was watching.
 
 ## Gotchas
 
@@ -343,9 +345,11 @@ reads, and a run whose scores must survive an adversary needs that container.
 - **A different `pulse` is a different experiment.** It fixes the convention and the four stored
   slots for every leg. Scores drawn under two pulses are not comparable, and neither the pulse nor
   the payload class appears anywhere else in a run's record, so every row carries a
-  `config_digest` over both. Reopening a provenance directory under a different one is then
-  visible in the rows. Refusing such a resume belongs to the stream, which is what owns run
-  identity; an env is handed a task and does not know which run it is being served into.
+  `config_digest`, published at inference level: the record keeps it and no feedback policy
+  reveals it, not even the one that reveals everything else. Reopening a provenance directory
+  under a different pulse is then visible in the rows. Refusing such a resume belongs to the
+  stream, which owns run identity; an env is handed a task and does not know which run it is
+  being served into.
 - **`show_tasks` returns a dict**, not a list: seeded requests carry no section, so they arrive
   under `no_section_tasks`. `show_projects` defaults to `page_limit=5`.
 - **The receipt names the task, and the draw is deterministic.** Both payloads print
