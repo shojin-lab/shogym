@@ -1,11 +1,10 @@
 # `frontier_bench` — Frontier-Bench, a Docker task driven as a shell and scored by its own verifier
 
 [**Frontier-Bench**](https://github.com/harbor-framework/frontier-bench) served through shogym at
-upstream release `v0.1.0` — the [Harbor](https://github.com/harbor-framework/harbor) team's
+upstream commit `eb4af26c` — the [Harbor](https://github.com/harbor-framework/harbor) team's
 maintained successor to Terminal-Bench. Each Frontier-Bench task is a **Docker environment** an
-agent operates through a
-shell, plus a **programmatic verifier** that scores the container's end-state (never the
-transcript). This is the **heaviest** shogym port type (Docker-per-task), but Harbor already
+agent operates through a shell, plus a **programmatic verifier** that scores the container's
+end-state (never the transcript). This is the **heaviest** shogym port type (Docker-per-task), but Harbor already
 separates the agent runner from the task/verifier data along *exactly* the seam shogym wants — so
 this port drives the served shell as the agent and reuses the task's own verifier for the verdict.
 
@@ -210,11 +209,14 @@ core-owned terminal evidence, so the transcript cannot influence it.
 
 ## Fidelity & deviations
 
-- **Pinned snapshot.** Frontier-Bench is continuously versioned; this port pins upstream release
-  tag **`v0.1.0`** (`eb4af26c`) and the per-task `sha256` digest recorded in upstream
-  `tasks/dataset.toml`, and vendors the files under [`tasks/`](tasks/). The upstream digest is an
-  OCI/packaging digest (from `harbor add`) recorded as provenance; the loader independently
-  verifies the vendored bytes against a recomputed content hash, and re-pins are deliberate.
+- **Pinned snapshot.** Frontier-Bench is continuously versioned; this port pins upstream commit
+  **`eb4af26c`**, recorded upstream as release tag `v0.1.0`, and the per-task `sha256` digest
+  recorded in upstream `tasks/dataset.toml`, and vendors the runtime files under
+  [`tasks/`](tasks/) (upstream's `maintainer/` tooling is not carried). The repository has since
+  moved to `harbor-framework/terminal-bench` and the `v0.1.0` tag no longer resolves there; the
+  commit does, which is why it is the anchor. The upstream digest is an OCI/packaging digest
+  (from `harbor add`) recorded as provenance; the loader independently verifies the vendored
+  bytes against a recomputed content hash, and re-pins are deliberate.
 - **Sanity-gated slice.** Only tasks this port could Docker-validate ship: for **every**
   vendored task, its own `solution/solve.sh` (the oracle) scores **1** through this port's
   verifier and an empty run (`nop`) scores **0** — the Docker-gated end-to-end test asserts both,

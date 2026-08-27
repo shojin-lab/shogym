@@ -111,9 +111,10 @@ yc_bench = [
     "streamlit>=1.55.0",
     "typer>=0.9",
 ]
-# The Frontier-Bench port (src/shogym/envs/frontier_bench) vendors five task directories from
-# Harbor's Frontier-Bench v0.1.0 byte-for-byte, each guarded by a pinned content hash; the env,
-# the Docker backend and the manifest are shogym code. Its only runtime dependency is a working
+# The Frontier-Bench port (src/shogym/envs/frontier_bench) vendors the runtime files of five
+# Frontier-Bench task directories byte-for-byte, at upstream commit eb4af26c, each guarded by a
+# pinned content hash. Upstream's `maintainer/` tooling is not carried, and the env, the Docker
+# backend and the manifest are shogym code. Its only runtime dependency is a working
 # local **Docker** daemon (a system dependency, not a pip package): the env builds+runs the task's
 # environment container as the served agent's world and runs the task's own verifier container
 # for the 0/1 verdict. The Python code uses stdlib only (subprocess + tomllib), so this extra

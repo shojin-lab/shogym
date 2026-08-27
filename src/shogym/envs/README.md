@@ -108,12 +108,12 @@ extras and the network, so there is nothing left for it to legitimately skip.
 | Env | What it is | README |
 |---|---|---|
 | `wordle_v1` | The reference env-as-center environment — Wordle in the smallest honest form (`guess` + reserved `terminate`, a pure trajectory verifier). No extra deps; runs on core shogym. | [`wordle/README.md`](wordle/README.md) |
-| `tau2_mock`, `tau2_airline`, `tau2_retail`, `tau2_telecom`, `tau2_banking_knowledge` | [τ²-bench](https://github.com/sierra-research/tau2-bench) served through shogym at upstream commit `1d244f5` — tool-using customer-service agents across domains, scored by tau2's own evaluator. Needs the `tau2` extra + tau2 data. | [`tau2/README.md`](tau2/README.md) |
+| `tau2_mock`, `tau2_airline`, `tau2_retail`, `tau2_telecom`, `tau2_banking_knowledge` | [τ²-bench](https://github.com/sierra-research/tau2-bench) served through shogym at upstream source commit `1d244f5`, with domain data from an unversioned `TAU2_DATA_DIR` checkout — tool-using customer-service agents across domains, scored by tau2's own evaluator. Needs the `tau2` extra + tau2 data. | [`tau2/README.md`](tau2/README.md) |
 | `yc_bench` | [YC-Bench](https://github.com/collinear-ai/yc-bench) served through shogym at upstream commit `e7d6067` — operate a simulated AI startup for one year via a single `run_command` tool, scored on survival, funds, and tasks completed. Needs the `yc_bench` extra (deterministic in-process sim — no data or key). | [`yc_bench/README.md`](yc_bench/README.md) |
 | `hle` | [Humanity's Last Exam](https://huggingface.co/datasets/cais/hle) served through shogym — a single-turn, expert-level question answered via one `submit_answer` tool, graded server-side with HLE's own judge prompt (exact-match fast path, then an OpenAI model judge; shogym's first model-graded verifier). Needs the `hle` extra, `OPENAI_API_KEY`, and gated `cais/hle` access. | [`hle/README.md`](hle/README.md) |
 | `browsecomp_plus` | [BrowseComp-Plus](https://github.com/texttron/BrowseComp-Plus) served through shogym at upstream commit `0469490` — answer reasoning-heavy queries against a fixed ~100K-doc corpus via `search` / `get_document` / `submit_answer`, graded by an LLM judge plus deterministic retrieval-recall / citation metrics. Needs the `browsecomp_plus` extra, `OPENAI_API_KEY`, Java 21, and gated dataset access. | [`browsecomp_plus/README.md`](browsecomp_plus/README.md) |
 | `automationbench` | [AutomationBench](https://github.com/zapier/AutomationBench) served through shogym at upstream commit `a321764` — carry out a cross-application business workflow over a fully simulated world of ~47 SaaS apps via an `api` tool surface, scored end-state-only by upstream's own rubric. Needs the `automationbench` extra (offline / deterministic — no key). | [`automationbench/README.md`](automationbench/README.md) |
-| `frontier_bench` | [Frontier-Bench](https://github.com/harbor-framework/frontier-bench) served through shogym at upstream release `v0.1.0` — operate a per-task Docker container through a shell (`exec` / `read_file` / `write_file` / `done`), scored by the task's own verifier over the container end-state. A CPU-only, single-container slice (5 tasks). Needs the `frontier_bench` extra + a local Docker daemon (no key or data download). | [`frontier_bench/README.md`](frontier_bench/README.md) |
+| `frontier_bench` | [Frontier-Bench](https://github.com/harbor-framework/frontier-bench) served through shogym at upstream commit `eb4af26c` — operate a per-task Docker container through a shell (`exec` / `read_file` / `write_file` / `done`), scored by the task's own verifier over the container end-state. A CPU-only, single-container slice (5 tasks). Needs the `frontier_bench` extra + a local Docker daemon (no key or data download). | [`frontier_bench/README.md`](frontier_bench/README.md) |
 
 Runnable end-to-end demos (Claude Code drives a served env; shogym scores off the trace) live
 under [`examples/`](../../../examples/), one per harness. Each serves a
@@ -154,17 +154,18 @@ each env keeps a one-liner and links back to the matching section of this README
 `Layout`. `Requirements`, `Gotchas`, and `Layout` are optional — include them when the env has
 extras / keys / data, sharp edges, or a source map worth drawing.
 
-- **The pin clause is optional.** Name the commit or release when the port pins one. `hle`
-  loads the `cais/hle` split at whatever revision resolves, so its opener drops the clause and
-  the next line names what it loads instead. An opener never implies a pin the code does not
-  make.
+- **The opener summarises the pin; `Fidelity & deviations` is authoritative.** Name the commit
+  or release in the opener when the port pins one, and give the exact pin and its limits below.
+  The clause is optional: `hle` loads the `cais/hle` split at whatever revision resolves, so its
+  opener drops it and the next line names what it loads instead. An opener never implies a pin
+  the code does not make.
 - **`How it works`** always carries `describe → TaskSpec` then `Tools (served over MCP)`, then
   a verifier subsection: **`finalize + verify`** for a seal env (the score terminal seals,
   `finalize` produces the verdict, `verify` reads it) or **`verify`** for a marker/trivial env
   (wordle — a pure verifier over the trajectory, no `finalize`). Use the heading bare: no
   parentheticals, no arrows.
-- **`Fidelity & deviations`** is the one place every deviation from upstream lives: the pinned
-  upstream commit / tag, the retriever / judge / variant / model choices, any deferred scope
-  (multimodal, dense retrieval, keyed variants), and any intentional delta from the original
-  benchmark. Every question of the form "what does this port change" is answered here, and
+- **`Fidelity & deviations`** is the one place every deviation from upstream lives: the exact
+  pinned upstream commit / tag and what it does not cover, the retriever / judge / variant /
+  model choices, any deferred scope (multimodal, dense retrieval, keyed variants), and any
+  intentional delta from the original benchmark. Every question of the form "what does this port change" is answered here, and
   nothing fidelity-related hides in `Gotchas` or `Requirements`.

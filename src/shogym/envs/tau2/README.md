@@ -1,10 +1,11 @@
 # `tau2_*` — τ²-bench, tool-using customer-service agents
 
 [**τ²-bench**](https://github.com/sierra-research/tau2-bench) (Sierra's benchmark for tool-using
-customer-service agents) served through shogym at upstream commit `1d244f5`. tau2 puts an agent
-in a domain (airline, retail, telecom, …) where it uses domain tools and converses with a
-simulated user to resolve a task, then scores the run with a deterministic evaluator (final DB
-state, the actions taken) plus optional NL assertions.
+customer-service agents) served through shogym at upstream source commit `1d244f5`. The domain
+policies, tasks and DBs come from a `TAU2_DATA_DIR` checkout the caller supplies, which shogym
+does not version-check. tau2 puts an agent in a domain (airline, retail, telecom, …) where it
+uses domain tools and converses with a simulated user to resolve a task, then scores the run
+with a deterministic evaluator (final DB state, the actions taken) plus optional NL assertions.
 
 Like every shogym env this **describes** a task, **serves** its tools over MCP, and **verifies**
 a recorded trajectory while an external harness drives the tools — see
@@ -181,6 +182,10 @@ semantics (give each run its own trace file for a guaranteed 1:1 mapping).
   **evaluator** are reused **verbatim** — only the agent is swapped and the shogym-side terminal
   wiring rides on the seal. There are **zero shogym core changes**; the whole port is additive
   under `src/shogym/envs/tau2/`.
+- **Pinned to source commit `1d244f5`.** The pin covers tau2's Python source only. Domain
+  policies, tasks and DBs are loaded from the `TAU2_DATA_DIR` checkout the caller provides, and
+  shogym checks no revision or hash on it, so two runs under the same commit label can serve
+  different benchmark content.
 - **Python 3.12 pin rationale.** The pinned tau2 revision imports the stdlib `audioop` module,
   removed in 3.13 — this is why the shared project pin is `>=3.12,<3.13`.
 - **banking uses `bm25_grep`.** `tau2_banking_knowledge` is pinned to the offline `bm25_grep`

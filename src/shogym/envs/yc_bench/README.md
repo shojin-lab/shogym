@@ -10,11 +10,12 @@ company ends up.
 
 Like every shogym env this **describes** a task, **serves** its tools over MCP, and **verifies**
 a recorded trajectory while an external harness drives the tools — see
-[`../README.md`](../README.md). YC-Bench ships **no agent loop**: it explicitly expects an
-*external driver* to advance the sim, feed CLI results back, and collect the next commands.
-shogym's harness *is* that driver, so the port reuses YC-Bench's sim engine, command
-execution, SQLite state, world seeding and scoring verbatim, and replaces only the *agent* (with
-the harness, through the served tools). The runnable demo is
+[`../README.md`](../README.md). YC-Bench ships its own LLM agent loop (`agent/loop.py`, driven
+by `runner/main.py`) over a sim built to take an *external driver*: something has to advance the
+clock, feed CLI results back, and collect the next commands. shogym's harness is that driver.
+The port reuses YC-Bench's sim engine, CLI entry point and command validation, SQLite ORM, and
+`_init_simulation` world seeding; it replaces the agent loop and supplies the command, terminal
+and scoring layers around them. The runnable demo is
 [`examples/`](../../../../examples/).
 
 ## Running it
@@ -183,12 +184,15 @@ semantics (give each run its own trace file for a guaranteed 1:1 mapping).
 
 ## Fidelity & deviations
 
-- **Verbatim reuse.** YC-Bench's sim engine, command execution/validation, SQLite state, world
-  seeding, and scoring are reused **verbatim** — only the agent is swapped for the harness.
-  There are **zero shogym core changes**; the whole port is additive under
-  `src/shogym/envs/yc_bench/`.
-- **Pinned to a commit SHA.** The extra is pinned to an upstream **commit SHA** — YC-Bench has
-  no stable public API, so a pin makes upstream drift a contained maintenance cost.
+- **What is reused, and what is not.** YC-Bench's sim engine, CLI entry point and command
+  validation, SQLite state/ORM, and `_init_simulation` world seeding are reused **verbatim**.
+  shogym supplies the layers around them: the command wrapper and allowlist (`adapter.run_cli`),
+  the terminal metrics derived off the sim DB (`adapter.read_final_state`), and the `reward` /
+  `success` fields plus the early-submit gate (`env_v1.score_verdict`). The numbers all come
+  from the sim's own rows; the shaping into episode feedback is shogym's. There are **zero
+  shogym core changes**; the whole port is additive under `src/shogym/envs/yc_bench/`.
+- **Pinned to commit `e7d6067`.** YC-Bench has no stable public API, so a commit pin makes
+  upstream drift a contained maintenance cost.
 - **`run` / `start` rejected.** `run_command` allowlists only the operational sub-command
   groups; `yc-bench run` (upstream's own credential-inheriting LLM agent loop) and `yc-bench
   start` (interactive) are rejected before any subprocess spawns — that agent loop is exactly
