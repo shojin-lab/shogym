@@ -1,28 +1,40 @@
-"""The seam between shogym and AppWorld: the pins, the corpus, and one worker per episode.
+"""The seam between shogym and AppWorld: the pins, the corpus, and one container per episode.
 
 **AppWorld cannot be installed beside shogym**, and that is a fact about the two projects rather
 than a packaging preference: ``appworld`` pins ``pydantic<2`` and shogym's MCP layer needs
-``pydantic>=2.7``. No environment satisfies both. So this port provisions an interpreter of its
-own, installs the pinned release into it, and runs every world under it, talking to it over a
-loopback socket (:mod:`shogym.envs.appworld.worker`). The separation the design wanted for
-isolation is the same one packaging forces, so it costs nothing extra.
+``pydantic>=2.7``. No environment satisfies both. It is not installed on the host at all: it lives
+in an image (:mod:`shogym.envs.appworld.container`), and every process that touches it, the
+episode's world included, is a container talking to this one over its own stdin and stdout
+(:mod:`shogym.envs.appworld.worker`). The separation the design wanted for isolation is the same
+one packaging forces, so it costs nothing extra.
 
-Three things are provisioned, and all three are pinned here:
+**And the container is the isolation, not an arrangement of paths.** The code an agent writes runs
+as the worker, so a worker on the host runs it as the user running the run, and everything that
+user can read it can read. The worker has no host path any more. It gets one task's served tree,
+its own output directory, and no network; the run's provenance, the grader's tree, the corpus, the
+repository and every other episode's world are not hidden from it, they are absent.
 
-- **the interpreter**, a virtual environment holding ``appworld`` at :data:`UPSTREAM_VERSION`;
-- **the app sources**, which the wheel ships packed and unpacks on first use;
+Two things are provisioned, and both are pinned here:
+
+- **the image**, digest-pinned to its base and version-pinned to ``appworld`` at
+  :data:`UPSTREAM_VERSION`, with the app sources the wheel ships packed unpacked at build time;
 - **the data bundle**, which is a 33 MB download the package fetches without checking anything.
   This module fetches it itself and refuses a bundle whose digest is not
   :data:`DATA_BUNDLE_SHA256`, because every task, every database and every ground truth in the
   measurement comes out of that file and "we downloaded something from S3" is not a pin.
 
-The corpus is then *derived* rather than used in place. Each served task gets a directory whose
-files are links to the task's own, except the one database log this port rewrites to carry the
-seeded backlog. Deriving costs one small file per task, leaves the downloaded corpus untouched,
-and makes the seeded rows part of the task's input state, which is where they have to be for the
-scenario's own score to survive them.
+The corpus is *not* baked into the image, and that is deliberate rather than an omission: it
+carries every task's ``ground_truth`` beside every task's ``specs.json``, so an image holding it
+would put the answers inside the container that runs the agent's code.
 
-Importing this module imports nothing from upstream. Provisioning happens when an env is built.
+The corpus is then *derived* rather than used in place. Each served task gets a directory whose
+files are hard links to the task's own, except the one database log this port rewrites to carry
+the seeded backlog. Deriving costs one small file per task, leaves the downloaded corpus
+untouched, and makes the seeded rows part of the task's input state, which is where they have to
+be for the scenario's own score to survive them.
+
+Importing this module imports nothing from upstream and starts no container. Provisioning happens
+when an env is built.
 """
 
 from __future__ import annotations
@@ -37,17 +49,23 @@ import select
 import shutil
 import stat
 import subprocess
+import threading
 import time
+<<<<<<< HEAD
 import tempfile
 import sys
+=======
+>>>>>>> f4000d8 (appworld: run the episode worker in a container, over stdio rather than a port)
 import urllib.error
 import urllib.request
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from functools import lru_cache
 from pathlib import Path
-from typing import Any, Dict, Iterator, List, Optional, Sequence, Tuple
+from typing import Any, Dict, List, Sequence, Tuple
 
 from shogym.envs._upstream import _locked
+from shogym.envs.appworld import container
+from shogym.envs.appworld.container import CORPUS_MOUNT, GRADED_MOUNT, OUTPUTS_MOUNT, Mount
 
 # ----- the pins -----
 
@@ -84,12 +102,17 @@ ROOT_ENV_VAR = "APPWORLD_ROOT"
 
 _DOWNLOAD_TIMEOUT_SECONDS = 300.0
 
-#: How long one provisioning subprocess gets: creating the venv, resolving and installing the
-#: pinned release, unpacking the app sources, unpacking the bundle. See :func:`_run`.
-_PROVISION_TIMEOUT_SECONDS = 1800.0
+#: How long one command into a live world may take before the parent stops waiting. Generous,
+#: because a block of agent code may drive the world for a while, and bounded, because a world
+#: wedged in a native call would otherwise hold the episode that sent the command forever.
+_CALL_TIMEOUT_SECONDS = 300.0
 
-#: How long a worker gets to stop after it is signalled, before it is killed. Short: teardown
-#: runs on the shared loop and a wedged world may not hold the others.
+#: How long a worker gets to say it is ready. Generous, because a cold container importing
+#: upstream and its clock-patching library is not fast, and bounded, because a worker that never
+#: speaks would otherwise hang the episode that started it with nothing to read.
+_SPAWN_TIMEOUT_SECONDS = 180.0
+
+#: How long the ``docker run`` client gets to exit after its container has been removed.
 _CLOSE_SECONDS = 10.0
 
 #: How long SIGTERM is given before SIGKILL follows it, whatever happened.
@@ -104,28 +127,25 @@ _TERM_GRACE_SECONDS = 0.5
 #: episode's terminal open for the life of the run.
 _GRADE_TIMEOUT_SECONDS = 600.0
 
-#: How long a worker gets to bind its port and say so. Generous, because a cold interpreter
-#: importing upstream and its clock-patching library is not fast, and bounded, because a worker
-#: that never speaks would otherwise hang the episode that started it with nothing to read.
-_SPAWN_TIMEOUT_SECONDS = 180.0
+#: How long seeding one task's database log gets.
+_SEED_TIMEOUT_SECONDS = 600.0
 
 
 class ProvisioningError(RuntimeError):
-    """A step that builds the interpreter or the corpus failed.
+    """A step that builds the image or the corpus failed.
 
     Its own type because the two things it can mean are far apart: a machine with no network, and
     a pin that no longer resolves. A caller that wants to tolerate the first without hiding the
     second needs to be able to tell this apart from every other failure."""
 
 
-
 def cache_root() -> Path:
     """Where this port keeps what it provisions, as an absolute path.
 
-    Resolved rather than taken as given. A derived corpus is a tree of symlinks whose targets are
-    written verbatim, and a relative target is read relative to the link's own directory rather
-    than to the directory the run was launched from, so a relative cache root produces a tree of
-    links that resolve to nothing."""
+    Resolved rather than taken as given, for two reasons that both end in the same place. A
+    relative path is read relative to whatever directory a process happens to be in, and the
+    processes here are containers whose working directory is a tmpfs; and a bind mount's source
+    has to be absolute or Docker reads it as a named volume and silently mounts an empty one."""
     base = os.environ.get("SHOGYM_CACHE")
     root = Path(base).expanduser().resolve() if base else Path.home() / ".cache" / "shogym"
     return root / "appworld"
@@ -133,299 +153,25 @@ def cache_root() -> Path:
 
 # ----- provisioning -----
 
-WORKER = Path(__file__).with_name("worker.py")
+WORKER = container.WORKER
 
 
-#: What a built runtime says it is, written inside it once it is complete and checked before it is
-#: reused. The name carries the same values; this is for the case a name cannot cover, which is a
-#: tree replaced, restored or half-deleted under a name that still claims the old identity.
-_RUNTIME_FILE = ".shogym-runtime"
+def ensure_image() -> str:
+    """The image every world runs in, building it if this machine does not have it.
 
-#: What a runtime whose app sources have been unpacked says about itself, written inside it once
-#: the unpack has finished. Beside the runtime stamp rather than inside the installed package,
-#: because a runtime that is rebuilt is published by a rename over this directory and takes its
-#: marker with it, and because it can then be read without starting the interpreter to find out
-#: where the package lives (see :func:`ensure_apps`).
-_APPS_FILE = ".shogym-apps"
+    Not a virtual environment any more. ``appworld`` pins ``pydantic<2`` and shogym needs
+    ``pydantic>=2.7``, which used to force an interpreter of its own; it now forces an image of its
+    own, which is the same separation with a boundary around it.
 
-
-def runtime() -> Path:
-    """The interpreter every world runs under, building it if it is not there yet.
-
-    A virtual environment rather than the running one, because ``appworld`` pins ``pydantic<2``
-    and shogym needs ``pydantic>=2.7``: installing it beside shogym is not a thing pip will do,
-    and a port that pretended otherwise would fail at resolve time on every machine. Built with
-    ``uv`` where it is on the path and with the standard library's own tools otherwise, so the
-    port needs no tool the user did not already have.
-
-    **Named for both pins, and reused only against its own stamp.** The old test was that
-    ``bin/python`` existed, which is true of a venv whose install failed after the interpreter was
-    created, of one a later pin change should have rebuilt, and of one somebody edited. The name
-    now carries the version and the commit, and the stamp inside says the same thing, so what is
-    reused is a tree this code finished building under these pins rather than a directory that
-    happens to hold a Python."""
-    home = cache_root() / f"runtime-{UPSTREAM_VERSION}-{UPSTREAM_SHA[:12]}"
-    python = _interpreter(home)
-    if _stamped(home) and python.exists():
-        return python
-    home.parent.mkdir(parents=True, exist_ok=True)
-    # Required, not advisory: the staging tree below has a fixed name and is deleted before it is
-    # written, so two cold builders without exclusion remove and publish each other's half-built
-    # interpreter. See `_upstream._locked`.
-    with _locked(home.parent, required=True):
-        if _stamped(home) and python.exists():
-            return python
-        _build_runtime(home)
-    return python
-
-
-def _runtime_stamp() -> str:
-    """What a runtime built by this code under these pins says about itself."""
-    return json.dumps(
-        {"version": UPSTREAM_VERSION, "sha": UPSTREAM_SHA, "python": _python_series()},
-        sort_keys=True,
-    )
-
-
-def _stamped(home: Path) -> bool:
-    """Whether ``home`` holds this code's own stamp, refusing one that holds a different stamp.
-
-    A missing stamp is a cold cache, or a runtime built by a head that had none, and both are
-    answered by building. A stamp that says something else is a tree under a name that claims an
-    identity it does not have, and the only honest answer to that is to stop: the interpreter is
-    what every world runs under, so serving out of one whose provenance disagrees with its own
-    name would put the disagreement in the scores rather than in an error."""
+    A machine with no Docker daemon fails here as a :class:`ProvisioningError`, which is the type
+    the test gate reads as "not provisioned on this machine" and skips on, and which
+    ``SHOGYM_REQUIRE_UPSTREAM=1`` turns back into a failure. An env constructed on such a machine
+    says so in plainer words first: see :func:`shogym.envs.appworld.container.require_docker`."""
     try:
-        held = (home / _RUNTIME_FILE).read_text().strip()
-    except OSError:
-        return False
-    if held != _runtime_stamp():
-        raise ProvisioningError(
-            f"the appworld runtime at {home} says it was built as {held}, but this run pins "
-            f"{_runtime_stamp()}; the interpreter is what every world runs under, so this refuses "
-            "rather than serving out of it. Remove that directory, or point SHOGYM_CACHE elsewhere"
-        )
-    return True
-
-
-def _build_runtime(home: Path) -> None:
-    """Create the environment, install the pinned release into it, and check what arrived.
-
-    Checked inside the staging tree and stamped there, before the rename that publishes it. So the
-    final name never exists holding an interpreter that failed its own pin, and a builder that
-    dies part way through leaves a staging directory rather than a runtime other processes would
-    reuse."""
-    import shutil
-    import venv
-
-    staging = home.with_name(home.name + ".building")
-    shutil.rmtree(staging, ignore_errors=True)
-    requirement = f"appworld=={UPSTREAM_VERSION}"
-    uv = shutil.which("uv")
-    if uv:
-        _run([uv, "venv", "--python", _python_series(), str(staging)])
-        _run([uv, "pip", "install", "--python", str(_interpreter(staging)), requirement])
-    else:
-        venv.EnvBuilder(with_pip=True).create(str(staging))
-        _run([str(_interpreter(staging)), "-m", "pip", "install", "--quiet", requirement])
-    _check_pin(staging)
-    (staging / _RUNTIME_FILE).write_text(_runtime_stamp())
-    _publish_runtime(staging, home)
-
-
-def _publish_runtime(staging: Path, home: Path) -> None:
-    """Give the staged tree its final name, moving any incumbent aside first.
-
-    ``os.replace`` will not rename a directory over a non-empty one, and there is a way to reach
-    this with something already under the name: a tree that is not one this code stamped is
-    rebuilt rather than reused, and the tree it is rebuilding over is still there. So the
-    incumbent is renamed away and the publish stays the single atomic step it has to be. A worker
-    already running out of the old tree keeps every file it has open, because a rename moves a
-    name and not an inode; what it loses is the ability to open new ones by that path, which is
-    the same thing it would lose to any rebuild.
-
-    Removing the incumbent afterwards is housekeeping and is allowed to fail: the publish has
-    already happened by then, and a directory left behind costs disk rather than correctness."""
-    displaced = home.with_name(f"{home.name}.replaced.{os.getpid()}.{secrets.token_hex(8)}")
-    if home.exists():
-        os.replace(home, displaced)
-    os.replace(staging, home)
-    shutil.rmtree(displaced, ignore_errors=True)
-
-
-def _check_pin(home: Path) -> None:
-    """Refuse a runtime whose installed ``appworld`` is not the pinned release.
-
-    The requirement string asks for one version and the resolver is what answers; a build that
-    resolved something else, or an index that moved under the name, would otherwise be served
-    under a cache name that says the pin was honored. Read off the distribution metadata rather
-    than by running the interpreter, so a broken install fails here rather than at the first
-    episode.
-
-    **This is the whole of what the pins can be checked against, and it is half of one of them.**
-    The wheel carries no record of the commit it was cut from, so :data:`UPSTREAM_SHA` is not
-    verifiable here or anywhere else on this machine (see the pins). What covers the realized code
-    is :func:`runtime_digest`, which reads the bytes rather than the label."""
-    found = sorted(
-        entry.name[: -len(".dist-info")]
-        for packages in _site_packages(home)
-        for entry in packages.iterdir()
-        if entry.name.startswith("appworld-") and entry.name.endswith(".dist-info")
-    )
-    if found != [f"appworld-{UPSTREAM_VERSION}"]:
-        raise ProvisioningError(
-            f"the appworld runtime at {home} installed {found or 'no appworld distribution'}, "
-            f"but this port pins appworld=={UPSTREAM_VERSION}; every task, every database and "
-            "every ground truth in the measurement is read by this interpreter, so a release "
-            "nobody asked for is refused rather than served"
-        )
-
-
-def _site_packages(home: Path) -> List[Path]:
-    """The provisioned interpreter's ``site-packages`` directories, in a stable order.
-
-    Both layouts, because the port names an interpreter and not a platform: POSIX venvs put it
-    under ``lib/pythonX.Y/`` and Windows ones under ``Lib/``. One definition, because the pin
-    check and the runtime digest have to be looking at the same tree."""
-    found = list(home.glob("lib/python*/site-packages")) + list(home.glob("Lib/site-packages"))
-    return sorted(path for path in found if path.is_dir())
-
-
-def _interpreter(home: Path) -> Path:
-    return home / ("Scripts" if os.name == "nt" else "bin") / "python"
-
-
-def _python_series() -> str:
-    """The Python this port asks for, matching the one shogym is running under."""
-    return f"{sys.version_info.major}.{sys.version_info.minor}"
-
-
-def _run(command: list, *, timeout: float = _PROVISION_TIMEOUT_SECONDS) -> None:
-    """Run a provisioning command, and say what it was if it fails or if it never finishes.
-
-    **Bounded, because every one of these is a network call wearing a subprocess.** A ``pip
-    install`` against an index that accepts the connection and then stops sending has no timeout of
-    its own, and neither does an unpack whose child wedged. Construction is what waits on this, and
-    a construction that never returns is a queue that never starts and a run that reports nothing
-    at all, which is strictly worse than a run that says which command hung. The bound is generous
-    on purpose: it is a liveness bound and not a performance one, so a cold resolve on a slow link
-    stays inside it and a wedge does not."""
-    try:
-        finished = subprocess.run(command, capture_output=True, text=True, timeout=timeout)
-    except subprocess.TimeoutExpired as expired:
-        # `subprocess.run` has already killed and reaped the child by the time this is raised.
-        raise ProvisioningError(
-            f"provisioning the appworld runtime timed out after {timeout:.0f}s: "
-            f"{' '.join(command)}"
-        ) from expired
-    if finished.returncode != 0:
-        raise ProvisioningError(
-            f"provisioning the appworld runtime failed: {' '.join(command)}\n"
-            f"{finished.stderr.strip()[-2000:]}"
-        )
-
-
-def ensure_apps() -> None:
-    """Unpack the app sources the wheel ships packed, if they are not unpacked already.
-
-    A fresh install has ``appworld.apps`` with the shared library in it and none of the nine
-    apps, so the first import of a model module fails with a plain ``ModuleNotFoundError`` that
-    says nothing about the missing step. Idempotent, and silent when there is nothing to do.
-
-    **What says it is done is a stamp written after the unpack returned, not a file the unpack
-    happens to create early.** The test used to be that ``apps/todoist/models.py`` existed.
-    Upstream's ``install_package`` goes on doing in-place work after the individual app files are
-    there, and the runtime is already published and stamped by the time this runs, so an unpack
-    interrupted anywhere after that one file appeared left a runtime every later construction
-    skipped: a half-unpacked interpreter under a name and a stamp that both say it is finished.
-    The stamp below is written only once the unpacking subprocess has exited zero, so what is
-    trusted is a completed unpack rather than a step of one.
-
-    **And it is read before the interpreter is asked anything**, which is what makes the warm path
-    free. Locating the installed package means importing ``appworld`` in a subprocess, and that is
-    most of a second on every env construction; the stamp lives in the runtime's own directory, so
-    a runtime that has been unpacked is recognised without starting a process at all."""
-    python = runtime()
-    marker = python.parent.parent / _APPS_FILE
-    if _apps_unpacked(marker):
-        return
-    installed = _installed_package(python)
-    # Required: this one unpacks *in place*, into the interpreter every world runs under, so two
-    # unpackers without exclusion are two processes writing one tree. There is no staging name to
-    # publish from and no rename to make it atomic.
-    with _locked(installed, required=True):
-        if _apps_unpacked(marker):
-            return
-        _run([str(python), str(WORKER), "install"])
-        _mark_apps(marker)
-
-
-def _apps_stamp() -> str:
-    """What a runtime whose app sources are unpacked says about itself."""
-    return json.dumps({"version": UPSTREAM_VERSION, "sha": UPSTREAM_SHA, "apps": "unpacked"})
-
-
-def _apps_unpacked(marker: Path) -> bool:
-    """Whether this runtime's apps were unpacked by a run that got to the end of the unpack.
-
-    Anything other than this code's own stamp reads as not done and is answered by unpacking
-    again, which is idempotent. There is no refusal here of the kind :func:`_stamped` makes: the
-    runtime directory the marker sits in already carries the pins in its name and in its own
-    stamp, so a marker that says something else is a leftover rather than a claim to be an
-    interpreter this run did not build."""
-    try:
-        return marker.read_text().strip() == _apps_stamp()
-    except OSError:
-        return False
-
-
-def _mark_apps(marker: Path) -> None:
-    """Record that the unpack finished, whole or not at all.
-
-    Written to a name of this process's own and renamed into place, because a marker written
-    directly is a name that exists before it holds anything: a crash between the create and the
-    write leaves a file that is not this stamp, which reads as unfinished and unpacks again, and a
-    concurrent reader would see the same. ``os.replace`` is atomic within a directory."""
-    staged = marker.with_name(f"{marker.name}.{os.getpid()}.{secrets.token_hex(8)}")
-    staged.write_text(_apps_stamp())
-    os.replace(staged, marker)
-
-
-#: How long the provisioned interpreter gets to import ``appworld`` and say where it lives.
-#:
-#: Bounded for the reason :func:`_run` is bounded, and it is the same reason stated about a
-#: different subprocess: env construction waits on this one, and a construction that never returns
-#: is a queue that never starts and a run that reports nothing at all. Generous, because it is a
-#: cold import of a large package on a machine that may just have installed it.
-_IMPORT_TIMEOUT_SECONDS = 300.0
-
-
-def _installed_package(python: Path) -> Path:
-    """Where ``appworld`` sits inside the provisioned interpreter.
-
-    **Under a deadline**, which it was not. This starts a process and waits for it with no bound,
-    on an interpreter that was provisioned rather than shipped: an import that wedges on a broken
-    shared library or a filesystem that stopped answering held construction open for the life of
-    the run, before any task existed to file a timeout row against."""
-    try:
-        finished = subprocess.run(
-            [str(python), "-c", "import appworld, os; print(os.path.dirname(appworld.__file__))"],
-            capture_output=True,
-            text=True,
-            timeout=_IMPORT_TIMEOUT_SECONDS,
-        )
-    except subprocess.TimeoutExpired as expired:
-        # `subprocess.run` has already killed and reaped the child by the time this is raised.
-        raise ProvisioningError(
-            f"the provisioned appworld runtime at {python} did not finish importing appworld "
-            f"within {_IMPORT_TIMEOUT_SECONDS:.0f}s"
-        ) from expired
-    if finished.returncode != 0:
-        raise ProvisioningError(
-            f"the provisioned appworld runtime cannot import appworld:\n"
-            f"{finished.stderr.strip()[-2000:]}"
-        )
-    return Path(finished.stdout.strip())
+        container.require_docker()
+        return container.ensure_image(cache=cache_root())
+    except container.DockerError as exc:
+        raise ProvisioningError(f"the appworld worker image is not available: {exc}") from exc
 
 
 def ensure_corpus() -> Path:
@@ -443,17 +189,12 @@ def ensure_corpus() -> Path:
     if (root / "data" / "tasks").is_dir():
         return root
     root.parent.mkdir(parents=True, exist_ok=True)
-    # Both of these take the same lock, on this port's own cache directory, and an ``flock`` taken
-    # twice through two opens in one process blocks on itself. So the interpreter and the app
-    # sources are provisioned *before* the corpus lock is taken, never inside it. A genuinely cold
+    # The image build and the corpus fetch take the same lock, on this port's own cache directory,
+    # and an ``flock`` taken twice through two opens blocks on itself even inside one process. So
+    # the image is built *before* the corpus lock is taken, never inside it. A genuinely cold
     # machine takes exactly this path.
-    runtime()
-    ensure_apps()
-    # Required, for the reason the runtime's lock is: `_fetch_corpus` stages under a fixed
-    # `.building` name it deletes first, so two cold fetchers without exclusion delete and publish
-    # each other's half-unpacked corpus, and the corpus is the material every score is computed
-    # against.
-    with _locked(root.parent, required=True):
+    ensure_image()
+    with _locked(root.parent):
         if (root / "data" / "tasks").is_dir():
             return root
         _fetch_corpus(root)
@@ -463,13 +204,10 @@ def ensure_corpus() -> Path:
 def _fetch_corpus(root: Path) -> None:
     """Download, verify and unpack the pinned bundle into ``root``.
 
-    Unpacked by the provisioned interpreter, because the bundle is an encrypted archive whose
-    format is upstream's business. What this function owns is the check in front of it. The
-    interpreter is provisioned by the caller, outside this function's lock (see
+    Unpacked by a container, because the bundle is an encrypted archive whose format is upstream's
+    business and upstream is not installed on this machine. What this function owns is the check in
+    front of it. The image is built by the caller, outside this function's lock (see
     :func:`ensure_corpus`)."""
-    import shutil
-
-    python = runtime()
     staging = root.with_name(root.name + ".building")
     shutil.rmtree(staging, ignore_errors=True)
     staging.mkdir(parents=True)
@@ -477,13 +215,36 @@ def _fetch_corpus(root: Path) -> None:
     with urllib.request.urlopen(DATA_BUNDLE_URL, timeout=_DOWNLOAD_TIMEOUT_SECONDS) as response:
         bundle.write_bytes(response.read())
     _verify(bundle)
-    _run([str(python), str(WORKER), "unpack", "--bundle", str(bundle), "--into", str(staging)])
+    _unpack_in_container(staging, bundle.name)
     bundle.unlink()
     if not (staging / "data" / "tasks").is_dir():
         raise ProvisioningError(
             f"the bundle at {DATA_BUNDLE_URL} unpacked without a data/tasks tree"
         )
     os.replace(staging, root)
+
+
+def _unpack_in_container(staging: Path, bundle_name: str) -> None:
+    """Open the verified bundle inside the worker image, into the staging directory."""
+    work = "/work"
+    process, name = container.run(
+        role="unpack",
+        arguments=["--bundle", f"{work}/{bundle_name}", "--into", work],
+        mounts=[Mount(staging, work, writable=True)],
+    )
+    try:
+        finished = process.wait(timeout=_DOWNLOAD_TIMEOUT_SECONDS)
+    except subprocess.TimeoutExpired:
+        container.remove(name)
+        process.kill()
+        raise ProvisioningError(
+            f"unpacking the data bundle did not finish within {_DOWNLOAD_TIMEOUT_SECONDS:.0f}s"
+        ) from None
+    finally:
+        _close_pipes(process)
+    if finished != 0:
+        container.remove(name)
+        raise ProvisioningError(f"unpacking the data bundle failed (status {finished})")
 
 
 def _verify(bundle: Path) -> None:
@@ -565,204 +326,37 @@ def runtime_digest() -> str:
 # ----- the derived corpus -----
 
 
-#: Bumped when the shape of a derived tree changes: what is copied, what is linked, and what a
-#: task carries to say it is whole. It is part of a cache's name and of its stamp, so a tree built
-#: under an older layout is a different cache rather than one this code will read as its own.
-DERIVATION_VERSION = 3
+def derived_root() -> Path:
+    """Where the seeded copy of the corpus lives, named for what generated it.
 
-#: What a derived cache was built from, written inside it once it is complete.
-_SOURCE_FILE = ".shogym-source"
-
-
-def derived_root(source: Optional[str] = None, *, runtime: Optional[str] = None) -> Path:
-    """Where the seeded copy of the corpus lives, named for what it was built from.
-
-    Four things are in the name, and each of them changes what the tree holds. The generator
-    digest covers the backlog generator's constants *and its implementation*, so changing a cut
-    value, an option set, the number of requests or the code that draws them derives a new corpus
-    instead of serving a stale one. The derivation version covers the *layout*: what is copied,
-    what is linked, and what a task carries to say it is whole. The runtime digest covers the
-    interpreter that wrote the seeded rows, because it is the interpreter and not this process that
-    writes them: a task's database file is a replayable statement log written through upstream's
-    own model layer, so a pin that changed how a row is serialized changed the world under a name
-    that had not moved. And the source digest covers the corpus this was derived from, which used to be
-    missing entirely: ``APPWORLD_ROOT`` takes any directory with a ``data/tasks`` in it, so a
-    process pointed at a second corpus computed a fingerprint for that one and then reused and
-    served task material derived from the first.
-
-    ``runtime`` is passed in rather than read, for the reason ``source`` is: an env reads it once
-    at construction and hands the same value to both roots and to its own fingerprint, so the
-    three cannot disagree, and a caller that only wants to name a path does not have to."""
-    return cache_root() / f"seeded-{DATA_VERSION}-{DERIVATION_VERSION}-{_source(source, runtime)}"
+    The name carries a digest of the backlog generator's own constants, so changing a cut value,
+    an option set or the number of requests derives a new corpus instead of serving a stale one
+    that was built under the old ones."""
+    return cache_root() / f"seeded-{DATA_VERSION}-{_generator_digest()}"
 
 
 def private_home() -> Path:
     """The directory holding everything an agent's world must not be handed.
 
-    Not a sibling of the served root and not under this port's ordinary cache, because the served
-    root's own path is in the worker's environment and a neighbour of it is a guess away."""
+    Kept out of this port's ordinary cache, and now also out of every mount an episode's container
+    is given, which is the half that makes it a boundary rather than a hiding place."""
     base = cache_root().parent
     return base.parent / f"{base.name}-private" / "appworld"
 
 
-def graded_root(source: Optional[str] = None, *, runtime: Optional[str] = None) -> Path:
+def graded_root() -> Path:
     """Where the grader's view of the corpus lives: a private directory with an unguessable name.
 
-    **This raises the cost of finding it and does not close the route.** The worker runs as the
-    same user as the process that built this, so no directory mode keeps it out: 0700 stops other
-    users and stops nothing else. What closes it is a namespace in which the directory is not
-    mounted at all, which is a container and is not built here (see the port's README). What this
-    does is stop the tree being derivable from what the worker is given, which the previous
-    layout, a fixed name beside the served root, was."""
+    The unguessable name is now belt to the container's braces. It used to be the whole of the
+    defence, and the port said so: the worker ran as the user who built this, so no directory mode
+    kept it out and only the cost of finding it was raised. The episode's container mounts one
+    task's served tree and nothing else, so this directory is not on a filesystem the world can
+    see, whatever its name."""
     home = private_home()
-    return (
-        home
-        / f"graded-{DATA_VERSION}-{DERIVATION_VERSION}-{_source(source, runtime)}-{_private_tag()}"
-    )
+    return home / f"graded-{DATA_VERSION}-{_generator_digest()}-{_private_tag()}"
 
 
-def _read_tag(keyfile: Path) -> Optional[str]:
-    """The published tag, or ``None`` if there is not a complete one there yet."""
-    try:
-        tag = keyfile.read_text().strip()
-    except FileNotFoundError:
-        return None
-    return tag if len(tag) == 16 else None
-
-
-def _source(source: Optional[str], runtime: Optional[str] = None) -> str:
-    """Everything but the layout that a cache name is keyed by: the generator, the interpreter
-    that ran it, and the corpus it read.
-
-    The arguments exist so that the env reads each of these once and hands the same values to both
-    roots and to its own fingerprint; the defaults are for callers that only want to name a path
-    (tests, tooling) and would otherwise have to reach for the corpus and the runtime
-    themselves."""
-    return "-".join(
-        (
-            _generator_digest(),
-            runtime if runtime is not None else runtime_digest(),
-            source or corpus_digest(ensure_corpus()),
-        )
-    )
-
-
-def stamp_cache(root: Path, *, source: str, runtime: str) -> None:
-    """Record what a derived cache was built from, and refuse one built from something else.
-
-    The name already carries the same values, so this cannot normally disagree. It is here for the
-    case the name cannot cover: a tree edited, moved or restored in place under a name that still
-    claims the old identity. A cache is the material a run is scored against, and the failure mode
-    without this is silent, so the check is worth one file read per construction.
-
-    Published by link rather than written in place, for the reason :func:`world._publish` gives:
-    two cold processes reach this together and the loser must find the winner's whole stamp rather
-    than half of its own."""
-    root.mkdir(parents=True, exist_ok=True)
-    stamp = root / _SOURCE_FILE
-    material = json.dumps(
-        {
-            "source": source,
-            "runtime": runtime,
-            "generator": _generator_digest(),
-            "derivation": DERIVATION_VERSION,
-            "data": DATA_VERSION,
-        },
-        sort_keys=True,
-    )
-    held = ""
-    try:
-        held = stamp.read_text().strip()
-    except OSError:
-        held = ""
-    if held:
-        if held != material:
-            raise ProvisioningError(
-                f"the derived cache at {root} says it was built from {held}, but this run serves "
-                f"{material}; a cache is the material a run is scored against, so this refuses "
-                "rather than reusing it. Remove that directory, or point SHOGYM_CACHE elsewhere"
-            )
-        return
-    staged = root / f"{_SOURCE_FILE}.{os.getpid()}.{secrets.token_hex(8)}"
-    try:
-        staged.write_text(material)
-        os.link(staged, stamp)
-    except FileExistsError:
-        # Another process published first. Its stamp is the one that counts, and it is checked
-        # rather than trusted: this is the same comparison as above.
-        if stamp.read_text().strip() != material:
-            raise ProvisioningError(
-                f"the derived cache at {root} was stamped by another process with a different "
-                "identity while this one was building it"
-            ) from None
-    finally:
-        try:
-            staged.unlink()
-        except OSError:
-            pass
-
-
-@dataclass(frozen=True)
-class CorpusSnapshot:
-    """One reading of a corpus: what it held, the authored text it held, and how to prove it still
-    holds it.
-
-    The first two travel together because they have to be one observation. A digest and a later
-    ``specs.json`` read are two, and the gap between them is a corpus that can change: the env
-    fixed its fingerprint and its cache names from the first and then went on serving instructions
-    and dates read from the second, so an in-place edit served authored text under an identity
-    that had never seen it. Here the spec is parsed from the very bytes the digest was computed
-    over, so ``digest`` states what ``specs`` came from and there is no window between them to
-    edit.
-
-    **``units`` is what closes the same gap for everything the digest is not made of.** Holding a
-    task's *text* was never enough: derivation copies a task's databases and its ground truth out
-    of the live corpus, and it copies the shared base out of it too, so a corpus edited after
-    construction could still put changed bytes into a served world and into the tree it is graded
-    against, under the unchanged ``config_digest`` computed before the edit. Rehashing all 183 MB
-    before every task is a second and a half nobody can pay per episode. So the one walk that
-    computes the whole digest also records a digest per *unit*, a unit being one task or one
-    top-level entry of ``data``, and derivation checks the unit it is about to read (see
-    :meth:`verify`)."""
-
-    #: What the whole of ``data`` held, as sixteen hex characters.
-    digest: str
-    #: Task id to its shipped specification, for the tasks that were asked for and no others.
-    specs: Dict[str, Dict[str, Any]]
-    #: Unit name to what that unit held, as sixteen hex characters. A unit is ``tasks/<task_id>``
-    #: or a top-level name under ``data``; the whole corpus is partitioned by them.
-    units: Dict[str, str]
-
-    def verify(self, root: Path, unit: str) -> None:
-        """Refuse to derive from bytes that are not the ones this snapshot read.
-
-        **What this verifies:** that every regular file under ``data/<unit>`` of the corpus at
-        ``root`` is byte-for-byte what it was when this snapshot was taken, path for path. For a
-        task that is its ``specs.json``, its databases and its ground truth, which is the whole of
-        what deriving that task reads. For a shared entry it is every file of it.
-
-        **What it does not:** anything outside the named unit, and the instant after it returns. A
-        corpus edited *during* the derivation it guards is not covered, and cannot be by anything
-        short of a copy taken under the same lock. What it removes is the window that mattered,
-        which was measured in minutes and episodes rather than in the microseconds between this
-        check and the read that follows it: an env states its identity once at construction and
-        then derives tasks lazily, first-use, for as long as the run lasts.
-
-        Cost is the unit's own size: about a millisecond for a task's 32 KB, paid once per task on
-        the cold path and never on the warm one, because derivation asks nothing of a task that is
-        already on disk."""
-        held = self.units.get(unit)
-        found = _unit_digest(root / "data", unit)
-        if held is None or found != held:
-            raise ProvisioningError(
-                f"the corpus at {root} no longer holds the {unit} this run was built against "
-                f"(read as {held or 'absent'}, now {found or 'absent'}); every task, every "
-                "database and every ground truth in the measurement comes out of these bytes, so "
-                "this refuses to derive from them rather than serving a world the run's identity "
-                "has never seen"
-            )
-
-
+@lru_cache(maxsize=4)
 def corpus_digest(root: Path) -> str:
     """What the corpus at ``root`` actually holds, as sixteen hex characters.
 
@@ -771,48 +365,13 @@ def corpus_digest(root: Path) -> str:
     otherwise be served under a name that claims to be the pinned one, and would reuse a derived
     tree built from something else.
 
-    **Every scoring-relevant file is read, not sized.** This once hashed `specs.json` in full and
-    took path and size for everything else, which left the ground truth and the evaluation
-    material identifiable only by length: a same-length edit to an answer key passed unnoticed
-    under a digest whose whole job is to say what the corpus holds. A size is not a summary of
-    contents, and a fingerprint that says it covers the scoring inputs has to have read them.
-
-    **Everything under ``data`` is read, not only the tasks.** This once covered ``version.txt``
-    and the task tree, which left out ``base_dbs``, ``datasets`` and ``api_docs`` entirely. Those
-    are 134 MB of starting state and documentation that every episode reads as input: a world
-    built on different base databases is a different world, and a digest whose job is to say what
-    the corpus holds cannot leave out the largest thing in it.
-
-    **Not memoized, deliberately.** It was cached on the root path, so a corpus that changed under
-    one path during a process kept the digest it had when the process first looked, which is the
-    one case the cache would have had to answer. The env computes this once in its constructor and
-    keeps the value; the cost is about two seconds on a fresh corpus, dominated by the fourteen
-    thousand small files in the task tree, and it is the price of the digest meaning what it
-    says."""
-    return corpus_snapshot(root, task_ids=()).digest
-
-
-def corpus_snapshot(root: Path, *, task_ids: Sequence[str]) -> CorpusSnapshot:
-    """Read the corpus at ``root`` once: its digest, and the specs of the tasks named.
-
-    One walk rather than two, and that is the point rather than an optimization. The specs are
-    parsed out of the same bytes the digest is computed from, as they are read, so a caller that
-    holds both holds one statement about one corpus at one instant. See :class:`CorpusSnapshot`
-    for what the two-observation version let through.
-
-    A named task whose spec the walk never reached is a manifest and a corpus that disagree, which
-    is refused here rather than at the two-hundredth episode of a run.
-
-    **The same walk also records what each unit held on its own**, so that a derivation months of
-    episodes later can prove the bytes it is about to copy are still the ones this reading saw
-    without rehashing the corpus (see :meth:`CorpusSnapshot.verify`). It costs a second hash
-    update over bytes already in memory, about a tenth of a second on this corpus, and a
-    dictionary of a few hundred entries."""
+    Read in full for the files that decide what a task is and what it is scored against, and by
+    name and size for the databases, which are 179 MB and would make this a minute of reading on
+    every construction. A database edited without changing its length is therefore not caught, and
+    that is the honest limit of this digest rather than a claim it does not make."""
     digest = hashlib.sha256()
     data = root / "data"
-    wanted = set(task_ids)
-    specs: Dict[str, Dict[str, Any]] = {}
-    units: Dict[str, Any] = {}
+<<<<<<< HEAD
     for path in sorted(data.rglob("*")):
         if path.is_symlink():
             # **Refused rather than skipped.** A skipped link is a file the digest does not cover
@@ -825,131 +384,31 @@ def corpus_snapshot(root: Path, *, task_ids: Sequence[str]) -> CorpusSnapshot:
                 f"the corpus at {root} contains a symbolic link ({path.relative_to(data)}), and "
                 "this port cannot state the identity of a tree whose contents are somewhere else"
             )
+=======
+    version = data / "version.txt"
+    digest.update(version.read_bytes() if version.exists() else b"")
+    for path in sorted((data / "tasks").rglob("*")):
+>>>>>>> f4000d8 (appworld: run the episode worker in a container, over stdio rather than a port)
         if not path.is_file():
             continue
-        relative = path.relative_to(data)
-        # `tasks/<task_id>/specs.json` and nothing else: a `specs.json` anywhere else in the tree
-        # is not a task's, and a task not asked for is not read into memory.
-        keeping = (
-            relative.parts[:1] == ("tasks",)
-            and len(relative.parts) == 3
-            and relative.parts[2] == "specs.json"
-            and relative.parts[1] in wanted
-        )
-        unit = units.setdefault(_unit_of(relative), hashlib.sha256())
-        kept = _absorb((digest, unit), str(relative), path, keep=keeping)
-        if keeping:
-            specs[relative.parts[1]] = json.loads(kept)
-    missing = sorted(wanted - set(specs))
-    if missing:
-        raise ProvisioningError(
-            f"the corpus at {root} has no specification for {len(missing)} of the tasks this port "
-            f"serves (first: {missing[0]}); the manifest at {MANIFEST} and this corpus are not "
-            "describing the same split"
-        )
-    return CorpusSnapshot(
-        digest=digest.hexdigest()[:16],
-        specs=specs,
-        units={name: unit.hexdigest()[:16] for name, unit in units.items()},
-    )
-
-
-def _unit_of(relative: Path) -> str:
-    """Which unit of a corpus a file belongs to: its task, or its top-level entry.
-
-    One task per unit rather than one for the whole task tree, because that is the granularity
-    derivation works at: a task is materialised on its first use and the rest of the tree is not
-    touched, so a check at task granularity is a millisecond and a check at tree granularity is a
-    second and a half."""
-    head, *rest = relative.parts
-    if head == "tasks" and rest:
-        return f"tasks/{rest[0]}"
-    return head
-
-
-def _absorb(
-    material: "Sequence[Any]", relative: str, path: Path, *, keep: bool = False
-) -> bytes:
-    """Fold one file's name and content into every hasher given, and hand back the bytes if asked.
-
-    One definition, used by the walk that reads a whole corpus and by the check that re-reads one
-    unit of it. They have to agree byte for byte on what a file contributes or the second would
-    report a corpus that never changed as changed, and a check that cries wolf is a check somebody
-    turns off."""
-    for hasher in material:
-        hasher.update(relative.encode())
-    kept: List[bytes] = []
-    with path.open("rb") as handle:
-        while True:
-            block = handle.read(1 << 20)
-            if not block:
-                break
-            for hasher in material:
-                hasher.update(block)
-            if keep:
-                kept.append(block)
-    return b"".join(kept)
-
-
-def _unit_digest(data: Path, unit: str) -> Optional[str]:
-    """Re-read one unit of a corpus exactly as :func:`corpus_snapshot` read it.
-
-    ``None`` where there is nothing readable to state a digest over: the unit is gone, or
-    something in it is a symbolic link, which the whole-corpus walk refuses outright rather than
-    hashes. Both are answered by the caller as a mismatch, because a unit that cannot be read is
-    not a unit that was proved unchanged."""
-    top = data / unit
-    try:
-        mode = top.lstat().st_mode
-    except OSError:
-        return None
-    if stat.S_ISLNK(mode):
-        return None
-    material = hashlib.sha256()
-    paths = sorted(top.rglob("*")) if stat.S_ISDIR(mode) else [top]
-    for path in paths:
-        if path.is_symlink():
-            return None
-        if not path.is_file():
-            continue
-        try:
-            _absorb((material,), str(path.relative_to(data)), path)
-        except OSError:
-            return None
-    return material.hexdigest()[:16]
+        digest.update(str(path.relative_to(data)).encode())
+        if path.name == "specs.json":
+            digest.update(path.read_bytes())
+        else:
+            digest.update(str(path.stat().st_size).encode())
+    return digest.hexdigest()[:16]
 
 
 def episode_outputs(session_id: str) -> Path:
-    """One episode's own output tree, named for the episode and not under the private home.
+    """One episode's own output tree, under the private home and named for the episode.
 
-    AppWorld joins its experiment name onto its own output root, so an absolute name replaces that
-    root outright. That is what keeps an episode's end state, its logs and anything the evaluator
-    leaves behind out of the corpus tree every other episode is served from. A shared output tree
-    is a place the other arm of a pair can read an earlier grade.
-
-    **Deliberately not a child of** :func:`private_home`. The runtime keeps this value on the live
-    AppWorld object, where agent-authored code can read it, so whatever directory it names is
-    named *to the agent*. Under the private home it named the grader's own parent, and the
-    unguessable tag that protects the grader stops protecting it once something hands the name
-    over. This tree is separate: reading it tells you where episode outputs go and nothing about
-    where the answers are.
-
-    The name is still absolute, so on the host this remains a path the worker's user could reach
-    if it went looking. Making it unreachable is the container's job (see the PR that runs the
-    worker in its own mount namespace); what belongs here is not handing over the address."""
-    home = episodes_home()
+    Outside every served corpus, and mounted alone into the two containers that need it. Upstream's
+    evaluator writes a report quoting the requirement prose and the values behind it, and a shared
+    output tree is a place the other arm of a pair can read an earlier grade; a per-episode tree
+    that no other episode's container mounts is a place nothing else can read at all."""
+    home = private_home() / f"episodes-{DATA_VERSION}-{_private_tag()}"
     home.mkdir(parents=True, exist_ok=True)
     return home / f"episode-{session_id}"
-
-
-def episodes_home() -> Path:
-    """Where per-episode output trees live: this port's ordinary cache, not the private one."""
-    return cache_root() / f"episodes-{DATA_VERSION}"
-
-
-def episode_view(session_id: str) -> Path:
-    """The root of one episode's own served corpus (see :func:`~world.derive_view`)."""
-    return cache_root() / f"views-{DATA_VERSION}" / f"view-{session_id}"
 
 
 @lru_cache(maxsize=1)
@@ -962,34 +421,22 @@ def _private_tag() -> str:
     home.mkdir(parents=True, exist_ok=True)
     os.chmod(home, 0o700)
     keyfile = home / ".tag"
-    existing = _read_tag(keyfile)
-    if existing is not None:
-        return existing
-    # Written whole, then published by rename. An exclusive create publishes the *name* before the
-    # bytes, so a concurrent reader could see a real file holding nothing, and a crash in the gap
-    # left that empty file behind for good. `os.replace` is atomic within a directory, so the name
-    # appears only once it already holds a complete tag.
-    tag = secrets.token_hex(8)
-    staged = home / f".tag.{os.getpid()}.{tag}"
-    handle = os.open(staged, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+    # Created exclusively, and a loser reads the winner's value rather than keeping its own. Two
+    # processes that each kept their own would name two private trees, and a private tree is a
+    # copy of the corpus: the cost of getting this wrong is 134 MB and a rebuild, per loser.
     try:
+        handle = os.open(keyfile, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+    except FileExistsError:
+        tag = keyfile.read_text().strip()
+        if len(tag) == 16:
+            return tag
+        raise RuntimeError(f"the private tag at {keyfile} is not a tag; remove it to rebuild")
+    try:
+        tag = secrets.token_hex(8)
         os.write(handle, tag.encode())
-        os.fsync(handle)
     finally:
         os.close(handle)
-    try:
-        # A loser takes the winner's tag rather than keeping its own: two processes that each kept
-        # theirs would name two private trees, and a private tree is a copy of the corpus, so the
-        # cost of getting this wrong is 134 MB and a rebuild for every loser.
-        os.link(staged, keyfile)
-    except FileExistsError:
-        pass
-    finally:
-        os.unlink(staged)
-    published = _read_tag(keyfile)
-    if published is None:
-        raise RuntimeError(f"the private tag at {keyfile} is not a tag; remove it to rebuild")
-    return published
+    return tag
 
 
 #: The modules that generate a world, from which the rest of the generator is reached. Between
@@ -1159,15 +606,45 @@ def _generator_digest() -> str:
 
 
 class WorkerError(RuntimeError):
-    """The worker refused a command, or the world raised inside one."""
+    """The worker refused a command, the world raised inside one, or the container went away."""
 
 
-#: What a worker's environment is allowed to carry. Agent-authored code runs as that process, so
-#: everything the serving process holds is otherwise one ``os.environ`` away from it: provider
-#: keys, the run's own paths, whatever the operator exported. The list is what a Python process
-#: needs to start and no more, and ``HOME`` and the caches are pointed at a scratch directory of
-#: the episode's own.
-_ENV_ALLOW_LIST: Tuple[str, ...] = ("PATH", "LANG", "LC_ALL", "LC_CTYPE", "SYSTEMROOT", "TMPDIR")
+class _Frames:
+    """Length-prefixed frames off a pipe, with a deadline on every read.
+
+    A buffer of its own rather than a :class:`io.BufferedReader`, because a deadline needs
+    ``select`` on the descriptor and a buffered reader may already hold bytes ``select`` will
+    never announce again. Everything read goes through here, so nothing is ever left in two
+    places."""
+
+    def __init__(self, fd: int) -> None:
+        self.fd = fd
+        self.buffer = bytearray()
+
+    def _fill(self, deadline: float) -> None:
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            raise TimeoutError("the appworld worker did not answer in time")
+        ready, _, _ = select.select([self.fd], [], [], remaining)
+        if not ready:
+            raise TimeoutError("the appworld worker did not answer in time")
+        chunk = os.read(self.fd, 65536)
+        if not chunk:
+            raise EOFError("the appworld worker closed its output")
+        self.buffer += chunk
+
+    def frame(self, timeout: float) -> Dict[str, Any]:
+        deadline = time.monotonic() + timeout
+        while b"\n" not in self.buffer:
+            self._fill(deadline)
+        header, _, rest = bytes(self.buffer).partition(b"\n")
+        self.buffer = bytearray(rest)
+        length = int(header.strip())
+        while len(self.buffer) < length:
+            self._fill(deadline)
+        body = bytes(self.buffer[:length])
+        del self.buffer[:length]
+        return json.loads(body)
 
 #: What every worker's scratch directory is named for, so a directory this port left behind on a
 #: host is one an operator can recognise.
@@ -1177,169 +654,271 @@ _SCRATCH_PREFIX = "shogym-appworld-"
 _GRADE_SCRATCH_PREFIX = _SCRATCH_PREFIX + "grade-"
 
 
-def _worker_environment(scratch: Path) -> Dict[str, str]:
-    """A scrubbed environment for one worker.
+def _close_descriptor(descriptor: Optional[int]) -> None:
+    """Close a raw descriptor, and treat one that is already closed as closed."""
+    if descriptor is None:
+        return
+    try:
+        os.close(descriptor)
+    except OSError:
+        pass
 
-    ``PYTHONDONTWRITEBYTECODE`` because this is the process that runs agent-authored code and the
-    interpreter it runs under is shared by every episode on this machine: a worker that wrote
-    bytecode caches into it would be writing into what the next episode imports."""
-    scrubbed = {
-        name: os.environ[name] for name in _ENV_ALLOW_LIST if os.environ.get(name) is not None
+
+def _send(process: subprocess.Popen, payload: Dict[str, Any]) -> None:
+    assert process.stdin is not None
+    encoded = json.dumps(payload).encode()
+    process.stdin.write(b"%d\n" % len(encoded))
+    process.stdin.write(encoded)
+    process.stdin.flush()
+
+
+def _close_pipes(process: subprocess.Popen) -> None:
+    for stream in (process.stdin, process.stdout, process.stderr):
+        if stream is not None:
+            try:
+                stream.close()
+            except Exception:
+                pass
+
+
+def _worker_environment(root: str) -> Dict[str, str]:
+    """What one worker container is given, which is all it has.
+
+    Nothing is inherited: ``docker run`` passes the image's own environment and what is named
+    here, so the serving process's provider keys and run paths are not absent because they were
+    removed, they are absent because they were never offered. This used to be an allow-list over
+    ``os.environ``, which is the same list with a different failure mode: a name nobody thought of
+    still got through."""
+    return {
+        "APPWORLD_ROOT": root,
+        "HOME": container.SCRATCH_MOUNT,
+        "LANG": "C.UTF-8",
+        # The root filesystem is read-only, so a `.pyc` written on first import could not be kept
+        # anyway; the image byte-compiled everything at build time.
+        "PYTHONDONTWRITEBYTECODE": "1",
     }
-    scrubbed["HOME"] = str(scratch)
-    scrubbed["APPWORLD_CACHE"] = str(scratch / "appworld-cache")
-    scrubbed["PYTHONDONTWRITEBYTECODE"] = "1"
-    return scrubbed
+
+
+def served_mounts(*, root: Path, task_id: str, outputs: Path) -> List[Mount]:
+    """Everything one episode's world can see, and it is a short list.
+
+    The corpus's shared parts read-only, this one task's derived tree read-only, and this one
+    episode's output tree, which is the only writable mount there is. ``data/tasks`` therefore
+    holds exactly one directory inside the container: another episode's world is not a path that
+    resolves and is refused, it is a path that does not exist.
+
+    The output tree is mounted at a fixed name outside the corpus rather than under it, and the
+    world is told its experiment *is* that directory. AppWorld joins an experiment name onto its
+    own output root, so an absolute one replaces the root, which is what keeps an episode's end
+    state and its evaluator artifacts out of the tree the next episode is served.
+
+    ``root`` is the derived root, the parent of ``data``."""
+    mounts = [
+        Mount(entry, f"{CORPUS_MOUNT}/data/{entry.name}")
+        for entry in sorted((root / "data").iterdir())
+        if entry.name != "tasks"
+    ]
+    mounts.append(Mount(root / "data" / "tasks" / task_id, f"{CORPUS_MOUNT}/data/tasks/{task_id}"))
+    mounts.append(Mount(outputs, OUTPUTS_MOUNT, writable=True))
+    return mounts
+
+
+def graded_mounts(*, graded: Path, task_id: str, outputs: Path) -> List[Mount]:
+    """What the grading container sees: the answers, and the end state to grade against them.
+
+    The same shape as :func:`served_mounts` and for a different reason. Nothing here ever runs a
+    line an agent wrote, so this is not a boundary; it is the mount set that makes the grader's
+    view exist at all, because the answers and the episode's output tree live in two different
+    places on the host and the evaluator wants a root and an experiment."""
+    mounts = [
+        Mount(entry, f"{GRADED_MOUNT}/data/{entry.name}")
+        for entry in sorted((graded / "data").iterdir())
+        if entry.name != "tasks"
+    ]
+    mounts.append(Mount(graded / "data" / "tasks" / task_id, f"{GRADED_MOUNT}/data/tasks/{task_id}"))
+    mounts.append(Mount(outputs, OUTPUTS_MOUNT, writable=True))
+    return mounts
 
 
 @dataclass
 class Worker:
-    """A handle on one episode's world, running in a process of its own.
+    """A handle on one episode's world, running in a container of its own.
 
-    The port is the process's and the token is this object's, and neither is handed over on any of
-    the standard surfaces: not on the worker's command line, not in its environment, not in the
-    instructions the env publishes, not in a tool's schema, and not in a tool's result. That is
-    the whole of the claim, and it is what the tests exercise.
+    Reached over the pipe pair this process created for it and by nothing else: the container has
+    no network stack, so there is no port to find and no token to need. What it can see is the
+    mount set :func:`served_mounts` builds, which is one task's served tree and this episode's own
+    output directory.
 
-    **It is not a secret from the code the agent writes**, and nothing here should be built as
-    though it were. That code runs as the worker process, and the token is that process's own
-    handler state; no arrangement inside one interpreter puts a value beyond the code running in
-    it. What the token holds is the boundary it can hold: another process on this machine cannot
-    drive this world without it (see :data:`~worker.TOKEN_HEADER`).
-
-    What this is and is not: it keeps the world's own grading routes and the serving process's
-    environment out of the agent's reach, and it is not a sandbox. The code an agent writes runs
-    as the worker, with the worker's filesystem. See the port's README."""
+    The container's name is the handle teardown needs. Killing the ``docker run`` client does not
+    stop a container, so :meth:`close` removes it by name and does so on every path out, including
+    the ones where spawning failed halfway."""
 
     root: Path
     process: subprocess.Popen
-    port: int
-    token: str
-    scratch: Path
+    container: str
+    frames: "_Frames"
+    lock: threading.Lock = field(default_factory=threading.Lock)
+    closed: bool = False
 
     @classmethod
-    def spawn(cls, root: Path) -> "Worker":
-        """Start a worker on ``root`` and wait for it to say which port it bound.
+    def spawn(cls, root: Path, *, task_id: str, outputs: Path) -> "Worker":
+        """Start a worker on one task and wait for it to say it is ready.
 
-        The token and the root go over stdin, which is read once and closed, rather than on the
-        command line, which any code running in that process can read back off ``sys.argv`` for
-        the life of it.
-
-        **Nothing escapes this without an owner.** Only the empty-line branch used to clean up, so
-        a handshake that failed any other way left a live worker process and its scratch directory
-        behind with nobody holding a reference: a stdin the child never read and closed, a first
-        line that is not JSON, a JSON object with no ``port`` in it, a port that is not an
-        integer. All of those happen at construction, before there is a task to file a failure row
-        against, so the run's own record would not have said either. The process and the scratch
-        belong to this method until a ``Worker`` is returned, and are killed, reaped and removed on
-        every other exit.
-
-        The whole handshake is under :data:`_SPAWN_TIMEOUT_SECONDS`. The write is not, and does not
-        need to be: it is a couple of hundred bytes into an empty pipe, which cannot block."""
-        token = secrets.token_urlsafe(32)
-        scratch = Path(tempfile.mkdtemp(prefix=_SCRATCH_PREFIX))
-        process: Optional[subprocess.Popen] = None
-        published = False
+        The output directory is created here rather than by Docker, because a bind mount whose
+        source does not exist is created by the daemon and owned by root, and the container runs
+        as this user."""
+        outputs.mkdir(parents=True, exist_ok=True)
+        process, name = container.run(
+            role="serve",
+            mounts=served_mounts(root=root, task_id=task_id, outputs=outputs),
+            environment=_worker_environment(CORPUS_MOUNT),
+        )
+        assert process.stdout is not None
+        frames = _Frames(process.stdout.fileno())
         try:
-            process = subprocess.Popen(
-                [str(runtime()), str(WORKER), "serve"],
-                stdin=subprocess.PIPE,
-                stdout=subprocess.PIPE,
-                stderr=subprocess.DEVNULL,
-                text=True,
-                cwd=str(scratch),
-                env=_worker_environment(scratch),
-            )
-            assert process.stdin is not None
-            process.stdin.write(json.dumps({"root": str(root), "token": token}) + "\n")
-            process.stdin.flush()
-            process.stdin.close()
-            assert process.stdout is not None
-            line = _first_line(process, _SPAWN_TIMEOUT_SECONDS)
-            if not line:
-                raise WorkerError(
-                    "the appworld worker never bound a port "
-                    f"(status {process.poll()}, waited {_SPAWN_TIMEOUT_SECONDS:.0f}s)"
-                )
-            worker = cls(
-                root=root,
-                process=process,
-                port=int(json.loads(line)["port"]),
-                token=token,
-                scratch=scratch,
-            )
-            published = True
-            return worker
-        finally:
-            if not published:
-                _abandon(process, scratch)
+            opening = frames.frame(_SPAWN_TIMEOUT_SECONDS)
+        except (TimeoutError, EOFError, ValueError) as exc:
+            container.remove(name)
+            process.kill()
+            _close_pipes(process)
+            raise WorkerError(
+                f"the appworld worker container never became ready ({type(exc).__name__}: {exc}); "
+                f"waited {_SPAWN_TIMEOUT_SECONDS:.0f}s"
+            ) from exc
+        if not opening.get("ready"):
+            container.remove(name)
+            process.kill()
+            _close_pipes(process)
+            raise WorkerError(f"the appworld worker answered {opening!r} instead of ready")
+        return cls(root=root, process=process, container=name, frames=frames)
 
     def call(self, command: str, **body: Any) -> Any:
-        """Send one command and return what the world answered."""
-        payload = json.dumps(body).encode()
-        request = urllib.request.Request(
-            f"http://127.0.0.1:{self.port}/{command}",
-            data=payload,
-            headers={"Content-Type": "application/json", "X-Shogym-Worker-Token": self.token},
-        )
-        try:
-            with urllib.request.urlopen(request, timeout=_DOWNLOAD_TIMEOUT_SECONDS) as response:
-                return json.loads(response.read())["output"]
-        except urllib.error.HTTPError as exc:
-            detail = exc.read().decode(errors="replace")
-            raise WorkerError(f"appworld worker refused {command!r}: {detail}") from exc
+        """Send one command and return what the world answered.
+
+        Under a lock, because the frames on one pipe are one sequence: two callers interleaving
+        writes would produce a frame neither of them sent."""
+        with self.lock:
+            try:
+                _send(self.process, {"command": command, "body": body})
+                answer = self.frames.frame(_CALL_TIMEOUT_SECONDS)
+            except (BrokenPipeError, EOFError) as exc:
+                raise WorkerError(
+                    f"the appworld worker container stopped during {command!r}: {exc}"
+                ) from exc
+            except TimeoutError as exc:
+                raise WorkerError(
+                    f"the appworld worker did not answer {command!r} within "
+                    f"{_CALL_TIMEOUT_SECONDS:.0f}s"
+                ) from exc
+        if "error" in answer:
+            raise WorkerError(f"appworld worker refused {command!r}: {answer['error']}")
+        return answer["output"]
 
     def close(self) -> None:
-        """Stop the worker and wait for it, so what is graded is a tree nothing is writing to.
+        """Stop the worker, promptly and with a bound.
 
-        Signalled and reaped rather than asked over the socket. There is no close command to ask
-        for: this is the process that runs agent-authored code, so a reply from it saying that it
-        had stopped is a reply the episode could have written. The fact the host needs is that the
-        process stopped, and that fact is the kernel's.
+        The container is removed first and by name. Closing the pipe would be the polite way and
+        is not the reliable one: a world wedged in a native call never reads its stdin again, and
+        the ``docker run`` client does not stop a container by dying. What ``--rm`` and the pipe
+        do cover is the case this cannot: a parent that crashes leaves a worker reading
+        end-of-file, which stops it.
 
-        SIGTERM, a short grace, then SIGKILL whatever happened. The grace buys an ordinary exit
-        for a process that wants one; it must not buy time, because every second of it is a second
-        in which the process that ran agent-authored code can still write into the tree that is
-        about to be graded.
-
-        Idempotent, and safe to call twice, which an ordinary episode does: once when the sealed
-        world is read, once from teardown. Both go through the same terminate-and-wait, and a
-        process already reaped is not signalled again.
-
-        **This stops the worker and not everything the worker started.** Agent code runs in that
-        process and is free to spawn, and a descendant of it survives this call. That is the
-        development host worker's boundary, and it is why the container the worker runs in
-        (shojin-lab/shogym#140) is the one this port's isolation claims rest on: a container that
-        goes away takes its whole process tree with it, which no arrangement of signals here
-        can promise."""
-        if self.process.returncode is None:
-            try:
-                self.process.terminate()
-            except OSError:
-                pass
+        Idempotent, because it is called twice on the ordinary path: finalization stops the world
+        before the grader reads its end state, and teardown then closes the session it was in.
+        A second removal would be a wasted round trip to the daemon and a second wait on a process
+        that has already been reaped."""
+        if self.closed:
+            return
+        self.closed = True
+        container.remove(self.container)
+        if self.process.poll() is None:
+            self.process.terminate()
             try:
                 self.process.wait(timeout=_TERM_GRACE_SECONDS)
             except subprocess.TimeoutExpired:
-                try:
-                    self.process.kill()
-                except OSError:
-                    pass
+<<<<<<< HEAD
+                _stop(self.process, signal.SIGKILL, pgid)
+            return False
+        # SIGTERM, a short grace, then SIGKILL whatever happened. The grace used to be ten
+        # seconds of a signal any process may catch, ignore or take its time over, and every one
+        # of those seconds is time in which the process that ran agent-authored code is still
+        # able to write into the tree about to be graded. It is short because it buys only an
+        # ordinary exit, and it ends in a signal nothing can decline.
+        _signal_group(pgid, signal.SIGTERM)
+        # The grace, watched through the process table rather than through `wait`: `wait` reaps,
+        # and a group is enumerable only while its number is still held. A leader that exits
+        # tidily becomes a zombie, which the enumeration steps over, so this returns as soon as
+        # the group is really empty and otherwise costs the grace.
+        _group_emptied(pgid, within=_TERM_GRACE_SECONDS)
+        _signal_group(pgid, signal.SIGKILL)
+        # Enumerated while the leader is still unreaped, and that ordering is the point. Reaping
+        # releases the pid, and a process group exists only while it has a member: reap first and
+        # the number is free, so an enumeration or an escalation after it is about whatever holds
+        # it now. An unreaped leader is a zombie, which holds the number and is excluded from the
+        # count (see `_group_members`), so this asks about descendants and about nothing else.
+        empty = _group_emptied(pgid, within=_CLOSE_SECONDS) is True
+        # Reaped last.
+=======
+                self.process.kill()
                 try:
                     self.process.wait(timeout=_CLOSE_SECONDS)
                 except subprocess.TimeoutExpired:
                     pass
-        for stream in (self.process.stdout, self.process.stderr):
-            if stream is not None:
-                try:
-                    stream.close()
-                except Exception:
-                    pass
-        shutil.rmtree(self.scratch, ignore_errors=True)
+        _close_pipes(self.process)
 
 
-class SnapshotError(RuntimeError):
-    """The stopped output tree is not something that may be graded.
+def _one_shot(
+    *,
+    role: str,
+    body: Dict[str, Any],
+    mounts: Sequence[Mount],
+    environment: Dict[str, str],
+    timeout: float,
+    what: str,
+) -> Any:
+    """Run one short-lived container, send it one frame, and return its one answer.
 
+    The shape ``seed`` and ``grade`` share. Both are bounded, killed and reaped: a container that
+    hangs would otherwise hold a sealed episode's terminal open forever, and removing it by name
+    is the only thing that actually stops it."""
+    process, name = container.run(
+        role=role, mounts=list(mounts), environment=environment
+    )
+    frames = _Frames(process.stdout.fileno()) if process.stdout is not None else None
+    try:
+        assert frames is not None
+        _send(process, {"body": body})
+        answer = frames.frame(timeout)
+    except TimeoutError as exc:
+        container.remove(name)
+        process.kill()
+        raise WorkerError(f"{what} did not finish within {timeout:.0f}s; it was killed") from exc
+    except (BrokenPipeError, EOFError, ValueError) as exc:
+        container.remove(name)
+        process.kill()
+        raise WorkerError(f"{what} failed: {type(exc).__name__}: {exc}") from exc
+    finally:
+>>>>>>> f4000d8 (appworld: run the episode worker in a container, over stdio rather than a port)
+        try:
+            process.wait(timeout=_CLOSE_SECONDS)
+        except subprocess.TimeoutExpired:
+<<<<<<< HEAD
+            return False
+        return empty
+=======
+            container.remove(name)
+            process.kill()
+        _close_pipes(process)
+    if "error" in answer:
+        raise WorkerError(f"{what} failed: {answer['error']}")
+    return answer["output"]
+>>>>>>> f4000d8 (appworld: run the episode worker in a container, over stdio rather than a port)
+
+
+def seed(*, source_dbs: Path, into: Path, rows: Dict[str, Any]) -> Any:
+    """Write one task's seeded database log, in a container of its own.
+
+<<<<<<< HEAD
     Its own type because it is an episode-level failure with a cause worth naming: the tree the
     world left behind holds something that is not a plain file, and a grader that opened it would
     be resolving a path the agent chose in a process that also holds the answers."""
@@ -1408,37 +987,61 @@ def snapshot_outputs(outputs: Path, *, into: Path) -> Path:
                 raise SnapshotError(f"the episode left {name}, which is not a file or directory")
             shutil.copyfile(entry, target / name)
     return into
+=======
+    ``source_dbs`` is the task's own input databases in the downloaded corpus and ``into`` is the
+    file being written inside a staging directory. Two mounts, one read-only and one not, and no
+    corpus root: the model layer is given both paths outright."""
+    return _one_shot(
+        role="seed",
+        body={**rows, "from_dbs": "/from", "into": f"/into/{into.name}"},
+        mounts=[Mount(source_dbs, "/from"), Mount(into.parent, "/into", writable=True)],
+        environment={"HOME": container.SCRATCH_MOUNT, "PYTHONDONTWRITEBYTECODE": "1"},
+        timeout=_SEED_TIMEOUT_SECONDS,
+        what=f"seeding {into.parent.parent.name}",
+    )
+>>>>>>> f4000d8 (appworld: run the episode worker in a container, over stdio rather than a port)
 
 
 def grade(
     *,
-    root: Path,
+    graded: Path,
     task_id: str,
     outputs: Path,
     ignore: Sequence[str],
-    filing: Dict[str, str],
     timeout: float = _GRADE_TIMEOUT_SECONDS,
 ) -> Any:
-    """The base task's own checks and the episode's own filing, from a process that has never run
-    a line the agent wrote.
+    """The base task's own checks, from a container that has never run a line the agent wrote.
 
-    A second, short-lived worker rather than the one that served the episode. It is the only place
-    ground truth is loaded, it starts after the serving worker has been stopped, and it reads the
-    end state off disk, so the answers are never objects in the process the agent's code ran as.
+    A second, short-lived container rather than the one that served the episode. It is the only
+    place ground truth is loaded, it starts after the world is sealed, and it reads the end state
+    off the episode's own output directory, so the answers are never objects in the process the
+    agent's code ran as and never files on a filesystem that process could see.
 
-    **The filing and the digests come back from here too.** They used to be asked of the serving
-    world over the protocol, which made the process that runs agent-authored code the process
-    reporting what the episode had done. One process now reads one stopped tree, so the filing,
-    the databases' digest and the evaluator's verdicts are one state by construction rather than
-    two observations that happened to agree.
-
-    Bounded, killed and reaped. An evaluator that hangs would otherwise hold a sealed episode's
-    terminal open forever: ``to_thread`` does not make a child process cancellable, so a deadline
-    on the coroutine stops the waiting and leaves the child running. The bound covers the leader
-    and not what the leader started, which is the same boundary :meth:`Worker.close` has and the
-    same reason the container is what the isolation claims rest on."""
-    scratch = Path(tempfile.mkdtemp(prefix=_GRADE_SCRATCH_PREFIX))
-    process: Optional[subprocess.Popen] = None
+    ``graded`` is the grader's root, the parent of ``data``."""
+    return _one_shot(
+        role="grade",
+        body={
+            "root": GRADED_MOUNT,
+            "task_id": task_id,
+            "experiment": OUTPUTS_MOUNT,
+            "ignore": list(ignore),
+        },
+        mounts=graded_mounts(graded=graded, task_id=task_id, outputs=outputs),
+        environment=_worker_environment(GRADED_MOUNT),
+        timeout=timeout,
+        what=f"grading {task_id}",
+    )
+<<<<<<< HEAD
+    scratch = Path(tempfile.mkdtemp(prefix="shogym-appworld-grade-"))
+    process = subprocess.Popen(
+        [str(runtime()), str(WORKER), "grade"],
+        stdin=subprocess.PIPE,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        text=True,
+        cwd=str(scratch),
+        env=_worker_environment(scratch),
+    )
     try:
         process = subprocess.Popen(
             [str(runtime()), str(WORKER), "grade"],
@@ -1529,31 +1132,12 @@ def _first_line(process: subprocess.Popen, timeout: float) -> str:
     nothing to read while the line sits in the buffer, which is the deadlock this is meant to
     remove rather than a version of it. Nothing else reads this descriptor before the handshake."""
     assert process.stdout is not None
-    handle = process.stdout.fileno()
-    deadline = time.monotonic() + timeout
-    chunks: List[bytes] = []
-    seen = 0
-    while True:
-        remaining = deadline - time.monotonic()
-        if remaining <= 0:
-            return ""
-        ready, _, _ = select.select([handle], [], [], remaining)
-        if not ready:
-            return ""
-        try:
-            block = os.read(handle, 4096)
-        except OSError:
-            return ""
-        if not block:
-            # The worker closed its pipe without finishing a line, which is a worker that died.
-            return ""
-        chunks.append(block)
-        seen += len(block)
-        if b"\n" in block:
-            break
-        if seen > _HANDSHAKE_MAX_BYTES:
-            return ""
-    return b"".join(chunks).decode(errors="replace").split("\n", 1)[0] + "\n"
+    ready, _, _ = select.select([process.stdout], [], [], timeout)
+    if not ready:
+        return ""
+    return process.stdout.readline()
+=======
+>>>>>>> f4000d8 (appworld: run the episode worker in a container, over stdio rather than a port)
 
 
 __all__ = [
@@ -1561,12 +1145,10 @@ __all__ = [
     "DATA_BUNDLE_SHA256",
     "DATA_BUNDLE_URL",
     "DATA_VERSION",
-    "DERIVATION_VERSION",
     "MANIFEST",
     "ProvisioningError",
     "ROOT_ENV_VAR",
     "SPLIT",
-    "SnapshotError",
     "UPSTREAM_SHA",
     "UPSTREAM_VERSION",
     "Worker",
@@ -1577,17 +1159,23 @@ __all__ = [
     "corpus_snapshot",
     "derived_root",
     "episode_outputs",
-    "episode_view",
-    "episodes_home",
+    "ensure_corpus",
+    "ensure_image",
     "grade",
+    "graded_mounts",
     "graded_root",
     "private_home",
+<<<<<<< HEAD
     "ensure_apps",
     "ensure_corpus",
     "runtime",
     "runtime_digest",
     "snapshot_outputs",
     "stamp_cache",
+=======
+    "seed",
+    "served_mounts",
+>>>>>>> f4000d8 (appworld: run the episode worker in a container, over stdio rather than a port)
     "task_ids",
     "task_specs",
 ]
