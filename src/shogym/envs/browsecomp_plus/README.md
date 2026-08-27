@@ -1,6 +1,7 @@
 # `browsecomp_plus` — BrowseComp-Plus, a Deep-Research retrieval env ("HLE with a fixed corpus")
 
-[**BrowseComp-Plus**](https://github.com/texttron/BrowseComp-Plus) (ACL 2026) served through
+[**BrowseComp-Plus**](https://github.com/texttron/BrowseComp-Plus) ([arXiv
+2508.06600](https://arxiv.org/abs/2508.06600)) served through
 shogym at upstream commit `0469490`, which covers the qrels and the evaluation / judge code this
 port copies; the encrypted queries and the BM25 index carry their own Hugging Face revisions
 (see [Fidelity & deviations](#fidelity--deviations)). The task: answer OpenAI BrowseComp's
@@ -9,8 +10,9 @@ reasoning-heavy queries against a **fixed, human-verified ~100K-doc corpus** ser
 reasoning from web noise and makes runs reproducible. `submit_answer` is the **score terminal**:
 submitting seals the episode and the env's `finalize` hook grades the sealed answer with an LLM
 judge (as in the [HLE](../hle/README.md) port), and the env adds deterministic
-**retrieval-recall** and **citation** metrics computed purely off the recorded
-trajectory against the query's relevance judgements (qrels) — so it exercises shogym's verification
+**retrieval-recall** and **citation** metrics scored against the query's relevance judgements
+(qrels): recall off the recorded `search` steps, citations off the submitted answer the terminal
+evidence carries — so it exercises shogym's verification
 surface with both a model judge *and* deterministic retrieval metrics.
 
 Like every shogym env this **describes** a task, **serves** its tools over MCP, and **verifies** a
@@ -30,7 +32,7 @@ recorded trajectory while an external harness drives the tools — see
 ```python
 import shogym
 
-env = shogym.make("browsecomp_plus")     # train split; decrypts queries in memory, loads BM25 index
+env = shogym.make("browsecomp_plus")     # train split; decrypts queries in memory
 spec = env.describe("0")                # task 0: the query + tool manifest
 ```
 
@@ -79,7 +81,8 @@ pulls `datasets` (the encrypted queries), `openai` (the default judge client), a
 
 - **Java 21.** pyserini's BM25 backend runs on Lucene (JVM). Without a JDK 21 the real retriever
   can't run; offline tests use an in-memory searcher and need no Java.
-- **`OPENAI_API_KEY`.** `submit_answer` grades with an LLM judge. With the default judge, an
+- **`OPENAI_API_KEY`.** Grading runs in the env's `finalize`, after `submit_answer` seals the
+  episode, and uses an LLM judge. With the default judge, an
   episode **fails fast at startup** if no key is set (so a keyless run never silently scores
   everything wrong). Opt out by injecting a scripted `judge`, or point `judge_base_url` at a
   keyless OpenAI-compatible endpoint. For upstream's own judge set **both** `judge_base_url` (a
@@ -91,7 +94,7 @@ pulls `datasets` (the encrypted queries), `openai` (the default judge client), a
   The dataset downloads once to `~/.cache/shogym/browsecomp_plus` (honor `HF_HOME` or
   `SHOGYM_BROWSECOMP_PLUS_DATA_DIR`). The per-query qrels are lazy-downloaded from the pinned
   upstream commit and cached alongside.
-- **The prebuilt BM25 index (~2.78 GB).** **Auto-downloads once** to
+- **The prebuilt BM25 index (~2.17 GB).** **Auto-downloads once** to
   `~/.cache/shogym/browsecomp_plus/bm25/` on first real (served) use — from the upstream HF *dataset*
   repo `Tevatron/browsecomp-plus-indexes` (`bm25/*`), the same source as upstream's
   `scripts_build_index/download_indexes.sh`, provisioned lazily like the queries/qrels. The
@@ -118,7 +121,7 @@ Backed by the in-process server in `mcp_server.py` (shogym's near-verbatim reuse
 - **`submit_answer(answer, confidence)`** — the **score terminal**. The serve layer validates
   its args, atomically **seals** the episode, then runs the env's `finalize` hook — so its handler
   body is never dispatched inward. The **judge runs in `finalize`**: it grades `answer` against
-  the session's gold answer (BrowseComp-Plus's own `GRADER_TEMPLATE`, temp 0 for determinism) and
+  the session's gold answer (BrowseComp-Plus's own `GRADER_TEMPLATE`, at a requested temp 0) and
   returns core-owned, **sanitized** `TerminalEvidence`. Submitting ends the episode; single
   submission is structural (a second `submit_answer` is tombstoned).
 - **`terminate()`** — the reserved `abort` terminal (ending without a submission scores
@@ -194,7 +197,9 @@ semantics (give each run its own trace file for a guaranteed 1:1 mapping).
 - **Retriever pinned to BM25.** The retriever materially changes scores (BM25 vs dense
   Qwen3-Embedding), so the backend is named in the TaskSpec and this first cut pins **BM25**
   (CPU/Java-only; the dense path needs Faiss + GPU — a deferred follow-up).
-- **Judge.** Pinned to temp 0 for determinism; upstream reports GPT-4.1 (paper) / Qwen3-32B
+- **Judge.** Requests temp 0 and falls back to the endpoint default if that request raises
+  (`OpenAIJudge.__call__`), so it is lower variance, not a determinism guarantee; upstream
+  reports GPT-4.1 (paper) / Qwen3-32B
   (vLLM) — shogym defaults to GPT-4.1, overridable via `judge_model` / `judge_base_url`. A judge
   failure fails closed to `correct=False` with `judge_error=True`.
 - **Queries stay encrypted at rest.** The XOR/canary decryption happens only in memory at load;
@@ -202,7 +207,7 @@ semantics (give each run its own trace file for a guaranteed 1:1 mapping).
 
 ## Gotchas
 
-- **The index is heavy but auto-provisioned.** ~2.78 GB Lucene index (Java 21); it auto-downloads
+- **The index is heavy but auto-provisioned.** ~2.17 GB Lucene index (Java 21); it auto-downloads
   once to `~/.cache/shogym/browsecomp_plus/bm25/` on first served use (override with
   `SHOGYM_BROWSECOMP_PLUS_BM25_INDEX`). The Java check runs *before* that download, so a missing JVM
   fails fast without paying for it. Offline tests inject a tiny synthetic corpus (no Java, no

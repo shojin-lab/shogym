@@ -8,10 +8,12 @@ judge and returns its verdict as core-owned terminal evidence. The tool handler 
 (it is not dispatched inward once sealed), and the env's ``_verify`` stays a pure function that
 only *reads* that verdict.
 
-The grading prompt (:data:`GRADER_TEMPLATE`) is **verbatim** from upstream
+The grading prompt (:data:`GRADER_TEMPLATE`) is upstream's from
 ``scripts_evaluation/evaluate_run.py`` (BrowseComp-Plus commit ``0469490``), so the grading
-criteria match the benchmark's own. The reply parser (:func:`parse_judge_response`) is adapted
-from upstream's: it reads a line-anchored verdict and fails closed (see its docstring).
+criteria match the benchmark's own. It is not byte-identical: upstream's
+``extracted_final_answer`` line ends in a trailing space that this copy drops. The reply parser
+(:func:`parse_judge_response`) is adapted from upstream's: it reads a line-anchored verdict and
+fails closed (see its docstring).
 
 Upstream grades with Qwen3-32B (vLLM, temp 0.7) or GPT-4.1 (the paper); shogym canonicalizes an
 OpenAI-compatible judge that *requests* **temperature 0**, falling back to the endpoint default
@@ -80,10 +82,11 @@ class Judge(Protocol):
     ) -> JudgeResult: ...
 
 
-# The official BrowseComp-Plus judge prompt (``scripts_evaluation/evaluate_run.py``), used
-# verbatim so the judge's grading criteria match the benchmark's own. The literal ``|\%|`` in
-# the confidence line is upstream's own escaping and is preserved as-is; shogym reads correctness
-# only, so confidence extraction here is advisory.
+# The BrowseComp-Plus judge prompt (``scripts_evaluation/evaluate_run.py``), so the judge's
+# grading criteria match the benchmark's own. Not byte-identical: upstream's
+# ``extracted_final_answer`` line ends in a trailing space that this copy drops. The literal
+# ``|\%|`` in the confidence line is upstream's own escaping and is preserved as-is; shogym
+# reads correctness only, so confidence extraction here is advisory.
 GRADER_TEMPLATE = """
 Judge whether the following [response] to [question] is correct or not based on the precise and unambiguous [correct_answer] below.
 
@@ -121,7 +124,9 @@ class OpenAIJudge:
     Constructed offline (no network): the client is created lazily on the first call, so a
     ``browsecomp_plus`` env can be built and its manifest probed without a key. Pass a ready
     ``client`` (or ``base_url``) to point at any OpenAI-compatible endpoint (e.g. a vLLM
-    Qwen3-32B, the upstream judge). Decodes at :data:`JUDGE_TEMPERATURE` (0) for determinism.
+    Qwen3-32B, the upstream judge; set ``model`` to match, or the request still asks for
+    ``gpt-4.1``). Requests :data:`JUDGE_TEMPERATURE` (0), falling back to the endpoint default if
+    that request raises.
     """
 
     def __init__(

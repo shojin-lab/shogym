@@ -7,15 +7,16 @@ task and exercises shogym's **verification surface** with a real **LLM judge**. 
 first model-graded verifier; [`browsecomp_plus`](../browsecomp_plus/README.md) now grades the
 same way.
 
-The port loads the `cais/hle` test split and grades with HLE's own judge prompt; it filters out
+The port loads the `cais/hle` test split and grades with HLE's judge prompt (lightly edited, see
+[Fidelity & deviations](#fidelity--deviations)); it filters out
 the image questions and picks its own judge model (see
 [Fidelity & deviations](#fidelity--deviations)).
 
 Like every shogym env this **describes** a task, **serves** its tools over MCP, and **verifies**
 a recorded trajectory while an external harness drives the tools — see
-[`../README.md`](../README.md). Here the single tool grades server-side, so the verifier stays
-a pure function over the sealed episode's evidence. The runnable demo is
-[`examples/`](../../../../examples/).
+[`../README.md`](../README.md). Here the single tool seals and the env's `finalize` grades
+server-side after it, so the verifier stays a pure function over the sealed episode's evidence.
+The runnable demo is [`examples/`](../../../../examples/).
 
 ## Running it
 
@@ -184,10 +185,15 @@ semantics (give each run its own trace file for a guaranteed 1:1 mapping).
   time. If upstream adds, removes or reorders rows, the 80/20 positional split moves with it and
   a task index stops naming the same question. Two runs are comparable only when they read the
   same cached snapshot.
-- **Grading is HLE's own.** The judge uses HLE's own judge prompt; the registered env defaults
-  to `OpenAIJudge` (overridable via `judge_model` / `judge_kwargs` / `judge_base_url`, or a
-  fully injected `judge`). The exact-match fast path is a free, offline pre-check that never
-  changes a correct verdict.
+- **Grading follows HLE's, with two departures.** The judge prompt is HLE's
+  `hle_eval/run_judge_results.py` text, but not verbatim: this copy drops upstream's doubled
+  "if there if there" clause, drops a blank line before the `confidence:` field, and writes
+  `0%`/`100%` where upstream writes its escaped `0|\%|`/`100|\%|`. Upstream also grades through
+  `client.beta.chat.completions.parse` with a strict `response_format`, while this judge sends a
+  plain chat completion and parses the reply with a line-anchored regex that fails closed. The
+  registered env defaults to `OpenAIJudge` (overridable via `judge_model` / `judge_kwargs` /
+  `judge_base_url`, or a fully injected `judge`). The exact-match fast path is a free, offline
+  pre-check that never changes a correct verdict.
 - **The default judge model is a scoring decision.** It is `gpt-5.6-luna`, at that model's own
   default reasoning effort, chosen on grading quality measured against the previous default
   (issue #122). Changing it changes measured accuracy, which is why every model-graded episode
@@ -200,11 +206,11 @@ semantics (give each run its own trace file for a guaranteed 1:1 mapping).
 
 ## Gotchas
 
-- **The judge is model-graded and keyed.** `submit_answer` calls an OpenAI model unless the
-  answer hits the exact-match fast path. With the default judge, starting an episode without
-  `OPENAI_API_KEY` raises early (before any tool runs) rather than letting the run score
-  everything incorrect — inject a scripted `judge`, or set `judge_base_url` for a keyless local
-  endpoint, to opt out.
+- **The judge is model-graded and keyed.** Sealing on `submit_answer` runs `finalize`, which
+  calls an OpenAI model unless the answer hits the exact-match fast path. With the default
+  judge, starting an episode without `OPENAI_API_KEY` raises early (before any tool runs) rather
+  than letting the run score everything incorrect — inject a scripted `judge`, or set
+  `judge_base_url` for a keyless local endpoint, to opt out.
 - **The dataset is gated.** `cais/hle` needs accepted terms + HF auth; constructing the
   registered env downloads it (once). Inject `tasks` to construct the env without the download.
 - **Look-ups defeat the point.** HLE measures the model's own reasoning — a harness must deny

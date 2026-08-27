@@ -96,7 +96,7 @@ def exact_match(response: Any, correct_answer: Any) -> bool:
     return bool(gold) and normalize_answer(response) == gold
 
 
-# The official HLE judge prompt (Center for AI Safety, `cais/hle`), used verbatim so the
+# HLE's judge prompt (Center for AI Safety, `cais/hle`), lightly edited so the
 # judge's grading criteria match the benchmark's own.
 JUDGE_PROMPT = """Judge whether the following [response] to [question] is correct or not \
 based on the precise and unambiguous [correct_answer] below.

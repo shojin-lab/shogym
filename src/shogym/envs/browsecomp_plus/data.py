@@ -40,7 +40,7 @@ HF_QUERIES_SPLIT = "test"
 # from the pinned qrels and BM25 index — reproducibility-breaking, invalid scores. Same fidelity
 # guarantee as ``INDEX_REVISION``; the repo exposes no tag, so this sha is the pin.
 HF_QUERIES_REVISION = "144cff8e35b5eaef7e526346aa60774a9deb941f"
-HF_CORPUS_DATASET = "Tevatron/browsecomp-plus-corpus"  # ~2.78 GB — never auto-downloaded
+HF_CORPUS_DATASET = "Tevatron/browsecomp-plus-corpus"  # ~1.76 GB — never auto-downloaded
 
 # The prebuilt BM25 Lucene index ships in the upstream HF *dataset* repo under ``bm25/*`` (see
 # upstream ``scripts_build_index/download_indexes.sh``). Lazy-downloaded on first served use.

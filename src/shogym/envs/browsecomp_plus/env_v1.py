@@ -4,8 +4,9 @@ A Deep-Research **retrieval** benchmark: answer OpenAI BrowseComp's reasoning-he
 against a **fixed, human-verified corpus** (served ``search`` / ``get_document`` tools) instead
 of the live web — isolating search+reasoning from web noise and making runs reproducible. This
 is "HLE with a fixed retrieval corpus": the answer is graded by an LLM judge (as in the HLE
-port), and the env adds deterministic **retrieval recall** and **citation** metrics computed
-purely off the recorded trajectory against the query's relevance judgements (qrels).
+port), and the env adds deterministic **retrieval recall** (off the recorded ``search`` steps)
+and **citation** metrics (off the submitted answer the terminal evidence carries), both scored
+against the query's relevance judgements (qrels).
 
 ``submit_answer`` is the env's ``score`` **terminal**: submitting **seals** the episode, then
 the env's ``finalize`` hook runs the LLM judge on the frozen submission (seal-before-verdict),
@@ -22,8 +23,9 @@ lives here — a harness drives the tools.
 
 This module imports **nothing** heavy at load time — not ``datasets``, not ``openai``, not
 ``pyserini`` — so ``import shogym`` (which imports this module to register the env) stays offline.
-The dataset (decrypted **in memory**; never persisted) and the BM25 index load lazily only when
-the *registered* env is constructed; the judge's client only when it is first called.
+The dataset (decrypted **in memory**; never persisted) loads lazily when the *registered* env is
+constructed; the BM25 index is provisioned later still, at session start, so ``make`` and
+``describe`` stay offline; the judge's client only when it is first called.
 """
 
 from __future__ import annotations
