@@ -14,7 +14,7 @@ from shogym.envs.registration import make, register, registered_envs
 # `shogym.envs.appworld.env_v1` imports nothing from the `appworld` extra at top level. The app
 # sources the wheel ships packed, and the pinned data bundle, are provisioned only when the env is
 # *constructed*, so `import shogym` stays offline and needs neither the extra nor the corpus.
-from shogym.envs.appworld import env_v1 as appworld_env_v1  # noqa: F401 — triggers registration
+from shogym.envs.appworld import env_v1 as appworld_env_v1  # noqa: F401 (registration)
 from shogym.envs.automationbench import (  # noqa: F401 — triggers registration
     env_v1 as automationbench_env_v1,
 )

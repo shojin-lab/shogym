@@ -290,7 +290,7 @@ async def test_the_port_and_the_token_reach_no_agent_visible_surface() -> None:
 
 
 async def test_the_two_arms_match_on_encoded_bytes_with_non_ascii_in_the_world() -> None:
-    hostile = "​Sectioń—\U0001f600"
+    hostile = "​Sectioń«\U0001f600"
     played = await play(
         [
             f'''

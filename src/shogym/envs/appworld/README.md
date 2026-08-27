@@ -1,9 +1,9 @@
-# `appworld` — AppWorld, with one paragraph appended that nobody answers for you
+# `appworld`: AppWorld, with one paragraph appended that nobody answers for you
 
 A faithful shogym port of [AppWorld](https://github.com/StonyBrookNLP/appworld): carry out a
 natural-language instruction across nine simulated apps by writing Python against their APIs. On
 top of the rented task, one authored paragraph asks for a filing log in a corner of the world no
-scenario touches, whose values a house convention computes from the world's own data — and the
+scenario touches, whose values a house convention computes from the world's own data, and the
 paragraph names none of the four choices that convention makes.
 
 Env-as-center: describe, serve, verify. See [`../README.md`](../README.md) for the shared
@@ -55,8 +55,8 @@ Pin-and-install mechanics are shared; see [`../README.md`](../README.md). What i
 
 - **The `appworld` extra carries no packages, and cannot.** `appworld` 0.1.3.post1 pins
   `pydantic>=1.9,<2`; shogym's MCP layer needs `pydantic>=2.7`. No environment satisfies both. The
-  port therefore builds an interpreter of its own — a virtual environment under
-  `~/.cache/shogym/appworld/runtime-<version>/` holding the pinned release — and runs every world
+  port therefore builds an interpreter of its own (a virtual environment under
+  `~/.cache/shogym/appworld/runtime-<version>/` holding the pinned release) and runs every world
   in a subprocess under it. `SHOGYM_CACHE` relocates it; `uv` is used when it is on `PATH` and
   `venv` + `pip` otherwise. This is provisioned when an `appworld` env is **constructed**, so
   `import shogym` stays offline.
@@ -66,7 +66,7 @@ Pin-and-install mechanics are shared; see [`../README.md`](../README.md). What i
   directory whose `data/tasks` exists is used as it stands, so a machine that already ran
   `appworld download data` needs no download.
 - **No API key, no Docker, no network once provisioned.**
-- The port's pure pieces — the backlog generator, the scorer, the three payload classes — need
+- The port's pure pieces (the backlog generator, the scorer, the three payload classes) need
   none of the above, and their tests run in the core offline suite.
 
 ## How it works
@@ -102,8 +102,8 @@ The base task's answer is recorded the way AppWorld records it, with
 ### finalize + verify
 
 `submit` seals the episode. `finalize` then reads the world's end state, collects the base task's
-own checks, and scores the filing against the drawn key — in the **serving** process, never in the
-world's. The worker's protocol has no field for the key and no comparison in it, so a world an
+own checks, and scores the filing against the drawn key, in the **serving** process and never in
+the world's. The worker's protocol has no field for the key and no comparison in it, so a world an
 agent had complete control of still could not be made to say what the answer was.
 
 `_verify` publishes the numbers plus the matched pair: `report` carries the receipt, `notice`
@@ -196,7 +196,7 @@ bytes, sha256 `fd9f9608c2ec71ed0ac25c3633a738b9129a318a129e31230425b9188e508250`
   collected, so the appended chore does not fail a scenario's changed-model assertion. A task
   whose own evaluation names one of them is not served (see [Tasks](#tasks)).
 - **Assertion rows carry no expected-versus-actual diff.** Upstream's failure traces quote the
-  values a check asserts on, which would put world data — and part of the task's answer — into a
+  values a check asserts on, which would put world data (and part of the task's answer) into a
   payload whose whole argument is a closed ASCII vocabulary. Rows report `ok` / `not ok`. The
   diff-carrying variant is not built.
 - **The world runs in a subprocess under its own interpreter,** for the packaging conflict above
@@ -205,7 +205,7 @@ bytes, sha256 `fd9f9608c2ec71ed0ac25c3633a738b9129a318a129e31230425b9188e508250`
   minted at spawn. AppWorld's own environment server publishes `evaluate`, `save_state` and
   `load_state` unauthenticated on every interface; this one does not.
 - **The generator's global-RNG state is captured and restored around every episode,** and the seed
-  it is started from names the task and nothing else — not the session, not the run, not the
+  it is started from names the task and nothing else: not the session, not the run, not the
   feedback regime. AppWorld saves databases and not generator state, and every `login` draws from
   the global generator, so a port that replayed only the databases would serve two worlds that
   agreed on their contents and disagreed on their next draw.
