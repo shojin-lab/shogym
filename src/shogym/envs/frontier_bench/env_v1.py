@@ -6,9 +6,10 @@ programmatic *verifier* that scores the container end-state (never the transcrip
 already draws the boundary shogym wants — task/verifier data vs. agent runner — so this port
 drives the served shell as the agent and reuses the task's own verifier for the verdict.
 
-This slice ports the CPU-only, single-container, ``gpus=0``, ``environment_mode="separate"``,
-pytest-verified tasks (issue #48), pinned to upstream commit ``eb4af26c`` (recorded upstream as
-``v0.1.0``) plus each task's ``dataset.toml`` digest. The env exposes them as ``num_tasks``
+This slice vendors a first batch of the CPU-only, single-container, ``gpus=0``, pytest-verified,
+small-bundled-data tasks (issue #48) at upstream commit ``eb4af26c``, plus each task's
+``dataset.toml`` digest. More upstream tasks meet those criteria and are deferred; see the env
+README. The env exposes them as ``num_tasks``
 selectable by **index** (``0..N-1``) or **name**:
 
   - **describe(task_id)** — return the selected task's ``instruction.md``.
@@ -87,7 +88,7 @@ class FrontierBenchEnv(Env):
     Config (all optional, via ``shogym.make("frontier_bench", config=...)`` / ``env_config``):
       - ``task``: the *default* vendored task, by name or index — used when a serve/describe call
         omits the task selector (default ``"fin-saccr-rwa"``, index 0).
-      - ``max_steps``: hard cap on tool calls per episode (the shogym horizon).
+      - ``max_steps``: the tool-call budget per episode (the shogym horizon is ``max_steps + 2``).
       - ``command_timeout_seconds``: per-``exec`` wall-clock budget inside the container.
       - ``keep_container``: leave the container + images up after the episode (debugging).
     """

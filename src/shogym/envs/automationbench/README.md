@@ -171,10 +171,12 @@ semantics (give each run its own trace file for a guaranteed 1:1 mapping).
 
 ## Fidelity & deviations
 
-- **One toolset variant.** Upstream scores differ across its toolset variants (`api`, `zapier`,
-  `limited_zapier`, meta-tools); this port pins the **`api`** variant and reproduces it (including
-  the BM25 top-5 `api_search`). Numbers are comparable to the `api`-toolset leaderboard, not the
-  meta-tool ones.
+- **One toolset variant.** Upstream offers three (`scripts/eval.py` `--toolset`): `api`,
+  `zapier` and `limited_zapier`, where `zapier` *is* the meta-tool discovery mode
+  (`runner.py` sets `use_meta_tools = toolset == "zapier"`). This port pins **`api`** and
+  reproduces it, including the BM25 top-5 `api_search`. Upstream publishes a single table and
+  scores its official leaderboard on a held-out private set, so treat a number from here as an
+  `api`-toolset result rather than as comparable to any published per-variant figure.
 - **Pinned upstream source.** The port provisions and imports the pinned upstream commit
   [`a321764`](https://github.com/zapier/AutomationBench/commit/a321764ace3cfbe42289e6a13abef2f0f4f56fad),
   reusing only the `verifiers`-free pieces (simulated tools + `WorldState`, typed task defs, the

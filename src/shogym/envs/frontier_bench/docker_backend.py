@@ -127,8 +127,9 @@ def build_image(
 ) -> None:
     """Build ``tag`` from ``dockerfile`` with ``context_dir`` as the build context.
 
-    Pins ``--platform linux/amd64``: the vendored task images are amd64 (they digest-pin an
-    amd64 ``python:3.11-slim`` base), so an arm64 host must emulate rather than fail the pull.
+    Pins ``--platform linux/amd64`` so every host builds the architecture the tasks were
+    authored and validated on. The vendored bases are multi-arch image indexes, so an arm64 host
+    emulates rather than silently building a different architecture.
     """
     _run_docker(
         [
