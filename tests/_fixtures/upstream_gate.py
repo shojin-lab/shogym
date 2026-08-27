@@ -85,7 +85,7 @@ def _environmental_reason(exc: BaseException, *, package: str, extra: str) -> Op
             return f"{extra} extra not installed (no module {missing!r})"
         # A port that provisions an interpreter or a corpus rather than importing one raises this
         # when a provisioning step fails. On a laptop it means "not provisioned here"; in CI,
-        # where the network is up, `_required()` turns it back into the failure it may also be —
+        # where the network is up, `_required()` turns it back into the failure it may also be:
         # a pin that no longer resolves.
         if type(cause).__name__ == "ProvisioningError":
             return f"{extra}: not provisioned on this machine ({cause})"
@@ -96,7 +96,7 @@ _T = TypeVar("_T")
 
 
 def provisioned(provision: Callable[[], _T], *, package: str, extra: str) -> _T:
-    """Run ``provision`` — a port's own provisioning step — and return what it produced.
+    """Run ``provision``, a port's own provisioning step, and return what it produced.
 
     The counterpart to :func:`gate` for a port whose upstream is not provisioned at import. The
     appworld port builds an interpreter of its own and downloads a corpus when an env is

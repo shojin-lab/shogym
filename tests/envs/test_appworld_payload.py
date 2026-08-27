@@ -298,7 +298,7 @@ def test_the_match_survives_a_world_whose_values_are_not_ascii(
     # more in one class than another. Nothing from the world reaches a payload: a value outside
     # the published option set is rendered as a token from the payload's own vocabulary.
     key = draw_key(TASK, 0)
-    hostile = "​Ińbound—x"
+    hostile = "​Ińbound«x"
     verdicts = scored(backlog, key, section=hostile, color=hostile)
     section = next(item for item in verdicts.items if item.check_id == "fr.log.section")
     assert section.observed == OTHER

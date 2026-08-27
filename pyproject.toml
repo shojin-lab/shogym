@@ -125,9 +125,9 @@ yc_bench = [
 # is a hard conflict rather than a preference: `appworld` 0.1.3.post1 (the PyPI release cut from
 # upstream commit 66ad809) pins `pydantic>=1.9,<2`, while shogym's MCP layer needs `pydantic>=2.7`.
 # No environment satisfies both, so upstream cannot be a requirement of shogym under any marker.
-# The port therefore provisions an interpreter of its own — a virtual environment under
-# `~/.cache/shogym/appworld/runtime-<version>/` holding the pinned release, honoring `SHOGYM_CACHE`
-# — and runs every world in a subprocess under it, talking over a loopback socket. That separation
+# The port therefore provisions an interpreter of its own (a virtual environment under
+# `~/.cache/shogym/appworld/runtime-<version>/` holding the pinned release, honoring `SHOGYM_CACHE`)
+# and runs every world in a subprocess under it, talking over a loopback socket. That separation
 # is needed anyway: AppWorld freezes the process clock and holds each app's database engine on a
 # class attribute, so one interpreter can hold one world. The 33 MB data bundle is fetched by the
 # port and refused unless its sha256 matches the pin (upstream's own downloader checks nothing);

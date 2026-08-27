@@ -358,7 +358,7 @@ def build_handler(episode: Episode, token: str, server: List[Any]) -> type:
     class Handler(BaseHTTPRequestHandler):
         protocol_version = "HTTP/1.1"
 
-        def do_POST(self) -> None:  # noqa: N802 — the base class names it
+        def do_POST(self) -> None:  # noqa: N802 (the base class names it)
             if self.headers.get(TOKEN_HEADER) != token:
                 # No detail, and the same answer for a missing token and a wrong one: a caller
                 # that did not bring the token is not one this process owes an explanation.
