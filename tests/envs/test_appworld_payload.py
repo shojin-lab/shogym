@@ -216,6 +216,27 @@ def test_a_request_named_twice_is_one_answer_and_a_duplicate(backlog: ledger.Bac
     assert row.passed
 
 
+def test_a_slot_left_at_the_api_s_own_default_reads_as_unexercised(
+    backlog: ledger.Backlog,
+) -> None:
+    # The world writes a value into these columns whether the agent chose one or not, so "left
+    # alone" and "chosen wrong" arrive looking the same. Every default is struck from its option
+    # set and read back as unexercised: scoring one as a wrong guess would count an omission as an
+    # attempt and put the slot's filing rate inside its compliance rate.
+    key = draw_key(TASK, 0)
+    defaults = {slot.check_id: slot.default for slot in world.SLOTS}
+    verdicts = scored(backlog, key, color="charcoal", priority="medium")
+    rows = {item.check_id: item for item in verdicts.items if item.kind == PINNED}
+    assert defaults["fr.label.color"] == "charcoal"
+    assert defaults["fr.log.priority"] == "medium"
+    assert rows["fr.label.color"].observed == NOT_SET
+    assert rows["fr.log.priority"].observed == NOT_SET
+    assert not rows["fr.label.color"].passed and not rows["fr.log.priority"].passed
+    # And a default is never in its own option set, so it cannot be what the draw asked for.
+    for slot in world.SLOTS:
+        assert slot.default not in slot.options
+
+
 def test_a_stored_slot_is_scored_on_itself(backlog: ledger.Backlog) -> None:
     key = draw_key(TASK, 0)
     verdicts = scored(backlog, key, color=None, unit="minutes")

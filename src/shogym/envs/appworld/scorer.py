@@ -154,7 +154,10 @@ def score(
 
     correct_pinned = 0
     for slot, drawn, filled in zip(SLOTS, key.slots, _slot_values(filing)):
-        observed = NOT_SET if filled is None else (filled if filled in slot.options else OTHER)
+        if filled is None or filled == slot.default:
+            observed = NOT_SET
+        else:
+            observed = filled if filled in slot.options else OTHER
         passed = filled is not None and filled == drawn
         correct_pinned += passed
         items.append(Item(PINNED, slot.check_id, observed, passed))

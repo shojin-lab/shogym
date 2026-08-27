@@ -237,7 +237,8 @@ def _read_filing(models: Any, body: Dict[str, Any]) -> Dict[str, Any]:
         if not any(link.label_id == label.id for link in links):
             color = None
     if not rows:
-        return {**empty, "color": color if label is None else None}
+        # A label with no row to carry it is a colour nobody chose for anything.
+        return empty
     first = rows[0]
     sections = {s.id: s.name for s in todoist.Section.find_all(project_id=project.id)}
     return {

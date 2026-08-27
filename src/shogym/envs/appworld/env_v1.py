@@ -229,7 +229,12 @@ class AppWorldEnv(Env):
             session.worker.close()
 
     def _derive(self, worker: adapter.Worker, task_id: str) -> None:
-        """Make sure the seeded copy of ``task_id``'s world exists, writing it if it does not."""
+        """Make sure the seeded copy of ``task_id``'s world exists, writing it if it does not.
+
+        Checked before the backlog is drawn rather than after. Drawing one costs about a second,
+        and a run that serves a task a second time has the world it needs already on disk."""
+        if (self._derived / "tasks" / task_id / "dbs" / "todoist.jsonl").exists():
+            return
         specs = adapter.task_specs(self._original.parent, task_id)
         backlog = self._backlog(task_id, specs)
         rows = world.seeding(
