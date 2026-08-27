@@ -215,8 +215,6 @@ semantics (give each run its own trace file for a guaranteed 1:1 mapping).
 
 ## Layout
 
-A source map for orientation:
-
 | File | Role |
 |---|---|
 | `env_v1.py` | The registered `tau2_*` envs (one per domain): `describe` (policy + ticket + manifest), the `finalize` hook (tau2 agent-stop → `evaluate_simulation` once, on the sealed episode), and the pure `_verify` scorer (verdict from evidence). |

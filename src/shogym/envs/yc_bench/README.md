@@ -3,10 +3,10 @@
 [**YC-Bench**](https://github.com/collinear-ai/yc-bench) (Collinear AI's long-horizon
 deterministic benchmark) served through shogym at upstream commit `e7d6067`. YC-Bench puts an
 agent in charge of a simulated AI startup for one year: starting with **$200,000**, it issues
-`yc-bench` CLI commands against a
-deterministic, SQLite-backed discrete-event simulation — accepting tasks from a marketplace,
-assigning employees, advancing the clock, and managing cash flow — until **bankruptcy**
-(funds < 0) or the **one-year horizon**. The score is how the company ends up.
+`yc-bench` CLI commands against a deterministic, SQLite-backed discrete-event simulation —
+accepting tasks from a marketplace, assigning employees, advancing the clock, and managing cash
+flow — until **bankruptcy** (funds < 0) or the **one-year horizon**. The score is how the
+company ends up.
 
 Like every shogym env this **describes** a task, **serves** its tools over MCP, and **verifies**
 a recorded trajectory while an external harness drives the tools — see
@@ -220,8 +220,6 @@ semantics (give each run its own trace file for a guaranteed 1:1 mapping).
   3.12 suite stays green without it.
 
 ## Layout
-
-A source map for orientation:
 
 | File | Role |
 |---|---|

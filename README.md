@@ -11,8 +11,8 @@ score.
 It is a substrate for questions about agents on tasks. How do agents improve themselves? What
 does adding a tool change? Does an agent's self-report match an honest score?
 
-Under the hood, an environment (`Env`) is a task loader, an initial observation, a pure verifier,
-and a set of MCP servers. Tools are [MCP](https://modelcontextprotocol.io) servers
+An environment (`Env`) is a task loader, an initial observation, a pure verifier, and a set of
+MCP servers. Tools are [MCP](https://modelcontextprotocol.io) servers
 (in-process, stdio, or HTTP); episodes are session-keyed for safe concurrent rollouts;
 termination is a reserved `terminate` tool or the horizon; verification is a pure function over
 the recorded trajectory.

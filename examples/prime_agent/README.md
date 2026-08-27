@@ -86,9 +86,9 @@ If the agent stops after one task, `--autonomous` is the host policy for unatten
 continuations (`--autonomous-max-continuations`, default 3; `--autonomous-max-turns`, default
 12). The prompt asks it to drive itself; the flag is what keeps the host asking.
 
-There is no way to fence the affordances here, and it is worth being blunt about that. The
-other quickstarts end this section with a deny list (`--disallowedTools`, `-t shogym`,
-`--no-builtin-tools`) so that the served tools are the only thing the agent can reach. Prime
+There is no way to fence the affordances here. The other quickstarts end this section with a
+deny list (`--disallowedTools`, `-t shogym`, `--no-builtin-tools`) so that the served tools are
+the only thing the agent can reach. Prime
 Agent has one built-in tool and the stream lives *inside* it: `--no-builtin-tools` and
 `--no-tools` both remove `ipython`, which removes the kernel, which removes the stream. So the
 same kernel that plays the task can read the env's task definitions off disk, and no flag

@@ -213,8 +213,6 @@ semantics (give each run its own trace file for a guaranteed 1:1 mapping).
 
 ## Layout
 
-A source map for orientation:
-
 | File | Role |
 |---|---|
 | `env_v1.py` | The registered `hle` env: `describe` (question + manifest), the dataset load + 80/20 split, the `finalize` hook (exact-match fast path → LLM judge on the sealed submission), and the pure `score_evidence` verifier. |

@@ -13,15 +13,14 @@ harness (Claude Code, Codex, pi, Hermes, or a small in-process loop) drives the 
 env only describes, serves, and scores. Hold `(env, task)` fixed, swap the harness, and the
 delta in the trace is attributable to the harness.
 
-This README is the **single source** for the machinery every env shares — the terminal
-lifecycle vocabulary, how a score is read back off a trace, the requirements boilerplate, and
-the offline-vs-keyed test split. Each env's own README states only what is *specific* to that
-env and links back here for the rest.
+The machinery every env shares lives here — the terminal lifecycle vocabulary, how a score is
+read back off a trace, the requirements boilerplate, and the offline-vs-keyed test split. Each
+env's own README states only what is *specific* to that env and links back here for the rest.
 
 ## Terminal lifecycle: seal, terminal, score-terminal, abort
 
-Every env ends an episode through the same lifecycle. The vocabulary is defined once here and
-used verbatim in each env README:
+Every env ends an episode through the same lifecycle, and each env README uses this vocabulary
+verbatim:
 
 - **terminal** — a tool call that *ends* the episode. Each tool advertises a `terminal_kind`
   in the manifest: `none` (an ordinary step), `score`, or `abort`.
@@ -66,7 +65,7 @@ the same `EvalResult` this way.
 ## Requirements boilerplate
 
 Every env that needs an optional extra states its own data / keys, but the pin-and-install
-mechanics are identical and defined once here:
+mechanics are identical:
 
 - **Python 3.12.** The project is pinned to 3.12 (`requires-python = ">=3.12,<3.13"`, with a
   committed `.python-version`) — the tau2 port needs it.

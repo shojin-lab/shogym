@@ -3,10 +3,9 @@
 [**AutomationBench**](https://github.com/zapier/AutomationBench) (MIT, © Zapier) served through
 shogym at upstream commit `a321764`: an agent gets a natural-language instruction and carries out
 a realistic cross-application business workflow over a fully **simulated** world of ~47 SaaS
-apps; scoring
-checks — programmatically, **end-state only** — whether the right data landed in the right
-systems. No LLM judge, no live SaaS, no network at eval time — the whole port is deterministic
-and offline.
+apps; scoring checks — programmatically, **end-state only** — whether the right data landed in
+the right systems. No LLM judge, no live SaaS, no network at eval time — the whole port is
+deterministic and offline.
 
 Like every shogym env this **describes** a task, **serves** its tools over MCP, and **verifies**
 a recorded trajectory while an external harness drives the tools — see
@@ -203,6 +202,5 @@ src/shogym/envs/automationbench/
   env_v1.py      # @register("automationbench"): describe / task-load / finalize (seal) + verify (evidence)
   mcp_server.py  # in-process MCP: api_search / api_fetch / base64_encode / done, per-session WorldState + score_session
   adapter.py     # the single seam: provisions + imports upstream, re-hosts setup_state helpers, reuses the rubric
-  README.md      # this file
 ```
 </content>
