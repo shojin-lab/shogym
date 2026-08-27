@@ -34,7 +34,7 @@ provisioned(adapter.ensure_apps, package="appworld", extra="appworld")
 
 import shogym  # noqa: E402
 from shogym.envs.appworld import ledger, payload, world  # noqa: E402
-from shogym.envs.appworld.scorer import draw_key  # noqa: E402
+from shogym.envs.appworld.scorer import draw_key, leg_of  # noqa: E402
 from shogym.envs.appworld.worker import TOKEN_HEADER  # noqa: E402
 from shogym.serve import ServedEpisode  # noqa: E402
 
@@ -85,7 +85,7 @@ async def play(blocks: List[str], *, position: int = TASK, **config: Any) -> Dic
 def filing_block(position: int = TASK, *, pulse: int = 0, section: bool = True) -> str:
     """Code that files the log the drawn convention asks for. The reference solution."""
     built = backlog_for(position)
-    key = draw_key(task_id(position), pulse)
+    key = draw_key(leg_of(task_id(position)), pulse)
     lines = "\n".join(
         f"{request.reference}, {band}"
         for request, band in zip(built.requests, built.key(key.convention))
@@ -284,6 +284,94 @@ async def test_the_port_and_the_token_reach_no_agent_visible_surface() -> None:
                 assert secret not in surface
     finally:
         await episode.close()
+
+
+async def test_agent_authored_code_cannot_reach_what_the_boundary_hides() -> None:
+    """The probes a curious agent actually runs, and what each of them may not find.
+
+    The code an agent writes runs *as* the worker process, so the worker is not a sandbox and this
+    does not pretend otherwise. What it is is a set of things deliberately not put where that code
+    can reach: the token and the corpus root are not on the command line, the answers are not in
+    the process and not in the corpus tree it was given, and the serving process's environment was
+    left behind. Each probe below is one the review named."""
+    # Written the way the review wrote them. AppWorld's own guard refuses a plain `import sys`
+    # and lets `__import__("sys")` through, which is the whole reason the guard is not a boundary
+    # and these properties have to hold without it.
+    argv_probe = """
+print(json.dumps(__import__("sys").argv))
+"""
+    env_probe = """
+print(json.dumps(dict(__import__("os").environ)))
+"""
+    disk_probe = """
+_io, _os = __import__("io"), __import__("os")
+root = _os.environ["APPWORLD_ROOT"]
+
+
+def _read(path):
+    try:
+        return _io.open(path).read()[:40]
+    except Exception as failure:
+        return type(failure).__name__
+
+
+print(json.dumps({
+    "root": root,
+    "readable": _read(root + "/data/tasks/%s/specs.json"),
+    "answers": _read(root + "/data/tasks/%s/ground_truth/answer.json"),
+}))
+""" % (task_id(), task_id())
+    played = await play([argv_probe, env_probe, disk_probe])
+    argv = json.loads(json.loads(played["outputs"][0]["content"])["output"])
+    environment = json.loads(json.loads(played["outputs"][1]["content"])["output"])
+    filesystem = json.loads(json.loads(played["outputs"][2]["content"])["output"])
+
+    # 1. Nothing on the command line but the interpreter, the script and the subcommand. The
+    #    token and the root arrive on stdin, which is read once and closed.
+    assert argv[-1] == "serve"
+    joined = " ".join(argv)
+    assert "--token" not in joined and "--root" not in joined
+    assert filesystem["root"] not in joined
+
+    # 2. The serving process's environment did not come along, so an inherited provider key is
+    #    not sitting there for the taking.
+    # The allow-list, what the worker sets for itself, and the handful the platform and the
+    # interpreter inject into every process no matter what they were handed.
+    platform = {"__CF_USER_TEXT_ENCODING", "__PYVENV_LAUNCHER__", "PYTHONHASHSEED"}
+    allowed = set(adapter._ENV_ALLOW_LIST) | {"HOME", "APPWORLD_CACHE", "APPWORLD_ROOT"} | platform
+    assert set(environment) <= allowed, sorted(set(environment) - allowed)
+    assert not [
+        name
+        for name in environment
+        if any(word in name.upper() for word in ("KEY", "TOKEN", "SECRET", "PASSWORD"))
+    ]
+
+    # 3. The answers are not in the tree the world was served from. They ship in the corpus in
+    #    plaintext, so the tree an agent's world is given simply does not carry them. Both halves
+    #    matter: the corpus really is readable from here, and the answers really are not in it.
+    assert filesystem["readable"].startswith("{")
+    assert filesystem["answers"] == "FileNotFoundError"
+
+
+async def test_the_answers_are_not_in_the_process_that_runs_agent_code() -> None:
+    """The world is built without ground truth, so there is no evaluator to call and no expected
+    value to walk to from a frame. Grading happens in a second process that never runs agent
+    code, reading the end state off disk."""
+    probe = """
+_gc, _sys = __import__("gc"), __import__("sys")
+kind = _sys.modules["appworld.environment"].AppWorld
+live = [o for o in _gc.get_objects() if isinstance(o, kind)]
+print(json.dumps({
+    "worlds": len(live),
+    "ground_truth": [w.task.ground_truth is not None for w in live],
+}))
+"""
+    played = await play([probe])
+    seen = json.loads(json.loads(played["outputs"][0]["content"])["output"])
+    assert seen["worlds"] >= 1
+    assert seen["ground_truth"] == [False] * seen["worlds"]
+    # And the base task is still graded, by the process that does hold them.
+    assert played["feedback"]["checks"] > 0
 
 
 # ----- hazard: the payloads match on bytes even when the world does not speak ASCII -----

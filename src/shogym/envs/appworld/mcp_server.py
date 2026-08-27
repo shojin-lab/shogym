@@ -33,6 +33,7 @@ class Session:
     worker: Any
     task_id: str
     supervisor_email: str
+    experiment: str
     calls: int = 0
 
 

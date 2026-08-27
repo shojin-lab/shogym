@@ -37,8 +37,6 @@ NOT_SET = "not set"
 OTHER = "other"
 AMBIGUOUS = "ambiguous"
 NOT_DETERMINED = "not determined"
-OK = "ok"
-NOT_OK = "not ok"
 
 #: Every token that may appear in a rendered ``observed`` column, which is what makes the width
 #: of that column a constant and the payload's length independent of the world.
@@ -50,8 +48,6 @@ OBSERVED_VOCABULARY: Tuple[str, ...] = (
     OTHER,
     AMBIGUOUS,
     NOT_DETERMINED,
-    OK,
-    NOT_OK,
 )
 
 LEDGER = "ledger"
@@ -66,14 +62,31 @@ class Key(NamedTuple):
     slots: Tuple[str, ...]
 
 
-def draw_key(task_id: str, pulse: int) -> Key:
-    """The key for one task under one draw.
+def leg_of(task_id: str) -> str:
+    """The group of tasks one convention is drawn for.
+
+    AppWorld numbers a scenario's instantiations ``<scenario>_1``, ``_2``, ``_3``: same template,
+    same slots, different values, which is the sibling relation this port rents rather than
+    invents. One convention is drawn per scenario, so a task and its sibling are graded under the
+    same rule and a grade on the first is a grade about something the second still contains.
+
+    Per task would be a different experiment and a broken one. A convention that changed between
+    a task and its sibling would make every receipt a statement about a rule that no longer
+    applies, and the difference between the two arms would measure nothing."""
+    return task_id.rsplit("_", 1)[0]
+
+
+def draw_key(leg: str, pulse: int) -> Key:
+    """The key one leg is graded under.
 
     Uniform over the 64 conventions and over each slot's own options, and a deterministic
-    function of the task and the pulse alone. It never sees the agent, the feedback regime or the
-    run, so the same task drawn twice is the same key and two arms of one task are graded against
-    one rule."""
-    draw = stream(f"{pulse}|{task_id}")
+    function of the leg and the pulse alone. It never sees the agent, the feedback regime or the
+    run, so the same leg drawn twice is the same key and two arms of one task are graded against
+    one rule.
+
+    Drawn per leg rather than per run: a single convention shared by the whole roster would make
+    one draw the entire experiment, and every leg's result a reading of the same coin."""
+    draw = stream(f"{pulse}|{leg}")
     convention = CONVENTIONS[next(draw) % len(CONVENTIONS)]
     slots = tuple(slot.options[next(draw) % len(slot.options)] for slot in SLOTS)
     return Key(convention=convention, slots=slots)
@@ -115,6 +128,7 @@ class Verdicts(NamedTuple):
     parse_fraction: float
     distinct_bands: int
     filing_rows: int
+    duration_set: bool
 
     @property
     def assertions(self) -> int:
@@ -139,8 +153,13 @@ def score(
 
     items: List[Item] = []
     for check_id, passed in assertions:
-        observed = NOT_DETERMINED if passed is None else (OK if passed else NOT_OK)
-        items.append(Item(ASSERTION, check_id, observed, bool(passed)))
+        # `not determined`, always, whatever the check did. The observed column is what the agent
+        # put somewhere, and a base-task check has no such value: it asserts over models the agent
+        # touched through nine apps, and naming its outcome here would put a grade in the one
+        # column both payload classes share. The digest hashes this column, so an outcome here
+        # would make the inert payload move with the base task's outcome, which is the one thing
+        # it may not do.
+        items.append(Item(ASSERTION, check_id, NOT_DETERMINED, bool(passed)))
 
     correct_ledger = 0
     exercised = 0
@@ -172,6 +191,7 @@ def score(
         parse_fraction=(parsed / lines) if lines else 0.0,
         distinct_bands=len(bands),
         filing_rows=filing.rows,
+        duration_set=filing.duration is not None,
     )
 
 
@@ -226,16 +246,15 @@ __all__ = [
     "LEDGER",
     "NOT_DETERMINED",
     "NOT_FILED",
-    "NOT_OK",
     "NOT_SET",
     "OBSERVED_VOCABULARY",
-    "OK",
     "OTHER",
     "PINNED",
     "Item",
     "Key",
     "Verdicts",
     "draw_key",
+    "leg_of",
     "score",
     "stream",
 ]

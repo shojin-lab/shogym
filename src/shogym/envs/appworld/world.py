@@ -25,6 +25,7 @@ import shutil
 from pathlib import Path
 from typing import Any, Callable, Dict, NamedTuple, Optional, Tuple
 
+from shogym.envs._upstream import _locked
 from shogym.envs.appworld.ledger import ROLES, SECTIONS, Backlog, Request
 
 # ----- the appended paragraph -----
@@ -110,10 +111,22 @@ class Filing(NamedTuple):
     color: Optional[str]
     unit: Optional[str]
     priority: Optional[str]
+    #: The number the paragraph asks for beside the unit. Not one of the four scored slots: it is
+    #: a value rather than a choice from an option set, so no draw can be right about it and a
+    #: verdict on it would carry nothing. Reported, so that leaving it out is visible rather than
+    #: invisible to every metric.
+    duration: Optional[float]
 
 
 EMPTY_FILING = Filing(
-    filed=False, rows=0, lines=(), section=None, color=None, unit=None, priority=None
+    filed=False,
+    rows=0,
+    lines=(),
+    section=None,
+    color=None,
+    unit=None,
+    priority=None,
+    duration=None,
 )
 
 
@@ -162,39 +175,78 @@ def derive_task(
     *,
     original: Path,
     derived: Path,
+    graded: Path,
     task_id: str,
     write_log: Callable[[Path, Path], None],
 ) -> Path:
-    """Materialise one task's directory under ``derived``, with its filing log written into it.
+    """Materialise one task's world twice: once for the agent, once for the grader.
+
+    ``derived`` is the corpus the episode's world runs against and it carries **no**
+    ``ground_truth`` directory at all. The answers ship in the corpus in plaintext, agent-authored
+    code runs with that corpus's root in its environment, and a directory that is not there is not
+    readable. ``graded`` is the same task, sharing the same database files, with the answers linked
+    back in; only the grading process is given that root, and it never runs agent code.
 
     Everything the task ships is linked rather than copied, so a derived corpus of the whole split
     costs one small file per task. Only the todoist log is a real file, because it is the only one
     this port changes: ``write_log`` is handed the task's own database directory and the path the
     rewritten log belongs at.
 
-    Built beside the target and moved into place in one rename, so a task is either fully derived
-    or not derived at all: a half-written log picked up by a later run would be a world nobody
-    could reproduce. Idempotent, which is what makes the same task served twice the same world."""
+    **Two streams starting the same cold task is the ordinary case, not a hypothetical.** Paired
+    forks are launched together and both derive on first use, so the work is done under a lock on
+    the tasks directory and published with one rename, into a staging directory named for the
+    process that owns it. A loser finds the target already there and uses it."""
     target = derived / "tasks" / task_id
-    if (target / "dbs" / "todoist.jsonl").exists():
+    if already_derived(derived=derived, graded=graded, task_id=task_id):
         return target
-    source = original / "tasks" / task_id
-    building = derived / "tasks" / f".{task_id}.building"
-    if building.exists():
-        shutil.rmtree(building)
-    (building / "dbs").mkdir(parents=True)
-    for entry in sorted(source.iterdir()):
-        if entry.name != "dbs":
-            _link(entry, building / entry.name)
-    for entry in sorted((source / "dbs").iterdir()):
-        if entry.name != "todoist.jsonl":
-            _link(entry, building / "dbs" / entry.name)
-    write_log(source / "dbs", building / "dbs" / "todoist.jsonl")
-    if target.exists():
-        shutil.rmtree(target)
-    target.parent.mkdir(parents=True, exist_ok=True)
-    os.replace(building, target)
+    (derived / "tasks").mkdir(parents=True, exist_ok=True)
+    (graded / "tasks").mkdir(parents=True, exist_ok=True)
+    with _locked(derived / "tasks"):
+        if already_derived(derived=derived, graded=graded, task_id=task_id):
+            return target
+        source = original / "tasks" / task_id
+        building = derived / "tasks" / f".{task_id}.{os.getpid()}.building"
+        shutil.rmtree(building, ignore_errors=True)
+        (building / "dbs").mkdir(parents=True)
+        for entry in sorted(source.iterdir()):
+            # `ground_truth` is deliberately absent: see the docstring.
+            if entry.name not in ("dbs", "ground_truth"):
+                _link(entry, building / entry.name)
+        for entry in sorted((source / "dbs").iterdir()):
+            if entry.name != "todoist.jsonl":
+                _link(entry, building / "dbs" / entry.name)
+        write_log(source / "dbs", building / "dbs" / "todoist.jsonl")
+        if target.exists():
+            shutil.rmtree(target)
+        os.replace(building, target)
+        _grading_view(target, graded / "tasks" / task_id, source / "ground_truth")
     return target
+
+
+def already_derived(*, derived: Path, graded: Path, task_id: str) -> bool:
+    """Whether both views of a task are already on disk and complete.
+
+    Both, not either: the world an agent drives and the grader's view of it are built together and
+    a run that found only the first would serve an episode nothing could grade."""
+    return (derived / "tasks" / task_id / "dbs" / "todoist.jsonl").exists() and (
+        graded / "tasks" / task_id / "ground_truth"
+    ).exists()
+
+
+def _grading_view(target: Path, view: Path, answers: Path) -> None:
+    """The grader's view of a derived task: the same world, with the answers linked back in.
+
+    Three links rather than a copy, so the seeded database log has exactly one instance on disk
+    and the two views cannot drift apart."""
+    building = view.parent / f".{view.name}.{os.getpid()}.building"
+    shutil.rmtree(building, ignore_errors=True)
+    building.mkdir(parents=True)
+    for entry in sorted(target.iterdir()):
+        _link(entry, building / entry.name)
+    _link(answers, building / "ground_truth")
+    if view.exists():
+        shutil.rmtree(view)
+    os.replace(building, view)
 
 
 def derive_root(*, original: Path, derived: Path) -> Path:
@@ -203,11 +255,25 @@ def derive_root(*, original: Path, derived: Path) -> Path:
     The base databases, the API documentation and the split files are linked in whole: they are
     read-only inputs and linking them means one derived corpus rather than a copy per run."""
     (derived / "tasks").mkdir(parents=True, exist_ok=True)
-    for entry in sorted(original.iterdir()):
-        if entry.name == "tasks":
-            continue
-        _link(entry, derived / entry.name)
+    with _locked(derived):
+        for entry in sorted(original.iterdir()):
+            if entry.name == "tasks":
+                continue
+            _link(entry, derived / entry.name)
     return derived
+
+
+def share_outputs(*, derived: Path, graded: Path) -> None:
+    """Point the grader's root at the episode's own output tree.
+
+    An episode writes its end state under the root its world was served from, and the grader reads
+    it under the root *it* was given. Those are two roots on purpose, so the tree the agent's
+    world lives in carries no answers, and one link is what keeps them looking at the same end
+    state rather than at two copies that can disagree."""
+    outputs = derived / "experiments"
+    (outputs / "outputs").mkdir(parents=True, exist_ok=True)
+    graded.mkdir(parents=True, exist_ok=True)
+    _link(outputs, graded / "experiments")
 
 
 def _link(source: Path, target: Path) -> None:
@@ -237,7 +303,9 @@ __all__ = [
     "SLOTS",
     "Filing",
     "Slot",
+    "already_derived",
     "derive_root",
+    "share_outputs",
     "derive_task",
     "request_description",
     "seeding",

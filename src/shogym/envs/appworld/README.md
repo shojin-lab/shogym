@@ -128,6 +128,14 @@ before any episode and recorded in [`task_manifest.txt`](task_manifest.txt):
   model a scenario *asserts on* would turn a passing check into a failing one, so that task is not
   served either.
 
+**One convention is drawn per scenario, not per task.** AppWorld numbers a scenario's
+instantiations `_1`, `_2`, `_3`: the same template with different values, which is the sibling
+relation this port rents rather than invents. A task and its sibling are therefore graded under
+one rule, so a grade on the first is a grade about something the second still contains. Per task
+it would be a rule that had already changed by the time the next task arrived, and the difference
+between two arms would measure nothing. Two scenarios are two draws, so no single draw is the
+whole experiment.
+
 A task's world is the shipped one with 35 rows added: the `Task Log` project (its description
 holds the working week and three closed dates and nothing else), a collaborator link to the
 supervisor alone, four sections, 28 dated requests and one undated one. The rows go into the
@@ -142,7 +150,7 @@ seed are all deterministic functions of the task identity.
 | Metric | What it is |
 |---|---|
 | `ledger_fraction` | **the headline.** Correct bands over 29 requests, with a request the agent filed no line for counted incorrect. |
-| `pinned_fraction` | **the control.** Correct stored slots over 4. Each reads its own slot alone, so a failure crosses off one option and says nothing about any other row: whatever the agent learns, this cannot pass `mean(1/c) = 77/240 = 0.3208` in expectation. A run in which it moves with the headline is a run whose headline is measuring something else. |
+| `pinned_fraction` | **the control.** Correct stored slots over 4. Each reads its own slot alone, so a failure crosses off one option and says nothing about any other row. See [What the control caps](#what-the-control-caps) for the two numbers this involves, which are not the same number. |
 | `exercise_fraction` | How much of the ledger was attempted. A contrast carried by this is an agent learning a chore. |
 | `parse_fraction` | How many written lines named exactly one request. Reported as a shape error, never graded as a lesson. |
 | `assertion_fraction` | The base task's own checks, from AppWorld's evaluator, reported beside the headline and never summed with it. |
@@ -157,6 +165,61 @@ print(result.terminated, result.value("ledger_fraction"))
 
 Filter semantics are shared; see [`../README.md`](../README.md).
 
+### What the control caps
+
+A stored slot is answered by picking one of `c` options, and a verdict on it says only whether the
+pick was right. Two numbers follow and they are easy to confuse.
+
+- **Ungraded compliance is `1/c` per slot**, so the four slots average
+  `mean(1/c) = (1/4 + 1/5 + 1/3 + 1/2) / 4 = 77/240 = 0.3208`. That is what an arm with no
+  feedback scores, and it is the level to check the placebo arm against.
+- **After one verdict the ceiling is `2/c` per slot**: right one time in `c` and knowing it,
+  wrong the rest and then picking from the `c - 1` survivors. The four slots average
+  `mean(2/c) = 77/120 = 0.6417`.
+
+So the cap on what a grade can be *worth* here is the difference, `mean(1/c) = 0.3208`, and
+reaching it takes no skill: a competent reader and a brilliant one cross off the same option. That
+is the whole point of keeping these four beside the headline. They are a negative control **only
+where they sit at their cap**; a reader below it can climb toward it as experience accumulates, so
+a moving pinned level is evidence of a broken fork only when the level was already there. Both
+numbers are published beside the trend for that reason.
+
+The ledger is not like this, and that is the difference the instrument rests on: a band is
+*computed* from a request's own dates rather than picked off a list, so different conventions
+collide on some requests and separate on others and there is a pattern to explain rather than a
+bit to invert.
+
+### What one receipt settles, and what it does not
+
+A receipt is the vector of bits saying, per request, whether the drawn convention would have
+written what the agent wrote. Conventions sharing a vector are conventions no reader can separate
+however well it reads. Enumerated on the served roster, against the submission a measured panel of
+readers actually produces:
+
+| quantity | value |
+|---|---|
+| distinct verdict vectors, of 64 conventions | 47.8 |
+| largest set of conventions sharing one vector | 7.7 |
+| conventions still standing after one receipt | 2.88 |
+| Bayes-action ceiling | 0.9530 |
+| lookup floor (what the receipt's own labels concede) | 0.5901 |
+| **headroom** | **0.3629** |
+
+**The map is not injective and cannot be made so.** Some pairs of conventions agree on every
+request the world can supply: when no window under the drawn anchor lands on a printed figure, the
+boundary rule changes nothing anywhere, and no extra request can make it. Measured at 28, 34, 40
+and 48 dated requests, no backlog at any length has a one-to-one map, and the mean posterior
+asymptotes near 1.7 rather than reaching 1.
+
+So the claim this instrument supports is **matching the drawn convention closely, not naming it**.
+64 conventions down to about three is most of what there was to learn, and the headroom figure is
+what a grade is worth on that scale. Anything published off this port should say "matches the
+drawn convention more closely" and never "identifies the convention".
+
+The admission gate is the one the enumeration justifies and no more: 64 distinct answer keys, and
+every single-axis move changing at least two requests. Both are checked per backlog, and the
+narrowing above is enumerated and asserted across the roster.
+
 ### The three payload classes
 
 All three list every scored item in canonical order and **are the same length on the wire**, by
@@ -169,7 +232,11 @@ cannot change the byte count.
   item turns on.
 - **the digest** (`notice`, under `Placebo`): `sha256(task || check || observed)[:4]` per item. A
   function of the task identity and the agent's own submission, both of which are already in the
-  agent's transcript, so it carries nothing about the key by construction.
+  agent's transcript, so it carries nothing about the key by construction. The base task's own
+  checks render their observed value as `not determined`, always: a check asserts over models the
+  agent touched through nine apps and has no value the agent wrote anywhere, and naming its
+  outcome in the one column both classes share would make the inert payload move with the base
+  task's result. A test flips every check and asserts no byte of the digest moves.
 - **the drawn receipt** (`report`, with `report="drawn"`): the receipt's shape with verdicts that
   were sampled rather than computed. The number of passing dated requests is drawn from
   [`pass_counts.txt`](pass_counts.txt), the roster's own distribution enumerated over every served
@@ -204,16 +271,50 @@ bytes, sha256 `fd9f9608c2ec71ed0ac25c3633a738b9129a318a129e31230425b9188e508250`
   attribute. That subprocess binds a loopback port and refuses every request without a token
   minted at spawn. AppWorld's own environment server publishes `evaluate`, `save_state` and
   `load_state` unauthenticated on every interface; this one does not.
+- **The base task is graded in a second process that never runs agent code.** The world an
+  episode is served from is built with `load_ground_truth=False`, so the answers and the checks
+  are not objects in the process an agent's code runs as and there is no evaluator there to call.
+  At the seal the end state is flushed to disk and a short-lived grading process reads it.
 - **The generator's global-RNG state is captured and restored around every episode,** and the seed
   it is started from names the task and nothing else: not the session, not the run, not the
   feedback regime. AppWorld saves databases and not generator state, and every `login` draws from
   the global generator, so a port that replayed only the databases would serve two worlds that
   agreed on their contents and disagreed on their next draw.
+- **Deferred: the derived cache's identity does not fingerprint its source.** The cache name
+  carries a digest of the backlog generator's constants, so changing a cut value or an option set
+  derives a fresh corpus. It does not carry the source corpus's own identity or the derivation
+  code's version, so pointing `APPWORLD_ROOT` at a different corpus, or changing how a task is
+  derived without changing a ledger constant, would reuse the existing tree. The pinned bundle
+  makes the first unlikely and neither is a silent wrong answer within one pinned run, so it is
+  recorded here rather than fixed.
 - **Not built:** the yoked payload (a donor's submission and the receipt computed on it), the
   foreign rendering of a verdict vector as prose and the parser that round-trips it, the fixed-size
   envelope that would pad those to one predeclared size, and any assignment, forking or analysis
   machinery. This is the environment and its three payload classes; the experiment that uses them
   is not in this repository.
+
+### What the worker boundary is, and what it is not
+
+The code an agent writes runs **as** the worker process, with that process's filesystem and
+network. AppWorld's own `SafetyGuard` is not a boundary either: it refuses `import sys` and lets
+`__import__("sys")` through, and it null-patches `os.walk` and `os.listdir` while `io.open` reads
+whatever the user running the port can read. So the port does not claim a sandbox. What it claims
+is a set of things deliberately not put where that code can reach, each of them tested by running
+the probe rather than by reading the code:
+
+| what | how |
+|---|---|
+| the worker's token and corpus root | passed on stdin, which is read once and closed, so `sys.argv` carries only the script and the subcommand |
+| the serving process's environment | replaced with an allow-list, so an inherited provider key is not there to be read |
+| the answers, as objects | the world is built without ground truth, and there is no evaluator in the process |
+| the answers, as files | the corpus tree the world is served from carries **no** `ground_truth` directory at all; the grader gets its own view of the same task, sharing the same database files |
+| the drawn key | never sent to either process: the protocol has no field for one |
+
+**What is still reachable, and is the harness's to close.** The port's own source, and therefore
+the draw's algorithm. The run's provenance directory, which retains the true report even when a
+run is serving `Placebo`, so a later worker on the same host could read a grade the policy
+withheld. Anything else the user running the port can read. A run whose scores have to survive an
+adversary needs a container around the worker process, not a longer allow-list inside it.
 
 ## Gotchas
 
@@ -222,7 +323,11 @@ bytes, sha256 `fd9f9608c2ec71ed0ac25c3633a738b9129a318a129e31230425b9188e508250`
   one-time cost; deriving a task's seeded world costs about a second the first time it is served
   and nothing after that. Set `APPWORLD_ROOT` to skip the download.
 - **A different `pulse` is a different experiment.** It fixes the convention and the four stored
-  slots for every task. Scores drawn under two pulses are not comparable.
+  slots for every leg. Scores drawn under two pulses are not comparable, and neither the pulse nor
+  the payload class appears anywhere else in a run's record, so every row carries a
+  `config_digest` over both. Reopening a provenance directory under a different one is then
+  visible in the rows. Refusing such a resume belongs to the stream, which is what owns run
+  identity; an env is handed a task and does not know which run it is being served into.
 - **`show_tasks` returns a dict**, not a list: seeded requests carry no section, so they arrive
   under `no_section_tasks`. `show_projects` defaults to `page_limit=5`.
 - **The receipt names the task, and the draw is deterministic.** Both payloads print

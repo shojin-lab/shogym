@@ -393,6 +393,45 @@ def _draw(
 # ----- what a roster's real verdict counts look like -----
 
 
+class Posterior(NamedTuple):
+    """What one receipt leaves standing, enumerated rather than argued about.
+
+    ``distinct`` is how many different verdict vectors the 64 conventions produce against one
+    submission, ``largest`` the size of the biggest set of conventions that produce the same one,
+    and ``mean_size`` the average number of conventions still standing after the receipt is read,
+    under a uniform prior."""
+
+    distinct: int
+    largest: int
+    mean_size: float
+
+
+def posterior_profile(backlog: "Backlog", applied: Convention) -> Posterior:
+    """What a receipt on ``applied``'s own answer leaves standing about the drawn convention.
+
+    The observation is the vector of bits saying, per request, whether the drawn convention would
+    have written what the agent wrote. Two conventions that produce the same vector are two a
+    reader cannot separate however well it reads, so counting the vectors is the exact statement
+    of what one grade can and cannot settle.
+
+    **It is not one, and no length of backlog makes it one.** Some pairs of conventions agree on
+    every request the world can supply: when no window under the drawn anchor lands on a printed
+    figure, the boundary rule changes nothing anywhere, and no extra request can make it. What the
+    receipt supports is matching the drawn convention closely, not naming it, and this is the
+    number that says by how much."""
+    submission = backlog.keys[_CONVENTION_INDEX[applied]]
+    tally: Dict[Tuple[bool, ...], int] = {}
+    for row in backlog.keys:
+        vector = tuple((row == submission).tolist())
+        tally[vector] = tally.get(vector, 0) + 1
+    total = len(CONVENTIONS)
+    return Posterior(
+        distinct=len(tally),
+        largest=max(tally.values()),
+        mean_size=sum(size * size for size in tally.values()) / total,
+    )
+
+
 def pass_count_marginal(backlogs: Iterable[Backlog]) -> Tuple[int, ...]:
     """How often each number of passing requests occurs across a roster, as raw counts.
 
@@ -433,8 +472,10 @@ __all__ = [
     "UNDATED",
     "Backlog",
     "Convention",
+    "Posterior",
     "Request",
     "band_of",
     "build_backlog",
     "pass_count_marginal",
+    "posterior_profile",
 ]

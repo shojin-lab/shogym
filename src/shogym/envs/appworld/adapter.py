@@ -32,14 +32,16 @@ import json
 import os
 import secrets
 import select
+import shutil
 import subprocess
+import tempfile
 import sys
 import urllib.error
 import urllib.request
 from dataclasses import dataclass
 from functools import lru_cache
 from pathlib import Path
-from typing import Any, Dict, Tuple
+from typing import Any, Dict, Sequence, Tuple
 
 from shogym.envs._upstream import _locked
 
@@ -84,9 +86,14 @@ class ProvisioningError(RuntimeError):
 
 
 def cache_root() -> Path:
-    """Where this port keeps what it provisions."""
+    """Where this port keeps what it provisions, as an absolute path.
+
+    Resolved rather than taken as given. A derived corpus is a tree of symlinks whose targets are
+    written verbatim, and a relative target is read relative to the link's own directory rather
+    than to the directory the run was launched from, so a relative cache root produces a tree of
+    links that resolve to nothing."""
     base = os.environ.get("SHOGYM_CACHE")
-    root = Path(base) if base else Path.home() / ".cache" / "shogym"
+    root = Path(base).expanduser().resolve() if base else Path.home() / ".cache" / "shogym"
     return root / "appworld"
 
 
@@ -198,6 +205,12 @@ def ensure_corpus() -> Path:
     if (root / "data" / "tasks").is_dir():
         return root
     root.parent.mkdir(parents=True, exist_ok=True)
+    # Both of these take the same lock, on this port's own cache directory, and an ``flock`` taken
+    # twice through two opens in one process blocks on itself. So the interpreter and the app
+    # sources are provisioned *before* the corpus lock is taken, never inside it. A genuinely cold
+    # machine takes exactly this path.
+    runtime()
+    ensure_apps()
     with _locked(root.parent):
         if (root / "data" / "tasks").is_dir():
             return root
@@ -209,11 +222,12 @@ def _fetch_corpus(root: Path) -> None:
     """Download, verify and unpack the pinned bundle into ``root``.
 
     Unpacked by the provisioned interpreter, because the bundle is an encrypted archive whose
-    format is upstream's business. What this function owns is the check in front of it."""
+    format is upstream's business. What this function owns is the check in front of it. The
+    interpreter is provisioned by the caller, outside this function's lock (see
+    :func:`ensure_corpus`)."""
     import shutil
 
     python = runtime()
-    ensure_apps()
     staging = root.with_name(root.name + ".building")
     shutil.rmtree(staging, ignore_errors=True)
     staging.mkdir(parents=True)
@@ -278,6 +292,14 @@ def derived_root() -> Path:
     return cache_root() / f"seeded-{DATA_VERSION}-{_generator_digest()}"
 
 
+def graded_root() -> Path:
+    """Where the grader's view of the corpus lives.
+
+    A sibling of the derived root rather than a directory inside it, so the root an agent's world
+    is given contains no path that leads to the answers."""
+    return cache_root() / f"graded-{DATA_VERSION}-{_generator_digest()}"
+
+
 @lru_cache(maxsize=1)
 def _generator_digest() -> str:
     """Eight hex characters over everything that decides what a backlog looks like."""
@@ -308,40 +330,81 @@ class WorkerError(RuntimeError):
     """The worker refused a command, or the world raised inside one."""
 
 
+#: What a worker's environment is allowed to carry. Agent-authored code runs as that process, so
+#: everything the serving process holds is otherwise one ``os.environ`` away from it: provider
+#: keys, the run's own paths, whatever the operator exported. The list is what a Python process
+#: needs to start and no more, and ``HOME`` and the caches are pointed at a scratch directory of
+#: the episode's own.
+_ENV_ALLOW_LIST: Tuple[str, ...] = ("PATH", "LANG", "LC_ALL", "LC_CTYPE", "SYSTEMROOT", "TMPDIR")
+
+
+def _worker_environment(scratch: Path) -> Dict[str, str]:
+    """A scrubbed environment for one worker."""
+    scrubbed = {
+        name: os.environ[name] for name in _ENV_ALLOW_LIST if os.environ.get(name) is not None
+    }
+    scrubbed["HOME"] = str(scratch)
+    scrubbed["APPWORLD_CACHE"] = str(scratch / "appworld-cache")
+    return scrubbed
+
+
 @dataclass
 class Worker:
     """A handle on one episode's world, running in a process of its own.
 
     The port is the process's, the token is this object's, and neither is ever put anywhere an
-    agent can read: not in the instructions the env publishes, not in a tool's schema, and not in
-    a tool's result. That is what keeps the unauthenticated grading routes AppWorld's own server
-    publishes out of reach of the thing being graded."""
+    agent can read: not on the worker's command line, not in the instructions the env publishes,
+    not in a tool's schema, and not in a tool's result.
+
+    What this is and is not: it keeps the world's own grading routes and the serving process's
+    environment out of the agent's reach, and it is not a sandbox. The code an agent writes runs
+    as the worker, with the worker's filesystem. See the port's README."""
 
     root: Path
     process: subprocess.Popen
     port: int
     token: str
+    scratch: Path
 
     @classmethod
     def spawn(cls, root: Path) -> "Worker":
-        """Start a worker on ``root`` and wait for it to say which port it bound."""
+        """Start a worker on ``root`` and wait for it to say which port it bound.
+
+        The token and the root go over stdin, which is read once and closed, rather than on the
+        command line, which any code running in that process can read back off ``sys.argv`` for
+        the life of it."""
         token = secrets.token_urlsafe(32)
+        scratch = Path(tempfile.mkdtemp(prefix="shogym-appworld-"))
         process = subprocess.Popen(
-            [str(runtime()), str(WORKER), "serve", "--root", str(root), "--token", token],
+            [str(runtime()), str(WORKER), "serve"],
+            stdin=subprocess.PIPE,
             stdout=subprocess.PIPE,
             stderr=subprocess.DEVNULL,
             text=True,
+            cwd=str(scratch),
+            env=_worker_environment(scratch),
         )
+        assert process.stdin is not None
+        process.stdin.write(json.dumps({"root": str(root), "token": token}) + "\n")
+        process.stdin.flush()
+        process.stdin.close()
         assert process.stdout is not None
         line = _first_line(process, _SPAWN_TIMEOUT_SECONDS)
         if not line:
             process.kill()
             process.wait(timeout=10)
+            shutil.rmtree(scratch, ignore_errors=True)
             raise WorkerError(
                 "the appworld worker never bound a port "
                 f"(status {process.returncode}, waited {_SPAWN_TIMEOUT_SECONDS:.0f}s)"
             )
-        return cls(root=root, process=process, port=int(json.loads(line)["port"]), token=token)
+        return cls(
+            root=root,
+            process=process,
+            port=int(json.loads(line)["port"]),
+            token=token,
+            scratch=scratch,
+        )
 
     def call(self, command: str, **body: Any) -> Any:
         """Send one command and return what the world answered."""
@@ -372,6 +435,36 @@ class Worker:
             self.process.wait(timeout=10)
         if self.process.stdout is not None:
             self.process.stdout.close()
+        shutil.rmtree(self.scratch, ignore_errors=True)
+
+
+def grade(*, root: Path, task_id: str, experiment: str, ignore: Sequence[str]) -> Any:
+    """The base task's own checks, from a process that has never run a line the agent wrote.
+
+    A second, short-lived worker rather than the one that served the episode. It is the only place
+    ground truth is loaded, it starts after the world is sealed, and it reads the end state off
+    disk, so the answers are never objects in the process the agent's code ran as."""
+    opening = json.dumps(
+        {"root": str(root), "task_id": task_id, "experiment": experiment, "ignore": list(ignore)}
+    )
+    scratch = Path(tempfile.mkdtemp(prefix="shogym-appworld-grade-"))
+    try:
+        finished = subprocess.run(
+            [str(runtime()), str(WORKER), "grade"],
+            input=opening + "\n",
+            capture_output=True,
+            text=True,
+            cwd=str(scratch),
+            env=_worker_environment(scratch),
+        )
+        if finished.returncode != 0:
+            raise WorkerError(
+                f"grading {task_id} failed (status {finished.returncode}): "
+                f"{finished.stderr.strip()[-2000:]}"
+            )
+        return json.loads(finished.stdout.strip().splitlines()[-1])["output"]
+    finally:
+        shutil.rmtree(scratch, ignore_errors=True)
 
 
 def _first_line(process: subprocess.Popen, timeout: float) -> str:
@@ -402,6 +495,8 @@ __all__ = [
     "WORKER",
     "cache_root",
     "derived_root",
+    "grade",
+    "graded_root",
     "ensure_apps",
     "ensure_corpus",
     "runtime",
