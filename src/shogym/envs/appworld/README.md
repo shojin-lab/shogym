@@ -264,8 +264,9 @@ bytes, sha256 `fd9f9608c2ec71ed0ac25c3633a738b9129a318a129e31230425b9188e508250`
   whose own evaluation names one of them is not served (see [Tasks](#tasks)).
 - **Assertion rows carry no expected-versus-actual diff.** Upstream's failure traces quote the
   values a check asserts on, which would put world data (and part of the task's answer) into a
-  payload whose whole argument is a closed ASCII vocabulary. Rows report `ok` / `not ok`. The
-  diff-carrying variant is not built.
+  payload whose whole argument is a closed ASCII vocabulary. An assertion row's observed value is
+  `not determined` in every payload class, and the outcome appears only in the graded receipt's
+  verdict column. The diff-carrying variant is not built.
 - **The world runs in a subprocess under its own interpreter,** for the packaging conflict above
   and because AppWorld freezes the process clock and holds each app's database engine on a class
   attribute. That subprocess binds a loopback port and refuses every request without a token
@@ -296,25 +297,42 @@ bytes, sha256 `fd9f9608c2ec71ed0ac25c3633a738b9129a318a129e31230425b9188e508250`
 ### What the worker boundary is, and what it is not
 
 The code an agent writes runs **as** the worker process, with that process's filesystem and
-network. AppWorld's own `SafetyGuard` is not a boundary either: it refuses `import sys` and lets
-`__import__("sys")` through, and it null-patches `os.walk` and `os.listdir` while `io.open` reads
-whatever the user running the port can read. So the port does not claim a sandbox. What it claims
-is a set of things deliberately not put where that code can reach, each of them tested by running
-the probe rather than by reading the code:
+network, as the same user as the run. AppWorld's own `SafetyGuard` is not a boundary either: it
+refuses `import sys` and lets `__import__("sys")` through, and it null-patches `os.walk` and
+`os.listdir` while `io.open` reads whatever the user can read. **This port does not claim a
+sandbox, and on one uid no filesystem arrangement is one.** What it claims is that the cheap
+routes are closed and the expensive one is visible, each tested by running the probe:
 
 | what | how |
 |---|---|
-| the worker's token and corpus root | passed on stdin, which is read once and closed, so `sys.argv` carries only the script and the subcommand |
-| the serving process's environment | replaced with an allow-list, so an inherited provider key is not there to be read |
+| the worker's token and corpus root | passed on stdin, read once and closed, so `sys.argv` carries only the script and the subcommand |
+| the serving process's environment | replaced with an allow-list, so an inherited provider key is not there to read |
 | the answers, as objects | the world is built without ground truth, and there is no evaluator in the process |
-| the answers, as files | the corpus tree the world is served from carries **no** `ground_truth` directory at all; the grader gets its own view of the same task, sharing the same database files |
+| the answers, as files | the served tree contains no `ground_truth` and **no symlink into the corpus**: every file in it is a hard link or a copy, so no path in it names a directory the answers are a sibling of |
+| the grader's tree | a directory with an unguessable name under a private parent, not a neighbour of the served root |
 | the drawn key | never sent to either process: the protocol has no field for one |
+| going looking | an audit hook installed before any agent code runs journals files opened from outside the served tree, and the count rides on the result row as `opened_outside`. **Unverified on the agent's own path**: see below |
 
-**What is still reachable, and is the harness's to close.** The port's own source, and therefore
-the draw's algorithm. The run's provenance directory, which retains the true report even when a
-run is serving `Placebo`, so a later worker on the same host could read a grade the policy
-withheld. Anything else the user running the port can read. A run whose scores have to survive an
-adversary needs a container around the worker process, not a longer allow-list inside it.
+**The journal does not yet do the job it is there for.** The hook records opens made by the
+worker process, and in isolation it records opens made inside an embedded IPython shell. It did
+not record a file read through a served `execute` call in a live world, and why is not understood.
+So a non-empty journal is evidence that something was opened, and an empty one is evidence of
+nothing. It is shipped because it costs nothing and its baseline is readable (an ordinary episode
+journals two platform files), and it is not counted as a control until that gap is closed.
+
+**The residual, stated exactly.** The private tree is hard to guess and not hard to read: it is the
+same uid, so its 0700 mode stops other users and stops nothing else. The port's own source is
+readable, and with it the draw's algorithm. The run's provenance directory retains true reports
+even under `Placebo`. Anything else the user running the port can read is readable.
+
+**What would close it** is an OS namespace in which none of that is mounted: the worker in a
+container with only the served tree bound in. That is assessed and not built here, because it is
+not configuration. The existing agent image mounts `/root`, `/work` and a read-only `/cfg` and
+publishes no ports, so it needs a new image (the pinned interpreter baked in), a new argument
+builder, a fixed container port published to host loopback and read back with `docker port`
+(a container-loopback listener cannot be forwarded, and `--network none` and `-p` are mutually
+exclusive), and container-aware teardown. Until then the journal is what a post-hoc cheat check
+reads, and a run whose scores must survive an adversary needs that container.
 
 ## Gotchas
 

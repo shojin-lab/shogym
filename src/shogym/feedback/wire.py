@@ -43,6 +43,14 @@ TERMINATE_META_KEY = "shogym/terminate"
 REPORT_FEEDBACK_NAME = "report"
 NOTICE_FEEDBACK_NAME = "notice"
 
+# The name a *revealed* item from either channel carries on the wire. The two names above are how
+# an env files its two versions; this is the only one an agent ever sees. They are deliberately
+# different things: a payload that arrived as `notice` would label its own arm, so an agent under
+# the control could read which arm it was in off the field name without reading a byte of the
+# value. Renamed at the moment of reveal, so the record keeps the env's own names and the wire
+# carries one.
+CHANNEL_FEEDBACK_NAME = "feedback"
+
 FeedbackItem = Union[InferenceFeedback, EpisodeFeedback]
 
 

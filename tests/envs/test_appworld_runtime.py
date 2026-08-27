@@ -74,17 +74,19 @@ def test_a_relative_cache_root_still_produces_links_that_resolve(
     tree whose every link pointed at nothing, silently."""
     monkeypatch.chdir(tmp_path)
     monkeypatch.setenv("SHOGYM_CACHE", "cache")
+    adapter._private_tag.cache_clear()
     assert adapter.cache_root().is_absolute()
+    assert adapter.graded_root().is_absolute()
 
     original = tmp_path / "corpus" / "data"
     (original / "tasks").mkdir(parents=True)
     (original / "shared").write_text("base databases")
     derived = adapter.cache_root() / "derived" / "data"
     world.derive_root(original=original, derived=derived)
-    link = derived / "shared"
-    assert link.is_symlink()
-    assert Path(os.readlink(link)).is_absolute()
-    assert link.exists() and link.read_text() == "base databases"
+    materialised = derived / "shared"
+    # No symlink to resolve at all now, which is the stronger form of the same guarantee.
+    assert not materialised.is_symlink()
+    assert materialised.exists() and materialised.read_text() == "base databases"
 
 
 # ----- concurrency -----
@@ -146,6 +148,66 @@ def test_two_streams_deriving_one_cold_task_both_get_a_world(tmp_path: Path) -> 
     assert (derived / "tasks" / "abc_1" / "dbs" / "todoist.jsonl").read_text() == "seeded"
     assert (derived / "tasks" / "abc_1" / "dbs" / "gmail.jsonl").read_text() == "mail"
     assert not list((derived / "tasks").glob(".*building*"))
+
+
+def test_two_cold_constructors_do_not_race_on_the_shared_output_link(tmp_path: Path) -> None:
+    """Every environment constructed runs this, so two built at once is the ordinary case. Before
+    the lock, both could see the link absent and then race in `symlink_to`, and the loser's
+    constructor raised `FileExistsError`."""
+    derived, graded = tmp_path / "derived", tmp_path / "graded"
+    derived.mkdir()
+    failures: List[BaseException] = []
+    start = threading.Barrier(4)
+
+    def share() -> None:
+        try:
+            start.wait(timeout=30)
+            world.share_outputs(derived=derived, graded=graded)
+        except BaseException as exc:  # noqa: BLE001 (the point is that none escapes)
+            failures.append(exc)
+
+    threads = [threading.Thread(target=share) for _ in range(4)]
+    for thread in threads:
+        thread.start()
+    for thread in threads:
+        thread.join(timeout=60)
+    assert not failures, failures
+    assert (graded / "experiments").is_symlink()
+    assert (graded / "experiments" / "outputs").is_dir()
+    # And it is idempotent: running it again over a finished tree changes nothing.
+    world.share_outputs(derived=derived, graded=graded)
+    assert os.readlink(graded / "experiments") == str(derived / "experiments")
+
+
+def test_nothing_in_a_served_task_names_where_it_came_from(tmp_path: Path) -> None:
+    """The served tree is what the worker gets `APPWORLD_ROOT` pointing at, so any symlink in it
+    is a path to the corpus, and the corpus has every task's answers one directory over."""
+    original = tmp_path / "corpus"
+    task = original / "tasks" / "abc_1"
+    (task / "dbs").mkdir(parents=True)
+    (task / "specs.json").write_text("{}")
+    (task / "ground_truth").mkdir()
+    (task / "ground_truth" / "answer.json").write_text('"the answer"')
+    (task / "dbs" / "todoist.jsonl").write_text("")
+    (task / "dbs" / "gmail.jsonl").write_text("mail")
+    (original / "base_dbs").mkdir()
+    (original / "base_dbs" / "admin.db").write_text("base")
+
+    derived, graded = tmp_path / "derived", tmp_path / "graded"
+    world.derive_root(original=original, derived=derived)
+    world.derive_task(
+        original=original,
+        derived=derived,
+        graded=graded,
+        task_id="abc_1",
+        write_log=lambda source, into: into.write_text("seeded"),
+    )
+    links = [p for p in derived.rglob("*") if p.is_symlink()]
+    assert links == [], links
+    # The content is really there, so this is not a tree of empty files.
+    assert (derived / "tasks" / "abc_1" / "specs.json").read_text() == "{}"
+    assert (derived / "base_dbs" / "admin.db").read_text() == "base"
+    assert not (derived / "tasks" / "abc_1" / "ground_truth").exists()
 
 
 def test_the_world_an_agent_is_given_carries_no_answers(tmp_path: Path) -> None:
@@ -229,34 +291,40 @@ async def test_a_deadline_can_still_fire_on_a_finalizer_that_is_waiting() -> Non
 # ----- the published budget -----
 
 
-def test_the_published_horizon_reserves_one_slot_and_no_more() -> None:
-    """``horizon=N`` means N blocks of code. The serve layer dispatches the call that *reaches*
-    the horizon, so a budget of N with two spare slots is a budget of N + 1 blocks: one extra
-    execute, silently."""
-    from shogym.envs.appworld.env_v1 import DEFAULT_HORIZON, _config_digest
+def test_the_run_fingerprint_covers_everything_that_changes_what_a_score_means() -> None:
+    """Two runs whose rows are meant to be one measurement have to agree on all of these. The
+    digest is not agent-visible feedback: it is a short hash over a small integer pulse and
+    otherwise public material, so an agent handed it could enumerate pulses until one matched and
+    then compute every later key."""
+    from shogym.envs.appworld.env_v1 import run_fingerprint
 
-    assert isinstance(_config_digest(pulse=0, report="graded"), str)
-    # Read off the constructor's own arithmetic rather than by building an env, which would
-    # provision an interpreter and a corpus.
+    base = run_fingerprint(pulse=0, report="graded", blocks=60)
+    assert base == run_fingerprint(pulse=0, report="graded", blocks=60)
+    assert base != run_fingerprint(pulse=1, report="graded", blocks=60)
+    assert base != run_fingerprint(pulse=0, report="drawn", blocks=60)
+    assert base != run_fingerprint(pulse=0, report="graded", blocks=61)
+    assert len(base) == 16
+    # And it moves when the way a score is read moves, which no input of the run would show.
+    from shogym.envs.appworld import env_v1
+
+    original = env_v1.SCORING_VERSION
+    try:
+        env_v1.SCORING_VERSION = original + 1
+        assert base != run_fingerprint(pulse=0, report="graded", blocks=60)
+    finally:
+        env_v1.SCORING_VERSION = original
+
+
+def test_the_fingerprint_is_not_published_as_agent_visible_feedback() -> None:
+    """Read off the publishing code rather than by building an env, which would provision an
+    interpreter and a corpus."""
     import inspect
 
     from shogym.envs.appworld import env_v1
 
-    source = inspect.getsource(env_v1.AppWorldEnv.__init__)
-    assert "horizon=horizon + 1" in source
-    assert DEFAULT_HORIZON == 60
-
-
-def test_the_run_configuration_is_a_digest_rather_than_its_values() -> None:
-    """It is published beside the agent's own feedback, and naming the pulse in a row an agent
-    might see hands over half of what it takes to compute the key."""
-    from shogym.envs.appworld.env_v1 import _config_digest
-
-    one = _config_digest(pulse=0, report="graded")
-    assert one != _config_digest(pulse=1, report="graded")
-    assert one != _config_digest(pulse=0, report="drawn")
-    assert one == _config_digest(pulse=0, report="graded")
-    assert len(one) == 12
+    published = inspect.getsource(env_v1.AppWorldEnv._verify)
+    assert "config_digest" not in published.split("for name in")[-1]
+    assert "config_digest" in inspect.getsource(env_v1.AppWorldEnv.finalize)
 
 
 def test_a_worker_environment_carries_nothing_it_was_not_given(

@@ -137,6 +137,12 @@ def _wire_form(spec: TaskSpec) -> TaskSpec:
     return spec.model_copy(update={"tools": tools}) if changed else spec
 
 
+#: How long teardown waits for an env to release one episode's resources before going on without
+#: it. Teardown runs on the shared loop, so this is a bound on the wait rather than a kill: an env
+#: whose release has to be certain makes its own hook bounded.
+_END_SESSION_SECONDS = 60.0
+
+
 @dataclass
 class CallResult:
     """The outcome of one tool call: the tool's functional ``content`` (the observation the
@@ -371,7 +377,11 @@ class ServedEpisode:
                 opened.append(session)
                 for tool_config in await session.list_tools():
                     sessions[tool_config.name] = session
-            env.begin_session(session_id, task_data)
+            # Off the event loop. `_begin_session` is an env hook and some envs make it do real
+            # work: an env whose episode is a world in another process spawns it here, and a slow
+            # or wedged one would otherwise freeze every other episode this server is running,
+            # along with their watchdogs and deadlines.
+            await asyncio.to_thread(env.begin_session, session_id, task_data)
             # The one description this episode ever asks for. Everything published about the task
             # and everything enforced on it comes off this single answer — see the snapshot the
             # constructor takes of it.
@@ -1070,7 +1080,15 @@ class ServedEpisode:
             self._teardown_runs += 1
             self._state = LifecycleState.TEARING_DOWN
         try:
-            self._env.end_session(self._session_id)
+            # Off the loop and bounded, for the reason `begin_session` is: teardown runs on the
+            # shared loop and an env that waits on a wedged child would hold every other episode
+            # with it. At the bound the wait is abandoned; an env that needs its own release to be
+            # certain has to make its hook bounded too, which is why the appworld worker's close
+            # signals and reaps rather than asking politely over a socket.
+            await asyncio.wait_for(
+                asyncio.to_thread(self._env.end_session, self._session_id),
+                timeout=_END_SESSION_SECONDS,
+            )
         except Exception:
             pass
         self._state = LifecycleState.CLOSED

@@ -157,12 +157,17 @@ class AppWorldEnv(Env):
         )
         self._task_ids = adapter.task_ids()
         self._backlogs: Dict[str, Any] = {}
-        self._config_digest = _config_digest(pulse=self._pulse, report=self._report)
         self.function = FunctionConfig(example_system_template=_static_instructions())
-        # One slot past the configured block budget, for the terminal that ends the task. Two
-        # would let an extra block run: the serve layer dispatches the call that reaches the
-        # horizon, so a budget of N with two spare slots is a budget of N + 1 blocks.
-        super().__init__(horizon=horizon + 1, num_tasks=len(self._task_ids))
+        # The step budget the serve layer enforces is one past the configured block budget, so
+        # that `submit` always has a slot to run in. The spare slot is not another block: the
+        # serve layer dispatches the call that reaches the horizon and cannot tell an `execute`
+        # from a terminal, so `execute` counts its own calls and refuses past `blocks` without
+        # touching the world (see `mcp_server.execute`).
+        self._blocks = int(horizon)
+        self._config_digest = run_fingerprint(
+            pulse=self._pulse, report=self._report, blocks=self._blocks
+        )
+        super().__init__(horizon=self._blocks + 1, num_tasks=len(self._task_ids))
 
     # ----- task loading -----
 
@@ -183,6 +188,11 @@ class AppWorldEnv(Env):
             "task_id": task_id,
             "supervisor_email": specs["supervisor"]["email"],
         }
+
+    @property
+    def config_digest(self) -> str:
+        """The run fingerprint (see :func:`run_fingerprint`), for a runner to record and compare."""
+        return self._config_digest
 
     def _backlog(self, task_id: str, specs: Dict[str, Any]):
         """The backlog seeded into ``task_id``'s world.
@@ -231,6 +241,7 @@ class AppWorldEnv(Env):
                 task_id=task_id,
                 supervisor_email=str(task["supervisor_email"]),
                 experiment=experiment,
+                budget=self._blocks,
             ),
         )
 
@@ -352,6 +363,7 @@ class AppWorldEnv(Env):
                 ignore=world.ADDED_MODELS,
             )
         )["checks"]
+        outside = session.worker.opened_outside()
         filing = world.Filing(**{**read["filing"], "lines": tuple(read["filing"]["lines"])})
         verdicts = score(
             backlog=backlog,
@@ -373,6 +385,7 @@ class AppWorldEnv(Env):
                 "config_digest": self._config_digest,
                 "payload_class": self._report,
                 "world_digest": str(read["world_digest"]),
+                "opened_outside": float(len(outside)),
                 "rng_digest": str(read["rng_digest"]),
                 REPORT_FEEDBACK_NAME: rendered[self._report],
                 NOTICE_FEEDBACK_NAME: rendered[payload.DIGEST],
@@ -416,9 +429,19 @@ class AppWorldEnv(Env):
             "assertion_fraction",
         ):
             fb.episode.append(EpisodeFeedback(name=name, value=float(verdict.get(name) or 0.0)))
-        for name in ("distinct_bands", "filing_rows", "duration_set", "checks"):
+        for name in (
+            "distinct_bands",
+            "filing_rows",
+            "duration_set",
+            "checks",
+            "opened_outside",
+        ):
             fb.episode.append(EpisodeFeedback(name=name, value=float(verdict.get(name) or 0.0)))
-        for name in ("config_digest", "payload_class", "world_digest", "rng_digest"):
+        # `config_digest` is deliberately not among these. It is run identity, not feedback: an
+        # agent handed it under a revealing policy could enumerate plausible pulses against it and
+        # recover the draw. It rides on the terminal evidence, which the record keeps and no
+        # policy reveals.
+        for name in ("payload_class", "world_digest", "rng_digest"):
             fb.episode.append(EpisodeFeedback(name=name, value=str(verdict.get(name) or "")))
         fb.episode.append(
             EpisodeFeedback(name=REPORT_FEEDBACK_NAME, value=str(verdict.get(REPORT_FEEDBACK_NAME) or ""))
@@ -457,24 +480,44 @@ def _static_instructions() -> str:
     return f"{_WORLD_GUIDE}\n\n{_TOOL_GUIDE}"
 
 
-def _config_digest(*, pulse: int, report: str) -> str:
-    """What every row of a run has to agree on for its scores to be one measurement.
+#: Bumped by hand when a change to this port would make two runs' scores mean different things
+#: without changing any of its inputs: the scorer's rules, the payload's layout, the seeded
+#: backlog's shape. It is in the run fingerprint so that "the same pulse" is not mistaken for
+#: "the same measurement" across such a change.
+SCORING_VERSION = 2
 
-    The draw and the payload class decide what a score *means*: two pulses grade against different
-    rules, and two payload classes answer with different content. Neither is visible anywhere else
-    in a run's record, so a provenance directory reopened under a different one would take
-    incomparable rows without complaint. This goes on every row, and on the terminal evidence
-    behind it, so a reader can tell.
 
-    It is a digest rather than the values themselves because it is published beside the agent's
-    own feedback: naming the pulse in a row an agent might see would hand over half of what it
-    takes to compute the key.
+def run_fingerprint(*, pulse: int, report: str, blocks: int) -> str:
+    """Everything two runs must agree on for their rows to be one measurement.
 
-    Refusing such a resume is the stream's to do, not this env's: an env is handed a task and does
-    not know which run directory it is being served into. What this can do is make the mixing
-    visible in the record, which it now is."""
-    material = f"{pulse}|{report}|{adapter.MANIFEST.read_text()}"
-    return hashlib.sha256(material.encode()).hexdigest()[:12]
+    The draw and the payload class decide what a score *means*; the block budget decides what an
+    episode had the chance to do; the corpus and the interpreter decide what world it happened in;
+    and :data:`SCORING_VERSION` decides how it was read. A provenance directory reopened under a
+    different one of those takes incomparable rows, and none of them is visible anywhere else in a
+    run's record.
+
+    **Not agent-visible.** It rides on the terminal evidence and never on published feedback. It
+    is a short digest over a usually small integer pulse and otherwise public material, so an
+    agent handed it could enumerate pulses until one matched and then compute every later key.
+
+    **Enforcing it is the runner's, not this env's.** A stream validates a resumed directory's
+    queue and its feedback regime; an env is handed a task and does not know which directory it is
+    being served into, so it cannot refuse a resume. What it can do is publish one value that says
+    whether two rows belong to one measurement, which is what a runner has to compare."""
+    material = "|".join(
+        [
+            str(pulse),
+            report,
+            str(blocks),
+            str(SCORING_VERSION),
+            adapter.DATA_VERSION,
+            adapter.DATA_BUNDLE_SHA256,
+            adapter.UPSTREAM_VERSION,
+            adapter.MANIFEST.read_text(),
+            payload.PASS_COUNTS_FILE.read_text(),
+        ]
+    )
+    return hashlib.sha256(material.encode()).hexdigest()[:16]
 
 
 def _backlog_seed(task_id: str) -> int:
@@ -499,6 +542,8 @@ __all__ = [
     "DEFAULT_HORIZON",
     "DEFAULT_PULSE",
     "EXECUTE_TOOL_NAME",
+    "SCORING_VERSION",
     "SUBMIT_TOOL_NAME",
     "AppWorldEnv",
+    "run_fingerprint",
 ]

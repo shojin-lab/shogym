@@ -19,7 +19,11 @@ import json
 from pathlib import Path
 from typing import Any, Dict, List
 
-from shogym.feedback.wire import NOTICE_FEEDBACK_NAME, REPORT_FEEDBACK_NAME
+from shogym.feedback.wire import (
+    CHANNEL_FEEDBACK_NAME,
+    NOTICE_FEEDBACK_NAME,
+    REPORT_FEEDBACK_NAME,
+)
 from shogym.serve.stream import (
     FeedbackPolicy,
     Immediate,
@@ -74,7 +78,7 @@ async def test_information_reveals_the_report_and_nothing_beside_it(tmp_path: Pa
         answer = _payload(await stream.dispatch(SUBMIT_TOOL, {"answer": "4"}))
 
     assert answer["feedback"] == [
-        {"name": REPORT_FEEDBACK_NAME, "value": REPORT_TEXT, "level": "episode"}
+        {"name": CHANNEL_FEEDBACK_NAME, "value": REPORT_TEXT, "level": "episode"}
     ]
     # The env published `correct` too, and the record kept it. The channel did not.
     assert "correct" in json.dumps(_rows(tmp_path))
@@ -87,7 +91,7 @@ async def test_placebo_reveals_the_notice_and_nothing_beside_it(tmp_path: Path) 
         answer = _payload(await stream.dispatch(SUBMIT_TOOL, {"answer": "4"}))
 
     assert answer["feedback"] == [
-        {"name": NOTICE_FEEDBACK_NAME, "value": NOTICE_TEXT, "level": "episode"}
+        {"name": CHANNEL_FEEDBACK_NAME, "value": NOTICE_TEXT, "level": "episode"}
     ]
     assert REPORT_TEXT not in json.dumps(answer)
 
@@ -121,7 +125,16 @@ async def test_the_two_arms_differ_in_the_value_and_in_nothing_else(tmp_path: Pa
         key: placebo[key] for key in placebo if key != "feedback"
     }
     assert len(treatment["feedback"]) == len(placebo["feedback"]) == 1
-    assert len(REPORT_FEEDBACK_NAME) == len(NOTICE_FEEDBACK_NAME)
+    # The strong form, and the one an equal length alone does not give: the two serialized items
+    # are identical apart from the value's own bytes. An item still carrying the env's own
+    # `notice` would name its arm, and the control could be told apart without a word of what it
+    # was handed being read.
+    treated_item, control_item = dict(treatment["feedback"][0]), dict(placebo["feedback"][0])
+    assert treated_item["name"] == control_item["name"] == CHANNEL_FEEDBACK_NAME
+    assert treated_item.pop("value") != control_item.pop("value")
+    assert treated_item == control_item
+    assert NOTICE_FEEDBACK_NAME not in json.dumps(placebo)
+    assert REPORT_FEEDBACK_NAME not in json.dumps(treatment)
     assert len(json.dumps(treatment)) == len(json.dumps(placebo))
 
 
@@ -211,5 +224,5 @@ async def test_a_shadowed_reveal_on_an_admitted_policy_is_not_called(tmp_path: P
         answer = _payload(await stream.dispatch(SUBMIT_TOOL, {"answer": "4"}))
 
     assert answer["feedback"] == [
-        {"name": REPORT_FEEDBACK_NAME, "value": REPORT_TEXT, "level": "episode"}
+        {"name": CHANNEL_FEEDBACK_NAME, "value": REPORT_TEXT, "level": "episode"}
     ]

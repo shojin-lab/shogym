@@ -308,7 +308,11 @@ from fastmcp import FastMCP
 from fastmcp.tools import ToolResult
 
 from shogym.core import Env
-from shogym.feedback.wire import NOTICE_FEEDBACK_NAME, REPORT_FEEDBACK_NAME
+from shogym.feedback.wire import (
+    CHANNEL_FEEDBACK_NAME,
+    NOTICE_FEEDBACK_NAME,
+    REPORT_FEEDBACK_NAME,
+)
 from shogym.serve.episode import ServedEpisode
 from shogym.serve.server import build_tool
 from shogym.shared.terminate_mcp import TERMINATE_TOOL_NAME
@@ -1696,13 +1700,27 @@ class Immediate(FeedbackPolicy):
 
 
 def _channel(published: Sequence[Dict[str, Any]], name: str) -> List[Dict[str, Any]]:
-    """The published items filed under ``name``, in publication order, and nothing else.
+    """The item the env filed under ``name``, renamed to the one name a revealed item carries.
 
-    What the two policies below are made of. Selection by name rather than by position, because
-    an env publishes what it publishes: a run whose env emitted the summary numbers first and a
-    run whose env emitted them last must open the same channel, and an index would make the
-    answer depend on an ordering nothing in the contract fixes."""
-    return [dict(item) for item in published if item.get("name") == name]
+    Two jobs, and the second is what makes a pair of policies a pair. Selection is by name rather
+    than by position, because an env publishes what it publishes: a run whose env emitted the
+    summary numbers first and a run whose env emitted them last must open the same channel, and an
+    index would make the answer depend on an ordering nothing in the contract fixes.
+
+    **The rename is the point.** An env files its two versions under two names so the record can
+    tell them apart, but an item that reached the agent still carrying ``notice`` would announce
+    its own arm: the control could be identified from the field name without reading a byte of the
+    value. Revealed items are therefore all named :data:`CHANNEL_FEEDBACK_NAME`, so the two arms'
+    serialized answers differ in the value and in nothing else. The record is unaffected, because
+    it stores what the env published rather than what the policy revealed.
+
+    One item, not a list. An env that files two under one name has published something this
+    contract has no reading of, and the first is taken rather than both, so the shape an agent
+    sees cannot vary with a mistake upstream."""
+    for item in published:
+        if item.get("name") == name:
+            return [{**dict(item), "name": CHANNEL_FEEDBACK_NAME}]
+    return []
 
 
 @dataclass(frozen=True)
@@ -1719,7 +1737,10 @@ class Information(FeedbackPolicy):
 
     The channel is the env's to fill and the env's to be honest about: an env that names the
     answer in its report hands the answer over here. That is what an open channel is, and it is
-    why :class:`Never` remains the default."""
+    why :class:`Never` remains the default.
+
+    What reaches the agent is named :data:`~shogym.feedback.wire.CHANNEL_FEEDBACK_NAME`, not
+    ``report``: see :func:`_channel`."""
 
     regime: ClassVar[str] = _INFORMATION_REGIME
     reveals: ClassVar[bool] = True
@@ -1743,8 +1764,11 @@ class Placebo(FeedbackPolicy):
     **The match is the env's to hold up.** Nothing here checks that the notice an env published is
     the length of its report or that it says nothing evaluative; a policy reveals, it does not
     author (see :class:`FeedbackPolicy`). What this side of it guarantees is that the two arms
-    differ in the value and in nothing else: one item, the same member, and, the two names being
-    the same length, the same number of bytes around it."""
+    differ in the value and in nothing else: one item, the same member, and the same field name,
+    because a revealed item is renamed to
+    :data:`~shogym.feedback.wire.CHANNEL_FEEDBACK_NAME` before it goes out (see
+    :func:`_channel`). An arm that announced itself in the field name would not need its value
+    read to be recognised."""
 
     regime: ClassVar[str] = _PLACEBO_REGIME
     reveals: ClassVar[bool] = True
@@ -1906,9 +1930,12 @@ class TaskStream:
             in-process (see :meth:`_with_timeout`). Finite and positive, for the same reason
             ``deadline`` is; ``None`` waits indefinitely.
         feedback: what a terminating call tells the agent about the task it just ended (see
-            :class:`FeedbackPolicy`). :class:`Never` — the default — answers with the fixed
+            :class:`FeedbackPolicy`). :class:`Never`, the default, answers with the fixed
             payload and opens no verdict channel; :class:`Immediate` answers with the sealed
-            row's own episode-level feedback, verbatim. Those two and nothing else: the policies
+            row's own episode-level feedback, verbatim; :class:`Information` and :class:`Placebo`
+            are a matched pair, each answering with exactly one item under one public name, so
+            two arms of a paired design differ in what that item says and in nothing else. Those
+            four and nothing else: the policies
             a stream serves under are an allow-list of exact types (see :data:`_POLICIES`), and
             the regime written into every dispense record and every result row is taken from that
             list rather than from the object passed here — so the posture a run served under is a

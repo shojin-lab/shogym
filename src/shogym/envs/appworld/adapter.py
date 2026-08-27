@@ -41,7 +41,7 @@ import urllib.request
 from dataclasses import dataclass
 from functools import lru_cache
 from pathlib import Path
-from typing import Any, Dict, Sequence, Tuple
+from typing import Any, Dict, List, Sequence, Tuple
 
 from shogym.envs._upstream import _locked
 
@@ -69,6 +69,15 @@ SPLIT = "test_challenge"
 ROOT_ENV_VAR = "APPWORLD_ROOT"
 
 _DOWNLOAD_TIMEOUT_SECONDS = 300.0
+
+#: How long a worker gets to stop after it is signalled, before it is killed. Short: teardown
+#: runs on the shared loop and a wedged world may not hold the others.
+_CLOSE_SECONDS = 10.0
+
+#: How long the grader gets. Generous, because the base task's evaluator replays a whole task's
+#: database changes, and bounded, because a grader that never finishes would hold a sealed
+#: episode's terminal open for the life of the run.
+_GRADE_TIMEOUT_SECONDS = 600.0
 
 #: How long a worker gets to bind its port and say so. Generous, because a cold interpreter
 #: importing upstream and its clock-patching library is not fast, and bounded, because a worker
@@ -292,12 +301,49 @@ def derived_root() -> Path:
     return cache_root() / f"seeded-{DATA_VERSION}-{_generator_digest()}"
 
 
-def graded_root() -> Path:
-    """Where the grader's view of the corpus lives.
+def private_home() -> Path:
+    """The directory holding everything an agent's world must not be handed.
 
-    A sibling of the derived root rather than a directory inside it, so the root an agent's world
-    is given contains no path that leads to the answers."""
-    return cache_root() / f"graded-{DATA_VERSION}-{_generator_digest()}"
+    Not a sibling of the served root and not under this port's ordinary cache, because the served
+    root's own path is in the worker's environment and a neighbour of it is a guess away."""
+    base = cache_root().parent
+    return base.parent / f"{base.name}-private" / "appworld"
+
+
+def graded_root() -> Path:
+    """Where the grader's view of the corpus lives: a private directory with an unguessable name.
+
+    **This raises the cost of finding it and does not close the route.** The worker runs as the
+    same user as the process that built this, so no directory mode keeps it out: 0700 stops other
+    users and stops nothing else. What closes it is a namespace in which the directory is not
+    mounted at all, which is a container and is not built here (see the port's README). What this
+    does is stop the tree being derivable from what the worker is given, which the previous
+    layout, a fixed name beside the served root, was."""
+    home = private_home()
+    return home / f"graded-{DATA_VERSION}-{_generator_digest()}-{_private_tag()}"
+
+
+@lru_cache(maxsize=1)
+def _private_tag() -> str:
+    """Sixteen hex characters, drawn once per installation and kept beside the private tree.
+
+    Persisted rather than redrawn, because a name that changed per process would derive the whole
+    corpus again on every run."""
+    home = private_home()
+    home.mkdir(parents=True, exist_ok=True)
+    os.chmod(home, 0o700)
+    keyfile = home / ".tag"
+    if keyfile.exists():
+        tag = keyfile.read_text().strip()
+        if len(tag) == 16:
+            return tag
+    tag = secrets.token_hex(8)
+    handle = os.open(keyfile, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+    try:
+        os.write(handle, tag.encode())
+    finally:
+        os.close(handle)
+    return tag
 
 
 @lru_cache(maxsize=1)
@@ -365,6 +411,7 @@ class Worker:
     port: int
     token: str
     scratch: Path
+    journal: Path
 
     @classmethod
     def spawn(cls, root: Path) -> "Worker":
@@ -375,6 +422,10 @@ class Worker:
         the life of it."""
         token = secrets.token_urlsafe(32)
         scratch = Path(tempfile.mkdtemp(prefix="shogym-appworld-"))
+        # Beside the worker's working directory rather than inside it: the working directory is
+        # the agent's own, and a record of what an agent did that the agent can rewrite is not a
+        # record.
+        journal = Path(tempfile.mkdtemp(prefix="shogym-appworld-journal-")) / "opened.jsonl"
         process = subprocess.Popen(
             [str(runtime()), str(WORKER), "serve"],
             stdin=subprocess.PIPE,
@@ -385,7 +436,9 @@ class Worker:
             env=_worker_environment(scratch),
         )
         assert process.stdin is not None
-        process.stdin.write(json.dumps({"root": str(root), "token": token}) + "\n")
+        process.stdin.write(
+            json.dumps({"root": str(root), "token": token, "journal": str(journal)}) + "\n"
+        )
         process.stdin.flush()
         process.stdin.close()
         assert process.stdout is not None
@@ -394,6 +447,7 @@ class Worker:
             process.kill()
             process.wait(timeout=10)
             shutil.rmtree(scratch, ignore_errors=True)
+            shutil.rmtree(journal.parent, ignore_errors=True)
             raise WorkerError(
                 "the appworld worker never bound a port "
                 f"(status {process.returncode}, waited {_SPAWN_TIMEOUT_SECONDS:.0f}s)"
@@ -404,6 +458,7 @@ class Worker:
             port=int(json.loads(line)["port"]),
             token=token,
             scratch=scratch,
+            journal=journal,
         )
 
     def call(self, command: str, **body: Any) -> Any:
@@ -421,24 +476,57 @@ class Worker:
             detail = exc.read().decode(errors="replace")
             raise WorkerError(f"appworld worker refused {command!r}: {detail}") from exc
 
-    def close(self) -> None:
-        """Tell the worker to shut down, and make sure it did."""
-        if self.process.poll() is None:
+    def opened_outside(self) -> List[str]:
+        """Every path this episode opened from outside the tree it was served.
+
+        Empty on an ordinary episode. Non-empty is not proof of anything on its own: a library
+        reads its own files. It is the record a post-hoc check reads to ask whether an agent went
+        looking, which is a question a run has no other way to answer."""
+        if not self.journal.exists():
+            return []
+        out = []
+        for line in self.journal.read_text().splitlines():
             try:
-                self.call("close")
+                out.append(json.loads(line)["opened"])
             except Exception:
-                pass
-        try:
-            self.process.wait(timeout=30)
-        except subprocess.TimeoutExpired:
-            self.process.kill()
-            self.process.wait(timeout=10)
-        if self.process.stdout is not None:
-            self.process.stdout.close()
+                continue
+        return out
+
+    def close(self) -> None:
+        """Stop the worker, promptly and with a bound.
+
+        Signalled and reaped rather than asked over the socket. Teardown runs on the serving
+        process's shared loop, so a close that waited on an HTTP round trip into a wedged world
+        would hold every other episode with it; and there is nothing to ask for, because the end
+        state was flushed when the episode was read. A process that ignores the signal is killed."""
+        if self.process.poll() is None:
+            self.process.terminate()
+            try:
+                self.process.wait(timeout=_CLOSE_SECONDS)
+            except subprocess.TimeoutExpired:
+                self.process.kill()
+                try:
+                    self.process.wait(timeout=_CLOSE_SECONDS)
+                except subprocess.TimeoutExpired:
+                    pass
+        for stream in (self.process.stdout, self.process.stderr):
+            if stream is not None:
+                try:
+                    stream.close()
+                except Exception:
+                    pass
         shutil.rmtree(self.scratch, ignore_errors=True)
+        shutil.rmtree(self.journal.parent, ignore_errors=True)
 
 
-def grade(*, root: Path, task_id: str, experiment: str, ignore: Sequence[str]) -> Any:
+def grade(
+    *,
+    root: Path,
+    task_id: str,
+    experiment: str,
+    ignore: Sequence[str],
+    timeout: float = _GRADE_TIMEOUT_SECONDS,
+) -> Any:
     """The base task's own checks, from a process that has never run a line the agent wrote.
 
     A second, short-lived worker rather than the one that served the episode. It is the only place
@@ -448,23 +536,33 @@ def grade(*, root: Path, task_id: str, experiment: str, ignore: Sequence[str]) -
         {"root": str(root), "task_id": task_id, "experiment": experiment, "ignore": list(ignore)}
     )
     scratch = Path(tempfile.mkdtemp(prefix="shogym-appworld-grade-"))
+    process = subprocess.Popen(
+        [str(runtime()), str(WORKER), "grade"],
+        stdin=subprocess.PIPE,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        text=True,
+        cwd=str(scratch),
+        env=_worker_environment(scratch),
+    )
     try:
-        finished = subprocess.run(
-            [str(runtime()), str(WORKER), "grade"],
-            input=opening + "\n",
-            capture_output=True,
-            text=True,
-            cwd=str(scratch),
-            env=_worker_environment(scratch),
-        )
-        if finished.returncode != 0:
-            raise WorkerError(
-                f"grading {task_id} failed (status {finished.returncode}): "
-                f"{finished.stderr.strip()[-2000:]}"
-            )
-        return json.loads(finished.stdout.strip().splitlines()[-1])["output"]
+        # Bounded, killed and reaped. An evaluator that hangs would otherwise hold a sealed
+        # episode's terminal open forever: `to_thread` does not make a child process cancellable,
+        # so a deadline on the coroutine stops the waiting and leaves the child running.
+        out, err = process.communicate(input=opening + "\n", timeout=timeout)
+    except subprocess.TimeoutExpired:
+        process.kill()
+        process.communicate()
+        raise WorkerError(
+            f"grading {task_id} did not finish within {timeout:.0f}s; the grader was killed"
+        ) from None
     finally:
         shutil.rmtree(scratch, ignore_errors=True)
+    if process.returncode != 0:
+        raise WorkerError(
+            f"grading {task_id} failed (status {process.returncode}): {err.strip()[-2000:]}"
+        )
+    return json.loads(out.strip().splitlines()[-1])["output"]
 
 
 def _first_line(process: subprocess.Popen, timeout: float) -> str:
@@ -497,6 +595,7 @@ __all__ = [
     "derived_root",
     "grade",
     "graded_root",
+    "private_home",
     "ensure_apps",
     "ensure_corpus",
     "runtime",

@@ -181,16 +181,15 @@ def derive_task(
 ) -> Path:
     """Materialise one task's world twice: once for the agent, once for the grader.
 
-    ``derived`` is the corpus the episode's world runs against and it carries **no**
-    ``ground_truth`` directory at all. The answers ship in the corpus in plaintext, agent-authored
-    code runs with that corpus's root in its environment, and a directory that is not there is not
-    readable. ``graded`` is the same task, sharing the same database files, with the answers linked
-    back in; only the grading process is given that root, and it never runs agent code.
+    ``derived`` is the corpus the episode's world runs against. It carries no ``ground_truth``
+    directory, and **nothing in it is a symlink**: every file is a hard link to the corpus's own
+    (or a copy, across filesystems). That second part is the load-bearing one. A symlink names its
+    target, and a target names a directory, and that directory has a ``ground_truth`` sibling, so a
+    tree of symlinks into the source corpus is a tree of directions to the answers. A hard link is
+    a file with no other discoverable path.
 
-    Everything the task ships is linked rather than copied, so a derived corpus of the whole split
-    costs one small file per task. Only the todoist log is a real file, because it is the only one
-    this port changes: ``write_log`` is handed the task's own database directory and the path the
-    rewritten log belongs at.
+    ``graded`` is the same task with the answers linked back in, and only the grading process is
+    ever given that root.
 
     **Two streams starting the same cold task is the ordinary case, not a hypothetical.** Paired
     forks are launched together and both derive on first use, so the work is done under a lock on
@@ -211,14 +210,12 @@ def derive_task(
         for entry in sorted(source.iterdir()):
             # `ground_truth` is deliberately absent: see the docstring.
             if entry.name not in ("dbs", "ground_truth"):
-                _link(entry, building / entry.name)
+                _materialise(entry, building / entry.name)
         for entry in sorted((source / "dbs").iterdir()):
             if entry.name != "todoist.jsonl":
-                _link(entry, building / "dbs" / entry.name)
+                _materialise(entry, building / "dbs" / entry.name)
         write_log(source / "dbs", building / "dbs" / "todoist.jsonl")
-        if target.exists():
-            shutil.rmtree(target)
-        os.replace(building, target)
+        _publish(building, target)
         _grading_view(target, graded / "tasks" / task_id, source / "ground_truth")
     return target
 
@@ -236,52 +233,98 @@ def already_derived(*, derived: Path, graded: Path, task_id: str) -> bool:
 def _grading_view(target: Path, view: Path, answers: Path) -> None:
     """The grader's view of a derived task: the same world, with the answers linked back in.
 
-    Three links rather than a copy, so the seeded database log has exactly one instance on disk
-    and the two views cannot drift apart."""
+    Hard links to the served task's own files rather than copies, so the seeded database log has
+    one instance on disk and the two views cannot drift apart. The answers are linked from the
+    corpus, and this tree is the only place in the port that names them."""
     building = view.parent / f".{view.name}.{os.getpid()}.building"
     shutil.rmtree(building, ignore_errors=True)
-    building.mkdir(parents=True)
+    (building / "dbs").mkdir(parents=True)
     for entry in sorted(target.iterdir()):
-        _link(entry, building / entry.name)
-    _link(answers, building / "ground_truth")
-    if view.exists():
-        shutil.rmtree(view)
-    os.replace(building, view)
+        if entry.name != "dbs":
+            _materialise(entry, building / entry.name)
+    for entry in sorted((target / "dbs").iterdir()):
+        _materialise(entry, building / "dbs" / entry.name)
+    _materialise(answers, building / "ground_truth")
+    _publish(building, view)
 
 
 def derive_root(*, original: Path, derived: Path) -> Path:
     """Materialise the parts of a corpus that no task changes, and return the derived root.
 
-    The base databases, the API documentation and the split files are linked in whole: they are
-    read-only inputs and linking them means one derived corpus rather than a copy per run."""
+    Hard links rather than symlinks, for the reason :func:`derive_task` gives: a symlink to the
+    corpus's own ``datasets`` directory is a path to the corpus, and the corpus holds every task's
+    answers. The base databases are 129 MB and the API documentation 4.5 MB, so linking rather
+    than copying is also what makes this free."""
     (derived / "tasks").mkdir(parents=True, exist_ok=True)
     with _locked(derived):
         for entry in sorted(original.iterdir()):
             if entry.name == "tasks":
                 continue
-            _link(entry, derived / entry.name)
+            if not (derived / entry.name).exists():
+                _materialise(entry, derived / entry.name)
     return derived
 
 
 def share_outputs(*, derived: Path, graded: Path) -> None:
-    """Point the grader's root at the episode's own output tree.
+    """Give the grader a view of the episode's own output tree.
 
     An episode writes its end state under the root its world was served from, and the grader reads
-    it under the root *it* was given. Those are two roots on purpose, so the tree the agent's
-    world lives in carries no answers, and one link is what keeps them looking at the same end
-    state rather than at two copies that can disagree."""
+    it under the root it was given. Those are two roots on purpose. This publishes the second name
+    for the first tree under the same lock the roots are built under, because every environment
+    constructed against a cold cache runs this and two of them racing on one ``symlink`` is an
+    ``FileExistsError`` out of a constructor.
+
+    A symlink here rather than a hard link, because a directory cannot be hard-linked and this
+    one has to stay the same directory as it fills up. It points from the grader's private tree
+    into the served tree, which is a direction an agent's process has no way to follow: it is the
+    private tree that is hard to find, and this link lives in it."""
     outputs = derived / "experiments"
     (outputs / "outputs").mkdir(parents=True, exist_ok=True)
     graded.mkdir(parents=True, exist_ok=True)
-    _link(outputs, graded / "experiments")
+    with _locked(graded):
+        link = graded / "experiments"
+        if link.is_symlink() and os.readlink(link) == str(outputs):
+            return
+        _link(outputs, link)
+
+
+def _materialise(source: Path, target: Path) -> None:
+    """Put ``source``'s content at ``target`` without leaving a path back to where it came from.
+
+    A hard link where the filesystem allows one, a copy otherwise. Never a symlink: a symlink
+    names its target's directory, and in this corpus every task directory has the answers as a
+    sibling."""
+    if target.exists():
+        return
+    if source.is_dir():
+        target.mkdir(parents=True, exist_ok=True)
+        for entry in sorted(source.iterdir()):
+            _materialise(entry, target / entry.name)
+        return
+    try:
+        os.link(source, target)
+    except OSError:
+        # A different filesystem, or one with no hard links. A copy costs space and says nothing
+        # about where it came from, which is the property that matters.
+        shutil.copy2(source, target)
+
+
+def _publish(building: Path, target: Path) -> None:
+    """Move a staging tree into place, or drop it if someone else got there first."""
+    if target.exists():
+        shutil.rmtree(building, ignore_errors=True)
+        return
+    target.parent.mkdir(parents=True, exist_ok=True)
+    try:
+        os.replace(building, target)
+    except OSError:
+        shutil.rmtree(building, ignore_errors=True)
+        if not target.exists():
+            raise
 
 
 def _link(source: Path, target: Path) -> None:
-    """Point ``target`` at ``source``, replacing whatever was there.
-
-    A link that already points where it should is left alone rather than remade. Two envs built at
-    the same moment both call this over the shared part of the corpus, and an unlink-then-relink
-    would leave a window in which the other one's world had no databases."""
+    """Point ``target`` at ``source``, replacing whatever was there."""
     if target.is_symlink() and os.readlink(target) == str(source):
         return
     if target.is_symlink() or target.exists():
