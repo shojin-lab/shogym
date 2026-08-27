@@ -300,4 +300,3 @@ Frontier-Bench `v0.1.0` has **74** tasks. The rest are deferred to follow-up iss
 | `docker_backend.py` | The single Docker seam: `Container` (exec/cp) + `run_separate_verifier` (Harbor's SEPARATE-mode protocol) + the daemon-NCPU clamp. |
 | `manifest.py` | Upstream pins (`v0.1.0` + digest), vendored-task loading, and the canary / integrity checks. |
 | `tasks/` | The vendored task dirs (`fin-saccr-rwa/…`), canary preserved byte-for-byte. |
-</content>

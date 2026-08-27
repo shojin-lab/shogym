@@ -164,5 +164,3 @@ extras / keys / data, sharp edges, or a source map worth drawing.
   (multimodal, dense retrieval, keyed variants), and any intentional delta from the original
   benchmark. Every question of the form "what does this port change" is answered here, and
   nothing fidelity-related hides in `Gotchas` or `Requirements`.
-</content>
-</invoke>

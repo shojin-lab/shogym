@@ -226,4 +226,3 @@ semantics (give each run its own trace file for a guaranteed 1:1 mapping).
 | `env_v1.py` | The registered `yc_bench` env: `describe` (rules + seed + manifest), the train/test seed banks, the `finalize` hook (reads final sim metrics on the sealed episode), and the pure `_verify` scorer (verdict from evidence, with the genuine-terminal-state gate). |
 | `mcp_server.py` | The in-process MCP server: `run_command` (allowlisted `yc-bench` CLI against a per-session SQLite DB) + `submit` (the score terminal), seeding/dropping the private DB per session. |
 | `adapter.py` | The single seam funnelling all `yc_bench` imports (sim engine, CLI, ORM, `_init_simulation` seeding), so upstream API drift touches one file. |
-</content>

@@ -203,4 +203,3 @@ src/shogym/envs/automationbench/
   mcp_server.py  # in-process MCP: api_search / api_fetch / base64_encode / done, per-session WorldState + score_session
   adapter.py     # the single seam: provisions + imports upstream, re-hosts setup_state helpers, reuses the rubric
 ```
-</content>

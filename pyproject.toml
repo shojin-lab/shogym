@@ -112,8 +112,8 @@ yc_bench = [
     "typer>=0.9",
 ]
 # The Frontier-Bench port (src/shogym/envs/frontier_bench) vendors a pinned snapshot of the
-# Harbor benchmark (release tag v0.1.0), byte-for-byte. Its only runtime dependency is a working local
-# **Docker** daemon (a system dependency, not a pip package): the env builds+runs the task's
+# Harbor benchmark (release tag v0.1.0), byte-for-byte. Its only runtime dependency is a working
+# local **Docker** daemon (a system dependency, not a pip package): the env builds+runs the task's
 # environment container as the served agent's world and runs the task's own verifier container
 # for the 0/1 verdict. The Python code uses stdlib only (subprocess + tomllib), so this extra
 # carries no Python packages — it exists as a stable install/label target and a home for this

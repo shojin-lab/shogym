@@ -222,4 +222,3 @@ semantics (give each run its own trace file for a guaranteed 1:1 mapping).
 | `mock_server.py` | The solo `mock` domain server (tau2 `DummyUser`, fully offline). |
 | `airline_server.py` / `retail_server.py` / `telecom_server.py` | The non-solo domain servers (domain tools + `send_message` to the LLM user simulator). |
 | `banking_knowledge_server.py` | The `banking_knowledge` domain server, pinned to the offline `bm25_grep` retrieval variant. |
-</content>

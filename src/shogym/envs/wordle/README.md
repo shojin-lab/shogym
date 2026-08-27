@@ -159,4 +159,3 @@ automationbench, frontier_bench) each carry their own `Fidelity & deviations` se
 | `utils.py` | `load_words`, `score_guess` (the G/Y/X scorer), `format_feedback`. |
 | `functions/` | The advisory instruction templates (`guess_v1/example/*.minijinja`) and their variable schemas. |
 | `data/words.txt` | 2,315 five-letter answers, one per line. |
-</content>

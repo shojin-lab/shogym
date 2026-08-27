@@ -219,4 +219,3 @@ semantics (give each run its own trace file for a guaranteed 1:1 mapping).
 | `mcp_server.py` | The in-process MCP server backing `submit_answer` (the score terminal, sealed before any verdict) + the reserved `terminate`. |
 | `judge.py` | The `Judge` seam: `OpenAIJudge` (default) + the scripted judge used by offline tests, plus HLE's own judge prompt. |
 | `data.py` | Loads the gated `cais/hle` dataset, filters to text-only, and caches under `~/.cache/shogym/hle`. |
-</content>
