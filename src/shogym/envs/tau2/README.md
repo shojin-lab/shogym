@@ -86,9 +86,10 @@ default `dev` group, so `uv sync` includes it. On top of that:
   (`tau2/utils/utils.py` falls back to `<checkout>/data` when `TAU2_DATA_DIR` is unset). shogym
   version-checks neither.
 - **`OPENAI_API_KEY`** — required for the **default/live user simulator** on non-solo domains
-  (it's an OpenAI LLM), and for evaluator paths that call a judge (NL assertions) or dense
-  retrieval (retail, banking). It is *not* needed to run a non-solo domain with a scripted
-  offline user (`user_llm_args={"mock_response": "…"}`), nor for the solo `mock` domain.
+  (it's an OpenAI LLM), and for evaluator paths that call a judge (NL assertions, mostly
+  `retail`) or dense retrieval (`banking_knowledge` only; `retail` ships no retrieval code). It is
+  *not* needed to run a non-solo domain with a scripted offline user
+  (`user_llm_args={"mock_response": "…"}`), nor for the solo `mock` domain.
 
 ## How it works
 
@@ -185,10 +186,11 @@ semantics (give each run its own trace file for a guaranteed 1:1 mapping).
 
 - **What is reused, and what is not.** tau2's `Orchestrator`, user simulator,
   domains/tools/tasks, and **evaluator** are reused **verbatim**, and the agent is swapped for
-  the harness. `reward`, `db_match` and `action_match_proportion` are tau2's own numbers off
-  `evaluate_simulation`; shogym derives `success` (`reward >= 1.0`) and scores an abort or a
-  missing verdict as `reward = 0.0`. There are **zero shogym core changes**; the whole port is
-  additive under `src/shogym/envs/tau2/`.
+  the harness. `reward` and `db_match` are tau2's own numbers off `evaluate_simulation`
+  (`RewardInfo.reward`, `DBCheck.db_match`). shogym derives the rest: `action_match_proportion`
+  is a ratio it computes over upstream's per-action `action_checks`, `success` is
+  `reward >= 1.0`, and an abort or a missing verdict scores `reward = 0.0`. There are **zero
+  shogym core changes**; the whole port is additive under `src/shogym/envs/tau2/`.
 - **Pinned to source commit `1d244f5`.** The pin covers tau2's Python source only, and the
   default provisioner extracts `src/tau2` alone, so it ships no benchmark data at all. The
   domain policies, tasks and DBs arrive by one of two caller-controlled routes: `TAU2_DATA_DIR`,
@@ -203,14 +205,19 @@ semantics (give each run its own trace file for a guaranteed 1:1 mapping).
   retrieval variant (rank-bm25, no embeddings) so it constructs/serves offline. The benchmark
   default (`alltools`, dense OpenAI embeddings) needs a key at construction time and is a keyed
   follow-up.
-- **NL-assertion reward is keyed.** `retail` and `banking_knowledge` have `NL_ASSERTION` in
-  their `reward_basis`, so the *full* reward needs a judge LLM. Offline runs use
+- **NL-assertion reward is keyed.** `retail` carries `NL_ASSERTION` in nearly every task's
+  `reward_basis` (112 of 114), so its *full* reward needs a judge LLM. `banking_knowledge`
+  carries it in exactly one task of 97 (the rest are `DB` or `ACTION`), so a keyless run loses
+  almost nothing there. Offline runs use
   `evaluation_type="env"` to score the deterministic DB component only.
 - **Splits verbatim.** `airline` / `retail` / `telecom` use tau2's declared `train`/`test`
   splits verbatim (no positional slicing, no leakage). `mock` and `banking_knowledge` declare no
   holdout, so both splits return the full task set.
-- **Max-step preserved.** Reaching the shogym horizon scores tau2's evaluator over the completed
-  run (upstream's max-step behaviour), not an independent premature zero.
+- **The horizon is more generous than upstream's max-step.** Upstream scores any termination
+  outside `AGENT_STOP` / `USER_STOP` as a premature `reward = 0.0`, its own max-step included.
+  Reaching the shogym horizon instead delivers `done`, so tau2 stops as `AGENT_STOP` and its
+  evaluator scores the completed run. shogym invents no zero of its own, but this is a
+  deliberate deviation, not preserved upstream behaviour.
 
 ## Gotchas
 

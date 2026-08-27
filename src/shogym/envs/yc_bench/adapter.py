@@ -11,7 +11,7 @@ here, behind a small, stable surface the rest of the env calls:
 
   - :func:`build_db` — open a fresh per-session SQLite database.
   - :func:`seed_session` — seed one deterministic company/world (reuses yc-bench's own
-    ``_init_simulation``, so seeding is bit-identical to ``yc-bench run`` for a given
+    ``_init_simulation``, so the seeded world matches ``yc-bench run``'s attributes for a given
     seed/config/start-date).
   - :func:`run_cli` — execute one ``yc-bench <cmd>`` against the session DB, reusing
     yc-bench's command-validation policy and its real CLI entry point.

@@ -121,8 +121,9 @@ class Tau2Env(Env):
         # Orchestrator budget (`max_steps`, counted over message hops) almost always stops the
         # simulation first, and that autonomous stop stashes tau2's verdict (see mcp_server). If
         # the shogym horizon is nonetheless reached, the serve layer runs this env's `finalize` with
-        # source="horizon" — so a hit horizon **scores tau2's evaluator over the completed run**
-        # (preserve_upstream_maxstep), never an independent premature zero. Kept at max_steps + 2
+        # source="horizon", which delivers `done` — so tau2 stops as AGENT_STOP and its evaluator
+        # scores the completed run. That is more generous than upstream's own max-step, which
+        # evaluates as a premature zero; shogym just never invents a zero. Kept at max_steps + 2
         # (unchanged) so the cap is never the binding constraint for a legitimate episode.
         super().__init__(horizon=max_steps + 2, num_tasks=len(self._task_ids))
 
@@ -406,8 +407,9 @@ class Tau2TelecomEnv(Tau2Env):
 class Tau2BankingKnowledgeEnv(Tau2Env):
     """tau2's ``banking_knowledge`` domain (non-solo). Pinned to the offline ``bm25_grep``
     retrieval variant so the env constructs/serves without OpenAI embeddings; the benchmark
-    default (``alltools``, dense embeddings) is a keyed follow-up. reward_basis includes
-    NL_ASSERTION — use ``evaluation_type="env"`` for an offline served run."""
+    default (``alltools``, dense embeddings) is a keyed follow-up. Exactly one of its 97 tasks
+    carries ``NL_ASSERTION`` in ``reward_basis`` — use ``evaluation_type="env"`` to score the
+    deterministic component offline."""
 
     domain = "banking_knowledge"
     solo_mode = False

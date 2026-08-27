@@ -22,8 +22,9 @@ and scoring layers around them. The runnable demo is
 
 > Requires **Python 3.12 + the `yc_bench` extra** — see [Requirements](#requirements). Unlike
 > tau2, YC-Bench needs **no data download**: its world is generated from the seed and the sim
-> runs in-process, so a served episode is fully offline once the pinned upstream source is
-> cached (no API key). The first construction fetches that source.
+> runs in-process, so a served episode needs no key and no benchmark data once the pinned
+> upstream source is cached. The first construction fetches that source, and importing it pulls
+> in litellm, which reaches for a model-cost map (see [Requirements](#requirements)).
 
 ### Construct + serve
 
@@ -84,12 +85,18 @@ the default `dev` group, so `uv sync` includes it. On top of that:
   instead, exactly as `automationbench` does. The `yc_bench` extra declares upstream's own
   runtime dependencies explicitly, since pip no longer resolves them transitively.
 - **No data, no API key** for a served episode. YC-Bench generates its world from the seed and
-  runs its sim in-process, so once the source is cached the whole served path
-  (seed → commands → verdict) is offline. (A YC-Bench *model* key is only needed by upstream's
-  own agent loop, which this port replaces with the harness.)
+  runs its sim in-process, so once the source is cached the served path
+  (seed → commands → verdict) makes no network call of its own. It is not strictly
+  network-free: importing the adapter pulls in litellm (below), which fetches a model-cost map
+  on import unless `LITELLM_LOCAL_MODEL_COST_MAP=true`, falling back to a bundled copy when
+  that fails. (A YC-Bench *model* key is only needed by upstream's own agent loop, which this
+  port replaces with the harness.)
 - **Heavy extra.** YC-Bench depends on litellm / streamlit / matplotlib / plotly (its own
-  runner/dashboard). They install with the extra but are never imported by the served path
-  (only the sim engine, CLI commands, and ORM are), so command execution stays light.
+  runner/dashboard). streamlit, matplotlib and plotly are never imported. **litellm is**: the
+  adapter imports `_init_simulation` from `yc_bench.runner.main`, which pulls in
+  `agent.loop` and `agent.runtime.factory`, and that reaches `import litellm`. It is imported,
+  never called — the served path issues no model requests — but constructing the env pays its
+  import cost.
 
 ## How it works
 
@@ -110,7 +117,8 @@ client trust, adversarial clients), this run's **seed / preset**, and the **tool
 
 The env's in-process MCP server (`mcp_server.py`) seeds a **private, throwaway SQLite database
 per episode** on `begin_session` (one company/world, seeded deterministically from the task's
-seed via YC-Bench's own `_init_simulation`, so seeding is bit-identical to `yc-bench run`) and
+seed via YC-Bench's own `_init_simulation`, the same function `yc-bench run` calls, so the
+seeded world carries the same attributes as upstream's; the row ids are fresh `uuid4`s) and
 drops it on `end_session`. It exposes two tools:
 
 - **`run_command(command)`** — mirrors upstream's `run_command("yc-bench
@@ -148,13 +156,14 @@ second submission to guard against and no trajectory to scan for a forged marker
 A task **is a world seed**. The seed selects the market tasks generated for the world (upstream
 fixes employees/clients across seeds), so it reproduces the *business* attributes of an instance:
 the same companies, employees, clients and tasks with the same numbers. It does not reproduce
-the row **identifiers** — upstream's `services/seed_world.py` calls `uuid4()` for the company,
-every employee, every client and every market task, and for replacement tasks. Those ids are
-agent-visible in `company status` / `market browse` output and are consumed by task commands, so
-two runs of one seed differ in their ids and a literal command sequence containing them cannot
-be replayed. `yc_bench` ships two disjoint seed banks — `train` (seeds 1–16) and `test`
-(seeds 9001–9016) — selected by `task_split` (default `train`). Task indices are relative to
-the chosen split.
+the database **row ids**: upstream's `services/seed_world.py` mints a `uuid4()` for the company,
+every employee, every client and every market task, and for replacements. Those mostly stay
+behind the CLI, which reports a task by its deterministic **title** — `market browse` and the
+`task` commands emit `"task_id": task.title`, and titles are `Task-<serial>` — so a command
+sequence written against `Task-42` replays across runs. The `uuid4`s surface as `company_id`
+and `client_id`, which no task command consumes. `yc_bench` ships two disjoint seed banks —
+`train` (seeds 1–16) and `test` (seeds 9001–9016) — selected by `task_split` (default `train`).
+Task indices are relative to the chosen split.
 
 ## Scoring
 
@@ -206,11 +215,12 @@ semantics (give each run its own trace file for a guaranteed 1:1 mapping).
   groups; `yc-bench run` (upstream's own credential-inheriting LLM agent loop) and `yc-bench
   start` (interactive) are rejected before any subprocess spawns — that agent loop is exactly
   what this port replaces with the harness.
-- **Determinism check, scoped to outcomes.** For a fixed seed and an equivalent command
-  sequence the final funds are reproducible run to run and match a direct `yc-bench` seeding of
-  the same seed. The served/determinism tests assert that, reading each run's freshly generated
-  task id rather than replaying a literal one; the identifiers themselves are `uuid4` and differ
-  every run (see [Tasks](#tasks)).
+- **Determinism check, scoped to what is tested.** `tests/envs/test_yc_bench_served.py` runs one
+  seed twice through shogym and asserts the two runs end on the same funds. Nothing compares the
+  result against a direct `yc-bench` seeding, so equality with upstream is asserted nowhere here;
+  unlike the other ports, this one ships no keyed fidelity test. Database row ids are `uuid4` and
+  differ every run, though the agent-facing task ids are deterministic titles (see
+  [Tasks](#tasks)).
 
 ## Gotchas
 

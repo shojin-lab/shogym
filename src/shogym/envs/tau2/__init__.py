@@ -7,7 +7,8 @@ env is actually *constructed* (its in-process MCP server is probed) or served.
 
 The port reuses tau2's Orchestrator, user simulator, domain tools/tasks, and evaluator
 verbatim, and replaces only the *agent* — via tau2's own
-``GymAgent`` control-inversion bridge (``tau2.gym``), which runs the Orchestrator on a
-background thread and blocks the agent's turn until the shogym harness makes its next
-MCP tool call.
+``GymAgent`` control-inversion bridge (``tau2.gym``), a ``HalfDuplexAgent`` that blocks the
+agent's turn until the next ``set_action``. This port hosts the Orchestrator on a background
+thread of its own (see :mod:`shogym.envs.tau2.mcp_server`) and unblocks that turn when the
+shogym harness makes its next MCP tool call.
 """
