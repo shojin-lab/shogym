@@ -111,15 +111,16 @@ yc_bench = [
     "streamlit>=1.55.0",
     "typer>=0.9",
 ]
-# The Frontier-Bench port (src/shogym/envs/frontier_bench) vendors a pinned snapshot of the
-# Harbor benchmark (release tag v0.1.0), byte-for-byte. Its only runtime dependency is a working
+# The Frontier-Bench port (src/shogym/envs/frontier_bench) vendors five task directories from
+# Harbor's Frontier-Bench v0.1.0 byte-for-byte, each guarded by a pinned content hash; the env,
+# the Docker backend and the manifest are shogym code. Its only runtime dependency is a working
 # local **Docker** daemon (a system dependency, not a pip package): the env builds+runs the task's
 # environment container as the served agent's world and runs the task's own verifier container
 # for the 0/1 verdict. The Python code uses stdlib only (subprocess + tomllib), so this extra
 # carries no Python packages — it exists as a stable install/label target and a home for this
 # note. `import shogym` registers `frontier_bench` without importing Docker; only serving an
-# episode shells out to `docker`. Task files are vendored under the package (tiny), so
-# describe / verdict-parsing / the offline tests need neither Docker nor a network.
+# episode shells out to `docker`. The vendored files are tiny, so describe / verdict-parsing /
+# the offline tests need neither Docker nor a network.
 frontier_bench = []
 # The AutomationBench port (src/shogym/envs/automationbench). Upstream (MIT, © Zapier) is pinned to
 # commit a321764 and, on top of the PyPI direct-reference ban that rules out a git requirement for

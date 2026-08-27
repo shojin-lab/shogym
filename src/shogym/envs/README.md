@@ -130,7 +130,7 @@ each env keeps a one-liner and links back to the matching section of this README
 
 ```
 # `<registered_env_id>` — <BenchmarkName>, <hook>
-<upstream> served through shogym at <pinned commit or release>. <one line: what the task is.>
+<upstream> served through shogym[ at <pinned commit or release>]. <one line: what the task is.>
 <one line: what the port reuses from upstream verbatim, and what it replaces.>
 <one-liner: env-as-center → link to this README; the runnable example link.>
 
@@ -154,6 +154,10 @@ each env keeps a one-liner and links back to the matching section of this README
 `Layout`. `Requirements`, `Gotchas`, and `Layout` are optional — include them when the env has
 extras / keys / data, sharp edges, or a source map worth drawing.
 
+- **The pin clause is optional.** Name the commit or release when the port pins one. `hle`
+  loads the `cais/hle` split at whatever revision resolves, so its opener drops the clause and
+  the next line names what it loads instead. An opener never implies a pin the code does not
+  make.
 - **`How it works`** always carries `describe → TaskSpec` then `Tools (served over MCP)`, then
   a verifier subsection: **`finalize + verify`** for a seal env (the score terminal seals,
   `finalize` produces the verdict, `verify` reads it) or **`verify`** for a marker/trivial env
