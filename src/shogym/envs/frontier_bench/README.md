@@ -97,12 +97,19 @@ of the shared boilerplate:
   task's `tests/Dockerfile` as a separate verifier container. This slice is deliberately
   **CPU-only, single-container, Docker-only** (no GPU / compose / Modal runners — see
   [Fidelity & deviations](#fidelity--deviations)).
-- **No API key, no data download.** All task files (Dockerfiles, seed data, the oracle, the
-  pytest verifier + golden files) are vendored under [`tasks/`](tasks/), pinned to upstream
-  commit `eb4af26c` (labelled `v0.1.0` upstream), so
-  `describe` / verdict-parsing / the offline tests need neither Docker nor a network. Each task
-  image pulls a (usually digest-pinned) `python:3.x-slim` base at build time — the only network
-  the served path needs.
+- **No API key, and no benchmark-data download.** All task files (Dockerfiles, seed data, the
+  oracle, the pytest verifier + golden files) are vendored under [`tasks/`](tasks/) at upstream
+  commit `eb4af26c`, so `describe` / verdict-parsing / the offline tests need neither Docker nor
+  a network.
+- **A cold image build does need the network, and more than a registry.** Nine of the ten
+  vendored Dockerfiles run networked package installs: `apt-get` and `pip install`, plus
+  `curl -LsSf https://astral.sh/uv/0.9.7/install.sh | sh` and `uv pip install` in the
+  `protein-autointerp-disulfide` and `sound-change-cascade` verifier images. A cold build
+  therefore reaches Docker Hub, Debian's apt mirrors, PyPI and astral.sh. Only **one** of the
+  ten `FROM` lines is digest-pinned; the other nine take a mutable tag. The exception on both
+  counts is the same file, `fin-saccr-rwa/environment/Dockerfile`: digest-pinned base, no
+  network install. Once a task's image is built the content-addressed tag reuses it, so this
+  is a cold-build cost, not a per-episode one.
 
 ## How it works
 
@@ -211,11 +218,15 @@ core-owned terminal evidence, so the transcript cannot influence it.
 ## Fidelity & deviations
 
 - **Pinned snapshot.** Frontier-Bench is continuously versioned; this port pins upstream commit
-  **`eb4af26c`**, recorded upstream as release tag `v0.1.0`, and the per-task `sha256` digest
-  recorded in upstream `tasks/dataset.toml`, and vendors the runtime files under
-  [`tasks/`](tasks/) (upstream's `maintainer/` tooling is not carried). The repository has since
-  moved to `harbor-framework/terminal-bench` and the `v0.1.0` tag no longer resolves there; the
-  commit does, which is why it is the anchor. `describe()` still stamps the recorded label in
+  **`eb4af26c`** and the per-task `sha256` digest recorded in upstream `tasks/dataset.toml`, and
+  vendors the runtime files under [`tasks/`](tasks/) (upstream's `maintainer/` tooling is not
+  carried). The five recorded digests match that file exactly.
+- **`v0.1.0` is this port's own label.** `manifest.UPSTREAM_TAG` records it, and nothing at the
+  pinned commit corroborates it: the repository has moved to `harbor-framework/terminal-bench`,
+  no `v0.1.0` tag or release resolves there, and upstream's `tasks/dataset.toml` at `eb4af26c`
+  names the dataset `terminal-bench/terminal-bench-3` with no version field, while the string
+  `0.1.0` appears in none of the vendored task files. Treat it as a legacy local label; the
+  commit is the only anchor that resolves. `describe()` still stamps the recorded label in
   each TaskSpec's provenance footer (`pinned: frontier-bench v0.1.0 · <digest>`); moving that
   footer onto the commit changes a served string, so it is
   [issue #136](https://github.com/shojin-lab/shogym/issues/136) rather than part of this pass.
@@ -233,10 +244,11 @@ core-owned terminal evidence, so the transcript cannot influence it.
   `--cpus` larger than the daemon can grant (e.g. a Desktop VM capped at 2 while the client sees
   8+). This preserves benchmark behavior wherever the resources exist and only bounds it to what
   the daemon can actually provide.
-- **Base-image tags vendored as-is.** Some upstream `environment/` / `tests/` Dockerfiles
-  digest-pin their `python:3.x-slim` base (e.g. `fin-saccr-rwa`); others pin only a *mutable* tag
-  (e.g. `python:3.13-slim-bookworm`). This port **vendors each Dockerfile byte-for-byte** from the
-  `v0.1.0` snapshot rather than rewriting it, because the integrity contract is byte-for-byte
+- **Base-image tags vendored as-is.** One of the ten vendored `environment/` / `tests/`
+  Dockerfiles digest-pins its `python:3.x-slim` base (`fin-saccr-rwa/environment`); the other
+  nine pin only a *mutable* tag (e.g. `python:3.13-slim-bookworm`), and none pin the apt or PyPI
+  packages they then install. This port **vendors each Dockerfile byte-for-byte** from the
+  pinned snapshot rather than rewriting it, because the integrity contract is byte-for-byte
   redistribution (`verify_vendored_integrity` would flag a local edit as tampering). Consequence:
   the content pin guards the *vendored files* against drift but cannot make an upstream *mutable
   base tag* immutable — a cold rebuild on a fresh host could pull a newer base for those tasks
@@ -246,7 +258,8 @@ core-owned terminal evidence, so the transcript cannot influence it.
 
 ### Deferred upstream scope (not ported in this slice)
 
-Frontier-Bench `v0.1.0` has **74** tasks. The rest are deferred to follow-up issues:
+Upstream at `eb4af26c` lists **74** tasks in `tasks/dataset.toml`. The rest are deferred to
+follow-up issues:
 
 - **GPU (4)** — `gpus > 0`; need GPU-provisioned runners: `math-eval-grader`, `exam-pdf-eval`,
   `jax-speedrun-gpu`, `fp8-rmsnorm-gemm`.

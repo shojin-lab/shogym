@@ -109,7 +109,7 @@ extras and the network, so there is nothing left for it to legitimately skip.
 |---|---|---|
 | `wordle_v1` | The reference env-as-center environment — Wordle in the smallest honest form (`guess` + reserved `terminate`, a pure trajectory verifier). No extra deps; runs on core shogym. | [`wordle/README.md`](wordle/README.md) |
 | `tau2_mock`, `tau2_airline`, `tau2_retail`, `tau2_telecom`, `tau2_banking_knowledge` | [τ²-bench](https://github.com/sierra-research/tau2-bench) served through shogym at upstream source commit `1d244f5`, with domain data from an unversioned caller-supplied checkout (`TAU2_DATA_DIR`, or upstream's source-relative fallback) — tool-using customer-service agents across domains, scored by tau2's own evaluator. Needs the `tau2` extra + tau2 data. | [`tau2/README.md`](tau2/README.md) |
-| `yc_bench` | [YC-Bench](https://github.com/collinear-ai/yc-bench) served through shogym at upstream commit `e7d6067` — operate a simulated AI startup for one year via a single `run_command` tool, scored on survival, funds, and tasks completed. Needs the `yc_bench` extra (deterministic in-process sim — no data or key). | [`yc_bench/README.md`](yc_bench/README.md) |
+| `yc_bench` | [YC-Bench](https://github.com/collinear-ai/yc-bench) served through shogym at upstream commit `e7d6067` — operate a simulated AI startup for one year via a single `run_command` tool, scored on survival, funds, and tasks completed. Needs the `yc_bench` extra (in-process sim, no data or key; a seed reproduces the business attributes, not the `uuid4` row ids). | [`yc_bench/README.md`](yc_bench/README.md) |
 | `hle` | [Humanity's Last Exam](https://huggingface.co/datasets/cais/hle) served through shogym — a single-turn, expert-level question answered via one `submit_answer` tool, graded server-side with HLE's own judge prompt (exact-match fast path, then an OpenAI model judge; shogym's first model-graded verifier). Needs the `hle` extra, `OPENAI_API_KEY`, and gated `cais/hle` access. | [`hle/README.md`](hle/README.md) |
 | `browsecomp_plus` | [BrowseComp-Plus](https://github.com/texttron/BrowseComp-Plus) served through shogym at upstream commit `0469490` for the qrels and the copied evaluation code, with separately pinned Hugging Face revisions for the queries and the BM25 index — answer reasoning-heavy queries against a fixed ~100K-doc corpus via `search` / `get_document` / `submit_answer`, graded by an LLM judge plus deterministic retrieval-recall / citation metrics. Needs the `browsecomp_plus` extra, `OPENAI_API_KEY`, Java 21, and gated dataset access. | [`browsecomp_plus/README.md`](browsecomp_plus/README.md) |
 | `automationbench` | [AutomationBench](https://github.com/zapier/AutomationBench) served through shogym at upstream commit `a321764` — carry out a cross-application business workflow over a fully simulated world of ~47 SaaS apps via an `api` tool surface, scored end-state-only by upstream's own rubric. Needs the `automationbench` extra (offline, no key; the rubric is deterministic over a given end-state, though upstream mints `uuid4` ids and reads `datetime.now()`). | [`automationbench/README.md`](automationbench/README.md) |
@@ -164,8 +164,10 @@ extras / keys / data, sharp edges, or a source map worth drawing.
   `finalize` produces the verdict, `verify` reads it) or **`verify`** for a marker/trivial env
   (wordle — a pure verifier over the trajectory, no `finalize`). Use the heading bare: no
   parentheticals, no arrows.
-- **`Fidelity & deviations`** is the one place every deviation from upstream lives: the exact
-  pinned upstream commit / tag and what it does not cover, the retriever / judge / variant /
-  model choices, any deferred scope (multimodal, dense retrieval, keyed variants), and any
-  intentional delta from the original benchmark. Every question of the form "what does this port change" is answered here, and
-  nothing fidelity-related hides in `Gotchas` or `Requirements`.
+- **`Fidelity & deviations`** is the authoritative place for every *deviation* from upstream:
+  the exact pinned upstream commit / tag and what it does not cover, the retriever / judge /
+  variant / model choices, any deferred scope (multimodal, dense retrieval, keyed variants),
+  and any intentional delta from the original benchmark. Every question of the form "what
+  does this port change" is answered here. `Requirements` and `Gotchas` may repeat a
+  fidelity-adjacent fact a reader needs in order to run the env, but a deviation that appears
+  only there is a bug in the README.

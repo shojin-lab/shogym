@@ -50,7 +50,8 @@ analysis = ["pandas>=2.2", "duckdb>=1.0"]
 # shogym` (and the core test suite) stay lean and never import tau2 — `import shogym` registers
 # `tau2_*` envs without provisioning or loading it.
 # NOTE: tau2's `data/` is a separate provisioning concern and is unchanged — a tau2 env still
-# needs `TAU2_DATA_DIR` pointing at a tau2-bench data checkout.
+# needs a data checkout, either via `TAU2_DATA_DIR` or via a full `TAU2_SRC` clone whose sibling
+# `data/` upstream resolves on its own. The default runtime fetch extracts only `src/tau2`.
 tau2 = [
     # upstream [project] dependencies @ 1d244f5
     "addict>=2.4.0",
@@ -98,7 +99,8 @@ hle = [
 # resolve transitively through that direct requirement: upstream's `[project] dependencies`
 # verbatim at the pinned SHA. Kept optional so `pip install shogym` (and the core test suite) stay
 # lean and never import yc_bench — `import shogym` registers the `yc_bench` env without
-# provisioning or loading it. YC-Bench generates its whole world deterministically from a seed, so
+# provisioning or loading it. YC-Bench generates its whole world from a seed (business attributes
+# reproducibly; row ids are uuid4 and differ per run), so
 # (unlike tau2) it needs no external data provisioned at runtime.
 yc_bench = [
     # upstream [project] dependencies @ e7d6067

@@ -237,8 +237,9 @@ class YcBenchEnv(Env):
         session (``engine.dispose()`` / DB teardown) only *after* this returns, so the read here
         always sees an open DB. The verdict is the sim's own end-state — the agent's company
         metrics, public-safe with no oracle; ``verify`` applies the terminal-state gate when it
-        scores it, and core stamps the provenance. Deterministic, offline, keyless: the sim is a
-        pure in-process function of the seed and the commands issued.
+        scores it, and core stamps the provenance. Offline and keyless, and the sim advances
+        deterministically in-process from the seed and the commands issued — though upstream's
+        world seeding mints ``uuid4`` row ids, so the identifiers differ run to run.
         """
         from shogym.envs.yc_bench import mcp_server  # lazy: pulls in yc_bench
         from shogym.serve.lifecycle import TerminalEvidence

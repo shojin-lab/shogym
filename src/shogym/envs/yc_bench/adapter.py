@@ -137,11 +137,13 @@ def seed_session(
     horizon_years: Optional[int],
     company_name: str,
 ) -> str:
-    """Seed one deterministic company/world into the session DB; return the company id.
+    """Seed one company/world into the session DB from the task seed; return the company id.
 
     Delegates to yc-bench's own ``_init_simulation`` (the exact function ``yc-bench run``
     calls), so for a fixed seed/config/start-date the seeded world — employees, clients,
-    market tasks, horizon event, and initial ``SimState`` — is identical to upstream."""
+    market tasks, horizon event, and initial ``SimState`` — carries the same *attributes* as
+    upstream's. The row **ids** are not reproducible: upstream's ``services/seed_world.py``
+    mints a ``uuid4()`` per company, employee, client and market task."""
     experiment_cfg = load_config(config_name)
     resolved_horizon = (
         horizon_years if horizon_years is not None else experiment_cfg.sim.horizon_years

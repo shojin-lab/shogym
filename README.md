@@ -71,8 +71,9 @@ README covers the model and the shared env-README template.
   by tau2's own evaluator. Needs the `tau2` extra + data.
 - **[`yc_bench`](src/shogym/envs/yc_bench/README.md)**: a port of
   [YC-Bench](https://github.com/collinear-ai/yc-bench). Operate a simulated AI startup for a year
-  via a single `run_command` tool, scored on survival, funds, and tasks. Deterministic in-process
-  sim (no data or key). Needs the `yc_bench` extra.
+  via a single `run_command` tool, scored on survival, funds, and tasks. In-process sim, no data
+  or key; a seed reproduces the business attributes, not the `uuid4` row ids. Needs the
+  `yc_bench` extra.
 - **[`hle`](src/shogym/envs/hle/README.md)**: a port of
   [Humanity's Last Exam](https://huggingface.co/datasets/cais/hle). A single-turn, expert-level
   question answered via one `submit_answer` tool and graded server-side (exact-match fast path,

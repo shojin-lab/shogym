@@ -82,7 +82,9 @@ pulls `datasets` (the encrypted queries), `openai` (the default judge client), a
 - **`OPENAI_API_KEY`.** `submit_answer` grades with an LLM judge. With the default judge, an
   episode **fails fast at startup** if no key is set (so a keyless run never silently scores
   everything wrong). Opt out by injecting a scripted `judge`, or point `judge_base_url` at a
-  keyless OpenAI-compatible endpoint (e.g. a vLLM **Qwen3-32B** — the upstream judge).
+  keyless OpenAI-compatible endpoint. For upstream's own judge set **both** `judge_base_url` (a
+  vLLM **Qwen3-32B**) and `judge_model` to that model id: the base URL alone still requests
+  `gpt-4.1`, which such a server rejects as unknown.
 - **The query dataset (`Tevatron/browsecomp-plus`).** Queries + answers are **XOR-encrypted**
   with a canary to keep the benchmark off plain-text crawls. shogym decrypts them **in memory
   only** — it never writes or commits decrypted queries/answers, and the canary is preserved.

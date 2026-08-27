@@ -17,16 +17,16 @@ tools/tasks and evaluator verbatim and replacing only the agent. The runnable de
 
 ## Running it
 
-> Requires **Python 3.12 + the `tau2` extra**, tau2 data (`TAU2_DATA_DIR`), and a one-time
-> fetch of the pinned upstream source on first construction — see
-> [Requirements](#requirements) below.
+> Requires **Python 3.12 + the `tau2` extra**, a tau2 `data/` checkout (by `TAU2_DATA_DIR`, or
+> by a full `TAU2_SRC` clone that carries its own `data/`), and a one-time fetch of the pinned
+> upstream source on first construction — see [Requirements](#requirements) below.
 
 ### Construct + serve
 
 ```python
 import shogym
 
-env = shogym.make("tau2_mock")          # needs tau2 data (set TAU2_DATA_DIR)
+env = shogym.make("tau2_mock")          # needs tau2 data (TAU2_DATA_DIR, or a full TAU2_SRC clone)
 spec = env.describe("0")               # task 0: policy + this task's ticket + the tool manifest
 ```
 
@@ -58,7 +58,8 @@ variable at the top of its `serve.py`:
 ENV = "tau2_mock"
 ```
 
-The mock domain is fully offline once `TAU2_DATA_DIR` points at a tau2-bench `data/` checkout.
+The mock domain is fully offline once tau2's `data/` is reachable, by `TAU2_DATA_DIR` or by a
+full `TAU2_SRC` clone.
 A real (non-solo) domain additionally needs `OPENAI_API_KEY` for tau2's own user simulator,
 which is a real cost.
 
@@ -78,9 +79,12 @@ default `dev` group, so `uv sync` includes it. On top of that:
   as `automationbench` does. The `tau2` extra declares upstream's own runtime dependencies
   explicitly (its base deps plus its `[gym]` and `[knowledge]` extras), since pip no longer
   resolves them transitively.
-- **tau2 data**, separately. tau2 does **not** ship its `data/` in the install, and the runtime
-  source fetch deliberately does not carry it either, so it must be provisioned: set
-  `TAU2_DATA_DIR` to a tau2-bench `data/` checkout.
+- **tau2 data**, separately. tau2 does **not** ship its `data/` in the install, and the default
+  runtime fetch extracts `src/tau2` alone, so a provisioned-from-cache run must supply the data
+  itself. Two routes work: set `TAU2_DATA_DIR` to a tau2-bench `data/` checkout, or point
+  `TAU2_SRC` at a **full** clone's `src/`, whose sibling `data/` upstream finds on its own
+  (`tau2/utils/utils.py` falls back to `<checkout>/data` when `TAU2_DATA_DIR` is unset). shogym
+  version-checks neither.
 - **`OPENAI_API_KEY`** — required for the **default/live user simulator** on non-solo domains
   (it's an OpenAI LLM), and for evaluator paths that call a judge (NL assertions) or dense
   retrieval (retail, banking). It is *not* needed to run a non-solo domain with a scripted

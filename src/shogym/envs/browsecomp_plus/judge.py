@@ -14,10 +14,12 @@ criteria match the benchmark's own. The reply parser (:func:`parse_judge_respons
 from upstream's: it reads a line-anchored verdict and fails closed (see its docstring).
 
 Upstream grades with Qwen3-32B (vLLM, temp 0.7) or GPT-4.1 (the paper); shogym canonicalizes an
-OpenAI-compatible judge at **temperature 0** for deterministic verification, defaulting to the
-paper's GPT-4.1 and overridable via ``judge_model`` / ``judge_base_url``. Pointing both at a
-vLLM Qwen3-32B grades with upstream's model, but not identically: upstream defaults
-``top_p=0.8`` and ``top_k=20`` at temperature 0.7, and this judge sends neither at temperature 0.
+OpenAI-compatible judge that *requests* **temperature 0**, falling back to the endpoint default
+when that request raises (see :meth:`OpenAIJudge.__call__`), so temperature 0 is lower variance
+rather than a determinism guarantee. It defaults to the paper's GPT-4.1 and is overridable via
+``judge_model`` / ``judge_base_url``. Setting **both** at a vLLM Qwen3-32B grades with
+upstream's model, but not identically: upstream defaults ``top_p=0.8`` and ``top_k=20`` at
+temperature 0.7, and this judge sends neither. A base URL alone still requests ``gpt-4.1``.
 
 Nothing here imports ``openai`` at module load — the client is created lazily on first use —
 so ``import shogym`` (which imports the env to register it) stays offline and lean.
@@ -31,12 +33,17 @@ from dataclasses import dataclass
 from typing import Any, Optional, Protocol, runtime_checkable
 
 # The paper's judge model (BrowseComp-Plus reports GPT-4.1). A current OpenAI model id; override
-# via `judge_model` env config, or point `judge_base_url` at a vLLM Qwen3-32B to match the repo
-# default exactly.
+# via `judge_model`. To grade with upstream's model, set `judge_model` to the Qwen id *and*
+# `judge_base_url` to the vLLM endpoint: a base URL alone still requests `gpt-4.1`, which such a
+# server normally rejects as unknown. The sampling and the reply parser still differ from
+# upstream's either way.
 DEFAULT_JUDGE_MODEL = "gpt-4.1"
 
-# Deterministic decoding for a reproducible verifier (upstream uses temp 0.7; we pin 0). Some
-# newer/reasoning models reject an explicit temperature — the judge drops it and retries.
+# Requested decoding for a lower-variance verifier (upstream uses temp 0.7; this asks for 0).
+# `OpenAIJudge.__call__` catches *any* exception from that request and retries with no
+# temperature at all, so a grade can land at the endpoint default — the intended path for models
+# that reject an explicit temperature, and also what happens after an unrelated first-call
+# failure.
 JUDGE_TEMPERATURE = 0.0
 
 # A non-secret stand-in api_key. Local OpenAI-compatible servers (vLLM/Ollama/LM Studio) need no

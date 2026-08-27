@@ -179,6 +179,11 @@ semantics (give each run its own trace file for a guaranteed 1:1 mapping).
 
 ## Fidelity & deviations
 
+- **The dataset is not pinned.** `data.py` calls `load_dataset("cais/hle", split="test")` with
+  no `revision`, so a cold cache resolves whatever the dataset repo's default branch holds at the
+  time. If upstream adds, removes or reorders rows, the 80/20 positional split moves with it and
+  a task index stops naming the same question. Two runs are comparable only when they read the
+  same cached snapshot.
 - **Grading is HLE's own.** The judge uses HLE's own judge prompt; the registered env defaults
   to `OpenAIJudge` (overridable via `judge_model` / `judge_kwargs` / `judge_base_url`, or a
   fully injected `judge`). The exact-match fast path is a free, offline pre-check that never
