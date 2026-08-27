@@ -111,6 +111,21 @@ yc_bench = [
     "streamlit>=1.55.0",
     "typer>=0.9",
 ]
+# The AppWorld port (src/shogym/envs/appworld). This extra carries **no packages**, and the reason
+# is a hard conflict rather than a preference: `appworld` 0.1.3.post1 (the PyPI release cut from
+# upstream commit 66ad809) pins `pydantic>=1.9,<2`, while shogym's MCP layer needs `pydantic>=2.7`.
+# No environment satisfies both, so upstream cannot be a requirement of shogym under any marker.
+# The port therefore provisions an interpreter of its own — a virtual environment under
+# `~/.cache/shogym/appworld/runtime-<version>/` holding the pinned release, honoring `SHOGYM_CACHE`
+# — and runs every world in a subprocess under it, talking over a loopback socket. That separation
+# is needed anyway: AppWorld freezes the process clock and holds each app's database engine on a
+# class attribute, so one interpreter can hold one world. The 33 MB data bundle is fetched by the
+# port and refused unless its sha256 matches the pin (upstream's own downloader checks nothing);
+# `APPWORLD_ROOT` points at an existing corpus instead. This extra exists as a stable install label
+# and a home for this note. `import shogym` registers `appworld` without provisioning anything, and
+# the port's pure pieces (the backlog generator, the scorer, the three payload classes) are offline
+# and need neither the runtime nor the corpus.
+appworld = []
 # The Frontier-Bench port (src/shogym/envs/frontier_bench) is a faithful, pinned snapshot of the
 # Harbor benchmark (release tag v0.1.0). Its only runtime dependency is a working local
 # **Docker** daemon (a system dependency, not a pip package): the env builds+runs the task's
@@ -165,6 +180,7 @@ dev = [
     "shogym[frontier_bench]",
     "shogym[automationbench]",
     "shogym[browsecomp_plus]",
+    "shogym[appworld]",
 ]
 
 [build-system]

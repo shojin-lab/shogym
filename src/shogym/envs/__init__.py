@@ -11,6 +11,10 @@ from shogym.envs.registration import make, register, registered_envs
 # `shogym.envs.automationbench.env_v1` imports nothing from the vendored `automationbench` package
 # at top level — the package (and `datasets`) load lazily on env construction/serve — so
 # `import shogym` stays offline without the `automationbench` extra installed.
+# `shogym.envs.appworld.env_v1` imports nothing from the `appworld` extra at top level. The app
+# sources the wheel ships packed, and the pinned data bundle, are provisioned only when the env is
+# *constructed*, so `import shogym` stays offline and needs neither the extra nor the corpus.
+from shogym.envs.appworld import env_v1 as appworld_env_v1  # noqa: F401 — triggers registration
 from shogym.envs.automationbench import (  # noqa: F401 — triggers registration
     env_v1 as automationbench_env_v1,
 )
@@ -30,6 +34,7 @@ from shogym.envs.wordle import env_v1 as wordle_env_v1  # noqa: F401 — trigger
 from shogym.envs.yc_bench import env_v1 as yc_bench_env_v1  # noqa: F401 — triggers registration
 
 __all__ = [
+    "appworld_env_v1",
     "automationbench_env_v1",
     "browsecomp_plus_env_v1",
     "frontier_bench_env_v1",

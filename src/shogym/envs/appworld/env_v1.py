@@ -1,0 +1,448 @@
+"""``appworld`` on the env-as-center core: one AppWorld task, plus one authored chore, as one task.
+
+AppWorld is a simulated phone and its nine apps, with a person's whole digital life in the
+databases behind them and a natural-language instruction that takes tens of API calls to carry
+out. This port rents all of that and adds one paragraph to the end of every instruction.
+
+The paragraph asks the agent to keep a filing log in a corner of the world no scenario touches,
+and the values it asks for are computed from the world's own data by a house convention nobody
+states. Four choices are left open and every one of them is constructible from what the world
+shows; none is named. So the base task measures whether the agent can operate the world, and the
+appended chore measures something the base task cannot: whether the agent can work out an unstated
+rule, and what a grade on one attempt is worth to it on the next.
+
+  - **describe**: a :class:`TaskSpec` whose instructions are the task's own, the world's own
+    conventions for driving it, and the appended paragraph, byte-identical on every task.
+  - **serve**: ``execute`` runs Python against the world; ``submit`` is the ``score`` terminal.
+  - **finalize + verify**: ``submit`` seals the episode, then ``finalize`` reads the end state,
+    scores the filing against the drawn key, and publishes the three payload classes.
+
+**Repeats are legal and a repeat is a repeat.** A task addressed by index is the same world every
+time it is asked for, down to the state of the generator the world draws from: the backlog is a
+deterministic function of the task, the key is a deterministic function of the task and the draw,
+and the process's randomness is put aside at the start of an episode and handed back at the end.
+AppWorld saves databases and not generator state, so a port that only replayed the databases would
+serve two worlds that agreed on their contents and disagreed on their next draw.
+
+**One world, one process.** AppWorld freezes the clock for the whole interpreter and holds every
+app's database engine on a class attribute, so two worlds in one process are one world being
+unfrozen by the other. Each episode gets a worker process on its own loopback port, gated by a
+token the agent never sees (:mod:`shogym.envs.appworld.worker`).
+
+This module imports **nothing** from upstream at load time, so ``import shogym`` (which imports it
+to register the env) stays offline. The corpus and the app sources are provisioned when an
+``appworld`` env is *constructed*; see :mod:`shogym.envs.appworld.adapter`.
+"""
+
+from __future__ import annotations
+
+import datetime as dt
+import zlib
+from typing import TYPE_CHECKING, Any, Dict, Optional
+
+from shogym.core import Env
+from shogym.envs.appworld import adapter, payload, world
+from shogym.envs.appworld.ledger import build_backlog
+from shogym.envs.appworld.scorer import Verdicts, draw_key, score
+from shogym.envs.registration import register
+from shogym.feedback.wire import NOTICE_FEEDBACK_NAME, REPORT_FEEDBACK_NAME
+from shogym.mcp import MCPServerSpec
+from shogym.task import TaskSpec
+from shogym.trajectory import Trajectory
+from shogym.types import EpisodeFeedback, FeedbackCollection, FunctionConfig
+
+if TYPE_CHECKING:
+    from shogym.serve.lifecycle import FinalizeRequest, TerminalEvidence
+
+EXECUTE_TOOL_NAME = "execute"
+
+# The env's `score` terminal. Calling it seals the episode and only then scores it, so a verdict
+# never exists for a world that can still be written to.
+SUBMIT_TOOL_NAME = "submit"
+
+#: How many blocks of code an episode may run. Gold solutions for this split make a minimum of 5
+#: API calls, a median of 25 and a maximum of 649, and a block may make as many calls as it likes,
+#: so this is a budget on turns rather than on work.
+DEFAULT_HORIZON = 60
+
+#: The draw. It fixes the convention and the four stored slots for every task, and nothing else in
+#: the port reads it. Two runs that share it are graded against the same rules; two that do not
+#: are two different experiments and their scores are not comparable.
+DEFAULT_PULSE = 0
+
+APPWORLD_SPEC = MCPServerSpec(
+    name="appworld",
+    transport="in_process",
+    module="shogym.envs.appworld.mcp_server",
+)
+
+_TOOL_GUIDE = """\
+# Tools
+- `execute(code)`: run one block of Python in the world. The shell persists between calls, so a
+  name you bind in one block is still bound in the next. Only what you `print` comes back.
+- `submit()`: end the task and record what you did. Call it once the instruction is carried out
+  and the filing log is updated. There is no second submission and no need to call `terminate`
+  afterward."""
+
+_WORLD_GUIDE = """\
+# The world
+You drive nine apps through one object, `apis`, which is already bound in your shell. Start from
+its documentation, which is part of the world rather than something to guess at:
+
+```python
+print(apis.api_docs.show_app_descriptions())
+print(apis.api_docs.show_api_descriptions(app_name="todoist"))
+print(apis.api_docs.show_api_doc(app_name="todoist", api_name="create_task"))
+```
+
+Most APIs need an access token. Your supervisor's own accounts are the ones to use:
+
+```python
+print(apis.supervisor.show_profile())
+print(apis.supervisor.show_account_passwords())
+```
+
+Log in to an app with the supervisor's email and that app's password, and pass the token you get
+back to the app's other APIs.
+
+When the instruction asks a question, record the answer with
+`apis.supervisor.complete_task(answer=...)`; when it does not, call it with no answer. Do that
+before you `submit`."""
+
+
+@register("appworld")
+class AppWorldEnv(Env):
+    """One AppWorld task with the filing chore appended, served as one shogym task.
+
+    Config (all optional, via ``shogym.make("appworld", config=...)`` / ``env_config``):
+      - ``pulse``: which draw the conventions come from. The default is the published one; a
+        different value is a different experiment and its scores are not comparable.
+      - ``report``: which payload class rides the report channel, ``graded`` (the receipt) or
+        ``drawn`` (a receipt whose verdicts were sampled rather than computed). The notice channel
+        always carries the digest. All three are the same length on the wire.
+      - ``horizon``: how many blocks of code an episode may run.
+    """
+
+    mcp_servers = (APPWORLD_SPEC,)
+    function_name = "agent"
+    score_terminal_tool = SUBMIT_TOOL_NAME
+
+    def __init__(
+        self,
+        pulse: int = DEFAULT_PULSE,
+        report: str = payload.GRADED,
+        horizon: int = DEFAULT_HORIZON,
+    ) -> None:
+        if report not in (payload.GRADED, payload.DRAWN):
+            raise ValueError(
+                f"report must be {payload.GRADED!r} or {payload.DRAWN!r}, got {report!r}; the "
+                "digest is the notice channel's and is never the report's"
+            )
+        adapter.ensure_apps()
+        self._pulse = int(pulse)
+        self._report = report
+        self._original = adapter.ensure_corpus() / "data"
+        self._derived = world.derive_root(
+            original=self._original, derived=adapter.derived_root() / "data"
+        )
+        self._task_ids = adapter.task_ids()
+        self._backlogs: Dict[str, Any] = {}
+        self.function = FunctionConfig(example_system_template=_static_instructions())
+        super().__init__(horizon=horizon + 2, num_tasks=len(self._task_ids))
+
+    # ----- task loading -----
+
+    def _load_task(self, task_idx: Optional[int]) -> Dict[str, Any]:
+        """Resolve one task: which one it is, and whose accounts its world is driven with."""
+        if task_idx is None:
+            task_idx = int(self.np_random.integers(0, len(self._task_ids)))
+        if not 0 <= task_idx < len(self._task_ids):
+            # Negatives too: Python would index backwards into a real task while the record said
+            # `-1`, so a task that ran would be filed as one that does not exist.
+            raise ValueError(
+                f"Task index {task_idx} is out of range for {len(self._task_ids)} tasks"
+            )
+        task_id = self._task_ids[task_idx]
+        specs = adapter.task_specs(self._original.parent, task_id)
+        return {
+            "task_idx": task_idx,
+            "task_id": task_id,
+            "supervisor_email": specs["supervisor"]["email"],
+        }
+
+    def _backlog(self, task_id: str, specs: Dict[str, Any]):
+        """The backlog seeded into ``task_id``'s world.
+
+        Drawn from the task identity alone, so it is the same on every machine, in every process
+        and under every feedback regime. Every task in the manifest has one; a task that does not
+        is not in the manifest."""
+        if task_id in self._backlogs:
+            return self._backlogs[task_id]
+        reference = dt.datetime.fromisoformat(specs["datetime"]).date()
+        backlog = build_backlog(_backlog_seed(task_id), reference)
+        if backlog is None:
+            raise RuntimeError(
+                f"no backlog for {task_id} separates the conventions, but the manifest lists it; "
+                f"the manifest at {adapter.MANIFEST} and the generator disagree"
+            )
+        self._backlogs[task_id] = backlog
+        return backlog
+
+    # ----- session lifecycle -----
+
+    def _begin_session(self, session_id: str, task: Dict[str, Any]) -> None:
+        """Start a worker for this episode, seed the task's world if it is new, and open it.
+
+        Seeding runs here rather than at load time because the rows are written by the worker's
+        interpreter: AppWorld cannot be imported beside shogym, so the only process that can write
+        a database log is the one that owns the worlds. It is idempotent, so the second time a
+        task is served the derived world is already on disk and nothing is written."""
+        from shogym.envs.appworld import mcp_server
+
+        task_id = str(task["task_id"])
+        worker = adapter.Worker.spawn(self._derived.parent)
+        try:
+            self._derive(worker, task_id)
+            worker.call(
+                "open",
+                task_id=task_id,
+                experiment=f"shogym-{session_id}",
+                seed=_world_seed(task_id),
+            )
+        except Exception:
+            worker.close()
+            raise
+        mcp_server.begin_session(
+            session_id,
+            mcp_server.Session(
+                worker=worker,
+                task_id=task_id,
+                supervisor_email=str(task["supervisor_email"]),
+            ),
+        )
+
+    def _end_session(self, session_id: str) -> None:
+        from shogym.envs.appworld import mcp_server
+
+        session = mcp_server.end_session(session_id)
+        if session is not None:
+            session.worker.close()
+
+    def _derive(self, worker: adapter.Worker, task_id: str) -> None:
+        """Make sure the seeded copy of ``task_id``'s world exists, writing it if it does not."""
+        specs = adapter.task_specs(self._original.parent, task_id)
+        backlog = self._backlog(task_id, specs)
+        rows = world.seeding(
+            backlog,
+            supervisor_email=specs["supervisor"]["email"],
+            moment=specs["datetime"],
+            tag=task_id,
+        )
+        world.derive_task(
+            original=self._original,
+            derived=self._derived,
+            task_id=task_id,
+            write_log=lambda source, into: worker.call(
+                "seed", **rows, from_dbs=str(source), into=str(into)
+            ),
+        )
+
+    # ----- describe -----
+
+    def describe(self, task_id: Optional[str] = None) -> TaskSpec:
+        spec = super().describe(task_id)
+        idx = self._resolve_idx(task_id)
+        if idx is None:
+            return spec
+        return spec.model_copy(update={"instructions": self._instructions(idx)})
+
+    def _resolve_idx(self, task_id: Optional[str]) -> Optional[int]:
+        if task_id is None:
+            return None
+        try:
+            idx = int(task_id)
+        except (TypeError, ValueError):
+            return None
+        return idx if 0 <= idx < len(self._task_ids) else None
+
+    def _instructions(self, task_idx: int) -> str:
+        """One task's instructions: the world's own, then the task's, then the appended paragraph.
+
+        The paragraph goes last and is byte-identical everywhere, so an agent reading its
+        hundredth task reads the same words it read on its first and nothing about the position
+        is in the text."""
+        specs = adapter.task_specs(self._original.parent, self._task_ids[task_idx])
+        supervisor = specs["supervisor"]
+        who = (
+            f"You are working for {supervisor['first_name']} {supervisor['last_name']} "
+            f"({supervisor['email']}, {supervisor['phone_number']}). "
+            f"Today is {specs['datetime']}."
+        )
+        return (
+            f"{_static_instructions()}\n\n"
+            f"# Your supervisor\n{who}\n\n"
+            f"# The instruction\n{specs['instruction']}\n\n"
+            f"{world.APPENDED_PARAGRAPH}"
+        )
+
+    # ----- finalize (seal-before-verdict) -----
+
+    async def finalize(  # pyright: ignore[reportIncompatibleVariableOverride]
+        self, req: "FinalizeRequest"
+    ) -> "TerminalEvidence":
+        """Score the **sealed** episode and return core-owned evidence.
+
+        The world is read, the base task's own checks are collected, and the filing is compared
+        against the drawn key here, in the serving process. The key is never sent to the world:
+        the worker's protocol has no field for it and no comparison in it, so a world that an
+        agent had complete control of still could not be made to say what the key was.
+
+        The verdict carries all three payload classes, because publishing them is what the port
+        is for: they become the episode feedback a feedback policy decides the fate of. A stream
+        answers a terminating call from its policy and never from this dict."""
+        from shogym.envs.appworld import mcp_server
+        from shogym.serve.lifecycle import TerminalEvidence
+
+        session = mcp_server.get_session(req.session_id)
+        if session is None:
+            raise RuntimeError(f"no open world for session {req.session_id}")
+        specs = adapter.task_specs(self._original.parent, session.task_id)
+        backlog = self._backlog(session.task_id, specs)
+        key = draw_key(session.task_id, self._pulse)
+
+        read = session.worker.call(
+            "read",
+            supervisor_email=session.supervisor_email,
+            project=world.PROJECT_NAME,
+            title=world.LOG_TITLE,
+            label=world.LOG_LABEL,
+        )
+        checks = session.worker.call("evaluate", ignore=list(world.ADDED_MODELS))["checks"]
+        filing = world.Filing(**{**read["filing"], "lines": tuple(read["filing"]["lines"])})
+        verdicts = score(
+            backlog=backlog,
+            key=key,
+            filing=filing,
+            assertions=[(check_id, passed) for check_id, passed in checks],
+        )
+        rendered = {
+            name: payload.render(
+                task_id=session.task_id, verdicts=verdicts, cell=name, pulse=self._pulse
+            )
+            for name in (self._report, payload.DIGEST)
+        }
+        return TerminalEvidence(
+            source=req.source,
+            status="ok",
+            verdict={
+                **_numbers(verdicts),
+                "payload_class": self._report,
+                "world_digest": str(read["world_digest"]),
+                "rng_digest": str(read["rng_digest"]),
+                REPORT_FEEDBACK_NAME: rendered[self._report],
+                NOTICE_FEEDBACK_NAME: rendered[payload.DIGEST],
+            },
+            diagnostic=(
+                f"scored source={req.source} ledger={verdicts.ledger_fraction:.4f} "
+                f"pinned={verdicts.pinned_fraction:.4f} exercised={verdicts.exercise_fraction:.4f}"
+            ),
+        )
+
+    # ----- verify -----
+
+    def _verify(
+        self,
+        trajectory: Trajectory,
+        task: Dict[str, Any],
+        *,
+        terminated: bool,
+        evidence: "Optional[TerminalEvidence]" = None,
+    ) -> FeedbackCollection:
+        """Publish the episode's outcome off the core-owned terminal ``evidence``.
+
+        ``ledger_fraction`` is the headline and ``pinned_fraction`` is its control: the four
+        stored slots are scored the same way and cannot move past one over their option count
+        whatever the agent learns, so a run in which they move with the headline is a run whose
+        headline is measuring something else.
+
+        ``report`` and ``notice`` are the matched pair a feedback policy chooses between. Both are
+        always published, whatever regime the run is serving, because the env does not know the
+        regime and may not: an env that published only the one its run was going to reveal would
+        have made the record depend on the treatment."""
+        fb = FeedbackCollection()
+        if not terminated:
+            return fb
+        verdict = evidence.verdict if evidence is not None else {}
+        for name in (
+            "ledger_fraction",
+            "pinned_fraction",
+            "exercise_fraction",
+            "parse_fraction",
+            "assertion_fraction",
+        ):
+            fb.episode.append(EpisodeFeedback(name=name, value=float(verdict.get(name) or 0.0)))
+        for name in ("distinct_bands", "filing_rows", "checks"):
+            fb.episode.append(EpisodeFeedback(name=name, value=float(verdict.get(name) or 0.0)))
+        for name in ("payload_class", "world_digest", "rng_digest"):
+            fb.episode.append(EpisodeFeedback(name=name, value=str(verdict.get(name) or "")))
+        fb.episode.append(
+            EpisodeFeedback(name=REPORT_FEEDBACK_NAME, value=str(verdict.get(REPORT_FEEDBACK_NAME) or ""))
+        )
+        fb.episode.append(
+            EpisodeFeedback(name=NOTICE_FEEDBACK_NAME, value=str(verdict.get(NOTICE_FEEDBACK_NAME) or ""))
+        )
+        if evidence is not None and evidence.finalize_error:
+            fb.episode.append(EpisodeFeedback(name="finalize_error", value=True))
+        return fb
+
+
+# ----- pure helpers -----
+
+
+def _numbers(verdicts: Verdicts) -> Dict[str, float]:
+    """The fractions a scored episode publishes, with the base task's own beside them."""
+    assertions = [item for item in verdicts.items if item.kind == "assertion"]
+    return {
+        "ledger_fraction": verdicts.ledger_fraction,
+        "pinned_fraction": verdicts.pinned_fraction,
+        "exercise_fraction": verdicts.exercise_fraction,
+        "parse_fraction": verdicts.parse_fraction,
+        "assertion_fraction": (
+            sum(1 for item in assertions if item.passed) / len(assertions) if assertions else 0.0
+        ),
+        "distinct_bands": float(verdicts.distinct_bands),
+        "filing_rows": float(verdicts.filing_rows),
+        "checks": float(len(verdicts.items)),
+    }
+
+
+def _static_instructions() -> str:
+    """The durable, task-independent framing published by ``describe(task_id=None)``."""
+    return f"{_WORLD_GUIDE}\n\n{_TOOL_GUIDE}"
+
+
+def _backlog_seed(task_id: str) -> int:
+    """The seed a task's backlog is drawn from: the task identity and nothing else.
+
+    A checksum rather than ``hash``, which Python randomises per process, so a backlog built
+    today is the backlog built tomorrow."""
+    return zlib.crc32(task_id.encode())
+
+
+def _world_seed(task_id: str) -> int:
+    """The seed the world's own generator is started from.
+
+    Named for the task and for nothing else. Not the session, not the run, and not the feedback
+    regime: a seed that named the arm would deal two arms of one task two different worlds, and
+    the difference between them would be a difference the treatment did not make."""
+    return zlib.crc32(f"appworld|{task_id}".encode()) & 0x7FFFFFFF
+
+
+__all__ = [
+    "APPWORLD_SPEC",
+    "DEFAULT_HORIZON",
+    "DEFAULT_PULSE",
+    "EXECUTE_TOOL_NAME",
+    "SUBMIT_TOOL_NAME",
+    "AppWorldEnv",
+]

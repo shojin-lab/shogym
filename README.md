@@ -88,6 +88,13 @@ README covers the model and the shared env-README template.
   business workflow over a fully simulated world of ~47 SaaS apps via an `api` tool surface,
   scored end-state-only by a pure rubric. Deterministic and offline (no key). Needs the
   `automationbench` extra.
+- **[`appworld`](src/shogym/envs/appworld/README.md)**: a port of
+  [AppWorld](https://github.com/StonyBrookNLP/appworld). Carry out a natural-language instruction
+  across nine simulated apps by writing Python against their APIs, with one authored paragraph
+  appended that asks for a filing log whose values a house convention computes from the world's
+  own data and never states. Ships a matched pair of payloads for `Information` / `Placebo` runs.
+  Needs no key; provisions its own interpreter (upstream pins `pydantic<2`) and a pinned data
+  bundle.
 - **[`frontier_bench`](src/shogym/envs/frontier_bench/README.md)**: a port of
   [Frontier-Bench](https://github.com/harbor-framework/frontier-bench). Operate a per-task Docker
   container through a shell (`exec` / `read_file` / `write_file` / `done`), scored by the task's
