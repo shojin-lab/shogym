@@ -34,6 +34,11 @@ class Session:
     task_id: str
     supervisor_email: str
     experiment: str
+    #: How many blocks of code this episode may run. The step budget the serve layer enforces has
+    #: one slot more than this, so that `submit` always has somewhere to go; without a separate
+    #: count the spare slot is just another `execute`, and a task's world can be changed after the
+    #: budget it was supposed to be scored under has run out.
+    budget: int = 0
     calls: int = 0
 
 
@@ -72,6 +77,15 @@ def execute(code: str, _session_id: str) -> Dict[str, Any]:
             return {
                 "output": "<error: session not initialized; env did not call begin_session>",
                 "calls": 0,
+            }
+        if session.budget and session.calls >= session.budget:
+            return {
+                "output": (
+                    "<no code budget left: this task allows "
+                    f"{session.budget} blocks and has run {session.calls}. "
+                    "Call `submit` to end the task.>"
+                ),
+                "calls": session.calls,
             }
         session.calls += 1
         calls = session.calls

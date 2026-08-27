@@ -66,6 +66,65 @@ from typing import Any, Dict, List, Optional
 TOKEN_HEADER = "X-Shogym-Worker-Token"
 
 
+def watch_file_opens(served_root: str, journal: str) -> None:
+    """Record every file opened from outside the tree this world was served from.
+
+    Not a boundary and not sold as one: the code an agent writes runs as this process and can open
+    what this process can open. What this does is make the attempt *visible*, so a run can be
+    checked afterwards for whether an agent went looking rather than only for what it scored. An
+    audit hook is the right shape for that: it sees the open before it happens and it costs nothing
+    on the path an ordinary episode takes.
+
+    **It is not verified on the path that matters.** The hook demonstrably records opens made by
+    this process, including opens made inside an embedded IPython shell in isolation. It did *not*
+    record a file an agent read through a served ``execute`` call in a live world, and why is not
+    yet understood. Until that is explained the journal is evidence when it is non-empty and
+    evidence of nothing when it is empty, and the README says so rather than counting it as a
+    control.
+
+    **The exclusions are what make it readable.** An interpreter opens its own standard library and
+    site-packages thousands of times, and a journal that recorded those would drown the one line
+    that matters. So the interpreter's own trees and this episode's scratch directory are not
+    recorded, and neither is the served root. What is left is a path that is neither the world, nor
+    the machinery running it, nor this episode's own workspace, which is the only kind worth a
+    reader's attention."""
+    seen: set = set()
+    root = os.path.realpath(served_root)
+    machinery = {
+        os.path.realpath(path)
+        for path in (sys.prefix, sys.base_prefix, os.path.dirname(os.__file__), os.getcwd())
+        if path
+    }
+    machinery.update(os.path.realpath(entry) for entry in sys.path if entry)
+
+    def _inside(resolved: str, directory: str) -> bool:
+        return resolved == directory or resolved.startswith(directory + os.sep)
+
+    def audit(event: str, args: tuple) -> None:
+        if event != "open" or not args:
+            return
+        target = args[0]
+        if not isinstance(target, (str, bytes)):
+            return
+        path = target.decode("utf-8", "replace") if isinstance(target, bytes) else target
+        try:
+            resolved = os.path.realpath(path)
+        except Exception:
+            resolved = str(path)
+        if _inside(resolved, root) or resolved in seen:
+            return
+        if any(_inside(resolved, directory) for directory in machinery):
+            return
+        seen.add(resolved)
+        try:
+            with open(journal, "a") as handle:
+                handle.write(json.dumps({"opened": resolved}) + "\n")
+        except Exception:
+            pass
+
+    sys.addaudithook(audit)
+
+
 class Episode:
     """The one world this process serves, and the randomness it was handed."""
 
@@ -435,7 +494,7 @@ def _handshake() -> Dict[str, Any]:
     return json.loads(line)
 
 
-def serve(root: str, token: str) -> int:
+def serve(root: str, token: str, journal: Optional[str] = None) -> int:
     """Bind a loopback port, say which one, and serve until told to close.
 
     One request at a time, and every one of them on the main thread. AppWorld runs an agent's code
@@ -444,6 +503,10 @@ def serve(root: str, token: str) -> int:
     anyway: there is one world here, and two commands into it at once is two commands into the
     same mutable state."""
     os.environ["APPWORLD_ROOT"] = root
+    if journal:
+        # Installed before the world exists and before any agent code runs, so nothing an episode
+        # does happens outside its view.
+        watch_file_opens(root, journal)
     episode = Episode()
     holder: List[Any] = []
     server = HTTPServer(("127.0.0.1", 0), build_handler(episode, token, holder))
@@ -485,7 +548,7 @@ def main(argv: Optional[List[str]] = None) -> int:
     args = parser.parse_args(argv)
     if args.command == "serve":
         opening = _handshake()
-        return serve(opening["root"], opening["token"])
+        return serve(opening["root"], opening["token"], opening.get("journal"))
     if args.command == "grade":
         print(json.dumps({"output": grade(_handshake())}), flush=True)
         return 0

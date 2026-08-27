@@ -353,6 +353,93 @@ print(json.dumps({
     assert filesystem["answers"] == "FileNotFoundError"
 
 
+async def test_the_served_tree_has_no_path_that_leads_to_the_answers() -> None:
+    """The route a reviewer actually walked: follow a link out of the served tree, then take the
+    sibling. It worked, because `specs.json` was a symlink into the corpus and the corpus holds
+    every task's answers next door.
+
+    Nothing in the served tree is a symlink now. Each probe below is one step of that walk."""
+    probe = """
+_io, _os = __import__("io"), __import__("os")
+root = _os.environ["APPWORLD_ROOT"]
+task = root + "/data/tasks/%s"
+
+
+def _read(path):
+    try:
+        return _io.open(path).read()[:40]
+    except Exception as failure:
+        return type(failure).__name__
+
+
+def _target(path):
+    try:
+        return _os.readlink(path)
+    except Exception as failure:
+        return type(failure).__name__
+
+
+print(json.dumps({
+    "specs": _read(task + "/specs.json"),
+    "specs_is_link": _os.path.islink(task + "/specs.json"),
+    "specs_target": _target(task + "/specs.json"),
+    "db_is_link": _os.path.islink(task + "/dbs/gmail.jsonl"),
+    "sibling": _read(task + "/ground_truth/test_data.json"),
+    "root_links": [n for n in ("base_dbs", "datasets", "api_docs")
+                   if _os.path.islink(root + "/data/" + n)],
+}))
+""" % task_id()
+    played = await play([probe])
+    seen = json.loads(json.loads(played["outputs"][0]["content"])["output"])
+
+    # The corpus is genuinely readable from here, so the negatives below mean something.
+    assert seen["specs"].startswith("{")
+    # And nothing in it names where it came from.
+    assert seen["specs_is_link"] is False
+    assert seen["specs_target"] == "OSError"
+    assert seen["db_is_link"] is False
+    assert seen["root_links"] == []
+    assert seen["sibling"] == "FileNotFoundError"
+
+
+async def test_the_graders_tree_is_not_a_neighbour_of_the_served_one() -> None:
+    """The independent route: the grader's view used to be a fixed name beside the served root,
+    so knowing one gave you the other. It now lives under a different parent with an unguessable
+    name. This raises the cost and does not close it, and the README says so; what it checks is
+    that the tree is no longer derivable from what the worker is handed."""
+    from shogym.envs.appworld import adapter as adapter_module
+
+    served, graded = adapter_module.derived_root(), adapter_module.graded_root()
+    assert graded.parent != served.parent
+    assert str(served.parent) not in str(graded)
+    # Sixteen hex characters of the name are drawn, not derived from anything public.
+    assert not str(graded).startswith(str(adapter_module.cache_root()))
+    probe = """
+_os = __import__("os")
+root = _os.environ["APPWORLD_ROOT"]
+print(json.dumps({"root": root, "guess": _os.path.exists(root.replace("seeded", "graded"))}))
+"""
+    played = await play([probe])
+    seen = json.loads(json.loads(played["outputs"][0]["content"])["output"])
+    assert seen["guess"] in (False, None)
+
+
+async def test_an_ordinary_episode_leaves_a_journal_a_reader_could_use() -> None:
+    """The journal is the port's answer to what it cannot prevent, and its only value is that a
+    reader can tell an ordinary episode from one that went looking. So the floor has to be low: an
+    interpreter opens its own libraries thousands of times, and a journal recording those would
+    drown the line that matters.
+
+    **What this does not assert is that an agent's own read is caught, because it is not.** The
+    hook records opens made by this process, and in isolation it records opens made inside an
+    embedded shell, but a file read through a served `execute` call in a live world did not appear
+    and the reason is not yet understood. A non-empty journal is evidence; an empty one is
+    evidence of nothing. The README and the open issue say so."""
+    played = await play(['print(apis.supervisor.show_profile())'])
+    # Small enough to read by eye: the platform's own version file and a timezone table.
+    assert played["feedback"]["opened_outside"] <= 8.0
+
+
 async def test_the_answers_are_not_in_the_process_that_runs_agent_code() -> None:
     """The world is built without ground truth, so there is no evaluator to call and no expected
     value to walk to from a frame. Grading happens in a second process that never runs agent
@@ -406,6 +493,55 @@ print("filed")
     assert hostile not in report and hostile not in notice
 
 
+async def test_a_block_budget_of_n_allows_exactly_n_blocks_to_touch_the_world() -> None:
+    """Exercised, not read off the constructor.
+
+    The serve layer dispatches the call that *reaches* the horizon and cannot tell an `execute`
+    from a terminal, so a budget of N published as N + 1 let call N + 1 be another block, changing
+    the world after the budget it was to be scored under had run out. `execute` therefore counts
+    its own calls and refuses past the budget without touching the world.
+
+    The proof is behavioural: the over-budget call is the one that would have filed a perfect
+    ledger, and the episode scores zero on it."""
+    env = shogym.make("appworld", config={"horizon": 2})
+    # One slot past the block budget, and the slot exists so a terminal always has somewhere to go.
+    assert env.describe("0").horizon == 3
+    episode = await ServedEpisode.open_env(env, env_name="appworld", task=TASK)
+    try:
+        used = [
+            json.loads((await episode.call("execute", {"code": "print(%d)" % n})).content)
+            for n in (1, 2)
+        ]
+        assert [step["calls"] for step in used] == [1, 2]
+        assert [step["output"].strip() for step in used] == ["1", "2"]
+        # Call three reaches the horizon, so the serve layer runs it and then finalizes. What it
+        # must not do is change the world, and this one would have filed a perfect log.
+        terminal = await episode.call("execute", {"code": filing_block()})
+        verdict = json.loads(terminal.content)
+        assert verdict["ledger_fraction"] == 0.0
+        assert verdict["exercise_fraction"] == 0.0
+        assert verdict["filing_rows"] == 0.0
+    finally:
+        await episode.close()
+
+
+async def test_the_same_block_inside_the_budget_does_file_the_log() -> None:
+    """The other half, without which the test above passes for the wrong reason."""
+    env = shogym.make("appworld", config={"horizon": 2})
+    episode = await ServedEpisode.open_env(env, env_name="appworld", task=TASK)
+    try:
+        await episode.call("execute", {"code": filing_block()})
+        terminal = await episode.call("submit", {})
+        feedback = {
+            item["name"]: item["value"]
+            for item in (terminal.meta.get("shogym/feedback") or [])
+        }
+        assert feedback["ledger_fraction"] == 1.0
+        assert feedback["filing_rows"] == 1.0
+    finally:
+        await episode.close()
+
+
 # ----- the matched pair, through a stream -----
 
 
@@ -433,10 +569,15 @@ async def test_information_hands_back_the_receipt_and_placebo_the_digest(
         name: {item["name"]: item["value"] for item in answer["feedback"]}
         for name, answer in answers.items()
     }
-    # One item each, and only the one its own policy opens. Neither arm is handed the numbers.
-    assert set(revealed["information"]) == {"report"}
-    assert set(revealed["placebo"]) == {"notice"}
-    receipt, digest = revealed["information"]["report"], revealed["placebo"]["notice"]
+    # One item each, under one public name, and neither arm is handed the numbers. The env files
+    # its two versions under two names so the record can tell them apart; what reaches the agent
+    # is named the same in both, or the control would announce its own arm in the field name.
+    from shogym.feedback.wire import CHANNEL_FEEDBACK_NAME
+
+    assert set(revealed["information"]) == {CHANNEL_FEEDBACK_NAME}
+    assert set(revealed["placebo"]) == {CHANNEL_FEEDBACK_NAME}
+    receipt = revealed["information"][CHANNEL_FEEDBACK_NAME]
+    digest = revealed["placebo"][CHANNEL_FEEDBACK_NAME]
     assert "SUBMISSION RECEIPT" in receipt and "SUBMISSION RECEIPT" in digest
     assert payload.PASS in receipt and payload.PASS not in digest
     assert len(receipt.encode()) == len(digest.encode())
