@@ -73,6 +73,35 @@ def test_no_axis_is_decided_by_a_single_request(backlog: ledger.Backlog) -> None
     assert flips["missing"] == 1
 
 
+def test_one_verdict_vector_separates_every_option_on_every_axis(
+    backlog: ledger.Backlog,
+) -> None:
+    """The property the whole instrument rests on, stated as a number.
+
+    Take one convention as the drawn one and move a single axis through its options. Each move
+    gives a verdict vector over the requests. If two options give the *same* vector, no reader can
+    tell them apart from one grade however well it reads, and compliance on that axis is capped at
+    two over its option count whatever the agent does. Counting the distinct vectors is exact, so
+    the cap is checkable before any model is run rather than argued about after."""
+    axes = {
+        "anchor": ledger.ROLES,
+        "basis": ledger.BASIS_OPTIONS,
+        "boundary": ledger.BOUNDARY_OPTIONS,
+        "missing": ledger.MISSING_OPTIONS,
+    }
+    positions = {c: i for i, c in enumerate(ledger.CONVENTIONS)}
+    for drawn in ledger.CONVENTIONS:
+        key = backlog.keys[positions[drawn]]
+        for axis, options in axes.items():
+            vectors = {
+                tuple((backlog.keys[positions[drawn._replace(**{axis: option})]] == key).tolist())
+                for option in options
+            }
+            # Full resolution: as many distinct vectors as the axis has options, so a reader that
+            # evaluates the readouts can separate all of them.
+            assert len(vectors) == len(options), (drawn, axis)
+
+
 def test_a_backlog_holds_the_requests_it_says_it_does(backlog: ledger.Backlog) -> None:
     assert len(backlog.requests) == ledger.DATED + ledger.UNDATED == 29
     assert sum(1 for request in backlog.requests if request.dates is None) == ledger.UNDATED
