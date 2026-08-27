@@ -14,7 +14,8 @@ so a graded verdict only ever exists for an already-sealed, un-continuable episo
 can never grade, read the verdict, then edit and re-grade. ``finalize`` returns core-owned,
 **sanitized** :class:`~shogym.serve.lifecycle.TerminalEvidence` (a public ``correct`` verdict
 only — never the judge's reasoning, extracted answer, or exception text); the pure ``_verify``
-scores from that evidence plus the deterministic retrieval/citation metrics off the trajectory.
+scores from that evidence, plus retrieval recall off the recorded ``search`` steps and citation
+metrics off the submitted answer the same terminal evidence carries.
 
 The env **describes** a task (the query + the served tool manifest + a search/turn horizon),
 **serves** ``search`` / ``get_document`` / ``submit_answer`` over MCP (see :mod:`mcp_server`),
@@ -23,9 +24,11 @@ lives here — a harness drives the tools.
 
 This module imports **nothing** heavy at load time — not ``datasets``, not ``openai``, not
 ``pyserini`` — so ``import shogym`` (which imports this module to register the env) stays offline.
-The dataset (decrypted **in memory**; never persisted) loads lazily when the *registered* env is
-constructed; the BM25 index is provisioned later still, at session start, so ``make`` and
-``describe`` stay offline; the judge's client only when it is first called.
+The dataset (decrypted **in memory**; never persisted) loads when the *registered* env is
+constructed, which means a default ``make`` cold-downloads the query dataset and both qrel files;
+pass ``tasks`` to skip that. What ``make`` and ``describe`` do **not** do is provision or open
+the multi-GB BM25 index — that is deferred to session start. The judge's client is built only
+when it is first called.
 """
 
 from __future__ import annotations

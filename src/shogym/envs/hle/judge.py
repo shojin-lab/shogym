@@ -77,10 +77,11 @@ class Judge(Protocol):
 def normalize_answer(text: Any) -> str:
     """Casefold, collapse internal whitespace, and strip surrounding punctuation.
 
-    Deliberately conservative: it only equates answers that differ by case, spacing, or
-    trailing punctuation. Anything semantic (unit conversions, paraphrase, numeric
-    tolerance) is left to the LLM judge — the fast path must never *grant* credit an exact
-    comparison wouldn't."""
+    Intended to equate answers differing only by case, spacing, or trailing punctuation,
+    leaving anything semantic (unit conversions, paraphrase, numeric tolerance) to the LLM
+    judge. It does not hold to that: ``_STRIP_CHARS`` includes ``!``, ``?`` and brackets, and
+    ``str.strip`` removes them repeatedly, so ``normalize_answer("5!") == "5"`` and a factorial
+    or a closing bracket can be erased along with the character beneath it. See issue #139."""
     if text is None:
         return ""
     s = re.sub(r"\s+", " ", str(text)).strip()

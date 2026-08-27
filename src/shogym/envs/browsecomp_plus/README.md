@@ -230,8 +230,8 @@ semantics (give each run its own trace file for a guaranteed 1:1 mapping).
 - `mcp_server.py` — the in-process MCP server: `search` / `get_document` / `submit_answer` (the
   score terminal, never dispatched inward once sealed).
 - `searcher.py` — the `Searcher` seam: `InMemorySearcher` (fixtures) + `BM25Searcher` (pyserini).
-- `judge.py` — the LLM judge: `GRADER_TEMPLATE` verbatim from upstream, `parse_judge_response`
-  adapted from it (line-anchored verdict, fails closed).
+- `judge.py` — the LLM judge, both pieces adapted from upstream: `GRADER_TEMPLATE` (one trailing
+  space dropped) and `parse_judge_response` (line-anchored verdict, fails closed).
 - `metrics.py` — pure retrieval-recall + citation precision/recall, adapted from upstream
   (set-size denominators).
 - `data.py` — in-memory decryption (canary preserved), qrel + lazy BM25-index auto-download, and

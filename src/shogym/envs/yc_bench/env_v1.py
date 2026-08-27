@@ -104,7 +104,8 @@ class YcBenchEnv(Env):
     Config (all optional, via ``shogym.make("yc_bench", config=...)`` / ``env_config``):
       - ``task_split``: ``"train"`` (default) or ``"test"`` — selects the seed bank.
       - ``config_name``: YC-Bench preset name or ``.toml`` path (default ``"default"``).
-      - ``max_commands``: hard cap on commands per episode (the shogym horizon).
+      - ``max_commands``: the command budget per episode (the shogym horizon is
+        ``max_commands + 1``, reserving a slot for the terminal ``submit``).
       - ``horizon_years``: sim horizon (default: the preset's ``sim.horizon_years``).
       - ``start_date`` / ``company_name``: seeding parameters (defaults match ``yc-bench run``).
       - ``command_timeout_seconds``: per-command wall-clock budget.

@@ -185,15 +185,21 @@ semantics (give each run its own trace file for a guaranteed 1:1 mapping).
   time. If upstream adds, removes or reorders rows, the 80/20 positional split moves with it and
   a task index stops naming the same question. Two runs are comparable only when they read the
   same cached snapshot.
-- **Grading follows HLE's, with two departures.** The judge prompt is HLE's
+- **Grading follows HLE's, with three departures.** The judge prompt is HLE's
   `hle_eval/run_judge_results.py` text, but not verbatim: this copy drops upstream's doubled
   "if there if there" clause, drops a blank line before the `confidence:` field, and writes
   `0%`/`100%` where upstream writes its escaped `0|\%|`/`100|\%|`. Upstream also grades through
   `client.beta.chat.completions.parse` with a strict `response_format`, while this judge sends a
   plain chat completion and parses the reply with a line-anchored regex that fails closed. The
   registered env defaults to `OpenAIJudge` (overridable via `judge_model` / `judge_kwargs` /
-  `judge_base_url`, or a fully injected `judge`). The exact-match fast path is a free, offline
-  pre-check that never changes a correct verdict.
+  `judge_base_url`, or a fully injected `judge`).
+- **The exact-match fast path can change a verdict.** It is meant as a free offline pre-check,
+  but its normalizer strips `!` `?` and brackets as trailing punctuation, and `str.strip`
+  then keeps going into the character beneath. So `exact_match("5", "5!")` and
+  `exact_match("g(n)=(n+1)", "g(n)=(n+1)!")` are both `True`, and `finalize` returns
+  `correct=True` without calling the judge at all, where upstream would have graded the
+  answer. Tracked as [issue #139](https://github.com/shojin-lab/shogym/issues/139); fixing the
+  normalizer changes scoring, so it is not part of this documentation pass.
 - **The default judge model is a scoring decision.** It is `gpt-5.6-luna`, at that model's own
   default reasoning effort, chosen on grading quality measured against the previous default
   (issue #122). Changing it changes measured accuracy, which is why every model-graded episode

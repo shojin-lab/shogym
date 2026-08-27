@@ -58,8 +58,11 @@ variable at the top of its `serve.py`:
 ENV = "tau2_mock"
 ```
 
-The mock domain is fully offline once tau2's `data/` is reachable, by `TAU2_DATA_DIR` or by a
-full `TAU2_SRC` clone.
+The mock domain needs no key and no network of its own once tau2's `data/` is reachable, by
+`TAU2_DATA_DIR` or by a full `TAU2_SRC` clone. It is not strictly network-free: serving imports
+tau2's `registry`, which reaches `agent.llm_agent` → `utils.llm_utils` → `litellm`, and litellm
+fetches a model-cost map on import unless `LITELLM_LOCAL_MODEL_COST_MAP=true` is set, falling
+back to a bundled copy when that fails.
 A real (non-solo) domain additionally needs `OPENAI_API_KEY` for tau2's own user simulator,
 which is a real cost.
 
@@ -213,11 +216,17 @@ semantics (give each run its own trace file for a guaranteed 1:1 mapping).
 - **Splits verbatim.** `airline` / `retail` / `telecom` use tau2's declared `train`/`test`
   splits verbatim (no positional slicing, no leakage). `mock` and `banking_knowledge` declare no
   holdout, so both splits return the full task set.
-- **The horizon is more generous than upstream's max-step.** Upstream scores any termination
-  outside `AGENT_STOP` / `USER_STOP` as a premature `reward = 0.0`, its own max-step included.
-  Reaching the shogym horizon instead delivers `done`, so tau2 stops as `AGENT_STOP` and its
-  evaluator scores the completed run. shogym invents no zero of its own, but this is a
-  deliberate deviation, not preserved upstream behaviour.
+- **Upstream's max-step is what normally binds, and it scores zero.** The same `max_steps` goes
+  to tau2's `Orchestrator` while the shogym horizon is `max_steps + 2`, so for ordinary valid
+  actions upstream reaches its own message-hop budget first: it sets `MAX_STEPS`, and its
+  evaluator scores every termination outside `AGENT_STOP` / `USER_STOP` as a premature
+  `reward = 0.0`. The bridge evaluates and stashes that verdict as soon as it sees the stop, and
+  `finalize_once` returns the stored verdict rather than sending `done`, so reaching the outer
+  horizon afterwards does not convert the run to `AGENT_STOP`. The outer horizon binds first only
+  when calls are rejected before they advance tau2 (a malformed or disallowed call consumes a
+  shogym step but no tau2 step); in that case `finalize` does deliver `done`, tau2 stops as
+  `AGENT_STOP`, and the evaluator scores the completed run. Either way shogym invents no zero of
+  its own; upstream's is passed through.
 
 ## Gotchas
 

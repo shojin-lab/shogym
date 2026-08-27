@@ -88,7 +88,8 @@ class AutomationBenchEnv(Env):
       - ``tasks``: an explicit list of raw upstream task rows (each ``{"prompt", "info", ...}``,
         ``info`` a dict or JSON string). When given, the domain datasets are **not** loaded —
         this is how offline tests construct the env without ``datasets``.
-      - ``max_steps``: the shogym horizon (default 50, upstream's default).
+      - ``max_steps``: the tool-call budget (default 50, upstream's default); the shogym
+        horizon is ``max_steps + 2``.
     """
 
     mcp_servers = (AUTOMATIONBENCH_SPEC,)

@@ -53,7 +53,8 @@ reads the verdict off the trace via `shogym.result_from_trace(...)`.
 
 **Config** (via `shogym.make(name, config)` / `env_config`): `task_split` (`"train"`/`"test"`),
 `config_name` (YC-Bench preset name or `.toml` path, default `"default"`), `max_commands`
-(command budget = the shogym horizon, default 4000), `horizon_years` (default: the preset's
+(the command budget, default 4000; the shogym horizon is `max_commands + 1`, leaving one
+reserved slot for the terminal `submit`), `horizon_years` (default: the preset's
 `sim.horizon_years`), `start_date` / `company_name` (seeding params, defaults match
 `yc-bench run`), and `command_timeout_seconds`.
 
@@ -157,11 +158,14 @@ A task **is a world seed**. The seed selects the market tasks generated for the 
 fixes employees/clients across seeds), so it reproduces the *business* attributes of an instance:
 the same companies, employees, clients and tasks with the same numbers. It does not reproduce
 the database **row ids**: upstream's `services/seed_world.py` mints a `uuid4()` for the company,
-every employee, every client and every market task, and for replacements. Those mostly stay
-behind the CLI, which reports a task by its deterministic **title** — `market browse` and the
-`task` commands emit `"task_id": task.title`, and titles are `Task-<serial>` — so a command
-sequence written against `Task-42` replays across runs. The `uuid4`s surface as `company_id`
-and `client_id`, which no task command consumes. `yc_bench` ships two disjoint seed banks —
+every employee, every client and every market task, and for replacements. The command surface
+mostly reports a task by its deterministic **title**: `market browse` and the `task` commands
+emit `"task_id": task.title`, and titles are `Task-<serial>`. The raw UUIDs do reach the agent
+all the same — `core/engine.py` puts `"task_id": str(<uuid>)` in the `task_half` and
+`task_completed` wake events that `sim resume` returns, and upstream's `_resolve_task` accepts
+either a UUID or a title — so they are agent-visible, consumable state that differs every run.
+Event UUIDs are also the final tie-breaker between same-time, same-priority events, so event
+ordering is not fixed by the seed alone. `yc_bench` ships two disjoint seed banks —
 `train` (seeds 1–16) and `test` (seeds 9001–9016) — selected by `task_split` (default `train`).
 Task indices are relative to the chosen split.
 
@@ -215,12 +219,14 @@ semantics (give each run its own trace file for a guaranteed 1:1 mapping).
   groups; `yc-bench run` (upstream's own credential-inheriting LLM agent loop) and `yc-bench
   start` (interactive) are rejected before any subprocess spawns — that agent loop is exactly
   what this port replaces with the harness.
-- **Determinism check, scoped to what is tested.** `tests/envs/test_yc_bench_served.py` runs one
-  seed twice through shogym and asserts the two runs end on the same funds. Nothing compares the
-  result against a direct `yc-bench` seeding, so equality with upstream is asserted nowhere here;
-  unlike the other ports, this one ships no keyed fidelity test. Database row ids are `uuid4` and
-  differ every run, though the agent-facing task ids are deterministic titles (see
-  [Tasks](#tasks)).
+- **Determinism check, scoped to what is tested.** What is asserted is narrow:
+  `tests/envs/test_yc_bench_served.py` runs one seed through one command sequence twice and
+  checks the two runs end on the same funds. Nothing compares the result against a direct
+  `yc-bench` seeding, so equality with upstream is asserted nowhere here, and unlike the other
+  ports this one ships no keyed fidelity test. Row ids are `uuid4` and differ every run, they
+  reach the agent through `sim resume` wake events, and they break ties between simultaneous
+  events (see [Tasks](#tasks)), so treat determinism as a property of that tested outcome rather
+  than of the trajectory.
 
 ## Gotchas
 

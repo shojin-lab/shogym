@@ -120,10 +120,10 @@ class Tau2Env(Env):
         # Horizon: a generous cap on shogym steps (one per tau2 agent action). tau2's own
         # Orchestrator budget (`max_steps`, counted over message hops) almost always stops the
         # simulation first, and that autonomous stop stashes tau2's verdict (see mcp_server). If
-        # the shogym horizon is nonetheless reached, the serve layer runs this env's `finalize` with
-        # source="horizon", which delivers `done` — so tau2 stops as AGENT_STOP and its evaluator
-        # scores the completed run. That is more generous than upstream's own max-step, which
-        # evaluates as a premature zero; shogym just never invents a zero. Kept at max_steps + 2
+        # the shogym horizon is nonetheless reached (only when calls were rejected before they
+        # advanced tau2), `finalize` delivers `done`, tau2 stops as AGENT_STOP, and the evaluator
+        # scores the completed run. In the ordinary case upstream's MAX_STEPS lands first and its
+        # own premature zero is what `finalize_once` returns. Kept at max_steps + 2
         # (unchanged) so the cap is never the binding constraint for a legitimate episode.
         super().__init__(horizon=max_steps + 2, num_tasks=len(self._task_ids))
 

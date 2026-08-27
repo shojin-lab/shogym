@@ -113,8 +113,11 @@ of the shared boilerplate:
   therefore reaches Docker Hub, Debian's apt mirrors, PyPI and astral.sh. Only **one** of the
   ten `FROM` lines is digest-pinned; the other nine take a mutable tag. The exception on both
   counts is the same file, `fin-saccr-rwa/environment/Dockerfile`: digest-pinned base, no
-  network install. Once a task's image is built the content-addressed tag reuses it, so this
-  is a cold-build cost, not a per-episode one.
+  network install. The *environment* image is built once and reused: `build_task_image()`
+  existence-checks its content-addressed tag, so repeated episodes of a task skip it. The
+  *verifier* image is not — `run_separate_verifier` calls `build_image()` on every finalization
+  and, with the default `keep_container=False`, removes it afterwards, so each scored episode
+  rebuilds it and only Docker's layer cache avoids repeating the downloads.
 
 ## How it works
 
@@ -255,8 +258,10 @@ core-owned terminal evidence, so the transcript cannot influence it.
   the daemon can actually provide.
 - **Base-image tags vendored as-is.** One of the ten vendored `environment/` / `tests/`
   Dockerfiles digest-pins its `python:3.x-slim` base (`fin-saccr-rwa/environment`); the other
-  nine pin only a *mutable* tag (e.g. `python:3.13-slim-bookworm`), and none pin the apt or PyPI
-  packages they then install. This port **vendors each Dockerfile byte-for-byte** from the
+  nine pin only a *mutable* tag (e.g. `python:3.13-slim-bookworm`). Every *direct* PyPI
+  requirement in them is `==` pinned (`pytest==9.1.1`, `numpy==2.4.4`, `openpyxl==3.1.5` and so
+  on); the apt packages are unversioned, and neither transitive Python dependencies nor artifact
+  hashes are locked. This port **vendors each Dockerfile byte-for-byte** from the
   pinned `eb4af26c` snapshot rather than rewriting it, because the integrity contract is
   byte-for-byte redistribution (`verify_vendored_integrity` would flag a local edit as
   tampering). Consequence:
