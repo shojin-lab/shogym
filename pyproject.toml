@@ -128,7 +128,7 @@ frontier_bench = []
 # tau2/yc-bench, cannot be resolved by pip at all: it declares `requires-python >=3.13` (shogym is
 # hard-pinned to <3.13 for tau2's `audioop`) and pulls the heavy `verifiers` / `anthropic`
 # agent-loop stack — an unsatisfiable resolve on 3.12. The env-as-center port needs none of that
-# loop, only the deterministic verifiers-free pieces (simulated tools + WorldState, task defs, pure
+# loop, only the offline verifiers-free pieces (simulated tools + WorldState, task defs, pure
 # rubric), which import fine on 3.12 with just `pydantic` + `datasets`. So the pinned upstream
 # source is provisioned at runtime into a gitignored cache
 # (`~/.cache/shogym/automationbench/<sha>/`, honoring `AUTOMATIONBENCH_SRC` / `SHOGYM_CACHE`) — never

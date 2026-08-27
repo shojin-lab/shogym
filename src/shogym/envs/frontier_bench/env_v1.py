@@ -7,8 +7,9 @@ already draws the boundary shogym wants — task/verifier data vs. agent runner 
 drives the served shell as the agent and reuses the task's own verifier for the verdict.
 
 This slice ports the CPU-only, single-container, ``gpus=0``, ``environment_mode="separate"``,
-pytest-verified tasks (issue #48), pinned to upstream ``v0.1.0`` + each task's ``dataset.toml``
-digest. The env exposes them as ``num_tasks`` selectable by **index** (``0..N-1``) or **name**:
+pytest-verified tasks (issue #48), pinned to upstream commit ``eb4af26c`` (recorded upstream as
+``v0.1.0``) plus each task's ``dataset.toml`` digest. The env exposes them as ``num_tasks``
+selectable by **index** (``0..N-1``) or **name**:
 
   - **describe(task_id)** — return the selected task's ``instruction.md``.
   - **serve** — build+start that task's ``environment/Dockerfile`` container and expose its

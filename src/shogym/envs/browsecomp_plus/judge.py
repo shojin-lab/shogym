@@ -1,10 +1,12 @@
 """The model-graded judge for the ``browsecomp_plus`` env (issue #43).
 
 BrowseComp-Plus grades a Deep-Research answer with an **LLM judge**: does the submitted
-answer match the gold answer for the query? As with the HLE port, the judge is used
-**server-side**, inside the ``submit_answer`` tool handler (:mod:`mcp_server`), so the env's
-``_verify`` stays a pure function over the recorded trajectory — the handler runs the judge and
-records its verdict on the terminal step; the verifier only *parses* it.
+answer match the gold answer for the query? As with the HLE port, the judge runs
+**server-side, after the seal**: ``submit_answer`` seals the episode and the serve layer then
+runs :meth:`~shogym.envs.browsecomp_plus.env_v1.BrowseCompPlusEnv.finalize`, which calls the
+judge and returns its verdict as core-owned terminal evidence. The tool handler never grades
+(it is not dispatched inward once sealed), and the env's ``_verify`` stays a pure function that
+only *reads* that verdict.
 
 The grading prompt (:data:`GRADER_TEMPLATE`) is **verbatim** from upstream
 ``scripts_evaluation/evaluate_run.py`` (BrowseComp-Plus commit ``0469490``), so the grading
@@ -13,8 +15,9 @@ from upstream's: it reads a line-anchored verdict and fails closed (see its docs
 
 Upstream grades with Qwen3-32B (vLLM, temp 0.7) or GPT-4.1 (the paper); shogym canonicalizes an
 OpenAI-compatible judge at **temperature 0** for deterministic verification, defaulting to the
-paper's GPT-4.1 and overridable via ``judge_model`` / ``judge_base_url`` (point the base URL at
-a vLLM Qwen3-32B for exact upstream fidelity).
+paper's GPT-4.1 and overridable via ``judge_model`` / ``judge_base_url``. Pointing both at a
+vLLM Qwen3-32B grades with upstream's model, but not identically: upstream defaults
+``top_p=0.8`` and ``top_k=20`` at temperature 0.7, and this judge sends neither at temperature 0.
 
 Nothing here imports ``openai`` at module load — the client is created lazily on first use —
 so ``import shogym`` (which imports the env to register it) stays offline and lean.

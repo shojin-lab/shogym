@@ -86,8 +86,8 @@ README covers the model and the shared env-README template.
 - **[`automationbench`](src/shogym/envs/automationbench/README.md)**: a port of
   [AutomationBench](https://github.com/zapier/AutomationBench). Carry out a cross-application
   business workflow over a fully simulated world of ~47 SaaS apps via an `api` tool surface,
-  scored end-state-only by a pure rubric. Deterministic and offline (no key). Needs the
-  `automationbench` extra.
+  scored end-state-only by a pure rubric. Offline and keyless, and the rubric is deterministic
+  over a given end-state. Needs the `automationbench` extra.
 - **[`frontier_bench`](src/shogym/envs/frontier_bench/README.md)**: a port of
   [Frontier-Bench](https://github.com/harbor-framework/frontier-bench). Operate a per-task Docker
   container through a shell (`exec` / `read_file` / `write_file` / `done`), scored by the task's

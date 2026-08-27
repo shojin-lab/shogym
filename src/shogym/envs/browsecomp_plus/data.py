@@ -28,7 +28,8 @@ import sys
 from pathlib import Path
 from typing import Any, Dict, List, Optional, cast
 
-# BrowseComp-Plus fidelity pin (commit has no tags). Queries/qrels are read at this revision.
+# BrowseComp-Plus fidelity pin (commit has no tags). The qrels and the evaluation/judge code
+# this port copies come from this revision; the queries carry their own HF revision (below).
 UPSTREAM_COMMIT = "046949032b0328319cc9a02663a759ec601d9402"
 HF_QUERIES_DATASET = "Tevatron/browsecomp-plus"
 HF_QUERIES_SPLIT = "test"

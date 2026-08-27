@@ -2,10 +2,11 @@
 
 [**τ²-bench**](https://github.com/sierra-research/tau2-bench) (Sierra's benchmark for tool-using
 customer-service agents) served through shogym at upstream source commit `1d244f5`. The domain
-policies, tasks and DBs come from a `TAU2_DATA_DIR` checkout the caller supplies, which shogym
-does not version-check. tau2 puts an agent in a domain (airline, retail, telecom, …) where it
-uses domain tools and converses with a simulated user to resolve a task, then scores the run
-with a deterministic evaluator (final DB state, the actions taken) plus optional NL assertions.
+policies, tasks and DBs come from a checkout the caller supplies, by `TAU2_DATA_DIR` or by
+upstream's source-relative `<checkout>/data` fallback; shogym version-checks neither. tau2 puts
+an agent in a domain (airline, retail, telecom, …) where it uses domain tools and converses
+with a simulated user to resolve a task, then scores the run with a deterministic evaluator
+(final DB state, the actions taken) plus optional NL assertions.
 
 Like every shogym env this **describes** a task, **serves** its tools over MCP, and **verifies**
 a recorded trajectory while an external harness drives the tools — see
@@ -178,16 +179,20 @@ semantics (give each run its own trace file for a guaranteed 1:1 mapping).
 
 ## Fidelity & deviations
 
-- **Verbatim reuse.** tau2's `Orchestrator`, user simulator, domains/tools/tasks, and
-  **evaluator** are reused **verbatim** — only the agent is swapped and the shogym-side terminal
-  wiring rides on the seal. There are **zero shogym core changes**; the whole port is additive
-  under `src/shogym/envs/tau2/`.
-- **Pinned to source commit `1d244f5`.** The pin covers tau2's Python source only. Domain
-  policies, tasks and DBs are loaded from the `TAU2_DATA_DIR` checkout the caller provides, and
-  shogym checks no revision or hash on it, so two runs under the same commit label can serve
-  different benchmark content. The commit is pinned by the default runtime provisioner;
-  `TAU2_SRC` swaps in a local checkout whose revision nothing checks, so that documented
-  override is a trusted, unversioned path.
+- **What is reused, and what is not.** tau2's `Orchestrator`, user simulator,
+  domains/tools/tasks, and **evaluator** are reused **verbatim**, and the agent is swapped for
+  the harness. `reward`, `db_match` and `action_match_proportion` are tau2's own numbers off
+  `evaluate_simulation`; shogym derives `success` (`reward >= 1.0`) and scores an abort or a
+  missing verdict as `reward = 0.0`. There are **zero shogym core changes**; the whole port is
+  additive under `src/shogym/envs/tau2/`.
+- **Pinned to source commit `1d244f5`.** The pin covers tau2's Python source only, and the
+  default provisioner extracts `src/tau2` alone, so it ships no benchmark data at all. The
+  domain policies, tasks and DBs arrive by one of two caller-controlled routes: `TAU2_DATA_DIR`,
+  or upstream's source-relative fallback (`tau2/utils/utils.py` resolves `<checkout>/data` when
+  that variable is unset), which a `TAU2_SRC=/repo/src` clone satisfies on its own. shogym
+  checks no revision or hash on either route, and `TAU2_SRC` likewise swaps the source for a
+  checkout nothing version-checks, so two runs under the same commit label can serve different
+  benchmark content.
 - **Python 3.12 pin rationale.** The pinned tau2 revision imports the stdlib `audioop` module,
   removed in 3.13 — this is why the shared project pin is `>=3.12,<3.13`.
 - **banking uses `bm25_grep`.** `tau2_banking_knowledge` is pinned to the offline `bm25_grep`

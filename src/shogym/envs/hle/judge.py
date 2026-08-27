@@ -1,14 +1,14 @@
 """The model-graded judge for the HLE env — shogym's first model-graded verifier (issue #33).
 
 The judge decides whether a submitted answer matches the gold answer for a Humanity's Last
-Exam question. It is used **server-side**, inside the ``submit_answer`` tool handler
-(``mcp_server``), so the env's ``_verify`` stays a pure function over the recorded
-trajectory: the handler runs the judge and records its verdict on the terminal step; the
-verifier only *parses* that verdict.
+Exam question. It runs **server-side, after the seal**: ``submit_answer`` seals the episode and
+the serve layer then runs the env's ``finalize`` hook, which grades the frozen submission and
+returns the verdict as core-owned terminal evidence. The tool handler never grades, and the
+env's ``_verify`` stays a pure function that only *reads* that verdict.
 
 Two pieces, on purpose:
 
-- ``exact_match`` — a deterministic, offline fast path (normalize + compare). The handler
+- ``exact_match`` — a deterministic, offline fast path (normalize + compare). ``finalize``
   tries this first; a match short-circuits the LLM judge entirely (no network, no cost).
 - :class:`Judge` — the injectable LLM-judge seam. The registered ``hle`` env defaults to
   :class:`OpenAIJudge`; offline tests inject a scripted judge (mirroring how the tau2 port

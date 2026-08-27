@@ -182,11 +182,13 @@ semantics (give each run its own trace file for a guaranteed 1:1 mapping).
   BM25 index to revision `b3f37f70c33829eb09d04784a54277a31871fd63` of
   `Tevatron/browsecomp-plus-indexes` (`HF_QUERIES_REVISION` and `INDEX_REVISION` in `data.py`),
   so a cold-cache download is reproducible and cannot drift with an upstream replacement.
-- **The index pin binds only a cold download.** `bm25_index_path()` uses
+- **The pins bind only a cold download.** `bm25_index_path()` uses
   `SHOGYM_BROWSECOMP_PLUS_BM25_INDEX` as given, and reuses an existing `cache_dir()/bm25` if one
-  is already there, neither of them checked against `INDEX_REVISION`. Only the download path
-  applies the pin, so a pre-provisioned or previously cached index is a trusted, unversioned
-  input.
+  is already there, neither checked against `INDEX_REVISION`. `load_qrels()` does the same for
+  `qrel_golds.txt` / `qrel_evidence.txt`: fixed paths under `cache_dir()`, reused whenever the
+  file exists, with no hash and no commit in the name. Only the download paths apply a pin, so a
+  pre-provisioned or previously cached index or qrel file is a trusted, unversioned input, and a
+  stale one moves scores under the `0469490` label.
 - **Retriever pinned to BM25.** The retriever materially changes scores (BM25 vs dense
   Qwen3-Embedding), so the backend is named in the TaskSpec and this first cut pins **BM25**
   (CPU/Java-only; the dense path needs Faiss + GPU — a deferred follow-up).

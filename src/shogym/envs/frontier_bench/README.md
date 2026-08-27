@@ -98,7 +98,8 @@ of the shared boilerplate:
   **CPU-only, single-container, Docker-only** (no GPU / compose / Modal runners — see
   [Fidelity & deviations](#fidelity--deviations)).
 - **No API key, no data download.** All task files (Dockerfiles, seed data, the oracle, the
-  pytest verifier + golden files) are vendored under [`tasks/`](tasks/), pinned to `v0.1.0`, so
+  pytest verifier + golden files) are vendored under [`tasks/`](tasks/), pinned to upstream
+  commit `eb4af26c` (labelled `v0.1.0` upstream), so
   `describe` / verdict-parsing / the offline tests need neither Docker nor a network. Each task
   image pulls a (usually digest-pinned) `python:3.x-slim` base at build time — the only network
   the served path needs.
@@ -117,9 +118,9 @@ that onto shogym's env-as-center trio; every `docker` call funnels through a sin
 `env.describe(task_id)` resolves `task_id` (a task name or an index string; `None` → the
 configured default) and publishes that task's contract the harness reads: its real
 **`instruction.md`** (verbatim, canary comment included) plus a short provenance footer (the
-upstream task name + index, the `v0.1.0` + digest pin, the `environment_mode`), and the **tool
-manifest** — `exec`, `read_file`, `write_file`, `done` (**`terminal_kind: score`**), plus the
-reserved `terminate` (`terminal_kind: abort`).
+upstream task name + index, the recorded `v0.1.0` label + digest, the `environment_mode`), and
+the **tool manifest** — `exec`, `read_file`, `write_file`, `done`
+(**`terminal_kind: score`**), plus the reserved `terminate` (`terminal_kind: abort`).
 
 ### Tools (served over MCP)
 
@@ -304,5 +305,5 @@ Frontier-Bench `v0.1.0` has **74** tasks. The rest are deferred to follow-up iss
 | `env_v1.py` | The registered `frontier_bench` env: `describe`, the async `finalize` hook, and the pure `score_evidence` verifier. |
 | `mcp_server.py` | The in-process MCP server: `exec` / `read_file` / `write_file` / `done` + `finalize_session`, over one container per episode. |
 | `docker_backend.py` | The single Docker seam: `Container` (exec/cp) + `run_separate_verifier` (Harbor's SEPARATE-mode protocol) + the daemon-NCPU clamp. |
-| `manifest.py` | Upstream pins (`v0.1.0` + digest), vendored-task loading, and the canary / integrity checks. |
+| `manifest.py` | Upstream pins (commit `eb4af26c`, its `v0.1.0` label, + digest), vendored-task loading, and the canary / integrity checks. |
 | `tasks/` | The vendored task dirs (`fin-saccr-rwa/…`), canary preserved byte-for-byte. |

@@ -96,8 +96,8 @@ class BrowseCompPlusEnv(Env):
         lazily-provisioned prebuilt index.
       - ``judge``: an injected :class:`~shogym.envs.browsecomp_plus.judge.Judge` (a scripted judge
         for offline tests). Default: :class:`~shogym.envs.browsecomp_plus.judge.OpenAIJudge`.
-      - ``judge_model`` / ``judge_base_url``: the default judge's model id + endpoint (point the
-        base URL at a vLLM Qwen3-32B for exact upstream fidelity).
+      - ``judge_model`` / ``judge_base_url``: the default judge's model id + endpoint (set both
+        to a vLLM Qwen3-32B to grade with upstream's model; the sampling still differs).
       - ``k`` / ``snippet_max_tokens``: retrieval knobs (upstream defaults 5 / 512).
       - ``max_turns``: the tool-call horizon.
     """

@@ -4,13 +4,15 @@
 shogym at upstream commit `a321764`: an agent gets a natural-language instruction and carries out
 a realistic cross-application business workflow over a fully **simulated** world of ~47 SaaS
 apps; scoring checks — programmatically, **end-state only** — whether the right data landed in
-the right systems. No LLM judge, no live SaaS, no network at eval time — the whole port is
-deterministic and offline.
+the right systems. No LLM judge, no live SaaS, no network at eval time. The port is offline and
+keyless and the rubric is deterministic over a given end-state, but a run is not reproducible
+step for step: upstream mints `uuid4` ids (e.g. Google Drive create/copy) and reads
+`datetime.now()`, so the same tool sequence can land different ids and timestamps.
 
 Like every shogym env this **describes** a task, **serves** its tools over MCP, and **verifies**
 a recorded trajectory while an external harness drives the tools — see
 [`../README.md`](../README.md). Upstream ships its own loop (a Prime Intellect `verifiers`
-`StatefulToolEnv`); this port throws that away and reuses only the three deterministic,
+`StatefulToolEnv`); this port throws that away and reuses only the three offline,
 `verifiers`-free pieces (the simulated tools + `WorldState` engine, the typed task defs, and
 the pure rubric). The runnable demo is
 [`examples/`](../../../../examples/).
@@ -19,7 +21,8 @@ the pure rubric). The runnable demo is
 
 > Requires **Python 3.12 + the `automationbench` extra**; the upstream source is provisioned at
 > runtime on first construction (a one-time network fetch, or point at a local checkout). Fully
-> offline / deterministic at eval time — no API key. See [Requirements](#requirements).
+> offline at eval time, and the rubric is deterministic over the sealed end-state — no API key.
+> See [Requirements](#requirements).
 
 ### Construct + serve
 

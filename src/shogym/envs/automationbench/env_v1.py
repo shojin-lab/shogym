@@ -6,7 +6,7 @@ language; scoring checks — programmatically, **end-state only** — whether th
 in the right systems. No LLM judge, no live SaaS, no network.
 
 Upstream ships its own agent loop (a Prime Intellect ``verifiers`` ``StatefulToolEnv``). This
-port throws that away and keeps the three deterministic, offline pieces verbatim (see
+port throws that away and keeps the three offline, ``verifiers``-free pieces verbatim (see
 :mod:`shogym.envs.automationbench.adapter`): the simulated tools + ``WorldState`` engine, the typed
 task defs, and the pure rubric. shogym's harness *is* the agent loop:
 
