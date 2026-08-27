@@ -2485,7 +2485,7 @@ requires-dist = [
     { name = "typer", marker = "extra == 'yc-bench'", specifier = ">=0.9" },
     { name = "uvicorn", marker = "extra == 'tau2'", specifier = ">=0.34.0" },
 ]
-provides-extras = ["analysis", "durable", "tau2", "hle", "yc-bench", "frontier-bench", "automationbench", "browsecomp-plus"]
+provides-extras = ["analysis", "durable", "tau2", "hle", "yc-bench", "appworld", "frontier-bench", "automationbench", "browsecomp-plus"]
 
 [package.metadata.requires-dev]
 dev = [
@@ -2493,6 +2493,7 @@ dev = [
     { name = "pytest", specifier = ">=8.0" },
     { name = "pytest-asyncio", specifier = ">=0.26" },
     { name = "ruff", specifier = ">=0.8" },
+    { name = "shogym", extras = ["appworld"] },
     { name = "shogym", extras = ["automationbench"] },
     { name = "shogym", extras = ["browsecomp-plus"] },
     { name = "shogym", extras = ["durable"] },
