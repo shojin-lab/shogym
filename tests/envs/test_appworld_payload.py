@@ -268,6 +268,28 @@ def test_the_three_classes_are_the_same_length_on_the_wire(
     assert len({len(json.dumps(text)) for text in rendered}) == 1
 
 
+@pytest.mark.parametrize("cell", CLASSES)
+def test_a_payload_s_length_carries_nothing_about_the_score(
+    backlog: ledger.Backlog, cell: str
+) -> None:
+    # The sharpest of the length invariants, and the one the others rest on: how long a payload is
+    # must be the same for a submission that got everything right and one that got nothing right.
+    # Row count is a task constant and every column is fixed width, so this holds across the whole
+    # score range rather than at the two ends it is measured at.
+    key = draw_key(TASK, 0)
+    lengths = {
+        len(payload.render(task_id=TASK, verdicts=scored(backlog, key, correct=n), cell=cell).encode())
+        for n in range(0, 30, 3)
+    }
+    empty = payload.render(
+        task_id=TASK,
+        verdicts=score(backlog=backlog, key=key, filing=world.EMPTY_FILING, assertions=CHECKS),
+        cell=cell,
+    )
+    assert len(lengths) == 1
+    assert len(empty.encode()) == lengths.pop()
+
+
 def test_the_match_survives_a_world_whose_values_are_not_ascii(
     backlog: ledger.Backlog,
 ) -> None:
