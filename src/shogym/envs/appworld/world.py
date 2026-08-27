@@ -211,7 +211,13 @@ def derive_root(*, original: Path, derived: Path) -> Path:
 
 
 def _link(source: Path, target: Path) -> None:
-    """Point ``target`` at ``source``, replacing whatever was there."""
+    """Point ``target`` at ``source``, replacing whatever was there.
+
+    A link that already points where it should is left alone rather than remade. Two envs built at
+    the same moment both call this over the shared part of the corpus, and an unlink-then-relink
+    would leave a window in which the other one's world had no databases."""
+    if target.is_symlink() and os.readlink(target) == str(source):
+        return
     if target.is_symlink() or target.exists():
         if target.is_dir() and not target.is_symlink():
             shutil.rmtree(target)
