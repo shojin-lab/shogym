@@ -225,6 +225,13 @@ bytes, sha256 `fd9f9608c2ec71ed0ac25c3633a738b9129a318a129e31230425b9188e508250`
   slots for every task. Scores drawn under two pulses are not comparable.
 - **`show_tasks` returns a dict**, not a list: seeded requests carry no section, so they arrive
   under `no_section_tasks`. `show_projects` defaults to `page_limit=5`.
+- **The receipt names the task, and the draw is deterministic.** Both payloads print
+  `task <task_id>` in their header, and the key is a pure function of that identity and the run's
+  `pulse`. An agent that can read this source *and* knows the pulse can therefore compute the key
+  from the header alone. Nothing the env can do closes that: a payload has to identify itself, and
+  a draw that a reader cannot reproduce is a draw nobody can audit. Keeping the source and the
+  pulse off the agent's filesystem is the harness's job. The same goes for the corpus: the ground
+  truth ships in plaintext under `data/tasks/<id>/ground_truth/`.
 - **The chore is deliberately not dodge-proof.** A forcing assertion would correlate the two score
   components by construction and turn a visible dodge into an invisible one, since an agent that
   writes one band on all 29 lines passes any forcing check anybody would write. `exercise_fraction`

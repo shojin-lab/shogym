@@ -65,16 +65,21 @@ def execute(code: str, _session_id: str) -> Dict[str, Any]:
       - ``output``: everything the block printed, or the traceback if it raised
       - ``calls``: how many blocks this episode has run
     """
-    session = get_session(_session_id)
-    if session is None:
-        return {
-            "output": "<error: session not initialized; env did not call begin_session>",
-            "calls": 0,
-        }
     with _state_lock:
+        session = sessions.get(_session_id)
+        if session is None:
+            return {
+                "output": "<error: session not initialized; env did not call begin_session>",
+                "calls": 0,
+            }
         session.calls += 1
-        answered = session.worker.call("execute", code=str(code))
-    return {"output": str(answered.get("output", "")), "calls": session.calls}
+        calls = session.calls
+    # Outside the lock. The lock is over the session table, which is shared by every episode this
+    # env instance backs; the call is over one world, which is this episode's alone. Holding the
+    # table's lock across a call that runs an agent's code would make two concurrent episodes take
+    # turns, and one slow block would stall the other.
+    answered = session.worker.call("execute", code=str(code))
+    return {"output": str(answered.get("output", "")), "calls": calls}
 
 
 @server.tool

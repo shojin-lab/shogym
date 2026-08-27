@@ -75,19 +75,23 @@ class Slot(NamedTuple):
     Unlike a ledger line, a slot's verdict reads the slot alone: a failure crosses off exactly
     one option and says nothing about any other row. That caps what a grade on it can be worth at
     one over the option count however good the reader is, which is why the four of them are the
-    port's negative control and never its headline."""
+    port's negative control and never its headline.
+
+    ``default`` is what the API leaves behind when the agent passes nothing. It is struck from
+    ``options`` and read back as unexercised, because a field the agent never touched is not a
+    choice it made: scoring the default as a wrong guess would count an omission as an attempt
+    and would put the slot's own filing rate inside its compliance rate."""
 
     check_id: str
     options: Tuple[str, ...]
+    default: Optional[str]
 
 
-#: Every option set has the API's own default struck out of it, so an unset field reads as
-#: unexercised rather than as a choice the agent made.
 SLOTS: Tuple[Slot, ...] = (
-    Slot("fr.log.section", SECTIONS),
-    Slot("fr.label.color", ("red", "blue", "green", "orange", "yellow")),
-    Slot("fr.log.unit", ("minutes", "hours", "days")),
-    Slot("fr.log.priority", ("high", "low")),
+    Slot("fr.log.section", SECTIONS, None),
+    Slot("fr.label.color", ("red", "blue", "green", "orange", "yellow"), "charcoal"),
+    Slot("fr.log.unit", ("minutes", "hours", "days"), None),
+    Slot("fr.log.priority", ("high", "low"), "medium"),
 )
 
 

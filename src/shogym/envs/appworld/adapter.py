@@ -31,6 +31,7 @@ import hashlib
 import json
 import os
 import secrets
+import select
 import subprocess
 import sys
 import urllib.error
@@ -66,6 +67,11 @@ SPLIT = "test_challenge"
 ROOT_ENV_VAR = "APPWORLD_ROOT"
 
 _DOWNLOAD_TIMEOUT_SECONDS = 300.0
+
+#: How long a worker gets to bind its port and say so. Generous, because a cold interpreter
+#: importing upstream and its clock-patching library is not fast, and bounded, because a worker
+#: that never speaks would otherwise hang the episode that started it with nothing to read.
+_SPAWN_TIMEOUT_SECONDS = 180.0
 
 
 class ProvisioningError(RuntimeError):
@@ -327,11 +333,13 @@ class Worker:
             text=True,
         )
         assert process.stdout is not None
-        line = process.stdout.readline()
+        line = _first_line(process, _SPAWN_TIMEOUT_SECONDS)
         if not line:
-            process.wait(timeout=5)
+            process.kill()
+            process.wait(timeout=10)
             raise WorkerError(
-                f"the appworld worker exited before it bound a port (status {process.returncode})"
+                "the appworld worker never bound a port "
+                f"(status {process.returncode}, waited {_SPAWN_TIMEOUT_SECONDS:.0f}s)"
             )
         return cls(root=root, process=process, port=int(json.loads(line)["port"]), token=token)
 
@@ -364,6 +372,19 @@ class Worker:
             self.process.wait(timeout=10)
         if self.process.stdout is not None:
             self.process.stdout.close()
+
+
+def _first_line(process: subprocess.Popen, timeout: float) -> str:
+    """The worker's first line of output, or the empty string if it does not arrive in time.
+
+    ``readline`` on a pipe cannot be given a deadline, so the descriptor is waited on instead: a
+    worker that dies without printing closes the pipe and is readable immediately, and one that
+    hangs on an import is caught by the deadline rather than hanging its caller with it."""
+    assert process.stdout is not None
+    ready, _, _ = select.select([process.stdout], [], [], timeout)
+    if not ready:
+        return ""
+    return process.stdout.readline()
 
 
 __all__ = [
