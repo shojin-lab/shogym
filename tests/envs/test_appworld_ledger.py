@@ -73,16 +73,21 @@ def test_no_axis_is_decided_by_a_single_request(backlog: ledger.Backlog) -> None
     assert flips["missing"] == 1
 
 
-def test_one_verdict_vector_separates_every_option_on_every_axis(
+def test_moving_one_choice_at_a_time_separates_every_option_on_every_axis(
     backlog: ledger.Backlog,
 ) -> None:
-    """The property the whole instrument rests on, stated as a number.
+    """The admission gate's own property, stated exactly and not one word further.
 
-    Take one convention as the drawn one and move a single axis through its options. Each move
-    gives a verdict vector over the requests. If two options give the *same* vector, no reader can
-    tell them apart from one grade however well it reads, and compliance on that axis is capped at
-    two over its option count whatever the agent does. Counting the distinct vectors is exact, so
-    the cap is checkable before any model is run rather than argued about after."""
+    Hold three choices at the drawn convention and move the fourth through its options. Each move
+    gives a verdict vector over the requests, and this asserts they are all different, which is
+    what stops an axis being carried by a single request: one request produces two signatures
+    whatever its readout, and compliance on such an axis is capped at two over its option count
+    whatever the agent does.
+
+    **This is a statement about one axis at a time, and it is not identifiability.** Nothing here
+    says the drawn convention can be recovered from a receipt; three choices are already correct
+    in every vector compared. What one receipt actually leaves standing is a different quantity,
+    it is enumerated below, and it is not one."""
     axes = {
         "anchor": ledger.ROLES,
         "basis": ledger.BASIS_OPTIONS,
@@ -97,9 +102,41 @@ def test_one_verdict_vector_separates_every_option_on_every_axis(
                 tuple((backlog.keys[positions[drawn._replace(**{axis: option})]] == key).tolist())
                 for option in options
             }
-            # Full resolution: as many distinct vectors as the axis has options, so a reader that
-            # evaluates the readouts can separate all of them.
             assert len(vectors) == len(options), (drawn, axis)
+
+
+def test_one_receipt_narrows_the_convention_and_does_not_name_it(
+    backlog: ledger.Backlog,
+) -> None:
+    """The quantity the one-axis gate above does *not* establish, enumerated.
+
+    A receipt is the vector of bits saying, per request, whether the drawn convention would have
+    written what the agent wrote. Conventions sharing a vector are conventions no reader can
+    separate however well it reads. The map is **not** injective and cannot be made so: some pairs
+    agree on every request the world can supply, and measuring at 28, 34, 40 and 48 dated requests
+    found no backlog at any length whose map is one-to-one.
+
+    So the claim this instrument supports is matching the drawn convention closely, not naming it,
+    and these are the numbers that say by how much: 64 conventions down to a handful."""
+    profile = ledger.posterior_profile(backlog, ledger.REFERENCE_CONVENTION)
+    assert not profile.distinct == len(ledger.CONVENTIONS), "injectivity is not claimed"
+    # The floors are the roster's measured behaviour, not aspirations: over the served roster the
+    # means are about 48 distinct vectors, a largest class of about 8, and a posterior of about 3.
+    assert profile.distinct >= 32
+    assert profile.largest <= 16
+    assert profile.mean_size <= 8.0
+    # And a receipt is worth something: 64 down to a few is most of what there was to learn.
+    assert profile.mean_size < len(ledger.CONVENTIONS) / 8
+
+
+@pytest.mark.parametrize("position", [0, 40, 120, 240])
+def test_the_narrowing_holds_across_the_roster(position: int) -> None:
+    task_id = adapter.task_ids()[position]
+    built = ledger.build_backlog(zlib.crc32(task_id.encode()), REFERENCE)
+    assert built is not None
+    profile = ledger.posterior_profile(built, ledger.REFERENCE_CONVENTION)
+    assert profile.distinct >= 32, (task_id, profile)
+    assert profile.mean_size <= 8.0, (task_id, profile)
 
 
 def test_a_backlog_holds_the_requests_it_says_it_does(backlog: ledger.Backlog) -> None:
@@ -199,6 +236,10 @@ def test_the_frozen_pass_count_table_covers_the_dated_requests() -> None:
     from shogym.envs.appworld.payload import pass_counts
 
     counts = pass_counts()
+    # Enumerated over the tasks that are actually served, and no others. A table built before the
+    # roster was settled carries the excluded tasks' outcomes and is a distribution the run never
+    # produces, which is exactly what a drawn receipt must not be drawn from.
+    assert sum(counts) == len(adapter.task_ids()) * len(ledger.CONVENTIONS)
     # One weight per possible number of passing dated requests, zero through all of them.
     assert len(counts) == ledger.DATED + 1
     assert sum(counts) > 0

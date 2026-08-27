@@ -18,23 +18,33 @@ on a class attribute, and building a second world calls ``close_all()`` on the f
 in one process are one episode the other keeps unfreezing. So an episode gets a process, and the
 process gets a port.
 
-**The port is bound to loopback and gated by a token minted at spawn.** AppWorld's own environment
-server publishes ``evaluate``, ``save_state`` and ``load_state`` with no authentication, on every
-interface. A world where the ground truth is one unauthenticated request away is a world an agent
-with a shell can grade itself against, and "the agent probably will not port-scan" is not a
-property anybody can check. This one answers nothing without the token, and the token is held by
-the serving process and never reaches an agent: not in the instructions, not in a tool schema, not
-in a tool result.
+**The port is bound to loopback and gated by a token read from stdin at startup.** AppWorld's own
+environment server publishes ``evaluate``, ``save_state`` and ``load_state`` with no
+authentication, on every interface. This one answers nothing without the token. The token and the
+corpus root arrive on stdin rather than on the command line, because the code an agent writes runs
+inside this process and ``sys.argv`` is one attribute lookup away from it; stdin is read once,
+before any world exists, and closed.
 
-**Nothing about the treatment lives here.** This process is a generic handle on an AppWorld world:
-it writes the rows it is told to write, runs the code it is handed, and reports what the world
-holds. The convention the filing is graded against is never sent to it, there is no field in the
-protocol for one, and there is no comparison in this file. A world an agent had complete control
-of still could not be made to say what the answer was.
+**What this process must not be able to tell an agent, it does not hold.** The world is built with
+``load_ground_truth=False``, so the answers and the base task's checks are not objects in the
+process that runs agent-authored code, and there is no evaluator here to call. Grading the base
+task happens in a second, short-lived process that never runs agent code (:func:`grade`), reading
+the end state this one flushes to disk. The convention the filing is graded against is never sent
+to either: there is no field in the protocol for one and no comparison in this file.
+
+**What it still cannot do is contain an agent.** The code an agent writes runs as this process,
+with this process's filesystem and network. The environment is scrubbed to an allow-list and the
+working directory is a scratch directory, so an inherited API key or a relative path to the run's
+own records is not simply lying there, and the corpus this process is given carries no
+``ground_truth`` directory at all. It is not a sandbox: an agent that goes looking can still read
+whatever the user running it can read. The port's README says so in those words, and a run whose
+scores have to survive an adversary needs a container around this process, not a longer allow-list
+inside it.
 
 Usage::
 
-    python worker.py serve --root <appworld root> --token <token>
+    python worker.py serve            # {"root": ..., "token": ...} on stdin
+    python worker.py grade            # {"root": ..., "task_id": ..., "experiment": ...} on stdin
     python worker.py install
     python worker.py unpack --bundle <bundle> --into <directory>
 """
@@ -141,14 +151,15 @@ class Episode:
             task_id=body["task_id"],
             experiment_name=body["experiment"],
             random_seed=int(body["seed"]),
-            load_ground_truth=True,
+            # The answers are not loaded into the process that runs the agent's code: nothing here
+            # holds a check, an expected value or an evaluator to call.
+            load_ground_truth=False,
         )
         task = self.world.task
         return {
             "instruction": task.instruction,
             "supervisor": dict(task.supervisor),
             "datetime": task.datetime.isoformat(),
-            "checks": [entry["requirement"] for entry in _test_data(task)],
         }
 
     def execute(self, body: Dict[str, Any]) -> Dict[str, Any]:
@@ -165,30 +176,15 @@ class Episode:
         The digests are what make "the same task twice is the same world" checkable, one over the
         world's own end-state databases and one over the global generator's state."""
         self.world.models.reset_db_home_path()
+        filing = _read_filing(self.world.models, body)
+        # Flush the end state so the grader, which is a different process, has something to read.
+        # AppWorld writes the *initial* state at startup and nothing after it.
+        self.world._save_state(self.world.output_db_home_path_on_disk)
         return {
-            "filing": _read_filing(self.world.models, body),
+            "filing": filing,
             "world_digest": _directory_digest(self.world.output_db_home_path_on_disk),
             "rng_digest": _digest(repr(random.getstate())),
         }
-
-    def evaluate(self, body: Dict[str, Any]) -> Dict[str, Any]:
-        """The base task's own checks, in the order the task lists them.
-
-        Reported by position rather than by requirement text: a requirement is a paragraph of
-        English naming the models and values it asserts on, so carrying one out of here would
-        carry part of the task's answer with it. The position is the task's own order and is all a
-        row identifier has to be."""
-        with _ignoring(list(body.get("ignore") or ())):
-            tracker = self.world.evaluate(suppress_errors=True)
-        reported = tracker.to_dict(stats_only=False)
-        passed = {entry["requirement"] for entry in reported["passes"]}
-        failed = {entry["requirement"] for entry in reported["failures"]}
-        checks = []
-        for position, entry in enumerate(_test_data(self.world.task), start=1):
-            requirement = entry["requirement"]
-            verdict = True if requirement in passed else (False if requirement in failed else None)
-            checks.append([f"aw.{position:03d}", verdict])
-        return {"checks": checks}
 
     def close(self, body: Dict[str, Any]) -> Dict[str, Any]:
         """Shut the world down and give the process's randomness back to the caller."""
@@ -220,6 +216,7 @@ def _read_filing(models: Any, body: Dict[str, Any]) -> Dict[str, Any]:
         "color": None,
         "unit": None,
         "priority": None,
+        "duration": None,
     }
     todoist = models.todoist
     user = todoist.User.find_one(email=body["supervisor_email"])
@@ -249,6 +246,7 @@ def _read_filing(models: Any, body: Dict[str, Any]) -> Dict[str, Any]:
         "color": color,
         "unit": first.duration_unit,
         "priority": first.priority,
+        "duration": first.duration,
     }
 
 
@@ -351,7 +349,6 @@ def build_handler(episode: Episode, token: str, server: List[Any]) -> type:
         "/open": episode.open,
         "/execute": episode.execute,
         "/read": episode.read,
-        "/evaluate": episode.evaluate,
         "/close": episode.close,
     }
 
@@ -391,6 +388,49 @@ def build_handler(episode: Episode, token: str, server: List[Any]) -> type:
             """Silence. Every line here would name the task and the port on the parent's stderr."""
 
     return Handler
+
+
+def grade(body: Dict[str, Any]) -> Dict[str, Any]:
+    """The base task's own checks, in the order the task lists them, in a process of its own.
+
+    This is the only place ground truth is loaded, and it happens after the world is sealed, in a
+    process that has never run a line the agent wrote. It reads the end state the serving worker
+    flushed to disk, so nothing about the world has to be carried across.
+
+    Checks are reported by position rather than by requirement text: a requirement is a paragraph
+    of English naming the models and values it asserts on, so carrying one out of here would carry
+    part of the task's answer with it. The position is the task's own order and is all a row
+    identifier has to be."""
+    os.environ["APPWORLD_ROOT"] = body["root"]
+    from appworld.evaluator import evaluate_task
+    from appworld.task import Task
+
+    with _ignoring(list(body.get("ignore") or ())):
+        tracker = evaluate_task(
+            task_id=body["task_id"],
+            experiment_name=body["experiment"],
+            suppress_errors=True,
+        )
+    reported = tracker.to_dict(stats_only=False)
+    passed = {entry["requirement"] for entry in reported["passes"]}
+    failed = {entry["requirement"] for entry in reported["failures"]}
+    checks = []
+    task = Task.load(task_id=body["task_id"])
+    for position, entry in enumerate(_test_data(task), start=1):
+        requirement = entry["requirement"]
+        verdict = True if requirement in passed else (False if requirement in failed else None)
+        checks.append(["aw.%03d" % position, verdict])
+    return {"checks": checks}
+
+
+def _handshake() -> Dict[str, Any]:
+    """The one line of stdin a worker is started with, and the last thing it reads from it.
+
+    On stdin rather than on ``sys.argv`` because agent-authored code runs in this process, and
+    ``sys.argv`` survives for the life of it while a line of stdin does not."""
+    line = sys.stdin.readline()
+    sys.stdin.close()
+    return json.loads(line)
 
 
 def serve(root: str, token: str) -> int:
@@ -434,16 +474,19 @@ def unpack(bundle: str, into: str) -> int:
 def main(argv: Optional[List[str]] = None) -> int:
     parser = argparse.ArgumentParser(description="an AppWorld world, behind a loopback port")
     commands = parser.add_subparsers(dest="command", required=True)
-    serving = commands.add_parser("serve")
-    serving.add_argument("--root", required=True, help="the directory whose data/ is the corpus")
-    serving.add_argument("--token", required=True, help="the secret every request must carry")
+    commands.add_parser("serve", help="one world; reads {root, token} from stdin")
+    commands.add_parser("grade", help="one task's checks; reads {root, task_id, ...} from stdin")
     commands.add_parser("install")
     unpacking = commands.add_parser("unpack")
     unpacking.add_argument("--bundle", required=True)
     unpacking.add_argument("--into", required=True)
     args = parser.parse_args(argv)
     if args.command == "serve":
-        return serve(args.root, args.token)
+        opening = _handshake()
+        return serve(opening["root"], opening["token"])
+    if args.command == "grade":
+        print(json.dumps({"output": grade(_handshake())}), flush=True)
+        return 0
     if args.command == "install":
         return install()
     return unpack(args.bundle, args.into)

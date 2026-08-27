@@ -36,14 +36,16 @@ to register the env) stays offline. The corpus and the app sources are provision
 
 from __future__ import annotations
 
+import asyncio
 import datetime as dt
+import hashlib
 import zlib
 from typing import TYPE_CHECKING, Any, Dict, Optional
 
 from shogym.core import Env
 from shogym.envs.appworld import adapter, payload, world
 from shogym.envs.appworld.ledger import build_backlog
-from shogym.envs.appworld.scorer import Verdicts, draw_key, score
+from shogym.envs.appworld.scorer import Verdicts, draw_key, leg_of, score
 from shogym.envs.registration import register
 from shogym.feedback.wire import NOTICE_FEEDBACK_NAME, REPORT_FEEDBACK_NAME
 from shogym.mcp import MCPServerSpec
@@ -145,10 +147,22 @@ class AppWorldEnv(Env):
         self._derived = world.derive_root(
             original=self._original, derived=adapter.derived_root() / "data"
         )
+        # The grader's view of the same corpus, with the answers linked back in. Only the grading
+        # process is ever given this root; the world an agent drives is given the other one.
+        self._graded = world.derive_root(
+            original=self._original, derived=adapter.graded_root() / "data"
+        )
+        world.share_outputs(
+            derived=self._derived.parent, graded=self._graded.parent
+        )
         self._task_ids = adapter.task_ids()
         self._backlogs: Dict[str, Any] = {}
+        self._config_digest = _config_digest(pulse=self._pulse, report=self._report)
         self.function = FunctionConfig(example_system_template=_static_instructions())
-        super().__init__(horizon=horizon + 2, num_tasks=len(self._task_ids))
+        # One slot past the configured block budget, for the terminal that ends the task. Two
+        # would let an extra block run: the serve layer dispatches the call that reaches the
+        # horizon, so a budget of N with two spare slots is a budget of N + 1 blocks.
+        super().__init__(horizon=horizon + 1, num_tasks=len(self._task_ids))
 
     # ----- task loading -----
 
@@ -200,14 +214,12 @@ class AppWorldEnv(Env):
         from shogym.envs.appworld import mcp_server
 
         task_id = str(task["task_id"])
+        experiment = f"shogym-{session_id}"
         worker = adapter.Worker.spawn(self._derived.parent)
         try:
             self._derive(worker, task_id)
             worker.call(
-                "open",
-                task_id=task_id,
-                experiment=f"shogym-{session_id}",
-                seed=_world_seed(task_id),
+                "open", task_id=task_id, experiment=experiment, seed=_world_seed(task_id)
             )
         except Exception:
             worker.close()
@@ -218,6 +230,7 @@ class AppWorldEnv(Env):
                 worker=worker,
                 task_id=task_id,
                 supervisor_email=str(task["supervisor_email"]),
+                experiment=experiment,
             ),
         )
 
@@ -233,7 +246,9 @@ class AppWorldEnv(Env):
 
         Checked before the backlog is drawn rather than after. Drawing one costs about a second,
         and a run that serves a task a second time has the world it needs already on disk."""
-        if (self._derived / "tasks" / task_id / "dbs" / "todoist.jsonl").exists():
+        if world.already_derived(
+            derived=self._derived, graded=self._graded, task_id=task_id
+        ):
             return
         specs = adapter.task_specs(self._original.parent, task_id)
         backlog = self._backlog(task_id, specs)
@@ -246,6 +261,7 @@ class AppWorldEnv(Env):
         world.derive_task(
             original=self._original,
             derived=self._derived,
+            graded=self._graded,
             task_id=task_id,
             write_log=lambda source, into: worker.call(
                 "seed", **rows, from_dbs=str(source), into=str(into)
@@ -313,16 +329,29 @@ class AppWorldEnv(Env):
             raise RuntimeError(f"no open world for session {req.session_id}")
         specs = adapter.task_specs(self._original.parent, session.task_id)
         backlog = self._backlog(session.task_id, specs)
-        key = draw_key(session.task_id, self._pulse)
+        key = draw_key(leg_of(session.task_id), self._pulse)
 
-        read = session.worker.call(
+        # Off the event loop. Both of these are blocking HTTP calls into another process, one of
+        # which runs the world's own evaluator, and a coroutine that never yields would stop every
+        # other episode this serving process is running and would make the serve layer's deadline
+        # unable to fire on this one.
+        read = await asyncio.to_thread(
+            session.worker.call,
             "read",
             supervisor_email=session.supervisor_email,
             project=world.PROJECT_NAME,
             title=world.LOG_TITLE,
             label=world.LOG_LABEL,
         )
-        checks = session.worker.call("evaluate", ignore=list(world.ADDED_MODELS))["checks"]
+        checks = (
+            await asyncio.to_thread(
+                adapter.grade,
+                root=self._graded.parent,
+                task_id=session.task_id,
+                experiment=session.experiment,
+                ignore=world.ADDED_MODELS,
+            )
+        )["checks"]
         filing = world.Filing(**{**read["filing"], "lines": tuple(read["filing"]["lines"])})
         verdicts = score(
             backlog=backlog,
@@ -341,6 +370,7 @@ class AppWorldEnv(Env):
             status="ok",
             verdict={
                 **_numbers(verdicts),
+                "config_digest": self._config_digest,
                 "payload_class": self._report,
                 "world_digest": str(read["world_digest"]),
                 "rng_digest": str(read["rng_digest"]),
@@ -386,9 +416,9 @@ class AppWorldEnv(Env):
             "assertion_fraction",
         ):
             fb.episode.append(EpisodeFeedback(name=name, value=float(verdict.get(name) or 0.0)))
-        for name in ("distinct_bands", "filing_rows", "checks"):
+        for name in ("distinct_bands", "filing_rows", "duration_set", "checks"):
             fb.episode.append(EpisodeFeedback(name=name, value=float(verdict.get(name) or 0.0)))
-        for name in ("payload_class", "world_digest", "rng_digest"):
+        for name in ("config_digest", "payload_class", "world_digest", "rng_digest"):
             fb.episode.append(EpisodeFeedback(name=name, value=str(verdict.get(name) or "")))
         fb.episode.append(
             EpisodeFeedback(name=REPORT_FEEDBACK_NAME, value=str(verdict.get(REPORT_FEEDBACK_NAME) or ""))
@@ -417,6 +447,7 @@ def _numbers(verdicts: Verdicts) -> Dict[str, float]:
         ),
         "distinct_bands": float(verdicts.distinct_bands),
         "filing_rows": float(verdicts.filing_rows),
+        "duration_set": float(verdicts.duration_set),
         "checks": float(len(verdicts.items)),
     }
 
@@ -424,6 +455,26 @@ def _numbers(verdicts: Verdicts) -> Dict[str, float]:
 def _static_instructions() -> str:
     """The durable, task-independent framing published by ``describe(task_id=None)``."""
     return f"{_WORLD_GUIDE}\n\n{_TOOL_GUIDE}"
+
+
+def _config_digest(*, pulse: int, report: str) -> str:
+    """What every row of a run has to agree on for its scores to be one measurement.
+
+    The draw and the payload class decide what a score *means*: two pulses grade against different
+    rules, and two payload classes answer with different content. Neither is visible anywhere else
+    in a run's record, so a provenance directory reopened under a different one would take
+    incomparable rows without complaint. This goes on every row, and on the terminal evidence
+    behind it, so a reader can tell.
+
+    It is a digest rather than the values themselves because it is published beside the agent's
+    own feedback: naming the pulse in a row an agent might see would hand over half of what it
+    takes to compute the key.
+
+    Refusing such a resume is the stream's to do, not this env's: an env is handed a task and does
+    not know which run directory it is being served into. What this can do is make the mixing
+    visible in the record, which it now is."""
+    material = f"{pulse}|{report}|{adapter.MANIFEST.read_text()}"
+    return hashlib.sha256(material.encode()).hexdigest()[:12]
 
 
 def _backlog_seed(task_id: str) -> int:
