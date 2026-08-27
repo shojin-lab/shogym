@@ -51,7 +51,12 @@ from shogym.feedback.wire import NOTICE_FEEDBACK_NAME, REPORT_FEEDBACK_NAME
 from shogym.mcp import MCPServerSpec
 from shogym.task import TaskSpec
 from shogym.trajectory import Trajectory
-from shogym.types import EpisodeFeedback, FeedbackCollection, FunctionConfig
+from shogym.types import (
+    EpisodeFeedback,
+    FeedbackCollection,
+    FunctionConfig,
+    InferenceFeedback,
+)
 
 if TYPE_CHECKING:
     from shogym.serve.lifecycle import FinalizeRequest, TerminalEvidence
@@ -363,7 +368,6 @@ class AppWorldEnv(Env):
                 ignore=world.ADDED_MODELS,
             )
         )["checks"]
-        outside = session.worker.opened_outside()
         filing = world.Filing(**{**read["filing"], "lines": tuple(read["filing"]["lines"])})
         verdicts = score(
             backlog=backlog,
@@ -382,10 +386,8 @@ class AppWorldEnv(Env):
             status="ok",
             verdict={
                 **_numbers(verdicts),
-                "config_digest": self._config_digest,
                 "payload_class": self._report,
                 "world_digest": str(read["world_digest"]),
-                "opened_outside": float(len(outside)),
                 "rng_digest": str(read["rng_digest"]),
                 REPORT_FEEDBACK_NAME: rendered[self._report],
                 NOTICE_FEEDBACK_NAME: rendered[payload.DIGEST],
@@ -429,18 +431,8 @@ class AppWorldEnv(Env):
             "assertion_fraction",
         ):
             fb.episode.append(EpisodeFeedback(name=name, value=float(verdict.get(name) or 0.0)))
-        for name in (
-            "distinct_bands",
-            "filing_rows",
-            "duration_set",
-            "checks",
-            "opened_outside",
-        ):
+        for name in ("distinct_bands", "filing_rows", "duration_set", "checks"):
             fb.episode.append(EpisodeFeedback(name=name, value=float(verdict.get(name) or 0.0)))
-        # `config_digest` is deliberately not among these. It is run identity, not feedback: an
-        # agent handed it under a revealing policy could enumerate plausible pulses against it and
-        # recover the draw. It rides on the terminal evidence, which the record keeps and no
-        # policy reveals.
         for name in ("payload_class", "world_digest", "rng_digest"):
             fb.episode.append(EpisodeFeedback(name=name, value=str(verdict.get(name) or "")))
         fb.episode.append(
@@ -451,6 +443,15 @@ class AppWorldEnv(Env):
         )
         if evidence is not None and evidence.finalize_error:
             fb.episode.append(EpisodeFeedback(name="finalize_error", value=True))
+        # Recorded, never surfaced. Run identity has to be on every row, because that is what a
+        # resumed directory is checked against; and it has to be off every wire, because it is a
+        # short digest over a small integer pulse and an agent handed one could enumerate pulses
+        # until it matched and then compute every later key. Inference level is exactly that
+        # contract: the record keeps it, and no feedback policy can reveal it, including the one
+        # that reveals everything else.
+        fb.inference.append(
+            InferenceFeedback(name="config_digest", value=self._config_digest, step=0)
+        )
         return fb
 
 
@@ -496,9 +497,11 @@ def run_fingerprint(*, pulse: int, report: str, blocks: int) -> str:
     different one of those takes incomparable rows, and none of them is visible anywhere else in a
     run's record.
 
-    **Not agent-visible.** It rides on the terminal evidence and never on published feedback. It
-    is a short digest over a usually small integer pulse and otherwise public material, so an
-    agent handed it could enumerate pulses until one matched and then compute every later key.
+    **On every row, and on no wire.** It is published at inference level, which the record keeps
+    and no feedback policy reveals, not even the one that reveals everything else. Both halves
+    matter: a resumed directory is checked against what its rows say, and a digest over a usually
+    small integer pulse is one an agent handed it could enumerate until it matched, after which
+    every later key is computable.
 
     **Enforcing it is the runner's, not this env's.** A stream validates a resumed directory's
     queue and its feedback regime; an env is handed a task and does not know which directory it is

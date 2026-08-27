@@ -137,6 +137,35 @@ def _wire_form(spec: TaskSpec) -> TaskSpec:
     return spec.model_copy(update={"tools": tools}) if changed else spec
 
 
+def _release_when_begun(env: Any, session_id: str, beginning: "asyncio.Future[None]") -> None:
+    """Release a session whose setup was abandoned, once that setup finishes.
+
+    Setup runs in a thread and a thread cannot be told to stop, so a cancelled ``open_env`` cannot
+    undo what its hook is in the middle of doing. What it can do is leave a note: when the hook
+    lands, end the session it opened. An env whose hook failed has nothing to release and its
+    ``end_session`` is a no-op, which is why this does not distinguish the two cases."""
+
+    def release(finished: "asyncio.Future[None]") -> None:
+        if finished.cancelled():
+            return
+        try:
+            loop = asyncio.get_running_loop()
+        except RuntimeError:
+            return
+        loop.create_task(_ended(env, session_id))
+
+    beginning.add_done_callback(release)
+
+
+async def _ended(env: Any, session_id: str) -> None:
+    """End one session off the loop, swallowing whatever it says: this is cleanup after a failure
+    that is already on its way to the caller, and a second error here would replace the first."""
+    try:
+        await asyncio.to_thread(env.end_session, session_id)
+    except Exception:
+        pass
+
+
 #: How long teardown waits for an env to release one episode's resources before going on without
 #: it. Teardown runs on the shared loop, so this is a bound on the wait rather than a kill: an env
 #: whose release has to be certain makes its own hook bounded.
@@ -381,7 +410,19 @@ class ServedEpisode:
             # work: an env whose episode is a world in another process spawns it here, and a slow
             # or wedged one would otherwise freeze every other episode this server is running,
             # along with their watchdogs and deadlines.
-            await asyncio.to_thread(env.begin_session, session_id, task_data)
+            #
+            # A thread cannot be cancelled, so a caller that gives up on this await leaves the
+            # hook running, and whatever it goes on to create (a process, a port, a directory)
+            # has nobody left to release it. The wait is therefore shielded and, if it is
+            # abandoned, the release is arranged for the moment the hook lands.
+            beginning = asyncio.ensure_future(
+                asyncio.to_thread(env.begin_session, session_id, task_data)
+            )
+            try:
+                await asyncio.shield(beginning)
+            except BaseException:
+                _release_when_begun(env, session_id, beginning)
+                raise
             # The one description this episode ever asks for. Everything published about the task
             # and everything enforced on it comes off this single answer — see the snapshot the
             # constructor takes of it.
@@ -1085,8 +1126,15 @@ class ServedEpisode:
             # with it. At the bound the wait is abandoned; an env that needs its own release to be
             # certain has to make its hook bounded too, which is why the appworld worker's close
             # signals and reaps rather than asking politely over a socket.
+            #
+            # Abandoned, not repeated. The thread is still inside the hook when the bound expires,
+            # so re-issuing the release would put two of them on one episode's resources; an env
+            # whose hook is not safe to call twice would then be raced by this module rather than
+            # by anything a caller did.
             await asyncio.wait_for(
-                asyncio.to_thread(self._env.end_session, self._session_id),
+                asyncio.shield(
+                    asyncio.to_thread(self._env.end_session, self._session_id)
+                ),
                 timeout=_END_SESSION_SECONDS,
             )
         except Exception:

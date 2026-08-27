@@ -315,16 +315,31 @@ def test_the_run_fingerprint_covers_everything_that_changes_what_a_score_means()
         env_v1.SCORING_VERSION = original
 
 
-def test_the_fingerprint_is_not_published_as_agent_visible_feedback() -> None:
-    """Read off the publishing code rather than by building an env, which would provision an
-    interpreter and a corpus."""
+def test_the_fingerprint_is_recorded_and_never_revealed() -> None:
+    """Two halves, and both matter. A resumed directory is checked against what its rows say, so
+    the fingerprint has to be on every row. It is a digest over a usually small integer pulse, so
+    it must reach no agent: one handed it can enumerate pulses until it matches and then compute
+    every later key.
+
+    Inference level is exactly that contract, and it is the only channel an env has that satisfies
+    both: `_revealable` filters a row's feedback to episode level, so even `Immediate`, which
+    reveals everything else a row records, cannot reach an inference item."""
     import inspect
 
     from shogym.envs.appworld import env_v1
+    from shogym.serve import stream as stream_module
 
-    published = inspect.getsource(env_v1.AppWorldEnv._verify)
-    assert "config_digest" not in published.split("for name in")[-1]
-    assert "config_digest" in inspect.getsource(env_v1.AppWorldEnv.finalize)
+    verify = inspect.getsource(env_v1.AppWorldEnv._verify)
+    # On the row, at the level that is recorded rather than surfaced.
+    assert "fb.inference.append(" in verify
+    assert "config_digest" in verify.split("fb.inference.append(")[-1]
+    # And off the terminal evidence, which a direct caller reads back verbatim.
+    assert "config_digest" not in inspect.getsource(env_v1.AppWorldEnv.finalize)
+    # The filter that makes the level mean what it is being relied on to mean: what a terminating
+    # call can reveal is the row's episode-level items and nothing else.
+    revealable = inspect.getsource(stream_module._revealable)
+    assert "_EPISODE_LEVEL" in revealable
+    assert stream_module._EPISODE_LEVEL == "episode"
 
 
 def test_a_worker_environment_carries_nothing_it_was_not_given(
