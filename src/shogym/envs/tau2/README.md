@@ -1,16 +1,16 @@
 # `tau2_*` — τ²-bench, tool-using customer-service agents
 
-A faithful shogym port of [**τ²-bench**](https://github.com/sierra-research/tau2-bench)
-(Sierra's benchmark for tool-using customer-service agents). tau2 puts an agent in a domain
-(airline, retail, telecom, …) where it uses domain tools and converses with a simulated user
-to resolve a task, then scores the run with a deterministic evaluator (final DB state, the
-actions taken) plus optional NL assertions.
+[**τ²-bench**](https://github.com/sierra-research/tau2-bench) (Sierra's benchmark for tool-using
+customer-service agents) served through shogym at upstream commit `1d244f5`. tau2 puts an agent
+in a domain (airline, retail, telecom, …) where it uses domain tools and converses with a
+simulated user to resolve a task, then scores the run with a deterministic evaluator (final DB
+state, the actions taken) plus optional NL assertions.
 
 Like every shogym env this **describes** a task, **serves** its tools over MCP, and **verifies**
 a recorded trajectory while an external harness drives the tools — see
 [`../README.md`](../README.md). tau2's own contract is different (its `Orchestrator` *drives
-the agent*); this port bridges the two by replacing only the agent, keeping tau2's benchmark
-intact. The runnable demo is
+the agent*); this port bridges the two by reusing tau2's `Orchestrator`, user simulator, domain
+tools/tasks and evaluator verbatim and replacing only the agent. The runnable demo is
 [`examples/`](../../../../examples/).
 
 ## Running it

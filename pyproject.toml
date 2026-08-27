@@ -111,8 +111,8 @@ yc_bench = [
     "streamlit>=1.55.0",
     "typer>=0.9",
 ]
-# The Frontier-Bench port (src/shogym/envs/frontier_bench) is a faithful, pinned snapshot of the
-# Harbor benchmark (release tag v0.1.0). Its only runtime dependency is a working local
+# The Frontier-Bench port (src/shogym/envs/frontier_bench) vendors a pinned snapshot of the
+# Harbor benchmark (release tag v0.1.0), byte-for-byte. Its only runtime dependency is a working local
 # **Docker** daemon (a system dependency, not a pip package): the env builds+runs the task's
 # environment container as the served agent's world and runs the task's own verifier container
 # for the 0/1 verdict. The Python code uses stdlib only (subprocess + tomllib), so this extra
@@ -136,7 +136,7 @@ frontier_bench = []
 automationbench = [
     "datasets>=2.19",
 ]
-# The BrowseComp-Plus port (src/shogym/envs/browsecomp_plus), a faithful wrap pinned to upstream
+# The BrowseComp-Plus port (src/shogym/envs/browsecomp_plus), pinned to upstream
 # commit 0469490. `datasets` lazy-loads the XOR-encrypted `Tevatron/browsecomp-plus` queries
 # (decrypted in memory only — never persisted), `openai` backs the default model-graded judge,
 # and `pyserini` (which also needs a Java 21 runtime) is the BM25/Lucene retriever over the

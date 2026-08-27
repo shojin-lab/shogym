@@ -8,10 +8,10 @@ yc-bench has **no built-in agent loop**: it expects an external driver to issue 
 against its deterministic sim, feed the JSON results back, and collect the next commands. shogym
 *is* that driver. This server exposes that command surface as two MCP tools:
 
-  - **``run_command(command)``** — the faithful mirror of upstream's
+  - **``run_command(command)``** — mirrors upstream's
     ``run_command("yc-bench <cmd>")``: it runs one yc-bench CLI command against *this
     session's* SQLite sim and returns the CLI's JSON. Every observe/act/sim/memory command is
-    reached through this one tool (the most faithful surface per issue #32).
+    reached through this one tool (one tool for the whole surface, per issue #32).
   - **``submit()``** — the env's ``score`` terminal. Calling it ends the episode: the serve
     layer seals the episode, then the env's ``finalize`` hook reads the authoritative final
     metrics (survival, final funds, task outcomes) off the *live* sim DB and returns the

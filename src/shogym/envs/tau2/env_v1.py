@@ -1,4 +1,4 @@
-"""``tau2_<domain>`` on the env-as-center core (RFC 008): a faithful wrap of tau2-bench.
+"""``tau2_<domain>`` on the env-as-center core (RFC 008): a wrap of tau2-bench.
 
 The env declares one in-process MCP server (a per-domain module that hosts tau2's
 Orchestrator via its ``GymAgent`` bridge), loads a tau2 task per episode, and scores the run
@@ -363,7 +363,7 @@ def _find_verdict(trajectory: Trajectory) -> Optional[Dict[str, Any]]:
 
 @register("tau2_mock")
 class Tau2MockEnv(Tau2Env):
-    """tau2's ``mock`` domain (solo mode) — the smallest faithful, fully-offline slice."""
+    """tau2's ``mock`` domain (solo mode) — the smallest fully-offline slice."""
 
     domain = "mock"
     solo_mode = True

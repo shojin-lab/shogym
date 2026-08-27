@@ -1,10 +1,14 @@
 # `hle` — Humanity's Last Exam, shogym's first model-graded env
 
-A faithful shogym port of [**Humanity's Last Exam**](https://agi.safe.ai/) (HLE) — 2,500
+[**Humanity's Last Exam**](https://agi.safe.ai/) (HLE) served through shogym — 2,500
 expert, frontier-difficulty, closed-ended academic questions from the Center for AI Safety &
-Scale AI. HLE has essentially no tool surface: it is single-turn Q&A. Its value here is (a)
-coverage of a reasoning/QA task and (b) exercising shogym's **verification surface** with a real
-**LLM judge** — a model-graded verifier that nothing else in shogym uses.
+Scale AI. HLE has essentially no tool surface: it is single-turn Q&A. It covers a reasoning/QA
+task and exercises shogym's **verification surface** with a real **LLM judge** — a model-graded
+verifier that nothing else in shogym uses.
+
+The port loads the `cais/hle` test split and grades with HLE's own judge prompt; it filters out
+the image questions and picks its own judge model (see
+[Fidelity & deviations](#fidelity--deviations)).
 
 Like every shogym env this **describes** a task, **serves** its tools over MCP, and **verifies**
 a recorded trajectory while an external harness drives the tools — see

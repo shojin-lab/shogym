@@ -1,4 +1,4 @@
-"""Fidelity checks for the ``automationbench`` port: real domain loading + upstream-faithful seed.
+"""Fidelity checks for the ``automationbench`` port: real domain loading + a seed matching upstream.
 
 Unlike the verify/served tests (which inject synthetic tasks), these exercise the real upstream
 domain loader — ``datasets``-backed, with deterministic per-``example_id`` noise injection — so

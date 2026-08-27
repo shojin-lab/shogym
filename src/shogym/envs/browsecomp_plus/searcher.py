@@ -8,7 +8,7 @@ so the corpus/index is swappable (BM25/Lucene, dense Faiss, …). shogym reuses 
   offline tests inject an :class:`InMemorySearcher` over a tiny synthetic corpus.
 - :class:`InMemorySearcher` — a dependency-free, deterministic lexical searcher (token-overlap
   scoring) for fixtures and unit tests: **no Java, no pyserini, no network**.
-- :class:`BM25Searcher` — the faithful pyserini/Lucene backend (``LuceneSearcher``), ported from
+- :class:`BM25Searcher` — the pyserini/Lucene backend (``LuceneSearcher``), ported from
   upstream. It imports ``pyserini`` lazily (needs **Java 21**), so importing this module stays
   light; it is only constructed when the real env is served against a prebuilt BM25 index.
 
@@ -50,7 +50,7 @@ def _tokens(text: str) -> List[str]:
 class InMemorySearcher:
     """A deterministic, dependency-free lexical searcher over an in-memory corpus.
 
-    For fixtures and offline tests only — **not** a faithful BM25. Scores each document by the
+    For fixtures and offline tests only — **not** BM25. Scores each document by the
     number of distinct query terms it contains (ties broken by total term frequency, then docid
     for stability), which is enough to exercise the served ``search`` / ``get_document`` tools and
     the retrieval/citation metrics without Java, pyserini, or the 2.78 GB corpus.
@@ -104,7 +104,7 @@ def _docid_sort_key(docid: str) -> tuple:
 
 
 class BM25Searcher:
-    """The faithful BM25/Lucene backend, ported from BrowseComp-Plus ``BM25Searcher``.
+    """The BM25/Lucene backend, ported from BrowseComp-Plus ``BM25Searcher``.
 
     Wraps pyserini's ``LuceneSearcher`` over a prebuilt Lucene index. Requires **Java 21** and
     ``pyserini`` (the ``browsecomp_plus`` extra); ``pyserini`` is imported lazily in ``__init__``

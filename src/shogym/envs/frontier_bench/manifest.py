@@ -1,7 +1,7 @@
 """Pinned provenance + task loading for the ``frontier_bench`` port.
 
 Frontier-Bench is *continuously versioned* — the upstream repo is re-tagged as tasks land and
-verifiers are corrected. A faithful port is therefore a **snapshot**: this module pins the
+verifiers are corrected. A port is therefore a **snapshot**: this module pins the
 release tag ``v0.1.0`` (commit ``eb4af26c``) and records, per vendored task, the ``sha256``
 digest exactly as it appears in upstream ``tasks/dataset.toml``. Each task's files are
 *vendored* under ``tasks/<name>/`` (they are tiny — a handful of CSVs/scripts, two Dockerfiles,

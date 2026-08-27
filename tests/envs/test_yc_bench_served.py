@@ -160,7 +160,7 @@ async def test_command_budget_is_max_commands_then_submit() -> None:
 
 
 async def test_sim_resume_requires_active_task() -> None:
-    # Faithful yc-bench behavior: `sim resume` refuses to advance with no active task.
+    # Matches yc-bench: `sim resume` refuses to advance with no active task.
     episode = await ServedEpisode.start("yc_bench", task=0)
     try:
         r = await episode.call("run_command", {"command": "yc-bench sim resume"})

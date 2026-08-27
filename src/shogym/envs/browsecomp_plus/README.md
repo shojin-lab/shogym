@@ -1,8 +1,9 @@
 # `browsecomp_plus` — BrowseComp-Plus, a Deep-Research retrieval env ("HLE with a fixed corpus")
 
-A faithful shogym port of [**BrowseComp-Plus**](https://github.com/texttron/BrowseComp-Plus) (ACL
-2026) — answer OpenAI BrowseComp's reasoning-heavy queries against a **fixed, human-verified
-~100K-doc corpus** served as `search` / `get_document` tools, instead of the live web. Freezing
+[**BrowseComp-Plus**](https://github.com/texttron/BrowseComp-Plus) (ACL 2026) served through
+shogym at upstream commit `0469490` — answer OpenAI BrowseComp's reasoning-heavy queries against
+a **fixed, human-verified ~100K-doc corpus** served as `search` / `get_document` tools, instead
+of the live web. Freezing
 the corpus isolates search + reasoning from web noise and makes runs reproducible. `submit_answer`
 is the **score terminal**: submitting seals the episode and the env's `finalize` hook grades the
 sealed answer with an LLM judge (as in the [HLE](../hle/README.md) port), and the env adds

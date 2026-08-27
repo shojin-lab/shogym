@@ -1,4 +1,4 @@
-"""``automationbench`` on the env-as-center core (RFC 008): a faithful wrap of AutomationBench.
+"""``automationbench`` on the env-as-center core (RFC 008): a wrap of AutomationBench.
 
 AutomationBench (Zapier, MIT) drops an agent into a fully **simulated** world of ~47 SaaS apps
 and asks it to carry out a realistic cross-application business workflow described in natural

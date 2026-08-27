@@ -5,7 +5,7 @@ BrowseComp-Plus already exposes its retriever over MCP (``searcher/mcp_server.py
 tool to demarcate the final answer. Three tools:
 
   - **``search(query)``** — rank the corpus and return the top-k hits (``docid``, ``score``,
-    ``snippet``), faithfully mirroring upstream's ``search`` tool. The docids returned across a
+    ``snippet``), mirroring upstream's ``search`` tool. The docids returned across a
     run are what the pure verifier reads back as ``retrieved_docids`` for retrieval recall.
   - **``get_document(docid)``** — fetch a document's full text (upstream's optional tool).
   - **``submit_answer(answer, confidence)``** — the env's ``score`` **terminal**. The serve

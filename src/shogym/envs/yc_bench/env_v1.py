@@ -1,4 +1,4 @@
-"""``yc_bench`` on the env-as-center core (RFC 008): a faithful wrap of YC-Bench.
+"""``yc_bench`` on the env-as-center core (RFC 008): a wrap of YC-Bench.
 
 YC-Bench puts an agent in charge of a simulated AI startup for one year. Starting with
 $200,000, the agent issues ``yc-bench`` CLI commands against a deterministic, SQLite-backed

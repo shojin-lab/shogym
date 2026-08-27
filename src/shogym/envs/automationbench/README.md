@@ -1,8 +1,9 @@
 # `automationbench` — AutomationBench, an offline cross-app workflow env
 
-A faithful shogym port of [**AutomationBench**](https://github.com/zapier/AutomationBench)
-(MIT, © Zapier): an agent gets a natural-language instruction and carries out a realistic
-cross-application business workflow over a fully **simulated** world of ~47 SaaS apps; scoring
+[**AutomationBench**](https://github.com/zapier/AutomationBench) (MIT, © Zapier) served through
+shogym at upstream commit `a321764`: an agent gets a natural-language instruction and carries out
+a realistic cross-application business workflow over a fully **simulated** world of ~47 SaaS
+apps; scoring
 checks — programmatically, **end-state only** — whether the right data landed in the right
 systems. No LLM judge, no live SaaS, no network at eval time — the whole port is deterministic
 and offline.

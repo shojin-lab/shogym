@@ -1,8 +1,9 @@
 # `yc_bench` — YC-Bench, CEO of a simulated AI startup
 
-A faithful shogym port of [**YC-Bench**](https://github.com/collinear-ai/yc-bench) (Collinear
-AI's long-horizon deterministic benchmark). YC-Bench puts an agent in charge of a simulated AI
-startup for one year: starting with **$200,000**, it issues `yc-bench` CLI commands against a
+[**YC-Bench**](https://github.com/collinear-ai/yc-bench) (Collinear AI's long-horizon
+deterministic benchmark) served through shogym at upstream commit `e7d6067`. YC-Bench puts an
+agent in charge of a simulated AI startup for one year: starting with **$200,000**, it issues
+`yc-bench` CLI commands against a
 deterministic, SQLite-backed discrete-event simulation — accepting tasks from a marketplace,
 assigning employees, advancing the clock, and managing cash flow — until **bankruptcy**
 (funds < 0) or the **one-year horizon**. The score is how the company ends up.
@@ -11,7 +12,8 @@ Like every shogym env this **describes** a task, **serves** its tools over MCP, 
 a recorded trajectory while an external harness drives the tools — see
 [`../README.md`](../README.md). YC-Bench ships **no agent loop**: it explicitly expects an
 *external driver* to advance the sim, feed CLI results back, and collect the next commands.
-shogym's harness *is* that driver, so the port is a clean wrap — only the *agent* is replaced (by
+shogym's harness *is* that driver, so the port reuses YC-Bench's sim engine, command
+execution, SQLite state, world seeding and scoring verbatim, and replaces only the *agent* (with
 the harness, through the served tools). The runnable demo is
 [`examples/`](../../../../examples/).
 
@@ -109,7 +111,7 @@ per episode** on `begin_session` (one company/world, seeded deterministically fr
 seed via YC-Bench's own `_init_simulation`, so seeding is bit-identical to `yc-bench run`) and
 drops it on `end_session`. It exposes two tools:
 
-- **`run_command(command)`** — the faithful mirror of upstream's `run_command("yc-bench
+- **`run_command(command)`** — mirrors upstream's `run_command("yc-bench
   <cmd>")`: it validates the command with YC-Bench's own command policy, **allowlists the
   operational sub-command groups** (`company`, `employee`, `market`, `task`, `sim`, `finance`,
   `report`, `scratchpad`, `client`), then runs YC-Bench's real CLI entry point
@@ -197,7 +199,7 @@ semantics (give each run its own trace file for a guaranteed 1:1 mapping).
 
 ## Gotchas
 
-- **`sim resume` needs an active task.** Faithful to upstream, `yc-bench sim resume` refuses to
+- **`sim resume` needs an active task.** Matching upstream, `yc-bench sim resume` refuses to
   advance the clock with no active task — the agent must `market browse → task accept → task
   assign → task dispatch` first. The command returns an error payload (`ok: false`); it does
   not raise.

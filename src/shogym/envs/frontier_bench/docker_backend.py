@@ -312,7 +312,7 @@ def run_separate_verifier(
 ) -> VerifierOutcome:
     """Run the task's verifier in SEPARATE mode and return the recorded 0/1 verdict.
 
-    Faithful to Harbor's ``environment_mode="separate"`` flow:
+    Matches Harbor's ``environment_mode="separate"`` flow:
 
       1. Build the ``tests/`` image (it ``COPY . /tests/``, so it owns ``/tests/test.sh`` and
          golden files — the tests upload is skipped, exactly like Harbor's

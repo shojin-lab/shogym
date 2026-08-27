@@ -7,7 +7,7 @@ citation precision/recall exactly as upstream ``scripts_evaluation/evaluate_run.
 
 Everything here is **pure** and dependency-free (stdlib ``re`` only), so it runs in the offline
 core test suite and is called from the env's pure ``_verify``. The functions are ported
-verbatim from BrowseComp-Plus commit ``0469490`` to keep the metrics faithful.
+verbatim from BrowseComp-Plus commit ``0469490``, so the metrics match upstream's.
 """
 
 from __future__ import annotations
