@@ -65,15 +65,15 @@ from shogym.envs.appworld.container import CORPUS_MOUNT, GRADED_MOUNT, OUTPUTS_M
 
 #: The release this port reproduces, and the commit it was cut from.
 #:
-#: **Both are load-bearing, and they are load-bearing in different ways.** The version is what is
-#: installed and what the installed distribution is checked to be (see :func:`_check_pin`), so a
-#: runtime holding some other release is refused rather than served. The commit is not checkable
-#: against the artifact at all: the published wheel carries no marker of the tree it was built
-#: from, so nothing on this machine can say whether ``0.1.3.post1`` was cut from this commit. What
-#: it does instead is *name* the runtime and go into its stamp, so changing the pin builds a
-#: second interpreter under a second name rather than reusing the first, and every run's
-#: fingerprint moves with it. What the realized bytes turned out to be is :func:`runtime_digest`'s
-#: job, which is the question a pin can never answer.
+#: **Both are load-bearing, and they are load-bearing in different ways.** The version is what the
+#: image installs: ``worker.Dockerfile`` asks pip for exactly it, so a build that resolved some
+#: other release fails rather than publishing, and a test holds the Dockerfile to this constant so
+#: the two cannot drift apart. The commit is not checkable against the artifact at all: the
+#: published wheel carries no marker of the tree it was built from, so nothing on this machine can
+#: say whether ``0.1.3.post1`` was cut from this commit. What it does instead is go into the run
+#: fingerprint, so changing the pin moves every run's identity rather than passing for the earlier
+#: measurement. What the realized bytes turned out to be is :func:`runtime_digest`'s job, which is
+#: the question a pin can never answer.
 UPSTREAM_VERSION = "0.1.3.post1"
 UPSTREAM_SHA = "66ad8099e12188ece0d3fe45e661dbc01880813b"
 
@@ -181,7 +181,10 @@ def ensure_corpus() -> Path:
     # the image is built *before* the corpus lock is taken, never inside it. A genuinely cold
     # machine takes exactly this path.
     ensure_image()
-    with _locked(root.parent):
+    # Required, not advisory: the corpus is the material every score is computed against, and a
+    # window in which two fetchers are inside one cache directory is not made safe by staging.
+    # See `_upstream._locked`.
+    with _locked(root.parent, required=True):
         if (root / "data" / "tasks").is_dir():
             return root
         _fetch_corpus(root)
@@ -195,10 +198,10 @@ def _fetch_corpus(root: Path) -> None:
     business and upstream is not installed on this machine. What this function owns is the check in
     front of it. The image is built by the caller, outside this function's lock (see
     :func:`ensure_corpus`)."""
-    # Named for the process that owns it rather than fixed, and never cleared before use. A fixed
-    # name is a directory two cold starts both believe is theirs, and `_locked` is documented to
-    # yield without exclusion on a filesystem that cannot `flock`, so "the lock stops that" is not
-    # a thing this can assume. See the deferred note in the pull request.
+    # Named for the process that owns it rather than fixed, and never cleared before use. The
+    # caller's lock is required now, so this is belt and braces rather than the only exclusion:
+    # what it buys is that an abandoned staging tree is one process's residue under its own name
+    # rather than a directory the next cold start believes is its own.
     staging = root.with_name(f"{root.name}.{os.getpid()}.{secrets.token_hex(4)}.building")
     staging.mkdir(parents=True)
     bundle = staging / Path(DATA_BUNDLE_URL).name
@@ -288,7 +291,14 @@ def task_specs(root: Path, task_id: str) -> Dict[str, Any]:
     ``corpus_digest`` and a new cache name, and the same process went on serving the instruction,
     the supervisor and the datetime it had read the first time. The identity moved and the task
     did not. It is a few kilobytes of JSON, and the cache was also unbounded across a roster of
-    318."""
+    318.
+
+    **A served env does not call this.** It reads its whole roster's specs once, out of the same
+    walk that computes its corpus digest (:func:`corpus_snapshot`), and serves those for its life:
+    an env whose fingerprint and cache names were fixed at construction must not go on reading
+    authored text from a corpus that can change under it. This remains for the callers that want
+    one spec off a corpus as it stands rather than a pinned view of one, which is tooling and the
+    tests that check a committed table against the corpus it was generated from."""
     return json.loads((root / "data" / "tasks" / task_id / "specs.json").read_text())
 
 
@@ -394,6 +404,24 @@ def _read_tag(keyfile: Path) -> Optional[str]:
     return tag if len(tag) == 16 else None
 
 
+@dataclass(frozen=True)
+class CorpusSnapshot:
+    """One reading of a corpus: what it held, and the authored text it held while it was read.
+
+    The two travel together because they have to be one observation. A digest and a later
+    ``specs.json`` read are two, and the gap between them is a corpus that can change: the env
+    fixed its fingerprint and its cache names from the first and then went on serving instructions
+    and dates read from the second, so an in-place edit served authored text under an identity
+    that had never seen it. Here the spec is parsed from the very bytes the digest was computed
+    over, so ``digest`` states what ``specs`` came from and there is no window between them to
+    edit."""
+
+    #: What the whole of ``data`` held, as sixteen hex characters.
+    digest: str
+    #: Task id to its shipped specification, for the tasks that were asked for and no others.
+    specs: Dict[str, Dict[str, Any]]
+
+
 def corpus_digest(root: Path) -> str:
     """What the corpus at ``root`` actually holds, as sixteen hex characters.
 
@@ -420,8 +448,23 @@ def corpus_digest(root: Path) -> str:
     keeps the value; the cost is about two seconds on a fresh corpus, dominated by the fourteen
     thousand small files in the task tree, and it is the price of the digest meaning what it
     says."""
+    return corpus_snapshot(root, task_ids=()).digest
+
+
+def corpus_snapshot(root: Path, *, task_ids: Sequence[str]) -> CorpusSnapshot:
+    """Read the corpus at ``root`` once: its digest, and the specs of the tasks named.
+
+    One walk rather than two, and that is the point rather than an optimization. The specs are
+    parsed out of the same bytes the digest is computed from, as they are read, so a caller that
+    holds both holds one statement about one corpus at one instant. See :class:`CorpusSnapshot`
+    for what the two-observation version let through.
+
+    A named task whose spec the walk never reached is a manifest and a corpus that disagree, which
+    is refused here rather than at the two-hundredth episode of a run."""
     digest = hashlib.sha256()
     data = root / "data"
+    wanted = set(task_ids)
+    specs: Dict[str, Dict[str, Any]] = {}
     for path in sorted(data.rglob("*")):
         if path.is_symlink():
             # **Refused rather than skipped.** A skipped link is a file the digest does not cover
@@ -436,14 +479,35 @@ def corpus_digest(root: Path) -> str:
             )
         if not path.is_file():
             continue
-        digest.update(str(path.relative_to(data)).encode())
+        relative = path.relative_to(data)
+        digest.update(str(relative).encode())
+        # `tasks/<task_id>/specs.json` and nothing else: a `specs.json` anywhere else in the tree
+        # is not a task's, and a task not asked for is not read into memory.
+        keeping = (
+            relative.parts[:1] == ("tasks",)
+            and len(relative.parts) == 3
+            and relative.parts[2] == "specs.json"
+            and relative.parts[1] in wanted
+        )
+        blocks: List[bytes] = []
         with path.open("rb") as handle:
             while True:
                 block = handle.read(1 << 20)
                 if not block:
                     break
                 digest.update(block)
-    return digest.hexdigest()[:16]
+                if keeping:
+                    blocks.append(block)
+        if keeping:
+            specs[relative.parts[1]] = json.loads(b"".join(blocks))
+    missing = sorted(wanted - set(specs))
+    if missing:
+        raise ProvisioningError(
+            f"the corpus at {root} has no specification for {len(missing)} of the tasks this port "
+            f"serves (first: {missing[0]}); the manifest at {MANIFEST} and this corpus are not "
+            "describing the same split"
+        )
+    return CorpusSnapshot(digest=digest.hexdigest()[:16], specs=specs)
 
 
 def control_home() -> Path:
@@ -1243,43 +1307,149 @@ class SnapshotError(RuntimeError):
 #: read it without importing a file that only exists inside the image.
 _SAVE_MANIFEST = "save.manifest"
 
+#: What a snapshot may hold before it is refused. An episode's real output tree is tens of
+#: kilobytes across a few dozen files at a depth of four, so these bound a pathological case and
+#: not an ordinary one: the tree was writable by the process that ran agent-authored code, and an
+#: unbounded walk of it holds finalization open and fills the host's disk.
 _SNAPSHOT_MAX_NODES = 20_000
 _SNAPSHOT_MAX_BYTES = 1 << 30
 _SNAPSHOT_MAX_DEPTH = 24
 _SNAPSHOT_SECONDS = 60.0
 
+#: How much of one file is moved between two readings of the clock and the stop flag. A bound that
+#: is only checked between files is not a bound on a tree that may hold one enormous file, and a
+#: cancelled finalization would wait out the whole of it. A megabyte is small against the sixty
+#: seconds and large against the cost of a check.
+_SNAPSHOT_CHUNK_BYTES = 1 << 20
 
-#: How much of one file is copied between two checks of the clock and the abandon flag. A
-#: permitted file may be a gibibyte, and one `copyfile` of it is one uninterruptible operation
-#: that can outlast the bound this function advertises.
-_SNAPSHOT_CHUNK = 4 * 1024 * 1024
+
+class _Bound:
+    """The four bounds one snapshot runs under, and the only place any of them is read.
+
+    A class rather than four locals threaded through the walk, because the walk is no longer one
+    loop: enumerating a directory, removing the previous copy and moving one file's bytes are
+    three operations that each have to be able to say "the budget is gone" from inside themselves.
+    The limits are read off the module once, at construction, so a caller that shrinks them for a
+    test shrinks them for the whole of the call and not for half of it."""
+
+    def __init__(self, stop: "Optional[threading.Event]") -> None:
+        self.stop = stop
+        self.began = time.monotonic()
+        self.nodes = 0
+        self.bytes = 0
+        self.max_nodes = _SNAPSHOT_MAX_NODES
+        self.max_bytes = _SNAPSHOT_MAX_BYTES
+        self.max_depth = _SNAPSHOT_MAX_DEPTH
+        self.seconds = _SNAPSHOT_SECONDS
+
+    def alive(self) -> None:
+        """The two bounds that are about *when*, checked before anything that can take time.
+
+        Once per directory entry as it arrives and once per chunk of a file, which is what makes
+        the deadline and the cancellation bounds on the work rather than on the gaps between
+        pieces of it."""
+        if self.stop is not None and self.stop.is_set():
+            raise SnapshotError("the snapshot was abandoned before it finished")
+        if time.monotonic() - self.began > self.seconds:
+            raise SnapshotError(
+                f"the episode's output tree took longer than {self.seconds:.0f}s to copy"
+            )
+
+    def node(self) -> None:
+        """Count one directory entry, having first checked that there is still a budget to spend."""
+        self.alive()
+        self.nodes += 1
+        if self.nodes > self.max_nodes:
+            raise SnapshotError(
+                f"the episode's output tree holds more than {self.max_nodes} entries"
+            )
+
+    def descend(self, depth: int) -> None:
+        if depth > self.max_depth:
+            raise SnapshotError(
+                f"the episode's output tree is deeper than {self.max_depth} directories"
+            )
+
+    def offer(self, size: int) -> None:
+        """Refuse a file whose length alone breaks the budget, before any of it is read."""
+        if self.bytes + size > self.max_bytes:
+            raise SnapshotError(
+                f"the episode's output tree is larger than {self.max_bytes} bytes"
+            )
+
+    def spend(self, count: int) -> None:
+        """Account for bytes actually moved, so a file that grew past its own ``stat`` is caught."""
+        self.bytes += count
+        if self.bytes > self.max_bytes:
+            raise SnapshotError(
+                f"the episode's output tree is larger than {self.max_bytes} bytes"
+            )
 
 
-def _copy_bounded(
-    source: Path,
-    target: Path,
-    *,
-    began: float,
-    stop: "Optional[threading.Event]",
-    seen: int,
-) -> int:
-    """Copy one file in pieces, checking the deadline and the abandon flag between them.
+def _names(source: Path, bound: _Bound) -> List[str]:
+    """One directory's entry names, counted against the bound as they arrive, then sorted.
 
-    `shutil.copyfile` on a permitted file runs to completion whatever the clock says, so a single
-    large file could take the whole snapshot past the time it promises and a cancelled
-    finalization could not stop it until the file finished. Returns the running byte total."""
-    with open(source, "rb") as reading, open(target, "wb") as writing:
+    ``sorted(source.iterdir())`` read and sorted the whole directory before a single bound was
+    consulted, so a directory holding a million names spent all of that time and memory *after*
+    the deadline had passed and after the finalization had been cancelled. ``os.scandir`` hands
+    them over one at a time, so the bound is spent per entry and the enumeration stops inside the
+    directory rather than at the end of it.
+
+    The order is still the sorted one, and the sort still happens: it runs on the names that got
+    past the bound, which is the difference. A deterministic order is worth keeping, because it
+    decides which of several refusals an episode gets told about."""
+    names: List[str] = []
+    with os.scandir(source) as entries:
+        for entry in entries:
+            bound.node()
+            names.append(entry.name)
+    return sorted(names)
+
+
+def _clear(target: Path, bound: _Bound, depth: int = 0) -> None:
+    """Remove ``target`` and everything under it, under the same bound as the copy that follows.
+
+    ``shutil.rmtree`` was outside every bound, and what it removes is the previous snapshot, which
+    lives at a name one character away from the output root the world is handed: the process that
+    ran the agent's code could work out the name and fill the tree. So a cancelled finalization
+    waited out a deletion the episode had sized, before it reached the copy the bounds cover.
+
+    Depth is bounded here as well as in the copy, and for a second reason: this recurses, so a
+    tree nested ten thousand deep would otherwise be an interpreter stack rather than a refusal."""
+    bound.alive()
+    try:
+        mode = target.lstat().st_mode
+    except FileNotFoundError:
+        return
+    if stat.S_ISDIR(mode) and not stat.S_ISLNK(mode):
+        bound.descend(depth)
+        for name in _names(target, bound):
+            _clear(target / name, bound, depth + 1)
+        target.rmdir()
+        return
+    # A symlink is unlinked, never followed: what it names is outside the tree being removed.
+    target.unlink()
+
+
+def _copy(source: Path, target: Path, bound: _Bound) -> None:
+    """Move one file's bytes, reading the clock and the stop flag between chunks.
+
+    ``shutil.copyfile`` was one call with no way in: a single large or slow file ran to completion
+    however long the copy had already taken and however long ago the finalization it belongs to
+    was abandoned. Checking once per file bounds a tree of small files and bounds nothing about a
+    tree with one big one in it.
+
+    A refused copy leaves a partial file behind in the destination, and that is harmless by
+    construction: a snapshot that raises is an episode refused outright, nothing reads the
+    destination afterwards, and the next call removes it before it writes anything."""
+    with source.open("rb") as reader, target.open("wb") as writer:
         while True:
-            if stop is not None and stop.is_set():
-                raise SnapshotError("the snapshot was abandoned before it finished")
-            if time.monotonic() - began > _SNAPSHOT_SECONDS:
-                raise SnapshotError(
-                    f"the episode's output tree took longer than {_SNAPSHOT_SECONDS:.0f}s to copy"
-                )
-            chunk = reading.read(_SNAPSHOT_CHUNK)
-            if not chunk:
-                return seen
-            writing.write(chunk)
+            bound.alive()
+            block = reader.read(_SNAPSHOT_CHUNK_BYTES)
+            if not block:
+                return
+            bound.spend(len(block))
+            writer.write(block)
 
 
 def snapshot_outputs(
@@ -1305,8 +1475,15 @@ def snapshot_outputs(
     likes and fills the host's disk on the way, and neither the finalize deadline nor the grader's
     own timeout covers it: a deadline cancels the *await*, and the thread doing the copying does
     not stop for that. Which is what ``stop`` is for: the caller sets it when its await is
-    cancelled and this checks it once per file, so a cancelled finalization stops the copy at the
-    next file rather than at the end of the tree.
+    cancelled, and it is read from inside the work rather than between pieces of it.
+
+    **Every operation that can consume the bound is inside it, which three of them were not.** The
+    previous snapshot was removed by an unbounded ``rmtree`` before the clock was ever consulted;
+    each directory was read and sorted in full before the first check of the entries it produced;
+    and one file was copied by a single call that could not be interrupted however large it was.
+    So a tree an episode had sized could hold finalization open through any of the three while
+    every stated bound stood unbroken. The removal, the enumeration and the copy now each spend
+    the same budget as they go (see :class:`_Bound`).
 
     Every refusal is an episode refused outright rather than an entry skipped, because a grade
     computed over a tree with something quietly dropped is a grade over a tree nobody submitted.
@@ -1321,59 +1498,42 @@ def snapshot_outputs(
     root = outputs.resolve()
     if not root.is_dir():
         raise SnapshotError(f"the episode left no output tree at {outputs}")
-    began = time.monotonic()
-    nodes = 0
-    total = 0
-    shutil.rmtree(into, ignore_errors=True)
+    bound = _Bound(stop)
+    try:
+        _clear(into, bound)
+    except OSError as exc:
+        # Typed rather than let out raw: a destination that will not go away is this episode
+        # ending unscored, and that is a snapshot's own kind of failure rather than a bug.
+        raise SnapshotError(
+            f"the previous snapshot at {into} could not be removed ({exc}), so this episode "
+            "cannot be handed to the grader as the tree it submitted"
+        ) from exc
     into.mkdir(parents=True)
     # One pass: what is checked is what is copied. A validate-then-`copytree` would walk the tree
     # twice and bound neither walk.
     pending: List[Tuple[Path, Path, int]] = [(root, into, 0)]
     while pending:
         source, target, depth = pending.pop()
-        if depth > _SNAPSHOT_MAX_DEPTH:
-            raise SnapshotError(
-                f"the episode's output tree is deeper than {_SNAPSHOT_MAX_DEPTH} directories"
-            )
-        # **Enumerated lazily, and never sorted first.** `sorted(iterdir())` reads a whole
-        # directory into memory and orders it before any bound is consulted, so one wide directory
-        # an episode wrote was fully materialised before the refusal that exists to stop it. A
-        # `scandir` iterator hands over one entry at a time, so the bounds apply to the walk rather
-        # than only to what the walk found.
-        with os.scandir(source) as entries:
-            for entry in entries:
-                if stop is not None and stop.is_set():
-                    raise SnapshotError("the snapshot was abandoned before it finished")
-                if time.monotonic() - began > _SNAPSHOT_SECONDS:
-                    raise SnapshotError(
-                        f"the episode's output tree took longer than {_SNAPSHOT_SECONDS:.0f}s "
-                        "to copy"
-                    )
-                nodes += 1
-                if nodes > _SNAPSHOT_MAX_NODES:
-                    raise SnapshotError(
-                        f"the episode's output tree holds more than {_SNAPSHOT_MAX_NODES} entries"
-                    )
-                here = Path(entry.path)
-                if entry.is_symlink():
-                    raise SnapshotError(
-                        f"the episode left a symbolic link in its output tree ({entry.name} -> "
-                        f"{os.readlink(here)}), which a grader must not resolve"
-                    )
-                if entry.is_dir(follow_symlinks=False):
-                    (target / entry.name).mkdir()
-                    pending.append((here, target / entry.name, depth + 1))
-                    continue
-                if not entry.is_file(follow_symlinks=False):
-                    raise SnapshotError(
-                        f"the episode left {entry.name}, which is not a file or directory"
-                    )
-                total += entry.stat(follow_symlinks=False).st_size
-                if total > _SNAPSHOT_MAX_BYTES:
-                    raise SnapshotError(
-                        f"the episode's output tree is larger than {_SNAPSHOT_MAX_BYTES} bytes"
-                    )
-                total = _copy_bounded(here, target / entry.name, began=began, stop=stop, seen=total)
+        bound.descend(depth)
+        for name in _names(source, bound):
+            entry = source / name
+            bound.alive()
+            if entry.is_symlink():
+                raise SnapshotError(
+                    f"the episode left a symbolic link in its output tree ({name} -> "
+                    f"{os.readlink(entry)}), which a grader must not resolve"
+                )
+            if entry.is_dir():
+                (target / name).mkdir()
+                pending.append((entry, target / name, depth + 1))
+                continue
+            if not entry.is_file():
+                raise SnapshotError(f"the episode left {name}, which is not a file or directory")
+            # Offered before it is opened, so a file whose length alone breaks the budget costs a
+            # `stat` rather than a gigabyte, and accounted for again as it is read, so a file that
+            # is longer than it said cannot spend more than the budget either.
+            bound.offer(entry.stat().st_size)
+            _copy(entry, target / name, bound)
     return into
 
 
@@ -1559,6 +1719,7 @@ __all__ = [
     "control_file",
     "control_home",
     "corpus_digest",
+    "corpus_snapshot",
     "runtime_digest",
     "derived_root",
     "episode_outputs",
