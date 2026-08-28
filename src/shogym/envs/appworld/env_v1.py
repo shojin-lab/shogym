@@ -355,7 +355,7 @@ class AppWorldEnv(Env):
             graded=self._graded,
             task_id=task_id,
             write_log=lambda source, into: adapter.seed(
-                source_dbs=source, into=into, rows=rows
+                root=self._derived.parent, source_dbs=source, into=into, rows=rows
             ),
             verify=self._source_check,
         )

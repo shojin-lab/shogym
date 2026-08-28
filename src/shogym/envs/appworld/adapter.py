@@ -915,7 +915,7 @@ def _one_shot(
 >>>>>>> f4000d8 (appworld: run the episode worker in a container, over stdio rather than a port)
 
 
-def seed(*, source_dbs: Path, into: Path, rows: Dict[str, Any]) -> Any:
+def seed(*, root: Path, source_dbs: Path, into: Path, rows: Dict[str, Any]) -> Any:
     """Write one task's seeded database log, in a container of its own.
 
 <<<<<<< HEAD
@@ -989,13 +989,27 @@ def snapshot_outputs(outputs: Path, *, into: Path) -> Path:
     return into
 =======
     ``source_dbs`` is the task's own input databases in the downloaded corpus and ``into`` is the
-    file being written inside a staging directory. Two mounts, one read-only and one not, and no
-    corpus root: the model layer is given both paths outright."""
+    file being written inside a staging directory. ``root`` is the derived root, mounted because
+    upstream's model layer resolves an app's base database under ``APPWORLD_ROOT`` and a load with
+    no root reaches for one under the working directory.
+
+    Three mounts, one of them writable, and that one is the staging directory. This container runs
+    no agent code, so its mount set is a matter of keeping the seam narrow rather than a boundary:
+    what it can see is one task's inputs and the tree it is writing into."""
+    shared = [
+        Mount(entry, f"{CORPUS_MOUNT}/data/{entry.name}")
+        for entry in sorted((root / "data").iterdir())
+        if entry.name != "tasks"
+    ]
     return _one_shot(
         role="seed",
         body={**rows, "from_dbs": "/from", "into": f"/into/{into.name}"},
-        mounts=[Mount(source_dbs, "/from"), Mount(into.parent, "/into", writable=True)],
-        environment={"HOME": container.SCRATCH_MOUNT, "PYTHONDONTWRITEBYTECODE": "1"},
+        mounts=[
+            *shared,
+            Mount(source_dbs, "/from"),
+            Mount(into.parent, "/into", writable=True),
+        ],
+        environment=_worker_environment(CORPUS_MOUNT),
         timeout=_SEED_TIMEOUT_SECONDS,
         what=f"seeding {into.parent.parent.name}",
     )

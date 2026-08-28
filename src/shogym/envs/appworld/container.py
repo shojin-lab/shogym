@@ -11,13 +11,13 @@ they are absent.
 
 Three roles run through here, and only the first ever runs agent-authored code:
 
-- ``serve`` — one episode's world, held open for the length of the episode, talking to the parent
-  over its own stdin and stdout (see :mod:`shogym.envs.appworld.worker`).
-- ``seed`` — one short-lived container that writes one task's seeded database log into a staging
-  directory. It exists because that log has to be written through upstream's own model layer, and
-  upstream is not installed on the host at all.
-- ``grade`` and ``unpack`` — short-lived containers for the base task's evaluator and for opening
-  the pinned data bundle. Neither is ever handed a line an agent wrote.
+``serve`` is one episode's world, held open for the length of the episode, talking to the parent
+over its own stdin and stdout (see :mod:`shogym.envs.appworld.worker`). ``seed`` is one
+short-lived container that writes one task's seeded database log into a staging directory; it
+exists because that log has to be written through upstream's own model layer and upstream is not
+installed on the host at all. ``grade`` and ``unpack`` are short-lived containers for the base
+task's evaluator and for opening the pinned data bundle. Only the first ever runs agent-authored
+code.
 
 **The transport is stdio, not a port.** A container-loopback listener is not forwardable, a
 published port is not loopback-only, and ``--network none`` and ``-p`` are mutually exclusive. So

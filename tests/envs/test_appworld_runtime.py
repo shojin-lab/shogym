@@ -83,6 +83,11 @@ def test_a_relative_cache_root_still_produces_links_that_resolve(
     assert adapter.cache_root().is_absolute()
     assert adapter.graded_root().is_absolute()
 
+    # Cleared again at the end, not only at the start: the tag is memoized for the process, and a
+    # value drawn under this test's own relative cache root would otherwise be the tag every later
+    # test in the same session computed the grader's directory name from.
+    request_cleanup = adapter._private_tag.cache_clear
+
     original = tmp_path / "corpus" / "data"
     (original / "tasks").mkdir(parents=True)
     (original / "shared").write_text("base databases")
@@ -92,6 +97,7 @@ def test_a_relative_cache_root_still_produces_links_that_resolve(
     # No symlink to resolve at all now, which is the stronger form of the same guarantee.
     assert not materialised.is_symlink()
     assert materialised.exists() and materialised.read_text() == "base databases"
+    request_cleanup()
 
 
 # ----- concurrency -----

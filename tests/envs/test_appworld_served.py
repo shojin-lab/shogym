@@ -25,6 +25,8 @@ import zlib
 from pathlib import Path
 from typing import Any, Dict, List
 
+import pytest
+
 
 from tests._fixtures.upstream_gate import provisioned
 
@@ -675,12 +677,59 @@ async def test_the_container_is_gone_when_the_episode_is() -> None:
     worker = adapter.Worker.spawn(
         adapter.derived_root(),
         task_id=task_id(),
-        experiment="shogym-teardown-probe",
-        outputs=adapter.derived_root() / "experiments" / "outputs" / "shogym-teardown-probe",
+        outputs=adapter.episode_outputs("teardown-probe"),
     )
     assert container_module.running(worker.container)
     worker.close()
     assert not container_module.running(worker.container)
+
+
+async def test_the_worlds_container_is_gone_before_the_grader_starts(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The ordering, exercised at the container rather than at the process.
+
+    `read` flushes the end state into the episode's output directory, which is the one directory
+    the world may write and the one the grading container reads. A world still running while that
+    happens is agent-authored code with a live handle on the bytes it is about to be scored on: a
+    thread left behind by an earlier block could rewrite the flushed state after the flush and
+    before the grader opened it, and no assertion downstream would notice.
+
+    :func:`test_the_world_stops_before_it_is_graded` asserts the worker process is gone. This
+    asserts the container is, which is the stronger of the two and the one that holds when agent
+    code has started processes of its own: removing a container ends everything in its namespace,
+    where signalling a process group ends everything that stayed in the group."""
+    from shogym.envs.appworld import adapter as adapter_module
+    from shogym.envs.appworld import container as container_module
+    from shogym.envs.appworld import mcp_server
+
+    alive: List[bool] = []
+    real = adapter_module.grade
+
+    def _watching(**kwargs: Any) -> Any:
+        alive.append(any(container_module.running(name) for name in names))
+        return real(**kwargs)
+
+    env = shogym.make("appworld")
+    episode = await ServedEpisode.open_env(env, env_name="appworld", task=TASK)
+    session = mcp_server.get_session(episode.session_id)
+    assert session is not None
+    names = [session.worker.container]
+    monkeypatch.setattr(adapter_module, "grade", _watching)
+    try:
+        await episode.call("execute", {"code": filing_block()})
+        terminal = await episode.call("submit", {})
+    finally:
+        await episode.close()
+    # The grader ran, and the world's container was already gone when it did.
+    assert alive == [False], alive
+    feedback = {
+        item["name"]: item["value"] for item in (terminal.meta.get("shogym/feedback") or [])
+    }
+    # And stopping the world first did not cost the episode its grade: the base task's own checks
+    # are still collected, from the state the world flushed before it was stopped.
+    assert feedback["checks"] > 0
+    assert feedback["ledger_fraction"] == 1.0
 
 
 async def test_several_worlds_alive_at_once_stay_several_worlds() -> None:

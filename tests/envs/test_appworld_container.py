@@ -22,7 +22,7 @@ from shogym.envs.appworld import adapter, container
 
 
 def _corpus(root: Path) -> Path:
-    """A derived root with the shape the real one has: shared parts, two tasks, an output tree."""
+    """A derived root with the shape the real one has: shared parts and two tasks."""
     data = root / "data"
     for name in ("api_docs", "base_dbs", "datasets"):
         (data / name).mkdir(parents=True)
@@ -30,7 +30,6 @@ def _corpus(root: Path) -> Path:
     for task in ("abc_1", "def_2"):
         (data / "tasks" / task / "dbs").mkdir(parents=True)
         (data / "tasks" / task / "specs.json").write_text("{}")
-    (root / "experiments" / "outputs").mkdir(parents=True)
     return root
 
 
@@ -38,14 +37,13 @@ def _corpus(root: Path) -> Path:
 
 
 def test_one_episode_is_given_one_task_and_one_output_tree(tmp_path: Path) -> None:
-    """The corpus holds 318 tasks and a run's output tree holds one directory per episode, so
-    mounting either wholesale would put every other task's world and every sibling episode's end
-    state one ``listdir`` away. The mount set names one of each."""
+    """The corpus holds 318 tasks and every episode has an output tree of its own, so mounting
+    either wholesale would put another task's world or another episode's end state one ``listdir``
+    away. The mount set names one of each, and the output tree is mounted outside the corpus at a
+    fixed name, which is what the world is then told its experiment is."""
     root = _corpus(tmp_path / "seeded")
-    outputs = root / "experiments" / "outputs" / "shogym-one"
-    mounts = adapter.served_mounts(
-        root=root, task_id="abc_1", outputs=outputs, experiment="shogym-one"
-    )
+    outputs = tmp_path / "private" / "episode-abc"
+    mounts = adapter.served_mounts(root=root, task_id="abc_1", outputs=outputs)
     targets = {mount.target: mount for mount in mounts}
     assert targets.keys() == {
         "/corpus/data/api_docs",
@@ -53,8 +51,11 @@ def test_one_episode_is_given_one_task_and_one_output_tree(tmp_path: Path) -> No
         "/corpus/data/datasets",
         "/corpus/data/version.txt",
         "/corpus/data/tasks/abc_1",
-        "/corpus/experiments/outputs/shogym-one",
+        "/outputs",
     }
+    # The output tree is not under the corpus at all, so nothing an episode writes lands in the
+    # tree the next episode is served.
+    assert not str(outputs).startswith(str(root))
     # The other task is on the host, in the same tree, and is not in the mount set.
     assert (root / "data" / "tasks" / "def_2").is_dir()
     assert not [mount for mount in mounts if "def_2" in str(mount.source)]
@@ -68,13 +69,10 @@ def test_the_only_writable_mount_is_the_episodes_own_output_tree(tmp_path: Path)
     also what stops an episode editing the task it is about to be graded on."""
     root = _corpus(tmp_path / "seeded")
     mounts = adapter.served_mounts(
-        root=root,
-        task_id="abc_1",
-        outputs=root / "experiments" / "outputs" / "shogym-one",
-        experiment="shogym-one",
+        root=root, task_id="abc_1", outputs=tmp_path / "private" / "episode-abc"
     )
     writable = [mount.target for mount in mounts if mount.writable]
-    assert writable == ["/corpus/experiments/outputs/shogym-one"]
+    assert writable == ["/outputs"]
     for mount in mounts:
         assert mount.as_argument().endswith(":rw" if mount.writable else ":ro")
 
@@ -82,22 +80,25 @@ def test_the_only_writable_mount_is_the_episodes_own_output_tree(tmp_path: Path)
 def test_the_graders_view_is_the_answers_and_the_end_state_and_they_are_two_trees(
     tmp_path: Path,
 ) -> None:
-    """The answers live in a private tree and the end state under the served root, and the
-    evaluator wants both under one root. That used to be a symlink from the private tree into the
-    served one, published under a lock because two cold constructors raced on creating it. It is
-    two mounts now, so there is no link and no race."""
+    """The answers live in a private tree and the episode's end state in another, and the
+    evaluator wants a root and an experiment. That used to be a symlink from the private tree into
+    the served one, published under a lock because two cold constructors raced on creating it. It
+    is two mounts now, so there is no link and no race.
+
+    The grading container is given this episode's output tree and no other's, which is the same
+    property the world's container has and a different reason for it: nothing here runs a line an
+    agent wrote, and one episode's evaluator has no business opening another's end state."""
     graded = _corpus(tmp_path / "graded")
     (graded / "data" / "tasks" / "abc_1" / "ground_truth").mkdir()
-    outputs = tmp_path / "seeded" / "experiments" / "outputs" / "shogym-one"
-    mounts = adapter.graded_mounts(
-        graded=graded, task_id="abc_1", outputs=outputs, experiment="shogym-one"
-    )
+    outputs = tmp_path / "private" / "episode-abc"
+    mounts = adapter.graded_mounts(graded=graded, task_id="abc_1", outputs=outputs)
     targets = {mount.target for mount in mounts}
     assert "/graded/data/tasks/abc_1" in targets
-    assert "/graded/experiments/outputs/shogym-one" in targets
+    assert "/outputs" in targets
+    assert "/graded/data/tasks/def_2" not in targets
     # The two sources are in different trees on the host, which is the point of the second mount.
     sources = {mount.target: mount.source for mount in mounts}
-    assert sources["/graded/experiments/outputs/shogym-one"] == outputs
+    assert sources["/outputs"] == outputs
     assert not str(outputs).startswith(str(graded))
 
 
