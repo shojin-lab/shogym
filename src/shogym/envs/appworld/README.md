@@ -642,7 +642,7 @@ timeout above it can end.
 
 **Nothing the world writes is read as an instruction.** The save record the world leaves beside
 its databases says which block it had finished and how long each log it wrote was, which is what
-tells a save that finished from one that was interrupted mid-sequence — the bytes cannot, because
+tells a save that finished from one that was interrupted mid-sequence. The bytes cannot, because
 an interrupted save leaves every filename and a syntactically perfect tail. It is written by the
 process that runs agent-authored code, so what it establishes is completeness against an
 interruption rather than against an adversary, and it is read that way: the names walked are the
@@ -683,13 +683,30 @@ same corpus: per-episode startup 1.87s to 2.32s, one `execute` round trip 1.8ms 
 empty block and 3.9ms to 11.1ms on one that makes an API call, grading 1.43s to 1.80s, and a whole
 served episode 8.72s to 8.99s. The image builds in about half a minute and is 95 MB.
 
-**What the world can learn about the host is names, not contents.** `/proc/self/mountinfo` is
-readable from inside and names the host-side source of every bind: the cache root, the private
-home and its tag, and this episode's own output directory. None is openable from there, none is
-the Docker socket, and none is a key, a pulse or a grade; and none of them differs between two
-arms of a pair, so a world cannot read its treatment off its own filesystem. The container's short
-id is kept out of the environment by giving every container the same hostname. The claim is about
-contents, and the port does not claim its paths are secret.
+**What the world can learn about the host is names, and a description of the machine it cannot
+be given a different one of.** `/proc/self/mountinfo` is readable from inside and names the
+host-side source of every bind: the cache root, the private home and its tag, and this episode's
+own output directory. None is openable from there, none is the Docker socket, and none is a key, a
+pulse or a grade; and none of them differs between two arms of a pair, so a world cannot read its
+treatment off its own filesystem. The container's short id is kept out of the environment by
+giving every container the same hostname.
+
+A container's `/proc` is the second half of that, and it is the half this port used to overclaim.
+The kernel virtualizes the process tree per namespace and virtualizes almost nothing else, so the
+machine's processor inventory, its memory, how long it had been up and what it had been doing were
+all readable from a block of agent-authored code. None of that is ground truth, a grade, a pulse or
+an arm label, and both arms on one host read the same numbers; what it is, is a description of the
+machine rather than of the world, and a pair split across two machines would read two descriptions
+under one identity. So fixed files are mounted over `cpuinfo`, `meminfo`, `uptime`, `stat`,
+`loadavg`, `swaps` and `diskstats`, which is the set the container runtime will let a bind cover,
+and they are well formed rather than blank because the world's own dependencies parse them.
+
+**What remains readable, and is not covered by anything above:** `/proc/sys/kernel/random/boot_id`,
+`/proc/version`, the processor count as `sched_getaffinity` reports it (the port limits cpu by
+quota, not by affinity), and `/sys`. A bind onto an arbitrary path inside `/proc` is refused by
+the runtime, so covering those would need a userspace filesystem in every container rather than a
+flag. Two arms on one host read the same values for all of them; two arms on two hosts do not, and
+a paired design that splits across machines should say so.
 
 **A container whose parent died is swept, not hoped about.** Every container carries the pid that
 started it and this machine's boot, and construction removes the labelled ones whose parent is

@@ -1145,12 +1145,38 @@ class Worker:
         path that set it on a best-effort removal marked the container absent without asking, and
         finalization's own gate then returned early and graded a tree the container might still
         have been writing to. So this asks, and hands the container to the sweep when the answer
-        does not come."""
+        does not come.
+
+        **And it drops this process's own half either way.** It did not, and `close` returns at
+        once on a worker already marked closed, so the only wait and the only descriptor close in
+        this class were skipped for the whole life of a worker that failed: every timeout and every
+        broken frame left an attached `docker run` client and a pipe pair behind, for a run that
+        may serve hundreds of episodes. The container is somebody else's to worry about when the
+        daemon will not answer; the client and the pipes are nobody's but this one's."""
         try:
             container.remove(self.container, confirm=True)
             self.closed = True
         except container.DockerError:
             self.disown()
+        finally:
+            self._release_local()
+
+    def _release_local(self) -> None:
+        """End the local ``docker run`` client and drop the pipe pair, and never raise.
+
+        This process's own half of a worker, which is separate from the container's removal
+        because the two fail independently and only one of them is anybody else's business.
+        Killing the client does not stop a container and never did; what it does is stop this
+        process holding a child and two descriptors for a world that is over.
+
+        Idempotent, because every path out of a worker ends here and some of them arrive twice."""
+        if self.process.poll() is None:
+            self.process.kill()
+            try:
+                self.process.wait(timeout=_CLOSE_SECONDS)
+            except subprocess.TimeoutExpired:
+                pass
+        _close_pipes(self.process)
 
     def disown(self) -> None:
         """Hand this container to the sweep, by name, because nothing here can remove it.
@@ -1276,13 +1302,7 @@ class Worker:
             # container is known to be gone, and when it is not it has already written the name
             # where the sweep will find it.
             self.closed = bool(gone)
-        if self.process.poll() is None:
-            self.process.kill()
-            try:
-                self.process.wait(timeout=_CLOSE_SECONDS)
-            except subprocess.TimeoutExpired:
-                pass
-        _close_pipes(self.process)
+        self._release_local()
 
 
 def _one_shot(

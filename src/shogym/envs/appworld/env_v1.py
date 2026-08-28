@@ -42,11 +42,12 @@ import asyncio
 import datetime as dt
 import hashlib
 import os
+import stat
 import threading
 import time
 import zlib
 from pathlib import Path
-from typing import TYPE_CHECKING, Any, Dict, Optional
+from typing import TYPE_CHECKING, Any, Dict, Optional, Sequence
 
 from shogym.core import Env
 from shogym.envs.appworld import adapter, container, payload, world
@@ -328,27 +329,25 @@ class AppWorldEnv(Env):
         # directory: AppWorld joins an experiment name onto its own output root, so an absolute
         # one replaces the root, and inside the container the absolute one is the mount point.
         outputs = adapter.episode_outputs(session_id)
-        # Claimed before anything is written into them, so a sweep racing this construction sees
-        # an owner rather than an untouched directory.
-        #
-        # **Both trees, and the second one is claimed long before it exists.** Finalization copies
-        # the stopped output tree into a sibling directory to hand the grader, and that one was
-        # created without a claim: a process that died between the copy and its teardown left a
-        # tree the control plane said nothing about, which `_reclaimable` treats as unknown
-        # for ever rather than guessing about. Claim first and create later is the rule for every
-        # generated tree here, and a claim on a directory that never gets made costs one small
-        # file that teardown drops.
-        _claim_tree(outputs)
-        _claim_tree(_snapshot_of(outputs))
         experiment = container.OUTPUTS_MOUNT
         view = adapter.episode_view(session_id)
         # **Everything made before the session exists is made under this guard**, and the guard
-        # starts here rather than at the spawn: deriving a task the corpus does not have fails
-        # too, and it failed after the output tree had been claimed, so the tree was left with
-        # nothing holding it. The env's own close finds no session, so nothing else was going to
-        # remove either of them.
+        # starts at the first claim rather than at the spawn: a claim can fail too, and so can
+        # deriving a task the corpus does not have, and both used to fail after a tree had been
+        # made with nothing holding it. The env's own close finds no session, so nothing else was
+        # going to remove any of them.
         worker: Optional[adapter.Worker] = None
         try:
+            # **Claimed before it exists, and every tree this port generates is.** A sweep
+            # racing this construction has to find an owner rather than an untouched directory,
+            # and `_reclaimable` refuses to guess about a tree the control plane never heard of,
+            # so a directory that appeared before its record is one nothing will ever take.
+            _claim_tree(outputs)
+            # Claimed and not created: finalization is what makes the copy handed to the grader,
+            # and the claim has to be older than the directory rather than older than the copy
+            # into it. A record naming a directory that never gets made is one small file, which
+            # teardown drops and the sweep collects.
+            _claim_tree(_snapshot_of(outputs), create=False)
             # Deriving comes first, and has to: the world's container mounts this one task's tree,
             # so the tree has to exist before there is a container to mount it into. Seeding is a
             # container of its own, which is also why it no longer needs this episode's worker.
@@ -401,6 +400,12 @@ class AppWorldEnv(Env):
             # them, and the handle is dropped last, so nothing between here and there loses it.
             _discard(Path(session.view), session.outputs, _snapshot_of(session.outputs))
             mcp_server.end_session(session_id)
+            # Whatever that teardown could not finish is written down, and this is what comes back
+            # for it. Construction used to be the only thing that ever started a pass, and every
+            # failure that defers work happens after one: a run holding a single env for a whole
+            # queue recorded work nothing in the process would ever return to. On a thread, so an
+            # episode's end does not wait for a sweep (see `_housekeep`).
+            _housekeep()
 
     def _derive(self, task_id: str) -> None:
         """Make sure the seeded copy of ``task_id``'s world exists, writing it if it does not.
@@ -741,7 +746,6 @@ def _discard(*paths: Path) -> None:
     ownership records after a removal that had ignored its own errors, which left whatever
     remained unknown to the control plane and therefore never retried. The records are dropped
     only once the root is confirmed absent."""
-    import shutil
 
     for path in paths:
         try:
@@ -762,14 +766,71 @@ def _discard(*paths: Path) -> None:
             # process exited.
             _mark_ended(path)
             continue
-        shutil.rmtree(path, ignore_errors=True)
-        if os.path.lexists(path):
-            # `ignore_errors` means this call has already swallowed whatever stopped it. What is
-            # left is a partial tree, and the honest record of it is an ended episode a sweep
-            # will come back to rather than no record at all.
+        if not _remove_tree(path):
+            # What is left is a partial tree, and the honest record of it is an ended episode a
+            # sweep will come back to rather than no record at all.
             _mark_ended(path)
             continue
         _forget_tree(path)
+
+
+def _remove_tree(root: Path) -> bool:
+    """Remove ``root`` and say whether it is gone, repairing owner access once if it is not.
+
+    **A retry that changes nothing is not a retry.** `/outputs` is bound into the served container
+    writable and the container runs as this user, so a block of agent-authored code can leave a
+    directory it owns with no traversal bit on it. `shutil.rmtree` cannot enter that directory, and
+    `ignore_errors=True` means it says nothing about having failed; every later pass then made the
+    same call, got the same result and left the same bytes, so a tree that was recorded as still
+    somebody's was one nothing was ever going to reclaim.
+
+    The repair is the owner's own bits, which is all it takes: the process that cannot enter the
+    directory is the one that owns it. It is bounded like the walk that precedes it, and it is
+    attempted once, so a tree that survives two removals with a permission repair between them is
+    a tree this leaves where it is and records rather than one it keeps grinding at.
+
+    Symbolic links are never followed and never chmod-ed: unlinking one needs the bits on its
+    parent, and following one would put this walk somewhere the episode chose."""
+    import shutil
+
+    shutil.rmtree(root, ignore_errors=True)
+    if not os.path.lexists(root):
+        return True
+    _restore_owner_access(root)
+    shutil.rmtree(root, ignore_errors=True)
+    return not os.path.lexists(root)
+
+
+def _restore_owner_access(root: Path) -> None:
+    """Give the owner back traversal and write on what is left of a tree. Bounded, never raises.
+
+    Each directory is chmod-ed *before* it is listed, which is the whole point and is why this is
+    not an `os.walk`: a walk cannot enumerate a directory it cannot enter, so it would skip the
+    one node the repair exists for."""
+    pending = [root]
+    spent = 0
+    while pending:
+        path = pending.pop()
+        spent += 1
+        if spent > _DISCARD_MAX_NODES:
+            return
+        try:
+            mode = path.lstat().st_mode
+        except OSError:
+            continue
+        if stat.S_ISLNK(mode):
+            continue
+        wanted = stat.S_IRWXU if stat.S_ISDIR(mode) else stat.S_IRUSR | stat.S_IWUSR
+        if mode & wanted != wanted:
+            try:
+                os.chmod(path, stat.S_IMODE(mode) | wanted)
+            except OSError:
+                continue
+        if stat.S_ISDIR(mode):
+            try:
+                pending.extend(path / name for name in os.listdir(path))
+            except OSError:
+                continue
 
 
 #: What the control plane records about a per-episode tree. ``owner`` names the process that made
@@ -799,8 +860,17 @@ _SWEEP_SECONDS = 5.0
 _HOUSEKEEPING = threading.Lock()
 
 
+#: How long a housekeeping thread waits between passes, and how many it will make. Deferred work
+#: is written down when it is deferred, so a pass that leaves some is followed by another rather
+#: than by nothing: the case is a teardown failure, which by definition happens after the pass a
+#: construction started. Capped so the thread ends: what is still there when the passes run out is
+#: still written down, and the next episode's end wakes a new one.
+_HOUSEKEEPING_INTERVAL_SECONDS = 5.0
+_HOUSEKEEPING_MAX_PASSES = 12
+
+
 def _housekeep() -> None:
-    """Clear what the last run left behind, on a thread, and never make a caller wait for it.
+    """Clear what this run and the last one left behind, on a thread nothing waits on.
 
     Two jobs. Containers whose parent process is gone, which is the case teardown cannot reach: a
     run that died while a world was wedged inside a command leaves a worker that never gets back
@@ -808,19 +878,48 @@ def _housekeep() -> None:
     fires. And the per-episode trees teardown declined to walk, plus whatever a crash left behind.
 
     **On a thread, because the caller may be an event loop.** Both are Docker control calls and
-    filesystem walks over what a previous run left, and this runs in a constructor a serve layer
-    calls while it is dispensing — before the ``await`` that opens the episode, so every sibling
+    filesystem walks over what a previous run left, and construction runs in a call a serve layer
+    makes while it is dispensing, before the ``await`` that opens the episode, so every sibling
     episode, every deadline and the other arm of a pair waited out the whole of it. Each pass is
-    bounded now as well (see :func:`container.reap` and :func:`_sweep_leftovers`), and a bounded
-    stall on the loop that dispenses tasks is still a stall on it. Nothing waits on the result:
-    what this does not finish is still there for the next construction to find.
+    bounded as well (see :func:`container.reap` and :func:`_sweep_leftovers`), and a bounded stall
+    on the loop that dispenses tasks is still a stall on it.
+
+    **And it recurs while there is work, because deferring work is not doing it.** Construction was
+    the only thing that ever started a pass, and the failures that write work down happen after it:
+    a container the daemon would not remove is disowned during a teardown, and a tree that could not
+    be walked is marked ended there too. A run that builds one env and serves two hundred tasks
+    from it, which is what this port's README recommends, therefore recorded deferred work that
+    nothing in the process was ever going to come back to. Every episode's end asks for a pass, and
+    a pass that leaves work behind schedules the next one itself.
 
     One pass at a time, and failures are swallowed: this is housekeeping, and an env that could
     not tidy up after a previous run is an env that can still serve."""
     if not _HOUSEKEEPING.acquire(blocking=False):
         return
 
-    def _pass() -> None:
+    def _held() -> None:
+        try:
+            _housekeeping_passes()
+        finally:
+            _HOUSEKEEPING.release()
+
+    try:
+        threading.Thread(target=_held, name="shogym-appworld-housekeeping", daemon=True).start()
+    except RuntimeError:
+        # A process that cannot start a thread is one shutting down, and there is nothing here
+        # worth failing a construction over.
+        _HOUSEKEEPING.release()
+
+
+def _housekeeping_passes() -> None:
+    """Sweep until nothing is outstanding or the passes run out.
+
+    Synchronous, and holding nothing, so that what it does can be tested without a thread and
+    without a clock; the lock belongs to :func:`_housekeep`, which is what decides that one pass
+    is running at a time."""
+    for attempt in range(_HOUSEKEEPING_MAX_PASSES):
+        if attempt:
+            time.sleep(_HOUSEKEEPING_INTERVAL_SECONDS)
         try:
             container.reap()
             _sweep_leftovers(
@@ -829,15 +928,24 @@ def _housekeep() -> None:
             )
         except Exception:  # noqa: BLE001 — housekeeping never fails a construction
             pass
-        finally:
-            _HOUSEKEEPING.release()
+        if not _deferred_work():
+            return
 
+
+def _deferred_work() -> bool:
+    """Whether anything is still written down as somebody's to clean up.
+
+    The two places work is deferred to: the ledger of containers nobody could remove, and the
+    ended sidecars a teardown that could not finish leaves behind."""
     try:
-        threading.Thread(target=_pass, name="shogym-appworld-housekeeping", daemon=True).start()
-    except RuntimeError:
-        # A process that cannot start a thread is one shutting down, and there is nothing here
-        # worth failing a construction over.
-        _HOUSEKEEPING.release()
+        if container.outstanding():
+            return True
+    except OSError:
+        return False
+    try:
+        return any(adapter.control_home().glob(f"*.{_ENDED_KIND}"))
+    except OSError:
+        return False
 
 
 def _snapshot_of(outputs: Path) -> Path:
@@ -848,17 +956,38 @@ def _snapshot_of(outputs: Path) -> Path:
     return Path(str(outputs) + ".graded")
 
 
-def _claim_tree(root: Path) -> None:
-    """Record, in the control plane, which process a per-episode tree belongs to."""
+def _claim_tree(root: Path, *, create: bool = True) -> None:
+    """Record which process a per-episode tree belongs to, before the tree can be seen.
+
+    **The sidecar is published first, and a claim that cannot be made fails the setup.** This
+    created the root and then wrote the record, and swallowed every ``OSError`` on the way, so two
+    things it exists to rule out were reachable: an interruption between the two left a directory
+    the control plane had never heard of, and a control home that could not be written left one
+    silently, with the episode carrying on around it. `_reclaimable` refuses to guess about a tree
+    with no claim, by design, so either of those is a directory no sweep will ever take.
+
+    The order is the other way round now: the record goes down, and only then is the root made. A
+    crash between them leaves a record naming a directory that does not exist, which costs one
+    small file and which the sweep collects; the reverse left bytes nobody would ever remove.
+
+    ``create=False`` is for a tree something else will make later, which is the copy handed to the
+    grader: the claim is what has to exist first, and the directory is finalization's to create."""
     from shogym.envs.appworld import container as container_module
 
+    marker = adapter.control_file(root, _OWNER_KIND)
+    marker.write_text(f"{os.getpid()} {container_module.process_birth(os.getpid())}\n")
+    if not create:
+        return
     try:
         root.mkdir(parents=True, exist_ok=True)
-        adapter.control_file(root, _OWNER_KIND).write_text(
-            f"{os.getpid()} {container_module.process_birth(os.getpid())}\n"
-        )
     except OSError:
-        pass
+        # There is no tree to own, so the record is not left standing for one. Raised on, because
+        # a session that cannot make its own output directory has nothing to serve.
+        try:
+            marker.unlink(missing_ok=True)
+        except OSError:
+            pass
+        raise
 
 
 def _mark_ended(root: Path) -> None:
@@ -931,7 +1060,6 @@ def _sweep_leftovers(*homes: Path) -> None:
     construct one on its serving loop. The deadline is checked before each removal *and* the
     removals are capped, so one large tree cannot hold a construction open past the bound by more
     than the single deletion it was already inside."""
-    import shutil
 
     began = time.monotonic()
     removed = 0
@@ -945,14 +1073,42 @@ def _sweep_leftovers(*homes: Path) -> None:
                 return
             if not entry.is_dir() or not _reclaimable(entry):
                 continue
-            shutil.rmtree(entry, ignore_errors=True)
             removed += 1
-            if os.path.lexists(entry):
+            if not _remove_tree(entry):
                 # Removed as much as it could and no more. The records stay, so the next sweep
                 # still knows this tree is nobody's and comes back to it; erasing them here made
                 # the leftover unknown to the control plane and therefore permanent.
                 continue
             _forget_tree(entry)
+    _sweep_records(homes)
+
+
+def _sweep_records(homes: Sequence[Path]) -> None:
+    """Drop control-plane records for trees that are gone and whose owner is too.
+
+    A claim is written before its tree is made, so an interruption between the two leaves a record
+    naming a directory that does not exist. That is the right way round, and it is still a file:
+    without this the control home grows one small record per crash, for ever. A record is dropped
+    only when its tree is absent *and* its owner is gone, which is the same question the tree sweep
+    above asks and the same evidence."""
+    home_by_name = {home.name: home for home in homes}
+    try:
+        records = sorted(adapter.control_home().iterdir())
+    except OSError:
+        return
+    for record in records:
+        name = record.name
+        for kind in (_OWNER_KIND, _ENDED_KIND):
+            if not name.endswith(f".{kind}"):
+                continue
+            stem = name[: -len(f".{kind}")]
+            parent, _, leaf = stem.partition("--")
+            home = home_by_name.get(parent)
+            if home is None or not leaf:
+                continue
+            root = home / leaf
+            if not os.path.lexists(root) and _reclaimable(root):
+                _forget_tree(root)
 
 
 # ----- pure helpers -----
