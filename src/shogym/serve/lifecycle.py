@@ -410,11 +410,22 @@ class FinalizationStore:
         return out, unreadable
 
     def _read_path(self, path: Path) -> Optional[FinalizationRecord]:
-        """One record from one entry, or ``None`` when that entry is not a record."""
+        """One record from one entry, or ``None`` when that entry is not a record.
+
+        **The name and the contents have to agree.** A record is written to the file its own
+        ``finalization_id`` names, so an entry whose contents claim a different id is not a
+        record this store wrote. Trusted, it is resolved and then *written back under the id it
+        claims*: one malformed file overwrites a valid `FINALIZED` record belonging to another
+        episode with its own fail-closed resolution, destroys that evidence, and stays
+        unresolved itself because its own file is never touched."""
+        record = None
         try:
-            return _record_from_dict(json.loads(path.read_text(encoding="utf-8")))
+            record = _record_from_dict(json.loads(path.read_text(encoding="utf-8")))
         except _UNREADABLE:
             return None
+        if self._path(record.finalization_id) != path:
+            return None
+        return record
 
     def recover(self) -> List[FinalizationRecord]:
         """Restart-recovery, fail-closed **and concurrency-safe**. For every record left

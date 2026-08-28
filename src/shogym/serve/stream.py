@@ -318,6 +318,7 @@ from shogym.serve.episode import (
     ServedEpisode,
     _build,
     _discarded,
+    _discarded_env,
     _Lifecycle,
 )
 from shogym.serve.server import build_tool
@@ -1901,7 +1902,11 @@ class _Builder:
 
     lifecycle: Any
     building: Any
+    #: The constructor's context. A `Context` may be entered once at a time, and the build is
+    #: already inside this one, so the close gets its own copy of the same values rather than a
+    #: second entry into the same object.
     context: "contextvars.Context"
+    close_context: "contextvars.Context"
     adopted: bool = False
 
 
@@ -3605,12 +3610,15 @@ class TaskStream:
             # adopted by another was closed under the *adopting* caller's context, so an env
             # whose constructor took a tenant-scoped resource released a different tenant's.
             context = contextvars.copy_context()
+            close_context = contextvars.copy_context()
             building = (
                 lifecycle.run(_build(lambda: self._env_for(ref.env)), context)
                 if self._off_loop_factory
                 else None
             )
-            held = self._builders[position] = _Builder(lifecycle, building, context)
+            held = self._builders[position] = _Builder(
+                lifecycle, building, context, close_context
+            )
         held.adopted = True
         return held
 
@@ -3625,7 +3633,13 @@ class TaskStream:
             if held.adopted:
                 continue
             del self._builders[position]
-            held.lifecycle.stop_when(_discarded(held.lifecycle, held.building))
+            # Under the context its constructor ran in, not under whatever `aclose`'s caller
+            # happens to hold. That is the whole reason the builder keeps one: an env that took a
+            # tenant-scoped resource releases a tenant-scoped resource, and shutdown is not a
+            # place for it to release somebody else's.
+            held.lifecycle.stop_when(
+                _discarded(held.lifecycle, held.building, held.close_context)
+            )
 
     async def _release_stream(self) -> None:
         """Let go of what only this stream holds: its deadline watchdog, then its catalog envs.
@@ -3825,14 +3839,24 @@ class TaskStream:
                     env = self._env_for(ref.env)
             except BaseException:
                 # Not this pull's any more: the next one for this position adopts it, and a
-                # shutdown may discard it, because nobody is waiting for it now.
+                # shutdown may discard it, because nobody is waiting for it now. Unless the
+                # shutdown has already been and gone: `_drop_builders` skipped this one while it
+                # was adopted and nothing scans again, so there is no later pull and no second
+                # sweep, and letting go of it here means letting go of it for good.
                 held.adopted = False
+                if self._closed:
+                    self._builders.pop(position, None)
+                    held.lifecycle.stop_when(
+                        _discarded(held.lifecycle, held.building, held.close_context)
+                    )
                 if building is None or building.done():
                     # Nothing left to hand to a later pull: a synchronous factory that raised,
                     # or a build that has already failed. The one that is merely still running
                     # stays where it is, owed to this position.
                     self._builders.pop(position, None)
-                    lifecycle.stop_when(_discarded(lifecycle, building))
+                    lifecycle.stop_when(
+                        _discarded(lifecycle, building, held.close_context)
+                    )
                 raise
             self._builders.pop(position, None)
             # Spans after the build, not before it. A build survives a cancelled pull and the
@@ -3841,14 +3865,24 @@ class TaskStream:
             # three abandoned spans had taken was never given back. Nothing below this line needs
             # cleaning up when a span refuses to open, because the build it would have belonged
             # to is still owed to the position and still has an owner.
-            spans, dispensed_extensions = await self._begin_spans(ref)
+            try:
+                spans, dispensed_extensions = await self._begin_spans(ref)
+            except BaseException:
+                # The build has no owner from here: this pull took it out of `_builders` and the
+                # episode that would have owned it is never constructed, so an extension that
+                # raises, times out or is cancelled used to drop a built env and its lifecycle on
+                # the floor, once per retry and outside `max_in_flight`.
+                lifecycle.stop_when(
+                    _discarded_env(lifecycle, env, held.close_context)
+                )
+                raise
             episode = await ServedEpisode.open_env(
                 env,
                 env_name=ref.env,
                 task=ref.task_idx,
                 lifecycle=lifecycle,
                 built_on_lifecycle=self._off_loop_factory,
-                context=held.context,
+                context=held.close_context,
             )
             try:
                 # The episode's own snapshot, taken when it was opened and the same for every

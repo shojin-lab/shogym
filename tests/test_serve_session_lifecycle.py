@@ -1486,6 +1486,9 @@ def test_a_loop_loss_rollback_stops_its_own_lifecycle() -> None:
     env = _SlowSessionEnv(begin_seconds=0.3)
     loop = asyncio.new_event_loop()
     loop.set_exception_handler(lambda _loop, _context: None)
+    # This episode's own thread, not every thread in the process: another test's stream may still
+    # be shutting one of its own down, and that is not what this is about.
+    before = set(_session_threads_alive())
 
     async def give_up() -> None:
         opening = loop.create_task(ServedEpisode.open_env(env, task=0))
@@ -1499,7 +1502,7 @@ def test_a_loop_loss_rollback_stops_its_own_lifecycle() -> None:
     finally:
         loop.close()
     assert _until(env.closed.is_set)
-    assert _until(lambda: not _session_threads_alive()), _session_threads_alive()
+    assert _until(lambda: not (set(_session_threads_alive()) - before)), _session_threads_alive()
 
 
 async def test_a_cancelled_close_still_closes_the_env_and_stops_the_lifecycle() -> None:
@@ -1691,3 +1694,172 @@ def test_a_number_json_cannot_write_back_is_refused_however_deep_it_is(
     with _reads_counted(store) as reads:
         assert store.recover_once() == []
     assert reads["full"] == 0
+
+
+# ----- setup cleanup keeps the loop the env was built on -----
+
+
+async def test_a_failed_setup_closes_a_lifecycle_built_env_on_its_own_loop(
+    tmp_path: Path,
+) -> None:
+    # `here()` runs `env.close()` on whatever loop is asking, and both setup failure branches
+    # called it. A flagged env that had bound its constructor loop was therefore closed on the
+    # caller's, which is the one thing building it off that loop was meant to make impossible.
+    lifecycle = episode_module._Lifecycle("probe")
+    env = await episode_module._built(
+        lambda: _SlowSessionEnv(bind_loop=True, describe_error=RuntimeError("no contract")),
+        lifecycle,
+    )
+    with pytest.raises(RuntimeError, match="no contract"):
+        await ServedEpisode.open_env(
+            env, task=0, lifecycle=lifecycle, built_on_lifecycle=True
+        )
+    assert await _awaited(env.closed.is_set)
+    assert env.closed_on_a_foreign_loop is False
+    assert env.close_entries == 1
+
+
+# ----- a build nobody can take is closed, whoever dropped it -----
+
+
+async def test_a_span_that_refuses_does_not_leak_the_env_it_was_opening(
+    tmp_path: Path,
+) -> None:
+    # Once construction succeeds the pull is the build's only owner, and the spans are opened
+    # after it. An extension that raises used to drop the env and its lifecycle on the floor,
+    # once per retry and outside `max_in_flight`.
+    closed = threading.Event()
+
+    class _Noticing(_FixtureScoreEnv):
+        async def _close(self) -> None:
+            closed.set()
+
+    class _Refusing:
+        namespace = "refusing"
+
+        async def begin(self, *args: Any, **kwargs: Any) -> None:
+            raise RuntimeError("no span for you")
+
+        async def finalize(self, *args: Any, **kwargs: Any) -> None:
+            return None
+
+    stream = TaskStream(
+        lambda _name: _Noticing(tasks=list(TASKS)),
+        [TaskRef(ENV_NAME, 0)],
+        prov_dir=tmp_path / "prov",
+        off_loop_factory=True,
+        provenance=[_Refusing()],  # type: ignore[list-item]
+    )
+    with pytest.raises(BaseException):
+        await stream.get_task()
+    assert _until(closed.is_set), "the env the span refused was never closed"
+    with contextlib.suppress(BaseException):
+        await stream.aclose()
+
+
+async def test_a_pull_cancelled_after_shutdown_does_not_leave_its_build(
+    tmp_path: Path,
+) -> None:
+    # Shutdown skips a build a live pull has adopted, and nothing scans again. A pull cancelled
+    # after that skip therefore un-adopted a build with no shutdown left to come for it.
+    closed = threading.Event()
+    made = threading.Event()
+    release = threading.Event()
+
+    class _Noticing(_FixtureScoreEnv):
+        async def _close(self) -> None:
+            closed.set()
+
+    def factory(_name: str) -> _Noticing:
+        made.set()
+        release.wait(10.0)
+        return _Noticing(tasks=list(TASKS))
+
+    release.set()  # the catalog build runs inside the constructor and may not be held
+    stream = TaskStream(
+        factory, [TaskRef(ENV_NAME, 0)], prov_dir=tmp_path / "prov", off_loop_factory=True
+    )
+    made.clear()
+    release.clear()
+    pull = asyncio.ensure_future(stream.get_task())
+    assert await asyncio.to_thread(made.wait, 5.0)
+    closing = asyncio.ensure_future(stream.aclose())
+    await asyncio.sleep(0.05)
+    pull.cancel()
+    with contextlib.suppress(BaseException):
+        await pull
+    release.set()
+    with contextlib.suppress(BaseException):
+        await closing
+    assert _until(closed.is_set), "the build the shutdown skipped was never closed"
+
+
+async def test_shutdown_discards_a_build_under_the_context_it_was_built_in(
+    tmp_path: Path,
+) -> None:
+    # `_Builder` keeps the constructor's context for exactly this, and shutdown ignored it: a
+    # build started under one tenant was released under whoever happened to call `aclose`.
+    seen: Dict[str, Any] = {}
+    made = threading.Event()
+    release = threading.Event()
+
+    class _Noticing(_FixtureScoreEnv):
+        async def _close(self) -> None:
+            seen.setdefault("closed", []).append(_TENANT.get())
+
+    def factory(_name: str) -> _Noticing:
+        made.set()
+        release.wait(10.0)
+        return _Noticing(tasks=list(TASKS))
+
+    _TENANT.set("tenant-a")
+    release.set()
+    stream = TaskStream(
+        factory, [TaskRef(ENV_NAME, 0)], prov_dir=tmp_path / "prov", off_loop_factory=True
+    )
+    made.clear()
+    release.clear()
+    pull = asyncio.ensure_future(stream.get_task())
+    assert await asyncio.to_thread(made.wait, 5.0)
+    pull.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await pull
+    _TENANT.set("tenant-b")
+    closing = asyncio.ensure_future(stream.aclose())
+    release.set()
+    with contextlib.suppress(BaseException):
+        await closing
+    assert _until(lambda: len(seen.get("closed", [])) >= 2)
+    assert "tenant-a" in seen["closed"], seen
+
+
+# ----- a record is the file it is named by -----
+
+
+def test_a_record_that_names_another_file_is_not_a_record(tmp_path: Path) -> None:
+    # A record is written to the file its own id names, so an entry whose contents claim a
+    # different id is not one this store wrote. Trusted, it was resolved and written back under
+    # the id it claimed: it overwrote a valid FINALIZED record belonging to another episode with
+    # its own fail-closed resolution, and stayed unresolved itself.
+    directory = tmp_path / "finalizations"
+    store = FinalizationStore(directory)
+    store.write(
+        FinalizationRecord(
+            session_id="s", finalization_id="b", status="FINALIZED",
+            source="explicit_tool", verdict={"correct": True},
+        )
+    )
+    (directory / "finalization-a.json").write_text(
+        json.dumps(
+            {
+                "session_id": "s", "finalization_id": "b", "status": "PENDING",
+                "source": "explicit_tool",
+            }
+        ),
+        encoding="utf-8",
+    )
+    with pytest.warns(RuntimeWarning, match="are not finalization records"):
+        assert store.recover_once() == []
+    good = store.read("b")
+    assert good.status == "FINALIZED"
+    assert good.verdict == {"correct": True}

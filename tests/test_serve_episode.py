@@ -8,12 +8,14 @@ import asyncio
 import contextlib
 import json
 from pathlib import Path
+from typing import Any
 
 import pytest
 
 import shogym
 from shogym.feedback import parse_meta
 from shogym.serve import ServedEpisode
+from shogym.serve.lifecycle import LifecycleState
 from shogym.shared.terminate_mcp import TERMINATE_TOOL_NAME
 from shogym.trace import load_traces
 from tests._fixtures import score_env, score_mcp
@@ -370,3 +372,84 @@ async def test_an_env_that_cancels_from_end_session_does_not_cancel_the_caller()
     assert json.loads(result.content)["correct"] is True
     await ep.close()
     await ep.close()
+
+
+async def test_a_cancelled_close_does_not_score_over_a_running_finalizer() -> None:
+    held = asyncio.Event()
+    ep = await ServedEpisode.start(score_env.ENV_NAME, task=0)
+    real_finalize = ep._finalize
+
+    async def slow(req: Any) -> Any:
+        await held.wait()
+        return await real_finalize(req)
+
+    ep._finalize = slow  # type: ignore[assignment]
+    submitting = asyncio.ensure_future(ep.call(score_env.SUBMIT_TOOL, {"answer": "4"}))
+    await asyncio.sleep(0.05)
+    closing = asyncio.ensure_future(ep.close())
+    await asyncio.sleep(0.05)
+    closing.cancel()
+    with contextlib.suppress(BaseException):
+        await closing
+    # Turns for a teardown arranged in front of the finalizer to have run, if one was.
+    for _ in range(20):
+        await asyncio.sleep(0.01)
+    # Nothing has been torn down under the finalizer: it is still the owner of the env.
+    assert ep._env._gold, "the session was released while finalize was still grading"
+    held.set()
+    result = await submitting
+    assert json.loads(result.content)["correct"] is True
+    await ep.close()
+
+
+async def test_a_cancelled_horizon_call_still_seals_at_the_horizon() -> None:
+    score_mcp.reset_block()
+    ep = await ServedEpisode.start(score_env.ENV_NAME, task=0)
+    try:
+        for _ in range(score_env.HORIZON - 1):
+            await ep.call("noop", {})
+        assert ep._step == score_env.HORIZON - 1
+        reaching = asyncio.ensure_future(ep.call("block", {}))
+        await asyncio.sleep(0.1)
+        reaching.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await reaching
+        score_mcp.released.set()
+        # The dispatch commits the step that reaches the budget and seals as part of committing
+        # it, so there is nothing left for a caller to decide.
+        for _ in range(100):
+            if ep.terminated:
+                break
+            await asyncio.sleep(0.02)
+        assert ep._step == score_env.HORIZON
+        assert ep.terminated is True
+        await ep.wait_finalized()
+        assert ep._state is not LifecycleState.OPEN
+    finally:
+        score_mcp.released.set()
+        await ep.close()
+
+
+async def test_a_forced_legacy_terminal_does_not_start_a_second_dispatch() -> None:
+    score_mcp.reset_block()
+    ep = await ServedEpisode.start(score_env.ENV_NAME, task=0)
+    ep._seal_enabled = False
+    try:
+        running = asyncio.ensure_future(ep.call("block", {}))
+        await asyncio.sleep(0.1)
+        ended = await asyncio.wait_for(
+            ep.call(TERMINATE_TOOL_NAME, {}, forced=True), timeout=2.0
+        )
+        assert ended.terminated is True
+        assert ep.terminated is True
+        # One dispatch, and it is still the blocked one.
+        assert [entry.tool for entry in ep._trajectory] == []
+        score_mcp.released.set()
+        late = await running
+        # The overtaken call is tombstoned when it lands: nothing appended, nothing un-terminated.
+        assert late.tombstoned is True
+        assert ep.terminated is True
+        assert [entry.tool for entry in ep._trajectory] == []
+    finally:
+        score_mcp.released.set()
+        await ep.close()
