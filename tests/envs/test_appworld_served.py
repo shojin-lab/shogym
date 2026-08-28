@@ -675,9 +675,6 @@ async def test_a_read_outside_the_served_tree_is_refused() -> None:
     user as the run. A mount namespace is what makes this fail, and nothing short of one does. The
     worker is in one now, so the marker is gone with it.
 
-    Expected to fail today, and strictly: when it starts passing, the boundary exists and the
-    marker is what should go.
-
     **The sentinel is a host-only file, deliberately.** This read `/etc/hosts`, which a correctly
     isolated container has its own readable copy of, so the test would have gone green on a
     container that was working exactly as intended and told us nothing about whether the boundary
@@ -701,7 +698,9 @@ except Exception as failure:
         sentinel.unlink(missing_ok=True)
 
 
-async def test_activity_an_earlier_block_started_cannot_change_the_graded_bytes() -> None:
+async def test_activity_an_earlier_block_started_cannot_change_the_graded_bytes(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
     """The scored state and the graded state have to be one state, not two that agreed.
 
     A block can start a thread, and the thread outlives the block: AppWorld runs an agent's code
@@ -712,9 +711,11 @@ async def test_activity_an_earlier_block_started_cannot_change_the_graded_bytes(
     downstream would have noticed: the receipt would describe one state and the base checks
     another.
 
-    The flush, the removal and the reading are ordered now, and the last of them happens in a
-    container the world cannot reach. This proves the property that ordering buys: what the run
-    recorded as the world's digest is what is on disk once everything has stopped."""
+    The order is quiesce, seal, remove, read now, and the last of those happens in a container the
+    world cannot reach. The window this watches is the one that used to be open: the tree is
+    digested on the host on either side of the grading container's own run, and both have to equal
+    what the run recorded."""
+    from shogym.envs.appworld import adapter as adapter_module
     from shogym.envs.appworld import mcp_server
     from shogym.envs.appworld.worker import _directory_digest
 
@@ -746,11 +747,24 @@ def _write():
 _t.Thread(target=_write, daemon=True).start()
 print("started")
 """
+    watched: Dict[str, str] = {}
+    real = adapter_module.grade
+
+    def _watching(**kwargs: Any) -> Any:
+        # Both sides of the grading container's own run, on the host, so this sees the tree the
+        # grader read rather than a report about it. The episode's output tree is removed at
+        # teardown, which is why the reading happens here rather than after the call returns.
+        dbs = str(kwargs["outputs"] / "tasks" / kwargs["task_id"] / "dbs")
+        watched["before"] = _directory_digest(dbs)
+        answer = real(**kwargs)
+        watched["after"] = _directory_digest(dbs)
+        return answer
+
     env = shogym.make("appworld")
     episode = await ServedEpisode.open_env(env, env_name="appworld", task=TASK)
     session = mcp_server.get_session(episode.session_id)
     assert session is not None
-    outputs, task = session.outputs, session.task_id
+    monkeypatch.setattr(adapter_module, "grade", _watching)
     try:
         await episode.call("execute", {"code": spinner})
         # The thread is demonstrably writing into the world while the episode is still open, so
@@ -759,14 +773,14 @@ print("started")
         assert int(json.loads(seen.content)["output"].strip()) > 0
         terminal = await episode.call("submit", {})
     finally:
+        monkeypatch.undo()
         await episode.close()
     feedback = {
         item["name"]: item["value"] for item in (terminal.meta.get("shogym/feedback") or [])
     }
-    settled = _directory_digest(str(outputs / "tasks" / task / "dbs"))
-    assert feedback["world_digest"] == settled
-    # And it stays settled, because there is no process left that could write to it.
-    assert _directory_digest(str(outputs / "tasks" / task / "dbs")) == settled
+    # Nothing moved across the grading window, and what the run recorded is that same tree.
+    assert watched["before"] == watched["after"]
+    assert feedback["world_digest"] == watched["before"]
 
 
 async def test_a_removal_the_daemon_did_not_confirm_fails_the_episode(

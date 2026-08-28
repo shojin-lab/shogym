@@ -335,7 +335,7 @@ class AppWorldEnv(Env):
         # its logs, and leaving it behind gives a later episode something of an earlier one's to
         # find; a directory that only ever grows is retention by omission rather than by policy.
         # After the worker is closed, so nothing is still writing into what is being removed.
-        shutil.rmtree(session.experiment, ignore_errors=True)
+        shutil.rmtree(session.outputs, ignore_errors=True)
 
     def _derive(self, task_id: str) -> None:
         """Make sure the seeded copy of ``task_id``'s world exists, writing it if it does not.

@@ -108,8 +108,61 @@ class Episode:
         """Run one snippet of the agent's code against the world and return what it printed."""
         return {"output": self.world.execute(str(body["code"]))}
 
+    def quiesce(self, body: Dict[str, Any]) -> Dict[str, Any]:
+        """Stop everything this worker started, before the state below it is flushed.
+
+        Sealing closes the tool surface; it does not stop work an earlier `execute` left running.
+        A subprocess still writing while :meth:`seal` saves the snapshot leaves a file that is half
+        of one moment and half of another, and no later check would see it.
+
+        Descendants only. This process is the one being asked, and killing it here would take the
+        flush with it, so it stays until the parent removes the container. What cannot be stopped
+        is a thread inside this interpreter: threads are not signallable. That one is bounded by
+        the container going away, which ends the whole namespace, so the tree the grader reads is
+        settled whatever an episode left running.
+
+        Read off ``/proc``, which exists because this runs on Linux in a container, and where the
+        process table is this container's alone: the pids visible here are the ones this worker is
+        responsible for and nothing else on the machine."""
+        import signal
+        import time
+
+        mine = os.getpid()
+
+        def descendants() -> List[int]:
+            found: List[int] = []
+            try:
+                entries = os.listdir("/proc")
+            except OSError:
+                return found
+            for entry in entries:
+                if not entry.isdigit() or int(entry) == mine or int(entry) == 1:
+                    continue
+                found.append(int(entry))
+            return found
+
+        stopped = 0
+        for how in (signal.SIGTERM, signal.SIGKILL):
+            live = descendants()
+            if not live:
+                break
+            for pid in live:
+                try:
+                    os.kill(pid, how)
+                    stopped += 1
+                except OSError:
+                    pass
+            deadline = time.monotonic() + 5
+            while descendants() and time.monotonic() < deadline:
+                time.sleep(0.02)
+        return {"stopped": stopped, "left": len(descendants())}
+
+
     def seal(self, body: Dict[str, Any]) -> Dict[str, Any]:
         """Flush the end state to the episode's output tree, and read nothing off the live world.
+
+        Call :meth:`quiesce` first: what this writes has to be one instant of the episode, and it
+        is not one instant if something the episode started is still writing underneath it.
 
         **This used to be where the filing and the world's digest were read, and that was the
         wrong place for them.** They were observed on a live world while whatever an earlier
@@ -440,6 +493,7 @@ def serve(root: Optional[str] = None) -> int:
     commands = {
         "open": episode.open,
         "execute": episode.execute,
+        "quiesce": episode.quiesce,
         "seal": episode.seal,
         "close": episode.close,
     }

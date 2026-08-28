@@ -61,7 +61,7 @@ import urllib.request
 from dataclasses import dataclass, field
 from functools import lru_cache
 from pathlib import Path
-from typing import Any, Dict, List, Sequence, Tuple
+from typing import Any, Dict, List, Optional, Sequence, Tuple
 
 from shogym.envs._upstream import _locked
 from shogym.envs.appworld import container
@@ -365,6 +365,15 @@ def graded_root() -> Path:
     return home / f"graded-{DATA_VERSION}-{_generator_digest()}-{_private_tag()}"
 
 
+def _read_tag(keyfile: Path) -> Optional[str]:
+    """The published tag, or ``None`` if there is not a complete one there yet."""
+    try:
+        tag = keyfile.read_text().strip()
+    except FileNotFoundError:
+        return None
+    return tag if len(tag) == 16 else None
+
+
 @lru_cache(maxsize=4)
 def corpus_digest(root: Path) -> str:
     """What the corpus at ``root`` actually holds, as sixteen hex characters.
@@ -374,10 +383,14 @@ def corpus_digest(root: Path) -> str:
     otherwise be served under a name that claims to be the pinned one, and would reuse a derived
     tree built from something else.
 
-    Read in full for the files that decide what a task is and what it is scored against, and by
-    name and size for the databases, which are 179 MB and would make this a minute of reading on
-    every construction. A database edited without changing its length is therefore not caught, and
-    that is the honest limit of this digest rather than a claim it does not make."""
+    **Every scoring-relevant file is read, not sized.** This once hashed `specs.json` in full and
+    took path and size for everything else, which left the ground truth and the evaluation
+    material identifiable only by length: a same-length edit to an answer key passed unnoticed
+    under a digest whose whole job is to say what the corpus holds. A size is not a summary of
+    contents, and a fingerprint that says it covers the scoring inputs has to have read them.
+
+    The task tree is the scoring input, so all of it is read. Reading it costs a second or so on
+    every fresh process, which is the price of the digest meaning what it says."""
     digest = hashlib.sha256()
     data = root / "data"
 <<<<<<< HEAD
@@ -401,21 +414,29 @@ def corpus_digest(root: Path) -> str:
         if not path.is_file():
             continue
         digest.update(str(path.relative_to(data)).encode())
-        if path.name == "specs.json":
-            digest.update(path.read_bytes())
-        else:
-            digest.update(str(path.stat().st_size).encode())
+        digest.update(path.read_bytes())
     return digest.hexdigest()[:16]
 
 
+def episodes_home() -> Path:
+    """Where per-episode output trees live: this port's ordinary cache, not the private one."""
+    return cache_root() / f"episodes-{DATA_VERSION}"
+
+
 def episode_outputs(session_id: str) -> Path:
-    """One episode's own output tree, under the private home and named for the episode.
+    """One episode's own output tree, named for the episode and not under the private home.
 
     Outside every served corpus, and mounted alone into the two containers that need it. Upstream's
     evaluator writes a report quoting the requirement prose and the values behind it, and a shared
     output tree is a place the other arm of a pair can read an earlier grade; a per-episode tree
-    that no other episode's container mounts is a place nothing else can read at all."""
-    home = private_home() / f"episodes-{DATA_VERSION}-{_private_tag()}"
+    that no other episode's container mounts is a place nothing else can read at all.
+
+    **Deliberately not a child of** :func:`private_home`. Under the private home it named the
+    grader's own parent, and the unguessable name that protects the grader stops protecting it
+    the moment something hands an address inside it over. Nothing hands this one to the world,
+    which sees it at a fixed mount point, but the host path is in the container's own mount table
+    and so it must not be a path that says where the answers are."""
+    home = episodes_home()
     home.mkdir(parents=True, exist_ok=True)
     return home / f"episode-{session_id}"
 
@@ -430,22 +451,34 @@ def _private_tag() -> str:
     home.mkdir(parents=True, exist_ok=True)
     os.chmod(home, 0o700)
     keyfile = home / ".tag"
-    # Created exclusively, and a loser reads the winner's value rather than keeping its own. Two
-    # processes that each kept their own would name two private trees, and a private tree is a
-    # copy of the corpus: the cost of getting this wrong is 134 MB and a rebuild, per loser.
+    existing = _read_tag(keyfile)
+    if existing is not None:
+        return existing
+    # Written whole, then published by link. An exclusive create publishes the *name* before the
+    # bytes, so a concurrent reader could see a real file holding nothing, and a crash in the gap
+    # left that empty file behind for good. The link is atomic within a directory, so the name
+    # appears only once it already holds a complete tag.
+    tag = secrets.token_hex(8)
+    staged = home / f".tag.{os.getpid()}.{tag}"
+    handle = os.open(staged, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
     try:
-        handle = os.open(keyfile, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
-    except FileExistsError:
-        tag = keyfile.read_text().strip()
-        if len(tag) == 16:
-            return tag
-        raise RuntimeError(f"the private tag at {keyfile} is not a tag; remove it to rebuild")
-    try:
-        tag = secrets.token_hex(8)
         os.write(handle, tag.encode())
+        os.fsync(handle)
     finally:
         os.close(handle)
-    return tag
+    try:
+        # A loser takes the winner's tag rather than keeping its own: two processes that each kept
+        # theirs would name two private trees, and a private tree is a copy of the corpus, so the
+        # cost of getting this wrong is 134 MB and a rebuild for every loser.
+        os.link(staged, keyfile)
+    except FileExistsError:
+        pass
+    finally:
+        os.unlink(staged)
+    published = _read_tag(keyfile)
+    if published is None:
+        raise RuntimeError(f"the private tag at {keyfile} is not a tag; remove it to rebuild")
+    return published
 
 
 #: The modules that generate a world, from which the rest of the generator is reached. Between
@@ -1228,6 +1261,7 @@ __all__ = [
     "corpus_snapshot",
     "derived_root",
     "episode_outputs",
+    "episodes_home",
     "ensure_corpus",
     "ensure_image",
     "grade",
