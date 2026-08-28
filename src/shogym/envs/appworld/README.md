@@ -31,17 +31,48 @@ await episode.call("submit", {})        # seals, then scores
 await episode.close()
 ```
 
-### Claude Code example
+**That snippet is a development loop and not an arm of anything.** A `ServedEpisode` has no
+feedback policy in it, so its terminal answers with every episode-level item the env published:
+the numeric metrics, the receipt and the digest together. Use it to see what an episode produces.
+An experiment runs the two arms below, where one policy decides what a terminal reveals and the
+record says which arm each row was assigned.
 
-```bash
-SHOGYM_ENV=appworld SHOGYM_TASKS=0 claude -p "$(cat examples/claude_code/PROMPT.txt)" \
-    --mcp-config examples/claude_code/.mcp.json --strict-mcp-config \
-    --allowedTools 'mcp__shogym__*' --permission-mode dontAsk
-```
+### The paired arms
 
 The paired feedback policies are what this env was built for. `Information()` answers a
 terminating call with the receipt; `Placebo()` answers it with a digest of the agent's own
 submission, the same size on the wire; `Never()` answers with no channel at all.
+
+Two launches, one per arm, into two records:
+
+```bash
+# the treatment: the terminal carries the receipt, and nothing beside it
+SHOGYM_ENV=appworld SHOGYM_TASKS=0 SHOGYM_FEEDBACK=information \
+SHOGYM_IDENTITY=appworld-pulse-0 SHOGYM_DEADLINE=1800 SHOGYM_IN_FLIGHT=1 \
+claude -p "$(cat examples/claude_code/PROMPT.txt)" \
+    --mcp-config examples/claude_code/.mcp.json --strict-mcp-config \
+    --allowedTools 'mcp__shogym__*' --permission-mode dontAsk
+
+# the control: the same channel, the same shape, the inert digest in it
+SHOGYM_ENV=appworld SHOGYM_TASKS=0 SHOGYM_FEEDBACK=placebo \
+SHOGYM_IDENTITY=appworld-pulse-0 SHOGYM_DEADLINE=1800 SHOGYM_IN_FLIGHT=1 \
+claude -p "$(cat examples/claude_code/PROMPT.txt)" \
+    --mcp-config examples/claude_code/.mcp.json --strict-mcp-config \
+    --allowedTools 'mcp__shogym__*' --permission-mode dontAsk
+```
+
+Each arm writes its own provenance directory, named for its regime
+(`examples/claude_code/runs/appworld-information-<stamp>/`), because a directory that holds one
+arm's rows refuses the other's. The identity, the deadline and the capacity are the same on both
+commands on purpose: all three are members of what a record is filed under, together with what
+the env said about itself, and two runs that disagree on any of them are two measurements rather
+than two arms of one. Read either record back with `examples/claude_code/results.py`.
+
+**`SHOGYM_FEEDBACK=immediate` is the practice path, not a third arm.** It is the default, it
+hands back every episode-level item the env published (both payloads and the numeric grades), and
+a run under it is for watching an agent work rather than for comparing anything.
+
+The same policies from Python, for a runner that builds its own stream:
 
 ```python
 from shogym.serve.stream import Information, Placebo, TaskRef, TaskStream
@@ -237,12 +268,21 @@ seed are all deterministic functions of the task identity.
 | `assertion_fraction` | The base task's own checks, from AppWorld's evaluator, reported beside the headline and never summed with it. |
 | `distinct_bands`, `filing_rows` | A degenerate submission and hedging by over-filing, both visible and neither scoreable. |
 | `world_digest`, `rng_digest` | What the world became, and the state of the generator it draws from. |
+| `reward` | `ledger_fraction` again, under the name a durable row's summary is read from. |
 
 ```python
 import shogym
 result = shogym.result_from_trace("shogym_logs/run.jsonl", env="appworld", task="0")
 print(result.terminated, result.value("ledger_fraction"))
 ```
+
+`reward` is an alias and not a second number. A `TaskStream` row's `score.reward` is filled from
+`reward` or `partial_credit` and from nothing else, so a port whose headline is called anything
+else records rows that are scored and summarised as nothing: every shipped `results.py` counted
+non-null rewards and reported `scored 0/N` for a complete run of this env. Publishing the headline
+under both names fixes the summary without renaming the metric the scorer, this page and the
+analysis all use. It changes no wire: `Information` and `Placebo` each reveal the one channel they
+are named for, and neither of them is this.
 
 Filter semantics are shared; see [`../README.md`](../README.md).
 
@@ -514,12 +554,20 @@ before it should be read knowing that nothing was watching.
 ## Gotchas
 
 - **`env.num_tasks` is 318, not 417.** Task indices address the manifest, not the split.
-- **Construction is slow, online, and blocking.** Building the runtime, fetching the corpus and
-  copying it into the two derived views is a one-time cost; deriving a task's seeded world costs
-  about a second the first time it is served and nothing after that. `TaskStream` builds envs off
-  the event loop, so a queue is not held by it; a caller constructing an env directly on a loop it
-  is also serving on will block that loop and should build it in a thread. Set `APPWORLD_ROOT` to
-  skip the download.
+- **Construction is slow, online, and blocking, and it happens on the serving loop.** Building the
+  runtime, fetching the corpus and copying it into the two derived views is a one-time cost;
+  deriving a task's seeded world costs about a second the first time it is served and nothing
+  after that. A warm construction is still about four seconds, and `TaskStream.get_task()` calls
+  the env factory synchronously, on the loop it serves on. So while one task is being constructed
+  nothing else on that loop runs: a live sibling episode cannot dispatch a call and its deadline
+  cannot fire, and a 50 ms heartbeat was measured arriving 4.689 s late behind one construction.
+  At `max_in_flight=1` that is dead time and nothing worse; above it, the capacity is not what it
+  says. The mechanism that fixes it is the `off_loop_factory=True` keyword on
+  `TaskStream` / `ServedEpisode` from
+  [shojin-lab/shogym#141](https://github.com/shojin-lab/shogym/pull/141), which this port depends
+  on and which is not on this branch, so nothing here passes it yet. A caller constructing an env
+  directly on a loop it is also serving on has the same problem for the same reason and should
+  build it in a thread. Set `APPWORLD_ROOT` to skip the download.
 - **A different `pulse` is a different experiment.** It fixes the convention and the four stored
   slots for every leg. Scores drawn under two pulses are not comparable, and neither the pulse nor
   the payload class appears anywhere else in a run's record, so every row carries a

@@ -850,6 +850,30 @@ def _identity_unidentified(identity: Mapping[str, Any]) -> bool:
     return bool(identity.get("unidentified"))
 
 
+def _identity_incomparable(identity: Mapping[str, Any]) -> Optional[str]:
+    """Why a stored identity cannot be compared member by member, or ``None`` if it can.
+
+    Two shapes reach this. The empty string is a record written before the member existed and
+    says nothing at all. A bare non-empty string is a record written while the identity was still
+    one opaque name: it carries a caller and no deadline, no capacity and no env digests.
+
+    **Neither is evidence that the members it lacks stayed the same**, and treating absence as
+    equality is what let a record made at ``deadline=30, max_in_flight=1`` be resumed under the
+    same caller name at ``deadline=None, max_in_flight=2``. That is two opportunities in one
+    record, arrived at through the very field that exists to keep them apart. So an old shape is
+    not compared, it is *adopted*: the caller states once that it knows what those rows were, the
+    directory records who said so, and every other identity is refused from then on (see
+    :meth:`TaskStream._require_identity_matches`)."""
+    if _identity_unidentified(identity):
+        return "names no run identity"
+    if identity.get("named_only"):
+        return (
+            f"names only a caller ({identity.get('caller')!r}) and none of the run facts beside "
+            "it, because it was written before the identity was a record"
+        )
+    return None
+
+
 def _identity_names_nothing(identity: Mapping[str, Any]) -> bool:
     """Whether this identity's *asserted* half says anything about what produced a row.
 
@@ -2358,6 +2382,16 @@ class TaskStream:
             (see :func:`_close_on_owning_loop`). Nothing is moved to a worker loop, and nothing
             about the failure is swallowed — what could not be finished is attached to the
             error being raised.
+
+            **It is called on the serving loop, and a slow factory is felt by every live
+            sibling.** :meth:`get_task` builds the env before it reaches its first await, so for
+            as long as a constructor runs no other episode can dispatch and the watchdog cannot
+            enforce anyone's deadline: a factory that takes seconds delays a 50 ms heartbeat by
+            seconds. That is measurable with the AppWorld port, whose construction walks a corpus
+            and an installed interpreter. Keep a factory cheap, or run the run under the
+            ``off_loop_factory`` contract added by the stacked lifecycle branch, which moves the
+            call onto the episode's own thread and owns what a cancelled caller leaves behind.
+            This module does not offer a second mechanism for it.
         tasks: the materialised queue. Non-empty; may repeat a task index. An env key is a
             private label while the queue names one env — anything at all, ``__`` included,
             since the wire carries only the env's own tool names. Name a second env and every
@@ -2494,6 +2528,19 @@ class TaskStream:
             )
         if max_in_flight < 1:
             raise ValueError(f"max_in_flight must be at least 1, got {max_in_flight}")
+        # An exact boolean, and refused rather than coerced, for the reason `adopt_unidentified`
+        # is — and with more at stake. `bool()` on what a config file or an environment variable
+        # produces makes the *string* `"false"` a yes, and this is the one argument that
+        # deliberately breaks another stream's claim: a run that resumed by accident does not
+        # merely relax a check, it dispossesses a stream that was serving correctly, which then
+        # stops for good at its next owned append.
+        if not isinstance(resume, bool):
+            raise TypeError(
+                f"resume must be True or False, not {type(resume).__name__} ({resume!r}); it is "
+                "the assertion that another stream has stopped, and the only one that takes a "
+                "live provenance claim over, so a value that merely looks truthy is refused "
+                "rather than read as consent"
+            )
         if deadline is not None and not (math.isfinite(deadline) and deadline > 0):
             # NaN and infinity would both pass a `<= 0` check and then silently disable
             # enforcement: `now - started >= deadline` is false forever against either, so the
@@ -3345,16 +3392,21 @@ class TaskStream:
         putting the claim file back: if the displaced stream reached an append in between, it saw
         a foreign claim, stopped itself permanently and raised out of its own ``aclose`` — a
         correct run killed by a construction that went on to refuse."""
+        # Every dispense, by the lease its result is paired with. `reconcile` pairs the two logs
+        # that way and so does the cross-check below, so the map is built once and read twice.
+        dispensed: Dict[str, Tuple[int, str, int, int]] = {}
         for record in read_dispenses(self.prov_dir):
             stored = _recorded_identity(record)
             self._blank_dispenses += not stored
             where = f"{self.dispenses_path}: a dispense record"
+            position = _wire_int(record, "position", source=where)
+            ref = TaskRef(
+                _wire_str(record, "env", source=where),
+                _wire_int(record, "task_idx", source=where),
+            )
             self._require_position_matches(
-                _wire_int(record, "position", source=where),
-                TaskRef(
-                    _wire_str(record, "env", source=where),
-                    _wire_int(record, "task_idx", source=where),
-                ),
+                position,
+                ref,
                 source="a dispense record",
             )
             self._require_regime_matches(_recorded_regime(record), source="a dispense record")
@@ -3372,12 +3424,16 @@ class TaskStream:
                     "invisible to reconciliation"
                 )
             self._issued.add(lease)
-            self._seq = max(self._seq, _wire_int(record, "seq", source=where))
+            seq = _wire_int(record, "seq", source=where)
+            dispensed[lease] = (position, ref.env, ref.task_idx, seq)
+            self._seq = max(self._seq, seq)
+        answered: Dict[str, int] = {}
         for row in read_results(self.prov_dir):
             self._blank_results += not row.run_identity
             self._require_position_matches(
                 row.position, TaskRef(row.env, row.task_idx), source="a result row"
             )
+            self._require_answers_a_dispense(row, dispensed, answered)
             self._require_regime_matches(row.feedback_regime, source="a result row")
             self._require_identity_matches(row.run_identity, source="a result row")
             # What the env said, as against what the caller asserted — and the binding this
@@ -3390,6 +3446,69 @@ class TaskStream:
             self._issued.add(row.lease)
             self._done_positions.add(row.position)
             self._seq = max(self._seq, row.seq)
+
+    def _require_answers_a_dispense(
+        self,
+        row: ResultRow,
+        dispensed: Mapping[str, Tuple[int, str, int, int]],
+        answered: Dict[str, int],
+    ) -> None:
+        """A stored result must answer exactly one stored dispense, and no dispense twice.
+
+        The two logs were read independently, each row checked against the queue and neither
+        against the other. That is not enough, because they are not two records: a dispense is the
+        durable half a crash leaves behind and a result is the answer to it, and
+        :func:`reconcile` pairs them **by lease alone** to decide which opportunities were lost.
+        A result whose lease names no dispense therefore marked its position done and skipped,
+        while ``reconcile`` went on emitting a ``broker_abort`` for the dispense nothing now
+        answered: one queue position holding a scored outcome and a crash at the same time, in a
+        record a resume considered complete.
+
+        So the pairing is checked here, on the five fields the two halves are written from at
+        once — the lease, and the position, env, task index and ``seq`` that must be the same on
+        both sides because one call wrote them. A result that answers a dispense already answered
+        is refused for the same reason, and so is a second result for a position already done: a
+        position is one opportunity, and two outcomes for it cannot both be the one a mean
+        averages.
+
+        **A dispense with no result is not an error**, and must not become one: that is exactly
+        the abandoned dispense a resume exists to replay, and the row ``reconcile`` reports for
+        the crash that left it.
+
+        Same scope as the exact wire types beside it: the provenance directory is the harness's
+        own, so what reaches here is corruption, a mixed writer, or a hand-edited recovery. That
+        is what makes failing closed cheap rather than what makes it unnecessary."""
+        match = dispensed.get(row.lease)
+        if match is None:
+            raise ValueError(
+                f"{self.results_path} holds a result row under lease {row.lease!r}, which no "
+                f"dispense in {self.dispenses_path.name} records; a result is paired with a "
+                "dispense by its lease, so this row retires a queue position while the dispense "
+                "it should have answered reconciles as a crash, leaving one opportunity holding "
+                "both a score and a broker abort"
+            )
+        recorded = (match[0], match[1], match[2], match[3])
+        produced = (row.position, row.env, row.task_idx, row.seq)
+        if recorded != produced:
+            raise ValueError(
+                f"{self.results_path} holds a result row under lease {row.lease!r} naming "
+                f"(position, env, task, seq) {produced!r}, but the dispense it answers records "
+                f"{recorded!r}; one call wrote both halves, so a record whose halves disagree "
+                "cannot say which opportunity this outcome belongs to"
+            )
+        if row.lease in answered:
+            raise ValueError(
+                f"{self.results_path} holds two result rows under lease {row.lease!r} (seq "
+                f"{answered[row.lease]} and {row.seq}); one dispense is answered once, and a "
+                "record holding two answers for it has an outcome nothing can attribute"
+            )
+        if row.position in self._done_positions:
+            raise ValueError(
+                f"{self.results_path} holds two result rows for queue position {row.position}; a "
+                "position is one opportunity, so a mean over this record would average two "
+                "outcomes for a task that was played once"
+            )
+        answered[row.lease] = row.seq
 
     def _write_claim(self, payload: Mapping[str, Any]) -> None:
         """Publish the claim file holding ``payload``, or raise ``FileExistsError`` if one is
@@ -4034,28 +4153,22 @@ class TaskStream:
         does: the record has already said what produced its rows, and appending rows that decline
         to say makes a directory nobody can read as one run afterwards."""
         stored = _identity_from_wire(recorded)
-        if _identity_unidentified(stored):
+        incomparable = _identity_incomparable(stored)
+        if incomparable is not None:
             if self._already_adopted():
                 # Adopted already by this identity, and the directory says so rather than the
                 # caller. An ordinary resume from here on needs no flag.
                 return
             if self._adopted:
                 raise ValueError(
-                    f"{self.prov_dir} holds {source} that names no run identity, and those rows "
-                    "have already been adopted by "
+                    f"{self.prov_dir} holds {source} that {incomparable}, and those rows have "
+                    "already been adopted by "
                     + ", ".join(_identity_text(name) for name in self._adopted)
                     + f", which is not this stream's identity ({_identity_text(self._run_identity)})"
-                    "; unidentified rows are taken on once, by one configuration, or the record "
-                    "says they belong to two. Serve into a fresh provenance directory"
+                    "; rows an identity cannot be compared against are taken on once, by one "
+                    "configuration, or the record says they belong to two. Serve into a fresh "
+                    "provenance directory"
                 )
-            if _identity_names_nothing(self._run_identity):
-                # Nothing was asserted before and nothing is asserted now, and no adoption stands
-                # over these rows, so the record is continued as itself. Checked *after* the
-                # adoption and not before it: a named run that had taken these rows on left a
-                # record saying so, and an unnamed resume used to walk straight past it and append
-                # beside them — rows outside the adoption's own cutoff, silently folded into the
-                # adopter by the next ordinary resume under its identity.
-                return
             if self._adopt_unidentified:
                 # The migration is being performed *now*. Remembered rather than written here:
                 # this runs while the record is still being read, and an adoption is owed only by
@@ -4063,12 +4176,12 @@ class TaskStream:
                 self._adopting = True
                 return
             raise ValueError(
-                f"{self.prov_dir} holds {source} that names no run identity, but this stream "
-                f"serves under {_identity_text(self._run_identity)}; an unidentified record "
-                "cannot say what produced its rows, so nothing here can tell whether averaging "
-                "them with this configuration's describes anything at all. Serve into a fresh "
-                "provenance directory, or pass adopt_unidentified=True to state that those rows "
-                "were this configuration's"
+                f"{self.prov_dir} holds {source} that {incomparable}, but this stream serves "
+                f"under {_identity_text(self._run_identity)}; a record that cannot be compared "
+                "member by member is no evidence that the members it lacks stayed the same, so "
+                "nothing here can tell whether averaging its rows with this configuration's "
+                "describes anything at all. Serve into a fresh provenance directory, or pass "
+                "adopt_unidentified=True to state that those rows were this configuration's"
             )
         disagreement = _identity_disagreement(stored, self._run_identity)
         if disagreement is None:

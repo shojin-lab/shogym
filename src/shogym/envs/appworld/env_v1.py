@@ -153,6 +153,12 @@ class AppWorldEnv(Env):
         report: str = payload.GRADED,
         horizon: int = DEFAULT_HORIZON,
     ) -> None:
+        if not isinstance(horizon, int) or isinstance(horizon, bool) or horizon < 1:
+            # Eagerly, because the two ways of getting this wrong both half-work. A budget of zero
+            # disabled the guard entirely and let one block through before the serve layer ended
+            # the episode; a negative one refused the first block and still spent the call that
+            # ends the horizon. A budget is a count of blocks, and the smallest honest one is one.
+            raise ValueError(f"horizon must be a positive whole number of blocks, got {horizon!r}")
         if report not in (payload.GRADED, payload.DRAWN):
             raise ValueError(
                 f"report must be {payload.GRADED!r} or {payload.DRAWN!r}, got {report!r}; the "
@@ -597,7 +603,9 @@ class AppWorldEnv(Env):
         ``ledger_fraction`` is the headline and ``pinned_fraction`` is its control: the four
         stored slots are scored the same way and cannot move past one over their option count
         whatever the agent learns, so a run in which they move with the headline is a run whose
-        headline is measuring something else.
+        headline is measuring something else. The headline is published a second time as
+        ``reward``, which is the name a durable row's summary is read from and which this port
+        used to leave empty on every scored row.
 
         ``report`` and ``notice`` are the matched pair a feedback policy chooses between. Both are
         always published, whatever regime the run is serving, because the env does not know the
@@ -627,6 +635,18 @@ class AppWorldEnv(Env):
             "assertion_fraction",
         ):
             fb.episode.append(EpisodeFeedback(name=name, value=float(verdict.get(name) or 0.0)))
+        # The headline again, under the name the record reads a headline from. `ledger_fraction`
+        # is what this port calls its headline and the only thing here that is one, but a durable
+        # row's summary is filled from `reward` or `partial_credit` and from nothing else, so
+        # without this every complete appworld run recorded `score is not None` with `reward` and
+        # `success` both empty, and every shipped reader counted it as `scored 0/N`. An alias and
+        # not a rename: `ledger_fraction` stays, because it is the name the scorer, this README
+        # and the analysis all use, and a run whose rows lost it would not be readable as one of
+        # this port's. It changes no wire either, because both paired policies reveal the one
+        # channel they are named for and neither of them is this.
+        fb.episode.append(
+            EpisodeFeedback(name="reward", value=float(verdict.get("ledger_fraction") or 0.0))
+        )
         for name in ("distinct_bands", "filing_rows", "duration_set", "checks"):
             fb.episode.append(EpisodeFeedback(name=name, value=float(verdict.get(name) or 0.0)))
         for name in ("payload_class", "world_digest", "rng_digest"):

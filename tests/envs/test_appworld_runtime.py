@@ -19,7 +19,7 @@ import sys
 import threading
 import time
 from pathlib import Path
-from typing import Any, Dict, List, Tuple
+from typing import Any, Dict, List, Optional, Tuple
 
 import pytest
 
@@ -325,6 +325,27 @@ async def test_a_deadline_can_still_fire_on_a_finalizer_that_is_waiting() -> Non
 
 
 # ----- the published budget -----
+
+
+def test_a_block_budget_that_is_not_a_count_of_blocks_is_refused_at_construction() -> None:
+    """Zero blocks used to mean one block, and it is the mutating one that counts.
+
+    The env stored a zero budget and published a serve-layer horizon of one. The guard on the
+    served tool reads the budget for truth before it compares anything, so zero was read as no
+    limit at all and the first `execute` reached the world; only after that mutation did the serve
+    layer's own horizon end the episode. A negative budget half-works in the other direction: it
+    refuses the first block and still spends the call that ends the horizon.
+
+    A budget is a count of blocks, so the smallest honest one is one, and the boundary that can
+    say so is this one. It is refused before the constructor provisions anything, and refused
+    rather than coerced: this value is a member of the fingerprint two runs are compared on, and
+    a string that quietly became a number would be a second configuration wearing the first's
+    identity."""
+    from shogym.envs.appworld.env_v1 import AppWorldEnv
+
+    for refused in (0, -1, True, 2.0, "2", None):
+        with pytest.raises(ValueError, match="positive whole number of blocks"):
+            AppWorldEnv(horizon=refused)  # pyright: ignore[reportArgumentType]
 
 
 def test_the_run_fingerprint_covers_everything_that_changes_what_a_score_means() -> None:
@@ -752,6 +773,67 @@ def test_a_worker_whose_owner_is_gone_is_reclaimed_and_a_live_one_is_not(
             process.wait(timeout=30)
 
 
+def test_an_orphan_nothing_can_be_told_about_keeps_its_record_and_its_scratch(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A sweep may only spend a record it has actually dealt with.
+
+    The stop used to report nothing whatever it had done, so every one of its silent paths reached
+    the caller as a delivered kill. An entry whose owner is gone, whose worker pid is live, and
+    whose birth the process table will not answer for was therefore reported reclaimed: its
+    scratch directory was deleted and its ledger line tombstoned without a signal ever being sent,
+    which leaves a world still serving with nothing left that names it. That is the failure the
+    ledger exists to prevent, arrived at through the ledger.
+
+    Two shapes of the same ambiguity below. One record never had a birth written down; the other
+    has one the table has stopped answering for. Neither says the worker is gone and neither can
+    be signalled safely, so both keep everything they have for the next construction to try."""
+    monkeypatch.setenv("SHOGYM_CACHE", str(tmp_path / "cache"))
+    gone = _sleeper(120)
+    gone_birth = adapter.process_birth(gone.pid)
+    assert gone_birth, "the process table has to answer for this test to mean anything"
+    gone.kill()
+    gone.wait(timeout=30)
+
+    running: List[subprocess.Popen] = []
+    scratches: Dict[str, Path] = {}
+    try:
+        for name, birth in (("unrecorded", ""), ("unreadable", "1700000000")):
+            held = _sleeper(120)
+            running.append(held)
+            scratch = tmp_path / f"shogym-appworld-{name}"
+            scratch.mkdir()
+            scratches[name] = scratch
+            adapter._append(
+                "+"
+                + json.dumps(
+                    {
+                        "name": name,
+                        "parent": gone.pid,
+                        "birth": gone_birth,
+                        "boot": adapter._boot_id(),
+                        "pid": held.pid,
+                        # Either never written, or written and no longer confirmable.
+                        "pid_birth": birth,
+                        "pgid": adapter._group_of(held),
+                        "scratch": str(scratch),
+                    }
+                )
+            )
+        # The table answers about the owner (which is gone, so `kill` settles it without asking)
+        # and refuses to answer about either worker.
+        monkeypatch.setattr(adapter, "process_birth", lambda pid: "")
+
+        assert adapter.reap() == [], "nothing was stopped, so nothing may be reported reclaimed"
+        assert all(scratch.exists() for scratch in scratches.values())
+        assert sorted(r["name"] for r in adapter.outstanding()) == ["unreadable", "unrecorded"]
+        assert all(held.poll() is None for held in running), "and both worlds are still running"
+    finally:
+        for process in running:
+            process.kill()
+            process.wait(timeout=30)
+
+
 # ----- a stop that cannot be confirmed is not a stop -----
 
 
@@ -880,6 +962,72 @@ def test_an_output_tree_with_a_link_in_it_is_refused_rather_than_graded(tmp_path
 def test_an_episode_that_never_started_has_no_tree_to_grade(tmp_path: Path) -> None:
     with pytest.raises(adapter.SnapshotError, match="no output tree"):
         adapter.snapshot_outputs(tmp_path / "never", into=tmp_path / "into")
+
+
+def test_a_grader_that_outruns_its_bound_takes_its_whole_group_with_it(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The advertised ten minutes was a bound on nothing.
+
+    The grader was an ordinary child with captured pipes: a timeout killed the leader alone and
+    then read those pipes again with no deadline at all, so a descendant holding either of them
+    kept the call, and with it a sealed episode's terminal, open indefinitely. Measured with a
+    one-second bound, the call had not returned twenty seconds later and the descendant was still
+    running.
+
+    The grader leads a session of its own now, the group is what is signalled, its emptying is
+    what is waited for, and the final read of the pipes is bounded like every other wait on the
+    way down. The child below is the case the old code could not survive: it outlives its parent
+    and it inherited both pipes."""
+    script = tmp_path / "wedged_grader.py"
+    told = tmp_path / "descendant.pid"
+    script.write_text(
+        "import subprocess, sys, time\n"
+        "sys.stdin.readline()\n"
+        # Inherits stdout and stderr, so it holds the pipes the caller reads.
+        "child = subprocess.Popen([sys.executable, '-c', 'import time; time.sleep(120)'])\n"
+        f"open({str(told)!r}, 'w').write(str(child.pid))\n"
+        "time.sleep(120)\n"
+    )
+    monkeypatch.setattr(adapter, "runtime", lambda: Path(sys.executable))
+    monkeypatch.setattr(adapter, "WORKER", script)
+    monkeypatch.setattr(adapter.tempfile, "tempdir", str(tmp_path))
+    monkeypatch.setenv("SHOGYM_CACHE", str(tmp_path / "cache"))
+
+    failure: List[BaseException] = []
+
+    def _grade() -> None:
+        try:
+            adapter.grade(
+                root=tmp_path, task_id="abc_1", outputs=tmp_path, ignore=[], filing={}, timeout=1.0
+            )
+        except BaseException as exc:  # noqa: BLE001 - the point is which one, and how soon
+            failure.append(exc)
+
+    # In a thread with a join, so a teardown that does not return fails this test rather than
+    # hanging the suite the way the failure it is about hung a run.
+    grading = threading.Thread(target=_grade, daemon=True)
+    began = time.monotonic()
+    grading.start()
+    grading.join(60)
+    assert not grading.is_alive(), "the grader's timeout never returned"
+    assert time.monotonic() - began < 40, "it returned, but not inside anything like its bound"
+    assert failure and isinstance(failure[0], adapter.WorkerError)
+    assert "did not finish within" in str(failure[0])
+
+    descendant = int(told.read_text())
+    deadline = time.monotonic() + 30
+    while time.monotonic() < deadline:
+        try:
+            os.kill(descendant, 0)
+        except ProcessLookupError:
+            break
+        time.sleep(0.05)
+    else:
+        os.kill(descendant, signal.SIGKILL)
+        raise AssertionError("what the grader started outlived the grader's own timeout")
+    assert not list(tmp_path.glob("shogym-appworld-grade-*")), "and the scratch went with it"
+    assert adapter.outstanding() == [], "and the ledger entry it was written down under"
 
 
 # ----- the caches say what they were built from -----
@@ -1119,6 +1267,65 @@ def test_a_derivation_publishes_rather_than_building_in_place(tmp_path: Path) ->
     world._unseal(derived)
 
 
+def test_a_publish_that_fails_puts_the_displaced_tree_back(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A replacement that fails used to destroy the thing it was replacing.
+
+    The incumbent is renamed aside and the staged tree renamed in, and the displaced copy was then
+    removed whatever had happened in between. So a failure at the second rename deleted the only
+    remaining copy and left the name absent: injected once, the probe found neither tree. This
+    path covers served tasks, grading views and the shared base entries, and for the last of those
+    an episode already running resolves absolute names through the name that disappears.
+
+    Two outcomes below, and the second is why the restore is not enough on its own. When the
+    incumbent goes back, the caller is told the publish failed rather than left to serve an
+    episode out of the entry it had already judged unusable. When the restore itself cannot
+    happen, the displaced copy is kept under its own name, because it is then the only copy of
+    that tree there is."""
+    incumbent = tmp_path / "base_dbs"
+    incumbent.mkdir()
+    (incumbent / "big.jsonl").write_text("what live episodes resolve through")
+
+    def _publishing(failing: Tuple[int, ...]) -> None:
+        """Stage a replacement and publish it with those renames, by position, refused.
+
+        Rename 1 moves the incumbent aside, rename 2 moves the staged tree in, and rename 3 is the
+        restore that only happens because rename 2 did not."""
+        building = world._staging(tmp_path, "base_dbs")
+        building.mkdir(parents=True)
+        (building / "big.jsonl").write_text("the replacement")
+        real_replace = os.replace
+        renames: List[int] = []
+
+        def _fails(source: Any, destination: Any, **kwargs: Any) -> None:
+            renames.append(1)
+            if len(renames) in failing:
+                raise OSError(errno.ENOSPC, "no space left on device")
+            real_replace(source, destination, **kwargs)
+
+        monkeypatch.setattr(world.os, "replace", _fails)
+        try:
+            with pytest.raises(OSError):
+                world._publish(building, incumbent, replacing=True)
+        finally:
+            monkeypatch.setattr(world.os, "replace", real_replace)
+
+    # The publish fails: the incumbent goes back under its own name, with its own bytes.
+    _publishing(failing=(2,))
+    assert incumbent.is_dir()
+    assert (incumbent / "big.jsonl").read_text() == "what live episodes resolve through"
+    assert not list(tmp_path.glob("*.displaced")), "and nothing is left staged aside"
+    assert not list(tmp_path.glob("*.building")), "nor left half-built"
+
+    # The restore fails too: the only copy left is retained rather than removed.
+    _publishing(failing=(2, 3))
+    displaced = list(tmp_path.glob("*.displaced"))
+    assert not incumbent.exists(), "this is the case where the name really is gone"
+    assert len(displaced) == 1, "so the tree itself has to still be somewhere"
+    assert (displaced[0] / "big.jsonl").read_text() == "what live episodes resolve through"
+
+
 # ----- a seal that failed publishes no verdict -----
 
 
@@ -1180,6 +1387,51 @@ def test_an_ordinary_terminal_still_publishes_both_arms() -> None:
     assert published["report"] == "a receipt"
     assert published["notice"] == "a digest"
     assert "finalize_error" not in published
+
+
+def test_the_headline_is_published_under_the_name_a_row_is_summarised_from() -> None:
+    """A durable row's summary is filled from `reward` or `partial_credit` and from nothing else.
+
+    This port calls its headline `ledger_fraction`, which no stream reads a headline out of, so
+    every complete run of it recorded rows that had a score object and no score in it: `reward`
+    and `success` both empty, and every shipped `results.py` reporting `scored 0/N` for a run in
+    which every task was graded. The headline is published under both names now. An alias and not
+    a rename, because `ledger_fraction` is what the scorer, the port's README and the analysis all
+    call it.
+
+    It stays off both arms' wires, which is what makes it safe to add: `Information` reveals the
+    item named `report` and `Placebo` the one named `notice`, one item each and neither of them
+    this one."""
+    from shogym.envs.appworld import env_v1
+    from shogym.serve import stream as stream_module
+    from shogym.serve.lifecycle import TerminalEvidence
+
+    class _Env:
+        _config_digest = "fingerprint"
+
+    fb = env_v1.AppWorldEnv._verify(
+        _Env(),  # pyright: ignore[reportArgumentType]
+        trajectory=None,  # pyright: ignore[reportArgumentType]
+        task={},
+        terminated=True,
+        evidence=TerminalEvidence(
+            source="explicit_tool",
+            status="ok",
+            verdict={"ledger_fraction": 0.75, "report": "a receipt", "notice": "a digest"},
+        ),
+    )
+    # In the shape a row records them: episode level is what a terminal may summarise or reveal.
+    published = [{"name": item.name, "value": item.value, "level": "episode"} for item in fb.episode]
+    summary = {item["name"]: item["value"] for item in published}
+    assert summary["reward"] == summary["ledger_fraction"] == 0.75
+    # Read the way a row is read, through the stream's own funnel rather than by eye.
+    assert stream_module._pick_float(published, stream_module._REWARD_NAMES) == 0.75
+    # And revealed by neither arm of the pair.
+    from shogym.feedback.wire import NOTICE_FEEDBACK_NAME, REPORT_FEEDBACK_NAME
+
+    for channel in (REPORT_FEEDBACK_NAME, NOTICE_FEEDBACK_NAME):
+        revealed = stream_module._channel(published, channel)
+        assert [item["value"] for item in revealed] == [summary[channel]]
 
 
 # ----- what a stop is signalled with, and in what order -----
@@ -2248,6 +2500,108 @@ def test_a_handshake_that_fails_leaves_no_process_and_no_scratch_behind(
         with pytest.raises(ProcessLookupError):
             os.kill(pid, 0)
         assert not list(tmp_path.glob("shogym-appworld-*")), line
+
+
+def test_a_handshake_that_ends_at_end_of_file_signals_before_anything_reaps_the_leader(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The one handshake failure the tests above do not cover, and the ordering it broke.
+
+    A worker that closes its pipe without printing is a worker that died, and the branch that
+    reports it read the leader's exit status to say so. ``poll`` reaps an exited child, and a
+    reaped leader releases both its pid and its group number for the kernel to hand on, so the
+    cleanup that followed signalled a number that might already have been somebody else's. That is
+    the stale-group ordering `Worker._stop_the_group` refuses by name, reached through the one
+    path nothing exercised.
+
+    The group is signalled while the leader is still unreaped now, which is the window in which
+    the number is unambiguously this worker's, and a worker that started something before dying
+    has that something stopped with it."""
+    script = tmp_path / "eof_worker.py"
+    script.write_text(
+        "import os, subprocess, sys\n"
+        "sys.stdin.readline()\n"
+        # A descendant that does not hold the handshake pipe, so the leader's exit is an
+        # end-of-file rather than a wait for the whole spawn timeout.
+        "child = subprocess.Popen([sys.executable, '-c', 'import time; time.sleep(120)'],\n"
+        "                        stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)\n"
+        "open(sys.argv[0] + '.child', 'w').write(str(child.pid))\n"
+        # And then it dies without ever saying which port it bound.
+        "sys.exit(3)\n"
+    )
+    monkeypatch.setattr(adapter, "runtime", lambda: Path(sys.executable))
+    monkeypatch.setattr(adapter, "WORKER", script)
+    monkeypatch.setattr(adapter.tempfile, "tempdir", str(tmp_path))
+    monkeypatch.setenv("SHOGYM_CACHE", str(tmp_path / "cache"))
+
+    # `_group_of` is asked once per worker, on the worker, which is how this test gets a handle on
+    # the leader without standing between the constructor and the process it starts.
+    leader: List[subprocess.Popen] = []
+    real_group_of = adapter._group_of
+    real_killpg = os.killpg
+    reaped_when_signalled: List[Optional[int]] = []
+
+    def _capture(process: subprocess.Popen) -> Optional[int]:
+        leader.append(process)
+        return real_group_of(process)
+
+    def _watch(pgid: int, how: int) -> None:
+        # What the leader's status was at the instant the group was signalled. `None` is an
+        # unreaped leader, which is the only state in which this number is certainly its group's.
+        reaped_when_signalled.append(leader[0].returncode if leader else -1)
+        real_killpg(pgid, how)
+
+    monkeypatch.setattr(adapter, "_group_of", _capture)
+    monkeypatch.setattr(adapter.os, "killpg", _watch)
+
+    with pytest.raises(adapter.WorkerError, match="never bound a port"):
+        adapter.Worker.spawn(tmp_path / "root")
+
+    assert reaped_when_signalled, "the group was never signalled at all"
+    assert reaped_when_signalled[0] is None, (
+        "the group was signalled after the leader had been reaped, so the number may have been "
+        "handed on before the signal reached it"
+    )
+    child = int(Path(str(script) + ".child").read_text())
+    deadline = time.monotonic() + 30
+    while time.monotonic() < deadline:
+        try:
+            os.kill(child, 0)
+        except ProcessLookupError:
+            break
+        time.sleep(0.05)
+    else:
+        os.kill(child, signal.SIGKILL)
+        raise AssertionError("what the worker started outlived the failed handshake")
+    assert not list(tmp_path.glob("shogym-appworld-*")), "and the scratch went with it"
+
+
+def test_a_leader_something_already_reaped_is_abandoned_without_a_signal(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The guard itself, in the state a caller can arrive in however it got there.
+
+    A pid is reserved until its parent reaps it, and a process group exists while any member holds
+    it: once the leader has been waited on, both numbers are the kernel's to hand out again. So a
+    cleanup handed an already-reaped leader may signal nothing, which is the same rule
+    :meth:`Worker._stop_the_group` applies and the same one this used to break unconditionally.
+    The scratch directory is still cleared, because that is this call's own to remove."""
+    leader = _sleeper(120)
+    pgid = adapter._group_of(leader)
+    leader.kill()
+    leader.wait(timeout=30)  # reaped: the number is no longer this worker's
+
+    signalled: List[Tuple[int, int]] = []
+    monkeypatch.setattr(
+        adapter.os, "killpg", lambda group, how: signalled.append((group, how))
+    )
+    scratch = tmp_path / "shogym-appworld-reaped"
+    scratch.mkdir()
+
+    adapter._abandon(leader, pgid, scratch)
+
+    assert signalled == [], "a released group number was signalled"
+    assert not scratch.exists(), "the scratch directory is still this call's to remove"
 
 
 def test_a_session_that_never_opens_leaves_no_served_view_behind(
