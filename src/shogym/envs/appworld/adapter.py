@@ -294,13 +294,27 @@ def task_specs(root: Path, task_id: str) -> Dict[str, Any]:
 # ----- the derived corpus -----
 
 
-def derived_root() -> Path:
-    """Where the seeded copy of the corpus lives, named for what generated it.
+#: Bumped when the shape of a derived tree changes: what is copied, what is linked, what is
+#: sealed. It is part of a cache's name and of its stamp, so a tree built under an older layout is
+#: a different cache rather than one this code will read as its own.
+DERIVATION_VERSION = 1
 
-    The name carries a digest of the backlog generator's own constants, so changing a cut value,
-    an option set or the number of requests derives a new corpus instead of serving a stale one
-    that was built under the old ones."""
-    return cache_root() / f"seeded-{DATA_VERSION}-{_generator_digest()}"
+#: What a derived cache was built from, written inside it once it is complete.
+_SOURCE_FILE = ".shogym-source"
+
+
+def derived_root(source: Optional[str] = None) -> Path:
+    """Where the seeded copy of the corpus lives, named for what it was built from.
+
+    Three things are in the name, and each of them changes what the tree holds. The generator
+    digest covers the backlog generator's own constants, so changing a cut value, an option set or
+    the number of requests derives a new corpus instead of serving a stale one. The derivation
+    version covers the *layout*: what is copied, what is linked and what is sealed. And the source
+    digest covers the corpus this was derived from, which used to be missing entirely:
+    ``APPWORLD_ROOT`` takes any directory with a ``data/tasks`` in it, so a process pointed at a
+    second corpus computed a fingerprint for that one and then reused and served task material
+    derived from the first."""
+    return cache_root() / f"seeded-{DATA_VERSION}-{DERIVATION_VERSION}-{_source(source)}"
 
 
 def private_home() -> Path:
@@ -312,7 +326,7 @@ def private_home() -> Path:
     return base.parent / f"{base.name}-private" / "appworld"
 
 
-def graded_root() -> Path:
+def graded_root(source: Optional[str] = None) -> Path:
     """Where the grader's view of the corpus lives: a private directory with an unguessable name.
 
     **This raises the cost of finding it and does not close the route.** The worker runs as the
@@ -322,7 +336,7 @@ def graded_root() -> Path:
     does is stop the tree being derivable from what the worker is given, which the previous
     layout, a fixed name beside the served root, was."""
     home = private_home()
-    return home / f"graded-{DATA_VERSION}-{_generator_digest()}-{_private_tag()}"
+    return home / f"graded-{DATA_VERSION}-{DERIVATION_VERSION}-{_source(source)}-{_private_tag()}"
 
 
 def _read_tag(keyfile: Path) -> Optional[str]:
@@ -334,7 +348,63 @@ def _read_tag(keyfile: Path) -> Optional[str]:
     return tag if len(tag) == 16 else None
 
 
-@lru_cache(maxsize=4)
+def _source(source: Optional[str]) -> str:
+    """The source digest a cache name is keyed by, computed from the served corpus if not given.
+
+    The argument exists so that the env computes this once and hands the same value to both roots;
+    the default is for callers that only want to name a path (tests, tooling) and would otherwise
+    have to reach for the corpus themselves."""
+    return f"{_generator_digest()}-{source or corpus_digest(ensure_corpus())}"
+
+
+def stamp_cache(root: Path, *, source: str) -> None:
+    """Record what a derived cache was built from, and refuse one built from something else.
+
+    The name already carries the same values, so this cannot normally disagree. It is here for the
+    case the name cannot cover: a tree edited, moved or restored in place under a name that still
+    claims the old identity. A cache is the material a run is scored against, and the failure mode
+    without this is silent, so the check is worth one file read per construction.
+
+    Published by link rather than written in place, for the reason :func:`world._publish` gives:
+    two cold processes reach this together and the loser must find the winner's whole stamp rather
+    than half of its own."""
+    root.mkdir(parents=True, exist_ok=True)
+    stamp = root / _SOURCE_FILE
+    material = json.dumps(
+        {"source": source, "derivation": DERIVATION_VERSION, "data": DATA_VERSION}, sort_keys=True
+    )
+    held = ""
+    try:
+        held = stamp.read_text().strip()
+    except OSError:
+        held = ""
+    if held:
+        if held != material:
+            raise ProvisioningError(
+                f"the derived cache at {root} says it was built from {held}, but this run serves "
+                f"{material}; a cache is the material a run is scored against, so this refuses "
+                "rather than reusing it. Remove that directory, or point SHOGYM_CACHE elsewhere"
+            )
+        return
+    staged = root / f"{_SOURCE_FILE}.{os.getpid()}.{secrets.token_hex(8)}"
+    try:
+        staged.write_text(material)
+        os.link(staged, stamp)
+    except FileExistsError:
+        # Another process published first. Its stamp is the one that counts, and it is checked
+        # rather than trusted: this is the same comparison as above.
+        if stamp.read_text().strip() != material:
+            raise ProvisioningError(
+                f"the derived cache at {root} was stamped by another process with a different "
+                "identity while this one was building it"
+            ) from None
+    finally:
+        try:
+            staged.unlink()
+        except OSError:
+            pass
+
+
 def corpus_digest(root: Path) -> str:
     """What the corpus at ``root`` actually holds, as sixteen hex characters.
 
@@ -349,17 +419,30 @@ def corpus_digest(root: Path) -> str:
     under a digest whose whole job is to say what the corpus holds. A size is not a summary of
     contents, and a fingerprint that says it covers the scoring inputs has to have read them.
 
-    The task tree is the scoring input, so all of it is read. Reading it costs a second or so on
-    every fresh process, which is the price of the digest meaning what it says."""
+    **Everything under ``data`` is read, not only the tasks.** This once covered ``version.txt``
+    and the task tree, which left out ``base_dbs``, ``datasets`` and ``api_docs`` entirely. Those
+    are 134 MB of starting state and documentation that every episode reads as input: a world
+    built on different base databases is a different world, and a digest whose job is to say what
+    the corpus holds cannot leave out the largest thing in it.
+
+    **Not memoized, deliberately.** It was cached on the root path, so a corpus that changed under
+    one path during a process kept the digest it had when the process first looked, which is the
+    one case the cache would have had to answer. The env computes this once in its constructor and
+    keeps the value; the cost is about two seconds on a fresh corpus, dominated by the fourteen
+    thousand small files in the task tree, and it is the price of the digest meaning what it
+    says."""
     digest = hashlib.sha256()
     data = root / "data"
-    version = data / "version.txt"
-    digest.update(version.read_bytes() if version.exists() else b"")
-    for path in sorted((data / "tasks").rglob("*")):
-        if not path.is_file():
+    for path in sorted(data.rglob("*")):
+        if not path.is_file() or path.is_symlink():
             continue
         digest.update(str(path.relative_to(data)).encode())
-        digest.update(path.read_bytes())
+        with path.open("rb") as handle:
+            while True:
+                block = handle.read(1 << 20)
+                if not block:
+                    break
+                digest.update(block)
     return digest.hexdigest()[:16]
 
 
@@ -514,6 +597,10 @@ class Worker:
     #: Whether :meth:`close` has begun. Set before the first signal, so a close interrupted part
     #: way through is still a worker no later call will signal for.
     closed: bool = False
+    #: Whether the execution domain is *provably* gone: the leader was signalled while it was
+    #: alive, was reaped, and the process table was read and showed nothing left in the group.
+    #: What finalize grades on, and false wherever the answer is "I could not tell".
+    stopped: bool = False
 
     @classmethod
     def spawn(cls, root: Path) -> "Worker":
@@ -577,74 +664,172 @@ class Worker:
             detail = exc.read().decode(errors="replace")
             raise WorkerError(f"appworld worker refused {command!r}: {detail}") from exc
 
-    def close(self) -> None:
-        """Stop the worker, promptly and with a bound.
+    def close(self, *, confirm: bool = False) -> None:
+        """Stop the worker, promptly and with a bound, and say whether it is provably gone.
 
-        Signalled and reaped rather than asked over the socket. Teardown runs on the serving
-        process's shared loop, so a close that waited on an HTTP round trip into a wedged world
-        would hold every other episode with it; and there is nothing to ask for, because the end
-        state was flushed when the episode was read. A process that ignores the signal is killed.
+        Signalled and reaped rather than asked over the socket. There is no close command to ask
+        for: this is the process that runs agent-authored code, so a reply from it saying that it
+        had stopped is a reply the episode could have written. The fact the host needs is that the
+        process stopped, and that fact is the kernel's.
 
-        **The group, and not only its leader.** This used to signal only while the leader was
-        still alive and then wait only for that leader. A leader that had already exited left its
-        children unsignalled, and a child that outlived the leader was never noticed: the world
-        had been scored and something was still running in it. The group is signalled whatever the
-        leader is doing, and what is waited for is the group emptying.
+        **The group, and not only its leader.** Agent code runs in that process and is free to
+        spawn, so a signal to the direct child alone leaves descendants running against a world
+        that has been scored. The group is signalled and what is waited for is the group emptying.
+
+        **Only while the group is still this worker's.** A pgid is a number, and the kernel
+        recycles numbers once nothing holds them. The group is therefore signalled before the
+        leader is reaped, which is the window in which the number is certainly this worker's even
+        if the leader is already a zombie; a leader something else reaped first leaves a number
+        nothing here may use, and the honest report is then that the execution domain cannot be
+        addressed rather than that it was cleaned up (see :meth:`_stop_the_group`).
 
         **Stateful, and that is what makes it idempotent.** An ordinary episode calls this twice:
-        once when the sealed world has been read, and once from teardown. It used to answer the
-        second call by asking the kernel which group the stored pid was in, and by then the pid
-        may not be this worker's: the grader runs between the two closes with ten minutes to do
-        it in, which is long enough for a freed pid to be handed out again. The second call would
-        then have signalled a stranger's group. Nothing here asks about a pid after the first
-        call: the group was read at spawn, and the flag below is set before the first signal, so
-        the second call is a return."""
-        if self.closed:
-            return
-        # Before the signals rather than after them: a close that raises part way through is
-        # still a close, and a worker signalled once must not be looked up a second time.
-        self.closed = True
+        once from finalize, once from teardown. Between them runs the grader, which is allowed ten
+        minutes, and that is long enough for a freed pid to be handed out again. Nothing here asks
+        about a pid after the first call.
+
+        ``confirm`` turns a best effort into an assertion. It returns only when the leader was
+        signalled while it was alive, was reaped, and the process table was read and showed nothing
+        left in the group. Anything else raises, including a process table that could not be read,
+        because "I could not look" is not "there is nothing there" and an episode graded on the
+        strength of it is graded on a tree something may still be writing to."""
+        if not self.closed:
+            self.closed = True
+            self.stopped = self._stop_the_group()
+            for stream in (self.process.stdout, self.process.stderr):
+                if stream is not None:
+                    try:
+                        stream.close()
+                    except Exception:
+                        pass
+            shutil.rmtree(self.scratch, ignore_errors=True)
+        if confirm and not self.stopped:
+            raise WorkerError(
+                "the appworld worker's execution domain could not be confirmed stopped, so there "
+                "is no state it is safe to grade: the process group was not observed empty (see "
+                "`Worker.close`)"
+            )
+
+    def _stop_the_group(self) -> bool:
+        """Signal and reap this worker's group, and report whether it is provably empty.
+
+        **Signalled before anything reaps the leader, which is what makes the number safe to
+        use.** A pid is reserved until its parent reaps it, and a process group exists while it
+        has any member, a zombie included. So a leader that exited on its own, even one an agent
+        killed from inside its own block, is still holding this group when this runs: the number
+        is unambiguously this worker's and the signal reaches whatever it started. What is never
+        safe is signalling *after* the reap, because the kernel is free to hand the number on from
+        that instant.
+
+        The one case this cannot serve is a leader something else already reaped, which
+        ``returncode`` is the record of. Then the number may be anybody's, so it is neither
+        signalled nor enumerated and the stop is reported unconfirmed.
+
+        The ordering matters for a second reason. Reaping first and refusing an already-exited
+        leader would have handed an episode a way out of a bad score: kill the worker from inside
+        a block and the seal cannot be confirmed, so the row is unscored rather than low. Under
+        this order that episode is stopped, confirmed and graded on what upstream persisted, which
+        is the same answer any other episode gets."""
         pgid = self.pgid
-        if self.process.poll() is None:
+        if self.process.returncode is not None:
+            # Reaped before this call, so the pid and the group number may already have been
+            # handed on. Nothing is signalled and nothing is enumerated.
+            return False
+        if pgid is None:
+            # A platform without `setsid`: there is no group, so the leader is all there is to
+            # stop and there is nothing that could say what it started.
             _stop(self.process, signal.SIGTERM, pgid)
             try:
                 self.process.wait(timeout=_CLOSE_SECONDS)
             except subprocess.TimeoutExpired:
                 _stop(self.process, signal.SIGKILL, pgid)
-                try:
-                    self.process.wait(timeout=_CLOSE_SECONDS)
-                except subprocess.TimeoutExpired:
-                    pass
-        elif pgid is not None:
-            # The leader is already gone, so nothing above signalled anything. Its children are
-            # still in its group.
-            _signal_group(pgid, signal.SIGTERM)
-        if pgid is not None:
-            _reap_group(pgid)
-        for stream in (self.process.stdout, self.process.stderr):
-            if stream is not None:
-                try:
-                    stream.close()
-                except Exception:
-                    pass
-        shutil.rmtree(self.scratch, ignore_errors=True)
+            return False
+        _signal_group(pgid, signal.SIGTERM)
+        try:
+            self.process.wait(timeout=_CLOSE_SECONDS)
+        except subprocess.TimeoutExpired:
+            _signal_group(pgid, signal.SIGKILL)
+            try:
+                self.process.wait(timeout=_CLOSE_SECONDS)
+            except subprocess.TimeoutExpired:
+                return False
+        return _group_emptied(pgid) is True
+
+
+class SnapshotError(RuntimeError):
+    """The stopped output tree is not something that may be graded.
+
+    Its own type because it is an episode-level failure with a cause worth naming: the tree the
+    world left behind holds something that is not a plain file, and a grader that opened it would
+    be resolving a path the agent chose in a process that also holds the answers."""
+
+
+def snapshot_outputs(outputs: Path, *, into: Path) -> Path:
+    """Copy a stopped episode's output tree into one the grader can be given, or refuse.
+
+    **Why a copy and not the tree itself.** The grading process is pointed at the root that holds
+    the answers, and it also has to read the state to grade, which was writable by the process
+    that ran the agent's code. A symlink left in there resolves in the grader's process, so a link
+    planted under the output tree could make the digest, the filing and the evaluator read bytes
+    from the graded tree instead of from what the episode submitted. Nothing here returns those
+    bytes to the agent, so this is score integrity rather than a leak, and it is still not a thing
+    to leave open.
+
+    So: every entry is checked to be a plain file or a plain directory whose real path is inside
+    the tree, and anything else refuses the episode outright rather than being skipped, because a
+    skipped entry is a grade computed over a tree that is not the one submitted. What is copied is
+    then a tree of regular files with no link in it, and that is what the grader is given.
+
+    Safe to walk because the worker is already gone: this runs after a confirmed stop, so nothing
+    can add a link between the check and the copy."""
+    root = outputs.resolve()
+    if not root.is_dir():
+        raise SnapshotError(f"the episode left no output tree at {outputs}")
+    for path in sorted(root.rglob("*")):
+        if path.is_symlink():
+            raise SnapshotError(
+                f"the episode left a symbolic link in its output tree ({path.name} -> "
+                f"{os.readlink(path)}), which a grader must not resolve"
+            )
+        if not (path.is_file() or path.is_dir()):
+            raise SnapshotError(f"the episode left {path.name}, which is not a file or directory")
+        if not path.resolve().is_relative_to(root):
+            raise SnapshotError(f"the episode left {path.name}, which resolves outside its tree")
+    shutil.rmtree(into, ignore_errors=True)
+    shutil.copytree(root, into, symlinks=False)
+    return into
 
 
 def grade(
     *,
     root: Path,
     task_id: str,
-    experiment: str,
+    outputs: Path,
     ignore: Sequence[str],
+    filing: Dict[str, str],
     timeout: float = _GRADE_TIMEOUT_SECONDS,
 ) -> Any:
-    """The base task's own checks, from a process that has never run a line the agent wrote.
+    """The base task's own checks and the episode's own filing, from a process that has never run
+    a line the agent wrote.
 
     A second, short-lived worker rather than the one that served the episode. It is the only place
-    ground truth is loaded, it starts after the world is sealed, and it reads the end state off
-    disk, so the answers are never objects in the process the agent's code ran as."""
+    ground truth is loaded, it starts after the serving worker has been confirmed stopped, and it
+    reads the end state off disk, so the answers are never objects in the process the agent's code
+    ran as.
+
+    **The filing and the digests come back from here too.** They used to be asked of the serving
+    world over the protocol, which made the process that runs agent-authored code the process
+    reporting what the episode had done. One process now reads one stopped tree, so the filing,
+    the databases' digest and the evaluator's verdicts are one state by construction rather than
+    two observations that happened to agree."""
     opening = json.dumps(
-        {"root": str(root), "task_id": task_id, "experiment": experiment, "ignore": list(ignore)}
+        {
+            "root": str(root),
+            "task_id": task_id,
+            "experiment": str(outputs),
+            "ignore": list(ignore),
+            "filing": dict(filing),
+        }
     )
     scratch = Path(tempfile.mkdtemp(prefix="shogym-appworld-grade-"))
     process = subprocess.Popen(
@@ -694,47 +879,66 @@ def _signal_group(pgid: int, how: int) -> None:
         pass
 
 
-def _group_members(pgid: int) -> Sequence[int]:
-    """Every live process still in ``pgid``, this process excluded.
+def _group_members(pgid: int) -> Optional[List[int]]:
+    """Every live process still in ``pgid`` but this one, or ``None`` if the table was unreadable.
 
-    Asked of `ps` rather than of `/proc`, which macOS does not have. An answer this cannot get is
-    reported as an empty group: the caller uses it to decide whether to escalate, and a reaper
-    that raised on an unreadable process table would turn a diagnostic into a failed teardown."""
+    Asked of `ps` rather than of `/proc`, which macOS does not have.
+
+    **A table this could not read is not an empty table.** It used to answer both with an empty
+    sequence, so a `ps` that would not run reported the same fact as a group that had emptied, and
+    a caller confirming a stop confirmed it on no evidence. The two answers are now different
+    values and the caller that needs proof treats the missing one as a refusal.
+
+    Exited-but-unreaped entries are excluded. A process that was killed sits in the table until
+    somebody waits on it, and a zombie holds no memory, no descriptors and no ability to write, so
+    counting one as live would report a completed stop as an incomplete one."""
     try:
         listing = subprocess.run(
-            ["ps", "-o", "pid=,pgid=", "-A"],
+            ["ps", "-o", "pid=,pgid=,stat=", "-A"],
             capture_output=True,
             text=True,
             timeout=_CLOSE_SECONDS,
         )
     except (OSError, subprocess.SubprocessError):
-        return ()
+        return None
+    if listing.returncode != 0:
+        return None
     live: List[int] = []
+    mine = os.getpid()
     for line in listing.stdout.splitlines():
         fields = line.split()
-        if len(fields) != 2:
+        if len(fields) < 3:
             continue
         try:
             pid, group = int(fields[0]), int(fields[1])
         except ValueError:
             continue
-        if group == pgid and pid != os.getpid():
+        if group == pgid and pid != mine and not fields[2].startswith("Z"):
             live.append(pid)
     return live
 
 
-def _reap_group(pgid: int) -> None:
-    """Wait for the worker's group to empty, escalating once if it does not.
+def _group_emptied(pgid: int) -> Optional[bool]:
+    """Whether ``pgid`` is provably empty, escalating once if it is not, or ``None`` if unknown.
 
     Waiting for the leader says nothing about what the leader started. Agent code runs in that
     process and may have left something behind, and something still running after the world has
-    been scored is either changing what was scored or holding a port the next episode wants."""
+    been scored is either changing what was scored or holding a port the next episode wants.
+
+    Three answers rather than two, because the caller grades on the strength of this: ``True`` is
+    a process table that was read and held nothing of this group, ``False`` is one that still did
+    after a SIGKILL, and ``None`` is a table that could not be read at all."""
     deadline = time.monotonic() + _CLOSE_SECONDS
     escalated = False
-    while _group_members(pgid):
+    while True:
+        members = _group_members(pgid)
+        if members is None:
+            return None
+        if not members:
+            return True
         if time.monotonic() >= deadline:
             if escalated:
-                return
+                return False
             _signal_group(pgid, signal.SIGKILL)
             escalated = True
             deadline = time.monotonic() + _CLOSE_SECONDS
@@ -786,10 +990,12 @@ __all__ = [
     "DATA_BUNDLE_SHA256",
     "DATA_BUNDLE_URL",
     "DATA_VERSION",
+    "DERIVATION_VERSION",
     "MANIFEST",
     "ProvisioningError",
     "ROOT_ENV_VAR",
     "SPLIT",
+    "SnapshotError",
     "UPSTREAM_SHA",
     "UPSTREAM_VERSION",
     "Worker",
@@ -807,6 +1013,8 @@ __all__ = [
     "ensure_apps",
     "ensure_corpus",
     "runtime",
+    "snapshot_outputs",
+    "stamp_cache",
     "task_ids",
     "task_specs",
 ]

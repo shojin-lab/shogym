@@ -242,7 +242,10 @@ async def test_the_world_process_answers_nothing_without_its_token() -> None:
     # holds, so an agent that found the port still cannot ask the world what the answer was.
     worker = adapter.Worker.spawn(adapter.derived_root() / "data")
     try:
-        for command in ("evaluate", "read", "open", "execute", "close"):
+        # The two commands this protocol has, and three it does not: a token is checked before
+        # the path is looked up, so an unknown command is refused as an unauthenticated one and
+        # never as a hint about what the protocol carries.
+        for command in ("open", "execute", "evaluate", "quiesce", "read"):
             request = urllib.request.Request(
                 f"http://127.0.0.1:{worker.port}/{command}",
                 data=b"{}",
@@ -410,6 +413,7 @@ shared = ["base_dbs", "datasets", "api_docs"]
 # corpus, and the corpus keeps every task's answers in the folder beside its specs.
 neighbours = []
 answers = []
+writable = []
 for name in shared:
     if not _os.path.islink(root + "/data/" + name):
         continue
@@ -418,6 +422,20 @@ for name in shared:
         neighbours.append(name)
     if _os.path.exists(here + "/tasks/%(task)s/ground_truth"):
         answers.append(name)
+    # Continue the same walk into the shared task cache the links land beside: it is the pristine
+    # source every later episode's view is copied out of, so anything writable in it reaches the
+    # next episode and the other arm of this one's pair.
+    for reachable in (
+        "/tasks",
+        "/tasks/%(task)s",
+        "/tasks/%(task)s/specs.json",
+        "/tasks/%(task)s/dbs",
+        "/tasks/%(task)s/dbs/gmail.jsonl",
+        "/tasks/%(task)s/dbs/todoist.jsonl",
+    ):
+        path = here + reachable
+        if _os.path.exists(path) and (_os.stat(path).st_mode & 0o222):
+            writable.append(name + reachable)
 print(json.dumps({
     "specs": _read(task + "/specs.json"),
     "specs_is_link": _os.path.islink(task + "/specs.json"),
@@ -426,6 +444,7 @@ print(json.dumps({
     "sibling": _read(task + "/ground_truth/test_data.json"),
     "neighbours": sorted(set(neighbours)),
     "answers_beyond_a_link": sorted(set(answers)),
+    "writable_shared_inputs": sorted(set(writable)),
     # The base every episode shares. A write through it would be in the next episode's inputs.
     "shared_mode": _mode(root + "/data/api_docs"),
     "shared_file_mode": _mode(root + "/data/base_dbs/admin.db"),
@@ -448,6 +467,10 @@ print(json.dumps({
     # keeps every task's answers in the folder beside its specs.
     assert seen["neighbours"] == ["api_docs", "base_dbs", "datasets"]
     assert seen["answers_beyond_a_link"] == []
+    # And nothing the walk reaches is writable, which is the other half of the invariant: the
+    # shared base was sealed and the shared task cache beside it was not, so a served worker could
+    # edit the pristine copy the next episode is built from.
+    assert seen["writable_shared_inputs"] == []
     # The episode owns its task and nothing else. The shared base an episode links to is sealed
     # read-only, so a write through it cannot reach the next episode's starting inputs or the
     # other arm of its own pair's; its own task copy is writable and goes with the episode.
@@ -732,9 +755,13 @@ async def test_one_episodes_write_is_not_in_the_next_episodes_world() -> None:
 
 
 async def test_the_world_stops_before_it_is_graded() -> None:
-    """Sealing closes the tool surface and does not stop work an earlier call left running. The
-    worker is terminated before the read is scored, so the evaluator reads a snapshot nothing can
-    still be writing to."""
+    """Sealing closes the tool surface and does not stop work an earlier call left running, so the
+    worker's whole group is stopped and *confirmed gone* before anything reads what it left.
+
+    The leader's exit used to be the whole of this assertion, and a leader says nothing about what
+    it started. What is checked now is the value the finalizer grades on: the group was signalled
+    while it was still this worker's, the leader was reaped, and the process table was read and
+    held nothing of the group. An episode whose stop cannot be confirmed is not scored at all."""
     from shogym.envs.appworld import mcp_server
 
     env = shogym.make("appworld")
@@ -744,9 +771,41 @@ async def test_the_world_stops_before_it_is_graded() -> None:
         assert session is not None
         worker = session.worker
         assert worker.process.poll() is None
+        assert worker.stopped is False
         await episode.call("submit", {})
-        # Graded, and the process that could have changed the world is already gone.
+        # Graded, and the process that could have changed the world is not merely dead: its whole
+        # group was observed empty before a byte of what it wrote was read.
         assert worker.process.poll() is not None
+        assert worker.stopped is True
+    finally:
+        await episode.close()
+    # The copy the grader was given goes with the episode too.
+    assert not Path(str(adapter.episode_outputs(episode.session_id)) + ".graded").exists()
+
+
+async def test_a_stop_that_cannot_be_confirmed_scores_nothing_and_reveals_nothing(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The fail-closed path, driven through a real world.
+
+    An unconfirmed stop leaves a tree something may still be writing to, and a number computed
+    over it is a number about no instant of the episode. This used to be scored anyway: the
+    quiescence failure was noted on the row and the fractions, the receipt and the notice were
+    published beside it. Now the episode ends as an infrastructure closure, and there is no
+    receipt and no notice for a feedback policy to select, rename and reveal."""
+    env = shogym.make("appworld")
+    episode = await ServedEpisode.open_env(env, env_name="appworld", task=TASK)
+    try:
+        # Exactly the shape of the failure: `ps` cannot be read, so nothing can say the group is
+        # empty. The worker is still signalled and reaped; what is missing is the evidence.
+        monkeypatch.setattr(adapter, "_group_members", lambda pgid: None)
+        await episode.call("submit", {})
+        payload = episode.terminal_payload or {}
+        assert payload.get("finalize_error") is True
+        # Nothing that could be read as a score, and neither arm's dose.
+        published = {item["name"] for item in (episode.terminal_feedback or [])}
+        assert "report" not in published and "notice" not in published
+        assert "ledger_fraction" not in published
     finally:
         await episode.close()
 

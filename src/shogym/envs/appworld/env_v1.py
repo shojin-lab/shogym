@@ -40,6 +40,7 @@ import asyncio
 import datetime as dt
 import hashlib
 import zlib
+from pathlib import Path
 from typing import TYPE_CHECKING, Any, Dict, Optional
 
 from shogym.core import Env
@@ -149,14 +150,22 @@ class AppWorldEnv(Env):
         self._pulse = int(pulse)
         self._report = report
         self._original = adapter.ensure_corpus() / "data"
-        self._derived = world.derive_root(
-            original=self._original, derived=adapter.derived_root() / "data"
+        # Read once, from the corpus this run actually serves, and used for three things that all
+        # have to agree: the name of the served cache, the name of the grader's cache, and the run
+        # fingerprint a resumed record is checked against. They used to be able to disagree, so a
+        # process pointed at a second corpus computed a fingerprint for that one and then reused
+        # and served task material derived from the first.
+        self._corpus = adapter.corpus_digest(self._original.parent)
+        served, graded = (
+            adapter.derived_root(self._corpus),
+            adapter.graded_root(self._corpus),
         )
+        adapter.stamp_cache(served, source=self._corpus)
+        adapter.stamp_cache(graded, source=self._corpus)
+        self._derived = world.derive_root(original=self._original, derived=served / "data")
         # The grader's view of the same corpus, with the answers linked back in. Only the grading
         # process is ever given this root; the world an agent drives is given the other one.
-        self._graded = world.derive_root(
-            original=self._original, derived=adapter.graded_root() / "data"
-        )
+        self._graded = world.derive_root(original=self._original, derived=graded / "data")
         self._task_ids = adapter.task_ids()
         self._backlogs: Dict[str, Any] = {}
         self.function = FunctionConfig(example_system_template=_static_instructions())
@@ -170,7 +179,7 @@ class AppWorldEnv(Env):
             pulse=self._pulse,
             report=self._report,
             blocks=self._blocks,
-            corpus=adapter.corpus_digest(self._original.parent),
+            corpus=self._corpus,
         )
         super().__init__(horizon=self._blocks + 1, num_tasks=len(self._task_ids))
 
@@ -290,6 +299,8 @@ class AppWorldEnv(Env):
         # find; a directory that only ever grows is retention by omission rather than by policy.
         # After the worker is closed, so nothing is still writing into what is being removed.
         shutil.rmtree(session.experiment, ignore_errors=True)
+        # And the copy the grader was given, which is the same tree under a second name.
+        shutil.rmtree(session.experiment + ".graded", ignore_errors=True)
 
     def _derive(self, worker: adapter.Worker, task_id: str) -> None:
         """Make sure the seeded copy of ``task_id``'s world exists, writing it if it does not.
@@ -381,47 +392,59 @@ class AppWorldEnv(Env):
         backlog = self._backlog(session.task_id, specs)
         key = draw_key(leg_of(session.task_id), self._pulse)
 
-        # Off the event loop. Both of these are blocking HTTP calls into another process, one of
-        # which runs the world's own evaluator, and a coroutine that never yields would stop every
-        # other episode this serving process is running and would make the serve layer's deadline
-        # unable to fire on this one.
-        # Stop what the episode started before reading it. Sealing closed the tool surface and
-        # did not stop work an earlier call left running, so without this the filing and the
-        # snapshot beneath it can come from different moments and the evaluator scores a state no
-        # instant of the episode ever had.
-        try:
-            quiesced = await asyncio.to_thread(session.worker.call, "quiesce")
-        except Exception as failure:
-            # A worker too wedged to answer is about to be signalled anyway; the close below owns
-            # that, and a failure to quiesce politely must not cost the episode its grade. What it
-            # must not do is disappear: an episode whose execution domain was never stopped is an
-            # episode whose snapshot may be of a moving world, and swallowing the exception made
-            # that indistinguishable from a clean seal.
-            quiesced = {"quiesced": False, "note": f"quiesce failed: {type(failure).__name__}"}
-        read = await asyncio.to_thread(
-            session.worker.call,
-            "read",
-            supervisor_email=session.supervisor_email,
-            project=world.PROJECT_NAME,
-            title=world.LOG_TITLE,
-            label=world.LOG_LABEL,
+        # Off the event loop. Each of these blocks on another process, one of them the world's
+        # own evaluator, and a coroutine that never yields would stop every other episode this
+        # serving process is running and would make the serve layer's deadline unable to fire on
+        # this one.
+        #
+        # **Nothing here asks the world anything.** The world's process is the process that runs
+        # agent-authored code, so a reply from it saying that it had stopped, or flushed, or that
+        # a value was such-and-such, is a reply the episode could have written. There is no seal
+        # command, no quiesce command and no read command any more. The host stops the worker's
+        # process group, confirms from the process table that the group is empty, and grades what
+        # is on disk.
+        #
+        # **What is on disk is the world at the end of the last block, because upstream puts it
+        # there.** `AppWorld.execute` ends with its own save into the episode's output tree and
+        # `initialize` writes one before any block runs, so an episode that ran N blocks is graded
+        # on the state after block N, and an episode that ran none is graded on its opening state.
+        # Work an agent's thread does after its last block is lost rather than scored, which is
+        # the same rule the block budget states.
+        #
+        # **A stop that cannot be confirmed ends the episode unscored.** Not signalled, not
+        # reaped, or a process table that would not answer: each of those leaves a tree something
+        # may still be writing to, and a number computed over it is a number about no instant of
+        # the episode. Raising here is what makes that an infrastructure closure rather than a
+        # score: the stream files the row `finalize_error`, unscored, with nothing in `observed`,
+        # so neither feedback arm has a payload to reveal (see `TaskStream._unsealed_row`).
+        await asyncio.to_thread(session.worker.close, confirm=True)
+        # A tree of regular files, or no grade. See `adapter.snapshot_outputs`: the grading
+        # process is pointed at the root that holds the answers, so a link left under the output
+        # tree would resolve there.
+        snapshot = await asyncio.to_thread(
+            adapter.snapshot_outputs,
+            Path(session.experiment),
+            into=Path(session.experiment + ".graded"),
         )
-        # Stop the world before grading it. Sealing closes the tool surface and does not stop work
-        # an earlier call left running, so the process and everything it started are terminated
-        # here, and the evaluator then reads a snapshot on disk that nothing can still be writing
-        # to. The close teardown makes afterwards returns without signalling anything, because
-        # `Worker.close` records that it ran rather than re-deriving a group from a pid the
-        # grader's ten minutes were long enough for the kernel to hand to someone else.
-        await asyncio.to_thread(session.worker.close)
-        checks = (
-            await asyncio.to_thread(
-                adapter.grade,
-                root=self._graded.parent,
-                task_id=session.task_id,
-                experiment=session.experiment,
-                ignore=world.ADDED_MODELS,
-            )
-        )["checks"]
+        graded = await asyncio.to_thread(
+            adapter.grade,
+            root=self._graded.parent,
+            task_id=session.task_id,
+            outputs=snapshot,
+            ignore=world.ADDED_MODELS,
+            filing={
+                "supervisor_email": session.supervisor_email,
+                "project": world.PROJECT_NAME,
+                "title": world.LOG_TITLE,
+                "label": world.LOG_LABEL,
+            },
+        )
+        checks = graded["checks"]
+        read = {
+            "filing": graded["filing"],
+            "world_digest": graded["world_digest"],
+            "rng_digest": graded["rng_digest"],
+        }
         filing = world.Filing(**{**read["filing"], "lines": tuple(read["filing"]["lines"])})
         verdicts = score(
             backlog=backlog,
@@ -443,7 +466,6 @@ class AppWorldEnv(Env):
                 "payload_class": self._report,
                 "world_digest": str(read["world_digest"]),
                 "rng_digest": str(read["rng_digest"]),
-                "seal_note": _seal_note(quiesced, read),
                 REPORT_FEEDBACK_NAME: rendered[self._report],
                 NOTICE_FEEDBACK_NAME: rendered[payload.DIGEST],
             },
@@ -477,6 +499,18 @@ class AppWorldEnv(Env):
         fb = FeedbackCollection()
         if not terminated:
             return fb
+        if evidence is not None and evidence.finalize_error:
+            # **A failed terminal publishes the failure and nothing else.** It used to publish a
+            # row of zeroed fractions and an empty receipt beside them, which is a scored-looking
+            # row for an episode that was never scored: the zeros average into a mean and the
+            # empty receipt is still an item a paired policy selects and reveals. There is no
+            # verdict behind this episode, so the honest record of it is that fact alone, and the
+            # stream files the row unscored on the core's own stamp rather than on this item.
+            fb.episode.append(EpisodeFeedback(name="finalize_error", value=True))
+            fb.inference.append(
+                InferenceFeedback(name="config_digest", value=self._config_digest, step=0)
+            )
+            return fb
         verdict = evidence.verdict if evidence is not None else {}
         for name in (
             "ledger_fraction",
@@ -496,8 +530,6 @@ class AppWorldEnv(Env):
         fb.episode.append(
             EpisodeFeedback(name=NOTICE_FEEDBACK_NAME, value=str(verdict.get(NOTICE_FEEDBACK_NAME) or ""))
         )
-        if evidence is not None and evidence.finalize_error:
-            fb.episode.append(EpisodeFeedback(name="finalize_error", value=True))
         # Recorded, never surfaced. Run identity has to be on every row, because that is what a
         # resumed directory is checked against; and it has to be off every wire, because it is a
         # short digest over a small integer pulse and an agent handed one could enumerate pulses
@@ -507,39 +539,10 @@ class AppWorldEnv(Env):
         fb.inference.append(
             InferenceFeedback(name="config_digest", value=self._config_digest, step=0)
         )
-        # Recorded, never surfaced, and for the same two reasons. The record needs it, because an
-        # episode whose execution domain was still moving when it was snapshotted is an episode
-        # whose number is about a state no instant of it had, and a run that cannot tell those
-        # rows apart afterwards has no way to find them. The agent must not have it, because it
-        # says whether work the episode retained went unstopped, which is a fact about the seal
-        # that an episode could otherwise learn to exploit.
-        fb.inference.append(
-            InferenceFeedback(name="seal_note", value=str(verdict.get("seal_note") or ""), step=0)
-        )
         return fb
 
 
 # ----- pure helpers -----
-
-
-def _seal_note(quiesced: Any, read: Any) -> str:
-    """What about this episode's seal was not clean, or the empty string if it was.
-
-    Two questions, and the port answers both because neither implies the other. Quiescence asks
-    whether the execution domain was stopped: it can stop processes, it cannot stop threads inside
-    the worker's interpreter, and a process table it could not read is not an empty one. Stability
-    asks whether the filing and the snapshot came from one instant, which is the thing quiescence
-    exists to protect and which :meth:`worker.Episode.read` measures directly by digesting the
-    saved state on both sides of the read.
-
-    A clean seal is the empty string, so the presence of any text is the whole signal."""
-    notes = []
-    if not (isinstance(quiesced, dict) and quiesced.get("quiesced")):
-        detail = str((quiesced or {}).get("note") or "") if isinstance(quiesced, dict) else ""
-        notes.append(f"not quiesced ({detail})" if detail else "not quiesced")
-    if isinstance(read, dict) and read.get("stable") is False:
-        notes.append("the filing and the snapshot are from different moments")
-    return "; ".join(notes)
 
 
 def _numbers(verdicts: Verdicts) -> Dict[str, float]:
@@ -567,16 +570,22 @@ def _static_instructions() -> str:
 
 #: Bumped by hand when a change to this port would make two runs' scores mean different things
 #: without changing any of its inputs: the scorer's rules, the payload's layout, the seeded
-#: backlog's shape. It is in the run fingerprint so that "the same pulse" is not mistaken for
-#: "the same measurement" across such a change.
-SCORING_VERSION = 2
+#: backlog's shape, or how the state behind a score is read. It is in the run fingerprint so that
+#: "the same pulse" is not mistaken for "the same measurement" across such a change.
+#:
+#: 3: the filing and the world digest are read from the stopped episode's own persisted tree by
+#: the grading process, rather than asked of the serving world over the protocol. Two runs either
+#: side of that read different bytes at different moments, so their rows are not one measurement
+#: whatever else they agree on.
+SCORING_VERSION = 3
 
 
 def run_fingerprint(*, pulse: int, report: str, blocks: int, corpus: str = "") -> str:
     """Everything two runs must agree on for their rows to be one measurement.
 
     The draw and the payload class decide what a score *means*; the block budget decides what an
-    episode had the chance to do; the corpus and the interpreter decide what world it happened in;
+    episode had the chance to do; the corpus, the interpreter and the derivation decide what world
+    it happened in; every constant a payload is generated from decides what the agent was told;
     and :data:`SCORING_VERSION` decides how it was read. ``corpus`` is what the corpus actually
     holds rather than what the pin says it should (see :func:`~adapter.corpus_digest`), because
     the root is whatever the environment points at and a repointed one would otherwise pass for
@@ -601,11 +610,17 @@ def run_fingerprint(*, pulse: int, report: str, blocks: int, corpus: str = "") -
             str(blocks),
             str(SCORING_VERSION),
             adapter.DATA_VERSION,
+            str(adapter.DERIVATION_VERSION),
             adapter.DATA_BUNDLE_SHA256,
             corpus,
             adapter.UPSTREAM_VERSION,
             adapter.MANIFEST.read_text(),
             payload.PASS_COUNTS_FILE.read_text(),
+            # Every constant a published payload is generated from, and this one was missing.
+            # `DRAWN_BASIS` seeds the drawn arm's whole visible vector: changing it re-rolls
+            # every drawn payload, which is a change to the treatment an agent is under, and a
+            # record could resume across it under an unchanged identity.
+            payload.DRAWN_BASIS,
         ]
     )
     return hashlib.sha256(material.encode()).hexdigest()[:16]
