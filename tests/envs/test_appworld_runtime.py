@@ -10,6 +10,8 @@ a tree of links resolving to nothing.
 from __future__ import annotations
 
 import asyncio
+import errno
+import json
 import os
 import signal
 import subprocess
@@ -40,8 +42,9 @@ def test_provisioning_the_corpus_does_not_wait_on_a_lock_it_already_holds(
     held: List[Path] = []
 
     class _recorder:
-        def __init__(self, directory: Path) -> None:
+        def __init__(self, directory: Path, *, required: bool = False) -> None:
             self.directory = Path(directory)
+            self.required = required
 
         def __enter__(self) -> None:
             assert self.directory not in held, f"{self.directory} locked while already held"
@@ -1065,3 +1068,467 @@ def test_a_corpus_with_a_link_in_it_is_refused_rather_than_half_digested(
     (data / "tasks" / "abc_1" / "linked.json").symlink_to(elsewhere)
     with pytest.raises(adapter.ProvisioningError, match="symbolic link"):
         adapter.corpus_digest(tmp_path)
+
+
+# ----- what the runtime's identity covers, and what the pins enforce -----
+
+
+def _fake_runtime(home: Path) -> Path:
+    """A provisioned interpreter's shape, without provisioning one.
+
+    Enough of it for the two things that read a runtime off the filesystem: a venv config, a
+    ``site-packages`` holding the pinned distribution, and an interpreter to name."""
+    packages = home / "lib" / "python3.12" / "site-packages"
+    (packages / "appworld").mkdir(parents=True)
+    (packages / "appworld" / "__init__.py").write_text("VERSION = 'one'\n")
+    dist = packages / f"appworld-{adapter.UPSTREAM_VERSION}.dist-info"
+    dist.mkdir()
+    (dist / "RECORD").write_text("appworld/__init__.py,sha256=aaaa,16\n")
+    (home / "pyvenv.cfg").write_text("home = /usr/bin\nversion = 3.12.0\n")
+    (home / "bin").mkdir()
+    (home / "bin" / "python").write_text("")
+    return home / "bin" / "python"
+
+
+def test_the_runtime_digest_moves_when_the_installed_code_does(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The digest hashed labels and called them an identity.
+
+    It covered the platform, the venv config and the `.dist-info` directory *names*, which is the
+    list of what was asked for written down a second time. Two different artifacts published under
+    one version were therefore one identity, and so was a module edited in place inside the
+    interpreter every world runs under. The realized code has to be what moves it, and this
+    perturbs the tree rather than replacing the function.
+
+    The edit below is the same length as what it replaces, because a digest that only noticed
+    lengths would pass a weaker version of this test."""
+    home = tmp_path / "runtime"
+    python = _fake_runtime(home)
+    monkeypatch.setattr(adapter, "runtime", lambda: python)
+    packages = home / "lib" / "python3.12" / "site-packages"
+
+    before = adapter.runtime_digest()
+    assert adapter.runtime_digest() == before, "the same tree has to give the same answer"
+
+    (packages / "appworld" / "__init__.py").write_text("VERSION = 'two'\n")
+    edited = adapter.runtime_digest()
+    assert edited != before
+
+    (packages / "appworld" / "models.py").write_text("# a module that was not installed before\n")
+    added = adapter.runtime_digest()
+    assert added != edited
+
+    (packages / "widget-2.0.dist-info").mkdir()
+    (packages / "widget-2.0.dist-info" / "RECORD").write_text("widget/__init__.py,,\n")
+    assert adapter.runtime_digest() != added
+
+    # And it reaches the number every row carries, which is the only reason the digest exists.
+    from shogym.envs.appworld.env_v1 import run_fingerprint
+
+    stamped = run_fingerprint(pulse=0, report="graded", blocks=60)
+    (packages / "appworld" / "__init__.py").write_text("VERSION = 'three'\n")
+    assert run_fingerprint(pulse=0, report="graded", blocks=60) != stamped
+
+
+def test_a_bytecode_cache_is_not_part_of_the_runtime_identity(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The digest reads installed bytes, and `__pycache__` is not one of them.
+
+    A `.pyc` is written lazily by whichever process imported the module first, so hashing one
+    would make the interpreter's identity depend on what ran before rather than on what is
+    installed. Nothing hides in one either: Python discards a cache whose source is newer."""
+    home = tmp_path / "runtime"
+    python = _fake_runtime(home)
+    monkeypatch.setattr(adapter, "runtime", lambda: python)
+    cache = home / "lib" / "python3.12" / "site-packages" / "appworld" / "__pycache__"
+
+    before = adapter.runtime_digest()
+    cache.mkdir()
+    (cache / "__init__.cpython-312.pyc").write_bytes(b"\x00compiled")
+    assert adapter.runtime_digest() == before
+
+
+def test_a_runtime_is_reused_only_when_it_is_the_one_the_pins_name(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The test for reuse was that `bin/python` existed.
+
+    That is true of a venv whose install died after the interpreter was created, of one a later
+    pin change should have rebuilt, and of one somebody edited. The pins now name the directory
+    and are written inside it, so what is reused is a tree this code finished building under these
+    pins."""
+    monkeypatch.setenv("SHOGYM_CACHE", str(tmp_path / "cache"))
+    built: List[Path] = []
+
+    def _build(home: Path) -> None:
+        # Staged and published exactly as the real builder does it, because publishing over an
+        # incumbent is one of the cases this test walks through.
+        staging = home.with_name(home.name + ".building")
+        _fake_runtime(staging)
+        (staging / adapter._RUNTIME_FILE).write_text(adapter._runtime_stamp())
+        adapter._publish_runtime(staging, home)
+        built.append(home)
+
+    monkeypatch.setattr(adapter, "_build_runtime", _build)
+
+    python = adapter.runtime()
+    home = python.parent.parent
+    assert built == [home]
+    # Both pins are in the name, so moving either one is a second interpreter rather than a reused
+    # first one.
+    assert adapter.UPSTREAM_VERSION in home.name
+    assert adapter.UPSTREAM_SHA[:12] in home.name
+
+    adapter.runtime()
+    assert len(built) == 1, "a stamped runtime is reused"
+
+    (home / adapter._RUNTIME_FILE).unlink()
+    adapter.runtime()
+    assert len(built) == 2, "an interpreter nobody stamped is not one this code built"
+
+    (home / adapter._RUNTIME_FILE).write_text('{"sha": "some other commit"}')
+    with pytest.raises(adapter.ProvisioningError, match="says it was built as"):
+        adapter.runtime()
+
+
+def test_a_runtime_that_resolved_another_release_never_gets_published(tmp_path: Path) -> None:
+    """The requirement string asks and the resolver answers, and nothing read the answer.
+
+    A build that resolved a different release, or an index that moved under the name, was served
+    out of a cache whose name said the pin had been honored. This is checked inside the staging
+    tree, before the rename, so the published name never holds an interpreter that failed it."""
+    home = tmp_path / "runtime"
+    _fake_runtime(home)
+    adapter._check_pin(home)  # the pinned release passes
+
+    packages = adapter._site_packages(home)[0]
+    (packages / f"appworld-{adapter.UPSTREAM_VERSION}.dist-info").rename(
+        packages / "appworld-0.1.2.dist-info"
+    )
+    with pytest.raises(adapter.ProvisioningError, match="but this port pins"):
+        adapter._check_pin(home)
+
+
+# ----- what an env goes on serving after it has said what corpus it serves -----
+
+
+def _one_task_corpus(root: Path, *, instruction: str, moment: str) -> Path:
+    """A corpus holding one task, shaped like the pinned one."""
+    task = root / "data" / "tasks" / "abc_1"
+    task.mkdir(parents=True)
+    (root / "data" / "version.txt").write_text("0.1.0")
+    (task / "specs.json").write_text(
+        json.dumps(
+            {
+                "instruction": instruction,
+                "datetime": moment,
+                "supervisor": {
+                    "first_name": "Ada",
+                    "last_name": "Lovelace",
+                    "email": "ada@example.com",
+                    "phone_number": "555",
+                },
+            }
+        )
+    )
+    return root
+
+
+def test_a_corpus_is_read_once_for_its_digest_and_for_its_authored_text(tmp_path: Path) -> None:
+    """The digest and the specs are one observation, not two.
+
+    A digest computed in the constructor and a `specs.json` read later are two readings of a tree
+    that can change between them, and the gap is exactly where a corpus edited in place served new
+    authored text under the old identity. They come out of one walk now, and a manifest task the
+    walk never reached is a manifest and a corpus that are not describing the same split."""
+    root = _one_task_corpus(tmp_path / "corpus", instruction="do the thing", moment="2023-05-18T12:00:00")
+    snapshot = adapter.corpus_snapshot(root, task_ids=("abc_1",))
+    assert snapshot.digest == adapter.corpus_digest(root)
+    assert snapshot.specs["abc_1"]["instruction"] == "do the thing"
+
+    with pytest.raises(adapter.ProvisioningError, match="no specification for"):
+        adapter.corpus_snapshot(root, task_ids=("abc_1", "not_in_this_corpus_1"))
+
+
+def test_an_env_serves_the_corpus_it_was_constructed_against(tmp_path: Path) -> None:
+    """The env's own time-of-check gap, which the spec reread left open.
+
+    The corpus digest, the served cache's name and the grader's cache name were fixed in the
+    constructor, and the instruction, the supervisor and the datetime went on being reread from
+    the live corpus every time a task was described, seeded or scored. So a corpus edited after
+    construction served new authored text out of caches named for the old bytes, under a
+    fingerprint that had never seen it, and nothing in the record said so.
+
+    Refusing would need the corpus rehashed on every read, which is two seconds a time; serving
+    what was read costs nothing and is a contract that can be stated. This is the contract."""
+    from shogym.envs.appworld import env_v1
+
+    root = _one_task_corpus(tmp_path / "corpus", instruction="the first", moment="2023-05-18T12:00:00")
+    snapshot = adapter.corpus_snapshot(root, task_ids=("abc_1",))
+
+    env = env_v1.AppWorldEnv.__new__(env_v1.AppWorldEnv)
+    env._original = root / "data"
+    env._task_ids = ("abc_1",)
+    env._specs = snapshot.specs
+    env._corpus = snapshot.digest
+
+    # The corpus changes under the env, in place, after it has stated what it is serving.
+    (root / "data" / "tasks" / "abc_1" / "specs.json").write_text(
+        json.dumps(
+            {
+                "instruction": "the second",
+                "datetime": "2024-01-01T12:00:00",
+                "supervisor": {
+                    "first_name": "Mallory",
+                    "last_name": "Elsewhere",
+                    "email": "mallory@example.com",
+                    "phone_number": "999",
+                },
+            }
+        )
+    )
+    assert adapter.corpus_digest(root) != snapshot.digest, "the edit really did move the corpus"
+
+    specs = env._task_specs("abc_1")
+    assert specs["instruction"] == "the first"
+    assert specs["datetime"] == "2023-05-18T12:00:00"
+    # And every place the env hands that text on: the instructions an agent is given, and the
+    # supervisor whose accounts its world is driven with.
+    assert "the first" in env._instructions(0)
+    assert "the second" not in env._instructions(0)
+    assert env._load_task(0)["supervisor_email"] == "ada@example.com"
+
+
+# ----- exclusion the filesystem cannot give -----
+
+
+def test_a_mount_that_cannot_lock_refuses_the_builders_and_still_serves_the_download(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The fallback the concurrency test above never exercises, on both sides of the fork.
+
+    `_locked` yielded with no exclusion at all when the filesystem could not provide `flock`,
+    which is right for the upstream-source download it was written for: that publishes by one
+    atomic rename and a loser validates the winner, so the loss is redundant work. It is wrong for
+    every caller here. The runtime and corpus builders stage under fixed `.building` names they
+    delete first, so two of them remove and publish each other's half-built tree, and the
+    permission windows open a published directory and seal it again, which a second process inside
+    them closes under the first's feet.
+
+    Simulated at the errno, because a filesystem that cannot lock is not a thing a test suite
+    has."""
+    from shogym.envs import _upstream
+
+    def _cannot_lock(descriptor: int, operation: int) -> None:
+        raise OSError(errno.ENOLCK, "no locks available")
+
+    monkeypatch.setattr(_upstream.fcntl, "flock", _cannot_lock)
+    monkeypatch.setattr(_upstream, "_warned_unlocked", False)
+
+    # The download path is unchanged: it says so once and gets on with it.
+    with pytest.warns(RuntimeWarning, match="cannot provide flock"):
+        with _upstream._locked(tmp_path):
+            pass
+    with pytest.raises(_upstream.ExclusionUnavailable, match="needs real exclusion"):
+        with _upstream._locked(tmp_path, required=True):
+            pass
+
+    monkeypatch.setenv("SHOGYM_CACHE", str(tmp_path / "cache"))
+    monkeypatch.delenv(adapter.ROOT_ENV_VAR, raising=False)
+    # The runtime builder.
+    with pytest.raises(_upstream.ExclusionUnavailable):
+        adapter.runtime()
+    # The corpus builder, past the interpreter it provisions first.
+    monkeypatch.setattr(adapter, "runtime", lambda: Path("python"))
+    monkeypatch.setattr(adapter, "ensure_apps", lambda: None)
+    with pytest.raises(_upstream.ExclusionUnavailable):
+        adapter.ensure_corpus()
+
+    original = tmp_path / "corpus" / "data"
+    (original / "tasks" / "abc_1" / "dbs").mkdir(parents=True)
+    (original / "tasks" / "abc_1" / "ground_truth").mkdir()
+    (original / "tasks" / "abc_1" / "dbs" / "todoist.jsonl").write_text("")
+    (original / "shared").write_text("base databases")
+    # The permission window over the shared entries.
+    with pytest.raises(_upstream.ExclusionUnavailable):
+        world.derive_root(original=original, derived=tmp_path / "derived" / "data")
+    # And the one over the published tasks directory.
+    with pytest.raises(_upstream.ExclusionUnavailable):
+        world.derive_task(
+            original=original,
+            derived=tmp_path / "derived2" / "data",
+            graded=tmp_path / "graded2" / "data",
+            task_id="abc_1",
+            write_log=lambda source, into: into.write_text("seeded"),
+        )
+
+
+# ----- the snapshot's bounds cover the operations that spend them -----
+
+
+def test_the_walk_stops_inside_a_directory_rather_than_after_reading_all_of_it(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The enumeration was the one part of the walk no bound could reach.
+
+    `sorted(source.iterdir())` read and sorted a whole directory before the first check of the
+    node count, the deadline or the stop flag, so an episode that left a million names in one
+    directory spent all of that time and memory after the budget was gone and after the
+    finalization it belonged to had been cancelled. The entries arrive one at a time now, and the
+    bound is spent as they arrive.
+
+    Counted at the seam rather than timed, because "it stopped early" is the claim and a
+    stopwatch is not how to say it."""
+    outputs = tmp_path / "outputs"
+    outputs.mkdir()
+    for index in range(400):
+        (outputs / f"{index}.jsonl").write_text("x")
+
+    consumed = 0
+    real_scandir = os.scandir
+
+    class _counting:
+        def __init__(self, inner: Any) -> None:
+            self._inner = inner
+
+        def __enter__(self) -> "_counting":
+            return self
+
+        def __exit__(self, *exc: Any) -> None:
+            self._inner.__exit__(*exc)
+
+        def __iter__(self) -> "_counting":
+            return self
+
+        def __next__(self) -> Any:
+            nonlocal consumed
+            entry = next(self._inner)
+            consumed += 1
+            return entry
+
+    monkeypatch.setattr(os, "scandir", lambda path: _counting(real_scandir(path)))
+
+    monkeypatch.setattr(adapter, "_SNAPSHOT_MAX_NODES", 5)
+    with pytest.raises(adapter.SnapshotError, match="more than 5 entries"):
+        adapter.snapshot_outputs(outputs, into=tmp_path / "a")
+    assert 0 < consumed <= 6, "the walk read the whole directory before it refused it"
+
+    # The deadline is read inside the enumeration too, not only between directories.
+    consumed = 0
+    monkeypatch.setattr(adapter, "_SNAPSHOT_MAX_NODES", 20_000)
+    monkeypatch.setattr(adapter, "_SNAPSHOT_SECONDS", -1.0)
+    with pytest.raises(adapter.SnapshotError, match="longer than"):
+        adapter.snapshot_outputs(outputs, into=tmp_path / "b")
+    assert consumed <= 1
+
+
+def test_a_cancelled_snapshot_stops_partway_through_a_file(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Once per file is not a bound on a tree with one big file in it.
+
+    `shutil.copyfile` is one call with no way in, so a finalization that was cancelled while the
+    copy was inside a large file waited out the whole of it. The bytes move in chunks now and the
+    flag is read between them, which is what makes cancellation a bound on the work rather than on
+    the gaps between pieces of it."""
+    outputs = tmp_path / "outputs"
+    outputs.mkdir()
+    (outputs / "one.jsonl").write_bytes(b"x" * (1 << 16))
+    # Sixty-four chunks for one file, so a flag raised on the tenth reading is raised well inside
+    # it however the checks before the copy are arranged.
+    monkeypatch.setattr(adapter, "_SNAPSHOT_CHUNK_BYTES", 1024)
+
+    class _after:
+        """A stop flag that is not set when the copy starts and is set once it is under way."""
+
+        def __init__(self, checks: int) -> None:
+            self.checks = checks
+            self.seen = 0
+
+        def is_set(self) -> bool:
+            self.seen += 1
+            return self.seen > self.checks
+
+    stop = _after(checks=10)
+    with pytest.raises(adapter.SnapshotError, match="abandoned"):
+        adapter.snapshot_outputs(
+            outputs,
+            into=tmp_path / "into",
+            stop=stop,  # pyright: ignore[reportArgumentType]
+        )
+    # It stopped with the file part copied, which is the whole claim: the refusal came from inside
+    # one copy rather than from the gap after it.
+    partial = tmp_path / "into" / "one.jsonl"
+    assert partial.exists()
+    assert 0 < partial.stat().st_size < (1 << 16)
+
+
+def test_the_deadline_is_read_while_one_file_is_still_being_copied(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The same gap, told by the clock instead of by the flag.
+
+    A copy that crosses the sixty-second budget used to run to the end of the file and only then
+    be noticed, so an episode with one enormous file decided how long finalization took. The
+    bounds are shrunk here rather than the file grown: a chunk of one byte over a megabyte is work
+    that certainly outlasts a fiftieth of a second, and the assertion is that it was stopped in
+    the middle of it."""
+    outputs = tmp_path / "outputs"
+    outputs.mkdir()
+    (outputs / "one.jsonl").write_bytes(b"x" * (1 << 20))
+
+    monkeypatch.setattr(adapter, "_SNAPSHOT_CHUNK_BYTES", 1)
+    monkeypatch.setattr(adapter, "_SNAPSHOT_SECONDS", 0.05)
+    with pytest.raises(adapter.SnapshotError, match="longer than"):
+        adapter.snapshot_outputs(outputs, into=tmp_path / "into")
+    partial = tmp_path / "into" / "one.jsonl"
+    assert partial.exists()
+    assert 0 < partial.stat().st_size < (1 << 20)
+
+
+def test_the_previous_snapshot_is_removed_under_the_same_bound(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The destination is one character away from a name the world is handed.
+
+    AppWorld is given the episode's output root by absolute path, and the snapshot goes to that
+    name with `.graded` on the end, in a process running as the same user. So the tree removed
+    before the copy is a tree the episode can size, and it was removed by an `rmtree` outside
+    every bound: the deadline had not started, the stop flag was not read, and nothing counted the
+    entries."""
+    outputs = tmp_path / "outputs"
+    outputs.mkdir()
+    (outputs / "one.jsonl").write_text("what the episode submitted")
+
+    into = tmp_path / "outputs.graded"
+    (into / "planted").mkdir(parents=True)
+    for index in range(400):
+        (into / "planted" / f"{index}.jsonl").write_text("x")
+
+    monkeypatch.setattr(adapter, "_SNAPSHOT_MAX_NODES", 5)
+    with pytest.raises(adapter.SnapshotError, match="more than 5 entries"):
+        adapter.snapshot_outputs(outputs, into=into)
+
+    # And a cancelled finalization does not wait out the removal either.
+    stop = threading.Event()
+    stop.set()
+    monkeypatch.setattr(adapter, "_SNAPSHOT_MAX_NODES", 20_000)
+    with pytest.raises(adapter.SnapshotError, match="abandoned"):
+        adapter.snapshot_outputs(outputs, into=into, stop=stop)
+    assert (into / "planted").exists(), "nothing was removed after the flag was seen"
+
+
+def test_a_provisioning_subprocess_that_never_finishes_is_not_waited_on_forever(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Construction waits on these, and a construction that never returns reports nothing at all.
+
+    `pip install` against an index that accepts the connection and then stops sending has no
+    timeout of its own, and neither has an unpack whose child wedged. A run that says which
+    command hung is strictly better than a queue that never starts."""
+    began = time.monotonic()
+    with pytest.raises(adapter.ProvisioningError, match="timed out after"):
+        adapter._run([sys.executable, "-c", "import time; time.sleep(30)"], timeout=0.5)
+    assert time.monotonic() - began < 10.0

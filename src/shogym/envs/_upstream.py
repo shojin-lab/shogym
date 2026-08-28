@@ -199,8 +199,18 @@ def _warn_unlocked(directory: Path, exc: OSError) -> None:
     )
 
 
+class ExclusionUnavailable(RuntimeError):
+    """A caller that needs real exclusion asked for a lock this filesystem cannot give.
+
+    Its own type because it is neither a bug nor a failure of the work the caller wanted done: the
+    directory is fine, the code is fine, and the mount underneath them cannot provide ``flock``.
+    What a caller does about that depends entirely on what the lock was holding together, so the
+    two answers live at the call sites (see :func:`_locked`) and this is what carries the refusal
+    for the ones that cannot go on without it."""
+
+
 @contextlib.contextmanager
-def _locked(directory: Path) -> Iterator[None]:
+def _locked(directory: Path, *, required: bool = False) -> Iterator[None]:
     """Hold every other *process* out of ``directory`` for the length of the ``with`` body.
 
     ``_provision_lock`` only serializes threads inside one interpreter, and a cold cache is
@@ -225,16 +235,29 @@ def _locked(directory: Path) -> Iterator[None]:
     sweep is the exception and passes ``LOCK_NB`` itself, because there "someone else holds it"
     means "leave it alone", not "wait".)
 
-    **A filesystem that cannot lock at all yields anyway, and this is the one place this helper
-    parts company with its namesake in ``serve.stream``.** There the lock is what keeps concurrent
-    appends from interleaving in a provenance log, so exclusion is a *correctness* requirement and
-    an ``OSError`` from it rightly refuses the run at construction. Here it is an efficiency and
-    hygiene measure over a cache whose correctness is carried by other things entirely: the publish
+    **Whether a filesystem that cannot lock at all may be yielded to anyway is the caller's to
+    say, and it is what ``required`` says.** The default is no, in the sense of "no, this does not
+    need exclusion": the upstream-source path this module was written for is an efficiency and
+    hygiene measure over a cache whose correctness is carried by other things entirely. Its publish
     is a single atomic rename and a loser validates the winner (see :func:`_download_package`), and
     the sweep will not delete what it cannot lock (see :func:`_sweep_download_residue`). Refusing
     to provision on a mount where provisioning demonstrably works, because an optimization is
-    unavailable, would make a nice-to-have load-bearing. So the unsupported-lock errnos degrade to
-    redundant-but-correct work, with one warning; every other ``OSError`` still propagates."""
+    unavailable, would make a nice-to-have load-bearing. So there the unsupported-lock errnos
+    degrade to redundant-but-correct work, with one warning.
+
+    ``required=True`` is for the call sites where that reasoning does not hold, and it raises
+    :class:`ExclusionUnavailable` rather than yielding. Two shapes need it. A builder that stages
+    under a **fixed** name and deletes whatever is there first — the appworld runtime and corpus
+    builders — has no atomic publish to fall back on: two cold builders remove and rename each
+    other's staging tree, and the loser can publish half of the winner's. And a window that makes
+    a shared directory writable for the length of a build — appworld's permission windows, which
+    open a sealed cache directory and seal it again — is *only* correct while nothing else is
+    inside it, because what a second builder observes is not a stale tree but an open one.
+
+    Both are silent when they go wrong, and both are the material a run is scored against. A
+    refusal that names the mount is the honest outcome there, and the remedy is the same one the
+    warning already gives: point ``SHOGYM_CACHE`` at a local filesystem. Every other ``OSError``
+    still propagates in both modes."""
     # O_RDONLY: the lock is on the descriptor, not on what may be done through it, so this does
     # not ask for write access it never uses.
     descriptor = os.open(directory, os.O_RDONLY)
@@ -244,6 +267,13 @@ def _locked(directory: Path) -> Iterator[None]:
         except OSError as exc:
             if exc.errno not in _LOCK_UNSUPPORTED:
                 raise
+            if required:
+                raise ExclusionUnavailable(
+                    f"shogym: {directory} is on a filesystem that cannot provide flock "
+                    f"({exc.strerror}), and this step needs real exclusion between processes "
+                    f"rather than the redundant work an unlockable cache degrades to. Point "
+                    f"SHOGYM_CACHE at a local filesystem"
+                ) from exc
             _warn_unlocked(directory, exc)
         yield
     finally:
@@ -390,4 +420,4 @@ def ensure_package(
     return src
 
 
-__all__ = ["ensure_package", "source_env_var"]
+__all__ = ["ExclusionUnavailable", "ensure_package", "source_env_var"]

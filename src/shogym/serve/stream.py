@@ -302,6 +302,7 @@ from typing import (
     Set,
     SupportsIndex,
     Tuple,
+    Union,
 )
 
 from fastmcp import FastMCP
@@ -333,6 +334,7 @@ __all__ = [
     "ProvenanceSpan",
     "QueueInfo",
     "ResultRow",
+    "RunIdentity",
     "Score",
     "TaskRef",
     "TaskStream",
@@ -613,6 +615,237 @@ def _env_said(observed: Sequence[Mapping[str, Any]], name: str) -> str:
     return ""
 
 
+#: What an env may set to name the item it describes itself with. Declared by the env rather than
+#: assumed here: `config_digest` is an ordinary name any environment is free to publish as a
+#: metric, and a module that decided what its number meant would turn another env's successful
+#: terminal into an unscored failure. An env that declares nothing is not checked at all.
+_IDENTITY_DECLARATION = "identity_feedback_name"
+
+
+def _declared_identity_name(env: Any) -> str:
+    """The item ``env`` says describes the configuration it produces rows under, or ``""``.
+
+    Guarded, because reading an attribute runs the env's code: an env whose declaration is a
+    property that raises has not declared anything, and it may not take a construction down for
+    a check it is not participating in."""
+    try:
+        declared = getattr(env, _IDENTITY_DECLARATION, "")
+    except BaseException as exc:  # noqa: BLE001 — the env's failure, never this construction's
+        if _must_propagate(exc, None):
+            raise
+        return ""
+    return declared if isinstance(declared, str) else ""
+
+
+def _declared_identity_value(env: Any, declared: str) -> str:
+    """What ``env`` says its configuration *is*, read off the env under the name it declared.
+
+    This is the half a caller cannot supply and a row cannot carry early enough. A digest read
+    here is known before the first task is dispensed, so it goes into the ownership claim, and a
+    run killed before it recorded anything still leaves behind what the env said it was — which
+    is exactly the record a resume has to check and used to have nothing to check it with.
+
+    Guarded and typed for :func:`_declared_identity_name`'s reason, and blank for an env that
+    declares a name it does not answer to: what is not said is not compared."""
+    try:
+        said = getattr(env, declared, "")
+    except BaseException as exc:  # noqa: BLE001 — the env's failure, never this construction's
+        if _must_propagate(exc, None):
+            raise
+        return ""
+    return said if isinstance(said, str) else ""
+
+
+#: A run identity, as it travels on disk: either the empty string, which is a record that names
+#: nothing, or an object with one member per field below.
+RunIdentity = Union[str, Dict[str, Any]]
+
+#: The fields a run identity is made of, in the order a disagreement is reported in. Compared one
+#: by one and exactly. What makes two runs one measurement is a *conjunction* of facts — this env,
+#: under this clock, at this capacity, named this by the party that launched it — and a comparison
+#: that could be satisfied by one fact appearing somewhere inside a rendering of another is not a
+#: comparison of facts at all. That is what a single opaque string could do and what this cannot:
+#: an env digest occurring anywhere in a caller's composed name used to count as agreement, so a
+#: name with unrelated text around a digest was accepted and stamped on a scored row.
+_IDENTITY_FIELDS: Tuple[str, ...] = ("caller", "envs", "deadline", "max_in_flight")
+
+#: Stands in for a member this module could not read as the type it writes. Never equal to a
+#: value a stream serving now holds, so a record carrying junk fails the comparison rather than
+#: crashing it or, worse, matching through a coercion (`True == 1` is true, and a capacity of
+#: `true` is not a capacity).
+_UNREADABLE = "<unreadable>"
+
+
+def _identity_number(value: Any) -> Any:
+    """One numeric identity member, canonical, or :data:`_UNREADABLE`.
+
+    ``float`` because a deadline given as ``600`` and one given as ``600.0`` are the same run,
+    and two identities for one thing is a resume refused for no reason. Booleans are refused
+    rather than coerced for the reason the capacity check refuses them: ``True`` is an ``int`` in
+    Python and would compare equal to a capacity of one."""
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        return _UNREADABLE
+    return float(value)
+
+
+def _identity_capacity(value: Any) -> Any:
+    """One capacity identity member, canonical, or :data:`_UNREADABLE`.
+
+    ``int``, so that what is read back renders the way what is written renders: a capacity is a
+    count of slots and this module only ever writes whole ones. Booleans, non-numbers and values
+    with a fractional part are all things a capacity is not."""
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        return _UNREADABLE
+    if not math.isfinite(value) or value != int(value):
+        return _UNREADABLE
+    return int(value)
+
+
+def _identity(
+    *,
+    caller: str,
+    envs: Mapping[str, str],
+    deadline: Optional[float],
+    max_in_flight: int,
+) -> Dict[str, Any]:
+    """Compose the identity a run's rows are filed under, out of the facts that make them one
+    measurement.
+
+    ``caller`` is the opaque name the caller chose and is carried for the human reading the
+    record: this module compares it and never parses it. ``envs`` is what each env said about
+    itself, read off the env rather than asserted by anybody. ``deadline`` and ``max_in_flight``
+    are what the run let an episode do — a deadline decides whether a slow episode is scored or
+    timed out, and a capacity decides whether a task is served with a lease and how episodes are
+    scheduled against each other, so two directories that differ in either hold rows about two
+    different opportunities.
+
+    Sorted and canonicalised here, because this is the value that goes on disk and comes back off
+    it: the comparison is between two of these, and a member whose rendering depended on
+    insertion order or on ``int`` versus ``float`` would refuse a resume that had changed
+    nothing."""
+    return {
+        "caller": str(caller),
+        "envs": {str(name): str(digest) for name, digest in sorted(envs.items()) if digest},
+        "deadline": None if deadline is None else float(deadline),
+        "max_in_flight": int(max_in_flight),
+    }
+
+
+def _identity_from_wire(value: Any) -> Dict[str, Any]:
+    """Read a stored run identity back, whatever a record holds under that member.
+
+    Three shapes arrive here. An object is this module's own, read member by member and
+    canonicalised the way :func:`_identity` canonicalises what it writes. The empty string is a
+    record that names nothing, which is not a wildcard and is the one thing an adoption is about
+    (see :meth:`TaskStream._require_identity_matches`). A non-empty *string* is a record written
+    while the identity was still a single opaque name; it carries a caller and nothing else, so it
+    is compared on the caller alone and marked as such. Refusing those would be a durable-format
+    break rather than a safety property: the record names exactly what a caller can still name,
+    and the fields it does not carry it never had.
+
+    Nothing here raises. A member that is not the type this module writes becomes
+    :data:`_UNREADABLE`, which no serving stream's value equals — so a record this module did not
+    write is refused by the comparison rather than crashing it."""
+    if isinstance(value, str):
+        if not value:
+            return _identity(caller="", envs={}, deadline=None, max_in_flight=1)
+        return {"caller": value, "named_only": True}
+    if not isinstance(value, Mapping):
+        # Neither shape, so it cannot be read as either. Rendered rather than dropped: a record
+        # holding something else here is a record about a run this stream cannot describe, and
+        # the message it earns should say what was there.
+        return {"caller": repr(value), "named_only": True}
+    envs = value.get("envs")
+    return {
+        "caller": str(value.get("caller", "")),
+        "envs": (
+            {str(name): str(digest) for name, digest in sorted(envs.items()) if digest}
+            if isinstance(envs, Mapping)
+            else _UNREADABLE
+        ),
+        "deadline": (
+            None if value.get("deadline") is None else _identity_number(value.get("deadline"))
+        ),
+        "max_in_flight": _identity_capacity(value.get("max_in_flight")),
+    }
+
+
+def _identity_wire(identity: Mapping[str, Any]) -> RunIdentity:
+    """What goes on disk for ``identity``: the empty string for a run that names nothing, and the
+    object otherwise.
+
+    The empty string rather than an object full of blanks, so a run with no identity writes byte
+    for byte the record this module wrote before identities existed — and so that "this record
+    names nothing" stays one value a reader can test rather than a shape it has to inspect."""
+    if _identity_names_nothing(identity):
+        return ""
+    return {field: identity[field] for field in _IDENTITY_FIELDS}
+
+
+def _identity_names_nothing(identity: Mapping[str, Any]) -> bool:
+    """Whether this identity says anything about what produced a row.
+
+    The caller's name and what the envs said, and neither the deadline nor the capacity: those
+    two are properties of every run, including a run whose caller could not say what it was, so
+    an identity built out of nothing else would stop being the wildcard it is for. An env that
+    describes itself does identify the run, though — that half is observed rather than asserted,
+    and it works for a caller that named nothing precisely because nobody had to say it."""
+    return not identity.get("caller") and not identity.get("envs")
+
+
+def _identity_text(identity: Mapping[str, Any]) -> str:
+    """A run identity as it appears in a refusal, short enough to read in one line."""
+    if identity.get("named_only"):
+        return repr(identity.get("caller", ""))
+    if _identity_names_nothing(identity):
+        return "no identity"
+    envs = identity.get("envs")
+    return (
+        f"caller={identity.get('caller', '')!r}, envs={envs!r}, "
+        f"deadline={identity.get('deadline')!r}, max_in_flight={identity.get('max_in_flight')!r}"
+    )
+
+
+def _identity_disagreement(
+    recorded: Mapping[str, Any], serving: Mapping[str, Any]
+) -> Optional[str]:
+    """Which field makes ``recorded`` and ``serving`` two runs, or ``None`` if they are one.
+
+    Field by field and short-circuiting on the first difference, so a refusal names the one thing
+    that changed rather than printing two whole identities and leaving the reader to diff them."""
+    if recorded.get("named_only"):
+        # All this record carries is the caller's name, so that is the whole of what can be
+        # compared. What it does not say it never said, and inventing a disagreement out of a
+        # member it could not have held would refuse a run that changed nothing.
+        if recorded.get("caller") == serving.get("caller"):
+            return None
+        return (
+            f"caller: the record says {recorded.get('caller')!r} and this stream serves under "
+            f"{serving.get('caller')!r}"
+        )
+    for name in _IDENTITY_FIELDS:
+        if recorded.get(name) != serving.get(name):
+            return (
+                f"{name}: the record says {recorded.get(name)!r} and this stream serves under "
+                f"{serving.get(name)!r}"
+            )
+    return None
+
+
+def _recorded_identity(record: Mapping[str, Any]) -> RunIdentity:
+    """The run identity a stored dispense record or result row was written under, in wire form.
+
+    Passed through rather than coerced, because the two legal shapes are a string and an object
+    and the reader that has to tell them apart is :func:`_identity_from_wire`. A member that is
+    neither reaches that function too, and is refused there."""
+    stored = record.get("run_identity", "")
+    if isinstance(stored, str):
+        return stored
+    if isinstance(stored, Mapping):
+        return dict(stored)
+    return repr(stored)
+
+
 def _recorded_regime(record: Mapping[str, Any]) -> str:
     """The feedback regime a stored dispense record or result row says it was written under.
 
@@ -771,13 +1004,15 @@ class ResultRow:
     # stream that revealed nothing, and a row built without saying otherwise — `reconcile`'s, a
     # caller's — may not read as one that did.
     feedback_regime: str = _NEVER_REGIME
-    #: What the run was configured with, as its caller chose to summarise it. Opaque here: this
-    #: module compares it and never reads it. Empty for a run whose caller named no identity, and
-    #: for every record written before this field existed, which is why an empty one matches
-    #: anything. What the *env* said produced the row travels in ``observed`` under
-    #: ``config_digest``, and the two are checked against each other before the row lands (see
+    #: What the run was configured with: a record, not a name (see :func:`_identity`). Its
+    #: members are the caller's own opaque summary, what each env said about itself, the deadline
+    #: and the capacity, and a resume compares them one by one and exactly. Empty — the string —
+    #: for a run that names nothing and for every record written before this field existed, which
+    #: is the one value that is not a wildcard and the one an adoption is about. What the *env*
+    #: said produced this particular row also travels in ``observed``, under the name the env
+    #: declares, and the two are checked against each other before the row lands (see
     #: :meth:`TaskStream._require_env_agrees`).
-    run_identity: str = ""
+    run_identity: RunIdentity = ""
 
     def to_wire(self) -> Dict[str, Any]:
         return {
@@ -820,7 +1055,7 @@ class ResultRow:
             diagnostic=row.get("diagnostic"),
             extensions=dict(row.get("extensions") or {}),
             feedback_regime=_recorded_regime(row),
-            run_identity=str(row.get("run_identity", "")),
+            run_identity=_recorded_identity(row),
         )
 
 
@@ -1592,7 +1827,13 @@ def read_exposures(prov_dir: Path) -> List[Dict[str, Any]]:
     through: a cancelled or lost terminal, a task the *stream* ended (``drained``, ``timeout``),
     or a policy that could not answer. That is the state a dose analysis needs and the row cannot
     carry, because the row is fsynced before the answer exists (see
-    :meth:`TaskStream._record_exposure`)."""
+    :meth:`TaskStream._record_exposure`).
+
+    **And the two directions of that reading are both closed.** A delivery whose line cannot be
+    written is not delivered: the answer fails closed to the empty member and the stream stops, so
+    a silence here is never a verdict an agent read anyway. A task the stream ended is answered
+    with the same silence even when the env's finalization returns afterwards, so a late answer is
+    never a dose this log has no line for (see :meth:`TaskStream._answered_terminal`)."""
     return _read_jsonl(Path(prov_dir) / _EXPOSURES_FILE)
 
 
@@ -1602,7 +1843,12 @@ def read_adoptions(prov_dir: Path) -> List[Dict[str, Any]]:
     Written by a constructor that passed ``adopt_unidentified=True`` and found rows naming no
     identity (see :meth:`TaskStream._record_adoption`). It is what makes the migration durable:
     an ordinary ``resume=True`` under the adopting identity is accepted afterwards, because the
-    directory itself now records who took responsibility for the blank rows and when."""
+    directory itself now records who took responsibility for the blank rows and when. It is also
+    what refuses every *other* identity from then on, whatever flag it passes: unidentified rows
+    are taken on once, by one configuration, or the record says they belong to two.
+
+    Each line's ``run_identity`` is a run identity in wire form, the same shape a row carries
+    (see :class:`ResultRow`)."""
     return _read_jsonl(Path(prov_dir) / _ADOPTIONS_FILE)
 
 
@@ -1659,7 +1905,7 @@ def reconcile(prov_dir: Path) -> List[ResultRow]:
             # And the identity, for the same reason and from the same place. A row that lost it
             # reads back as belonging to no particular run, which is precisely the row a later
             # resume under a different configuration would be allowed to append beside.
-            run_identity=str(record.get("run_identity", "")),
+            run_identity=_recorded_identity(record),
         )
         for record in read_dispenses(prov_dir)
         if record["lease"] not in sealed
@@ -2033,19 +2279,26 @@ class TaskStream:
             evaluation-grade: the argument says what this run did, and the construction says what
             no argument could undo.
         identity: an opaque name for the configuration this run's rows are produced under:
-            whatever makes two runs one measurement rather than two. Written into the ownership
-            claim, stamped on every dispense record and every result row, and compared before a
-            takeover. This module never reads it, only compares it: what belongs in it is a
-            property of the env and the harness rather than of the queue (see
-            :meth:`_require_identity_matches`).
+            whatever makes two runs one measurement rather than two. This module never parses it,
+            only compares it, and it is carried for the human reading the record.
 
-            It is an assertion, and it is checked against the one party that knows. An env that
-            publishes a ``config_digest`` is describing the configuration that produced the row,
-            and a row whose env disagrees with the name it is being filed under is refused before
-            it lands. The digest also binds the *record*, which no assertion can: the first row
-            that publishes one fixes what this directory holds, and every later row and every
-            resume is held to it, whether or not a caller named anything at all (see
-            :meth:`_require_env_agrees`).
+            **It is one member of the run's identity and not the whole of it.** What is written
+            into the ownership claim, stamped on every dispense record and every result row, and
+            compared before a takeover is a *record*: this name, what each env said about itself,
+            the deadline and the capacity, compared member by member and exactly (see
+            :func:`_identity` and :meth:`_require_identity_matches`). The three beside the name
+            are facts this module can check rather than assertions it has to take: an env that
+            declares an identity item is describing the configuration that produced its rows, and
+            a deadline and a capacity decide what an episode was allowed to do, so two directories
+            differing in either hold rows about two different opportunities.
+
+            The env half also binds the *record*, which no assertion can. It is read off the env
+            at construction, so it reaches the claim before the first task is dispensed and a run
+            killed that early still leaves behind what its env said it was; and the first row of
+            an env that publishes one fixes what this directory holds for that env, whether or not
+            a caller named anything at all (see :meth:`_require_env_agrees`). An env declares the
+            item by setting ``identity_feedback_name``; an env that declares nothing is not
+            checked, because that name is one any env is free to publish as an ordinary metric.
         adopt_unidentified: whether a named caller may append to a record that names no identity.
             Off, and it has to be asked for, and it must be an exact ``bool``. A directory
             recorded before identities existed can be *read* by anyone, because it cannot say
@@ -2217,10 +2470,22 @@ class TaskStream:
         # no attribute of it is ever read.
         self._feedback = feedback
         self._regime = regime
-        # What the caller says makes two runs one measurement. Opaque to this module: it is
-        # written into the claim before the first dispense, stamped on every durable record, and
-        # compared before a takeover, and never read (see `_require_identity_matches`).
-        self._run_identity = str(identity)
+        # The caller's own name for what makes two runs one measurement. Opaque to this module:
+        # it is compared and never parsed. It is one member of the identity below rather than the
+        # whole of it — see `_identity` for the others and for why a name on its own could not do
+        # this job.
+        self._caller_identity = str(identity)
+        # The identity this run's rows are filed under: the caller's name, what each env says
+        # about itself, the deadline and the capacity, compared field by field on every resume
+        # (see `_identity` and `_require_identity_matches`). Composed once the catalog exists,
+        # because the env half is read off the envs; until then there is nothing to compare and
+        # nothing writes.
+        self._run_identity: Dict[str, Any] = _identity(
+            caller="", envs={}, deadline=deadline, max_in_flight=max_in_flight
+        )
+        # The same value in the shape it goes on disk, computed once because it is stamped on
+        # every dispense record, every result row and every exposure line.
+        self._identity_wire: RunIdentity = ""
         # Whether this caller has said it knows what an unidentified record's rows were, and so
         # may add its own named ones to them (see `_require_identity_matches`).
         #
@@ -2239,8 +2504,9 @@ class TaskStream:
         self._adopt_unidentified = adopt_unidentified
         # The identities this directory has already recorded an adoption for, read under the
         # claim (see `_claim_provenance`). A migration performed once and written down, so that an
-        # ordinary resume afterwards is an ordinary resume (see `_record_adoption`).
-        self._adopted: frozenset[str] = frozenset()
+        # ordinary resume afterwards is an ordinary resume (see `_record_adoption`) — and so that
+        # a *second* identity is refused rather than allowed to adopt the same blank rows again.
+        self._adopted: Tuple[Dict[str, Any], ...] = ()
         # Whether a blank record was met while this stream held the migration flag, and so
         # whether an adoption is owed to the directory once construction is past every refusal.
         self._adopting = False
@@ -2248,10 +2514,16 @@ class TaskStream:
         # construction is past every refusal: a call that raises leaves the directory as it found
         # it, and an adoption is the one thing a refused constructor could otherwise leave behind.
         self._adoption_undo: Optional[int] = None
-        # What the ENV said produced this record's rows, as opposed to what the caller asserted.
-        # Bound from the first row that says anything — this run's or, on a resume, the record's —
-        # and every later row is held to it (see `_require_env_agrees`).
-        self._env_identity: str = ""
+        # What each ENV said produced this record's rows, as opposed to what the caller asserted.
+        # Bound per env from the first row of that env's that says anything — this run's or, on a
+        # resume, the record's — and every later row of the same env is held to it. Keyed by env
+        # because a queue may name several, and a stream that held one binding for all of them
+        # scored the first env and then refused the second's rows as a finalize failure, which is
+        # a supported queue shape reported as an integrity failure (see `_require_env_agrees`).
+        self._env_identity: Dict[str, str] = {}
+        # The item each env declares as its own description of itself, read off the catalog once
+        # (see `_declared_identity`). Empty for an env that declares nothing, which is not checked.
+        self._identity_names: Dict[str, str] = {}
         self._reveals = reveals
         self._reveal = reveal
         # The validated names, bound to the extensions they were validated for. Uniqueness and
@@ -2292,12 +2564,6 @@ class TaskStream:
         # refusal: one that raises puts it back (see `_release_claim`).
         self._displaced: Optional[Dict[str, Any]] = None
         self._made_prov_dir = False
-        # Taken here, ahead of the catalog: it is the cheapest refusal this constructor has, and
-        # refusing before a factory is called costs no env the caller would then have to see
-        # closed. Ownership is one call and not two — what the directory already holds is checked
-        # inside the same exclusion that installs the claim, because an answer read outside it
-        # authorises nothing (see `_claim_provenance` and `_require_fresh_provenance`).
-        self._claim_provenance(resume)
 
         # One long-lived env per env name, used only to read the published contract (it never
         # begins a session, so closing it releases nothing an episode owns). Constructing it is
@@ -2306,8 +2572,22 @@ class TaskStream:
         # Everything from here to the end of construction runs under a cleanup guard: a factory
         # may provision real resources, and a constructor that raises hands back no object, so
         # nothing else could ever close what it built. That covers a partly-built catalog as
-        # well as any later check that refuses the queue — and the claim just taken, which no
-        # `aclose` will ever come to release because there is no stream to call it on.
+        # well as any later check that refuses the queue — and the claim, which no `aclose` will
+        # ever come to release because there is no stream to call it on.
+        #
+        # **The catalog is built before the directory is claimed, and that ordering is a
+        # correctness property rather than a preference.** The claim used to be taken first, on
+        # the grounds that it is the cheapest refusal here and costs no env a failure would then
+        # have to close. But a `resume=True` claim is a *takeover*: it displaces whoever held the
+        # directory, and everything that could still refuse ran afterwards — the factories, the
+        # manifests, the queue, the record. A constructor that refused in any of them put the
+        # displaced claim back, and putting a file back does not put back what the displaced
+        # stream did in the meantime: its own next append found a foreign claim inside the same
+        # exclusion and stopped it permanently, so a resume that was refused killed a run that was
+        # serving correctly. The order is now the other way round. Everything a construction can
+        # refuse for happens before the takeover — the envs and their contracts here, the whole
+        # stored record inside the claim's own critical section (see `_replay_record`) — and the
+        # displacement is the last thing that can happen to the directory rather than the first.
         self._catalog: Dict[str, Env] = {}
         try:
             for name in env_names:
@@ -2424,89 +2704,58 @@ class TaskStream:
                 self._naming[env_name] = _naming_note(renamed) if prefixed else None
             # Every lease ever issued, so one can never be reused — a recycled lease would let a
             # delayed call from a finished task act on, and be scored into, its successor. A
-            # resumed run seeds it from the record below: "ever" spans the whole record, not the
-            # process, or the guarantee lapses at exactly the boundary a crash creates.
+            # resumed run seeds this, `_done_positions` and `seq` from the stored record, inside
+            # the claim's own critical section (see `_replay_record`, which is also where the
+            # reasons those three are seeded that way are written down): "ever" spans the whole
+            # record, not the process, or the guarantee lapses at exactly the boundary a crash
+            # creates. The odds of a 128-bit CSPRNG repeating are not what makes that safe — this
+            # module promises a lease is never reused, and it is the run that has to keep the
+            # promise.
             self._issued: set[str] = set()
-
-            # Resume by queue POSITION, never by task index: the same index may be queued twice and
-            # both occurrences must play. A position that was dispensed but never sealed has no
-            # authoritative outcome, so it is replayed (its abandoned dispense stays visible through
-            # `reconcile`, and the replay gets its own lease).
-            #
-            # A position only carries meaning next to the queue it was recorded against, so every
-            # stored position is checked against the queue being served before any of it is trusted.
-            #
-            # `seq` continues past every number this directory already used, dispenses included.
-            # A dispense is durable before its task is handed out, so an abandoned one holds a
-            # `seq` no result row answers — and that is precisely the position a resume replays.
-            # Numbering the replay from the results alone would hand it the abandoned dispense's
-            # own number, leaving `reconcile`'s `broker_abort` and the replay's real outcome
-            # sharing one identifier: two rows for one position, indistinguishable in order, in
-            # the record whose whole purpose is to keep them apart.
-            #
-            # Leases continue past this directory's record for the same reason `seq` does, and
-            # for a stricter one. `reconcile` pairs a dispense with a result **by lease alone**,
-            # so a resumed run that minted one this record already holds would have the earlier
-            # run's result answer the later run's dispense: the position dispensed and never
-            # sealed reconciles to nothing, and the `broker_abort` a crash owes is simply absent
-            # from a record that still reads as complete. A row goes missing, quietly. The odds
-            # of a 128-bit CSPRNG repeating are not what makes that safe — this module promises a
-            # lease is never reused, and it is the run that has to keep the promise.
             self._done_positions: set[int] = set()
             self._seq = 0
+            # How much of the stored record names no identity, counted while it is read, so that
+            # an adoption can say what it took on rather than merely that it happened.
+            self._blank_dispenses = 0
+            self._blank_results = 0
+
+            # The identity this run is filed under, composed now that the catalog exists, because
+            # what each env says about itself is read off the env. Asking the env rather than the
+            # caller is what makes this half checkable: a caller's string is an assertion nobody
+            # can verify, and a run relaunched with a different configuration under a remembered
+            # name was accepted, its rows incomparable in exactly the way an identity exists to
+            # prevent. It also reaches the claim, which is what a crash before the first row
+            # leaves behind: a directory abandoned that early used to carry nothing but the
+            # caller's own string, so the resume that continued it had no env digest to check.
+            self._identity_names = {
+                name: declared
+                for name, env in self._catalog.items()
+                if (declared := _declared_identity_name(env))
+            }
+            self._run_identity = _identity(
+                caller=self._caller_identity,
+                envs={
+                    name: _declared_identity_value(self._catalog[name], declared)
+                    for name, declared in self._identity_names.items()
+                },
+                deadline=deadline,
+                max_in_flight=max_in_flight,
+            )
+            self._identity_wire = _identity_wire(self._run_identity)
+
+            # Ownership is one call and not two — what the directory already holds is checked, and
+            # the whole stored record read, inside the same exclusion that installs the claim,
+            # because an answer read outside it authorises nothing (see `_claim_provenance`,
+            # `_replay_record` and `_require_fresh_provenance`).
+            self._claim_provenance(resume)
             if resume:
-                # How much of this record names no identity, counted while it is read, so that an
-                # adoption can say what it took on rather than merely that it happened.
-                blank_dispenses = 0
-                blank_results = 0
-                for record in read_dispenses(self.prov_dir):
-                    blank_dispenses += not str(record.get("run_identity", ""))
-                    self._require_position_matches(
-                        int(record["position"]),
-                        TaskRef(str(record["env"]), int(record["task_idx"])),
-                        source="a dispense record",
-                    )
-                    self._require_regime_matches(
-                        _recorded_regime(record), source="a dispense record"
-                    )
-                    self._require_identity_matches(
-                        str(record.get("run_identity", "")), source="a dispense record"
-                    )
-                    lease = str(record["lease"])
-                    if lease in self._issued:
-                        # Already ambiguous on disk, before this run adds anything: the pairing
-                        # `reconcile` does cannot answer two dispenses with one result, so
-                        # whichever of them was sealed reports both as sealed. Continuing would
-                        # append to a record that has already lost a row.
-                        raise ValueError(
-                            f"{self.dispenses_path} records two dispenses under one lease "
-                            f"({lease!r}); a result is paired with a dispense by its lease, so "
-                            "one of them can never be answered and a crash on it would be "
-                            "invisible to reconciliation"
-                        )
-                    self._issued.add(lease)
-                    self._seq = max(self._seq, int(record["seq"]))
-                for row in read_results(self.prov_dir):
-                    blank_results += not row.run_identity
-                    self._require_position_matches(
-                        row.position, TaskRef(row.env, row.task_idx), source="a result row"
-                    )
-                    self._require_regime_matches(row.feedback_regime, source="a result row")
-                    self._require_identity_matches(row.run_identity, source="a result row")
-                    # What the env said, as against what the caller asserted — and the binding
-                    # this resume inherits. The first recorded row that describes its env fixes
-                    # the configuration this directory holds, and every row this run goes on to
-                    # write is held to the same one (see :meth:`_require_env_agrees`).
-                    self._require_env_agrees(row.observed)
-                    # A row's lease is the dispense's, so this adds nothing to a record whose two
-                    # files agree — and it is what keeps the guarantee if they ever do not.
-                    self._issued.add(row.lease)
-                    self._done_positions.add(row.position)
-                    self._seq = max(self._seq, row.seq)
                 # The record has been read through and every refusal it can raise is past, so the
                 # migration this construction performed becomes a fact about the directory rather
-                # than a flag the next caller has to remember.
-                self._record_adoption(results=blank_results, dispenses=blank_dispenses)
+                # than a flag the next caller has to remember. Outside the claim's critical
+                # section because it is an append and appends take that lock for themselves.
+                self._record_adoption(
+                    results=self._blank_results, dispenses=self._blank_dispenses
+                )
 
             self._position = 0
             self._consumed = 0
@@ -2819,8 +3068,9 @@ class TaskStream:
             # beside, so the check below and the one every resumed record goes through are both
             # reading a fact about the *directory* rather than a flag about the caller (see
             # :meth:`_require_identity_matches` and :meth:`_record_adoption`).
-            self._adopted = frozenset(
-                str(record.get("run_identity", "")) for record in read_adoptions(self.prov_dir)
+            self._adopted = tuple(
+                _identity_from_wire(_recorded_identity(record))
+                for record in read_adoptions(self.prov_dir)
             )
             if resume:
                 held = self._read_claim()
@@ -2833,8 +3083,13 @@ class TaskStream:
                         source="an ownership claim",
                     )
                     self._require_identity_matches(
-                        str(held.get("run_identity", "")), source="an ownership claim"
+                        _recorded_identity(held), source="an ownership claim"
                     )
+                # The whole stored record, read and checked while the claim it belongs to is still
+                # the live one's. Before the takeover rather than after it, which is the fix for a
+                # refusal that used to cost a running stream its run: see `_replay_record`.
+                self._replay_record()
+                if held is not None:
                     # The assertion `resume=True` makes, carried out. Nothing can come between this
                     # and the create below, so a claim that is gone here was gone before this
                     # stream arrived.
@@ -2843,11 +3098,15 @@ class TaskStream:
                     except FileNotFoundError:
                         pass
                     else:
-                        # Kept, because this constructor may still refuse: everything that can
-                        # reject the queue, the record or the envs runs after this point, and a
-                        # call that refuses has to leave the directory as it found it — which for
-                        # a takeover means the claim it displaced, not merely no claim of its own
-                        # (see :meth:`_release_claim`).
+                        # Kept, because a call that refuses has to leave the directory as it found
+                        # it — which for a takeover means the claim it displaced, not merely no
+                        # claim of its own (see :meth:`_release_claim`). Almost nothing can refuse
+                        # from here on: the envs, their contracts, the queue and the whole stored
+                        # record were all checked before this line, and what is left is the
+                        # adoption append and assignment. Putting a file back is all a refusal
+                        # could ever do, and it is not enough on its own — the displaced stream's
+                        # own next append would already have found a foreign claim and stopped it
+                        # for good, which is why the refusals moved rather than the restore.
                         self._displaced = held
                 elif self.claim_path.exists():
                     # A claim that will not parse, on the one path that is allowed to clear it.
@@ -2876,7 +3135,7 @@ class TaskStream:
                     {
                         "owner": self._owner,
                         "feedback_regime": self._regime,
-                        "run_identity": self._run_identity,
+                        "run_identity": self._identity_stamp,
                         # Read back by every append and every release, as identity: this is the
                         # process the claim was taken in, and no other may write under it (see
                         # :meth:`_require_claim`). The wall clock is for the human alone.
@@ -2896,6 +3155,85 @@ class TaskStream:
                     "directory over."
                 ) from None
             self._claimed = True
+
+    def _replay_record(self) -> None:
+        """Read the whole stored record, refuse it if it is not this run's, and seed what a
+        resume continues from it. **Callers hold :func:`_locked`.**
+
+        Resume by queue POSITION, never by task index: the same index may be queued twice and
+        both occurrences must play. A position that was dispensed but never sealed has no
+        authoritative outcome, so it is replayed (its abandoned dispense stays visible through
+        :func:`reconcile`, and the replay gets its own lease). A position only carries meaning
+        next to the queue it was recorded against, so every stored position is checked against the
+        queue being served before any of it is trusted.
+
+        ``seq`` continues past every number this directory already used, dispenses included. A
+        dispense is durable before its task is handed out, so an abandoned one holds a ``seq`` no
+        result row answers — and that is precisely the position a resume replays. Numbering the
+        replay from the results alone would hand it the abandoned dispense's own number, leaving
+        :func:`reconcile`'s ``broker_abort`` and the replay's real outcome sharing one identifier:
+        two rows for one position, indistinguishable in order, in the record whose whole purpose
+        is to keep them apart.
+
+        Leases continue past this directory's record for the same reason ``seq`` does, and for a
+        stricter one. :func:`reconcile` pairs a dispense with a result **by lease alone**, so a
+        resumed run that minted one this record already holds would have the earlier run's result
+        answer the later run's dispense: the position dispensed and never sealed reconciles to
+        nothing, and the ``broker_abort`` a crash owes is simply absent from a record that still
+        reads as complete. A row goes missing, quietly.
+
+        **Inside the claim's critical section, and before the takeover.** Two properties, and
+        neither is available anywhere else. The record read here is complete, because every append
+        re-reads the claim inside this same exclusion, so nothing can be added to it while it is
+        being read — which is what seeding a ``seq``, a lease set and a done-position set depends
+        on. And every refusal it can raise happens while the *live* claim is still the live one's:
+        a resume that finds a queue, a regime, an identity or a record it may not continue has
+        displaced nobody, so the stream that was serving is not merely restored on disk but never
+        interrupted. It used to run after the takeover, and a refusal there was not repairable by
+        putting the claim file back: if the displaced stream reached an append in between, it saw
+        a foreign claim, stopped itself permanently and raised out of its own ``aclose`` — a
+        correct run killed by a construction that went on to refuse."""
+        for record in read_dispenses(self.prov_dir):
+            stored = _recorded_identity(record)
+            self._blank_dispenses += not stored
+            self._require_position_matches(
+                int(record["position"]),
+                TaskRef(str(record["env"]), int(record["task_idx"])),
+                source="a dispense record",
+            )
+            self._require_regime_matches(_recorded_regime(record), source="a dispense record")
+            self._require_identity_matches(stored, source="a dispense record")
+            lease = str(record["lease"])
+            if lease in self._issued:
+                # Already ambiguous on disk, before this run adds anything: the pairing
+                # `reconcile` does cannot answer two dispenses with one result, so whichever of
+                # them was sealed reports both as sealed. Continuing would append to a record that
+                # has already lost a row.
+                raise ValueError(
+                    f"{self.dispenses_path} records two dispenses under one lease "
+                    f"({lease!r}); a result is paired with a dispense by its lease, so "
+                    "one of them can never be answered and a crash on it would be "
+                    "invisible to reconciliation"
+                )
+            self._issued.add(lease)
+            self._seq = max(self._seq, int(record["seq"]))
+        for row in read_results(self.prov_dir):
+            self._blank_results += not row.run_identity
+            self._require_position_matches(
+                row.position, TaskRef(row.env, row.task_idx), source="a result row"
+            )
+            self._require_regime_matches(row.feedback_regime, source="a result row")
+            self._require_identity_matches(row.run_identity, source="a result row")
+            # What the env said, as against what the caller asserted — and the binding this
+            # resume inherits. The first recorded row of an env that describes itself fixes what
+            # this directory holds for that env, and every row this run goes on to write for it is
+            # held to the same one (see :meth:`_require_env_agrees`).
+            self._require_env_agrees(row.env, row.observed)
+            # A row's lease is the dispense's, so this adds nothing to a record whose two files
+            # agree — and it is what keeps the guarantee if they ever do not.
+            self._issued.add(row.lease)
+            self._done_positions.add(row.position)
+            self._seq = max(self._seq, row.seq)
 
     def _write_claim(self, payload: Mapping[str, Any]) -> None:
         """Publish the claim file holding ``payload``, or raise ``FileExistsError`` if one is
@@ -3237,37 +3575,43 @@ class TaskStream:
             "provenance directory"
         )
 
-    #: What an env publishes to say which configuration produced a row. Read here and compared
-    #: against what the caller named; never revealed, because it is published at inference level
-    #: and no policy reaches that.
-    _ENV_IDENTITY_NAME = "config_digest"
+    def _require_env_agrees(self, env: str, observed: Sequence[Dict[str, Any]]) -> None:
+        """A row's env must say the same thing about itself that this record already holds, and
+        the same thing the identity this run is filed under says it said.
 
-    def _require_env_agrees(self, observed: Sequence[Dict[str, Any]]) -> None:
-        """The identity a run is filed under must be the one the env says produced the row.
-
-        The caller supplies a string and this module compares it to other strings on disk. That
-        makes a resume safe against a *changed caller*, and does nothing about a caller whose
-        string stopped describing its env: a run relaunched with a different pulse and the same
+        The caller supplies a name and this module compares it to other names on disk. That makes
+        a resume safe against a *changed caller*, and does nothing about a caller whose name
+        stopped describing its env: a run relaunched with a different pulse and the same
         remembered identity was accepted, and its rows are incomparable in exactly the way the
         identity exists to prevent. The env is the only party that knows, and it says so on every
         row it produces.
 
-        So the row is checked against the name it is being filed under, at the moment it is
-        written, before anything else can read the two together and average them. A caller that
-        named nothing is unaffected by *that* half — the wildcard is for parties that cannot say
-        rather than parties that disagree.
+        **Per env, because a queue may name several.** The binding used to be one value for the
+        whole stream, so a perfectly ordinary two-env queue whose envs published different digests
+        scored the first env and then refused the second env's first row as an unscored
+        ``finalize_error``, stopping the run: a supported queue shape reported as an integrity
+        failure. What one env said is a fact about that env, so it is kept under that env's name
+        and rows are only ever compared with rows of the same env.
+
+        **Exactly, and against a field rather than against a rendering.** What the env said is
+        compared with what the run identity holds for that env, member to member (see
+        :func:`_identity`). It used to be tested for *containment* in the caller's opaque string,
+        which is not a comparison of anything: a caller identity with unrelated text around a
+        digest was accepted and stamped on a scored row, and a composed name holding several
+        fields could match by accident.
 
         **And the record is bound to what the env said, which the caller's assertion cannot do.**
-        The first row that publishes a digest fixes it for the directory; every later row of the
-        run, and every row a resume replays, is held to the same one. That is the half a name
-        cannot carry: a catalog and an episode factory can be handed two configurations while one
-        remembered string is stamped on both, and it is the *env* that notices. It works for the
-        wildcard caller too, because it compares what the env said with what the env said before,
-        and neither of those is an assertion anybody made.
+        The first row of an env that publishes a digest fixes it for the directory; every later
+        row of that env, and every row a resume replays, is held to the same one. That is the half
+        a name cannot carry: a catalog and an episode factory can be handed two configurations
+        while one remembered string is stamped on both, and it is the *env* that notices. It works
+        for a caller that named nothing too, because it compares what the env said with what the
+        env said before, and neither of those is an assertion anybody made.
 
-        A row that publishes no digest binds nothing and is refused by nothing: an env that does
-        not describe itself is the state every env was in before this existed, and a reconciled
-        crash row cannot carry a digest no env ever produced for it.
+        A row whose env declares nothing, or that publishes no digest, binds nothing and is
+        refused by nothing: an env that does not describe itself is the state every env was in
+        before this existed, and a reconciled crash row cannot carry a digest no env ever produced
+        for it.
 
         **Finding the item is contained; disagreeing about it is not.** A published name is an
         object the env supplied, so the comparison that finds this one runs the env's own
@@ -3277,8 +3621,11 @@ class TaskStream:
         the same defect is what the summary funnel below refuses the *score* for, so such a run
         stops with an unscored row rather than continuing on an unchecked identity (see
         :meth:`_compose_row`)."""
+        declared = self._identity_names.get(env, "")
+        if not declared:
+            return
         try:
-            said = _env_said(observed, self._ENV_IDENTITY_NAME)
+            said = _env_said(observed, declared)
         except BaseException as exc:  # noqa: BLE001 — the env's failure, never this row's
             # Nothing in the read awaits, so no cancellation can be delivered into it and one
             # observed here was raised where it was observed (see :func:`_must_propagate`).
@@ -3287,22 +3634,23 @@ class TaskStream:
             return
         if not said:
             return
-        if self._env_identity and said != self._env_identity:
+        bound = self._env_identity.get(env, "")
+        if bound and said != bound:
             raise ValueError(
-                f"{self.prov_dir} holds rows the environment says were made under "
-                f"{self._env_identity!r}, but the environment says the row it has just produced "
-                f"was made under {said!r}; the rows of one record are read together, so a record "
-                "holding both has a mean that is about neither of them. Serve the second "
-                "configuration into a fresh provenance directory"
+                f"{self.prov_dir} holds rows env {env!r} says were made under {bound!r}, but that "
+                f"env says the row it has just produced was made under {said!r}; the rows of one "
+                "record are read together, so a record holding both has a mean that is about "
+                "neither of them. Serve the second configuration into a fresh provenance directory"
             )
-        if self._run_identity and said not in self._run_identity:
+        asserted = self._run_identity.get("envs", {}).get(env, "")
+        if asserted and said != asserted:
             raise ValueError(
-                f"{self.prov_dir} is being served under run identity {self._run_identity!r}, but "
-                f"the environment says the row it just produced was made under {said!r}; the "
-                "rows of one record are read together, so a record holding both has a mean that "
-                "is about neither of them"
+                f"{self.prov_dir} is being served under a run identity that has env {env!r} at "
+                f"{asserted!r}, but that env says the row it just produced was made under "
+                f"{said!r}; the rows of one record are read together, so a record holding both "
+                "has a mean that is about neither of them"
             )
-        self._env_identity = said
+        self._env_identity[env] = said
 
     def _record_adoption(self, *, results: int, dispenses: int) -> None:
         """Write down that this run has taken responsibility for the record's unidentified rows.
@@ -3326,7 +3674,7 @@ class TaskStream:
         if this constructor goes on to raise (see :meth:`_undo_adoption`): a call that refuses
         has served nothing, and it may not leave behind the one mark that makes the next call
         look reasonable."""
-        if not self._adopting or self._run_identity in self._adopted:
+        if not self._adopting or self._already_adopted():
             return
         # The committed length before this append, which is what an undo truncates back to. Taken
         # with the same helper the append itself uses, so the two agree about where the log ends.
@@ -3334,7 +3682,7 @@ class TaskStream:
         self._append_owned(
             self.adoptions_path,
             {
-                "run_identity": self._run_identity,
+                "run_identity": self._identity_stamp,
                 "feedback_regime": self._regime,
                 "results": results,
                 "dispenses": dispenses,
@@ -3343,8 +3691,30 @@ class TaskStream:
                 "adopted_at": time.time(),
             },
         )
-        self._adopted = self._adopted | {self._run_identity}
+        self._adopted = self._adopted + (dict(self._run_identity),)
         self._adopting = False
+
+    @property
+    def _identity_stamp(self) -> RunIdentity:
+        """This run's identity, as a fresh copy, for one record to be stamped with.
+
+        Copied per record for :class:`CompletedTask`'s reason: a :class:`ResultRow` is public and
+        ``frozen=True`` stops an attribute being rebound rather than making what it points at
+        immutable. One shared object stamped on every row and every dispense would let a consumer
+        that edited what it was handed edit what this stream is filed under, and the next append
+        would write the edit."""
+        return dict(self._identity_wire) if isinstance(self._identity_wire, dict) else ""
+
+    def _already_adopted(self) -> bool:
+        """Whether the identity this stream serves under is the one that adopted this record's
+        unidentified rows.
+
+        Compared with :func:`_identity_disagreement` rather than by set membership, so an adoption
+        written under an older shape of the identity is still recognised as this run's."""
+        return any(
+            _identity_disagreement(adopted, self._run_identity) is None
+            for adopted in self._adopted
+        )
 
     def _undo_adoption(self) -> None:
         """Take back an adoption this constructor wrote, because it is refusing after all.
@@ -3358,7 +3728,7 @@ class TaskStream:
         committed, self._adoption_undo = self._adoption_undo, None
         _undo_failed_append(self.adoptions_path, committed)
 
-    def _require_identity_matches(self, recorded: str, *, source: str) -> None:
+    def _require_identity_matches(self, recorded: RunIdentity, *, source: str) -> None:
         """A stored record must have been written under the same run configuration as this stream.
 
         The regime check beside this one asks which channel the rows were served under. This asks
@@ -3367,9 +3737,15 @@ class TaskStream:
         payload classes, two corpora or two versions of a scorer is a record whose parts are
         individually honest and whose mean is about neither of them.
 
-        What goes in the string is the caller's to decide and opaque here: this module compares it
-        and never reads it, because what makes two runs one measurement is a property of the env
-        and the harness rather than of the queue.
+        **What is compared is a record, member by member** (see :func:`_identity`). What goes in
+        the caller's own member is the caller's to decide and opaque here: this module compares it
+        and never parses it. Beside it are the facts this module can check for itself — what each
+        env said about itself, the deadline, the capacity — because what makes two runs one
+        measurement is a property of the env and the harness rather than of the queue, and a
+        caller's word for it is an assertion nobody could verify. A single string could not do
+        this job: composing several facts into one name and then asking whether one of them
+        occurs *inside* it accepts a name with unrelated text around a digest, and matches by
+        accident once a name holds more than one field.
 
         **A blank recorded identity is not a wildcard.** It used to be one, in the name of
         compatibility with records written before this field existed, and it is the wrong shape
@@ -3395,16 +3771,35 @@ class TaskStream:
         responsibility for the blank rows. The flag is then what it says it is: the one-time act
         of taking them on.
 
+        **And it is performed by one identity, not by each in turn.** The flag used to be asked
+        about only the *current* caller: a directory whose blank rows one configuration had
+        already adopted still said yes to a second one that also passed the flag, and
+        ``adoptions.jsonl`` then named both. The same unidentified rows were auditable as
+        belonging to two runs, which is the whole of what an adoption exists to rule out. So an
+        adoption already on record refuses every identity but its own, whatever flag the caller
+        passes, and the refusal says whose those rows are.
+
         **The other asymmetry stands.** A caller that names none is not accepted by a record that
         does: the record has already said what produced its rows, and appending rows that decline
         to say makes a directory nobody can read as one run afterwards."""
-        if recorded == self._run_identity:
-            return
-        if not recorded:
-            if not self._run_identity or self._run_identity in self._adopted:
-                # Blank continued as blank, or adopted already by this identity and the directory
-                # says so. Neither asserts anything that was not asserted once and recorded.
+        stored = _identity_from_wire(recorded)
+        if _identity_names_nothing(stored):
+            if _identity_names_nothing(self._run_identity):
+                # Blank continued as blank. Nothing is asserted that was not asserted before.
                 return
+            if self._already_adopted():
+                # Adopted already by this identity, and the directory says so rather than the
+                # caller. An ordinary resume from here on needs no flag.
+                return
+            if self._adopted:
+                raise ValueError(
+                    f"{self.prov_dir} holds {source} that names no run identity, and those rows "
+                    "have already been adopted by "
+                    + ", ".join(_identity_text(name) for name in self._adopted)
+                    + f", which is not this stream's identity ({_identity_text(self._run_identity)})"
+                    "; unidentified rows are taken on once, by one configuration, or the record "
+                    "says they belong to two. Serve into a fresh provenance directory"
+                )
             if self._adopt_unidentified:
                 # The migration is being performed *now*. Remembered rather than written here:
                 # this runs while the record is still being read, and an adoption is owed only by
@@ -3413,23 +3808,18 @@ class TaskStream:
                 return
             raise ValueError(
                 f"{self.prov_dir} holds {source} that names no run identity, but this stream "
-                f"serves under {self._run_identity!r}; an unidentified record cannot say what "
-                "produced its rows, so nothing here can tell whether averaging them with this "
-                "configuration's describes anything at all. Serve into a fresh provenance "
-                "directory, or pass adopt_unidentified=True to state that those rows were this "
-                "configuration's"
-                + (
-                    ""
-                    if not self._adopted
-                    else " (they were already adopted by "
-                    + ", ".join(repr(name) for name in sorted(self._adopted))
-                    + ", which is not this stream's identity)"
-                )
+                f"serves under {_identity_text(self._run_identity)}; an unidentified record "
+                "cannot say what produced its rows, so nothing here can tell whether averaging "
+                "them with this configuration's describes anything at all. Serve into a fresh "
+                "provenance directory, or pass adopt_unidentified=True to state that those rows "
+                "were this configuration's"
             )
+        disagreement = _identity_disagreement(stored, self._run_identity)
+        if disagreement is None:
+            return
         raise ValueError(
-            f"{self.prov_dir} holds {source} written under run identity {recorded!r}, but this "
-            f"stream serves under {self._run_identity or 'no identity'!r}; the rows of one record "
-            "are read together, "
+            f"{self.prov_dir} holds {source} written under a different run identity "
+            f"({disagreement}); the rows of one record are read together, "
             "so rows produced under two configurations have a mean that is about neither of "
             "them. Resume under the configuration the record was written with, or serve into a "
             "fresh provenance directory"
@@ -4764,12 +5154,34 @@ class TaskStream:
 
         The two are one step because the record is only true if the answer is: the exposure is
         written between the composition and the ``return``, so nothing awaits between them and no
-        cancellation can be delivered in the gap (see :meth:`_record_exposure`)."""
+        cancellation can be delivered in the gap (see :meth:`_record_exposure`).
+
+        **The record is written first and the answer is returned only if it landed.** The write
+        used to come after the composition and before the ``return`` and be allowed to fail: the
+        stream stopped, and the already-composed report went back to the agent anyway. So a
+        delivery really happened, was really read, and :func:`read_exposures` was empty — the
+        exact inverse of what a missing line means everywhere else in this module, and the one
+        reading that makes an absent line usable as evidence. It fails closed on the answer now:
+        the caller is told the task ended and nothing more, which is the same thing every other
+        integrity failure here tells it.
+
+        **A task the stream ended itself delivers nothing, and a late finalization does not
+        change that.** A terminal that ran past its deadline has already been sealed by the
+        watchdog into an unscored ``timeout`` row, and the row's own contract says a stream-ended
+        ending has nobody told (see :class:`ResultRow` and :meth:`_record_exposure`). What used to
+        happen is that the blocked call returned eventually, was handed that row, and was answered
+        with the report — a dose delivered outside the assignment it was recorded under, at a
+        moment the design counts as a failed delivery to be scored at the floor and retried rather
+        than as a treatment. So a timed-out row answers with the same silence a cancelled terminal
+        gets, and the exposure log stays silent about it too."""
+        if row is not None and row.closure == "timeout":
+            return ToolResult(content=_TASK_OVER_SILENT if self._reveals else _TASK_OVER)
         answer, items = self._terminal_answer(row)
-        self._record_exposure(live, items)
+        if not self._record_exposure(live, items):
+            return ToolResult(content=_TASK_OVER_SILENT if self._reveals else _TASK_OVER)
         return ToolResult(content=answer)
 
-    def _record_exposure(self, live: _Live, items: Optional[int]) -> None:
+    def _record_exposure(self, live: _Live, items: Optional[int]) -> bool:
         """Write down what a terminating call was actually told, as against what its row says it
         was assigned.
 
@@ -4804,13 +5216,18 @@ class TaskStream:
         no channel, so it has no exposure to record and its directory is byte for byte the one it
         wrote before this existed.
 
-        A failure to write stops the stream. The exposure log is evidence about the treatment
-        rather than about the task, so losing a line does not cost this row its outcome — it
-        costs the *run* the ability to say which of its deliveries landed, which is the same
-        eval-integrity failure an unwritable result file is, and the agent is told the task ended
-        and nothing more."""
+        A failure to write stops the stream **and takes the answer with it**, which is what the
+        ``bool`` is for. The exposure log is evidence about the treatment rather than about the
+        task, so losing a line does not cost this row its outcome — but it may not cost the record
+        its truthfulness either. Returning the report while this failed would deliver a dose the
+        record says nobody was told, and since non-delivery is read off the *absence* of a line,
+        that one row would be indistinguishable from every honest silence in the file. So the
+        caller gets what a cancelled terminal gets: the task ended, and nothing more.
+
+        ``True`` for a run that has nothing to record. Under :class:`Never` there is no channel
+        and no exposure, and the answer is the constant it always was."""
         if items is None:
-            return
+            return True
         try:
             self._append_owned(
                 self.exposures_path,
@@ -4823,7 +5240,7 @@ class TaskStream:
                     # Repeated from the row so this log reads on its own: what the task was
                     # assigned, beside how much of it was delivered.
                     "feedback_regime": self._regime,
-                    "run_identity": self._run_identity,
+                    "run_identity": self._identity_stamp,
                     # How many items the answer carried. Zero is a delivered answer that said
                     # nothing — an env that published none, a policy holding this task back, a
                     # seal that recorded no row, or a policy that could not answer.
@@ -4831,6 +5248,7 @@ class TaskStream:
                     "at": time.time(),
                 },
             )
+            return True
         except BaseException as exc:  # noqa: BLE001 — reported on the stream, not to the agent
             # Nothing above awaits, so no cancellation can be delivered into it and one observed
             # was raised where it was observed (see :func:`_must_propagate`).
@@ -4849,6 +5267,7 @@ class TaskStream:
                     f"{self._regime!r} regime could not be recorded ({rendered})"
                 ),
             )
+            return False
 
     def _tombstone_answer(self) -> str:
         """The whole response to a call that reached an episode already over: the task ended, and
@@ -5321,7 +5740,7 @@ class TaskStream:
             extensions=self._unclosed_spans(live, cause),
             # The regime this stream serves, exactly as a composed row records it.
             feedback_regime=self._regime,
-            run_identity=self._run_identity,
+            run_identity=self._identity_stamp,
         )
 
     def _unclosed_spans(self, live: _Live, cause: BaseException) -> Dict[str, Any]:
@@ -5466,7 +5885,7 @@ class TaskStream:
         # silently keeps one of them — losing the evidence and, for a summary name, deciding the
         # headline by list order (see `_pick_summary`).
         observed = [dict(item) for item in episode.terminal_feedback]
-        self._require_env_agrees(observed)
+        self._require_env_agrees(live.ref.env, observed)
         closure, diagnostic = self._classify(live, forced)
         # The summary is read as a unit and strictly (see `_pick_summary`): a wrong-typed
         # `success`/`reward` leaves the row unscored rather than coerced or quietly emptied.
@@ -5543,7 +5962,7 @@ class TaskStream:
             # policy object — the row says what the run was, not what the policy happens to
             # answer at the moment the row is built.
             feedback_regime=self._regime,
-            run_identity=self._run_identity,
+            run_identity=self._identity_stamp,
         )
         if unfinished is not None:
             # The seal's answer is already reached, so what is left is the failure. The row goes
@@ -5899,7 +6318,7 @@ class TaskStream:
                 # this run to write, the `broker_abort` :func:`reconcile` builds, can say which
                 # posture it was dispensed under instead of defaulting to the safe-looking one.
                 "feedback_regime": self._regime,
-                "run_identity": self._run_identity,
+                "run_identity": self._identity_stamp,
                 # namespace -> what that extension observed at dispense. The `{"dispensed": ...}`
                 # wrapper the row carries is deliberately *not* here: it exists to sit beside
                 # `sealed`/`error`, which are outcomes, and a dispense record has no outcome.

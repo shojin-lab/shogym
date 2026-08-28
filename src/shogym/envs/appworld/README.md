@@ -61,13 +61,17 @@ TaskStream(
 generated from, the text the agent is given (the world guide, the tool guide and the appended
 paragraph), the generator constants that decide the seeded backlog, the corpus this run actually
 serves (all of it, including the 134 MB of shared base episodes read as input), the derivation
-layout, the interpreter and distribution set the worker turned out to be built with, and a
-hand-bumped scoring version that moves when how a score is read moves. A stream's `deadline` and
-`max_in_flight` belong to a run's identity too and are not an env's to know; they are carried in
-the stream's own persisted identity on
-[shojin-lab/shogym#140](https://github.com/shojin-lab/shogym/pull/140). The derived and grader caches are named by the same source digest and
-carry a stamp inside them saying what they were built from, so a run pointed at a second corpus
-cannot serve material derived from the first.
+layout, every installed byte of the interpreter the worker turned out to be built with, and a
+hand-bumped scoring version that moves when how a score is read moves. An env serves the corpus it
+read at construction for the whole of its life: the instructions, the supervisors and the dates
+come from that one reading, so a corpus edited underneath a running env cannot put new authored
+text behind an unchanged fingerprint. A stream's `deadline` and
+`max_in_flight` belong to a run's identity too and are not an env's to know, so the stream folds
+them in itself: what a record is filed under is a structured identity whose members are the name
+passed here, the digest each env in the queue published about itself, the deadline and the
+capacity, compared member by member on every resume. The derived and grader caches are named by
+the same source digest and carry a stamp inside them saying what they were built from, so a run
+pointed at a second corpus cannot serve material derived from the first.
 
 Passing `identity` is how a record defends itself. A directory that already names one refuses a
 resume that names a different one, and refuses a caller that names none: the record has said what
@@ -78,11 +82,17 @@ what produced its rows, so a named caller has to state that it knows
 performed once and written into the directory, so the next ordinary resume under the same identity
 needs no flag.
 
-The assertion is also checked against the env, which is the one party that knows. Every terminal
-this env produces publishes its `config_digest` at inference level, the stream compares it with the
-name the record is being filed under, and the first row that publishes one binds the directory: a
-later row whose env says something else is refused before it can be scored, whether or not a caller
-named an identity at all.
+The name is also checked against the env, which is the one party that knows, and the env's own
+answer is a member of the identity rather than something searched for inside that name. This env
+declares the item it describes itself with (`identity_feedback_name = "config_digest"`) and
+answers to it before any episode runs, so the stream reads the digest off the env at construction
+and writes it into the ownership claim: a run killed between its claim and its first row still
+leaves behind what its env said it was, and a resume against a changed corpus, draw or runtime is
+refused before a task is spent. Every terminal this env produces publishes the same
+`config_digest` at inference level, and a row whose env says something else than the identity
+holds for it is refused before it can be scored. The first row of an env that publishes a digest
+also binds the directory for that env, which is what covers an env that publishes one without
+answering to it, and it works whether or not a caller named an identity at all.
 
 Each row's `feedback_regime` is the arm the task was **assigned**, not the arm it was told through.
 It has to be: the row is fsynced before the policy's answer is composed, because the answer is
@@ -93,6 +103,14 @@ was actually delivered is a separate state in `exposures.jsonl` beside the resul
 lease: a revealing run writes one line per terminating call it answered, and a row with no line
 there was never told. A run under `Never` writes no such log, because it opens no channel.
 
+The absence of a line is load-bearing, so two things fail closed on it. A delivery whose line
+cannot be written is not delivered: the terminating call is answered with the empty member every
+other silence uses, and the stream stops. And a terminal that outran its deadline delivers
+nothing even when the env's finalization eventually returns: the watchdog has already sealed that
+task into an unscored `timeout` row, which the design counts as a failed delivery to be scored at
+the floor and retried rather than as a dose, so the late answer carries the empty member and the
+log stays silent about it.
+
 ## Requirements
 
 Pin-and-install mechanics are shared; see [`../README.md`](../README.md). What is specific:
@@ -100,10 +118,15 @@ Pin-and-install mechanics are shared; see [`../README.md`](../README.md). What i
 - **The `appworld` extra carries no packages, and cannot.** `appworld` 0.1.3.post1 pins
   `pydantic>=1.9,<2`; shogym's MCP layer needs `pydantic>=2.7`. No environment satisfies both. The
   port therefore builds an interpreter of its own (a virtual environment under
-  `~/.cache/shogym/appworld/runtime-<version>/` holding the pinned release) and runs every world
-  in a subprocess under it. `SHOGYM_CACHE` relocates it; `uv` is used when it is on `PATH` and
-  `venv` + `pip` otherwise. This is provisioned when an `appworld` env is **constructed**, so
-  `import shogym` stays offline.
+  `~/.cache/shogym/appworld/runtime-<version>-<sha>/` holding the pinned release) and runs every
+  world in a subprocess under it. `SHOGYM_CACHE` relocates it; `uv` is used when it is on `PATH`
+  and `venv` + `pip` otherwise. This is provisioned when an `appworld` env is **constructed**, so
+  `import shogym` stays offline. Both pins are in that name and in a stamp inside it, and the
+  installed distribution is checked to be the pinned release before the tree is published, so a
+  build that resolved something else never gets served and a pin that moves builds a second
+  interpreter rather than reusing the first. What the wheel cannot say is which commit it was cut
+  from; that half of the pin names the runtime and is not verifiable against the artifact, and
+  what the realized code actually is comes from hashing the installed bytes instead.
 - **The data bundle is fetched and checked.** ~33 MB, once, into
   `~/.cache/shogym/appworld/corpus-0.1.0/`. Upstream's own downloader verifies nothing; this one
   refuses a bundle whose size and sha256 are not the pinned pair. `APPWORLD_ROOT` pointing at a
@@ -453,8 +476,9 @@ before it should be read knowing that nothing was watching.
   slots for every leg. Scores drawn under two pulses are not comparable, and neither the pulse nor
   the payload class appears anywhere else in a run's record, so every row carries a
   `config_digest`, which covers the draw, the payload class, the block budget, the pinned bundle,
-  the interpreter, the served roster, the frozen count table, a scoring version, and what the
-  corpus at `APPWORLD_ROOT` actually holds rather than what the pin says it should. Published at
+  what the interpreter actually holds rather than what version it was asked for, the served
+  roster, the frozen count table, a scoring version, and what the corpus at `APPWORLD_ROOT`
+  actually holds rather than what the pin says it should. Published at
   inference level: the record keeps it and no feedback policy
   reveals it, not even the one that reveals everything else. Reopening a provenance directory
   under a different pulse is then visible in the rows. Refusing such a resume belongs to the

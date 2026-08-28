@@ -202,7 +202,16 @@ def derive_task(
         return target
     (derived / "tasks").mkdir(parents=True, exist_ok=True)
     (graded / "tasks").mkdir(parents=True, exist_ok=True)
-    with _locked(derived / "tasks"), _opened(derived / "tasks"), _opened(graded / "tasks"):
+    # The lock is **required** here, not advisory. What follows it opens two published directories
+    # for writing and seals them again, and a permission window is only correct while nothing else
+    # is inside it: a second builder that arrives without exclusion does not find a stale tree, it
+    # finds an open one, and it seals it shut again under the first builder's feet. Staging and
+    # renaming makes the *contents* safe without a lock and can do nothing for the modes.
+    with (
+        _locked(derived / "tasks", required=True),
+        _opened(derived / "tasks"),
+        _opened(graded / "tasks"),
+    ):
         if already_derived(derived=derived, graded=graded, task_id=task_id):
             return target
         source = original / "tasks" / task_id
@@ -337,13 +346,16 @@ def derive_root(*, original: Path, derived: Path) -> Path:
     per corpus and every episode's view names it rather than copying it.
 
     **Staged and published, never built in place.** This used to unseal, delete, copy and mark
-    the final directory while holding :func:`_locked`, and that helper deliberately yields with no
-    exclusion on a filesystem whose ``flock`` it cannot take. Under it, two cold processes both
+    the final directory while holding :func:`_locked`, which at the time yielded with no exclusion
+    at all on a filesystem whose ``flock`` it could not take. Under it, two cold processes both
     deleted and rebuilt the same live target, and either could publish the completeness marker over
     a tree the other was halfway through writing. So each entry is built under a staging name of
     this process's own, sealed and marked there, and given its final name by one rename; a loser
     finds the target already published and drops what it built. That is the protocol
     :func:`derive_task` already uses, and it is correct without a lock rather than because of one.
+    The lock is now *required* rather than advisory anyway, for the modes rather than the
+    contents: staging cannot make a permission window safe, and this one opens a published
+    directory. Both defences are kept, because they answer different failures.
 
     **Sealed read-only, which is what lets a view name it.** Every episode's served root reaches
     these directories, so an episode that could write to one could leave something in the next
@@ -371,7 +383,10 @@ def derive_root(*, original: Path, derived: Path) -> Path:
     container read-only, which is a boundary rather than a convention, and it is what closes both
     the modes and the names."""
     derived.mkdir(parents=True, exist_ok=True)
-    with _locked(derived):
+    # Required, for the reason :func:`derive_task`'s is: the body below opens this directory for
+    # writing and seals it again, and what a second process without exclusion would find is not a
+    # stale tree but an open one. A window that another process can close is not a window.
+    with _locked(derived, required=True):
         # What is missing is decided before the directory is opened, so a construction that has
         # nothing to build never opens it at all. That matters because the ordinary case is warm:
         # an env is constructed while another episode of the pair is already running, and opening

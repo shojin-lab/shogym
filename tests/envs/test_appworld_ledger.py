@@ -4,12 +4,21 @@ Offline and upstream-free. The generator is a pure function of a seed and a date
 the measurement rests on is a property of what it produces: that the 64 conventions give 64
 different answer keys, that no single choice is decided by one request, and that the same seed
 gives the same backlog in any process on any machine.
+
+The seed and the date are production's own. The seed is the task identity, which these tests can
+compute; the date is the task's own specification, which lives in a 134 MB corpus these tests do
+not download, so it is committed beside them as a table and checked against the real corpus by
+``test_appworld_table.py``. A roster accepted at a date no episode is served is a roster nobody
+tested.
 """
 
 from __future__ import annotations
 
 import datetime as dt
+import os
 import zlib
+from pathlib import Path
+from typing import Dict, Tuple
 
 import numpy as np
 import pytest
@@ -17,8 +26,42 @@ import pytest
 from shogym.envs.appworld import adapter, ledger, world
 
 # The reference date all but a handful of the split's tasks carry, so a backlog built against it
-# is the shape the roster is mostly made of.
+# is the shape the roster is mostly made of. It is what the *generator's* own properties are
+# stated at, below, and it is deliberately no longer what the roster is accepted against: 31 of
+# the 318 served tasks carry another date, and production reads each task's own.
 REFERENCE = dt.date(2023, 5, 18)
+
+#: Task id to the datetime its specification carries, read off the pinned corpus and committed
+#: beside these tests. These tests are offline and a corpus is 134 MB of download, so the dates
+#: production reads have to arrive some other way; ``test_appworld_table.py`` checks this table
+#: against the live corpus wherever there is one, which is what stops it drifting into fiction.
+TASK_DATES = Path(__file__).with_name("appworld_task_dates.tsv")
+
+
+def _dates() -> Dict[str, dt.date]:
+    """The committed table, as the dates production would build backlogs against."""
+    table: Dict[str, dt.date] = {}
+    for line in TASK_DATES.read_text().splitlines():
+        if not line.strip() or line.startswith("#"):
+            continue
+        task_id, moment = line.split("\t")
+        # Parsed exactly as `AppWorldEnv._backlog` parses it, so what these tests feed the
+        # generator is what a run feeds it and not a second reading of the same string.
+        table[task_id] = dt.datetime.fromisoformat(moment).date()
+    return table
+
+
+def _production_inputs(task_id: str) -> Tuple[int, dt.date]:
+    """The two arguments production draws a task's backlog from: its seed and its own date."""
+    return zlib.crc32(task_id.encode()), _dates()[task_id]
+
+
+def _off_reference() -> Tuple[str, ...]:
+    """The served tasks whose date is not the one the rest share.
+
+    The population the old roster tests could not have been testing: they built every sampled
+    task's backlog at :data:`REFERENCE`, which is right for 287 of the 318 and wrong for these."""
+    return tuple(task for task, date in _dates().items() if date != REFERENCE)
 
 
 @pytest.fixture(scope="module")
@@ -132,8 +175,10 @@ def test_one_receipt_narrows_the_convention_and_does_not_name_it(
 
 @pytest.mark.parametrize("position", [0, 40, 120, 240])
 def test_the_narrowing_holds_across_the_roster(position: int) -> None:
+    # At the sampled task's own date, which is what a run builds it against. A floor asserted at
+    # one hard-coded date is a floor for a backlog no episode is ever served.
     task_id = adapter.task_ids()[position]
-    built = ledger.build_backlog(zlib.crc32(task_id.encode()), REFERENCE)
+    built = ledger.build_backlog(*_production_inputs(task_id))
     assert built is not None
     profile = ledger.posterior_profile(built, ledger.REFERENCE_CONVENTION)
     assert profile.distinct >= 32, (task_id, profile)
@@ -221,16 +266,66 @@ def test_the_manifest_is_a_roster_of_distinct_tasks() -> None:
     assert all(task_id.rsplit("_", 1)[-1] in {"1", "2", "3"} for task_id in served)
 
 
-@pytest.mark.parametrize("position", [0, 1, 100, 200, 317])
-def test_a_task_in_the_manifest_really_has_an_admissible_backlog(position: int) -> None:
-    # The manifest is the roster and the generator is what admitted it; a task that is listed and
-    # has no backlog is the two disagreeing, which would stop a run three tasks in.
-    task_id = adapter.task_ids()[position]
-    built = ledger.build_backlog(zlib.crc32(task_id.encode()), REFERENCE)
+def test_the_committed_dates_are_one_per_served_task_and_no_others() -> None:
+    """The table and the manifest are one roster, or the tests below are testing another one.
+
+    Cheap, unconditional, and the thing that makes a committed table safe to reason from offline:
+    an entry missing here is a task no roster test could have covered, and an entry that is here
+    and not in the manifest is a task no run serves."""
+    assert tuple(_dates()) == adapter.task_ids()
+
+
+def _admissible(task_id: str) -> None:
+    """Assert one task clears the gate that put it in the manifest, at its own date.
+
+    The manifest is the roster and the generator is what admitted it; a task that is listed and
+    has no backlog is the two disagreeing, which would stop a run at whatever position it sits
+    at. Admission is two claims: a backlog exists, and no axis of it is carried by a single
+    request."""
+    built = ledger.build_backlog(*_production_inputs(task_id))
     assert built is not None, task_id
     distinct, flips = built.audit()
-    assert distinct
-    assert min(flips[axis] for axis in ("anchor", "basis", "boundary")) >= 2
+    assert distinct, task_id
+    assert min(flips[axis] for axis in ("anchor", "basis", "boundary")) >= 2, task_id
+
+
+@pytest.mark.parametrize("task_id", _off_reference())
+def test_a_task_that_does_not_carry_the_reference_date_is_still_admissible(task_id: str) -> None:
+    """Every served task whose date is its own, all 31 of them, and not a sample of them.
+
+    These are the tasks the old acceptance test could not have been checking. It sampled five
+    positions and built each one's backlog at the single reference date, which is the date 287 of
+    the 318 happen to carry: for the other 31 it asserted a property of a backlog no episode is
+    served, and said nothing about the one that is. The whole subpopulation is covered here
+    because it is small; the whole roster is covered by the test below, which is minutes."""
+    _admissible(task_id)
+
+
+@pytest.mark.skipif(
+    os.environ.get("SHOGYM_CHECK_ROSTER") != "1",
+    reason="four minutes of computation; set SHOGYM_CHECK_ROSTER=1 to run all 318",
+)
+def test_every_task_in_the_manifest_has_an_admissible_backlog_at_its_own_date() -> None:
+    """All 318, at production's inputs, with nothing sampled.
+
+    Opt-in for the same reason the frozen table's full check is (see
+    ``tests/envs/test_appworld_table.py``): a backlog takes about three quarters of a second to
+    draw, so this is four minutes of computation whose result only moves when the manifest, the
+    seed rule, the generator's constants or the pinned corpus's dates move. That is when to run
+    it:
+
+        SHOGYM_CHECK_ROSTER=1 pytest tests/envs/test_appworld_ledger.py
+
+    The default run covers the five sampled positions and the whole off-reference subpopulation,
+    which is every task whose inputs the cheap test could get wrong. Last run green over all
+    318."""
+    for task_id in adapter.task_ids():
+        _admissible(task_id)
+
+
+@pytest.mark.parametrize("position", [0, 1, 100, 200, 317])
+def test_a_task_in_the_manifest_really_has_an_admissible_backlog(position: int) -> None:
+    _admissible(adapter.task_ids()[position])
 
 
 def test_the_frozen_pass_count_table_covers_the_dated_requests() -> None:
