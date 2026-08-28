@@ -1085,35 +1085,6 @@ def test_an_env_that_publishes_the_same_name_for_something_else_is_not_read(
         _ENV_REGISTRY.pop("a-quiet-env", None)
         _ENV_REGISTRY.pop("a-speaking-env", None)
 
-def test_a_snapshot_missing_a_log_is_not_a_world_to_grade(tmp_path: Path) -> None:
-    """Half a save is stable, and stable is what made it dangerous.
-
-    Upstream's saver clears its destination and writes the app logs one after another, so a world
-    stopped in the middle of one leaves a tree that never changes again and is missing a file. The
-    reply that said the block finished cannot be trusted, so completeness is checked rather than
-    believed: every log the task's own inputs have, and none of them cut off mid-write."""
-    served = tmp_path / "served" / "dbs"
-    served.mkdir(parents=True)
-    for name in ("todoist.jsonl", "gmail.jsonl"):
-        (served / name).write_text('{"row": 1}\n')
-    snapshot = tmp_path / "snap"
-    dbs = snapshot / "tasks" / "abc_1" / "dbs"
-    dbs.mkdir(parents=True)
-    (dbs / "todoist.jsonl").write_text('{"row": 1}\n')
-    (dbs / "gmail.jsonl").write_text('{"row": 1}\n')
-    # A whole save passes, so the refusals below are about the damage.
-    adapter.verify_snapshot(snapshot, task_id="abc_1", expected=served)
-
-    (dbs / "gmail.jsonl").unlink()
-    with pytest.raises(adapter.SnapshotError, match="missing gmail.jsonl"):
-        adapter.verify_snapshot(snapshot, task_id="abc_1", expected=served)
-
-    # And a log the save was cut off in the middle of writing.
-    (dbs / "gmail.jsonl").write_text('{"row": 1}\n{"row": 2, "cut')
-    with pytest.raises(adapter.SnapshotError, match="mid-line"):
-        adapter.verify_snapshot(snapshot, task_id="abc_1", expected=served)
-
-
 def test_a_worker_with_a_call_in_flight_does_not_settle(monkeypatch: pytest.MonkeyPatch) -> None:
     """What finalization asks before it stops a container.
 
@@ -1176,36 +1147,188 @@ def test_a_spawn_that_never_becomes_ready_releases_everything(
     assert process.stdout is None or process.stdout.closed
 
 
-def test_the_sweep_keeps_a_tree_whose_owner_is_still_running(tmp_path: Path) -> None:
-    """Age is not evidence that anybody left.
+def test_a_snapshot_that_is_a_whole_prefix_is_not_a_whole_save(tmp_path: Path) -> None:
+    """A newline is not the end of a save, and that was the hole.
 
-    This removed any per-episode tree untouched for an hour, and an episode can legitimately run
-    longer: sixty blocks at five minutes each is the default budget, a view's root is static from
-    the moment it is built, and a database written three levels down does not touch the root above
-    it. A sibling arm constructing an env would then have deleted a live episode's mounted tree.
-    What is asked now is whether the process that wrote the owner file is still there."""
-    import os
-    import time
+    Upstream clears the database directory and writes the logs one after another, one JSON record
+    per line, so an interruption between two complete records leaves every expected filename in
+    place and a syntactically perfect tail with a suffix of state simply missing. Nothing about
+    the bytes says a record should have followed. What says so is a length written after the save
+    returned, and the block the host asked for: a save that never finished leaves the manifest of
+    the block before it."""
+    served = tmp_path / "served" / "dbs"
+    served.mkdir(parents=True)
+    for name in ("todoist.jsonl", "gmail.jsonl"):
+        (served / name).write_text('{"row": 1}\n')
+    snapshot = tmp_path / "snap"
+    task = snapshot / "tasks" / "abc_1"
+    dbs = task / "dbs"
+    dbs.mkdir(parents=True)
+    whole = '{"row": 1}\n{"row": 2}\n'
+    (dbs / "todoist.jsonl").write_text(whole)
+    (dbs / "gmail.jsonl").write_text(whole)
 
+    def _record(block: int) -> None:
+        (task / "save.manifest").write_text(
+            json.dumps(
+                {
+                    "block": block,
+                    "files": {p.name: p.stat().st_size for p in sorted(dbs.iterdir())
+                              if p.suffix == ".jsonl"},
+                }
+            )
+        )
+
+    _record(3)
+    # A whole save passes, so the refusals below are about the damage.
+    adapter.verify_snapshot(snapshot, task_id="abc_1", expected=served, blocks=3)
+
+    # Cut between two complete records: every name present, the tail a perfect JSON object, and a
+    # record missing after it.
+    (dbs / "gmail.jsonl").write_text('{"row": 1}\n')
+    with pytest.raises(adapter.SnapshotError, match="bytes where the save"):
+        adapter.verify_snapshot(snapshot, task_id="abc_1", expected=served, blocks=3)
+
+    # And an empty file where the save had written records, which the earlier check permitted.
+    (dbs / "gmail.jsonl").write_text("")
+    with pytest.raises(adapter.SnapshotError, match="bytes where the save"):
+        adapter.verify_snapshot(snapshot, task_id="abc_1", expected=served, blocks=3)
+
+    # A save that never finished leaves the record of the block before it.
+    (dbs / "gmail.jsonl").write_text(whole)
+    _record(2)
+    with pytest.raises(adapter.SnapshotError, match="did not finish"):
+        adapter.verify_snapshot(snapshot, task_id="abc_1", expected=served, blocks=3)
+
+    # And a snapshot with no record of its save at all.
+    (task / "save.manifest").unlink()
+    with pytest.raises(adapter.SnapshotError, match="no record of the save"):
+        adapter.verify_snapshot(snapshot, task_id="abc_1", expected=served, blocks=3)
+
+
+def test_verification_reads_in_chunks_and_stops_when_it_is_abandoned(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """A permitted tree may be most of a gibibyte, and this runs in the serving process.
+
+    Reading one of its files whole would put that allocation where the container's memory limit
+    does not reach, after a copy that was careful not to. And the copy takes an abandon flag while
+    the check that follows it took none, so a cancelled finalization left this walking."""
+    import threading
+
+    served = tmp_path / "served" / "dbs"
+    served.mkdir(parents=True)
+    (served / "todoist.jsonl").write_text('{"row": 1}\n')
+    snapshot = tmp_path / "snap"
+    task = snapshot / "tasks" / "abc_1"
+    dbs = task / "dbs"
+    dbs.mkdir(parents=True)
+    body = "".join('{"row": %d}\n' % n for n in range(20_000))
+    (dbs / "todoist.jsonl").write_text(body)
+    (task / "save.manifest").write_text(
+        json.dumps({"block": 1, "files": {"todoist.jsonl": len(body)}})
+    )
+    # Nothing is read whole: the buffer is a chunk, whatever the file is.
+    monkeypatch.setattr(adapter, "_VERIFY_CHUNK", 4096)
+    adapter.verify_snapshot(snapshot, task_id="abc_1", expected=served, blocks=1)
+
+    abandoned = threading.Event()
+    abandoned.set()
+    with pytest.raises(adapter.SnapshotError, match="abandoned"):
+        adapter.verify_snapshot(
+            snapshot, task_id="abc_1", expected=served, blocks=1, stop=abandoned
+        )
+
+    # A name the save did not record is not opened at all, so a file an episode planted cannot
+    # cost the host a read.
+    (dbs / "planted.jsonl").write_text("not json at all")
+    adapter.verify_snapshot(snapshot, task_id="abc_1", expected=served, blocks=1)
+
+
+def test_a_frame_of_the_wrong_shape_is_fatal(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Valid JSON is not a valid answer, and the difference used to escape the boundary.
+
+    A scalar or a list reached the caller, which did `.get` on it; an object without `output`
+    reached the caller, which indexed it. Both came out as an `AttributeError` or a `KeyError`
+    from the transport, with the worker neither poisoned nor stopped. The writer is reachable from
+    inside the interpreter that runs agent code, so the shape of an answer is part of framing."""
+    for shape in ('"a string"', "[1, 2, 3]", '{"id": 1, "something": "else"}'):
+        body = shape.encode()
+        emit = (
+            "body = {body!r}\n"
+            "    w.write(str(len(body)).encode() + b'\\n')\n"
+            "    w.write(body)\n"
+            "    w.flush()"
+        ).format(body=body)
+        stub = _ECHO.replace(
+            'send({"id": request["id"], "output": {"saw": request["command"]}})', emit
+        )
+        stopped: List[str] = []
+        worker = _stub_worker(stub, monkeypatch)
+        monkeypatch.setattr(container, "remove", lambda name, confirm=False: stopped.append(name))
+        try:
+            with pytest.raises(adapter.WorkerError) as refused:
+                worker.call("execute")
+            assert "protocol was broken" in str(refused.value), shape
+            assert worker.poisoned
+            assert stopped == [worker.container]
+        finally:
+            monkeypatch.undo()
+
+
+def test_ownership_lives_beside_the_tree_and_not_inside_it(tmp_path: Path) -> None:
+    """Cleanup authority was kept in the tree it governs, which the episode can write.
+
+    The output root is bound into the container at `/outputs` writable, so a marker in there is a
+    fact its own subject could rewrite: a forged one would have made a sibling constructor remove
+    a live tree, and an unreadable one would have kept a dead tree for ever. The control plane is
+    a directory of its own that no mount set names."""
     from shogym.envs.appworld import env_v1
 
     home = tmp_path / "episodes"
-    live, dead, unmarked = home / "live", home / "dead", home / "unmarked"
-    for root in (live, dead, unmarked):
-        root.mkdir(parents=True)
-        (root / "something").write_text("state")
-    env_v1._claim_tree(live)
-    (dead / env_v1._OWNER_FILE).write_text("999999 1700000000\n")
-    # Older than any age threshold anybody would pick.
-    ancient = time.time() - 86_400
-    for root in (live, dead, unmarked):
-        os.utime(root, (ancient, ancient))
+    root = home / "episode-abc"
+    root.mkdir(parents=True)
+    monkey = adapter.control_file(root, "owner")
+    # Nothing of the control plane is under the tree it is about.
+    assert not str(monkey).startswith(str(home))
+    env_v1._claim_tree(root)
+    assert monkey.exists()
+    assert not list(root.iterdir())
 
+    # A forged marker inside the tree changes nothing: it is not where anybody looks.
+    (root / ".shogym-owner").write_text("1 forged\n")
+    assert env_v1._reclaimable(root) is False
+    monkey.write_text("999999 1700000000\n")
+    assert env_v1._reclaimable(root) is True
+
+
+def test_a_tree_teardown_declined_to_walk_is_reclaimed_while_the_server_lives(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """The path that exists to reclaim what teardown could not delete could not reclaim it.
+
+    Teardown leaves an oversized tree rather than walking it inside somebody else's deadline. The
+    tree still named the process that made it, which is the serving one and is alive, so the sweep
+    kept it until that process exited. An episode that ended says so, and after a short grace the
+    tree is reclaimable however alive the server is."""
+    from shogym.envs.appworld import env_v1
+
+    home = tmp_path / "episodes"
+    root = home / "episode-big"
+    root.mkdir(parents=True)
+    (root / "state").write_text("x")
+    env_v1._claim_tree(root)
+    # This process is alive, so nothing takes it while the episode is running.
+    assert env_v1._reclaimable(root) is False
+
+    monkeypatch.setattr(env_v1, "_DISCARD_MAX_NODES", 0)
+    env_v1._discard(root)
+    # Declined, and said to be over.
+    assert root.exists()
+    assert env_v1._reclaimable(root) is False  # inside the grace
+    monkeypatch.setattr(env_v1, "_ENDED_GRACE_SECONDS", -1.0)
+    assert env_v1._reclaimable(root) is True
     env_v1._sweep_leftovers(home)
-    # The live one is this process, which is alive, so it stays however old it looks.
-    assert live.exists()
-    # The dead one names a process that is gone.
-    assert not dead.exists()
-    # And a tree with no owner predates this and is left alone rather than guessed about.
-    assert unmarked.exists()
-
+    assert not root.exists()
+    # And its control-plane records go with it.
+    assert not adapter.control_file(root, "ended").exists()

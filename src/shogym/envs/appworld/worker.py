@@ -70,6 +70,12 @@ from typing import Any, BinaryIO, Dict, List, Optional, Tuple
 #: than inside them, because upstream's saver clears that directory on every save.
 RNG_DIGEST_FILE = "rng.digest"
 
+#: What the world says about the save that has just finished: which block it was, and how long
+#: every database log is. Written after upstream's own save returns, so a save that was
+#: interrupted leaves the manifest of the block before it and the host sees a block number that
+#: is not the one it sent.
+SAVE_MANIFEST_FILE = "save.manifest"
+
 class Episode:
     """The one world this process serves, and the randomness it was handed."""
 
@@ -99,6 +105,8 @@ class Episode:
         )
         task = self.world.task
         self._record_rng()
+        # The opening state is a save too: an episode that runs no block is graded on it.
+        self._record_save(0)
         return {
             "instruction": task.instruction,
             "supervisor": dict(task.supervisor),
@@ -120,7 +128,38 @@ class Episode:
         but a diagnostic read out of a reply is a diagnostic the episode can choose."""
         output = self.world.execute(str(body["code"]))
         self._record_rng()
+        self._record_save(int(body.get("block") or 0))
         return {"output": output}
+
+    def _record_save(self, block: int) -> None:
+        """Write what the save that just finished produced, after it finished.
+
+        Upstream clears the database directory and writes the logs one after another, so an
+        interruption leaves every expected filename and a suffix of state missing: the tail of the
+        last file it reached is a complete record, and nothing about the bytes says a record is
+        missing after it. What does say so is a length written once the save returned, together
+        with the block the host asked for. A save that never finished leaves the block before it,
+        and the host compares against the block it sent.
+
+        Written by this process, which runs agent-authored code, so it is evidence about an
+        interruption rather than about an adversary: an episode that rewrites it is rewriting a
+        claim about its own tree, which it could already write."""
+        try:
+            dbs = self.world.output_db_home_path_on_disk
+            manifest = {
+                "block": block,
+                "files": {
+                    name: os.path.getsize(os.path.join(dbs, name))
+                    for name in sorted(os.listdir(dbs))
+                    if name.endswith(".jsonl")
+                },
+            }
+            with open(os.path.join(os.path.dirname(dbs), SAVE_MANIFEST_FILE), "w") as handle:
+                handle.write(json.dumps(manifest))
+        except Exception:
+            # A manifest that could not be written is a manifest the host will not find, which
+            # refuses the episode rather than passing it.
+            pass
 
     def _record_rng(self) -> None:
         """Write the generator's state digest beside this episode's databases.
