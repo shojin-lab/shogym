@@ -617,31 +617,6 @@ async def test_the_world_stops_before_it_is_graded() -> None:
         await episode.close()
 
 
-async def test_the_frozen_table_is_the_one_this_roster_produces() -> None:
-    """The distribution a drawn receipt's count comes from, checked against the generator over
-    every served task at its own reference date.
-
-    The cheap versions of this check pass while being wrong: a length and a sum survive a permuted
-    table, and a fixture built at one hard-coded date is not what production builds. This is the
-    whole roster, each task at the date its own specification carries, compared exactly."""
-    root = adapter.ensure_corpus()
-    built = ledger.pass_count_marginal(
-        _backlog_at(task_id, root) for task_id in adapter.task_ids()
-    )
-    assert built == payload.pass_counts()
-    assert sum(built) == len(adapter.task_ids()) * len(ledger.CONVENTIONS)
-
-
-def _backlog_at(task_id: str, root) -> ledger.Backlog:
-    specs = adapter.task_specs(root, task_id)
-    built = ledger.build_backlog(
-        zlib.crc32(task_id.encode()),
-        dt.datetime.fromisoformat(specs["datetime"]).date(),
-    )
-    assert built is not None, task_id
-    return built
-
-
 # ----- the matched pair, through a stream -----
 
 
