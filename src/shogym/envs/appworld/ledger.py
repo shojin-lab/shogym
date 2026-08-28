@@ -200,6 +200,16 @@ class Backlog:
         return least
 
 
+def _cover_gains(pool: np.ndarray, cover: np.ndarray, scale: int) -> np.ndarray:
+    """Each candidate's gain against the cover so far, in exact integers.
+
+    Named and separated from the loop that uses it so a test can assert what makes it
+    architecture independent, which is a property of the dtypes on this path rather than of the
+    machine the test runs on. One machine can therefore check a claim about every machine: if
+    nothing here is a float, no BLAS kernel's summation order can reach the result."""
+    return pool @ (3 * scale // (1 + cover))
+
+
 def _admissible(backlog: Backlog) -> bool:
     """Whether a built backlog clears both gates (see :meth:`Backlog.audit`)."""
     distinct, flips = backlog.audit()
@@ -383,7 +393,7 @@ def _draw(
     for _ in range(min(designed, dated)):
         if not len(order) or taken.all():
             break
-        gains = pool @ (3 * scale // (1 + cover))
+        gains = _cover_gains(pool, cover, scale)
         # Gains are non-negative, so -1 is below every real candidate. `argmax` takes the first
         # maximum, which is the rule this had before and is well defined on exact integers.
         gains[taken] = -1

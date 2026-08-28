@@ -11,6 +11,7 @@ from __future__ import annotations
 import datetime as dt
 import zlib
 
+import numpy as np
 import pytest
 
 from shogym.envs.appworld import adapter, ledger, world
@@ -259,3 +260,38 @@ def test_the_table_is_the_one_this_generator_produces(backlog: ledger.Backlog) -
     assert sum(marginal) == len(ledger.CONVENTIONS)
     # The reference convention agrees with itself on every dated request.
     assert marginal[-1] >= 1
+
+
+def test_the_draw_cannot_depend_on_the_machine_that_runs_it(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The docstring promises a backlog is the same on any machine. This is what makes that true.
+
+    It was once false, and not subtly: the greedy cover scored candidates with a float64 dot
+    product, BLAS sums in whatever order its kernel picks, and one served task's backlog existed
+    on arm64 and did not exist on x86_64. The seeded ledger an episode is graded against was a
+    property of the CPU.
+
+    Checked by construction rather than by running anywhere else, because two machines is not a
+    thing a test suite has. If every array on the scoring path is an integer array, no kernel's
+    summation order can reach the result: integer addition is associative and exact. So this runs
+    a real draw and asserts the dtypes of what actually flowed through it."""
+    seen: list[tuple] = []
+    original = ledger._cover_gains
+
+    def recording(pool, cover, scale):
+        result = original(pool, cover, scale)
+        seen.append((pool.dtype, cover.dtype, result.dtype, type(scale)))
+        return result
+
+    monkeypatch.setattr(ledger, "_cover_gains", recording)
+    built = ledger.build_backlog(zlib.crc32(b"machine-independence"), dt.date(2023, 5, 18))
+    assert built is not None
+
+    assert seen, "the scoring path never ran, so this asserted nothing"
+    for pool_dtype, cover_dtype, gains_dtype, scale_type in seen:
+        for dtype in (pool_dtype, cover_dtype, gains_dtype):
+            assert np.issubdtype(dtype, np.integer), f"{dtype} on the scoring path is not integral"
+        # The common denominator is a Python int, so `3 * scale // (1 + cover)` stays integral
+        # rather than being promoted to float by a stray numpy float scalar.
+        assert scale_type is int
