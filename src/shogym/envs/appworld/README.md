@@ -459,7 +459,9 @@ home. None of them is a file the world may not open. None of them is a path.
 transport bought: the worker used to answer on a loopback port, and a container-loopback listener
 cannot be forwarded, a published port is not loopback-only, and `--network none` and `-p` are
 mutually exclusive. It speaks length-prefixed JSON frames on the pipe pair its parent made
-instead, so there is no port to find and no token to need: a pipe has one writer. Descriptors 0
+instead, so there is no port to find and no token to need: a pipe has one writer. A frame that is
+not an object carrying an answer is a framing failure like any other, fatal to that worker: valid
+JSON of the wrong shape used to reach the caller and come back out as an attribute error. Descriptors 0
 and 1 are duplicated and then pointed at `/dev/null` and standard error, so a library that prints
 on import cannot corrupt a frame and agent code reading `sys.stdin` cannot eat a command.
 
@@ -540,6 +542,22 @@ progress. What the host does about it is not believe it: the snapshot is checked
 of database logs, none of them cut off mid-write, and an episode whose tree is half a save is
 refused. Two things follow: a forged reply earns no block, because the budget is spent when a
 request goes out, and moves no grade, because what is graded is the tree and the tree is checked.
+
+**What this port says about an episode is kept beside the episode's tree, never inside it.** The
+output tree is mounted writable, so an owner marker in there is cleanup authority its own subject
+could rewrite, and a completion record in there is a claim about a save made by the thing that was
+saving. Both live in a control directory no mount set names.
+
+**A save is checked against a record written after it finished.** Upstream clears the database
+directory and writes the logs one after another, one record per line, so an interruption leaves
+every expected filename and a perfect tail with a suffix of state missing: no property of the
+bytes tells the two apart. What tells them apart is a length recorded once the save returned,
+beside the number of the block the host asked for, and the host compares that number against the
+one it sent. A save that never finished leaves the record of the block before it. That record is
+written inside the interpreter that runs agent code, so it establishes completeness against an
+interruption rather than against an adversary; against an adversary the guarantee is the one that
+was always there, which is that an episode already controls its own tree and nothing it writes
+there improves its grade.
 
 **A per-episode tree is removed when its owner is gone, never because it is old.** Every one
 carries the pid and the birth stamp of the process that made it, and a sweep asks whether that

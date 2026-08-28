@@ -446,6 +446,28 @@ def corpus_digest(root: Path) -> str:
     return digest.hexdigest()[:16]
 
 
+def control_home() -> Path:
+    """Where this port keeps what it says about episodes, as opposed to what an episode wrote.
+
+    **Nothing here is ever mounted.** An episode's output tree is bound into its container
+    writable, so anything kept inside it is a fact the subject of that fact can rewrite: an owner
+    marker in there is cleanup authority an episode can forge, and a completion record in there is
+    a claim about a save made by the thing that was saving. So the control plane is a directory of
+    its own, beside the trees rather than inside them, and every mount set in this module is built
+    from an explicit list that does not include it."""
+    return cache_root() / f"control-{DATA_VERSION}"
+
+
+def control_file(root: Path, kind: str) -> Path:
+    """The control-plane file of ``kind`` for the per-episode tree at ``root``.
+
+    Named for the tree's own directory and the home it sits in, so two homes cannot collide and a
+    reader with the tree in hand can find the file without a lookup table."""
+    home = control_home()
+    home.mkdir(parents=True, exist_ok=True)
+    return home / f"{root.parent.name}--{root.name}.{kind}"
+
+
 def episodes_home() -> Path:
     """Where per-episode output trees live: this port's ordinary cache, not the private one."""
     return cache_root() / f"episodes-{DATA_VERSION}"
@@ -782,9 +804,25 @@ class _Frames:
         body = bytes(self.buffer[:length])
         del self.buffer[:length]
         try:
-            return json.loads(body)
+            answer = json.loads(body)
         except ValueError as exc:
             raise FramingError(f"the appworld worker sent a frame that is not JSON: {exc}") from exc
+        # **Shape is part of framing.** Valid JSON of the wrong kind used to travel straight into
+        # the caller, which then did `.get` on a list or indexed `output` on an object that had
+        # none: an `AttributeError` or a `KeyError` out of the transport, with the worker neither
+        # poisoned nor stopped and the spawn path skipping its own release. The writer is reachable
+        # from inside the interpreter that runs agent code, so an answer that is not an answer is
+        # exactly the thing this boundary is for.
+        if not isinstance(answer, dict):
+            raise FramingError(
+                f"the appworld worker sent a {type(answer).__name__} where a frame belongs"
+            )
+        if not ({"output", "error", "ready"} & set(answer)):
+            raise FramingError(
+                f"the appworld worker sent a frame carrying none of output, error or ready: "
+                f"{sorted(answer)[:8]}"
+            )
+        return answer
 
 #: What every worker's scratch directory is named for, so a directory this port left behind on a
 #: host is one an operator can recognise.
@@ -1201,6 +1239,10 @@ class SnapshotError(RuntimeError):
     be resolving a path the agent chose inside a namespace that also holds the answers."""
 
 
+#: The name the world writes its save record under, mirrored from the worker so this module can
+#: read it without importing a file that only exists inside the image.
+_SAVE_MANIFEST = "save.manifest"
+
 _SNAPSHOT_MAX_NODES = 20_000
 _SNAPSHOT_MAX_BYTES = 1 << 30
 _SNAPSHOT_MAX_DEPTH = 24
@@ -1335,59 +1377,123 @@ def snapshot_outputs(
     return into
 
 
-def verify_snapshot(snapshot: Path, *, task_id: str, expected: Path) -> None:
-    """Refuse a snapshot that is not a whole save, whatever stopped the world.
+#: How much of one database log verification will read before it refuses. Streaming, so this is a
+#: buffer rather than a file size: the tree may approach a gibibyte, and reading one of its files
+#: whole would put that allocation in the serving process, where the container's memory limit
+#: does not reach.
+_VERIFY_CHUNK = 1 << 20
 
-    **The reply that says a block finished cannot be trusted, so completeness is checked rather
-    than believed.** The protocol's writer stays open in the interpreter that runs agent-authored
-    code, and upstream disables its own guard before the save that ends every block, so a frame
-    can reach the parent while the real save is still running. What the host can do about that is
-    not to believe the frame: it looks at what is on the stopped tree and refuses anything that is
-    not a complete set of database logs.
+#: The longest single record verification will accept. A log is one JSON object per line, so a
+#: line longer than this is not a record this port wrote.
+_VERIFY_MAX_RECORD = 8 << 20
 
-    Upstream's saver clears its destination and writes the logs one after another, so an
-    interrupted save shows up in two ways this can see: a log the task's own inputs have and the
-    output does not, and a log whose last line was cut off mid-write. Both refuse the episode.
 
-    This is a completeness check, not an authentication: a world that ran to the end of its last
-    block and then had a thread write more is a world whose tree is complete and whose extra
-    writes are its own. What it rules out is grading half of a save."""
+def verify_snapshot(
+    snapshot: Path,
+    *,
+    task_id: str,
+    expected: Path,
+    blocks: int,
+    stop: "Optional[threading.Event]" = None,
+) -> None:
+    """Refuse a snapshot that is not the whole of the save the host asked for.
+
+    **A newline is not the end of a save.** Upstream clears the database directory and writes the
+    logs one after another, one JSON record per line, so an interruption leaves every expected
+    filename in place and a syntactically perfect tail with a suffix of state simply missing. No
+    property of the bytes distinguishes that from a finished save, which is why this compares them
+    against something written *after* the save returned: the world records the block it was
+    serving and the length of every log it produced, and the host compares the block against the
+    one it sent. A save that never finished leaves the manifest of the block before it.
+
+    That manifest comes from the process that runs agent-authored code, so what it establishes is
+    completeness against an *interruption* rather than against an adversary. Against an adversary
+    the guarantee is the one that was always there: the tree is what is graded, an episode already
+    controls its own tree, and nothing it can write there improves its grade.
+
+    **Bounded and cancellable, like the copy before it.** A permitted tree may approach a
+    gibibyte, so nothing here reads a file whole: each log is streamed in chunks with a byte
+    budget and a record cap, the deadline and the abandon flag are checked between chunks, and a
+    name the manifest does not list is not opened at all."""
+    began = time.monotonic()
     dbs = snapshot / "tasks" / task_id / "dbs"
     if not dbs.is_dir():
         raise SnapshotError(
             f"the episode's snapshot has no databases at tasks/{task_id}/dbs, so what it "
             "persisted is not a world to grade"
         )
+    recorded = dbs.parent / _SAVE_MANIFEST
+    try:
+        manifest = json.loads(recorded.read_text(errors="replace")[:_VERIFY_CHUNK])
+    except (OSError, ValueError) as exc:
+        raise SnapshotError(
+            f"the episode's snapshot carries no record of the save that made it ({exc}); a save "
+            "that finished writes one, so this did not finish"
+        ) from exc
+    if not isinstance(manifest, dict) or not isinstance(manifest.get("files"), dict):
+        raise SnapshotError("the episode's snapshot carries a save record of the wrong shape")
+    if int(manifest.get("block", -1)) != int(blocks):
+        raise SnapshotError(
+            f"the episode's snapshot records the save after block {manifest.get('block')!r} while "
+            f"the host ran {blocks}; the save for the last block did not finish"
+        )
     wanted = {path.name for path in expected.iterdir() if path.suffix == ".jsonl"}
-    found = {path.name for path in dbs.iterdir() if path.suffix == ".jsonl"}
-    missing = sorted(wanted - found)
+    listed = {str(name): int(size) for name, size in manifest["files"].items()}
+    missing = sorted(wanted - set(listed))
     if missing:
         raise SnapshotError(
             f"the episode's snapshot is missing {', '.join(missing)}; upstream's saver clears its "
             "destination and writes the logs in sequence, so this is half of a save"
         )
-    for path in sorted(dbs.iterdir()):
-        if path.suffix != ".jsonl":
-            continue
-        try:
-            body = path.read_bytes()
-        except OSError as exc:
-            raise SnapshotError(f"the episode's snapshot cannot read {path.name}: {exc}") from exc
-        if not body:
-            continue
-        if not body.endswith(b"\n"):
+    for name, size in sorted(listed.items()):
+        if stop is not None and stop.is_set():
+            raise SnapshotError("the snapshot check was abandoned before it finished")
+        if time.monotonic() - began > _SNAPSHOT_SECONDS:
             raise SnapshotError(
-                f"the episode's snapshot has {path.name} ending mid-line, so the save that was "
-                "writing it did not finish"
+                f"checking the episode's snapshot took longer than {_SNAPSHOT_SECONDS:.0f}s"
             )
-        last = body.rsplit(b"\n", 2)[-2] if body.count(b"\n") > 1 else body.strip()
+        path = dbs / name
         try:
-            json.loads(last)
-        except ValueError as exc:
+            actual = path.stat().st_size
+        except OSError as exc:
+            raise SnapshotError(f"the episode's snapshot is missing {name}: {exc}") from exc
+        if actual != size:
             raise SnapshotError(
-                f"the episode's snapshot has {path.name} ending in a line that is not a record "
-                f"({exc}), so the save that was writing it did not finish"
-            ) from exc
+                f"the episode's snapshot has {name} at {actual} bytes where the save that "
+                f"produced it recorded {size}; the save did not finish"
+            )
+        _verify_records(path, began=began, stop=stop)
+
+
+def _verify_records(path: Path, *, began: float, stop: "Optional[threading.Event]") -> None:
+    """Read one log in chunks and refuse one that does not end on a whole record.
+
+    Streaming rather than whole: a permitted file may be most of a gibibyte and reading it into
+    the serving process is an allocation the container's memory limit does not cover. What is kept
+    is the tail of the current line and nothing else."""
+    tail = b""
+    with open(path, "rb") as handle:
+        while True:
+            if stop is not None and stop.is_set():
+                raise SnapshotError("the snapshot check was abandoned before it finished")
+            if time.monotonic() - began > _SNAPSHOT_SECONDS:
+                raise SnapshotError(
+                    f"checking the episode's snapshot took longer than {_SNAPSHOT_SECONDS:.0f}s"
+                )
+            chunk = handle.read(_VERIFY_CHUNK)
+            if not chunk:
+                break
+            tail = (tail + chunk).rsplit(b"\n", 1)[-1]
+            if len(tail) > _VERIFY_MAX_RECORD:
+                raise SnapshotError(
+                    f"the episode's snapshot has a record in {path.name} longer than "
+                    f"{_VERIFY_MAX_RECORD} bytes, which is not a record this port wrote"
+                )
+    if tail.strip():
+        raise SnapshotError(
+            f"the episode's snapshot has {path.name} ending mid-line, so the save that was "
+            "writing it did not finish"
+        )
 
 
 def grade(
@@ -1450,6 +1556,8 @@ __all__ = [
     "WORKER",
     "cache_root",
     "DERIVATION_VERSION",
+    "control_file",
+    "control_home",
     "corpus_digest",
     "runtime_digest",
     "derived_root",

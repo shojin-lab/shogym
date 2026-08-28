@@ -41,6 +41,7 @@ import datetime as dt
 import hashlib
 import os
 import threading
+import time
 import zlib
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, Dict, Optional
@@ -538,12 +539,19 @@ class AppWorldEnv(Env):
         # A whole save, or no grade. The reply that said a block finished is not evidence, so
         # what is on the stopped tree is checked instead: every log the task's own inputs have,
         # and none of them cut off mid-write.
-        await asyncio.to_thread(
-            adapter.verify_snapshot,
-            snapshot,
-            task_id=session.task_id,
-            expected=self._derived / "tasks" / session.task_id / "dbs",
-        )
+        try:
+            await asyncio.to_thread(
+                adapter.verify_snapshot,
+                snapshot,
+                task_id=session.task_id,
+                expected=self._derived / "tasks" / session.task_id / "dbs",
+                # What the host sent, which is the half of this the world cannot write.
+                blocks=session.calls,
+                stop=abandon,
+            )
+        except BaseException:
+            abandon.set()
+            raise
         graded = await asyncio.to_thread(
             adapter.grade,
             graded=self._graded.parent,
@@ -715,15 +723,30 @@ def _discard(*paths: Path) -> None:
                 if nodes > _DISCARD_MAX_NODES:
                     break
             if nodes > _DISCARD_MAX_NODES:
+                # Left where it is, and *said to be over*: without that it still named the serving
+                # process, which is alive, so the sweep meant to reclaim it could not until that
+                # process exited.
+                _mark_ended(path)
                 continue
         except OSError:
             continue
         shutil.rmtree(path, ignore_errors=True)
+        _forget_tree(path)
 
 
-#: Written inside every per-episode tree, naming the process that owns it. A tree is somebody's
-#: until that process is gone, and nothing else is evidence of anything.
-_OWNER_FILE = ".shogym-owner"
+#: What the control plane records about a per-episode tree. ``owner`` names the process that made
+#: it, and ``ended`` says the episode is over and the tree is reclaimable whoever is still running.
+#:
+#: **Beside the tree, never inside it.** An episode's output tree is mounted into its container
+#: writable, so a marker kept in there is cleanup authority the episode could rewrite: a forged
+#: owner would have made a sibling constructor remove a live tree, or kept a dead one for ever.
+_OWNER_KIND = "owner"
+_ENDED_KIND = "ended"
+
+#: How long a tree marked ended is left before a sweep takes it. Short, because the episode that
+#: owned it is over; not zero, because a teardown that declined to walk a tree may still be
+#: writing the marker as another construction reads it.
+_ENDED_GRACE_SECONDS = 60.0
 
 #: How many trees one construction will remove, and how long it will spend. The sweep runs where
 #: an env is built, which a stream may do on its serving loop, so it is bounded like everything
@@ -733,37 +756,89 @@ _SWEEP_SECONDS = 5.0
 
 
 def _claim_tree(root: Path) -> None:
-    """Mark a per-episode tree as this process's, so a sweep can tell it is not abandoned."""
+    """Record, in the control plane, which process a per-episode tree belongs to."""
     from shogym.envs.appworld import container as container_module
 
     try:
         root.mkdir(parents=True, exist_ok=True)
-        (root / _OWNER_FILE).write_text(
+        adapter.control_file(root, _OWNER_KIND).write_text(
             f"{os.getpid()} {container_module.process_birth(os.getpid())}\n"
         )
     except OSError:
         pass
 
 
+def _mark_ended(root: Path) -> None:
+    """Say that the episode which owned ``root`` is over, so a sweep may take the tree.
+
+    The case is a teardown that declined to walk an oversized tree. Without this the tree still
+    named a live process, which is the serving one, so the sweep kept it until that process
+    exited: the path meant to reclaim what teardown could not delete could not reclaim it while
+    the server ran."""
+    try:
+        adapter.control_file(root, _ENDED_KIND).write_text(f"{time.time():.0f}\n")
+    except OSError:
+        pass
+
+
+def _forget_tree(root: Path) -> None:
+    """Drop a tree's control-plane records, once the tree itself is gone."""
+    for kind in (_OWNER_KIND, _ENDED_KIND):
+        try:
+            adapter.control_file(root, kind).unlink(missing_ok=True)
+        except OSError:
+            pass
+
+
+def _reclaimable(root: Path) -> bool:
+    """Whether a per-episode tree is nobody's any more.
+
+    Two ways, and neither of them is age. An episode that ended says so, and after a short grace
+    the tree is reclaimable however alive the server is; that is what a teardown which declined to
+    walk an oversized tree leaves behind. Otherwise the question is whether the process that made
+    it is still running, which is the same question and the same evidence the container sweep
+    asks: a pid and the birth stamp that says it is the same process.
+
+    A tree the control plane says nothing about predates this and is left alone rather than
+    guessed about, and every read is bounded because these files are the control plane's own and
+    are two short lines."""
+    from shogym.envs.appworld import container as container_module
+
+    ended = adapter.control_file(root, _ENDED_KIND)
+    try:
+        stamp = ended.read_text(errors="replace")[:64].strip()
+    except OSError:
+        stamp = ""
+    if stamp:
+        try:
+            return time.time() - float(stamp) > _ENDED_GRACE_SECONDS
+        except ValueError:
+            return False
+    try:
+        owner = adapter.control_file(root, _OWNER_KIND).read_text(errors="replace")[:64].split()
+    except OSError:
+        return False
+    if not owner or not owner[0].isdigit():
+        return False
+    return not container_module._process_is_alive(
+        int(owner[0]), owner[1] if len(owner) > 1 else ""
+    )
+
+
 def _sweep_leftovers(*homes: Path) -> None:
-    """Remove episode trees whose owner is gone, and never one whose owner is alive.
+    """Remove per-episode trees that are nobody's, bounded in trees and in seconds.
 
     **Age is not evidence.** This removed anything whose directory had not been touched for an
-    hour, and an episode can legitimately run longer than that: sixty blocks at five minutes each
-    is the default budget, a view's root is static from the moment it is built, and a database
-    written three levels down does not touch the root above it. A sibling arm's construction would
-    then have deleted a live episode's mounted tree. What is asked instead is whether the process
-    that wrote the owner file is still there, which is the same question, and the same evidence,
-    the container sweep asks: a pid and the birth stamp that says it is the same process.
-
-    A tree with no owner file predates this and is left alone rather than guessed about.
+    hour, and an episode can legitimately run longer: sixty blocks at five minutes each is the
+    default budget, a view's root is static from the moment it is built, and a database written
+    three levels down does not touch the root above it. A sibling arm's construction would then
+    have deleted a live episode's mounted tree.
 
     Bounded in both directions, because this runs where an env is constructed and a stream may
-    construct one on its serving loop."""
+    construct one on its serving loop. The deadline is checked before each removal *and* the
+    removals are capped, so one large tree cannot hold a construction open past the bound by more
+    than the single deletion it was already inside."""
     import shutil
-    import time
-
-    from shogym.envs.appworld import container as container_module
 
     began = time.monotonic()
     removed = 0
@@ -775,18 +850,10 @@ def _sweep_leftovers(*homes: Path) -> None:
         for entry in entries:
             if removed >= _SWEEP_MAX_TREES or time.monotonic() - began > _SWEEP_SECONDS:
                 return
-            try:
-                owner = (entry / _OWNER_FILE).read_text().split()
-            except OSError:
-                # No owner, or unreadable: not evidence that anybody left.
-                continue
-            if not owner or not owner[0].isdigit():
-                continue
-            if container_module._process_is_alive(
-                int(owner[0]), owner[1] if len(owner) > 1 else ""
-            ):
+            if not entry.is_dir() or not _reclaimable(entry):
                 continue
             shutil.rmtree(entry, ignore_errors=True)
+            _forget_tree(entry)
             removed += 1
 
 

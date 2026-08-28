@@ -100,7 +100,10 @@ def execute(code: str, _session_id: str) -> Dict[str, Any]:
     # env instance backs; the call is over one world, which is this episode's alone. Holding the
     # table's lock across a call that runs an agent's code would make two concurrent episodes take
     # turns, and one slow block would stall the other.
-    answered = session.worker.call("execute", code=str(code))
+    # The block number goes with the request. It is the host's own count, and the world records
+    # it beside the save it makes, so a save that never finished is one the host can see because
+    # the number it gets back is the block before.
+    answered = session.worker.call("execute", code=str(code), block=calls)
     return {"output": str(answered.get("output", "")), "calls": calls}
 
 
