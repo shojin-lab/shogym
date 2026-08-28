@@ -22,6 +22,7 @@ from __future__ import annotations
 
 import asyncio
 import contextvars
+import json
 import os
 import threading
 import time
@@ -39,6 +40,11 @@ from tests._fixtures.score_env import ENV_NAME, SUBMIT_TOOL, _FixtureScoreEnv
 
 TASKS = [{"id": "q0", "question": "2+2?", "answer": "4"}]
 
+#: A request-scoped value of the kind a caller sets before opening an episode: a tenant, an auth
+#: subject, a trace id. The session hooks run in a thread, and a thread that does not carry the
+#: caller's context reads the default here and begins or releases the wrong one.
+_TENANT: contextvars.ContextVar[str] = contextvars.ContextVar("tenant", default="unset")
+
 
 class _SlowSessionEnv(_FixtureScoreEnv):
     """A score env whose session hooks take a measurable amount of time and count their entries.
@@ -55,6 +61,7 @@ class _SlowSessionEnv(_FixtureScoreEnv):
         end_seconds: float = 0.0,
         begin_error: Optional[BaseException] = None,
         describe_error: Optional[BaseException] = None,
+        bind_loop: bool = False,
         tasks: Optional[List[Dict[str, Any]]] = None,
     ) -> None:
         self._begin_seconds = begin_seconds
@@ -67,6 +74,13 @@ class _SlowSessionEnv(_FixtureScoreEnv):
         self.peak_releases = 0
         self.closed = threading.Event()
         self.closed_during_release = False
+        self.close_entries = 0
+        self.peak_closes = 0
+        self.closed_on_a_foreign_loop = False
+        self.begin_context: Optional[str] = None
+        self.end_context: Optional[str] = None
+        self.owner = asyncio.get_running_loop() if bind_loop else None
+        self._inside_close = 0
         self.describe_error = describe_error
         self._inside = 0
         self._counting = threading.Lock()
@@ -79,13 +93,28 @@ class _SlowSessionEnv(_FixtureScoreEnv):
 
     async def _close(self) -> None:
         """The env-level half of cleanup, which releasing a session is not. A `close()` that runs
-        while a release is still inside `_end_session` is tearing down underneath it."""
+        while a release is still inside `_end_session` is tearing down underneath it, and a
+        second one running beside the first tears the same thing down twice."""
         with self._counting:
             if self._inside:
                 self.closed_during_release = True
-        self.closed.set()
+            self._inside_close += 1
+            self.close_entries += 1
+            self.peak_closes = max(self.peak_closes, self._inside_close)
+        try:
+            if self.owner is not None and asyncio.get_running_loop() is not self.owner:
+                self.closed_on_a_foreign_loop = True
+                raise RuntimeError("closed on a loop that does not own this env's resources")
+            # A yield, so a second close arriving while this one is in flight overlaps it rather
+            # than queueing behind it by accident.
+            await asyncio.sleep(0.05)
+        finally:
+            with self._counting:
+                self._inside_close -= 1
+            self.closed.set()
 
     def _begin_session(self, session_id: str, task: Dict[str, Any]) -> None:
+        self.begin_context = _TENANT.get()
         self.begins.append(time.perf_counter())
         time.sleep(self._begin_seconds)
         if self._begin_error is not None:
@@ -95,6 +124,7 @@ class _SlowSessionEnv(_FixtureScoreEnv):
         self.begin_returned = time.perf_counter()
 
     def _end_session(self, session_id: str) -> None:
+        self.end_context = _TENANT.get()
         with self._counting:
             self._inside += 1
             self.peak_releases = max(self.peak_releases, self._inside)
@@ -109,6 +139,20 @@ class _SlowSessionEnv(_FixtureScoreEnv):
         finally:
             with self._counting:
                 self._inside -= 1
+
+
+async def _awaited(predicate: Any, seconds: float = 5.0) -> bool:
+    """Wait for something the loop itself has to run.
+
+    A close arranged from the hook thread is scheduled back onto the loop that built the env, so
+    a caller that blocks that loop waiting for it is waiting for work it is preventing. This
+    yields instead."""
+    deadline = time.perf_counter() + seconds
+    while time.perf_counter() < deadline:
+        if predicate():
+            return True
+        await asyncio.sleep(0.005)
+    return predicate()
 
 
 def _until(predicate: Any, seconds: float = 5.0) -> bool:
@@ -205,6 +249,12 @@ def test_a_cancelled_setups_rollback_outlives_the_loop_it_was_cancelled_on() -> 
     assert _until(lambda: len(env.releases) == 1), env.releases
     assert _until(lambda: env.releases_finished == 1)
     assert env.peak_releases == 1
+    # And the env is closed too, which is the half that used to be decided by the coroutine after
+    # the wait. A coroutine parked on a loop that then closes never decides anything, so the
+    # session was released and the env left open. Both halves are queued when the rollback is
+    # made, so a loop that goes away cannot orphan the second one.
+    assert _until(env.closed.is_set), "the loop went away and took the env close with it"
+    assert env.close_entries == 1, env.close_entries
 
 
 # ----- a teardown that gave up waiting does not let close start a second release -----
@@ -239,10 +289,11 @@ async def test_a_timed_out_teardown_is_abandoned_and_never_reissued(
     # env close follows it rather than running beside it. `Env.close` states that order, and a
     # `_close` that tears down what `_end_session` is still using is the same use-after-free by
     # another route. Bounding the caller's latency is not the same as declaring cleanup done.
-    assert _until(lambda: env.releases_finished == 1)
+    assert await _awaited(lambda: env.releases_finished == 1)
     assert len(env.releases) == 1, env.releases
-    assert _until(env.closed.is_set), "the env was never closed"
+    assert await _awaited(env.closed.is_set), "the env was never closed"
     assert env.closed_during_release is False
+    assert env.close_entries == 1, env.close_entries
 
 
 async def test_an_ordinary_episode_releases_its_session_exactly_once() -> None:
@@ -368,7 +419,7 @@ async def test_an_abandoned_construction_is_closed_rather_than_left_running() ->
     building.cancel()
     with pytest.raises(asyncio.CancelledError):
         await building
-    assert _until(closed.is_set), "the env nobody took was never closed"
+    assert await _awaited(closed.is_set), "the env nobody took was never closed"
 
 
 # ----- restart recovery is a startup question, asked once -----
@@ -652,3 +703,121 @@ def _a_dead_pid() -> int:
         os._exit(0)
     os.waitpid(pid, 0)
     return pid
+
+
+async def test_a_timed_out_release_closes_a_loop_affine_env_on_its_own_loop(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # `TaskStream` promises its envs are closed on the loop that built them and on no other, and
+    # a factory is allowed to bind loop-affine resources, so a close handed to a worker thread's
+    # throwaway loop is not a safe generalisation: the env refuses it, and the refusal used to be
+    # swallowed. The deferred close is scheduled back onto the owning loop while that loop can
+    # still take work.
+    monkeypatch.setattr(episode_module, "_END_SESSION_SECONDS", 0.02)
+    env = _SlowSessionEnv(end_seconds=0.4, bind_loop=True)
+    ep = await ServedEpisode.open_env(env, task=0)
+    await ep.call(SUBMIT_TOOL, {"answer": "4"})
+    await ep.close()
+    # Serving continues, which is the condition under which the owning loop is available: the
+    # close lands on it when the release finally comes out of the hook.
+    for _ in range(80):
+        if env.closed.is_set():
+            break
+        await asyncio.sleep(0.02)
+    assert env.closed.is_set(), "the deferred close never ran"
+    assert env.closed_on_a_foreign_loop is False
+    assert env.close_entries == 1, env.close_entries
+
+
+async def test_a_second_close_joins_the_deferred_one_rather_than_starting_another(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # The first close times out and arranges the close behind the release. The second arrives
+    # after the release has finished, so a check of "has the release landed" sends it straight
+    # into `_close` while the arranged one is already inside it. One owner, and everyone else
+    # joins.
+    monkeypatch.setattr(episode_module, "_END_SESSION_SECONDS", 0.02)
+    env = _SlowSessionEnv(end_seconds=0.3)
+    ep = await ServedEpisode.open_env(env, task=0)
+    await ep.call(SUBMIT_TOOL, {"answer": "4"})
+    await ep.close()
+    await asyncio.sleep(0.35)  # the release lands; the arranged close starts
+    await ep.close()
+    await asyncio.sleep(0.2)
+    assert env.close_entries == 1, env.close_entries
+    assert env.peak_closes == 1, env.peak_closes
+    assert env.closed_during_release is False
+
+
+async def test_the_session_hooks_carry_the_callers_context() -> None:
+    # `asyncio.to_thread` copies the caller's context and a raw `submit` does not, so moving the
+    # hooks onto a dedicated thread silently took request-scoped state away from them: a hook
+    # that reads a tenant, an auth subject or a trace id read the default instead, and began or
+    # released the wrong one.
+    _TENANT.set("tenant-a")
+    env = _SlowSessionEnv()
+    ep = await ServedEpisode.open_env(env, task=0)
+    await ep.call(SUBMIT_TOOL, {"answer": "4"})
+    await ep.close()
+    assert env.begin_context == "tenant-a"
+    assert env.end_context == "tenant-a"
+
+
+@pytest.mark.parametrize(
+    "blob",
+    [
+        pytest.param("[]", id="valid json that is not an object"),
+        pytest.param("{}", id="an object with none of a record's fields"),
+        pytest.param(
+            json.dumps(
+                {
+                    "session_id": "s", "finalization_id": "f-bad", "status": "PENDING",
+                    "source": "explicit_tool", "verdict": [1, 2],
+                }
+            ),
+            id="a record shaped field that is the wrong shape",
+        ),
+    ],
+)
+def test_a_file_that_is_not_a_record_does_not_stop_an_episode_opening(
+    tmp_path: Path, blob: str
+) -> None:
+    # The store is shared with every session the machine has run and holds files this process did
+    # not write. "Not a record" is not only invalid JSON: valid JSON that is not an object raises
+    # on the mapping, an object missing the fields raises from the constructor, and a field of
+    # the wrong shape raises where it is first used, three frames away in recovery. All of it
+    # used to reach `ServedEpisode.__init__`, which caught `OSError` alone, so one such file in
+    # the machine-global store stopped every later score episode from opening.
+    directory = tmp_path / "finalizations"
+    directory.mkdir(parents=True)
+    (directory / "finalization-bad.json").write_text(blob, encoding="utf-8")
+    store = FinalizationStore(directory)
+    assert store.load_all() == []
+    assert store.recover_once() == []
+    # And unremembered, because a directory holding an entry that could not be read has not been
+    # dealt with. A readable dangling record beside it is still resolved.
+    store.write(
+        FinalizationRecord(
+            session_id="prior", finalization_id="f-crash", status="PENDING",
+            source="explicit_tool",
+        )
+    )
+    assert [r.finalization_id for r in store.recover_once()] == ["f-crash"]
+
+
+async def test_an_episode_opens_against_a_store_it_could_not_read(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # The containment, end to end: recovery may not decide whether an episode opens.
+    def unreadable(self: FinalizationStore) -> Any:
+        raise RuntimeError("this store cannot be read at all")
+
+    monkeypatch.setattr(FinalizationStore, "_load_all", unreadable)
+    ep = await ServedEpisode.open_env(
+        _FixtureScoreEnv(tasks=list(TASKS)), task=0, trace_path=tmp_path / "run.jsonl"
+    )
+    try:
+        result = await ep.call(SUBMIT_TOOL, {"answer": "4"})
+        assert result.terminated is True
+    finally:
+        await ep.close()

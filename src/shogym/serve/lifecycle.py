@@ -394,7 +394,7 @@ class FinalizationStore:
                 out.append(
                     _record_from_dict(json.loads(path.read_text(encoding="utf-8")))
                 )
-            except (ValueError, OSError):
+            except _UNREADABLE:
                 complete = False
                 continue
         return out, complete
@@ -602,7 +602,30 @@ def _fsync_dir(directory: Path) -> None:
         os.close(fd)
 
 
+#: What a decoded record may fail as. A store file is arbitrary bytes from the filesystem, not a
+#: value this process produced: it can be valid JSON that is not an object (`AttributeError` on
+#: the mapping), an object missing the fields a record is made of (`TypeError` from the
+#: constructor), or an object whose fields are the wrong shape, which raises wherever they are
+#: first used rather than where they were read. All of it means one thing to a reader, which is
+#: that this file is not a record.
+_UNREADABLE = (ValueError, TypeError, AttributeError, KeyError, IndexError, OSError)
+
+
 def _record_from_dict(data: Dict[str, Any]) -> FinalizationRecord:
+    """One record from one decoded file, refusing anything that is not the shape of a record.
+
+    Validated here rather than caught later. A `verdict` that is a list decodes without complaint
+    and raises on `.get` three frames away, in recovery, where the failure looks like a bug in
+    recovery rather than a file that was never a record; and the caller that has to survive it is
+    an episode opening against a directory shared with every session the machine has ever run."""
+    if not isinstance(data, dict):
+        raise TypeError(f"a finalization record is a JSON object, not {type(data).__name__}")
+    for name in ("verdict", "provenance"):
+        value = data.get(name)
+        if value is not None and not isinstance(value, dict):
+            raise TypeError(
+                f"a record's {name} is a JSON object or absent, not {type(value).__name__}"
+            )
     fields = {
         "session_id",
         "finalization_id",
