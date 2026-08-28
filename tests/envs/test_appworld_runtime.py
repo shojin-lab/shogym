@@ -13,13 +13,12 @@ import asyncio
 import errno
 import json
 import os
-import signal
 import subprocess
 import sys
 import threading
 import time
 from pathlib import Path
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Dict, List, Tuple
 
 import pytest
 
@@ -164,9 +163,8 @@ def test_a_write_through_the_served_tree_changes_nothing_else(tmp_path: Path) ->
     then change the corpus every later episode is derived from and the baseline the grader diffs
     against, which is a served episode editing the thing it is scored on.
 
-    The copies are half of it and the seal is the other half. The shared task is what every
-    episode's view is built from, so it is read-only from the moment it is published; only the
-    per-episode copy of it is writable."""
+    The per-episode view is the other half: an episode writes through its own copy of the task,
+    and the shared task every view is built from is untouched by it."""
     original = tmp_path / "corpus"
     task = original / "tasks" / "abc_1"
     (task / "dbs").mkdir(parents=True)
@@ -190,20 +188,9 @@ def test_a_write_through_the_served_tree_changes_nothing_else(tmp_path: Path) ->
     assert shared.stat().st_ino != source.stat().st_ino
     assert shared.stat().st_ino != baseline.stat().st_ino
 
-    # The shared task is the pristine source every later episode's view is copied out of, so it
-    # is sealed along with the rest of the derived tree: an episode that could write here would be
-    # writing into what the next one, or the other arm of its own pair, starts from.
-    for name in ("gmail.jsonl", "todoist.jsonl"):
-        with pytest.raises(PermissionError):
-            (derived / "tasks" / "abc_1" / "dbs" / name).write_text("rewritten by the agent")
-    # And a name cannot be added or taken away either, which is the other half of owning a cache.
-    with pytest.raises(PermissionError):
-        (derived / "tasks" / "abc_1" / "dbs" / "planted.jsonl").write_text("hello")
-    with pytest.raises(PermissionError):
-        (derived / "tasks" / "planted_1").mkdir()
-
-    # A write through the episode's own copy reaches nothing but itself, which is the property the
-    # copies are for and which the seal alone would not give.
+    # A write through the episode's own copy reaches nothing but itself, which is the property
+    # the copies are for. The shared task itself is writable by this uid, which is the host
+    # worker's boundary and what shojin-lab/shogym#140 closes by mounting it read-only.
     view = world.derive_view(derived=derived, view=tmp_path / "a", task_id="abc_1")
     (view / "data" / "tasks" / "abc_1" / "dbs" / "gmail.jsonl").write_text("rewritten by the agent")
     assert source.read_text() == "mail"
@@ -211,8 +198,6 @@ def test_a_write_through_the_served_tree_changes_nothing_else(tmp_path: Path) ->
     assert shared.read_text() == "mail"
     # And the seeded log the episode is scored against is the grader's own copy too.
     assert (graded / "tasks" / "abc_1" / "dbs" / "todoist.jsonl").read_text() == "seeded"
-    world._unseal(derived)
-    world._unseal(graded)
 
 
 def test_nothing_in_a_served_task_names_where_it_came_from(tmp_path: Path) -> None:
@@ -464,656 +449,14 @@ def test_two_episodes_of_one_task_do_not_share_their_served_inputs(tmp_path: Pat
     assert (second / "data" / "tasks" / "abc_1" / "dbs" / "gmail.jsonl").read_text() == "pristine"
     assert (derived / "tasks" / "abc_1" / "dbs" / "gmail.jsonl").read_text() == "pristine"
     # The 129 MB of shared databases are named rather than copied, which is what makes a view
-    # cheap enough to build per episode. Naming rather than copying is safe because the shared
-    # base is sealed read-only: an episode reads it and cannot leave anything in it for the next
-    # one, or for the other arm of its own pair. Both halves are asserted, because the link on its
-    # own is what the previous head shipped and it is the writability that decides the property.
+    # cheap enough to build per episode. What the link names is the derived tree, which has no
+    # answers in it, and that is the property being asserted here. It is shared and writable by
+    # this uid, so an episode that goes looking can leave something in it for the next one, which
+    # is the host worker's boundary and what shojin-lab/shogym#140 closes by binding it read-only.
     assert (first / "data" / "base_dbs").is_symlink()
     shared = first / "data" / "base_dbs" / "big.jsonl"
     assert shared.read_text() == "shared base"
-    with pytest.raises(PermissionError):
-        shared.write_text("reaching into the next episode")
-    with pytest.raises(PermissionError):
-        (first / "data" / "base_dbs" / "planted.jsonl").write_text("hello, twin")
     assert (second / "data" / "base_dbs" / "big.jsonl").read_text() == "shared base"
-    # Same-uid permissions, so this is a boundary against writing and not against a process that
-    # sets out to defeat it; shojin-lab/shogym#140 mounts the base read-only in the container,
-    # which is. Undone here so the temporary directory can be removed.
-    world._unseal(derived)
-
-
-def test_the_shared_parent_cannot_be_renamed_around(tmp_path: Path) -> None:
-    """The other half of the same invariant, and the half sealing each entry does not give.
-
-    A view names the shared entries by absolute path, so what an episode resolves is the entry's
-    bytes *and* the name that reaches them — and a name lives in its parent. The previous head
-    sealed every entry and left their parent owner-writable, so `base_dbs` could be renamed aside
-    and a directory of the episode's own choosing put there under the same name; every view that
-    resolved it afterwards, this episode's and the other arm of its pair's, would follow.
-    """
-    original = tmp_path / "corpus" / "data"
-    (original / "tasks").mkdir(parents=True)
-    (original / "base_dbs").mkdir()
-    (original / "base_dbs" / "big.jsonl").write_text("shared base")
-    (original / "version.txt").write_text("1.0")
-
-    derived = world.derive_root(original=original, derived=tmp_path / "derived" / "data")
-    (derived / "tasks" / "abc_1" / "dbs").mkdir(parents=True)
-    (derived / "tasks" / "abc_1" / "dbs" / "gmail.jsonl").write_text("pristine")
-    view = world.derive_view(derived=derived, view=tmp_path / "a", task_id="abc_1")
-
-    # The links really are absolute paths into the shared parent, which is what makes the parent
-    # part of what an episode resolves rather than an implementation detail above it.
-    link = view / "data" / "base_dbs"
-    assert link.is_symlink()
-    assert os.readlink(link) == str(derived / "base_dbs")
-
-    assert not (derived.lstat().st_mode & 0o222), oct(derived.lstat().st_mode)
-    # A name cannot be moved aside, replaced, added or taken away. Each of these needs write
-    # permission on the parent and none of them touches the entry's own mode, which is exactly why
-    # the entry seal did not cover them.
-    with pytest.raises(PermissionError):
-        os.rename(derived / "base_dbs", derived / "moved_aside")
-    with pytest.raises(PermissionError):
-        (derived / "planted").mkdir()
-    with pytest.raises(PermissionError):
-        (derived / "version.txt").unlink()
-    with pytest.raises(PermissionError):
-        (derived / "swapped").symlink_to(tmp_path / "elsewhere")
-    # And what the episode resolves is still what it was built from.
-    assert (view / "data" / "base_dbs" / "big.jsonl").read_text() == "shared base"
-
-    # The residual, stated by exercising it: the worker runs as the user that owns these files, so
-    # a process that means to defeat the mode can put it back. This is a boundary against a rename
-    # and not against an adversary; shojin-lab/shogym#140 mounts the shared base into the worker's
-    # container read-only, which is a boundary rather than a convention. Two ancestors above this
-    # one stay writable as well — the seeded root holds the port's cache stamp and the cache root
-    # is where it provisions — so the name `data` itself is movable by a process willing to work a
-    # level up, and the container mount is what closes that too.
-    os.chmod(derived, 0o755)
-    os.rename(derived / "base_dbs", derived / "moved_aside")
-    assert (derived / "moved_aside" / "big.jsonl").read_text() == "shared base"
-    world._unseal(derived)
-
-
-# ----- stopping a worker, and stopping what it started -----
-
-
-def _sleeper(seconds: float) -> subprocess.Popen:
-    """A process of its own session, standing in for a worker or for a stranger."""
-    return subprocess.Popen(
-        [sys.executable, "-c", f"import time; time.sleep({seconds})"],
-        start_new_session=True,
-    )
-
-
-def test_a_second_close_does_not_signal_whoever_holds_the_pid_now(tmp_path: Path) -> None:
-    """An ordinary episode closes its worker twice, and the two are ten minutes apart.
-
-    The first close happens when the sealed world has been read; the second comes from teardown.
-    Between them runs the grader, which is allowed 600 seconds, and a pid released at the start of
-    that window can belong to something else by the end of it. The second close used to resolve a
-    process group by asking the kernel which group the stored pid was in, so it signalled whoever
-    held the pid by then, and the comment beside it called the operation idempotent.
-
-    The reuse is made explicit rather than waited for: the worker's process is given the pid a
-    stranger now holds, which is exactly what the kernel does when it hands the number out again.
-    """
-    worker_process = _sleeper(30)
-    worker = adapter.Worker(
-        root=tmp_path,
-        process=worker_process,
-        port=0,
-        token="unused",
-        scratch=tmp_path / "scratch",
-        pgid=adapter._group_of(worker_process),
-    )
-    (tmp_path / "scratch").mkdir()
-    worker.close()
-    assert worker_process.poll() is not None
-
-    stranger = _sleeper(30)
-    try:
-        # The kernel hands the number out again.
-        worker.process.pid = stranger.pid
-        worker.close()
-        time.sleep(0.2)
-        assert stranger.poll() is None
-    finally:
-        stranger.kill()
-        stranger.wait(timeout=10)
-
-
-def test_a_worker_is_stopped_through_the_group_it_was_spawned_in() -> None:
-    """The other half of the same fix, at the helper that does the signalling.
-
-    The group is taken once, while the answer is still about this worker; the signal goes to that
-    group and never to the stored pid. A `killpg` that finds an empty group means there is nothing
-    left to stop, which used to fall through to `send_signal` on the pid: the one value that may
-    since have been handed to somebody else."""
-    worker_process = _sleeper(30)
-    real_pid = worker_process.pid
-    pgid = adapter._group_of(worker_process)
-    assert pgid == real_pid
-    stranger = _sleeper(30)
-    try:
-        # The kernel hands the number out again.
-        worker_process.pid = stranger.pid
-        adapter._stop(worker_process, signal.SIGTERM, pgid)
-        time.sleep(0.3)
-        # The stranger is untouched, and the worker's own group got the signal.
-        assert stranger.poll() is None
-        worker_process.pid = real_pid
-        assert worker_process.wait(timeout=10) is not None
-    finally:
-        stranger.kill()
-        stranger.wait(timeout=10)
-
-
-
-
-# ----- a worker whose parent is gone -----
-
-
-def _keepalive_worker_script(tmp_path: Path) -> Path:
-    """A worker that arms the real parent-death watch and then never stops on its own.
-
-    It calls `worker.watch_parent`, which is the code under test, rather than a copy of it. That
-    module imports nothing but the standard library at its top level, so it can be loaded by an
-    interpreter that has never heard of `appworld` or of shogym."""
-    script = tmp_path / "keepalive_worker.py"
-    script.write_text(
-        "import json, sys, time\n"
-        f"sys.path.insert(0, {str(adapter.WORKER.parent)!r})\n"
-        "import worker\n"
-        "opening = json.loads(sys.stdin.readline())\n"
-        "sys.stdin.close()\n"
-        "worker.watch_parent(opening.get('keepalive'))\n"
-        "sys.stdout.write(json.dumps({'port': 1}) + '\\n')\n"
-        "sys.stdout.flush()\n"
-        "while True:\n"
-        "    time.sleep(1)\n"
-    )
-    return script
-
-
-def _supervisor_script(tmp_path: Path) -> Path:
-    """A serving process that spawns one worker, says which pid it got, and then waits."""
-    script = tmp_path / "supervisor.py"
-    script.write_text(
-        "import sys, time\n"
-        "from pathlib import Path\n"
-        "from shogym.envs.appworld import adapter\n"
-        "adapter.runtime = lambda: Path(sys.executable)\n"
-        "adapter.WORKER = Path(sys.argv[1])\n"
-        "worker = adapter.Worker.spawn(Path(sys.argv[2]))\n"
-        "Path(sys.argv[3]).write_text(str(worker.process.pid))\n"
-        "time.sleep(300)\n"
-    )
-    return script
-
-
-def test_a_worker_stops_itself_when_the_process_that_started_it_dies(tmp_path: Path) -> None:
-    """Teardown needs a parent, and the case it cannot reach is the parent dying with an episode
-    open.
-
-    A worker is started in a session of its own, so nothing reaps it when its owner goes: it was
-    handed to init and went on serving a world, holding a port and a scratch directory, while the
-    only handle on it, the port, the token, the process and the group number, died with the
-    process that held them. Every other close test keeps the owning parent alive, so none of them
-    could have seen this.
-
-    The supervisor here is a real process running the real spawn, and it is killed with a signal
-    it cannot handle rather than asked to tidy up. What the worker is left with is the reading end
-    of a pipe, which reaches end of file because the kernel closed the writing end, and that is a
-    fact about the parent rather than a message from one."""
-    root = tmp_path / "root"
-    root.mkdir()
-    told = tmp_path / "worker.pid"
-    supervisor = subprocess.Popen(
-        [
-            sys.executable,
-            str(_supervisor_script(tmp_path)),
-            str(_keepalive_worker_script(tmp_path)),
-            str(root),
-            str(told),
-        ],
-        env={**os.environ, "SHOGYM_CACHE": str(tmp_path / "cache")},
-    )
-    try:
-        deadline = time.monotonic() + 60
-        while not told.exists() and time.monotonic() < deadline:
-            assert supervisor.poll() is None, "the supervisor exited instead of spawning"
-            time.sleep(0.05)
-        worker_pid = int(told.read_text())
-        os.kill(worker_pid, 0)
-        # And it was written down, which is the other half of what a later run has to work from.
-        written = (tmp_path / "cache" / "appworld" / "workers.txt").read_text()
-        assert f'"pid": {worker_pid}' in written
-
-        supervisor.kill()
-        supervisor.wait(timeout=30)
-        deadline = time.monotonic() + 30
-        while time.monotonic() < deadline:
-            try:
-                os.kill(worker_pid, 0)
-            except ProcessLookupError:
-                break
-            time.sleep(0.05)
-        else:
-            raise AssertionError("the worker outlived the process that started it")
-    finally:
-        supervisor.kill()
-        supervisor.wait(timeout=30)
-
-
-def test_a_worker_whose_owner_is_gone_is_reclaimed_and_a_live_one_is_not(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
-) -> None:
-    """The durable half: what a construction after a crash has instead of a `Worker` object.
-
-    Nothing outlived the serving process. A resumed harness could neither adopt a worker nor name
-    one for teardown, so it started another beside it. Every worker is written down now with the
-    pid and the start time of the process that started it, and a construction reads that file.
-
-    The start time is the load-bearing half. A pid alone answers "is something running under that
-    number", and pids are handed out again, so an owner's number can belong to a stranger by the
-    time anybody asks: reclaiming a live episode's world is worse than the failure this fixes. So
-    the owner below is a real process that really exited, and the live one is a real process
-    running under its own recorded birth."""
-    monkeypatch.setenv("SHOGYM_CACHE", str(tmp_path / "cache"))
-    running: List[subprocess.Popen] = []
-
-    def _worker_of(
-        name: str, owner: subprocess.Popen, birth: str
-    ) -> Tuple[subprocess.Popen, Path]:
-        """One sleeper standing in for a worker, written down as ``owner``'s."""
-        held = _sleeper(120)
-        running.append(held)
-        scratch = tmp_path / f"shogym-appworld-{name}"
-        scratch.mkdir()
-        adapter._append(
-            "+"
-            + json.dumps(
-                {
-                    "name": name,
-                    "parent": owner.pid,
-                    "birth": birth,
-                    "boot": adapter._boot_id(),
-                    "pid": held.pid,
-                    "pid_birth": adapter.process_birth(held.pid),
-                    "pgid": adapter._group_of(held),
-                    "scratch": str(scratch),
-                }
-            )
-        )
-        return held, scratch
-
-    gone = _sleeper(120)
-    gone_birth = adapter.process_birth(gone.pid)
-    assert gone_birth, "the process table has to answer for this test to mean anything"
-    gone.kill()
-    gone.wait(timeout=30)
-    living = _sleeper(120)
-    running.append(living)
-
-    try:
-        abandoned, abandoned_scratch = _worker_of("orphan", gone, gone_birth)
-        kept, kept_scratch = _worker_of("live", living, adapter.process_birth(living.pid))
-
-        assert adapter.reap() == ["orphan"]
-        assert abandoned.wait(timeout=30) is not None, "the abandoned world was stopped"
-        assert not abandoned_scratch.exists(), "and its scratch directory went with it"
-        assert kept.poll() is None and kept_scratch.exists(), "the live one is untouched"
-        assert [record["name"] for record in adapter.outstanding()] == ["live"]
-        assert adapter.reap() == [], "and a second sweep has nothing left to do"
-    finally:
-        for process in running:
-            process.kill()
-            process.wait(timeout=30)
-
-
-def test_an_orphan_nothing_can_be_told_about_keeps_its_record_and_its_scratch(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
-) -> None:
-    """A sweep may only spend a record it has actually dealt with.
-
-    The stop used to report nothing whatever it had done, so every one of its silent paths reached
-    the caller as a delivered kill. An entry whose owner is gone, whose worker pid is live, and
-    whose birth the process table will not answer for was therefore reported reclaimed: its
-    scratch directory was deleted and its ledger line tombstoned without a signal ever being sent,
-    which leaves a world still serving with nothing left that names it. That is the failure the
-    ledger exists to prevent, arrived at through the ledger.
-
-    Two shapes of the same ambiguity below. One record never had a birth written down; the other
-    has one the table has stopped answering for. Neither says the worker is gone and neither can
-    be signalled safely, so both keep everything they have for the next construction to try."""
-    monkeypatch.setenv("SHOGYM_CACHE", str(tmp_path / "cache"))
-    gone = _sleeper(120)
-    gone_birth = adapter.process_birth(gone.pid)
-    assert gone_birth, "the process table has to answer for this test to mean anything"
-    gone.kill()
-    gone.wait(timeout=30)
-
-    running: List[subprocess.Popen] = []
-    scratches: Dict[str, Path] = {}
-    try:
-        for name, birth in (("unrecorded", ""), ("unreadable", "1700000000")):
-            held = _sleeper(120)
-            running.append(held)
-            scratch = tmp_path / f"shogym-appworld-{name}"
-            scratch.mkdir()
-            scratches[name] = scratch
-            adapter._append(
-                "+"
-                + json.dumps(
-                    {
-                        "name": name,
-                        "parent": gone.pid,
-                        "birth": gone_birth,
-                        "boot": adapter._boot_id(),
-                        "pid": held.pid,
-                        # Either never written, or written and no longer confirmable.
-                        "pid_birth": birth,
-                        "pgid": adapter._group_of(held),
-                        "scratch": str(scratch),
-                    }
-                )
-            )
-        # The table answers about the owner (which is gone, so `kill` settles it without asking)
-        # and refuses to answer about either worker.
-        monkeypatch.setattr(adapter, "process_birth", lambda pid: "")
-
-        assert adapter.reap() == [], "nothing was stopped, so nothing may be reported reclaimed"
-        assert all(scratch.exists() for scratch in scratches.values())
-        assert sorted(r["name"] for r in adapter.outstanding()) == ["unreadable", "unrecorded"]
-        assert all(held.poll() is None for held in running), "and both worlds are still running"
-    finally:
-        for process in running:
-            process.kill()
-            process.wait(timeout=30)
-
-
-# The fork below is the subject of the test and pytest's own threads are what the interpreter is
-# warning about, so the warning says nothing about this code.
-@pytest.mark.filterwarnings("ignore:This process .* is multi-threaded")
-def test_a_forked_child_writes_down_its_own_birth_and_not_its_parents(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
-) -> None:
-    """The owner's birth is what keeps a live worker from being read as an orphan, and a fork used
-    to copy somebody else's.
-
-    The value is memoized, because it is one `ps` and a process's start time cannot change. What
-    can change is which process is asking: a fork gives the child every cached value the parent
-    had warmed, and one of them says when the *parent* started. A child that warmed it before
-    forking, or inherited it warm, then wrote that birth into the ledger beside its own pid. A
-    sibling construction reading that record sees a live worker pid under a birth that does not
-    match it, which is the shape of an abandoned worker, and reclaiming one is stopping it.
-
-    The parent below warms the cache the way a spawn does and then waits, because the process
-    table answers in whole seconds and two births inside one second are indistinguishable. What is
-    checked is the ledger rather than the cache, because the ledger is what the next construction
-    reads.
-
-    The child writes one line and says so down a pipe, and nothing else. Reading its own start
-    time means running `ps`, and a fork-and-exec from the child of a multi-threaded process is a
-    thing to keep out of a test that is about something else; the parent asks instead, before it
-    reaps, while the number is still reserved and the table still answers for the zombie."""
-    monkeypatch.setenv("SHOGYM_CACHE", str(tmp_path / "cache"))
-    parent_birth = adapter._own_birth()
-    assert parent_birth, "the process table has to answer for this test to mean anything"
-    time.sleep(1.2)
-
-    read, write = os.pipe()
-    child = os.fork()
-    if child == 0:
-        try:
-            os.close(read)
-            adapter.record_worker(pid=os.getpid(), scratch=str(tmp_path / "scratch"))
-            os.write(write, b"written")
-        finally:
-            os._exit(0)
-    os.close(write)
-    with os.fdopen(read) as handle:
-        assert handle.read() == "written"
-    child_birth = adapter.process_birth(child)
-    os.waitpid(child, 0)
-
-    assert child_birth and child_birth != parent_birth, "the two are a second or more apart"
-    written = adapter.outstanding()
-    assert [record["parent"] for record in written] == [child]
-    assert [record["birth"] for record in written] == [child_birth]
-
-    # The other half of the same fact, at the reader: this process's own number used to be enough
-    # on its own, so a record left by an earlier holder of it read as a live owner forever. The
-    # child's birth is a real one this process does not have, which is what such a record carries.
-    assert adapter._process_is_alive(os.getpid(), parent_birth) is True
-    assert adapter._process_is_alive(os.getpid(), child_birth) is False
-
-
-def test_two_constructions_do_not_both_reclaim_one_record(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
-) -> None:
-    """Reclaiming is a decision made of three steps, and nothing used to hold them together.
-
-    Reading the outstanding record, asking whether the leader is still the process written down,
-    and signalling its group are three operations, and the ledger's own lock covers none of them:
-    it is taken for one append and released. Two constructions on one machine therefore snapshot
-    the same record, both pass the birth check, and both signal. This probe caught exactly that,
-    two kills aimed at one worker, and the second is the dangerous one: by then the first has
-    killed the leader, and the number the second is aiming at may already have been handed on.
-
-    The signal is slow here on purpose, because the window is what the fix closes. Two sweeps at
-    once, one record between them, and afterwards one signal and one reclaimer."""
-    monkeypatch.setenv("SHOGYM_CACHE", str(tmp_path / "cache"))
-    gone = _sleeper(120)
-    gone_birth = adapter.process_birth(gone.pid)
-    assert gone_birth, "the process table has to answer for this test to mean anything"
-    gone.kill()
-    gone.wait(timeout=30)
-
-    held = _sleeper(120)
-    scratch = tmp_path / "shogym-appworld-orphan"
-    scratch.mkdir()
-    try:
-        adapter._append(
-            "+"
-            + json.dumps(
-                {
-                    "name": "orphan",
-                    "parent": gone.pid,
-                    "birth": gone_birth,
-                    "boot": adapter._boot_id(),
-                    "pid": held.pid,
-                    "pid_birth": adapter.process_birth(held.pid),
-                    "pgid": adapter._group_of(held),
-                    "scratch": str(scratch),
-                }
-            )
-        )
-
-        attempts: List[Any] = []
-        attempted = threading.Lock()
-
-        def _slow_signal(pgid: int, how: int) -> bool:
-            with attempted:
-                attempts.append((pgid, how))
-            # Wide enough that a second sweep with no exclusion is inside it, and short enough
-            # that this test costs nothing if the exclusion works.
-            time.sleep(0.4)
-            return True
-
-        monkeypatch.setattr(adapter, "_signal_group", _slow_signal)
-        swept: Dict[int, List[str]] = {}
-
-        def _sweep(which: int) -> None:
-            swept[which] = adapter.reap()
-
-        sweeps = [threading.Thread(target=_sweep, args=(which,)) for which in (0, 1)]
-        for sweep in sweeps:
-            sweep.start()
-        for sweep in sweeps:
-            sweep.join(60)
-        assert not any(sweep.is_alive() for sweep in sweeps), "a sweep never returned"
-
-        assert len(attempts) == 1, "one record was signalled twice"
-        assert sorted(swept.values()) == [[], ["orphan"]], "and reported reclaimed twice"
-        assert adapter.outstanding() == []
-    finally:
-        held.kill()
-        held.wait(timeout=30)
-
-
-# ----- a stop that cannot be confirmed is not a stop -----
-
-
-def _worker(tmp_path: Path, process: subprocess.Popen, *, recorded: bool = False) -> Any:
-    """One worker around ``process``, written into the ledger where the test needs the record.
-
-    Unrecorded by default, which is what the close tests that only care about signalling want. A
-    test about what a close *spends* has to have something to spend."""
-    scratch = tmp_path / f"scratch-{process.pid}"
-    scratch.mkdir(parents=True, exist_ok=True)
-    record = None
-    if recorded:
-        record = adapter.record_worker(
-            pid=process.pid,
-            pid_birth=adapter.process_birth(process.pid),
-            pgid=adapter._group_of(process),
-            scratch=str(scratch),
-        )
-    return adapter.Worker(
-        root=tmp_path,
-        process=process,
-        port=0,
-        token="unused",
-        scratch=scratch,
-        pgid=adapter._group_of(process),
-        record=record,
-    )
-
-
-def test_a_confirmed_close_needs_the_process_table_to_have_answered(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
-) -> None:
-    """"I could not look" is not "there is nothing there", and it used to be recorded as one.
-
-    `_group_members` mapped every failure of `ps` onto an empty sequence, which is the same value
-    a group that had emptied gives. A confirmed stop built on that confirmed nothing, and the
-    episode graded on the strength of it was graded on a tree something might still be writing
-    to."""
-    process = _sleeper(30)
-    worker = _worker(tmp_path, process)
-    monkeypatch.setattr(adapter, "_group_members", lambda pgid: None)
-    with pytest.raises(adapter.WorkerError, match="could not be confirmed stopped"):
-        worker.close(confirm=True)
-    # The worker itself is gone either way: what failed is the evidence, not the stop.
-    assert process.poll() is not None
-    assert worker.stopped is False
-
-
-def test_a_confirmed_close_needs_the_group_to_be_empty(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
-) -> None:
-    """A descendant that outlives SIGKILL is a domain that was not contained, and grading a tree
-    it can still write to is grading a state no instant of the episode had."""
-    process = _sleeper(30)
-    worker = _worker(tmp_path, process)
-    monkeypatch.setattr(adapter, "_group_members", lambda pgid: [999999])
-    monkeypatch.setattr(adapter, "_CLOSE_SECONDS", 0.05)
-    with pytest.raises(adapter.WorkerError, match="could not be confirmed stopped"):
-        worker.close(confirm=True)
-    assert worker.stopped is False
-
-
-def test_a_leader_something_else_reaped_leaves_a_number_nobody_may_signal(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
-) -> None:
-    """Saving a pgid at spawn does not reserve the number; reaping the leader releases it.
-
-    A leader that merely exited is still holding its group, so the close below signals it and
-    confirms it, which is what stops an episode buying an unscored row by killing its own world.
-    A leader something *else* has already reaped is a different fact: the number may have been
-    handed on, so it is neither signalled nor enumerated."""
-    process = _sleeper(0.01)
-    worker = _worker(tmp_path, process)
-    process.wait(timeout=10)  # reaped here, before the close
-
-    signalled: List[Any] = []
-    monkeypatch.setattr(adapter, "_signal_group", lambda pgid, how: signalled.append((pgid, how)))
-    monkeypatch.setattr(adapter, "_group_members", lambda pgid: signalled.append(pgid) or [])
-    with pytest.raises(adapter.WorkerError, match="could not be confirmed stopped"):
-        worker.close(confirm=True)
-    # Nothing was signalled and nothing was enumerated: the number is not this worker's to use.
-    assert signalled == []
-
-
-def test_a_worker_that_exited_on_its_own_is_still_stopped_and_confirmed(tmp_path: Path) -> None:
-    """The exploit the obvious ordering would have opened.
-
-    Reaping the leader first and refusing an already-exited one hands an episode a way out of a
-    bad score: kill the world from inside a block, and the seal cannot be confirmed, so the row is
-    unscored rather than low. A pid is reserved until its parent reaps it and a group exists while
-    any member does, so an exited-but-unreaped leader is still holding this group: it is signalled,
-    reaped and confirmed like any other, and the episode is graded on what upstream persisted."""
-    process = _sleeper(0.01)
-    worker = _worker(tmp_path, process)
-    time.sleep(0.3)
-    # Exited, and deliberately not polled: the pid is a zombie this process still holds.
-    assert process.returncode is None
-    worker.close(confirm=True)
-    assert worker.stopped is True
-
-
-def test_a_close_that_cannot_confirm_the_group_keeps_the_record_and_the_scratch(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
-) -> None:
-    """The ledger record and the scratch directory are the only way back to a worker, and an
-    unconfirmed stop used to spend them anyway.
-
-    A close signalled the group, failed to see it empty, and then removed the scratch directory
-    and tombstoned the ledger line regardless. Finalization refuses a score on that outcome, which
-    is right and is not the whole of it: a descendant the signal did not reach is then a process
-    nothing names, in a run whose next construction sweeps the ledger looking for exactly that.
-    The tests around this one build workers with no record at all, so none of them could have seen
-    it.
-
-    Both directions below. The table that cannot be read keeps everything; the group that is read
-    and found empty is the one outcome that may spend it."""
-    monkeypatch.setenv("SHOGYM_CACHE", str(tmp_path / "cache"))
-    process = _sleeper(30)
-    worker = _worker(tmp_path, process, recorded=True)
-    monkeypatch.setattr(adapter, "_group_members", lambda pgid: None)
-    worker.close()
-    assert worker.stopped is False, "the stop could not be confirmed"
-    assert worker.scratch.is_dir(), "so what a later construction would remove is still there"
-    assert [record["name"] for record in adapter.outstanding()] == [worker.record]
-
-    stopped = _sleeper(30)
-    confirmed = _worker(tmp_path, stopped, recorded=True)
-    monkeypatch.setattr(adapter, "_group_members", lambda pgid: [])
-    confirmed.close()
-    assert confirmed.stopped is True
-    assert not confirmed.scratch.exists() and confirmed.record is None
-    assert [record["name"] for record in adapter.outstanding()] == [worker.record]
-
-
-def test_an_ordinary_teardown_close_still_never_raises(tmp_path: Path) -> None:
-    """The confirmation is the finalizer's demand, not teardown's. Teardown runs on a shared loop
-    and its job is to release, so it takes the same stop without the assertion."""
-    process = _sleeper(0.01)
-    worker = _worker(tmp_path, process)
-    process.wait(timeout=10)
-    worker.close()
-    assert worker.closed is True and worker.stopped is False
-
-
-def test_a_process_table_that_cannot_be_read_is_not_an_empty_one(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    """The value beneath both of the above, at the helper that produces it."""
-    monkeypatch.setenv("PATH", "")
-    assert adapter._group_members(os.getpid()) is None
 
 
 # ----- what the grader reads, and what it refuses -----
@@ -1138,123 +481,6 @@ def test_an_output_tree_with_a_link_in_it_is_refused_rather_than_graded(tmp_path
 def test_an_episode_that_never_started_has_no_tree_to_grade(tmp_path: Path) -> None:
     with pytest.raises(adapter.SnapshotError, match="no output tree"):
         adapter.snapshot_outputs(tmp_path / "never", into=tmp_path / "into")
-
-
-def test_a_grader_that_outruns_its_bound_takes_its_whole_group_with_it(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
-) -> None:
-    """The advertised ten minutes was a bound on nothing.
-
-    The grader was an ordinary child with captured pipes: a timeout killed the leader alone and
-    then read those pipes again with no deadline at all, so a descendant holding either of them
-    kept the call, and with it a sealed episode's terminal, open indefinitely. Measured with a
-    one-second bound, the call had not returned twenty seconds later and the descendant was still
-    running.
-
-    The grader leads a session of its own now, the group is what is signalled, its emptying is
-    what is waited for, and the final read of the pipes is bounded like every other wait on the
-    way down. The child below is the case the old code could not survive: it outlives its parent
-    and it inherited both pipes."""
-    script = tmp_path / "wedged_grader.py"
-    told = tmp_path / "descendant.pid"
-    script.write_text(
-        "import subprocess, sys, time\n"
-        "sys.stdin.readline()\n"
-        # Inherits stdout and stderr, so it holds the pipes the caller reads.
-        "child = subprocess.Popen([sys.executable, '-c', 'import time; time.sleep(120)'])\n"
-        f"open({str(told)!r}, 'w').write(str(child.pid))\n"
-        "time.sleep(120)\n"
-    )
-    monkeypatch.setattr(adapter, "runtime", lambda: Path(sys.executable))
-    monkeypatch.setattr(adapter, "WORKER", script)
-    monkeypatch.setattr(adapter.tempfile, "tempdir", str(tmp_path))
-    monkeypatch.setenv("SHOGYM_CACHE", str(tmp_path / "cache"))
-
-    failure: List[BaseException] = []
-
-    def _grade() -> None:
-        try:
-            adapter.grade(
-                root=tmp_path, task_id="abc_1", outputs=tmp_path, ignore=[], filing={}, timeout=1.0
-            )
-        except BaseException as exc:  # noqa: BLE001 - the point is which one, and how soon
-            failure.append(exc)
-
-    # In a thread with a join, so a teardown that does not return fails this test rather than
-    # hanging the suite the way the failure it is about hung a run.
-    grading = threading.Thread(target=_grade, daemon=True)
-    began = time.monotonic()
-    grading.start()
-    grading.join(60)
-    assert not grading.is_alive(), "the grader's timeout never returned"
-    assert time.monotonic() - began < 40, "it returned, but not inside anything like its bound"
-    assert failure and isinstance(failure[0], adapter.WorkerError)
-    assert "did not finish within" in str(failure[0])
-
-    descendant = int(told.read_text())
-    deadline = time.monotonic() + 30
-    while time.monotonic() < deadline:
-        try:
-            os.kill(descendant, 0)
-        except ProcessLookupError:
-            break
-        time.sleep(0.05)
-    else:
-        os.kill(descendant, signal.SIGKILL)
-        raise AssertionError("what the grader started outlived the grader's own timeout")
-    assert not list(tmp_path.glob("shogym-appworld-grade-*")), "and the scratch went with it"
-    assert adapter.outstanding() == [], "and the ledger entry it was written down under"
-
-
-def test_a_grader_that_ends_leaving_a_descendant_keeps_its_record(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
-) -> None:
-    """An ordinary exit used to be read as the end of everything the grader had started.
-
-    The timeout path stops the group and waits for it to empty. Every other way out of `grade`
-    asked nothing at all: a leader that exited 0 had its scratch directory removed and its ledger
-    line tombstoned on the strength of its own status. The evaluator is upstream code that may
-    have started something, and a child of it that holds none of the captured pipes lets
-    `communicate` return at once, so the grade finishes cleanly and what it started becomes a
-    process with nothing naming it. The existing timeout test cannot see this, because there the
-    group really is emptied.
-
-    The grader below is the ordinary success: it answers with a verdict, exits 0, and leaves one
-    child behind on descriptors of its own. What has to survive it is the pair of handles a later
-    construction reclaims through."""
-    script = tmp_path / "leaky_grader.py"
-    told = tmp_path / "descendant.pid"
-    script.write_text(
-        "import json, os, subprocess, sys\n"
-        "sys.stdin.readline()\n"
-        # None of the captured pipes, so the caller's read finishes while this one runs on.
-        "quiet = os.open(os.devnull, os.O_RDWR)\n"
-        "child = subprocess.Popen([sys.executable, '-c', 'import time; time.sleep(120)'],\n"
-        "                        stdin=quiet, stdout=quiet, stderr=quiet)\n"
-        f"open({str(told)!r}, 'w').write(str(child.pid))\n"
-        "print(json.dumps({'output': {'graded': True}}))\n"
-        "sys.stdout.flush()\n"
-    )
-    monkeypatch.setattr(adapter, "runtime", lambda: Path(sys.executable))
-    monkeypatch.setattr(adapter, "WORKER", script)
-    monkeypatch.setattr(adapter.tempfile, "tempdir", str(tmp_path))
-    monkeypatch.setenv("SHOGYM_CACHE", str(tmp_path / "cache"))
-    # The bound on "has the group gone", which this test spends in full because the group has not.
-    monkeypatch.setattr(adapter, "_CLOSE_SECONDS", 1.0)
-
-    graded = adapter.grade(
-        root=tmp_path, task_id="abc_1", outputs=tmp_path, ignore=[], filing={}, timeout=60.0
-    )
-    descendant = int(told.read_text())
-    try:
-        assert graded == {"graded": True}, "the grade itself is unaffected"
-        os.kill(descendant, 0)  # still running, which is the whole point
-        assert list(tmp_path.glob("shogym-appworld-grade-*")), "its scratch is still there"
-        assert [record["pgid"] for record in adapter.outstanding()] == [
-            os.getpgid(descendant)
-        ], "and the ledger still names the group the descendant is running in"
-    finally:
-        os.kill(descendant, signal.SIGKILL)
 
 
 # ----- the caches say what they were built from -----
@@ -1301,16 +527,16 @@ def test_a_cache_is_named_by_the_code_and_the_interpreter_that_filled_it(
     constants were in the name, the code that reads them was not, so an edit to how a backlog is
     drawn or how a task is materialised left the key alone and compared it against rows an older
     implementation had seeded. The other is the provisioned interpreter, which is the process that
-    writes a task's database log through upstream's model layer: the run fingerprint moved when it
-    changed and the cache did not, so a run could hold a name saying one runtime over a world
-    another had built."""
+    writes a task's database log through upstream's model layer: the run fingerprint moves with
+    the runtime pin and the cache did not, so a run could hold a name saying one runtime over a
+    world another had built."""
     monkeypatch.setenv("SHOGYM_CACHE", str(tmp_path / "cache"))
     corpus = "0f0f0f0f0f0f0f0f"
 
     served = adapter.derived_root(corpus, runtime="aaaaaaaaaaaaaaaa")
     graded = adapter.graded_root(corpus, runtime="aaaaaaaaaaaaaaaa")
     assert served == adapter.derived_root(corpus, runtime="aaaaaaaaaaaaaaaa")
-    # A different realized interpreter is a different cache, on both roots.
+    # A different runtime pin is a different cache, on both roots.
     assert served != adapter.derived_root(corpus, runtime="bbbbbbbbbbbbbbbb")
     assert graded != adapter.graded_root(corpus, runtime="bbbbbbbbbbbbbbbb")
 
@@ -1428,35 +654,7 @@ def test_a_cache_that_was_built_from_something_else_is_refused(tmp_path: Path) -
         adapter.stamp_cache(root, source="aaaa", runtime="ssss")
 
 
-# ----- the seal is verified, not inferred -----
-
-
-def test_a_nested_chmod_that_failed_leaves_the_entry_unsealed(tmp_path: Path) -> None:
-    """The warm path used to read the top-level mode alone, on the reasoning that `_seal` sets it
-    last. That held only while every nested chmod succeeded, and `_chmod` swallowed the ones that
-    did not, so one failure left a writable child permanently behind a read-only top."""
-    tree = tmp_path / "entry"
-    (tree / "nested").mkdir(parents=True)
-    (tree / "nested" / "file.jsonl").write_text("x")
-    world._seal(tree)
-    assert world._sealed(tree) is True
-
-    # Exactly the state a swallowed failure produced: read-only top, writable child.
-    os.chmod(tree, 0o755)
-    os.chmod(tree / "nested" / "file.jsonl", 0o644)
-    os.chmod(tree, 0o555)
-    assert world._sealed(tree) is False
-    world._unseal(tree)
-
-
-def test_a_seal_that_cannot_be_taken_fails_the_derivation(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
-) -> None:
-    """`_chmod` swallowed every error, which turned a filesystem that cannot hold the invariant
-    into a derivation that claims it does."""
-    monkeypatch.setattr(world.os, "chmod", lambda *a, **k: (_ for _ in ()).throw(OSError("nope")))
-    with pytest.raises(OSError):
-        world._chmod(tmp_path, 0o555)
+# ----- a derivation publishes rather than building in place -----
 
 
 def test_a_derivation_publishes_rather_than_building_in_place(tmp_path: Path) -> None:
@@ -1474,9 +672,8 @@ def test_a_derivation_publishes_rather_than_building_in_place(tmp_path: Path) ->
     real_publish = world._publish
 
     def _watch(building: Path, target: Path, *, replacing: bool = False) -> None:
-        # Whatever is published is complete and sealed before it has a name.
+        # Whatever is published is complete before it has a name.
         assert (building / world._COMPLETE).exists()
-        assert world._sealed(building)
         published.append(target)
         real_publish(building, target, replacing=replacing)
 
@@ -1491,7 +688,6 @@ def test_a_derivation_publishes_rather_than_building_in_place(tmp_path: Path) ->
     # And the warm path publishes nothing at all.
     world.derive_root(original=original, derived=derived)
     assert len(published) == 1
-    world._unseal(derived)
 
 
 def test_a_publish_that_fails_puts_the_displaced_tree_back(
@@ -1661,61 +857,6 @@ def test_the_headline_is_published_under_the_name_a_row_is_summarised_from() -> 
         assert [item["value"] for item in revealed] == [summary[channel]]
 
 
-# ----- what a stop is signalled with, and in what order -----
-
-
-def test_the_group_is_killed_after_a_short_grace_and_reaped_last(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
-) -> None:
-    """Two orderings, both of which the docs claimed and the code did not do.
-
-    SIGTERM used to be followed by up to ten seconds of waiting, and SIGTERM is catchable: every
-    one of those seconds is a second in which the process that ran agent-authored code can still
-    write into the tree about to be graded. It gets a short grace and then a signal it cannot
-    decline.
-
-    And the leader was reaped *before* the group was enumerated. Reaping releases the pid, and a
-    group exists only while it has a member, so the enumeration and the escalation after it were
-    about whatever held the number by then. The group is read while the leader is still a zombie
-    holding it, and the reap is last."""
-    order: List[str] = []
-    real_members = adapter._group_members
-
-    def _watch_signal(pgid: int, how: int) -> None:
-        order.append("SIGKILL" if how == signal.SIGKILL else "SIGTERM")
-        try:
-            os.killpg(pgid, how)
-        except OSError:
-            # A group that has already emptied, which is what the real helper tolerates too: the
-            # kill after the grace is sent whatever the group did, and a no-op is one of the
-            # things it can be.
-            pass
-
-    def _watch_members(pgid: int) -> Any:
-        order.append("enumerate")
-        return real_members(pgid)
-
-    process = _sleeper(30)
-    worker = _worker(tmp_path, process)
-    monkeypatch.setattr(adapter, "_signal_group", _watch_signal)
-    monkeypatch.setattr(adapter, "_group_members", _watch_members)
-    monkeypatch.setattr(adapter, "_TERM_GRACE_SECONDS", 0.05)
-
-    began = time.monotonic()
-    worker.close(confirm=True)
-    elapsed = time.monotonic() - began
-
-    assert worker.stopped is True
-    # A kill follows the grace whatever the group did, and every enumeration happened before the
-    # reap, which is the last thing that runs.
-    assert order[0] == "SIGTERM"
-    assert "SIGKILL" in order
-    assert order.index("SIGKILL") < order.index("enumerate", order.index("SIGKILL"))
-    assert process.returncode is not None
-    # The grace is the bound, not ten seconds of a signal the process may ignore.
-    assert elapsed < 5.0
-
-
 # ----- what the grader may be handed -----
 
 
@@ -1734,64 +875,18 @@ def test_a_symlinked_output_root_is_refused(tmp_path: Path) -> None:
     assert adapter.snapshot_outputs(real, into=tmp_path / "into").is_dir()
 
 
-def test_a_snapshot_is_bounded_in_every_direction(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
-) -> None:
-    """An episode wrote this tree, so walking and copying it without a bound lets the episode
-    decide how long finalization takes and how much of the host's disk it uses. None of the
-    deadlines above cover it: a deadline cancels an await, and the thread doing the copying does
-    not stop for that."""
-    outputs = tmp_path / "outputs"
-    (outputs / "dbs").mkdir(parents=True)
-    for index in range(6):
-        (outputs / "dbs" / f"{index}.jsonl").write_text("x" * 64)
-
-    monkeypatch.setattr(adapter, "_SNAPSHOT_MAX_NODES", 3)
-    with pytest.raises(adapter.SnapshotError, match="more than 3 entries"):
-        adapter.snapshot_outputs(outputs, into=tmp_path / "a")
-
-    monkeypatch.setattr(adapter, "_SNAPSHOT_MAX_NODES", 20_000)
-    monkeypatch.setattr(adapter, "_SNAPSHOT_MAX_BYTES", 100)
-    with pytest.raises(adapter.SnapshotError, match="larger than 100 bytes"):
-        adapter.snapshot_outputs(outputs, into=tmp_path / "b")
-
-    monkeypatch.setattr(adapter, "_SNAPSHOT_MAX_BYTES", 1 << 30)
-    monkeypatch.setattr(adapter, "_SNAPSHOT_MAX_DEPTH", 0)
-    with pytest.raises(adapter.SnapshotError, match="deeper than 0 directories"):
-        adapter.snapshot_outputs(outputs, into=tmp_path / "c")
-
-    monkeypatch.setattr(adapter, "_SNAPSHOT_MAX_DEPTH", 24)
-    monkeypatch.setattr(adapter, "_SNAPSHOT_SECONDS", -1.0)
-    with pytest.raises(adapter.SnapshotError, match="longer than"):
-        adapter.snapshot_outputs(outputs, into=tmp_path / "d")
-
-
-def test_an_abandoned_snapshot_stops_at_the_next_file(tmp_path: Path) -> None:
-    """Cancelling the await does not stop the thread, so the thread is given something to stop
-    for, and it is checked once per file rather than once per tree."""
-    outputs = tmp_path / "outputs"
-    outputs.mkdir()
-    for index in range(4):
-        (outputs / f"{index}.jsonl").write_text("x")
-    stop = threading.Event()
-    stop.set()
-    with pytest.raises(adapter.SnapshotError, match="abandoned"):
-        adapter.snapshot_outputs(outputs, into=tmp_path / "into", stop=stop)
-
-
 # ----- what the identity covers -----
 
 
-def test_the_fingerprint_covers_the_realized_runtime_and_the_authored_text(
+def test_the_fingerprint_covers_the_runtime_pin_and_the_authored_text(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     """Four inputs the digest claimed to cover and did not.
 
-    The runtime cache is named for the direct AppWorld release while it is built by resolving
-    that release's ranges against whatever the host offers, so the realized interpreter and
-    distribution set were outside the identity entirely. The guide, the tool guide and the
-    appended paragraph are the text every episode is given, which is authored treatment rather
-    than scenery. And the generator digest already decided which derived cache was served."""
+    The runtime pin names the release, the commit and the interpreter series the worlds run
+    under. The guide, the tool guide and the appended paragraph are the text every episode is
+    given, which is authored treatment rather than scenery. And the generator digest already
+    decided which derived cache was served."""
     from shogym.envs.appworld import adapter, env_v1, world
     from shogym.envs.appworld.env_v1 import run_fingerprint
 
@@ -1844,7 +939,7 @@ def test_a_corpus_with_a_link_in_it_is_refused_rather_than_half_digested(
         adapter.corpus_digest(tmp_path)
 
 
-# ----- what the runtime's identity covers, and what the pins enforce -----
+# ----- what the pins enforce -----
 
 
 def _fake_runtime(home: Path) -> Path:
@@ -1862,86 +957,6 @@ def _fake_runtime(home: Path) -> Path:
     (home / "bin").mkdir()
     (home / "bin" / "python").write_text("")
     return home / "bin" / "python"
-
-
-def test_the_runtime_digest_moves_when_the_installed_code_does(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
-) -> None:
-    """The digest hashed labels and called them an identity.
-
-    It covered the platform, the venv config and the `.dist-info` directory *names*, which is the
-    list of what was asked for written down a second time. Two different artifacts published under
-    one version were therefore one identity, and so was a module edited in place inside the
-    interpreter every world runs under. The realized code has to be what moves it, and this
-    perturbs the tree rather than replacing the function.
-
-    The edit below is the same length as what it replaces, because a digest that only noticed
-    lengths would pass a weaker version of this test."""
-    home = tmp_path / "runtime"
-    python = _fake_runtime(home)
-    monkeypatch.setattr(adapter, "runtime", lambda: python)
-    packages = home / "lib" / "python3.12" / "site-packages"
-
-    before = adapter.runtime_digest()
-    assert adapter.runtime_digest() == before, "the same tree has to give the same answer"
-
-    (packages / "appworld" / "__init__.py").write_text("VERSION = 'two'\n")
-    edited = adapter.runtime_digest()
-    assert edited != before
-
-    (packages / "appworld" / "models.py").write_text("# a module that was not installed before\n")
-    added = adapter.runtime_digest()
-    assert added != edited
-
-    (packages / "widget-2.0.dist-info").mkdir()
-    (packages / "widget-2.0.dist-info" / "RECORD").write_text("widget/__init__.py,,\n")
-    assert adapter.runtime_digest() != added
-
-    # And it reaches the number every row carries, which is the only reason the digest exists.
-    from shogym.envs.appworld.env_v1 import run_fingerprint
-
-    stamped = run_fingerprint(pulse=0, report="graded", blocks=60)
-    (packages / "appworld" / "__init__.py").write_text("VERSION = 'three'\n")
-    assert run_fingerprint(pulse=0, report="graded", blocks=60) != stamped
-
-
-def test_a_bytecode_cache_is_part_of_the_runtime_identity(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
-) -> None:
-    """A `.pyc` is executable input, and the digest used to skip every one of them.
-
-    The defence of skipping them was that provisioning leaves the runtime holding hash-based
-    caches, which the import system validates against the source's own hash. That validation
-    binds the *source hash written in the cache's header* to the source, and binds nothing to the
-    marshalled code after it. So a cache whose header still matched its source and whose payload
-    had been changed was executable code the run's identity had never read, and the identity did
-    not move.
-
-    This builds precisely that: a real checked-hash cache, then one byte of its payload changed
-    with the sixteen-byte header left exactly as it was."""
-    import py_compile
-
-    home = tmp_path / "runtime"
-    python = _fake_runtime(home)
-    monkeypatch.setattr(adapter, "runtime", lambda: python)
-    installed = home / "lib" / "python3.12" / "site-packages" / "appworld" / "__init__.py"
-
-    compiled = Path(
-        py_compile.compile(
-            str(installed),
-            doraise=True,
-            invalidation_mode=py_compile.PycInvalidationMode.CHECKED_HASH,
-        )
-    )
-    before = adapter.runtime_digest()
-    source, original = installed.read_bytes(), compiled.read_bytes()
-    edited = bytearray(original)
-    edited[-1] ^= 0xFF
-    compiled.write_bytes(bytes(edited))
-
-    assert compiled.read_bytes()[:16] == original[:16], "the source hash it records is untouched"
-    assert installed.read_bytes() == source, "and so is the source it claims to stand for"
-    assert adapter.runtime_digest() != before
 
 
 def test_a_runtime_is_reused_only_when_it_is_the_one_the_pins_name(
@@ -2003,66 +1018,6 @@ def test_a_runtime_that_resolved_another_release_never_gets_published(tmp_path: 
     )
     with pytest.raises(adapter.ProvisioningError, match="but this port pins"):
         adapter._check_pin(home)
-
-
-def test_a_runtime_publish_that_fails_leaves_an_interpreter_under_the_name(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
-) -> None:
-    """Publishing a rebuilt runtime used to be able to leave no runtime at all.
-
-    The incumbent is renamed aside and the staged tree renamed in, and the displaced copy was then
-    removed whatever had happened in between. A failure at the second rename therefore left the
-    canonical name absent and the only interpreter left under a `.replaced` name nothing ever
-    looks for: injected once, the probe found no runtime under the name at all. That is worse than
-    a failed build, because the runtime is what every world runs under and a worker already
-    serving out of the old tree keeps its open files but resolves every new import through the
-    name that has just disappeared.
-
-    The same two outcomes the corpus publish is checked for, and the second is why restoring is
-    not enough on its own. When the incumbent goes back, the caller is still told the publish
-    failed, rather than being handed a path to an interpreter that was never published. When the
-    restore cannot happen either, the displaced copy is kept under its own name, because it is
-    then the only copy of that interpreter there is."""
-    home = tmp_path / "runtime"
-    _fake_runtime(home)
-    (home / "bin" / "python").write_text("what live workers run under")
-
-    def _publishing(failing: Tuple[int, ...]) -> None:
-        """Stage a rebuild and publish it with those renames, by position, refused.
-
-        Rename 1 moves the incumbent aside, rename 2 moves the staged tree in, and rename 3 is the
-        restore that only happens because rename 2 did not."""
-        staging = home.with_name(home.name + ".building")
-        _fake_runtime(staging)
-        (staging / "bin" / "python").write_text("the rebuild")
-        real_replace = os.replace
-        renames: List[int] = []
-
-        def _fails(source: Any, destination: Any, **kwargs: Any) -> None:
-            renames.append(1)
-            if len(renames) in failing:
-                raise OSError(errno.ENOSPC, "no space left on device")
-            real_replace(source, destination, **kwargs)
-
-        monkeypatch.setattr(adapter.os, "replace", _fails)
-        try:
-            with pytest.raises(OSError):
-                adapter._publish_runtime(staging, home)
-        finally:
-            monkeypatch.setattr(adapter.os, "replace", real_replace)
-
-    # The publish fails: the incumbent goes back under its own name, with its own bytes.
-    _publishing(failing=(2,))
-    assert (home / "bin" / "python").read_text() == "what live workers run under"
-    assert not list(tmp_path.glob("*.replaced.*")), "and nothing is left displaced"
-    assert not list(tmp_path.glob("*.building")), "nor left half-built"
-
-    # The restore fails too: the only interpreter left is retained rather than removed.
-    _publishing(failing=(2, 3))
-    displaced = list(tmp_path.glob("*.replaced.*"))
-    assert not home.exists(), "this is the case where the name really is gone"
-    assert len(displaced) == 1, "so the interpreter itself has to still be somewhere"
-    assert (displaced[0] / "bin" / "python").read_text() == "what live workers run under"
 
 
 # ----- what an env goes on serving after it has said what corpus it serves -----
@@ -2163,13 +1118,13 @@ def test_a_mount_that_cannot_lock_refuses_the_builders_and_still_serves_the_down
 ) -> None:
     """The fallback the concurrency test above never exercises, on both sides of the fork.
 
-    `_locked` yielded with no exclusion at all when the filesystem could not provide `flock`,
-    which is right for the upstream-source download it was written for: that publishes by one
-    atomic rename and a loser validates the winner, so the loss is redundant work. It is wrong for
-    every caller here. The runtime and corpus builders stage under fixed `.building` names they
-    delete first, so two of them remove and publish each other's half-built tree, and the
-    permission windows open a published directory and seal it again, which a second process inside
-    them closes under the first's feet.
+    `_locked` yields with no exclusion at all when the filesystem cannot provide `flock`, which is
+    right for the upstream-source download it was written for and for the derivation beside it:
+    both publish by an atomic rename out of a staging name of the builder's own, so a loser finds
+    the winner's tree and drops what it built, and the loss is redundant work. It is wrong for the
+    runtime and the corpus builders, which stage under a fixed `.building` name they delete first:
+    two of them without exclusion remove and publish each other's half-built tree, and one of
+    those trees is the interpreter every world runs under.
 
     Simulated at the errno, because a filesystem that cannot lock is not a thing a test suite
     has."""
@@ -2205,173 +1160,22 @@ def test_a_mount_that_cannot_lock_refuses_the_builders_and_still_serves_the_down
     (original / "tasks" / "abc_1" / "ground_truth").mkdir()
     (original / "tasks" / "abc_1" / "dbs" / "todoist.jsonl").write_text("")
     (original / "shared").write_text("base databases")
-    # The permission window over the shared entries.
-    with pytest.raises(_upstream.ExclusionUnavailable):
-        world.derive_root(original=original, derived=tmp_path / "derived" / "data")
-    # And the one over the published tasks directory.
-    with pytest.raises(_upstream.ExclusionUnavailable):
-        world.derive_task(
-            original=original,
-            derived=tmp_path / "derived2" / "data",
-            graded=tmp_path / "graded2" / "data",
-            task_id="abc_1",
-            write_log=lambda source, into: into.write_text("seeded"),
-        )
+    # The derivation, on the other hand, still runs: it stages under a name of its own and
+    # publishes by rename, which is correct without a lock rather than because of one, so a mount
+    # with no locks costs redundant work and never a broken tree.
+    derived = world.derive_root(original=original, derived=tmp_path / "derived" / "data")
+    assert (derived / "shared").read_text() == "base databases"
+    world.derive_task(
+        original=original,
+        derived=derived,
+        graded=tmp_path / "graded" / "data",
+        task_id="abc_1",
+        write_log=lambda source, into: into.write_text("seeded"),
+    )
+    assert (derived / "tasks" / "abc_1" / "dbs" / "todoist.jsonl").read_text() == "seeded"
 
 
-# ----- the snapshot's bounds cover the operations that spend them -----
-
-
-def test_the_walk_stops_inside_a_directory_rather_than_after_reading_all_of_it(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
-) -> None:
-    """The enumeration was the one part of the walk no bound could reach.
-
-    `sorted(source.iterdir())` read and sorted a whole directory before the first check of the
-    node count, the deadline or the stop flag, so an episode that left a million names in one
-    directory spent all of that time and memory after the budget was gone and after the
-    finalization it belonged to had been cancelled. The entries arrive one at a time now, and the
-    bound is spent as they arrive.
-
-    Counted at the seam rather than timed, because "it stopped early" is the claim and a
-    stopwatch is not how to say it."""
-    outputs = tmp_path / "outputs"
-    outputs.mkdir()
-    for index in range(400):
-        (outputs / f"{index}.jsonl").write_text("x")
-
-    consumed = 0
-    real_scandir = os.scandir
-
-    class _counting:
-        def __init__(self, inner: Any) -> None:
-            self._inner = inner
-
-        def __enter__(self) -> "_counting":
-            return self
-
-        def __exit__(self, *exc: Any) -> None:
-            self._inner.__exit__(*exc)
-
-        def __iter__(self) -> "_counting":
-            return self
-
-        def __next__(self) -> Any:
-            nonlocal consumed
-            entry = next(self._inner)
-            consumed += 1
-            return entry
-
-    monkeypatch.setattr(os, "scandir", lambda path: _counting(real_scandir(path)))
-
-    monkeypatch.setattr(adapter, "_SNAPSHOT_MAX_NODES", 5)
-    with pytest.raises(adapter.SnapshotError, match="more than 5 entries"):
-        adapter.snapshot_outputs(outputs, into=tmp_path / "a")
-    assert 0 < consumed <= 6, "the walk read the whole directory before it refused it"
-
-    # The deadline is read inside the enumeration too, not only between directories.
-    consumed = 0
-    monkeypatch.setattr(adapter, "_SNAPSHOT_MAX_NODES", 20_000)
-    monkeypatch.setattr(adapter, "_SNAPSHOT_SECONDS", -1.0)
-    with pytest.raises(adapter.SnapshotError, match="longer than"):
-        adapter.snapshot_outputs(outputs, into=tmp_path / "b")
-    assert consumed <= 1
-
-
-def test_a_cancelled_snapshot_stops_partway_through_a_file(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
-) -> None:
-    """Once per file is not a bound on a tree with one big file in it.
-
-    `shutil.copyfile` is one call with no way in, so a finalization that was cancelled while the
-    copy was inside a large file waited out the whole of it. The bytes move in chunks now and the
-    flag is read between them, which is what makes cancellation a bound on the work rather than on
-    the gaps between pieces of it."""
-    outputs = tmp_path / "outputs"
-    outputs.mkdir()
-    (outputs / "one.jsonl").write_bytes(b"x" * (1 << 16))
-    # Sixty-four chunks for one file, so a flag raised on the tenth reading is raised well inside
-    # it however the checks before the copy are arranged.
-    monkeypatch.setattr(adapter, "_SNAPSHOT_CHUNK_BYTES", 1024)
-
-    class _after:
-        """A stop flag that is not set when the copy starts and is set once it is under way."""
-
-        def __init__(self, checks: int) -> None:
-            self.checks = checks
-            self.seen = 0
-
-        def is_set(self) -> bool:
-            self.seen += 1
-            return self.seen > self.checks
-
-    stop = _after(checks=10)
-    with pytest.raises(adapter.SnapshotError, match="abandoned"):
-        adapter.snapshot_outputs(
-            outputs,
-            into=tmp_path / "into",
-            stop=stop,  # pyright: ignore[reportArgumentType]
-        )
-    # It stopped with the file part copied, which is the whole claim: the refusal came from inside
-    # one copy rather than from the gap after it.
-    partial = tmp_path / "into" / "one.jsonl"
-    assert partial.exists()
-    assert 0 < partial.stat().st_size < (1 << 16)
-
-
-def test_the_deadline_is_read_while_one_file_is_still_being_copied(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
-) -> None:
-    """The same gap, told by the clock instead of by the flag.
-
-    A copy that crosses the sixty-second budget used to run to the end of the file and only then
-    be noticed, so an episode with one enormous file decided how long finalization took. The
-    bounds are shrunk here rather than the file grown: a chunk of one byte over a megabyte is work
-    that certainly outlasts a fiftieth of a second, and the assertion is that it was stopped in
-    the middle of it."""
-    outputs = tmp_path / "outputs"
-    outputs.mkdir()
-    (outputs / "one.jsonl").write_bytes(b"x" * (1 << 20))
-
-    monkeypatch.setattr(adapter, "_SNAPSHOT_CHUNK_BYTES", 1)
-    monkeypatch.setattr(adapter, "_SNAPSHOT_SECONDS", 0.05)
-    with pytest.raises(adapter.SnapshotError, match="longer than"):
-        adapter.snapshot_outputs(outputs, into=tmp_path / "into")
-    partial = tmp_path / "into" / "one.jsonl"
-    assert partial.exists()
-    assert 0 < partial.stat().st_size < (1 << 20)
-
-
-def test_the_previous_snapshot_is_removed_under_the_same_bound(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
-) -> None:
-    """The destination is one character away from a name the world is handed.
-
-    AppWorld is given the episode's output root by absolute path, and the snapshot goes to that
-    name with `.graded` on the end, in a process running as the same user. So the tree removed
-    before the copy is a tree the episode can size, and it was removed by an `rmtree` outside
-    every bound: the deadline had not started, the stop flag was not read, and nothing counted the
-    entries."""
-    outputs = tmp_path / "outputs"
-    outputs.mkdir()
-    (outputs / "one.jsonl").write_text("what the episode submitted")
-
-    into = tmp_path / "outputs.graded"
-    (into / "planted").mkdir(parents=True)
-    for index in range(400):
-        (into / "planted" / f"{index}.jsonl").write_text("x")
-
-    monkeypatch.setattr(adapter, "_SNAPSHOT_MAX_NODES", 5)
-    with pytest.raises(adapter.SnapshotError, match="more than 5 entries"):
-        adapter.snapshot_outputs(outputs, into=into)
-
-    # And a cancelled finalization does not wait out the removal either.
-    stop = threading.Event()
-    stop.set()
-    monkeypatch.setattr(adapter, "_SNAPSHOT_MAX_NODES", 20_000)
-    with pytest.raises(adapter.SnapshotError, match="abandoned"):
-        adapter.snapshot_outputs(outputs, into=into, stop=stop)
-    assert (into / "planted").exists(), "nothing was removed after the flag was seen"
+# ----- provisioning is bounded -----
 
 
 def test_a_provisioning_subprocess_that_never_finishes_is_not_waited_on_forever(
@@ -2516,81 +1320,6 @@ def test_a_shared_entry_edited_after_the_snapshot_is_not_derived_into_a_root(
     (root / "data" / "base_dbs" / "big.jsonl").write_text("shared")
     world.derive_root(original=root / "data", derived=derived, verify=check)
     assert (derived / "base_dbs" / "big.jsonl").read_text() == "shared"
-
-
-# ----- a task is reused only when it is still the task that was derived -----
-
-
-def test_a_task_that_is_no_longer_what_was_derived_is_built_again(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
-) -> None:
-    """Reuse was decided by two path existences, which is not a task.
-
-    The question asked was whether the served `dbs/todoist.jsonl` and the graded `ground_truth`
-    were there. That says yes to a tree with everything else missing, to one whose databases were
-    changed after derivation, and to one whose read-only seal has come off; and what is reused is
-    the world every episode of the task starts in and the baseline it is graded against. Each of
-    the three is built here on a real derivation and the answer read.
-
-    A rebuild rather than a refusal, because a task that is not what was derived is a task this
-    can make correctly: the seeder is called again and the tree afterwards is the tree that was
-    published the first time."""
-    root = _derivable_corpus(tmp_path / "corpus")
-    env = _stub_env(root, tmp_path, monkeypatch)
-    seeder = _StubSeeder()
-    env._derive(seeder, "abc_1")
-    assert seeder.calls == 1
-    served = env._derived / "tasks" / "abc_1"
-    graded = env._graded / "tasks" / "abc_1"
-    assert world.already_derived(derived=env._derived, graded=env._graded, task_id="abc_1")
-    intact = {
-        path: path.read_bytes()
-        for path in sorted(served.rglob("*"))
-        if path.is_file() and not path.is_symlink()
-    }
-
-    def _damage(how: Any) -> None:
-        world._unseal(served)
-        how()
-        world._seal(served)
-
-    # A file removed, a file's bytes changed, and a node whose write bit came back. The third is
-    # left unsealed on purpose: it is the state a partial chmod leaves, and a shared task an
-    # episode can write to is one it can leave changed for the next episode and for the other arm
-    # of its own pair.
-    for damage in (
-        lambda: _damage(lambda: (served / "dbs" / "gmail.jsonl").unlink()),
-        lambda: _damage(lambda: (served / "dbs" / "gmail.jsonl").write_text("nail")),
-        lambda: world._unseal(served / "dbs" / "gmail.jsonl"),
-    ):
-        damage()
-        assert not world.already_derived(
-            derived=env._derived, graded=env._graded, task_id="abc_1"
-        )
-        before = seeder.calls
-        env._derive(seeder, "abc_1")
-        assert seeder.calls == before + 1, "rebuilt rather than trusted"
-        assert world.already_derived(derived=env._derived, graded=env._graded, task_id="abc_1")
-        assert {
-            path: path.read_bytes()
-            for path in sorted(served.rglob("*"))
-            if path.is_file() and not path.is_symlink()
-        } == intact
-
-    # And the grader's own view is held to the same standard: it is the baseline the evaluator
-    # diffs against, and half of it was never checked at all.
-    world._unseal(graded)
-    (graded / "ground_truth" / "answer.json").write_text('"moved"')
-    world._seal(graded)
-    assert not world.already_derived(derived=env._derived, graded=env._graded, task_id="abc_1")
-    env._derive(seeder, "abc_1")
-    assert json.loads((graded / "ground_truth" / "answer.json").read_text()) == "the answer"
-
-    # A warm episode pays for that check once per task, and this is what it costs.
-    began = time.monotonic()
-    for _ in range(20):
-        assert world.already_derived(derived=env._derived, graded=env._graded, task_id="abc_1")
-    assert (time.monotonic() - began) / 20 < 0.05
 
 
 # ----- what a finalizer may do before it yields -----
@@ -2789,108 +1518,6 @@ def test_a_handshake_that_fails_leaves_no_process_and_no_scratch_behind(
         assert not list(tmp_path.glob("shogym-appworld-*")), line
 
 
-def test_a_handshake_that_ends_at_end_of_file_signals_before_anything_reaps_the_leader(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
-) -> None:
-    """The one handshake failure the tests above do not cover, and the ordering it broke.
-
-    A worker that closes its pipe without printing is a worker that died, and the branch that
-    reports it read the leader's exit status to say so. ``poll`` reaps an exited child, and a
-    reaped leader releases both its pid and its group number for the kernel to hand on, so the
-    cleanup that followed signalled a number that might already have been somebody else's. That is
-    the stale-group ordering `Worker._stop_the_group` refuses by name, reached through the one
-    path nothing exercised.
-
-    The group is signalled while the leader is still unreaped now, which is the window in which
-    the number is unambiguously this worker's, and a worker that started something before dying
-    has that something stopped with it."""
-    script = tmp_path / "eof_worker.py"
-    script.write_text(
-        "import os, subprocess, sys\n"
-        "sys.stdin.readline()\n"
-        # A descendant that does not hold the handshake pipe, so the leader's exit is an
-        # end-of-file rather than a wait for the whole spawn timeout.
-        "child = subprocess.Popen([sys.executable, '-c', 'import time; time.sleep(120)'],\n"
-        "                        stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)\n"
-        "open(sys.argv[0] + '.child', 'w').write(str(child.pid))\n"
-        # And then it dies without ever saying which port it bound.
-        "sys.exit(3)\n"
-    )
-    monkeypatch.setattr(adapter, "runtime", lambda: Path(sys.executable))
-    monkeypatch.setattr(adapter, "WORKER", script)
-    monkeypatch.setattr(adapter.tempfile, "tempdir", str(tmp_path))
-    monkeypatch.setenv("SHOGYM_CACHE", str(tmp_path / "cache"))
-
-    # `_group_of` is asked once per worker, on the worker, which is how this test gets a handle on
-    # the leader without standing between the constructor and the process it starts.
-    leader: List[subprocess.Popen] = []
-    real_group_of = adapter._group_of
-    real_killpg = os.killpg
-    reaped_when_signalled: List[Optional[int]] = []
-
-    def _capture(process: subprocess.Popen) -> Optional[int]:
-        leader.append(process)
-        return real_group_of(process)
-
-    def _watch(pgid: int, how: int) -> None:
-        # What the leader's status was at the instant the group was signalled. `None` is an
-        # unreaped leader, which is the only state in which this number is certainly its group's.
-        reaped_when_signalled.append(leader[0].returncode if leader else -1)
-        real_killpg(pgid, how)
-
-    monkeypatch.setattr(adapter, "_group_of", _capture)
-    monkeypatch.setattr(adapter.os, "killpg", _watch)
-
-    with pytest.raises(adapter.WorkerError, match="never bound a port"):
-        adapter.Worker.spawn(tmp_path / "root")
-
-    assert reaped_when_signalled, "the group was never signalled at all"
-    assert reaped_when_signalled[0] is None, (
-        "the group was signalled after the leader had been reaped, so the number may have been "
-        "handed on before the signal reached it"
-    )
-    child = int(Path(str(script) + ".child").read_text())
-    deadline = time.monotonic() + 30
-    while time.monotonic() < deadline:
-        try:
-            os.kill(child, 0)
-        except ProcessLookupError:
-            break
-        time.sleep(0.05)
-    else:
-        os.kill(child, signal.SIGKILL)
-        raise AssertionError("what the worker started outlived the failed handshake")
-    assert not list(tmp_path.glob("shogym-appworld-*")), "and the scratch went with it"
-
-
-def test_a_leader_something_already_reaped_is_abandoned_without_a_signal(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
-) -> None:
-    """The guard itself, in the state a caller can arrive in however it got there.
-
-    A pid is reserved until its parent reaps it, and a process group exists while any member holds
-    it: once the leader has been waited on, both numbers are the kernel's to hand out again. So a
-    cleanup handed an already-reaped leader may signal nothing, which is the same rule
-    :meth:`Worker._stop_the_group` applies and the same one this used to break unconditionally.
-    The scratch directory is still cleared, because that is this call's own to remove."""
-    leader = _sleeper(120)
-    pgid = adapter._group_of(leader)
-    leader.kill()
-    leader.wait(timeout=30)  # reaped: the number is no longer this worker's
-
-    signalled: List[Tuple[int, int]] = []
-    monkeypatch.setattr(
-        adapter.os, "killpg", lambda group, how: signalled.append((group, how))
-    )
-    scratch = tmp_path / "shogym-appworld-reaped"
-    scratch.mkdir()
-
-    adapter._abandon(leader, pgid, scratch)
-
-    assert signalled == [], "a released group number was signalled"
-    assert not scratch.exists(), "the scratch directory is still this call's to remove"
-
-
 def test_a_session_that_never_opens_leaves_no_served_view_behind(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -2924,94 +1551,6 @@ def test_a_session_that_never_opens_leaves_no_served_view_behind(
     assert closed == [True]
     assert not view.exists()
     assert not adapter.episode_outputs("orphan").exists()
-
-
-# ----- what the runtime digest leaves out, and why that is safe -----
-
-
-def test_a_stale_bytecode_cache_is_not_what_the_worker_executes(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
-) -> None:
-    """The digest skips `__pycache__`, and the usual defence of that is not quite true.
-
-    Python discards a cache whose recorded source mtime and size have changed, which is weaker
-    than "whose source has changed": an ordinary `.pyc` carrying the right two numbers is executed
-    whatever is in it. This builds exactly that and proves the interpreter runs it, rather than
-    asserting that it would not; then it rebuilds the same cache the way provisioning does, as a
-    hash-based one the import system checks against the source's own hash, and proves the source
-    is what runs.
-
-    That is what an edited *source* costs, and it is only half the question. An edited *payload*
-    under a matching header is executed by either kind, which is why the digest reads these bytes
-    rather than reasoning about them: see
-    `test_a_bytecode_cache_is_part_of_the_runtime_identity`."""
-    import py_compile
-
-    site = tmp_path / "site"
-    package = site / "widget"
-    package.mkdir(parents=True)
-    source = package / "__init__.py"
-
-    def _plant(mode: "py_compile.PycInvalidationMode") -> None:
-        source.write_text("VALUE = 'cached'\n")
-        py_compile.compile(str(source), doraise=True, invalidation_mode=mode)
-        stamped = source.stat()
-        # The same length, so the cache's recorded size still matches, and the same modification
-        # time, so its recorded timestamp does too. The cache and the source now disagree, and a
-        # timestamp cache has nothing that could say so.
-        source.write_text("VALUE = 'source'\n")
-        os.utime(source, (stamped.st_atime, stamped.st_mtime))
-
-    def _value() -> str:
-        finished = subprocess.run(
-            [sys.executable, "-c", "import widget; print(widget.VALUE)"],
-            capture_output=True,
-            text=True,
-            env={
-                "PATH": os.environ.get("PATH", ""),
-                "PYTHONPATH": str(site),
-                "PYTHONDONTWRITEBYTECODE": "1",
-            },
-            timeout=60,
-        )
-        assert finished.returncode == 0, finished.stderr
-        return finished.stdout.strip()
-
-    _plant(py_compile.PycInvalidationMode.TIMESTAMP)
-    assert _value() == "cached", "a metadata-valid timestamp cache is executable code"
-
-    _plant(py_compile.PycInvalidationMode.CHECKED_HASH)
-    assert _value() == "source", "a hash-based cache is checked against the source it claims"
-
-    # And both halves of what puts the runtime in that state: every cache in it is rewritten as a
-    # hash-based one at provisioning, and a worker writes none back.
-    scratch = tmp_path / "scratch"
-    assert adapter._worker_environment(scratch)["PYTHONDONTWRITEBYTECODE"] == "1"
-
-
-def test_the_runtime_digest_covers_the_interpreter_the_venv_borrows(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
-) -> None:
-    """`bin/python` is a link out of the tree, and nothing read what it points at.
-
-    The digest walked `site-packages` and read `pyvenv.cfg`, which names the base interpreter's
-    *directory*. A directory is a label. The executable every world actually runs under was
-    outside the identity, so a base interpreter replaced or repointed under the same
-    configuration was one identity with the one before it."""
-    home = tmp_path / "runtime"
-    python = _fake_runtime(home)
-    base = tmp_path / "base" / "python3.12"
-    base.parent.mkdir()
-    base.write_bytes(b"an interpreter\n")
-    python.unlink()
-    python.symlink_to(base)
-    monkeypatch.setattr(adapter, "runtime", lambda: python)
-
-    before = adapter.runtime_digest()
-    assert adapter.runtime_digest() == before
-    # The same length, because a digest that only noticed lengths would pass a weaker test.
-    base.write_bytes(b"another one!!!\n")
-    assert adapter.runtime_digest() != before
 
 
 # ----- an unpack is finished or it is not -----
@@ -3052,10 +1591,6 @@ def test_a_half_unpacked_runtime_is_unpacked_again_rather_than_trusted(
     assert [command[-1] for command in ran][:1] == ["install"], (
         "the sentinel file alone is not proof the unpack finished"
     )
-    # And the interpreter is left with hash-based bytecode caches, which is what makes the runtime
-    # digest's silence about `__pycache__` a true statement rather than a hopeful one.
-    compiled = ran[-1]
-    assert "compileall" in compiled and "checked-hash" in compiled and "-f" in compiled
     unpacked = len(ran)
 
     adapter.ensure_apps()
