@@ -3720,14 +3720,8 @@ class TaskStream:
             # yet: if a span refuses to open, the episode never starts and the position is
             # still owed. Spans first, so nothing needs cleaning up when one fails.
             spans, dispensed_extensions = await self._begin_spans(ref)
-            # Built off the loop. `env_for` is the caller's function and some envs make it do
-            # real work in it: one that provisions an interpreter, walks a corpus and takes file
-            # locks would otherwise hold every other episode this server is running, before the
-            # episode it is building has even opened.
             episode = await ServedEpisode.open_env(
-                await asyncio.to_thread(self._env_for, ref.env),
-                env_name=ref.env,
-                task=ref.task_idx,
+                self._env_for(ref.env), env_name=ref.env, task=ref.task_idx
             )
             try:
                 # The episode's own snapshot, taken when it was opened and the same for every
