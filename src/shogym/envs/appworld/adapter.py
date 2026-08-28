@@ -58,7 +58,7 @@ from pathlib import Path
 from typing import Any, Dict, List, Mapping, Optional, Sequence, Tuple
 
 from shogym.envs._upstream import _locked
-from shogym.envs.appworld import container
+from shogym.envs.appworld import container, world
 from shogym.envs.appworld.container import CORPUS_MOUNT, GRADED_MOUNT, OUTPUTS_MOUNT, Mount
 
 # ----- the pins -----
@@ -296,7 +296,11 @@ def task_specs(root: Path, task_id: str) -> Dict[str, Any]:
 #: Bumped when the shape of a derived tree changes: what is copied, what is linked, what is
 #: sealed. It is in both cache names, so a tree built under an older layout is a different cache
 #: rather than a stale one wearing the same name.
-DERIVATION_VERSION = 1
+#:
+#: 2: the shared half of a derived root is the entries this port names rather than everything the
+#: corpus had beside ``tasks`` (see :data:`~world.SHARED_ENTRIES`), so a tree built under 1 holds
+#: entries a tree built under 2 does not.
+DERIVATION_VERSION = 2
 
 #: What a derived cache was built from, written inside it once it is complete.
 _SOURCE_FILE = ".shogym-source"
@@ -864,16 +868,6 @@ def _imported_modules(name: str, source: Path) -> "Iterator[str]":
                 yield f"{base}.{alias.name}"
 
 
-def _generator_sources() -> Tuple[Path, ...]:
-    """The files whose bytes decide what a derived corpus holds.
-
-    What a backlog is drawn as (``ledger``), what a derived tree is made of and what the seeded
-    rows say (``world``), and how those rows are actually written into a task's database log
-    (``worker``)."""
-    here = Path(__file__).parent
-    return tuple(here / name for name in ("ledger.py", "world.py", "worker.py"))
-
-
 @lru_cache(maxsize=1)
 def _generator_digest() -> str:
     """Eight hex characters over everything that decides what a backlog looks like: the constants
@@ -1165,6 +1159,26 @@ def _worker_environment(root: str) -> Dict[str, str]:
     }
 
 
+def _shared_mounts(data: Path, at: str) -> List[Mount]:
+    """The shared half of a corpus, named rather than enumerated, and only what is there.
+
+    **An allowlist, where this was a denylist.** Every top-level entry except ``tasks`` was
+    mounted, which puts whatever a corpus happens to carry inside the container that runs
+    agent-authored code: the pinned bundle ships a `LICENSE` and a `README_BEFORE_SHARING.md`
+    beside the four this port serves, and ``APPWORLD_ROOT`` takes any directory with a
+    ``data/tasks`` in it. None of that was ground truth and none of it was a grade; what it was is
+    a list this port described as exhaustive and did not build that way.
+
+    Only what exists, because a bind whose source is missing is a directory the daemon creates and
+    root owns, and a corpus without one of these fails where the world opens it, with upstream's
+    own words, which is where it failed before this list existed."""
+    return [
+        Mount(data / name, f"{at}/data/{name}")
+        for name in world.SHARED_ENTRIES
+        if (data / name).exists()
+    ]
+
+
 def served_mounts(*, root: Path, task_id: str, outputs: Path) -> List[Mount]:
     """Everything one episode's world can see, and it is a short list.
 
@@ -1178,12 +1192,18 @@ def served_mounts(*, root: Path, task_id: str, outputs: Path) -> List[Mount]:
     own output root, so an absolute one replaces the root, which is what keeps an episode's end
     state and its evaluator artifacts out of the tree the next episode is served.
 
+    **The shared half is an allowlist, and was a denylist.** It used to be every top-level entry
+    of the derived root except ``tasks``, which puts anything the corpus happens to carry inside
+    the boundary by default: the pinned bundle already ships a `LICENSE` and a
+    `README_BEFORE_SHARING.md`, and ``APPWORLD_ROOT`` takes any directory with a ``data/tasks`` in
+    it, so a custom corpus's own files were mounted because nothing had said they should not be.
+    None of that was ground truth and none of it was a grade; what it was is a list this port
+    described as exhaustive and did not build that way. The named entries are the ones a world
+    reads (:data:`~world.SHARED_ENTRIES`), and an entry not on the list is not mounted, whoever
+    put it in the corpus.
+
     ``root`` is the derived root, the parent of ``data``."""
-    mounts = [
-        Mount(entry, f"{CORPUS_MOUNT}/data/{entry.name}")
-        for entry in sorted((root / "data").iterdir())
-        if entry.name != "tasks"
-    ]
+    mounts = _shared_mounts(root / "data", CORPUS_MOUNT)
     mounts.append(Mount(root / "data" / "tasks" / task_id, f"{CORPUS_MOUNT}/data/tasks/{task_id}"))
     mounts.append(Mount(outputs, OUTPUTS_MOUNT, writable=True))
     return mounts
@@ -1196,11 +1216,7 @@ def graded_mounts(*, graded: Path, task_id: str, outputs: Path) -> List[Mount]:
     line an agent wrote, so this is not a boundary; it is the mount set that makes the grader's
     view exist at all, because the answers and the episode's output tree live in two different
     places on the host and the evaluator wants a root and an experiment."""
-    mounts = [
-        Mount(entry, f"{GRADED_MOUNT}/data/{entry.name}")
-        for entry in sorted((graded / "data").iterdir())
-        if entry.name != "tasks"
-    ]
+    mounts = _shared_mounts(graded / "data", GRADED_MOUNT)
     mounts.append(Mount(graded / "data" / "tasks" / task_id, f"{GRADED_MOUNT}/data/tasks/{task_id}"))
     mounts.append(Mount(outputs, OUTPUTS_MOUNT, writable=True))
     return mounts
@@ -1403,13 +1419,24 @@ class Worker:
                 # facts; this sets the first and attempts the second.
                 self._stop_after_failure()
                 raise WorkerError(f"the appworld worker: {self.poisoned}") from exc
-        if "error" in answer:
-            # **Poisoned, because what it did before it failed is unknown.** Upstream returns an
-            # agent's own exceptions as output, so an error on this channel is the worker's own
-            # handling going wrong, and every command ends with a save this cannot say happened.
-            self.poisoned = f"{command!r} failed inside the world: {answer['error']}"
-            raise WorkerError(f"appworld worker refused {command!r}: {answer['error']}")
-        return answer["output"]
+            if "error" in answer:
+                # **Poisoned, because what it did before it failed is unknown.** Upstream returns
+                # an agent's own exceptions as output, so an error on this channel is the worker's
+                # own handling going wrong, and every command ends with a save this cannot say
+                # happened.
+                #
+                # **Under the lock that read the answer, which it was not.** The lock is the whole
+                # of what `settle` asks: acquiring it is the fact that no call is in flight. This
+                # branch ran after the `with` had released it, so between the release and the
+                # assignment there was an interval in which the worker was neither busy nor
+                # poisoned. A terminal is deliberately allowed to overtake an ordinary call, so
+                # finalization could land exactly there: `settle` returned true, the poison read
+                # empty, and the container was removed and its tree graded on the strength of a
+                # command that had just failed inside the world. Both facts are published while
+                # the lock still holds, so nothing observes one without the other.
+                self.poisoned = f"{command!r} failed inside the world: {answer['error']}"
+                raise WorkerError(f"appworld worker refused {command!r}: {answer['error']}")
+            return answer["output"]
 
     def close(self, *, confirm: bool = False) -> None:
         """Stop the worker, promptly and with a bound.
@@ -1504,12 +1531,10 @@ def seed(*, root: Path, source_dbs: Path, into: Path, rows: Dict[str, Any]) -> A
 
     Three mounts, one of them writable, and that one is the staging directory. This container runs
     no agent code, so its mount set is a matter of keeping the seam narrow rather than a boundary:
-    what it can see is one task's inputs and the tree it is writing into."""
-    shared = [
-        Mount(entry, f"{CORPUS_MOUNT}/data/{entry.name}")
-        for entry in sorted((root / "data").iterdir())
-        if entry.name != "tasks"
-    ]
+    what it can see is one task's inputs and the tree it is writing into. Built from the same
+    named list as the served set, so the three mount builders in this module cannot come to
+    disagree about what the shared half of a corpus is."""
+    shared = _shared_mounts(root / "data", CORPUS_MOUNT)
     return _one_shot(
         role="seed",
         body={**rows, "from_dbs": "/from", "into": f"/into/{into.name}"},

@@ -646,7 +646,22 @@ def reap(*, alive: Optional[Callable[..., bool]] = None) -> List[str]:
         # ambiguous case has to be the one where nothing happens.
         if not parent.isdigit() or running(int(parent), birth):
             continue
-        _run(["rm", "-f", identifier], timeout=_CONTROL_TIMEOUT_SECONDS, check=False)
+        # **What the daemon did, not what it was asked.** The removal used to be issued with
+        # `check=False` and the id appended whatever came back, so a refusing daemon produced a
+        # reap that reported a container gone, spent one of its budgeted removals on it and left
+        # no record anywhere: the ledger is the only thing `_deferred_work` consults, and this
+        # path never wrote to it, so housekeeping concluded there was nothing left to do and
+        # stopped. A container that is still there still holds a writable mount.
+        try:
+            gone = remove(identifier, confirm=True)
+        except DockerError:
+            # The daemon would not confirm it. Written down where the sweep looks, so a later pass
+            # tries it again rather than this being the last anyone hears of it.
+            disowned(identifier)
+            continue
+        if not gone:
+            disowned(identifier)
+            continue
         removed.append(identifier)
     return removed
 

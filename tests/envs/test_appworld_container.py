@@ -517,7 +517,12 @@ def test_the_reaper_removes_a_container_whose_parent_is_gone(
         if args[0] == "ps":
             return _Finished(0, "\n".join(listed))
         if args[0] == "inspect":
-            return _Finished(0, labels[args[-1]])
+            # A daemon that answers about what it still has. The reaper confirms a removal now,
+            # so a stub that reported every container present for ever would be a daemon refusing
+            # every removal rather than one performing them.
+            if args[-1] in removed:
+                return _Finished(1, "", "Error: No such object: %s" % args[-1])
+            return _Finished(0, labels.get(args[-1], "{}"))
         if args[0] in ("rm", "stop"):
             removed.append(args[-1])
             return _Finished(0, "")
@@ -527,7 +532,10 @@ def test_the_reaper_removes_a_container_whose_parent_is_gone(
     monkeypatch.setattr(container, "_run", _run)
     swept = container.reap(alive=lambda pid, birth="": pid == 4243)
     assert swept == ["dead1"]
-    assert removed == ["dead1"]
+    # A stop and a removal, and only for the one whose parent is gone.
+    assert set(removed) == {"dead1"}
+    # It really went, so nothing is written down for a later pass to come back to.
+    assert container.outstanding() == []
 
 
 def test_every_container_carries_who_started_it(
@@ -1871,3 +1879,226 @@ def test_the_hosts_own_procfs_is_not_what_a_world_reads(
     assert "processor" in contents["/proc/cpuinfo"]
     assert contents["/proc/uptime"].split() == ["0.00", "0.00"]
     assert contents["/proc/stat"].splitlines()[0].startswith("cpu ")
+
+
+def test_an_error_answer_is_poison_before_the_lock_it_was_read_under_is_released(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """Unusable and busy are the two facts finalization reads, and there was an interval with
+    neither.
+
+    The lock is the whole of what `settle` asks: acquiring it is the fact that no call is in
+    flight. The branch that turns an error answer into poison ran after the `with` had released
+    it, so between the release and the assignment a finalization could see a worker that was
+    neither busy nor poisoned. A terminal is deliberately allowed to overtake an ordinary call, so
+    that is not a theoretical interleaving: it is the one the serve layer arranges on purpose, and
+    what follows it is a confirmed removal and a grade taken over the tree a command that had just
+    failed inside the world was writing to.
+
+    Observed at the release itself rather than by racing a thread against it: what the invariant
+    says is that the two are published together, and the moment the lock becomes available to
+    `settle` is the moment that has to be true."""
+    monkeypatch.setattr(container, "_ledger", lambda: tmp_path / "disowned.txt")
+    stub = _ECHO.replace(
+        'send({"id": request["id"], "output": {"saw": request["command"]}})',
+        'send({"id": request["id"], "error": "the world raised inside the handler"})',
+    )
+    worker = _stub_worker(stub, monkeypatch)
+    monkeypatch.setattr(container, "remove", lambda name, confirm=False: True)
+
+    seen: List[bool] = []
+
+    class _Watched:
+        """The worker's own lock, reporting what was published by the time it was let go."""
+
+        def __init__(self, inner: Any) -> None:
+            self._inner = inner
+
+        def acquire(self, *args: Any, **kwargs: Any) -> bool:
+            return self._inner.acquire(*args, **kwargs)
+
+        def release(self) -> None:
+            seen.append(bool(worker.poisoned))
+            self._inner.release()
+
+        def __enter__(self) -> "_Watched":
+            self._inner.acquire()
+            return self
+
+        def __exit__(self, *exc: Any) -> None:
+            self.release()
+
+    worker.lock = _Watched(worker.lock)  # type: ignore[assignment]
+    try:
+        with pytest.raises(adapter.WorkerError, match="refused"):
+            worker.call("execute")
+        # The one release is the call's own, and the poison was already on the worker at it.
+        assert seen == [True], "the lock was let go before the failure was published"
+        # Which is the pair finalization reads: nothing is in flight, and this is not usable.
+        assert worker.settle(0.0) is True
+        assert "failed inside the world" in worker.poisoned
+    finally:
+        worker.process.kill()
+        adapter._close_pipes(worker.process)
+
+
+def test_an_orphan_the_daemon_would_not_remove_is_written_down_rather_than_counted(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """A reap that says a container went has to have found out that it did.
+
+    The labelled path issued `docker rm -f` and appended the id whatever came back, so a refusing
+    daemon produced a reap that reported the container gone, spent one of its budgeted removals on
+    it, and left no record anywhere. The ledger is the only thing the recurrence consults, and this
+    path never wrote to it, so housekeeping saw nothing outstanding and stopped: a container still
+    holding a writable mount, with nobody left who was going to try again."""
+    monkeypatch.setattr(container, "_ledger", lambda: tmp_path / "disowned.txt")
+
+    def _refusing(args, **_):
+        if args[0] == "ps":
+            return _Finished(0, "stubborn")
+        if args[0] == "inspect":
+            # Still there, before and after: this daemon will not remove it and says so by
+            # continuing to answer about it.
+            return _Finished(
+                0, '{"shogym.appworld.parent": "4242", "shogym.appworld.birth": "1700000000"}'
+            )
+        if args[0] in ("rm", "stop"):
+            return _Finished(1, "", "Error response from daemon: cannot remove")
+        raise AssertionError(args)
+
+    monkeypatch.setattr(container, "_run", _refusing)
+    swept = container.reap(alive=lambda pid, birth="": False)
+    # Not reported as removed, because it was not.
+    assert swept == []
+    # And written where the recurrence looks, so a later pass tries it again.
+    assert container.outstanding() == ["stubborn"]
+    from shogym.envs.appworld import env_v1
+
+    monkeypatch.setenv("SHOGYM_CACHE", str(tmp_path / "cache"))
+    assert env_v1._deferred_work() is True
+
+
+def test_a_wake_that_arrives_at_the_end_of_a_pass_is_not_lost(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """Deferring work has to wake something, and a wake that is refused has to survive.
+
+    A caller that found the flag held simply returned. So a teardown recording a disowned
+    container or an ended tree, in the window between the running pass concluding there was
+    nothing left and the thread letting the lock go, had its wake dropped: the pass exited on a
+    conclusion that was already out of date, and on a run's last episode nothing came after it.
+
+    Both halves of the window are driven here, on the thread of the test: the wake that arrives
+    while a pass is running, and the one that arrives after the last check of the flag and before
+    the release, which is the narrow one the loop alone cannot close."""
+    import threading as _threading
+
+    from shogym.envs.appworld import env_v1
+
+    class _Inline:
+        """A thread that runs where it is started, so the handoff can be read without a clock."""
+
+        def __init__(self, target: Any, name: str = "", daemon: bool = False) -> None:
+            self._target = target
+
+        def start(self) -> None:
+            self._target()
+
+    monkeypatch.setattr(_threading, "Thread", _Inline)
+
+    # A wake during the pass. The teardown that sends it finds the lock held and is refused.
+    passes: List[int] = []
+
+    def _during() -> None:
+        passes.append(1)
+        if len(passes) == 1:
+            env_v1._housekeep()
+
+    monkeypatch.setattr(env_v1, "_housekeeping_passes", _during)
+    env_v1._housekeep()
+    assert len(passes) == 2, "the wake sent during the pass was dropped"
+
+    # And a wake in the window the loop cannot see: after its last read of the flag, before the
+    # lock is released.
+    held = env_v1._HOUSEKEEPING
+    waking = [True]
+    later: List[int] = []
+
+    class _Waking:
+        def acquire(self, blocking: bool = True) -> bool:
+            return held.acquire(blocking)
+
+        def release(self) -> None:
+            if waking:
+                waking.pop()
+                env_v1._housekeep()
+            held.release()
+
+    monkeypatch.setattr(env_v1, "_HOUSEKEEPING", _Waking())
+    monkeypatch.setattr(env_v1, "_housekeeping_passes", lambda: later.append(1))
+    env_v1._housekeep()
+    assert len(later) == 2, "the wake sent while the lock was being let go was dropped"
+
+
+def test_a_corpus_entry_this_port_does_not_name_is_not_mounted(tmp_path: Path) -> None:
+    """The shared half of the mount set is an allowlist, and was a denylist.
+
+    It used to be every top-level entry of the derived root except `tasks`, which puts whatever a
+    corpus happens to carry inside the boundary by default. The pinned bundle already ships two
+    such files, and `APPWORLD_ROOT` takes any directory with a `data/tasks` in it, so a custom
+    corpus's own artifacts were mounted into the container that runs agent-authored code because
+    nothing had said they should not be. None of that is ground truth and none of it is a grade;
+    what it is, is a list this port called exhaustive and did not build that way."""
+    from shogym.envs.appworld import world
+
+    root = tmp_path / "derived"
+    data = root / "data"
+    for name in world.SHARED_ENTRIES:
+        (data / name).mkdir(parents=True)
+    (data / "tasks" / "abc_1").mkdir(parents=True)
+    # What the pinned bundle ships beside them, and what a custom root might.
+    (data / "LICENSE").write_text("upstream's licence")
+    (data / "README_BEFORE_SHARING.md").write_text("upstream's note")
+    (data / "somebody_elses_notes").mkdir()
+
+    mounts = adapter.served_mounts(root=root, task_id="abc_1", outputs=tmp_path / "outputs")
+    targets = {mount.target for mount in mounts}
+    assert targets == {
+        *(f"/corpus/data/{name}" for name in world.SHARED_ENTRIES),
+        "/corpus/data/tasks/abc_1",
+        "/outputs",
+    }
+    joined = " ".join(sorted(targets)) + " " + " ".join(str(m.source) for m in mounts)
+    for extra in ("LICENSE", "README_BEFORE_SHARING", "somebody_elses_notes"):
+        assert extra not in joined, extra
+    # The grader is not a boundary and is built from the same list anyway, so the two cannot
+    # drift into disagreeing about what a corpus is made of.
+    graded = adapter.graded_mounts(
+        graded=root, task_id="abc_1", outputs=tmp_path / "outputs"
+    )
+    assert {mount.target for mount in graded} == {
+        *(f"/graded/data/{name}" for name in world.SHARED_ENTRIES),
+        "/graded/data/tasks/abc_1",
+        "/outputs",
+    }
+
+
+def test_the_readme_names_exactly_the_procfs_entries_that_are_masked() -> None:
+    """What the port says it covers has to be what it covers.
+
+    The masked set is what the container runtime will let a bind cover, which is a fixed list this
+    port does not choose; the residual is everything else, and a reader deciding whether a paired
+    design can be split across machines is reading the README rather than the constant. So the two
+    are held to each other: an entry added to or dropped from the overlay set without the sentence
+    moving with it fails here."""
+    readme = (WORKER.parent / "README.md").read_text()
+    sentence = readme[readme.index("So fixed files are mounted over") :]
+    sentence = sentence[: sentence.index("\n\n")]
+    named = {word.strip("`,.") for word in sentence.split() if word.startswith("`")}
+    assert named == set(container._NEUTRAL_PROC), sorted(named ^ set(container._NEUTRAL_PROC))
+    # And the residual the README lists is not silently a subset of it.
+    residual = readme[readme.index("**What remains readable, in two kinds.**") :]
+    residual = residual[: residual.index("\n\nWhat that means for a design")]
+    for masked in container._NEUTRAL_PROC:
+        assert f"/proc/{masked}`" not in residual, masked
