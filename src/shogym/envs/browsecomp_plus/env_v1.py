@@ -2,18 +2,23 @@
 
 A Deep-Research **retrieval** benchmark: answer OpenAI BrowseComp's reasoning-heavy queries
 against a **fixed, human-verified corpus** (served ``search`` / ``get_document`` tools) instead
-of the live web — isolating search+reasoning from web noise and making runs reproducible. This
+of the live web — isolating search+reasoning from web noise and stabilising retrieval (not the
+whole run: cached inputs bypass the pins and the judge is sampled). This
 is "HLE with a fixed retrieval corpus": the answer is graded by an LLM judge (as in the HLE
-port), and the env adds deterministic **retrieval recall** and **citation** metrics computed
-purely off the recorded trajectory against the query's relevance judgements (qrels).
+port), and the env adds deterministic **retrieval recall** (off the recorded ``search`` steps)
+and **citation** metrics (off the submitted answer the terminal evidence carries), both scored
+against the query's relevance judgements (qrels).
 
 ``submit_answer`` is the env's ``score`` **terminal**: submitting **seals** the episode, then
 the env's ``finalize`` hook runs the LLM judge on the frozen submission (seal-before-verdict),
 so a graded verdict only ever exists for an already-sealed, un-continuable episode — the agent
 can never grade, read the verdict, then edit and re-grade. ``finalize`` returns core-owned,
-**sanitized** :class:`~shogym.serve.lifecycle.TerminalEvidence` (a public ``correct`` verdict
-only — never the judge's reasoning, extracted answer, or exception text); the pure ``_verify``
-scores from that evidence plus the deterministic retrieval/citation metrics off the trajectory.
+**sanitized** :class:`~shogym.serve.lifecycle.TerminalEvidence` — sanitized by *exclusion*: never
+the judge's reasoning, extracted answer, or exception text. The public verdict carries
+``correct`` and ``confidence``, ``judge_error`` when grading failed, and core's
+``finalize_error``; the pure ``_verify``
+scores from that evidence, plus retrieval recall off the recorded ``search`` steps and citation
+metrics off the submitted answer the same terminal evidence carries.
 
 The env **describes** a task (the query + the served tool manifest + a search/turn horizon),
 **serves** ``search`` / ``get_document`` / ``submit_answer`` over MCP (see :mod:`mcp_server`),
@@ -22,8 +27,11 @@ lives here — a harness drives the tools.
 
 This module imports **nothing** heavy at load time — not ``datasets``, not ``openai``, not
 ``pyserini`` — so ``import shogym`` (which imports this module to register the env) stays offline.
-The dataset (decrypted **in memory**; never persisted) and the BM25 index load lazily only when
-the *registered* env is constructed; the judge's client only when it is first called.
+The dataset (decrypted **in memory**; never persisted) loads when the *registered* env is
+constructed, which means a default ``make`` cold-downloads the query dataset and both qrel files;
+pass ``tasks`` to skip that. What ``make`` and ``describe`` do **not** do is provision or open
+the multi-GB BM25 index — that is deferred to session start. The judge's client is built only
+when it is first called.
 """
 
 from __future__ import annotations
@@ -96,8 +104,8 @@ class BrowseCompPlusEnv(Env):
         lazily-provisioned prebuilt index.
       - ``judge``: an injected :class:`~shogym.envs.browsecomp_plus.judge.Judge` (a scripted judge
         for offline tests). Default: :class:`~shogym.envs.browsecomp_plus.judge.OpenAIJudge`.
-      - ``judge_model`` / ``judge_base_url``: the default judge's model id + endpoint (point the
-        base URL at a vLLM Qwen3-32B for exact upstream fidelity).
+      - ``judge_model`` / ``judge_base_url``: the default judge's model id + endpoint (set both
+        to a vLLM Qwen3-32B to grade with upstream's model; the sampling still differs).
       - ``k`` / ``snippet_max_tokens``: retrieval knobs (upstream defaults 5 / 512).
       - ``max_turns``: the tool-call horizon.
     """
@@ -170,10 +178,12 @@ class BrowseCompPlusEnv(Env):
     def _searcher_for_session(self) -> Searcher:
         """The injected searcher, or a lazily-built default ``BM25Searcher`` (built once, shared).
 
-        Deferred to session start (not env construction), so ``shogym.make(...)``, the tool
-        manifest, and ``describe()`` stay offline: building the BM25 searcher opens the prebuilt
-        Lucene index (Java 21 + pyserini) and provisions the corpus, which must not happen just to
-        read the contract. The searcher is read-only, so one instance safely backs every episode."""
+        Deferred to session start (not env construction): building the BM25 searcher opens the
+        prebuilt Lucene index (Java 21 + pyserini) and provisions the corpus, which must not
+        happen just to read the contract. That deferral is about the index alone — a default
+        ``shogym.make(...)`` still loads the query dataset and both qrel files (see the module
+        docstring); only an injected ``tasks=`` avoids those downloads. The searcher is
+        read-only, so one instance safely backs every episode."""
         if self._searcher is not None:
             return self._searcher
         from shogym.envs.browsecomp_plus.data import bm25_index_path
@@ -186,7 +196,9 @@ class BrowseCompPlusEnv(Env):
         """The injected judge, or a lazily-built default ``OpenAIJudge`` (no network yet).
 
         Preflighted at session start (not env construction), so making the env, probing the tool
-        manifest, and ``describe()`` stay offline and keyless. The default ``OpenAIJudge`` needs
+        manifest, and ``describe()`` stay keyless and build no client. (They are not otherwise
+        network-free: a default construction downloads the queries and qrels.) The default
+        ``OpenAIJudge`` needs
         ``OPENAI_API_KEY`` to grade answers; with no key it would fail-close every answer to
         incorrect, silently deflating the benchmark. Raise early and clearly instead — but only in
         the "forgot the key" case: an injected ``judge=`` or a ``judge_base_url`` override (a
@@ -331,7 +343,8 @@ class BrowseCompPlusEnv(Env):
         evidence: Optional[TerminalEvidence] = None,
     ) -> FeedbackCollection:
         """Score the episode: correctness from the core-owned ``evidence`` (never marker JSON),
-        plus deterministic retrieval/citation metrics off the recorded trajectory + the task's
+        plus retrieval recall off the recorded trajectory and citation metrics off the submitted
+        answer the same evidence carries, both against the task's
         qrels. Pure over its inputs."""
         return score_trajectory(trajectory, task, terminated=terminated, evidence=evidence)
 
@@ -350,12 +363,14 @@ def score_trajectory(
 
     Correctness comes from the core-owned :class:`TerminalEvidence` the seal transaction
     produced (the judge's verdict) — not from any tool result the agent can forge. The
-    retrieval/citation metrics are deterministic over the trajectory + the task's qrels.
+    retrieval recall is deterministic over the trajectory and the citation metrics over the
+    submitted answer carried on the terminal evidence, both against the task's qrels.
 
     Emits, on termination:
       - ``correct`` (bool) — the judge's verdict (False if the episode ended with no evidence).
       - ``confidence`` (0–1) + ``calibration_error`` (``|confidence − correct|``) — only when a
-        submission was graded (HLE-style calibration; omitted on a horizon/abort end).
+        submission was graded (HLE-style, a local per-episode diagnostic rather than upstream's
+        batch ``calib_err``; omitted on a horizon/abort end).
       - ``judge_error`` (True) — only when the grade was a fail-closed judge failure, or the
         finalize transaction itself failed closed.
       - ``retrieval_recall`` — fraction of the query's evidence docids retrieved across all

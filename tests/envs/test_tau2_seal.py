@@ -5,13 +5,16 @@ Covers the tau2-specific migration onto the terminal-seal substrate: the manifes
 ``done`` as the single ``score`` terminal (``terminate`` = abort); an explicit ``done`` seals
 the episode and ``_verify`` scores from core-owned evidence (never marker JSON); a tau2
 autonomous max-step stop is preserved and scored via the evaluator; reaching the shogym horizon
-runs the evaluator over the completed run (**preserve_upstream_maxstep**), not a premature
-zero; and ``close()`` waits for an in-flight finalize before tearing down (tau2's
+finalizes through this env (returning tau2's verdict) rather than having core synthesize a
+premature zero — in the ordinary path upstream's MAX_STEPS has already evaluated and stashed
+that verdict, and the horizon finalizer returns it; and ``close()`` waits for an in-flight
+finalize before tearing down (tau2's
 ``end_session``/``abort`` can't race the finalizer).
 
 Requires the ``tau2`` extra plus the provisioned upstream source, and a loadable tau2 ``mock``
 data set — skipped otherwise (naming the reason), so the offline core suite stays green. Solo
-mode ⇒ no user-simulator LLM ⇒ fully offline.
+mode ⇒ no user-simulator LLM ⇒ keyless (importing tau2's registry still reaches for litellm's
+model-cost map unless ``LITELLM_LOCAL_MODEL_COST_MAP=true``).
 """
 
 from __future__ import annotations
@@ -128,15 +131,17 @@ async def test_autonomous_maxstep_stop_verdict_is_preserved_through_the_seal() -
         await episode.close()
 
 
-# ----- shogym horizon: preserve_upstream_maxstep (evaluator over the completed run) -----
+# ----- shogym horizon: finalize through the env, never a core-synthesized zero -----
 
 
 async def test_horizon_runs_the_evaluator_finalize_not_a_premature_zero() -> None:
     # Drive past the shogym horizon: the budget-reaching step seals with source="horizon" and runs
-    # this env's finalize (tau2's evaluator over the completed run) — NOT an independent premature
-    # zero. Proof is deterministic and value-independent: finalize IS invoked with source=horizon
-    # (an `abort`/`terminate` would instead have core synthesize no-score evidence WITHOUT calling
-    # finalize). max_steps=1 -> horizon=3: step 1 auto-stops, steps 2-3 reach the cap.
+    # this env's finalize, so the verdict is tau2's — NOT a core-synthesized premature zero. What
+    # is proved is the provenance, not that evaluation happens at the horizon: with max_steps=1 ->
+    # horizon=3, step 1 already auto-stops tau2 on its own MAX_STEPS and stashes that verdict, and
+    # steps 2-3 merely reach the outer cap, where finalize returns the stored result. (An
+    # `abort`/`terminate` would instead have core synthesize no-score evidence WITHOUT calling
+    # finalize.)
     idx = _mock_task_index("create_task_1")
     episode = await ServedEpisode.start("tau2_mock", task=idx, env_config={"max_steps": 1})
     seen: dict = {}

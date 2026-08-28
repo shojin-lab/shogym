@@ -10,7 +10,7 @@ declares ``requires-python >=3.13`` (shogym is hard-pinned to 3.12 because tau2 
 ``anthropic`` agent-loop stack. So a ``pip``/``uv`` resolve of ``automation-bench`` under 3.12 is
 *unsatisfiable*.
 
-The env-as-center port needs none of that loop. It reuses only the three deterministic,
+The env-as-center port needs none of that loop. It reuses only the three offline,
 ``verifiers``-free pieces — the simulated tools + ``WorldState`` engine, the typed task defs, and
 the pure rubric (all of which import fine on 3.12 with just ``pydantic`` + ``datasets``). So this
 adapter **provisions the pinned upstream source at runtime** into a gitignored cache

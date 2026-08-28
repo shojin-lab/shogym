@@ -1,13 +1,21 @@
 # `browsecomp_plus` — BrowseComp-Plus, a Deep-Research retrieval env ("HLE with a fixed corpus")
 
-A faithful shogym port of [**BrowseComp-Plus**](https://github.com/texttron/BrowseComp-Plus) (ACL
-2026) — answer OpenAI BrowseComp's reasoning-heavy queries against a **fixed, human-verified
-~100K-doc corpus** served as `search` / `get_document` tools, instead of the live web. Freezing
-the corpus isolates search + reasoning from web noise and makes runs reproducible. `submit_answer`
-is the **score terminal**: submitting seals the episode and the env's `finalize` hook grades the
-sealed answer with an LLM judge (as in the [HLE](../hle/README.md) port), and the env adds
-deterministic **retrieval-recall** and **citation** metrics computed purely off the recorded
-trajectory against the query's relevance judgements (qrels) — so it exercises shogym's verification
+[**BrowseComp-Plus**](https://github.com/texttron/BrowseComp-Plus) ([arXiv
+2508.06600](https://arxiv.org/abs/2508.06600)) served through
+shogym at upstream commit `0469490`, which covers the qrels and the evaluation / judge code this
+port copies; the encrypted queries and the BM25 index carry their own Hugging Face revisions
+(see [Fidelity & deviations](#fidelity--deviations)). The task: answer OpenAI BrowseComp's
+reasoning-heavy queries against a **fixed, human-verified ~100K-doc corpus** served as
+`search` / `get_document` tools, instead of the live web. Freezing the corpus isolates search +
+reasoning from web noise, and the pinned cold-cache inputs keep retrieval stable. That is not
+end-to-end reproducibility: a cached or overridden index or qrel file bypasses the pins, and the
+judge is lower variance rather than deterministic (see
+[Fidelity & deviations](#fidelity--deviations)). `submit_answer` is the **score terminal**:
+submitting seals the episode and the env's `finalize` hook grades the sealed answer with an LLM
+judge (as in the [HLE](../hle/README.md) port), and the env adds deterministic
+**retrieval-recall** and **citation** metrics scored against the query's relevance judgements
+(qrels): recall off the recorded `search` steps, citations off the submitted answer the terminal
+evidence carries — so it exercises shogym's verification
 surface with both a model judge *and* deterministic retrieval metrics.
 
 Like every shogym env this **describes** a task, **serves** its tools over MCP, and **verifies** a
@@ -18,7 +26,8 @@ recorded trajectory while an external harness drives the tools — see
 ## Running it
 
 > Requires **Python 3.12 + the `browsecomp_plus` extra**, an OpenAI key for the judge, Hugging
-> Face access to the (encrypted) query dataset, and a **Java 21** runtime (pyserini/Lucene) — the
+> Face network access for the (encrypted, but public and ungated) query dataset, and a **Java 21**
+> runtime (pyserini/Lucene) — the
 > prebuilt **BM25 index auto-downloads once** on first served use. See
 > [Requirements](#requirements). Offline tests need none of it.
 
@@ -27,7 +36,7 @@ recorded trajectory while an external harness drives the tools — see
 ```python
 import shogym
 
-env = shogym.make("browsecomp_plus")     # train split; decrypts queries in memory, loads BM25 index
+env = shogym.make("browsecomp_plus")     # train split; decrypts queries in memory
 spec = env.describe("0")                # task 0: the query + tool manifest
 ```
 
@@ -76,17 +85,20 @@ pulls `datasets` (the encrypted queries), `openai` (the default judge client), a
 
 - **Java 21.** pyserini's BM25 backend runs on Lucene (JVM). Without a JDK 21 the real retriever
   can't run; offline tests use an in-memory searcher and need no Java.
-- **`OPENAI_API_KEY`.** `submit_answer` grades with an LLM judge. With the default judge, an
+- **`OPENAI_API_KEY`.** Grading runs in the env's `finalize`, after `submit_answer` seals the
+  episode, and uses an LLM judge. With the default judge, an
   episode **fails fast at startup** if no key is set (so a keyless run never silently scores
   everything wrong). Opt out by injecting a scripted `judge`, or point `judge_base_url` at a
-  keyless OpenAI-compatible endpoint (e.g. a vLLM **Qwen3-32B** — the upstream judge).
+  keyless OpenAI-compatible endpoint. For upstream's own judge set **both** `judge_base_url` (a
+  vLLM **Qwen3-32B**) and `judge_model` to that model id: the base URL alone still requests
+  `gpt-4.1`, which such a server rejects as unknown.
 - **The query dataset (`Tevatron/browsecomp-plus`).** Queries + answers are **XOR-encrypted**
   with a canary to keep the benchmark off plain-text crawls. shogym decrypts them **in memory
   only** — it never writes or commits decrypted queries/answers, and the canary is preserved.
   The dataset downloads once to `~/.cache/shogym/browsecomp_plus` (honor `HF_HOME` or
   `SHOGYM_BROWSECOMP_PLUS_DATA_DIR`). The per-query qrels are lazy-downloaded from the pinned
   upstream commit and cached alongside.
-- **The prebuilt BM25 index (~2.78 GB).** **Auto-downloads once** to
+- **The prebuilt BM25 index (~2.17 GB).** **Auto-downloads once** to
   `~/.cache/shogym/browsecomp_plus/bm25/` on first real (served) use — from the upstream HF *dataset*
   repo `Tevatron/browsecomp-plus-indexes` (`bm25/*`), the same source as upstream's
   `scripts_build_index/download_indexes.sh`, provisioned lazily like the queries/qrels. The
@@ -113,7 +125,7 @@ Backed by the in-process server in `mcp_server.py` (shogym's near-verbatim reuse
 - **`submit_answer(answer, confidence)`** — the **score terminal**. The serve layer validates
   its args, atomically **seals** the episode, then runs the env's `finalize` hook — so its handler
   body is never dispatched inward. The **judge runs in `finalize`**: it grades `answer` against
-  the session's gold answer (BrowseComp-Plus's own `GRADER_TEMPLATE`, temp 0 for determinism) and
+  the session's gold answer (BrowseComp-Plus's own `GRADER_TEMPLATE`, at a requested temp 0) and
   returns core-owned, **sanitized** `TerminalEvidence`. Submitting ends the episode; single
   submission is structural (a second `submit_answer` is tombstoned).
 - **`terminate()`** — the reserved `abort` terminal (ending without a submission scores
@@ -138,7 +150,9 @@ qrels. `score_trajectory` reads:
 - **`correct`** — the judge's verdict, off the core-owned `evidence.verdict` (never a marker in a
   tool result the agent can forge). A judge / finalize failure is flagged `judge_error=True`.
 - **`confidence`** (0–1) + **`calibration_error`** (`|confidence − correct|`) — HLE-style, read
-  from the validated submission (`evidence.args`); omitted on a horizon/abort end.
+  from the validated submission (`evidence.args`); omitted on a horizon/abort end. A local
+  per-episode diagnostic, not upstream's batch `calib_err` (see
+  [Fidelity & deviations](#fidelity--deviations)).
 - **`retrieval_recall`** — fraction of the query's evidence docids (`qrel_evidence`) retrieved
   across all `search` steps (BrowseComp-Plus's retrieval recall).
 - **`citation_recall` / `citation_precision` / `num_citations`** — cited-docid metrics vs
@@ -173,21 +187,48 @@ semantics (give each run its own trace file for a guaranteed 1:1 mapping).
 
 ## Fidelity & deviations
 
-- **Upstream pin.** Upstream commit `0469490` (MIT). The auto-downloaded BM25 index is pinned to
-  an immutable commit of `Tevatron/browsecomp-plus-indexes` (`INDEX_REVISION` in `data.py`), so a
-  cold-cache download is reproducible and can't drift with an upstream index replacement.
+- **Three separate pins.** GitHub commit `0469490` (MIT) covers the qrels and the evaluation /
+  judge code this port copies. The encrypted queries are pinned to Hugging Face revision
+  `144cff8e35b5eaef7e526346aa60774a9deb941f` of `Tevatron/browsecomp-plus`, and the prebuilt
+  BM25 index to revision `b3f37f70c33829eb09d04784a54277a31871fd63` of
+  `Tevatron/browsecomp-plus-indexes` (`HF_QUERIES_REVISION` and `INDEX_REVISION` in `data.py`),
+  so a cold-cache download is reproducible and cannot drift with an upstream replacement.
+- **The pins bind only a cold download.** `bm25_index_path()` uses
+  `SHOGYM_BROWSECOMP_PLUS_BM25_INDEX` as given, and reuses an existing `cache_dir()/bm25` if one
+  is already there, neither checked against `INDEX_REVISION`. `load_qrels()` does the same for
+  `qrel_golds.txt` / `qrel_evidence.txt`: fixed paths under `cache_dir()`, reused whenever the
+  file exists, with no hash and no commit in the name. Only the download paths apply a pin, so a
+  pre-provisioned or previously cached index or qrel file is a trusted, unversioned input, and a
+  stale one moves scores under the `0469490` label.
 - **Retriever pinned to BM25.** The retriever materially changes scores (BM25 vs dense
   Qwen3-Embedding), so the backend is named in the TaskSpec and this first cut pins **BM25**
   (CPU/Java-only; the dense path needs Faiss + GPU — a deferred follow-up).
-- **Judge.** Pinned to temp 0 for determinism; upstream reports GPT-4.1 (paper) / Qwen3-32B
+- **Judge.** Requests temp 0 and falls back to the endpoint default if that request raises
+  (`OpenAIJudge.__call__`), so it is lower variance, not a determinism guarantee; upstream
+  reports GPT-4.1 (paper) / Qwen3-32B
   (vLLM) — shogym defaults to GPT-4.1, overridable via `judge_model` / `judge_base_url`. A judge
   failure fails closed to `correct=False` with `judge_error=True`.
 - **Queries stay encrypted at rest.** The XOR/canary decryption happens only in memory at load;
   shogym never writes or commits decrypted queries/answers. The canary constant is preserved.
+- **Snippets are cut on whitespace, not subwords.** Upstream truncates a `search` snippet with
+  the `Qwen/Qwen3-0.6B` tokenizer (`searcher/tools.py`); this port splits on whitespace to stay
+  dependency-light. At the same nominal `snippet_max_tokens=512` a whitespace token is usually
+  longer than a subword one, so the agent generally sees a different, longer evidence window
+  than upstream would show it. That can change the submitted answer and its citations, so it is
+  a scoring-relevant deviation even though retrieval recall (docid-based) is unaffected.
+- **`calibration_error` is a local diagnostic, not upstream's metric.** This env emits a
+  per-episode `|confidence − correct|` from the `confidence` argument the agent passes to
+  `submit_answer`. Upstream has the *judge* extract a confidence from the response and computes
+  an adaptive **batch** calibration error (`calib_err`, `p=2`, `beta=100`, over at least 100
+  replies) in `scripts_evaluation/evaluate_run.py`. The two are not comparable; do not report
+  this number against the published Calibration Error.
+- **The 80/20 split is this port's.** Upstream evaluates its supplied query population whole.
+  This env slices it positionally into `train` / `test` and defaults to the 80% `train`
+  subset, so a default run is not scored on the published benchmark population.
 
 ## Gotchas
 
-- **The index is heavy but auto-provisioned.** ~2.78 GB Lucene index (Java 21); it auto-downloads
+- **The index is heavy but auto-provisioned.** ~2.17 GB Lucene index (Java 21); it auto-downloads
   once to `~/.cache/shogym/browsecomp_plus/bm25/` on first served use (override with
   `SHOGYM_BROWSECOMP_PLUS_BM25_INDEX`). The Java check runs *before* that download, so a missing JVM
   fails fast without paying for it. Offline tests inject a tiny synthetic corpus (no Java, no
@@ -210,8 +251,9 @@ semantics (give each run its own trace file for a guaranteed 1:1 mapping).
 - `mcp_server.py` — the in-process MCP server: `search` / `get_document` / `submit_answer` (the
   score terminal, never dispatched inward once sealed).
 - `searcher.py` — the `Searcher` seam: `InMemorySearcher` (fixtures) + `BM25Searcher` (pyserini).
-- `judge.py` — the LLM judge (`GRADER_TEMPLATE` + `parse_judge_response`, upstream verbatim).
-- `metrics.py` — pure retrieval-recall + citation precision/recall (upstream verbatim).
+- `judge.py` — the LLM judge, both pieces adapted from upstream: `GRADER_TEMPLATE` (one trailing
+  space dropped) and `parse_judge_response` (line-anchored verdict, fails closed).
+- `metrics.py` — pure retrieval-recall + citation precision/recall, adapted from upstream
+  (set-size denominators).
 - `data.py` — in-memory decryption (canary preserved), qrel + lazy BM25-index auto-download, and
   the Java-21 fast-check (before any multi-GB download).
-</content>

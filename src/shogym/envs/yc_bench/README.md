@@ -1,25 +1,30 @@
 # `yc_bench` — YC-Bench, CEO of a simulated AI startup
 
-A faithful shogym port of [**YC-Bench**](https://github.com/collinear-ai/yc-bench) (Collinear
-AI's long-horizon deterministic benchmark). YC-Bench puts an agent in charge of a simulated AI
-startup for one year: starting with **$200,000**, it issues `yc-bench` CLI commands against a
-deterministic, SQLite-backed discrete-event simulation — accepting tasks from a marketplace,
-assigning employees, advancing the clock, and managing cash flow — until **bankruptcy**
-(funds < 0) or the **one-year horizon**. The score is how the company ends up.
+[**YC-Bench**](https://github.com/collinear-ai/yc-bench) (Collinear AI's long-horizon,
+seeded benchmark) served through shogym at upstream commit `e7d6067`. YC-Bench puts an
+agent in charge of a simulated AI startup for one year: starting with **$200,000**, it issues
+`yc-bench` CLI commands against a seeded, SQLite-backed discrete-event simulation —
+accepting tasks from a marketplace, assigning employees, advancing the clock, and managing cash
+flow — until **bankruptcy** (funds < 0) or the **one-year horizon**. The score is how the
+company ends up.
 
 Like every shogym env this **describes** a task, **serves** its tools over MCP, and **verifies**
 a recorded trajectory while an external harness drives the tools — see
-[`../README.md`](../README.md). YC-Bench ships **no agent loop**: it explicitly expects an
-*external driver* to advance the sim, feed CLI results back, and collect the next commands.
-shogym's harness *is* that driver, so the port is a clean wrap — only the *agent* is replaced (by
-the harness, through the served tools). The runnable demo is
+[`../README.md`](../README.md). YC-Bench ships its own LLM agent loop (`agent/loop.py`, driven
+by `runner/main.py`) over a sim built to take an *external driver*: something has to advance the
+clock, feed CLI results back, and collect the next commands. shogym's harness is that driver.
+The port reuses YC-Bench's sim engine, CLI entry point and command validation, SQLite ORM, and
+`_init_simulation` world seeding; it replaces the agent loop and supplies the command, terminal
+and scoring layers around them. The runnable demo is
 [`examples/`](../../../../examples/).
 
 ## Running it
 
 > Requires **Python 3.12 + the `yc_bench` extra** — see [Requirements](#requirements). Unlike
-> tau2, YC-Bench needs **no data download**: its whole world is generated deterministically
-> from the seed and the sim runs in-process, so a served episode is fully offline (no API key).
+> tau2, YC-Bench needs **no data download**: its world is generated from the seed and the sim
+> runs in-process, so a served episode needs no key and no benchmark data once the pinned
+> upstream source is cached. The first construction fetches that source, and importing it pulls
+> in litellm, which reaches for a model-cost map (see [Requirements](#requirements)).
 
 ### Construct + serve
 
@@ -48,7 +53,8 @@ reads the verdict off the trace via `shogym.result_from_trace(...)`.
 
 **Config** (via `shogym.make(name, config)` / `env_config`): `task_split` (`"train"`/`"test"`),
 `config_name` (YC-Bench preset name or `.toml` path, default `"default"`), `max_commands`
-(command budget = the shogym horizon, default 4000), `horizon_years` (default: the preset's
+(the command budget, default 4000; the shogym horizon is `max_commands + 1`, leaving one
+reserved slot for the terminal `submit`), `horizon_years` (default: the preset's
 `sim.horizon_years`), `start_date` / `company_name` (seeding params, defaults match
 `yc-bench run`), and `command_timeout_seconds`.
 
@@ -62,7 +68,8 @@ variable at the top of its `serve.py`:
 ENV = "yc_bench"
 ```
 
-The sim itself is fully offline and needs no OpenAI or YC-Bench key; the harness still
+The sim itself needs no OpenAI or YC-Bench key and makes no model call of its own (importing the
+adapter still reaches for litellm's cost map, see [Requirements](#requirements)); the harness
 makes its own model calls.
 
 ## Requirements
@@ -79,13 +86,19 @@ the default `dev` group, so `uv sync` includes it. On top of that:
   release on PyPI is not the pinned commit — so the port fetches and imports the pinned source
   instead, exactly as `automationbench` does. The `yc_bench` extra declares upstream's own
   runtime dependencies explicitly, since pip no longer resolves them transitively.
-- **No data, no API key** for a served episode. YC-Bench generates its world deterministically
-  from the seed and runs its sim in-process, so once the source is cached the whole served path
-  (seed → commands → verdict) is offline. (A YC-Bench *model* key is only needed by upstream's
-  own agent loop, which this port replaces with the harness.)
+- **No data, no API key** for a served episode. YC-Bench generates its world from the seed and
+  runs its sim in-process, so once the source is cached the served path
+  (seed → commands → verdict) makes no network call of its own. It is not strictly
+  network-free: importing the adapter pulls in litellm (below), which fetches a model-cost map
+  on import unless `LITELLM_LOCAL_MODEL_COST_MAP=true`, falling back to a bundled copy when
+  that fails. (A YC-Bench *model* key is only needed by upstream's own agent loop, which this
+  port replaces with the harness.)
 - **Heavy extra.** YC-Bench depends on litellm / streamlit / matplotlib / plotly (its own
-  runner/dashboard). They install with the extra but are never imported by the served path
-  (only the sim engine, CLI commands, and ORM are), so command execution stays light.
+  runner/dashboard). streamlit, matplotlib and plotly are never imported. **litellm is**: the
+  adapter imports `_init_simulation` from `yc_bench.runner.main`, which pulls in
+  `agent.loop` and `agent.runtime.factory`, and that reaches `import litellm`. It is imported,
+  never called — the served path issues no model requests — but constructing the env pays its
+  import cost.
 
 ## How it works
 
@@ -106,10 +119,11 @@ client trust, adversarial clients), this run's **seed / preset**, and the **tool
 
 The env's in-process MCP server (`mcp_server.py`) seeds a **private, throwaway SQLite database
 per episode** on `begin_session` (one company/world, seeded deterministically from the task's
-seed via YC-Bench's own `_init_simulation`, so seeding is bit-identical to `yc-bench run`) and
+seed via YC-Bench's own `_init_simulation`, the same function `yc-bench run` calls, so the
+seeded world carries the same attributes as upstream's; the row ids are fresh `uuid4`s) and
 drops it on `end_session`. It exposes two tools:
 
-- **`run_command(command)`** — the faithful mirror of upstream's `run_command("yc-bench
+- **`run_command(command)`** — mirrors upstream's `run_command("yc-bench
   <cmd>")`: it validates the command with YC-Bench's own command policy, **allowlists the
   operational sub-command groups** (`company`, `employee`, `market`, `task`, `sim`, `finance`,
   `report`, `scratchpad`, `client`), then runs YC-Bench's real CLI entry point
@@ -142,9 +156,19 @@ second submission to guard against and no trajectory to scan for a forged marker
 ## Tasks
 
 A task **is a world seed**. The seed selects the market tasks generated for the world (upstream
-fixes employees/clients across seeds), so a seed fully reproduces an instance. `yc_bench` ships
-two disjoint seed banks — `train` (seeds 1–16) and `test` (seeds 9001–9016) — selected by
-`task_split` (default `train`). Task indices are relative to the chosen split.
+fixes employees/clients across seeds), so it reproduces the *business* attributes of an instance:
+the same companies, employees, clients and tasks with the same numbers. It does not reproduce
+the database **row ids**: upstream's `services/seed_world.py` mints a `uuid4()` for the company,
+every employee, every client and every market task, and for replacements. The command surface
+mostly reports a task by its deterministic **title**: `market browse` and the `task` commands
+emit `"task_id": task.title`, and titles are `Task-<serial>`. The raw UUIDs do reach the agent
+all the same — `core/engine.py` puts `"task_id": str(<uuid>)` in the `task_half` and
+`task_completed` wake events that `sim resume` returns, and upstream's `_resolve_task` accepts
+either a UUID or a title — so they are agent-visible, consumable state that differs every run.
+Event UUIDs are also the final tie-breaker between same-time, same-priority events, so event
+ordering is not fixed by the seed alone. `yc_bench` ships two disjoint seed banks —
+`train` (seeds 1–16) and `test` (seeds 9001–9016) — selected by `task_split` (default `train`).
+Task indices are relative to the chosen split.
 
 ## Scoring
 
@@ -181,23 +205,33 @@ semantics (give each run its own trace file for a guaranteed 1:1 mapping).
 
 ## Fidelity & deviations
 
-- **Verbatim reuse.** YC-Bench's sim engine, command execution/validation, SQLite state, world
-  seeding, and scoring are reused **verbatim** — only the agent is swapped for the harness.
-  There are **zero shogym core changes**; the whole port is additive under
-  `src/shogym/envs/yc_bench/`.
-- **Pinned to a commit SHA.** The extra is pinned to an upstream **commit SHA** — YC-Bench has
-  no stable public API, so a pin makes upstream drift a contained maintenance cost.
+- **What is reused, and what is not.** YC-Bench's sim engine, CLI entry point and command
+  validation, SQLite state/ORM, and `_init_simulation` world seeding are reused **verbatim**.
+  shogym supplies the layers around them: the command wrapper and allowlist (`adapter.run_cli`),
+  the terminal metrics derived off the sim DB (`adapter.read_final_state`), and the `reward` /
+  `success` fields plus the early-submit gate (`env_v1.score_verdict`). The numbers all come
+  from the sim's own rows; the shaping into episode feedback is shogym's. There are **zero
+  shogym core changes**; the whole port is additive under `src/shogym/envs/yc_bench/`.
+- **Pinned to commit `e7d6067`.** YC-Bench has no stable public API, so a commit pin makes
+  upstream drift a contained maintenance cost. The pin is the default runtime provisioner's;
+  `YC_BENCH_SRC` points the port at a local checkout whose revision nothing checks, so that
+  documented override is a trusted, unversioned path.
 - **`run` / `start` rejected.** `run_command` allowlists only the operational sub-command
   groups; `yc-bench run` (upstream's own credential-inheriting LLM agent loop) and `yc-bench
   start` (interactive) are rejected before any subprocess spawns — that agent loop is exactly
   what this port replaces with the harness.
-- **Determinism check.** For a fixed seed + command sequence the final funds are reproducible
-  run to run and match a direct `yc-bench` seeding of the same seed — the served/determinism
-  tests assert this.
+- **Determinism check, scoped to what is tested.** What is asserted is narrow:
+  `tests/envs/test_yc_bench_served.py` runs one seed through one command sequence twice and
+  checks the two runs end on the same funds. Nothing compares the result against a direct
+  `yc-bench` seeding, so equality with upstream is asserted nowhere here, and unlike the other
+  ports this one ships no keyed fidelity test. Row ids are `uuid4` and differ every run, they
+  reach the agent through `sim resume` wake events, and they break ties between simultaneous
+  events (see [Tasks](#tasks)), so treat determinism as a property of that tested outcome rather
+  than of the trajectory.
 
 ## Gotchas
 
-- **`sim resume` needs an active task.** Faithful to upstream, `yc-bench sim resume` refuses to
+- **`sim resume` needs an active task.** Matching upstream, `yc-bench sim resume` refuses to
   advance the clock with no active task — the agent must `market browse → task accept → task
   assign → task dispatch` first. The command returns an error payload (`ok: false`); it does
   not raise.
@@ -205,25 +239,27 @@ semantics (give each run its own trace file for a guaranteed 1:1 mapping).
   reads the sim's final state, scores it, and ends the run in one call. No separate `terminate`
   is needed (that stays available only as the *abort* terminal, which scores nothing).
 - **Long horizon.** A full year is many `run_command` / `sim resume` turns; the shogym horizon is
-  `max_commands + 1` (default 4001 steps) — `max_commands` non-terminal commands plus one
-  reserved slot so the terminal `submit` is never preempted by the horizon. Raise `max_commands`
-  for verbose policies.
+  `max_commands + 1` (default 4001 steps), and the `+ 1` is what keeps `submit` reachable.
+  `Episode.call` seals on the ordinary call that *reaches* the horizon, so with a horizon of
+  exactly `max_commands` the last budgeted command would itself end the episode and a following
+  `submit` would be tombstoned and scored as a horizon zero. The extra slot leaves the episode
+  open after the full budget. A `submit` issued while the episode is still open is handled
+  before the horizon check, so the horizon never preempts it — but that priority only helps
+  because the `+ 1` leaves an open episode to submit into. Raise `max_commands` for verbose
+  policies.
 - **One company per DB.** YC-Bench stores a single simulation per database, so each episode gets
   its own private SQLite file (seeded on `begin_session`, deleted on `end_session`). Sessions
   never share state.
 - **Offline vs keyed tests.** Follows the shared
   [offline-vs-keyed split](../README.md#tests-offline-vs-keyed): the pure-`verify` unit tests run
   in the core suite with no extra; the served + determinism tests need the `yc_bench` extra but
-  no API key (the sim is deterministic and in-process), and are `importorskip`-gated so the core
+  no API key (the sim runs in-process), and are `importorskip`-gated so the core
   3.12 suite stays green without it.
 
 ## Layout
-
-A source map for orientation:
 
 | File | Role |
 |---|---|
 | `env_v1.py` | The registered `yc_bench` env: `describe` (rules + seed + manifest), the train/test seed banks, the `finalize` hook (reads final sim metrics on the sealed episode), and the pure `_verify` scorer (verdict from evidence, with the genuine-terminal-state gate). |
 | `mcp_server.py` | The in-process MCP server: `run_command` (allowlisted `yc-bench` CLI against a per-session SQLite DB) + `submit` (the score terminal), seeding/dropping the private DB per session. |
 | `adapter.py` | The single seam funnelling all `yc_bench` imports (sim engine, CLI, ORM, `_init_simulation` seeding), so upstream API drift touches one file. |
-</content>

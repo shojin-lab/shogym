@@ -1,15 +1,17 @@
-"""``yc_bench`` on the env-as-center core (RFC 008): a faithful wrap of YC-Bench.
+"""``yc_bench`` on the env-as-center core (RFC 008): a wrap of YC-Bench.
 
 YC-Bench puts an agent in charge of a simulated AI startup for one year. Starting with
-$200,000, the agent issues ``yc-bench`` CLI commands against a deterministic, SQLite-backed
+$200,000, the agent issues ``yc-bench`` CLI commands against a seeded, SQLite-backed
 discrete-event simulation — accepting tasks from a marketplace, assigning employees,
 advancing the clock with ``sim resume``, and managing cash flow — until bankruptcy (funds < 0)
 or the one-year horizon. The score is how the company ends up.
 
-YC-Bench ships **no agent loop**: it expects an external driver to advance the sim, feed CLI
-results back, and collect the next commands. shogym's harness is that driver. This port is a
-clean wrap — the sim engine, command execution/validation, SQLite state, seeding, and scoring
-are reused verbatim (via :mod:`shogym.envs.yc_bench.adapter`); only the *agent* is replaced.
+YC-Bench ships its own LLM agent loop (``agent/loop.py``, driven by ``runner/main.py``) over a
+sim built to take an external driver: something has to advance the clock, feed CLI results
+back, and collect the next commands. shogym's harness is that driver. The sim engine, CLI entry
+point and command validation, SQLite state/ORM, and ``_init_simulation`` seeding are reused
+verbatim (via :mod:`shogym.envs.yc_bench.adapter`); the agent loop is replaced, and shogym
+supplies the command, terminal and scoring layers around them (see :func:`score_verdict`).
 
 This module imports **nothing** from ``yc_bench`` at load time, so ``import shogym`` (which
 imports this module to register the env) stays offline. yc-bench is imported lazily — only
@@ -46,7 +48,10 @@ DEFAULT_COMPANY_NAME = "BenchCo"
 
 # Deterministic, disjoint train/test seed banks. A task *is* a seed: it selects the market
 # tasks generated for the world (employees/clients are fixed across seeds upstream), so a seed
-# fully reproduces an instance. Seeds are small positive ints (upstream uses 1, 2, 3, …); the
+# reproduces an instance's *business attributes*. It does not reproduce the row ids: those are
+# fresh ``uuid4``s, they reach the agent in ``sim resume`` wake events, and they break ties
+# between simultaneous events (see the env README). Seeds are small positive ints (upstream
+# uses 1, 2, 3, …); the
 # test bank is offset far away so the two never overlap.
 _TRAIN_SEEDS: List[int] = list(range(1, 17))  # 16 tasks
 _TEST_SEEDS: List[int] = list(range(9001, 9017))  # 16 held-out tasks
@@ -102,7 +107,10 @@ class YcBenchEnv(Env):
     Config (all optional, via ``shogym.make("yc_bench", config=...)`` / ``env_config``):
       - ``task_split``: ``"train"`` (default) or ``"test"`` — selects the seed bank.
       - ``config_name``: YC-Bench preset name or ``.toml`` path (default ``"default"``).
-      - ``max_commands``: hard cap on commands per episode (the shogym horizon).
+      - ``max_commands``: the command budget per episode. The shogym horizon is
+        ``max_commands + 1``: the first ``max_commands`` ordinary commands leave the episode
+        open, and a further one both executes and seals. The ``+ 1`` is what keeps ``submit``
+        reachable after the full budget (see the README's *Long horizon* note).
       - ``horizon_years``: sim horizon (default: the preset's ``sim.horizon_years``).
       - ``start_date`` / ``company_name``: seeding parameters (defaults match ``yc-bench run``).
       - ``command_timeout_seconds``: per-command wall-clock budget.
@@ -235,8 +243,11 @@ class YcBenchEnv(Env):
         session (``engine.dispose()`` / DB teardown) only *after* this returns, so the read here
         always sees an open DB. The verdict is the sim's own end-state — the agent's company
         metrics, public-safe with no oracle; ``verify`` applies the terminal-state gate when it
-        scores it, and core stamps the provenance. Deterministic, offline, keyless: the sim is a
-        pure in-process function of the seed and the commands issued.
+        scores it, and core stamps the provenance. Keyless and in-process. Determinism is
+        narrower than it looks: the seeded *business attributes* follow the seed, and the tested
+        property is that one seed and one command sequence end on the same funds. Row ids are
+        ``uuid4``, they reach the agent through ``sim resume`` wake events, and they break ties
+        between simultaneous events, so the trajectory itself is not fixed by the seed.
         """
         from shogym.envs.yc_bench import mcp_server  # lazy: pulls in yc_bench
         from shogym.serve.lifecycle import TerminalEvidence

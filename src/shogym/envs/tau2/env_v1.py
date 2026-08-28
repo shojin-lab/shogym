@@ -1,4 +1,4 @@
-"""``tau2_<domain>`` on the env-as-center core (RFC 008): a faithful wrap of tau2-bench.
+"""``tau2_<domain>`` on the env-as-center core (RFC 008): a wrap of tau2-bench.
 
 The env declares one in-process MCP server (a per-domain module that hosts tau2's
 Orchestrator via its ``GymAgent`` bridge), loads a tau2 task per episode, and scores the run
@@ -120,9 +120,10 @@ class Tau2Env(Env):
         # Horizon: a generous cap on shogym steps (one per tau2 agent action). tau2's own
         # Orchestrator budget (`max_steps`, counted over message hops) almost always stops the
         # simulation first, and that autonomous stop stashes tau2's verdict (see mcp_server). If
-        # the shogym horizon is nonetheless reached, the serve layer runs this env's `finalize` with
-        # source="horizon" — so a hit horizon **scores tau2's evaluator over the completed run**
-        # (preserve_upstream_maxstep), never an independent premature zero. Kept at max_steps + 2
+        # the shogym horizon is nonetheless reached (only when calls were rejected before they
+        # advanced tau2), `finalize` delivers `done`, tau2 stops as AGENT_STOP, and the evaluator
+        # scores the completed run. In the ordinary case upstream's MAX_STEPS lands first and its
+        # own premature zero is what `finalize_once` returns. Kept at max_steps + 2
         # (unchanged) so the cap is never the binding constraint for a legitimate episode.
         super().__init__(horizon=max_steps + 2, num_tasks=len(self._task_ids))
 
@@ -363,7 +364,8 @@ def _find_verdict(trajectory: Trajectory) -> Optional[Dict[str, Any]]:
 
 @register("tau2_mock")
 class Tau2MockEnv(Tau2Env):
-    """tau2's ``mock`` domain (solo mode) — the smallest faithful, fully-offline slice."""
+    """tau2's ``mock`` domain (solo mode) — the smallest keyless slice (no user-simulator
+    model call; see the README on litellm's cost-map fetch at import)."""
 
     domain = "mock"
     solo_mode = True
@@ -374,7 +376,8 @@ class Tau2MockEnv(Tau2Env):
 @register("tau2_airline")
 class Tau2AirlineEnv(Tau2Env):
     """tau2's ``airline`` domain (non-solo; user simulator). reward_basis = DB + COMMUNICATE,
-    both scored offline — so a ``mock_response`` user makes the whole slice offline."""
+    both scored without a model call — so a ``mock_response`` user keeps the whole slice
+    keyless (see the README on litellm's cost-map fetch at import)."""
 
     domain = "airline"
     solo_mode = False
@@ -384,8 +387,10 @@ class Tau2AirlineEnv(Tau2Env):
 @register("tau2_retail")
 class Tau2RetailEnv(Tau2Env):
     """tau2's ``retail`` domain (non-solo). reward_basis includes NL_ASSERTION, so the *full*
-    reward needs a judge LLM (keyed). The DB component is scored offline — pass
-    ``evaluation_type="env"`` for an offline served run."""
+    reward needs a judge LLM (keyed). ``evaluation_type="env"`` scores the DB component only and
+    makes *evaluation* keyless; a keyless episode also needs a scripted user
+    (``user_llm_args={"mock_response": "…"}``), since this domain otherwise builds a live
+    ``UserSimulator``."""
 
     domain = "retail"
     solo_mode = False
@@ -406,8 +411,9 @@ class Tau2TelecomEnv(Tau2Env):
 class Tau2BankingKnowledgeEnv(Tau2Env):
     """tau2's ``banking_knowledge`` domain (non-solo). Pinned to the offline ``bm25_grep``
     retrieval variant so the env constructs/serves without OpenAI embeddings; the benchmark
-    default (``alltools``, dense embeddings) is a keyed follow-up. reward_basis includes
-    NL_ASSERTION — use ``evaluation_type="env"`` for an offline served run."""
+    default (``alltools``, dense embeddings) is a keyed follow-up. Exactly one of its 97 tasks
+    carries ``NL_ASSERTION`` in ``reward_basis`` — use ``evaluation_type="env"`` to score the
+    deterministic component offline."""
 
     domain = "banking_knowledge"
     solo_mode = False

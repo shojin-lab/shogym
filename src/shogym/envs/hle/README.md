@@ -1,16 +1,22 @@
 # `hle` — Humanity's Last Exam, shogym's first model-graded env
 
-A faithful shogym port of [**Humanity's Last Exam**](https://agi.safe.ai/) (HLE) — 2,500
+[**Humanity's Last Exam**](https://agi.safe.ai/) (HLE) served through shogym — 2,500
 expert, frontier-difficulty, closed-ended academic questions from the Center for AI Safety &
-Scale AI. HLE has essentially no tool surface: it is single-turn Q&A. Its value here is (a)
-coverage of a reasoning/QA task and (b) exercising shogym's **verification surface** with a real
-**LLM judge** — a model-graded verifier that nothing else in shogym uses.
+Scale AI. HLE has essentially no tool surface: it is single-turn Q&A. It covers a reasoning/QA
+task and exercises shogym's **verification surface** with a real **LLM judge**. It was shogym's
+first model-graded verifier; [`browsecomp_plus`](../browsecomp_plus/README.md) now grades the
+same way.
+
+The port loads the `cais/hle` test split and grades with HLE's judge prompt (lightly edited, see
+[Fidelity & deviations](#fidelity--deviations)); it filters out
+the image questions and picks its own judge model (see
+[Fidelity & deviations](#fidelity--deviations)).
 
 Like every shogym env this **describes** a task, **serves** its tools over MCP, and **verifies**
 a recorded trajectory while an external harness drives the tools — see
-[`../README.md`](../README.md). Here the single tool grades server-side, so the verifier stays
-a pure function over the sealed episode's evidence. The runnable demo is
-[`examples/`](../../../../examples/).
+[`../README.md`](../README.md). Here the single tool seals and the env's `finalize` grades
+server-side after it, so the verifier stays a pure function over the sealed episode's evidence.
+The runnable demo is [`examples/`](../../../../examples/).
 
 ## Running it
 
@@ -106,9 +112,14 @@ observation stream and no other tool.
   `OpenAIJudge`; offline tests inject a scripted judge, mirroring how the tau2 port injects a
   scripted user simulator. A judge failure **fails closed** — the answer scores incorrect and
   the verdict is flagged `judge_error` — rather than crashing the episode. The **result
-  returned to the agent is sanitized**: only the public-safe `correct` (bool) and `judge_error`
-  (bool). The judge's reasoning / extracted answer and any exception text are answer oracles —
-  they never reach the agent; they live only in the private, off-trace diagnostic.
+  returned to the agent is sanitized** by exclusion: the judge's reasoning, its extracted answer
+  and any exception text are answer oracles and never reach the agent, living only in the
+  private, off-trace diagnostic. What does reach it arrives on **two channels**. The terminal
+  result's JSON `content` is the sanitized verdict: `correct`, `judge_error`, plus `judge_model`
+  (and `judge_effort` when `judge_kwargs` set a `reasoning_effort`) on a model-judged episode,
+  and core's `finalize_error`. The `_meta["shogym/feedback"]` sidecar separately carries the
+  episode feedback, which for an explicit submission adds `confidence` and `calibration_error`
+  (see [Scoring](#scoring)).
 - **`terminate()`** — the reserved abort tool every env serves (`terminal_kind: abort`). Since
   `submit_answer` already ends the episode, a harness does **not** call `terminate` after
   submitting (it would be tombstoned); `terminate` before submitting ends the episode with no
@@ -132,8 +143,10 @@ Feedback emitted on termination (episode-level):
 - **`correct`** — did the judge (or the exact-match fast path) accept the answer.
 - **`confidence`** — the submitted 0–100 confidence as a 0–1 fraction.
 - **`calibration_error`** — `|confidence − correct|`, the per-episode Brier-style gap between
-  the stated confidence and the outcome (0 is perfectly calibrated). A terminal with no graded
-  submission emits only `correct = False` (there is no confidence to calibrate).
+  the stated confidence and the outcome (0 is perfectly calibrated). A local diagnostic, not
+  upstream's batch Calibration Error (see [Fidelity & deviations](#fidelity--deviations)).
+  A terminal with no graded submission emits only `correct = False` (there is no confidence to
+  calibrate).
 - **`judge_error`** — set (`True`) only when the grade fail-closed on a grading-infra failure
   (a judge exception, or a serve-layer finalize deadline/crash), so an analyst can filter those
   out of the genuine zeros.
@@ -174,27 +187,50 @@ semantics (give each run its own trace file for a guaranteed 1:1 mapping).
 
 ## Fidelity & deviations
 
-- **Grading is HLE's own.** The judge uses HLE's own judge prompt; the registered env defaults
-  to `OpenAIJudge` (overridable via `judge_model` / `judge_kwargs` / `judge_base_url`, or a
-  fully injected `judge`). The exact-match fast path is a free, offline pre-check that never
-  changes a correct verdict.
+- **The dataset is not pinned.** `data.py` calls `load_dataset("cais/hle", split="test")` with
+  no `revision`, so a cold cache resolves whatever the dataset repo's default branch holds at the
+  time. If upstream adds, removes or reorders rows, the 80/20 positional split moves with it and
+  a task index stops naming the same question. Two runs are comparable only when they read the
+  same cached snapshot.
+- **Grading follows HLE's, with three departures.** The judge prompt is HLE's
+  `hle_eval/run_judge_results.py` text, but not verbatim: this copy drops upstream's doubled
+  "if there if there" clause, drops a blank line before the `confidence:` field, and writes
+  `0%`/`100%` where upstream writes its escaped `0|\%|`/`100|\%|`. Upstream also grades through
+  `client.beta.chat.completions.parse` with a strict `response_format`, while this judge sends a
+  plain chat completion and parses the reply with a line-anchored regex that fails closed. The
+  registered env defaults to `OpenAIJudge` (overridable via `judge_model` / `judge_kwargs` /
+  `judge_base_url`, or a fully injected `judge`).
+- **The exact-match fast path can change a verdict.** It is meant as a free offline pre-check,
+  but its normalizer strips `!` `?` and brackets as trailing punctuation, and `str.strip`
+  then keeps going into the character beneath. So `exact_match("5", "5!")` and
+  `exact_match("g(n)=(n+1)", "g(n)=(n+1)!")` are both `True`, and `finalize` returns
+  `correct=True` without calling the judge at all, where upstream would have graded the
+  answer. Tracked as [issue #139](https://github.com/shojin-lab/shogym/issues/139); fixing the
+  normalizer changes scoring, so it is not part of this documentation pass.
 - **The default judge model is a scoring decision.** It is `gpt-5.6-luna`, at that model's own
   default reasoning effort, chosen on grading quality measured against the previous default
   (issue #122). Changing it changes measured accuracy, which is why every model-graded episode
   now records the model that graded it.
 - **Text-only for now.** Questions carrying an image are filtered out; multimodal is a
   follow-up.
+- **`calibration_error` is a local diagnostic, not upstream's metric.** This env emits a
+  per-episode `|confidence − correct|` from the `confidence` argument the agent passes to
+  `submit_answer`. Upstream has the judge extract a confidence from the response and reports an
+  adaptive **batch** calibration error over the run. The two are not comparable.
+- **The 80/20 split is this port's.** Upstream evaluates the 2,500-question set whole. This env
+  slices it positionally into `train` / `test` and defaults to the 80% `train` subset, so a
+  default run is not scored on the published benchmark population.
 - **Judge fail-closed.** A grading-infra failure scores `correct = False` with `judge_error =
   True` rather than crashing — so an infra failure is distinguishable from a genuine wrong
   answer, not silently counted as one.
 
 ## Gotchas
 
-- **The judge is model-graded and keyed.** `submit_answer` calls an OpenAI model unless the
-  answer hits the exact-match fast path. With the default judge, starting an episode without
-  `OPENAI_API_KEY` raises early (before any tool runs) rather than letting the run score
-  everything incorrect — inject a scripted `judge`, or set `judge_base_url` for a keyless local
-  endpoint, to opt out.
+- **The judge is model-graded and keyed.** Sealing on `submit_answer` runs `finalize`, which
+  calls an OpenAI model unless the answer hits the exact-match fast path. With the default
+  judge, starting an episode without `OPENAI_API_KEY` raises early (before any tool runs) rather
+  than letting the run score everything incorrect — inject a scripted `judge`, or set
+  `judge_base_url` for a keyless local endpoint, to opt out.
 - **The dataset is gated.** `cais/hle` needs accepted terms + HF auth; constructing the
   registered env downloads it (once). Inject `tasks` to construct the env without the download.
 - **Look-ups defeat the point.** HLE measures the model's own reasoning — a harness must deny
@@ -209,12 +245,9 @@ semantics (give each run its own trace file for a guaranteed 1:1 mapping).
 
 ## Layout
 
-A source map for orientation:
-
 | File | Role |
 |---|---|
 | `env_v1.py` | The registered `hle` env: `describe` (question + manifest), the dataset load + 80/20 split, the `finalize` hook (exact-match fast path → LLM judge on the sealed submission), and the pure `score_evidence` verifier. |
 | `mcp_server.py` | The in-process MCP server backing `submit_answer` (the score terminal, sealed before any verdict) + the reserved `terminate`. |
 | `judge.py` | The `Judge` seam: `OpenAIJudge` (default) + the scripted judge used by offline tests, plus HLE's own judge prompt. |
 | `data.py` | Loads the gated `cais/hle` dataset, filters to text-only, and caches under `~/.cache/shogym/hle`. |
-</content>

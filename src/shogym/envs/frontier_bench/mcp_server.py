@@ -51,7 +51,12 @@ _lock = threading.RLock()
 
 
 def _image_tags(task: FrontierTask) -> tuple[str, str]:
-    """Deterministic, content-addressed image tags so repeated episodes reuse a cached build."""
+    """Deterministic, content-addressed image tags, one per role.
+
+    The *environment* tag is what repeated episodes reuse: :func:`build_task_image`
+    existence-checks it and skips the build. The *verifier* tag is rebuilt on every finalization
+    and, unless ``keep_image``, removed afterwards, so only Docker's layer cache spares the
+    downloads there."""
     short = task.content_sha256[:12]
     return (
         f"shogym-frontier-env-{task.name}:{short}",

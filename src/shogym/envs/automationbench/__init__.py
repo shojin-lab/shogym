@@ -1,4 +1,4 @@
-"""AutomationBench env — a faithful, offline shogym wrap of Zapier's AutomationBench.
+"""AutomationBench env — an offline shogym wrap of Zapier's AutomationBench.
 
 See :mod:`shogym.envs.automationbench.env_v1` for the env, and ``README.md`` for the port notes.
 The upstream ``automationbench`` package (MIT, © Zapier) is provisioned at runtime into a

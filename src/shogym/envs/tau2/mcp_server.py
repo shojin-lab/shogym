@@ -15,9 +15,12 @@ call becomes the agent's next action:
     after ``send_message``, the **user-simulator's** reply) is returned as the MCP result;
   - **``send_message``** (non-solo domains) → an ``AssistantMessage`` with text content routed
     to the user simulator; its result is the user's reply;
-  - **``done``** → tau2's agent-stop; the Orchestrator finalizes and tau2's **evaluator** runs
-    over tau2's final state. The verdict JSON is returned as the result and later parsed off
-    the recorded trajectory by the env's pure ``verify`` (like wordle parses guess results).
+  - **``done``** → the env's ``score`` terminal. The serve layer **seals** the episode first and
+    then runs :meth:`~shogym.envs.tau2.env_v1.Tau2Env.finalize`, which drives tau2's agent-stop,
+    lets the Orchestrator finalize, and runs tau2's **evaluator** over tau2's final state exactly
+    once (:meth:`_Tau2Session.finalize_once`). The verdict comes back as core-owned
+    ``TerminalEvidence`` and the env's pure ``verify`` reads it from there; the trajectory scan is
+    kept only as a legacy defensive fallback.
 
 Only the *agent* is replaced; tau2's Orchestrator, user simulator, domains/tools/tasks, and
 evaluator are reused verbatim. State is keyed by ``_session_id`` (shogym injects it for tools

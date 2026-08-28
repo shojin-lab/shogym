@@ -1,4 +1,11 @@
-"""Lazy, gated data provisioning for the ``browsecomp_plus`` env (issue #43).
+"""Lazy data provisioning for the ``browsecomp_plus`` env (issue #43).
+
+Every Hugging Face repo this module touches is **public and ungated** (unlike the HLE port's
+``cais/hle``); what they need is network access, not accepted terms or a token. Two of them are
+pinned to an immutable revision — the queries (:data:`HF_QUERIES_REVISION`) and the prebuilt BM25
+index (:data:`INDEX_REVISION`). :data:`HF_CORPUS_DATASET` carries no revision and is never
+auto-downloaded; the qrels are pinned to a GitHub commit (:data:`UPSTREAM_COMMIT`), not an HF
+revision.
 
 Three pieces, all kept out of ``import shogym`` (imported only when the *registered* env is
 constructed, never at module import — so registering the env stays offline):
@@ -28,7 +35,8 @@ import sys
 from pathlib import Path
 from typing import Any, Dict, List, Optional, cast
 
-# BrowseComp-Plus fidelity pin (commit has no tags). Queries/qrels are read at this revision.
+# BrowseComp-Plus fidelity pin (commit has no tags). The qrels and the evaluation/judge code
+# this port copies come from this revision; the queries carry their own HF revision (below).
 UPSTREAM_COMMIT = "046949032b0328319cc9a02663a759ec601d9402"
 HF_QUERIES_DATASET = "Tevatron/browsecomp-plus"
 HF_QUERIES_SPLIT = "test"
@@ -39,7 +47,7 @@ HF_QUERIES_SPLIT = "test"
 # from the pinned qrels and BM25 index — reproducibility-breaking, invalid scores. Same fidelity
 # guarantee as ``INDEX_REVISION``; the repo exposes no tag, so this sha is the pin.
 HF_QUERIES_REVISION = "144cff8e35b5eaef7e526346aa60774a9deb941f"
-HF_CORPUS_DATASET = "Tevatron/browsecomp-plus-corpus"  # ~2.78 GB — never auto-downloaded
+HF_CORPUS_DATASET = "Tevatron/browsecomp-plus-corpus"  # ~1.76 GB — never auto-downloaded
 
 # The prebuilt BM25 Lucene index ships in the upstream HF *dataset* repo under ``bm25/*`` (see
 # upstream ``scripts_build_index/download_indexes.sh``). Lazy-downloaded on first served use.

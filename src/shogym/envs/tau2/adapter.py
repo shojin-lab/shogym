@@ -11,7 +11,8 @@ So this adapter **provisions the pinned upstream source at runtime** into a giti
 directly in ``sys.modules`` — never onto ``sys.path``, because the tau2-bench archive root carries
 sibling top-level dirs (``tests/``, ``docs/``, ``scripts/``, ``examples/``, ``web/``, ``data/``)
 that would shadow shogym's own packages. Only ``src/tau2`` is extracted; the ~700 MB of benchmark
-``data/`` in the archive is filtered out during extraction and never written to disk. The
+``data/`` is filtered out during extraction and never lands on disk unpacked (the compressed
+tarball is staged whole, then removed). The
 mechanics live in :mod:`shogym.envs._upstream`, shared with the automationbench and yc_bench ports.
 Nothing from upstream is committed to shogym, and the SHA pin — hence the fidelity guarantee —
 is unchanged; it just moved from a requirement string to :data:`UPSTREAM_SHA` here.
@@ -29,8 +30,9 @@ provisioning, a one-time network fetch if the cache is cold, is paid only when a
 
 Note: tau2's **domain data** is a separate concern and is unchanged by the fetch-and-import move.
 Upstream resolves it from ``TAU2_DATA_DIR`` (falling back to a path relative to the installed
-package, which does not exist for either an installed wheel or this cache), so a tau2 env still
-needs ``TAU2_DATA_DIR`` pointing at a tau2-bench ``data/`` checkout — exactly as before.
+package), so a tau2 env needs a data checkout by one of two routes: ``TAU2_DATA_DIR``, or a
+``TAU2_SRC`` pointing at a *full* clone's ``src/``, whose sibling ``data/`` that fallback finds
+on its own. shogym version-checks neither.
 """
 
 from __future__ import annotations

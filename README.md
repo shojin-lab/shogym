@@ -11,8 +11,8 @@ score.
 It is a substrate for questions about agents on tasks. How do agents improve themselves? What
 does adding a tool change? Does an agent's self-report match an honest score?
 
-Under the hood, an environment (`Env`) is a task loader, an initial observation, a pure verifier,
-and a set of MCP servers. Tools are [MCP](https://modelcontextprotocol.io) servers
+An environment (`Env`) is a task loader, an initial observation, a pure verifier, and a set of
+MCP servers. Tools are [MCP](https://modelcontextprotocol.io) servers
 (in-process, stdio, or HTTP); episodes are session-keyed for safe concurrent rollouts;
 termination is a reserved `terminate` tool or the horizon; verification is a pure function over
 the recorded trajectory.
@@ -71,8 +71,9 @@ README covers the model and the shared env-README template.
   by tau2's own evaluator. Needs the `tau2` extra + data.
 - **[`yc_bench`](src/shogym/envs/yc_bench/README.md)**: a port of
   [YC-Bench](https://github.com/collinear-ai/yc-bench). Operate a simulated AI startup for a year
-  via a single `run_command` tool, scored on survival, funds, and tasks. Deterministic in-process
-  sim (no data or key). Needs the `yc_bench` extra.
+  via a single `run_command` tool, scored on survival, funds, and tasks. In-process sim, no data
+  or key; a seed reproduces the business attributes, not the `uuid4` row ids. Needs the
+  `yc_bench` extra.
 - **[`hle`](src/shogym/envs/hle/README.md)**: a port of
   [Humanity's Last Exam](https://huggingface.co/datasets/cais/hle). A single-turn, expert-level
   question answered via one `submit_answer` tool and graded server-side (exact-match fast path,
@@ -82,12 +83,13 @@ README covers the model and the shared env-README template.
   [BrowseComp-Plus](https://github.com/texttron/BrowseComp-Plus). Answer reasoning-heavy queries
   against a fixed ~100K-doc corpus via `search` / `get_document` / `submit_answer`, graded by an
   LLM judge plus deterministic retrieval-recall and citation metrics. Needs the
-  `browsecomp_plus` extra, `OPENAI_API_KEY`, Java 21, and gated dataset access.
+  `browsecomp_plus` extra, `OPENAI_API_KEY`, Java 21, and Hugging Face network access (the
+  datasets are public).
 - **[`automationbench`](src/shogym/envs/automationbench/README.md)**: a port of
   [AutomationBench](https://github.com/zapier/AutomationBench). Carry out a cross-application
   business workflow over a fully simulated world of ~47 SaaS apps via an `api` tool surface,
-  scored end-state-only by a pure rubric. Deterministic and offline (no key). Needs the
-  `automationbench` extra.
+  scored end-state-only by a pure rubric. Offline and keyless, and the rubric is deterministic
+  over a given end-state. Needs the `automationbench` extra.
 - **[`appworld`](src/shogym/envs/appworld/README.md)**: a port of
   [AppWorld](https://github.com/StonyBrookNLP/appworld). Carry out a natural-language instruction
   across nine simulated apps by writing Python against their APIs, with one authored paragraph

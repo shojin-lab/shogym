@@ -50,7 +50,8 @@ analysis = ["pandas>=2.2", "duckdb>=1.0"]
 # shogym` (and the core test suite) stay lean and never import tau2 — `import shogym` registers
 # `tau2_*` envs without provisioning or loading it.
 # NOTE: tau2's `data/` is a separate provisioning concern and is unchanged — a tau2 env still
-# needs `TAU2_DATA_DIR` pointing at a tau2-bench data checkout.
+# needs a data checkout, either via `TAU2_DATA_DIR` or via a full `TAU2_SRC` clone whose sibling
+# `data/` upstream resolves on its own. The default runtime fetch extracts only `src/tau2`.
 tau2 = [
     # upstream [project] dependencies @ 1d244f5
     "addict>=2.4.0",
@@ -98,7 +99,8 @@ hle = [
 # resolve transitively through that direct requirement: upstream's `[project] dependencies`
 # verbatim at the pinned SHA. Kept optional so `pip install shogym` (and the core test suite) stay
 # lean and never import yc_bench — `import shogym` registers the `yc_bench` env without
-# provisioning or loading it. YC-Bench generates its whole world deterministically from a seed, so
+# provisioning or loading it. YC-Bench generates its whole world from a seed (business attributes
+# reproducibly; row ids are uuid4 and differ per run), so
 # (unlike tau2) it needs no external data provisioned at runtime.
 yc_bench = [
     # upstream [project] dependencies @ e7d6067
@@ -126,22 +128,25 @@ yc_bench = [
 # the port's pure pieces (the backlog generator, the scorer, the three payload classes) are offline
 # and need neither the runtime nor the corpus.
 appworld = []
-# The Frontier-Bench port (src/shogym/envs/frontier_bench) is a faithful, pinned snapshot of the
-# Harbor benchmark (release tag v0.1.0). Its only runtime dependency is a working local
-# **Docker** daemon (a system dependency, not a pip package): the env builds+runs the task's
+# The Frontier-Bench port (src/shogym/envs/frontier_bench) vendors the runtime files of five
+# Frontier-Bench task directories byte-for-byte, at upstream commit eb4af26c, each guarded by a
+# pinned content hash. Upstream's `maintainer/` tooling is not carried, and the env, the Docker
+# backend and the manifest are shogym code. Its only runtime dependency is a working
+# local **Docker** daemon (a system dependency, not a pip package): the env builds+runs the task's
 # environment container as the served agent's world and runs the task's own verifier container
-# for the 0/1 verdict. The Python code uses stdlib only (subprocess + tomllib), so this extra
+# for the 0/1 verdict. The Python code needs nothing beyond shogym's core dependencies (Docker is
+# driven with stdlib `subprocess`, the manifest parsed with `tomllib`), so this extra
 # carries no Python packages — it exists as a stable install/label target and a home for this
 # note. `import shogym` registers `frontier_bench` without importing Docker; only serving an
-# episode shells out to `docker`. Task files are vendored under the package (tiny), so
-# describe / verdict-parsing / the offline tests need neither Docker nor a network.
+# episode shells out to `docker`. The vendored files are tiny, so describe / verdict-parsing /
+# the offline tests need neither Docker nor a network.
 frontier_bench = []
 # The AutomationBench port (src/shogym/envs/automationbench). Upstream (MIT, © Zapier) is pinned to
 # commit a321764 and, on top of the PyPI direct-reference ban that rules out a git requirement for
 # tau2/yc-bench, cannot be resolved by pip at all: it declares `requires-python >=3.13` (shogym is
 # hard-pinned to <3.13 for tau2's `audioop`) and pulls the heavy `verifiers` / `anthropic`
 # agent-loop stack — an unsatisfiable resolve on 3.12. The env-as-center port needs none of that
-# loop, only the deterministic verifiers-free pieces (simulated tools + WorldState, task defs, pure
+# loop, only the offline verifiers-free pieces (simulated tools + WorldState, task defs, pure
 # rubric), which import fine on 3.12 with just `pydantic` + `datasets`. So the pinned upstream
 # source is provisioned at runtime into a gitignored cache
 # (`~/.cache/shogym/automationbench/<sha>/`, honoring `AUTOMATIONBENCH_SRC` / `SHOGYM_CACHE`) — never
@@ -151,8 +156,10 @@ frontier_bench = []
 automationbench = [
     "datasets>=2.19",
 ]
-# The BrowseComp-Plus port (src/shogym/envs/browsecomp_plus), a faithful wrap pinned to upstream
-# commit 0469490. `datasets` lazy-loads the XOR-encrypted `Tevatron/browsecomp-plus` queries
+# The BrowseComp-Plus port (src/shogym/envs/browsecomp_plus). Upstream commit 0469490 covers the
+# qrels and the evaluation/judge code this port copies; the encrypted queries and the prebuilt
+# BM25 index carry their own Hugging Face revisions (HF_QUERIES_REVISION / INDEX_REVISION in
+# data.py). `datasets` lazy-loads the XOR-encrypted `Tevatron/browsecomp-plus` queries
 # (decrypted in memory only — never persisted), `openai` backs the default model-graded judge,
 # and `pyserini` (which also needs a Java 21 runtime) is the BM25/Lucene retriever over the
 # prebuilt corpus index. Optional so `pip install shogym` (and the core offline test suite) stay

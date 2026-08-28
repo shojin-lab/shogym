@@ -148,11 +148,9 @@ semantics (each run should own its trace file for a guaranteed 1:1 mapping).
 `wordle_v1` is shogym's own reference environment, not a port of an external benchmark — there
 is no upstream commit to pin or deviate from. It exists to demonstrate the env-as-center
 contract in the smallest honest form; the port envs (tau2, yc_bench, hle, browsecomp_plus,
-automationbench) each carry their own `Fidelity & deviations` section.
+automationbench, frontier_bench) each carry their own `Fidelity & deviations` section.
 
 ## Layout
-
-A source map for orientation:
 
 | File | Role |
 |---|---|
@@ -161,4 +159,3 @@ A source map for orientation:
 | `utils.py` | `load_words`, `score_guess` (the G/Y/X scorer), `format_feedback`. |
 | `functions/` | The advisory instruction templates (`guess_v1/example/*.minijinja`) and their variable schemas. |
 | `data/words.txt` | 2,315 five-letter answers, one per line. |
-</content>

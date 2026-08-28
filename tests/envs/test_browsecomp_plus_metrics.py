@@ -1,5 +1,5 @@
-"""Unit tests for the deterministic retrieval + citation metrics (ported verbatim from upstream
-``evaluate_run.py``). Pure, stdlib-only — run in the offline core suite.
+"""Unit tests for the deterministic retrieval + citation metrics (adapted from upstream
+``evaluate_run.py``: set-size denominators). Pure, stdlib-only — run in the offline core suite.
 """
 
 from __future__ import annotations

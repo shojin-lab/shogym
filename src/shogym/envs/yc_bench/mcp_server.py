@@ -4,14 +4,15 @@
 # pyright: reportMissingImports=false
 """In-process MCP server for the ``yc_bench`` env — yc-bench's command surface, wrapped.
 
-yc-bench has **no built-in agent loop**: it expects an external driver to issue CLI commands
-against its deterministic sim, feed the JSON results back, and collect the next commands. shogym
-*is* that driver. This server exposes that command surface as two MCP tools:
+yc-bench ships its own LLM agent loop (``agent/loop.py``), but its sim is built to take an
+external driver: something has to issue CLI commands against the seeded sim, feed the
+JSON results back, and collect the next commands. shogym *is* that driver, in place of that
+loop. This server exposes the command surface as two MCP tools:
 
-  - **``run_command(command)``** — the faithful mirror of upstream's
+  - **``run_command(command)``** — mirrors upstream's
     ``run_command("yc-bench <cmd>")``: it runs one yc-bench CLI command against *this
     session's* SQLite sim and returns the CLI's JSON. Every observe/act/sim/memory command is
-    reached through this one tool (the most faithful surface per issue #32).
+    reached through this one tool (one tool for the whole surface, per issue #32).
   - **``submit()``** — the env's ``score`` terminal. Calling it ends the episode: the serve
     layer seals the episode, then the env's ``finalize`` hook reads the authoritative final
     metrics (survival, final funds, task outcomes) off the *live* sim DB and returns the
@@ -19,8 +20,10 @@ against its deterministic sim, feed the JSON results back, and collect the next 
     sealed, server-side state, the terminal score can't be forged through the command surface.
 
 Each episode gets its own throwaway SQLite database (one company per DB, matching yc-bench's
-single-simulation-per-DB model), seeded deterministically from the task's seed on
-``begin_session`` and torn down on ``end_session``. State is keyed by ``_session_id`` (shogym
+single-simulation-per-DB model), seeded from the task's seed on ``begin_session`` (same
+business attributes every run; upstream mints fresh ``uuid4`` row ids, which reach the agent in
+``sim resume`` wake events and break ties between simultaneous events) and torn down on
+``end_session``. State is keyed by ``_session_id`` (shogym
 injects it), so concurrent episodes are isolated. All ``yc_bench`` imports are funnelled
 through :mod:`shogym.envs.yc_bench.adapter`, so importing this module requires the ``yc_bench``
 extra — but it is only imported when a ``yc_bench`` env is constructed or served.
@@ -43,8 +46,8 @@ from shogym.envs.yc_bench import adapter
 RUN_COMMAND_TOOL_NAME = "run_command"
 SUBMIT_TOOL_NAME = "submit"
 
-# Default per-command wall-clock budget for a yc-bench CLI subprocess. The deterministic sim
-# commands are fast; this only guards against a pathological hang.
+# Default per-command wall-clock budget for a yc-bench CLI subprocess. The sim commands are
+# fast; this only guards against a pathological hang.
 DEFAULT_COMMAND_TIMEOUT_SECONDS = 60.0
 
 server: FastMCP = FastMCP(name="yc_bench")

@@ -1,6 +1,6 @@
-"""Unit tests for the BrowseComp-Plus judge's pure reply parser (ported verbatim from upstream
-``evaluate_run.py``). Dependency-free (no ``datasets``/``openai``/network), so it runs in the
-offline core suite.
+"""Unit tests for the BrowseComp-Plus judge's pure reply parser (adapted from upstream
+``evaluate_run.py``: line-anchored verdict, fails closed). Dependency-free (no
+``datasets``/``openai``/network), so it runs in the offline core suite.
 """
 
 from __future__ import annotations

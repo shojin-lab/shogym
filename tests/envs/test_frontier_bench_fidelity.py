@@ -1,8 +1,10 @@
 """Offline fidelity checks for the vendored frontier_bench tasks (no Docker).
 
-These pin the port to its upstream snapshot: the canary is preserved in every redistributed
-task file, the vendored bytes match their per-task content hash, the pinned dataset digests /
-tag are recorded, and each task's metadata (artifacts, mode, resource caps) parses as expected.
+These pin the port to its upstream snapshot: the canary GUID is preserved in each task's
+``task.toml`` and ``instruction.md`` (upstream carries it in most task files, not all) and the
+statement in the env package, the vendored bytes match their per-task content hash, the pinned
+dataset digests and the recorded tag are present, and each task's metadata (artifacts, mode,
+resource caps) parses as expected.
 The tool manifest is probed without Docker (listing schemas builds no container), so this all
 runs in the offline core suite.
 """

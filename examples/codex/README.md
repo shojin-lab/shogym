@@ -172,8 +172,8 @@ does **not** work, because trust is resolved before `-c` overrides apply. Either
 trust_level = "trusted"
 ```
 
-Note that `codex exec` never prompts, so a reader who only ever runs the non-interactive command
-is never asked and never told.
+`codex exec` never prompts, so anyone who only ever runs the non-interactive command is never
+asked and never told.
 
 There is a third route, `codex mcp add shogym -- uv run python serve.py`, and it is the one to
 avoid here: it writes the server into `~/.codex/config.toml`, where it stays and follows you into
