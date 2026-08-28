@@ -581,11 +581,11 @@ def derived_root(source: Optional[str] = None, *, runtime: Optional[str] = None)
     digest covers the backlog generator's constants *and its implementation*, so changing a cut
     value, an option set, the number of requests or the code that draws them derives a new corpus
     instead of serving a stale one. The derivation version covers the *layout*: what is copied,
-    what is linked and what is sealed. The runtime digest covers the interpreter that wrote the
-    seeded rows, because it is the interpreter and not this process that writes them: a task's
-    database file is a replayable statement log written through upstream's own model layer, so a
-    resolved dependency that changed how a row is serialized changed the world under a name that
-    had not moved. And the source digest covers the corpus this was derived from, which used to be
+    what is linked, and what a task carries to say it is whole. The runtime digest covers the
+    interpreter that wrote the seeded rows, because it is the interpreter and not this process that
+    writes them: a task's database file is a replayable statement log written through upstream's
+    own model layer, so a pin that changed how a row is serialized changed the world under a name
+    that had not moved. And the source digest covers the corpus this was derived from, which used to be
     missing entirely: ``APPWORLD_ROOT`` takes any directory with a ``data/tasks`` in it, so a
     process pointed at a second corpus computed a fingerprint for that one and then reused and
     served task material derived from the first.

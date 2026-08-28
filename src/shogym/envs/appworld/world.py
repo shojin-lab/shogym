@@ -202,7 +202,7 @@ def derive_task(
     holds what the caller was built against. It is called under the lock, after the decision to
     build and before a byte is copied, so a warm task pays nothing for it. A task is derived on its
     first use, which may be hours and two hundred episodes after the env stated what corpus it
-    serves; without this, an in-place edit in that window put changed databases and a changed
+    serves; without this, an in-place edit in that window would put changed databases and a changed
     ground truth into a world and its grading baseline under a run identity that had never read
     them (see :meth:`~adapter.CorpusSnapshot.verify` for what it does and does not prove)."""
     target = derived / "tasks" / task_id
@@ -303,9 +303,9 @@ def derive_view(*, derived: Path, view: Path, task_id: str) -> Path:
     named rather than copied, and they are writable by the user the worker runs as, so an episode
     that goes looking can change what a later episode, or the other arm of its own pair, starts
     from. Nothing here prevents that: upstream never writes there, so it does not happen by
-    accident, and preventing it deliberately is what the container does
-    (shojin-lab/shogym#140), which mounts the shared base read-only. The host worker is for
-    development, and this is the line where that matters."""
+    accident, and preventing it deliberately is what the container does, which mounts the shared
+    base read-only. The host worker is for development, and this is the line where that
+    matters."""
     data = view / "data"
     data.mkdir(parents=True, exist_ok=True)
     for entry in sorted(derived.iterdir()):
@@ -425,24 +425,21 @@ def _publish(building: Path, target: Path, *, replacing: bool = False) -> None:
     """Give a staging tree its final name, or drop it if someone else got there first.
 
     ``replacing`` is for the callers that have to displace an existing target: a served task, a
-    grading view, or a shared base entry left incomplete or partly sealed by a crash. It is still
-    not a build in place. The finished tree is renamed *aside* and the staged one renamed in, and
+    grading view, or a shared base entry left incomplete by a crash. It is still not a build in
+    place. The finished tree is renamed *aside* and the staged one renamed in, and
     the displaced one is removed afterwards.
 
     **Two renames are two operations, so the name is briefly absent even when this succeeds.**
-    That used to be written here as "the name is never absent", which is not something two
-    sequential renames can promise: between them the target does not exist, and the builders' lock
-    excludes other builders rather than the live workers resolving paths through this tree. The
-    window is a syscall wide and it is real. What this does promise is that the name never holds a
-    half-made tree, because what is renamed in was complete and sealed before it had this name.
+    Between them the target does not exist, and the builders' lock excludes other builders rather
+    than the live workers resolving paths through this tree. The window is a syscall wide and it
+    is real. What this does promise is that the name never holds a half-made tree, because what is
+    renamed in was complete before it had this name.
 
-    **A publish that fails puts the incumbent back.** The displaced tree used to be removed
-    unconditionally, so a failure at the second rename deleted the only remaining copy and left
-    the name absent: a probe that injected one found neither tree afterwards. For a shared base
-    entry that is worse than a failed build, because an episode already running resolves absolute
-    names through it. So the incumbent is restored, and if the restore itself fails the displaced
-    copy is *retained* under its own name rather than removed, because it is then the only copy
-    there is."""
+    **A publish that fails puts the incumbent back.** For a shared base entry a name left absent
+    is worse than a failed build, because an episode already running resolves absolute names
+    through it. So the incumbent is restored, and if the restore itself fails the displaced copy
+    is *retained* under its own name rather than removed, because it is then the only copy there
+    is."""
     if target.exists() and not replacing:
         shutil.rmtree(building, ignore_errors=True)
         return
@@ -475,7 +472,7 @@ def _publish(building: Path, target: Path, *, replacing: bool = False) -> None:
         if not target.exists():
             raise
         # Somebody else published while this build was staging. Their tree is under the name and
-        # this one has been dropped, which is what this branch has always meant.
+        # this one has been dropped.
     finally:
         if published and aside:
             shutil.rmtree(displaced, ignore_errors=True)
