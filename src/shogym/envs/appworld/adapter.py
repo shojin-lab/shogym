@@ -281,13 +281,16 @@ def task_ids() -> Tuple[str, ...]:
     return tuple(line.strip() for line in MANIFEST.read_text().splitlines() if line.strip())
 
 
-@lru_cache(maxsize=None)
 def task_specs(root: Path, task_id: str) -> Dict[str, Any]:
-    """One task's shipped specification: its instruction, its supervisor and its datetime."""
+    """One task's shipped specification: its instruction, its supervisor and its datetime.
+
+    **Read every time, not memoized.** This was cached on ``(root, task_id)``, which is a key that
+    says where a spec was rather than what it said: a corpus edited in place produced a new
+    ``corpus_digest`` and a new cache name, and the same process went on serving the instruction,
+    the supervisor and the datetime it had read the first time. The identity moved and the task
+    did not. It is a few kilobytes of JSON, and the cache was also unbounded across a roster of
+    318."""
     return json.loads((root / "data" / "tasks" / task_id / "specs.json").read_text())
-
-
-# ----- the derived corpus -----
 
 
 def derived_root(source: Optional[str] = None) -> Path:
@@ -400,26 +403,47 @@ def corpus_digest(root: Path) -> str:
     otherwise be served under a name that claims to be the pinned one, and would reuse a derived
     tree built from something else.
 
-    **Every file the world reads is read, not only the tasks.** This covered `version.txt` and
-    `data/tasks` alone, and a world also reads `base_dbs`, `datasets`, `api_docs` and every other
-    entry under `data` that :func:`served_mounts` binds into it. Those bytes decide what the world
-    does and what the grader compares against, and a change in them moved no digest at all.
-
     **Every scoring-relevant file is read, not sized.** This once hashed `specs.json` in full and
     took path and size for everything else, which left the ground truth and the evaluation
     material identifiable only by length: a same-length edit to an answer key passed unnoticed
     under a digest whose whole job is to say what the corpus holds. A size is not a summary of
     contents, and a fingerprint that says it covers the scoring inputs has to have read them.
 
-    The task tree is the scoring input, so all of it is read. Reading it costs a second or so on
-    every fresh process, which is the price of the digest meaning what it says."""
+    **Everything under ``data`` is read, not only the tasks.** This once covered ``version.txt``
+    and the task tree, which left out ``base_dbs``, ``datasets`` and ``api_docs`` entirely. Those
+    are 134 MB of starting state and documentation that every episode reads as input: a world
+    built on different base databases is a different world, and a digest whose job is to say what
+    the corpus holds cannot leave out the largest thing in it.
+
+    **Not memoized, deliberately.** It was cached on the root path, so a corpus that changed under
+    one path during a process kept the digest it had when the process first looked, which is the
+    one case the cache would have had to answer. The env computes this once in its constructor and
+    keeps the value; the cost is about two seconds on a fresh corpus, dominated by the fourteen
+    thousand small files in the task tree, and it is the price of the digest meaning what it
+    says."""
     digest = hashlib.sha256()
     data = root / "data"
     for path in sorted(data.rglob("*")):
+        if path.is_symlink():
+            # **Refused rather than skipped.** A skipped link is a file the digest does not cover
+            # and derivation copies anyway: `_materialise` follows links, so the served world held
+            # bytes the identity had never read, and changing what a link pointed at changed the
+            # world without changing the digest that claims to say what the world is. The pinned
+            # bundle contains none, so this refuses a corpus rather than growing a rule about how
+            # to hash one.
+            raise ProvisioningError(
+                f"the corpus at {root} contains a symbolic link ({path.relative_to(data)}), and "
+                "this port cannot state the identity of a tree whose contents are somewhere else"
+            )
         if not path.is_file():
             continue
         digest.update(str(path.relative_to(data)).encode())
-        digest.update(path.read_bytes())
+        with path.open("rb") as handle:
+            while True:
+                block = handle.read(1 << 20)
+                if not block:
+                    break
+                digest.update(block)
     return digest.hexdigest()[:16]
 
 
@@ -444,6 +468,24 @@ def episode_outputs(session_id: str) -> Path:
     home = episodes_home()
     home.mkdir(parents=True, exist_ok=True)
     return home / f"episode-{session_id}"
+
+
+def runtime_digest() -> str:
+    """What the worker's interpreter actually is, as sixteen hex characters.
+
+    The branch below reads a virtual environment's realized distribution set, because there the
+    runtime cache is named for the direct AppWorld release while it is built by resolving that
+    release's ranges against whatever the host offers on the day. Here there is no virtual
+    environment: the interpreter is an image, and the daemon holds one answer for what that image
+    is. The image id is that answer, and it moves for every reason the distribution set would
+    have, including the ones a tag cannot see (a re-pushed base, a transitive version that
+    resolved differently, the same tag built on another architecture).
+
+    Not memoized, for the reason :func:`corpus_digest` is not: the value has to be able to move
+    when the thing it names does."""
+    return hashlib.sha256(
+        container.image_identity(container.image_name()).encode()
+    ).hexdigest()[:16]
 
 
 def episode_view(session_id: str) -> Path:
@@ -858,6 +900,10 @@ class Worker:
     frames: "_Frames"
     lock: threading.Lock = field(default_factory=threading.Lock)
     closed: bool = False
+    #: Whether this worker's persistence is known to be complete. A timeout or a broken frame
+    #: interrupts a command that upstream ends with its own save, and the pinned saver clears its
+    #: destination and writes several pieces in sequence, so stopping it can leave a tree that is
+    #: stable and partial. Confirmed absence proves that writing stopped, not that it finished.
     #: Set by the first call that stopped waiting for an answer. A worker whose protocol has an
     #: outstanding command is a worker whose next answer belongs to a caller that is gone, so it
     #: is never used again; the field holds the reason, which is what the refusal says.
@@ -1008,7 +1054,7 @@ class Worker:
         if self.closed:
             return
         try:
-            container.remove(self.container, confirm=confirm)
+            gone = container.remove(self.container, confirm=confirm)
         except container.DockerError:
             if confirm:
                 # The caller is about to grade what this container could still be writing to, and
@@ -1019,7 +1065,12 @@ class Worker:
             # nobody could confirm is still somebody's, even while this parent is alive.
             self.disown()
         else:
-            self.closed = True
+            # **Only what the daemon confirmed.** A nonzero stop or removal used to reach this
+            # branch and be recorded as a removal, after which nothing tried again and the ordinary
+            # sweep skipped the container because its parent was alive. `remove` says whether the
+            # container is known to be gone, and when it is not it has already written the name
+            # where the sweep will find it.
+            self.closed = bool(gone)
         if self.process.poll() is None:
             self.process.kill()
             try:
@@ -1109,84 +1160,96 @@ class SnapshotError(RuntimeError):
     be resolving a path the agent chose inside a namespace that also holds the answers."""
 
 
-#: What an episode's output tree may hold before the grade is refused. An episode's databases and
-#: logs are a few megabytes; these are far past that and far below anything that hurts a machine.
-_MAX_OUTPUT_BYTES = 256 * 1024 * 1024
-_MAX_OUTPUT_FILES = 20_000
-_MAX_OUTPUT_DEPTH = 16
-
-#: How long the walk and the copy get. The grader's own budget starts after them, so an unbounded
-#: snapshot would sit outside every bound the episode has.
-_SNAPSHOT_TIMEOUT_SECONDS = 120.0
+_SNAPSHOT_MAX_NODES = 20_000
+_SNAPSHOT_MAX_BYTES = 1 << 30
+_SNAPSHOT_MAX_DEPTH = 24
+_SNAPSHOT_SECONDS = 60.0
 
 
-def snapshot_outputs(outputs: Path, *, into: Path) -> Path:
+def snapshot_outputs(
+    outputs: Path, *, into: Path, stop: "Optional[threading.Event]" = None
+) -> Path:
     """Copy a stopped episode's output tree into one the grader can be given, or refuse.
 
-    **Why a copy and not the tree itself.** The grading container mounts the answers. It also has
-    to mount the state to grade, and that state was writable by the process that ran the agent's
-    code. A symlink left in there resolves inside the grader's namespace, not the world's, so a
-    link planted under ``/outputs`` could make the digest and the evaluator read bytes from the
-    private tree instead of from what the episode submitted. Nothing here returns those bytes to
+    **Why a copy and not the tree itself.** The grading process is pointed at the root that holds
+    the answers, and it also has to read the state to grade, which was writable by the process
+    that ran the agent's code. A symlink left in there resolves in the grader, so a link planted
+    under the output tree could make the digest, the filing and the evaluator read bytes from the
+    graded tree instead of from what the episode submitted. Nothing here returns those bytes to
     the agent, so this is score integrity rather than a leak, and it is still not a thing to leave
     open.
 
-    So: every entry is checked to be a plain file or a plain directory whose real path is inside
-    the tree, and anything else refuses the episode outright rather than being skipped, because a
-    skipped entry is a grade computed over a tree that is not the one submitted.
+    **The root is checked before it is resolved.** ``resolve()`` erases the question: a root that
+    was itself a symlink came back as whatever it pointed at, and only its descendants were then
+    inspected, so substituting the episode's own output directory substituted the whole tree. It
+    is ``lstat``-ed first, and a link there refuses the episode like a link anywhere else.
 
-    **And it is bounded, because the tree is not.** ``/outputs`` is a host bind, which Docker
-    cannot put a size quota on, so what an episode may write there is bounded here instead: bytes,
-    files, depth, and the wall clock this walk and copy may take. A tree past any of them refuses
-    the episode rather than being copied, which is the fail-closed direction: the alternative is a
-    finalization that duplicates an arbitrary number of bytes on shared disk while a sibling arm is
-    running. The residual is that the writing happens before this sees it, so an episode can fill a
-    disk during its own execution; bounding that needs a filesystem quota this port does not have.
+    **Bounded in four ways, because this walks a tree an episode wrote.** Nodes, bytes, depth and
+    elapsed time. Without them a large or deep tree holds finalization open for as long as it
+    likes and fills the host's disk on the way, and neither the finalize deadline nor the grader's
+    own timeout covers it: a deadline cancels the *await*, and the thread doing the copying does
+    not stop for that. Which is what ``stop`` is for: the caller sets it when its await is
+    cancelled and this checks it once per file, so a cancelled finalization stops the copy at the
+    next file rather than at the end of the tree.
 
-    Safe to walk because the container is already gone: this runs after a confirmed removal, so
-    nothing can add a link between the check and the copy."""
-    deadline = time.monotonic() + _SNAPSHOT_TIMEOUT_SECONDS
+    Every refusal is an episode refused outright rather than an entry skipped, because a grade
+    computed over a tree with something quietly dropped is a grade over a tree nobody submitted.
+
+    Safe to walk because the worker is already gone: this runs after a confirmed stop, so nothing
+    can add a link between the check and the copy."""
+    if outputs.is_symlink():
+        raise SnapshotError(
+            f"the episode's output root {outputs} is a symbolic link, so what would be graded is "
+            "whatever it names rather than what the episode wrote"
+        )
     root = outputs.resolve()
     if not root.is_dir():
         raise SnapshotError(f"the episode left no output tree at {outputs}")
-    total, count = 0, 0
-    for path in sorted(root.rglob("*")):
-        if time.monotonic() > deadline:
-            raise SnapshotError(
-                f"reading the episode's output tree took longer than "
-                f"{_SNAPSHOT_TIMEOUT_SECONDS:.0f}s"
-            )
-        if path.is_symlink():
-            raise SnapshotError(
-                f"the episode left a symbolic link in its output tree ({path.name} -> "
-                f"{os.readlink(path)}), which a grader must not resolve"
-            )
-        if not (path.is_file() or path.is_dir()):
-            raise SnapshotError(f"the episode left {path.name}, which is not a file or directory")
-        if not path.resolve().is_relative_to(root):
-            raise SnapshotError(f"the episode left {path.name}, which resolves outside its tree")
-        if len(path.relative_to(root).parts) > _MAX_OUTPUT_DEPTH:
-            raise SnapshotError(
-                f"the episode's output tree is deeper than {_MAX_OUTPUT_DEPTH} directories"
-            )
-        count += 1
-        if count > _MAX_OUTPUT_FILES:
-            raise SnapshotError(
-                f"the episode's output tree holds more than {_MAX_OUTPUT_FILES} entries"
-            )
-        if path.is_file():
-            total += path.stat().st_size
-            if total > _MAX_OUTPUT_BYTES:
-                raise SnapshotError(
-                    f"the episode's output tree is larger than {_MAX_OUTPUT_BYTES} bytes"
-                )
+    began = time.monotonic()
+    nodes = 0
+    total = 0
     shutil.rmtree(into, ignore_errors=True)
-    shutil.copytree(root, into, symlinks=False)
-    if time.monotonic() > deadline:
-        raise SnapshotError(
-            f"copying the episode's output tree took longer than "
-            f"{_SNAPSHOT_TIMEOUT_SECONDS:.0f}s"
-        )
+    into.mkdir(parents=True)
+    # One pass: what is checked is what is copied. A validate-then-`copytree` would walk the tree
+    # twice and bound neither walk.
+    pending: List[Tuple[Path, Path, int]] = [(root, into, 0)]
+    while pending:
+        source, target, depth = pending.pop()
+        if depth > _SNAPSHOT_MAX_DEPTH:
+            raise SnapshotError(
+                f"the episode's output tree is deeper than {_SNAPSHOT_MAX_DEPTH} directories"
+            )
+        for entry in sorted(source.iterdir()):
+            if stop is not None and stop.is_set():
+                raise SnapshotError("the snapshot was abandoned before it finished")
+            if time.monotonic() - began > _SNAPSHOT_SECONDS:
+                raise SnapshotError(
+                    f"the episode's output tree took longer than {_SNAPSHOT_SECONDS:.0f}s to copy"
+                )
+            nodes += 1
+            if nodes > _SNAPSHOT_MAX_NODES:
+                raise SnapshotError(
+                    f"the episode's output tree holds more than {_SNAPSHOT_MAX_NODES} entries"
+                )
+            if entry.is_symlink():
+                raise SnapshotError(
+                    f"the episode left a symbolic link in its output tree ({entry.name} -> "
+                    f"{os.readlink(entry)}), which a grader must not resolve"
+                )
+            if entry.is_dir():
+                (target / entry.name).mkdir()
+                pending.append((entry, target / entry.name, depth + 1))
+                continue
+            if not entry.is_file():
+                raise SnapshotError(
+                    f"the episode left {entry.name}, which is not a file or directory"
+                )
+            total += entry.stat().st_size
+            if total > _SNAPSHOT_MAX_BYTES:
+                raise SnapshotError(
+                    f"the episode's output tree is larger than {_SNAPSHOT_MAX_BYTES} bytes"
+                )
+            shutil.copyfile(entry, target / entry.name, follow_symlinks=False)
     return into
 
 
@@ -1251,7 +1314,7 @@ __all__ = [
     "cache_root",
     "DERIVATION_VERSION",
     "corpus_digest",
-    "corpus_snapshot",
+    "runtime_digest",
     "derived_root",
     "episode_outputs",
     "episode_view",
