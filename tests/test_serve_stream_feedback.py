@@ -719,6 +719,39 @@ async def test_a_dispense_alone_is_enough_to_refuse_a_mixed_resume(tmp_path: Pat
 # ----- refusals -----
 
 
+async def test_a_resume_under_a_different_run_identity_is_refused(tmp_path: Path) -> None:
+    """The other half of what makes a record one measurement.
+
+    The regime check asks whether the agent was told its verdicts. This asks whether the rows were
+    produced by the same thing at all: a directory holding rows scored under two draws, two
+    payload classes or two corpora is a record whose mean is about neither. Written into the
+    ownership claim before the first dispense, so a run killed before it recorded anything is
+    still covered."""
+    stream = _stream(tmp_path, [0], identity="fingerprint-a")
+    async with stream:
+        await stream.get_task()
+        await stream.dispatch(SUBMIT_TOOL, {"answer": "4"})
+    assert [row["run_identity"] for row in _rows(tmp_path)] == ["fingerprint-a"]
+
+    with pytest.raises(ValueError, match="run identity"):
+        _stream(tmp_path, [0, 1], resume=True, identity="fingerprint-b")
+    # The same identity resumes, and so does a caller that names none.
+    _stream(tmp_path, [0, 1], resume=True, identity="fingerprint-a")
+    _stream(tmp_path, [0, 1], resume=True)
+
+
+async def test_the_claim_carries_the_identity_before_any_row_exists(tmp_path: Path) -> None:
+    """A run killed after its claim and before its first result recorded no row to compare, which
+    is exactly when a mistaken resume is least recoverable."""
+    stream = _stream(tmp_path, [0], identity="fingerprint-a")
+    async with stream:
+        # Read while the claim is held: a stream that finishes cleanly releases it, and what this
+        # is about is the window before the first row exists.
+        claim = json.loads((tmp_path / "prov" / "claim.json").read_text())
+        assert claim["run_identity"] == "fingerprint-a"
+        assert not (tmp_path / "prov" / "results.jsonl").exists()
+
+
 @pytest.mark.parametrize("bad", [True, "immediate", None, 1, Immediate])
 async def test_a_feedback_argument_that_is_not_a_policy_is_refused(
     tmp_path: Path, bad: Any

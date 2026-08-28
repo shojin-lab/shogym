@@ -310,6 +310,8 @@ routes are closed and the expensive one is visible, each tested by running the p
 | the answers, as objects | the world is built without ground truth, and there is no evaluator in the process |
 | the answers, as files | the served tree contains no `ground_truth` and **no symlink into the corpus**: every file in it is a hard link or a copy, so no path in it names a directory the answers are a sibling of |
 | the grader's tree | a directory with an unguessable name under a private parent, not a neighbour of the served root |
+| one episode's grade | upstream's evaluator report is disabled, and an episode's whole output tree is named absolutely and lives outside every served corpus, so no episode holds another's end state, logs or verdicts |
+| the corpus itself | served inputs are independent copies rather than hard links, so a write through the served pathname changes neither the corpus later episodes are derived from nor the baseline the grader diffs against |
 | the drawn key | never sent to either process: the protocol has no field for one |
 
 **There is no file-access audit, and a run must not be read as though there were one.** An earlier
@@ -320,6 +322,11 @@ world. A control that works on some paths and not the one that matters is worse 
 an empty journal reads as "file access was audited and nothing was found" when it means nothing of
 the kind. It has been removed rather than shipped with a caveat. Nothing here records what an
 agent's code opens.
+
+**The world is stopped before it is graded.** Sealing closes the tool surface and does not stop
+work an earlier call left running, so the worker and everything it started (it owns a process
+group) are terminated after the end state is read and before the evaluator runs. What is scored is
+a snapshot on disk that nothing can still be writing to.
 
 **The residual, stated exactly.** The private tree is hard to guess and not hard to read: it is the
 same uid, so its 0700 mode stops other users and stops nothing else. The port's own source is
@@ -339,13 +346,19 @@ before it should be read knowing that nothing was watching.
 ## Gotchas
 
 - **`env.num_tasks` is 318, not 417.** Task indices address the manifest, not the split.
-- **The first construction is slow and online.** Building the runtime and fetching the corpus is a
-  one-time cost; deriving a task's seeded world costs about a second the first time it is served
-  and nothing after that. Set `APPWORLD_ROOT` to skip the download.
+- **Construction is slow, online, and blocking.** Building the runtime, fetching the corpus and
+  copying it into the two derived views is a one-time cost; deriving a task's seeded world costs
+  about a second the first time it is served and nothing after that. `TaskStream` builds envs off
+  the event loop, so a queue is not held by it; a caller constructing an env directly on a loop it
+  is also serving on will block that loop and should build it in a thread. Set `APPWORLD_ROOT` to
+  skip the download.
 - **A different `pulse` is a different experiment.** It fixes the convention and the four stored
   slots for every leg. Scores drawn under two pulses are not comparable, and neither the pulse nor
   the payload class appears anywhere else in a run's record, so every row carries a
-  `config_digest`, published at inference level: the record keeps it and no feedback policy
+  `config_digest`, which covers the draw, the payload class, the block budget, the pinned bundle,
+  the interpreter, the served roster, the frozen count table, a scoring version, and what the
+  corpus at `APPWORLD_ROOT` actually holds rather than what the pin says it should. Published at
+  inference level: the record keeps it and no feedback policy
   reveals it, not even the one that reveals everything else. Reopening a provenance directory
   under a different pulse is then visible in the rows. Refusing such a resume belongs to the
   stream, which owns run identity; an env is handed a task and does not know which run it is

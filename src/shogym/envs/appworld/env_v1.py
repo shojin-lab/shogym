@@ -157,9 +157,6 @@ class AppWorldEnv(Env):
         self._graded = world.derive_root(
             original=self._original, derived=adapter.graded_root() / "data"
         )
-        world.share_outputs(
-            derived=self._derived.parent, graded=self._graded.parent
-        )
         self._task_ids = adapter.task_ids()
         self._backlogs: Dict[str, Any] = {}
         self.function = FunctionConfig(example_system_template=_static_instructions())
@@ -170,7 +167,10 @@ class AppWorldEnv(Env):
         # touching the world (see `mcp_server.execute`).
         self._blocks = int(horizon)
         self._config_digest = run_fingerprint(
-            pulse=self._pulse, report=self._report, blocks=self._blocks
+            pulse=self._pulse,
+            report=self._report,
+            blocks=self._blocks,
+            corpus=adapter.corpus_digest(self._original.parent),
         )
         super().__init__(horizon=self._blocks + 1, num_tasks=len(self._task_ids))
 
@@ -229,7 +229,11 @@ class AppWorldEnv(Env):
         from shogym.envs.appworld import mcp_server
 
         task_id = str(task["task_id"])
-        experiment = f"shogym-{session_id}"
+        # An absolute path, which AppWorld joins onto its own output root and so replaces it
+        # outright. That is the whole of what keeps one episode's end state, logs and evaluator
+        # artifacts out of the tree every other episode is served from: a shared output tree is a
+        # place a later episode, including the other arm of a pair, can read an earlier grade.
+        experiment = str(adapter.episode_outputs(session_id))
         worker = adapter.Worker.spawn(self._derived.parent)
         try:
             self._derive(worker, task_id)
@@ -359,6 +363,11 @@ class AppWorldEnv(Env):
             title=world.LOG_TITLE,
             label=world.LOG_LABEL,
         )
+        # Stop the world before grading it. Sealing closes the tool surface and does not stop work
+        # an earlier call left running, so the process and everything it started are terminated
+        # here, and the evaluator then reads a snapshot on disk that nothing can still be writing
+        # to. Idempotent, so teardown finding it already closed is not a second close.
+        await asyncio.to_thread(session.worker.close)
         checks = (
             await asyncio.to_thread(
                 adapter.grade,
@@ -488,12 +497,15 @@ def _static_instructions() -> str:
 SCORING_VERSION = 2
 
 
-def run_fingerprint(*, pulse: int, report: str, blocks: int) -> str:
+def run_fingerprint(*, pulse: int, report: str, blocks: int, corpus: str = "") -> str:
     """Everything two runs must agree on for their rows to be one measurement.
 
     The draw and the payload class decide what a score *means*; the block budget decides what an
     episode had the chance to do; the corpus and the interpreter decide what world it happened in;
-    and :data:`SCORING_VERSION` decides how it was read. A provenance directory reopened under a
+    and :data:`SCORING_VERSION` decides how it was read. ``corpus`` is what the corpus actually
+    holds rather than what the pin says it should (see :func:`~adapter.corpus_digest`), because
+    the root is whatever the environment points at and a repointed one would otherwise pass for
+    the pinned one. A provenance directory reopened under a
     different one of those takes incomparable rows, and none of them is visible anywhere else in a
     run's record.
 
@@ -515,6 +527,7 @@ def run_fingerprint(*, pulse: int, report: str, blocks: int) -> str:
             str(SCORING_VERSION),
             adapter.DATA_VERSION,
             adapter.DATA_BUNDLE_SHA256,
+            corpus,
             adapter.UPSTREAM_VERSION,
             adapter.MANIFEST.read_text(),
             payload.PASS_COUNTS_FILE.read_text(),

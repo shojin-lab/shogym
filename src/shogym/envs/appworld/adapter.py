@@ -32,6 +32,7 @@ import json
 import os
 import secrets
 import select
+import signal
 import shutil
 import subprocess
 import tempfile
@@ -323,6 +324,46 @@ def graded_root() -> Path:
     return home / f"graded-{DATA_VERSION}-{_generator_digest()}-{_private_tag()}"
 
 
+@lru_cache(maxsize=4)
+def corpus_digest(root: Path) -> str:
+    """What the corpus at ``root`` actually holds, as sixteen hex characters.
+
+    The pinned bundle's digest says what *should* be there and cannot say what is: ``APPWORLD_ROOT``
+    takes any directory with a ``data/tasks`` in it, so a repointed or edited corpus would
+    otherwise be served under a name that claims to be the pinned one, and would reuse a derived
+    tree built from something else.
+
+    Read in full for the files that decide what a task is and what it is scored against, and by
+    name and size for the databases, which are 179 MB and would make this a minute of reading on
+    every construction. A database edited without changing its length is therefore not caught, and
+    that is the honest limit of this digest rather than a claim it does not make."""
+    digest = hashlib.sha256()
+    data = root / "data"
+    version = data / "version.txt"
+    digest.update(version.read_bytes() if version.exists() else b"")
+    for path in sorted((data / "tasks").rglob("*")):
+        if not path.is_file():
+            continue
+        digest.update(str(path.relative_to(data)).encode())
+        if path.name == "specs.json":
+            digest.update(path.read_bytes())
+        else:
+            digest.update(str(path.stat().st_size).encode())
+    return digest.hexdigest()[:16]
+
+
+def episode_outputs(session_id: str) -> Path:
+    """One episode's own output tree, under the private home and named for the episode.
+
+    AppWorld joins its experiment name onto its own output root, so an absolute name replaces that
+    root outright. That is what keeps an episode's end state, its logs and anything the evaluator
+    leaves behind out of the corpus tree every other episode is served from. A shared output tree
+    is a place the other arm of a pair can read an earlier grade."""
+    home = private_home() / f"episodes-{DATA_VERSION}-{_private_tag()}"
+    home.mkdir(parents=True, exist_ok=True)
+    return home / f"episode-{session_id}"
+
+
 @lru_cache(maxsize=1)
 def _private_tag() -> str:
     """Sixteen hex characters, drawn once per installation and kept beside the private tree.
@@ -333,13 +374,18 @@ def _private_tag() -> str:
     home.mkdir(parents=True, exist_ok=True)
     os.chmod(home, 0o700)
     keyfile = home / ".tag"
-    if keyfile.exists():
+    # Created exclusively, and a loser reads the winner's value rather than keeping its own. Two
+    # processes that each kept their own would name two private trees, and a private tree is a
+    # copy of the corpus: the cost of getting this wrong is 134 MB and a rebuild, per loser.
+    try:
+        handle = os.open(keyfile, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+    except FileExistsError:
         tag = keyfile.read_text().strip()
         if len(tag) == 16:
             return tag
-    tag = secrets.token_hex(8)
-    handle = os.open(keyfile, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+        raise RuntimeError(f"the private tag at {keyfile} is not a tag; remove it to rebuild")
     try:
+        tag = secrets.token_hex(8)
         os.write(handle, tag.encode())
     finally:
         os.close(handle)
@@ -429,6 +475,10 @@ class Worker:
             text=True,
             cwd=str(scratch),
             env=_worker_environment(scratch),
+            # Its own process group, so stopping the episode stops everything it started. Agent
+            # code runs in this process and is free to spawn; signalling the direct child alone
+            # would leave those descendants running against the world after it was scored.
+            start_new_session=True,
         )
         assert process.stdin is not None
         process.stdin.write(json.dumps({"root": str(root), "token": token}) + "\n")
@@ -475,11 +525,11 @@ class Worker:
         would hold every other episode with it; and there is nothing to ask for, because the end
         state was flushed when the episode was read. A process that ignores the signal is killed."""
         if self.process.poll() is None:
-            self.process.terminate()
+            _stop(self.process, signal.SIGTERM)
             try:
                 self.process.wait(timeout=_CLOSE_SECONDS)
             except subprocess.TimeoutExpired:
-                self.process.kill()
+                _stop(self.process, signal.SIGKILL)
                 try:
                     self.process.wait(timeout=_CLOSE_SECONDS)
                 except subprocess.TimeoutExpired:
@@ -539,6 +589,20 @@ def grade(
     return json.loads(out.strip().splitlines()[-1])["output"]
 
 
+def _stop(process: subprocess.Popen, how: int) -> None:
+    """Signal the worker's whole process group, or the worker alone if it has no group of its own.
+
+    The group is the point: agent code runs in that process and may have started others, and a
+    signal to the direct child alone leaves them running against a world that has been scored."""
+    try:
+        os.killpg(os.getpgid(process.pid), how)
+    except (OSError, AttributeError):
+        try:
+            process.send_signal(how)
+        except OSError:
+            pass
+
+
 def _first_line(process: subprocess.Popen, timeout: float) -> str:
     """The worker's first line of output, or the empty string if it does not arrive in time.
 
@@ -566,7 +630,9 @@ __all__ = [
     "WorkerError",
     "WORKER",
     "cache_root",
+    "corpus_digest",
     "derived_root",
+    "episode_outputs",
     "grade",
     "graded_root",
     "private_home",

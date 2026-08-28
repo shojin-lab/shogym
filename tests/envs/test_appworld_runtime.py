@@ -10,7 +10,6 @@ a tree of links resolving to nothing.
 from __future__ import annotations
 
 import asyncio
-import os
 import threading
 import time
 from pathlib import Path
@@ -150,33 +149,42 @@ def test_two_streams_deriving_one_cold_task_both_get_a_world(tmp_path: Path) -> 
     assert not list((derived / "tasks").glob(".*building*"))
 
 
-def test_two_cold_constructors_do_not_race_on_the_shared_output_link(tmp_path: Path) -> None:
-    """Every environment constructed runs this, so two built at once is the ordinary case. Before
-    the lock, both could see the link absent and then race in `symlink_to`, and the loser's
-    constructor raised `FileExistsError`."""
+def test_a_write_through_the_served_tree_changes_nothing_else(tmp_path: Path) -> None:
+    """Served inputs are copies, not links of any kind.
+
+    A hard link removes the pathname that led back to the corpus and keeps the file: same inode,
+    two names, and the worker runs as the user that made it. A write through the served name would
+    then change the corpus every later episode is derived from and the baseline the grader diffs
+    against, which is a served episode editing the thing it is scored on."""
+    original = tmp_path / "corpus"
+    task = original / "tasks" / "abc_1"
+    (task / "dbs").mkdir(parents=True)
+    (task / "specs.json").write_text("{}")
+    (task / "ground_truth").mkdir()
+    (task / "ground_truth" / "answer.json").write_text('"the answer"')
+    (task / "dbs" / "todoist.jsonl").write_text("")
+    (task / "dbs" / "gmail.jsonl").write_text("mail")
+
     derived, graded = tmp_path / "derived", tmp_path / "graded"
-    derived.mkdir()
-    failures: List[BaseException] = []
-    start = threading.Barrier(4)
+    world.derive_task(
+        original=original,
+        derived=derived,
+        graded=graded,
+        task_id="abc_1",
+        write_log=lambda source, into: into.write_text("seeded"),
+    )
+    served = derived / "tasks" / "abc_1" / "dbs" / "gmail.jsonl"
+    source = task / "dbs" / "gmail.jsonl"
+    baseline = graded / "tasks" / "abc_1" / "dbs" / "gmail.jsonl"
+    assert served.stat().st_ino != source.stat().st_ino
+    assert served.stat().st_ino != baseline.stat().st_ino
 
-    def share() -> None:
-        try:
-            start.wait(timeout=30)
-            world.share_outputs(derived=derived, graded=graded)
-        except BaseException as exc:  # noqa: BLE001 (the point is that none escapes)
-            failures.append(exc)
-
-    threads = [threading.Thread(target=share) for _ in range(4)]
-    for thread in threads:
-        thread.start()
-    for thread in threads:
-        thread.join(timeout=60)
-    assert not failures, failures
-    assert (graded / "experiments").is_symlink()
-    assert (graded / "experiments" / "outputs").is_dir()
-    # And it is idempotent: running it again over a finished tree changes nothing.
-    world.share_outputs(derived=derived, graded=graded)
-    assert os.readlink(graded / "experiments") == str(derived / "experiments")
+    served.write_text("rewritten by the agent")
+    assert source.read_text() == "mail"
+    assert baseline.read_text() == "mail"
+    # And the seeded log the episode is scored against is the grader's own copy too.
+    (derived / "tasks" / "abc_1" / "dbs" / "todoist.jsonl").write_text("a different backlog")
+    assert (graded / "tasks" / "abc_1" / "dbs" / "todoist.jsonl").read_text() == "seeded"
 
 
 def test_nothing_in_a_served_task_names_where_it_came_from(tmp_path: Path) -> None:

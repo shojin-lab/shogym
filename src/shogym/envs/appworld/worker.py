@@ -412,6 +412,11 @@ def grade(body: Dict[str, Any]) -> Dict[str, Any]:
             task_id=body["task_id"],
             experiment_name=body["experiment"],
             suppress_errors=True,
+            # Upstream writes `evaluation/report.md` beside the episode's output by default, and
+            # that report quotes the requirement prose and the expected values behind it. It is a
+            # grade, written into a tree, and a tree is a thing another episode can read. Nothing
+            # here needs it: the verdicts come back through the protocol.
+            save_report=False,
         )
     reported = tracker.to_dict(stats_only=False)
     passed = {entry["requirement"] for entry in reported["passes"]}
