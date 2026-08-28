@@ -40,6 +40,7 @@ import asyncio
 import datetime as dt
 import hashlib
 import zlib
+from pathlib import Path
 from typing import TYPE_CHECKING, Any, Dict, Optional
 
 from shogym.core import Env
@@ -300,20 +301,20 @@ class AppWorldEnv(Env):
         view = world.derive_view(
             derived=self._derived, view=adapter.episode_view(session_id), task_id=task_id
         )
-        worker = adapter.Worker.spawn(view, task_id=task_id, outputs=outputs)
+        # Everything made before the session exists is made under this guard. A spawn or an open
+        # that failed used to leave the view and the output tree behind with nothing holding them:
+        # the env's own close finds no session, so neither was ever removed and both grew for the
+        # life of the machine.
+        worker: Optional[adapter.Worker] = None
         try:
-            # This episode's own view of the seeded world. Not the shared tree: see
-            # `world.derive_view` for why an episode that writes through its served inputs must
-            # not be writing through the next episode's, or the other arm of its own pair's.
-            # Inside the block, because a copy that fails part way through is a partial view under
-            # this session's name and nothing else will ever come back for it.
-            world.derive_view(derived=self._derived, view=view, task_id=task_id)
-            worker = adapter.Worker.spawn(view)
+            worker = adapter.Worker.spawn(view, task_id=task_id, outputs=outputs)
             worker.call(
                 "open", task_id=task_id, experiment=experiment, seed=_world_seed(task_id)
             )
         except Exception:
-            worker.close()
+            if worker is not None:
+                worker.close()
+            _discard(view, outputs)
             raise
         mcp_server.begin_session(
             session_id,
@@ -329,22 +330,23 @@ class AppWorldEnv(Env):
         )
 
     def _end_session(self, session_id: str) -> None:
-        import shutil
-
         from shogym.envs.appworld import mcp_server
 
-        session = mcp_server.end_session(session_id)
+        session = mcp_server.get_session(session_id)
         if session is None:
             return
-        session.worker.close()
-        # The episode's served view goes with it too, for the reason it existed: a view that
-        # outlived its episode is a directory the next one could be given by mistake.
-        shutil.rmtree(session.view, ignore_errors=True)
-        # The episode's output tree goes with the episode. It holds this episode's end state and
-        # its logs, and leaving it behind gives a later episode something of an earlier one's to
-        # find; a directory that only ever grows is retention by omission rather than by policy.
-        # After the worker is closed, so nothing is still writing into what is being removed.
-        shutil.rmtree(session.outputs, ignore_errors=True)
+        try:
+            # Never raises here: teardown's close is best effort by contract, and a container it
+            # could not remove belongs to the reaper rather than to this call.
+            session.worker.close()
+        finally:
+            # The directories go whatever the container did. A view that outlived its episode is
+            # a directory the next one could be given by mistake, and an output tree that only
+            # ever grows is retention by omission rather than by policy. In a `finally` because
+            # the failure that stops the close is exactly the failure that would otherwise leave
+            # them, and the handle is dropped last, so nothing between here and there loses it.
+            _discard(Path(session.view), session.outputs, Path(str(session.outputs) + ".graded"))
+            mcp_server.end_session(session_id)
 
     def _derive(self, task_id: str) -> None:
         """Make sure the seeded copy of ``task_id``'s world exists, writing it if it does not.
@@ -448,35 +450,29 @@ class AppWorldEnv(Env):
         # serving process is running and would make the serve layer's deadline unable to fire on
         # this one.
         #
-        # **The order is the invariant, not the tidiness.** `seal` flushes the end state into the
-        # episode's output tree and reads nothing off the live world. The container is then
-        # removed, which ends every process inside it, and only then is the tree opened: by the
-        # grading container, which reads the filing, digests the databases and runs the base
-        # task's checks off one state that nothing can still be writing to. Reading the filing on
-        # a live world was the defect: whatever an earlier `execute` had started was still running
-        # while it was observed, so the values scored and the bytes graded were two observations
-        # that happened to agree rather than one state.
-        # Stop what the episode started before the flush, so what is written is one instant of
-        # it. Removing the container ends everything either way, but a subprocess still writing
-        # while the state is being saved leaves a file that is half of one moment and half of
-        # another, and no later check would see that.
-        try:
-            await asyncio.to_thread(session.worker.call, "quiesce")
-        except Exception:
-            # A worker too wedged to answer is about to have its container removed, which is what
-            # actually stops it; a failure to stop politely must not cost the episode its grade.
-            pass
-        sealed = await asyncio.to_thread(session.worker.call, "seal")
-        # Confirmed, and the episode fails if it is not. A removal the daemon did not confirm is a
-        # container that may still be writing to the tree about to be graded, and a grade taken
-        # over that is a number with no claim behind it. Raising here reaches the serve layer as a
-        # finalize error, which is the design's own rule for an episode that cannot be scored.
+        # **Nothing here asks the world anything.** The world's process is the process that runs
+        # agent-authored code, so a reply from it saying that it had stopped, or flushed, or that
+        # a value was such-and-such, is a reply the episode could have written. There is no seal
+        # command and no quiesce command any more. The host stops the container, confirms it with
+        # the daemon, and grades what is on disk.
+        #
+        # **What is on disk is the world at the end of the last block, because upstream puts it
+        # there.** `AppWorld.execute` ends with its own save into the episode's output tree and
+        # `initialize` writes one before any block runs, so an episode that ran N blocks is graded
+        # on the state after block N, and an episode that ran none is graded on its opening state.
+        # Work an agent's thread does after its last block is lost rather than scored, which is
+        # the same rule the block budget states.
         await asyncio.to_thread(session.worker.close, confirm=True)
+        # A tree of regular files, or no grade. See `adapter.snapshot_outputs`: the grader's
+        # namespace holds the answers, so a link left under the output tree would resolve there.
+        snapshot = await asyncio.to_thread(
+            adapter.snapshot_outputs, session.outputs, into=Path(str(session.outputs) + ".graded")
+        )
         graded = await asyncio.to_thread(
             adapter.grade,
             graded=self._graded.parent,
             task_id=session.task_id,
-            outputs=session.outputs,
+            outputs=snapshot,
             ignore=world.ADDED_MODELS,
             filing={
                 "supervisor_email": session.supervisor_email,
@@ -489,7 +485,7 @@ class AppWorldEnv(Env):
         read = {
             "filing": graded["filing"],
             "world_digest": graded["world_digest"],
-            "rng_digest": sealed["rng_digest"],
+            "rng_digest": graded["rng_digest"],
         }
         filing = world.Filing(**{**read["filing"], "lines": tuple(read["filing"]["lines"])})
         verdicts = score(
@@ -598,6 +594,14 @@ class AppWorldEnv(Env):
             )
         )
         return fb
+
+
+def _discard(*paths: Path) -> None:
+    """Remove what an episode owned, and never raise while doing it."""
+    import shutil
+
+    for path in paths:
+        shutil.rmtree(path, ignore_errors=True)
 
 
 # ----- pure helpers -----

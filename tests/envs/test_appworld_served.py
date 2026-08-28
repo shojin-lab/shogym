@@ -1,18 +1,16 @@
 """End-to-end: drive served ``appworld`` episodes, and check the hazards that would corrupt them.
 
-The whole path (derive a seeded world, open it in a container of its own, drive it with
-``execute``, then call ``submit``, the ``score`` terminal, which seals and scores in one step)
-runs against a real AppWorld world in a real container. It needs Docker and the corpus; the
-module skips when the machine has neither and cannot get them, exactly as the tarball-provisioned
-ports' tests do, and ``SHOGYM_REQUIRE_UPSTREAM=1`` removes that escape.
+The whole path (derive a seeded world, open it in a worker of its own, drive it with ``execute``,
+then call ``submit``, the ``score`` terminal, which seals and scores in one step) runs against a
+real AppWorld world in a real subprocess. It needs the provisioned interpreter and the corpus;
+the module skips when the machine has neither and cannot get them, exactly as the tarball-
+provisioned ports' tests do, and ``SHOGYM_REQUIRE_UPSTREAM=1`` removes that escape.
 
-Five hazards are checked here because none of them can be checked anywhere else. A repeat must be
+Four hazards are checked here because none of them can be checked anywhere else. A repeat must be
 a repeat, in the databases *and* in the state of the generator the world draws from. No outcome
-may reach the observation stream before the payload is delivered. The two arms' payloads must
+may reach the observation stream before the payload is delivered, and the grading routes AppWorld
+publishes without authentication must be out of the agent's reach. And the two arms' payloads must
 still match on encoded bytes when the world the agent wrote into holds values that are not ASCII.
-The container must be a boundary rather than a description of one, which is checked by running
-the probes through the real ``execute`` path and asking what they can reach. And several worlds
-alive at once must stay several worlds.
 """
 
 from __future__ import annotations
@@ -20,13 +18,13 @@ from __future__ import annotations
 import asyncio
 import datetime as dt
 import json
+import re
 import uuid
 import zlib
 from pathlib import Path
 from typing import Any, Dict, List
 
 import pytest
-
 
 from tests._fixtures.upstream_gate import provisioned
 
@@ -240,6 +238,440 @@ async def test_the_tool_surface_cannot_grade_anything() -> None:
     assert names == {"execute", "submit", "terminate"}
 
 
+async def test_agent_authored_code_cannot_reach_what_the_boundary_hides() -> None:
+    """The probes a curious agent actually runs, and what each of them may not find.
+
+    These are the round-two probes, unchanged in what they ask and changed in what the answer
+    means. They used to check that things had not been *put* where agent code could reach them,
+    on a worker that was the same uid as the run and could read whatever the run could. The world
+    is a container now, so the same probes are checking that a filesystem holds one task's tree
+    and nothing else."""
+    # Written the way the review wrote them. AppWorld's own guard refuses a plain `import sys`
+    # and lets `__import__("sys")` through, which is the whole reason the guard is not a boundary
+    # and these properties have to hold without it.
+    argv_probe = """
+print(json.dumps(__import__("sys").argv))
+"""
+    env_probe = """
+print(json.dumps(dict(__import__("os").environ)))
+"""
+    disk_probe = """
+_io, _os = __import__("io"), __import__("os")
+root = _os.environ["APPWORLD_ROOT"]
+
+
+def _read(path):
+    try:
+        return _io.open(path).read()[:40]
+    except Exception as failure:
+        return type(failure).__name__
+
+
+print(json.dumps({
+    "root": root,
+    "readable": _read(root + "/data/tasks/%s/specs.json"),
+    "answers": _read(root + "/data/tasks/%s/ground_truth/answer.json"),
+}))
+""" % (task_id(), task_id())
+    played = await play([argv_probe, env_probe, disk_probe])
+    argv = json.loads(json.loads(played["outputs"][0]["content"])["output"])
+    environment = json.loads(json.loads(played["outputs"][1]["content"])["output"])
+    filesystem = json.loads(json.loads(played["outputs"][2]["content"])["output"])
+
+    # 1. Nothing on the command line but the script and the subcommand. There is no token and no
+    #    root to leak there any more: the root is a mount point named the same in every episode.
+    assert argv[-1] == "serve"
+    joined = " ".join(argv)
+    assert "--token" not in joined and "--root" not in joined
+    assert filesystem["root"] == "/corpus"
+
+    # 2. The serving process's environment did not come along. Not because it was filtered: a
+    #    container is given the image's own environment and what `docker run -e` names, so an
+    #    inherited provider key was never offered to it.
+    image = {"GPG_KEY", "HOSTNAME", "PATH", "PYTHON_SHA256", "PYTHON_VERSION", "PYTHONUNBUFFERED"}
+    ours = {"APPWORLD_ROOT", "APPWORLD_CACHE", "HOME", "LANG", "PYTHONDONTWRITEBYTECODE"}
+    assert set(environment) <= image | ours, sorted(set(environment) - image - ours)
+    # Nothing secret-shaped among the names this port passes. The base image's own `GPG_KEY` is
+    # excluded by name and not by luck: it is the published CPython release signing key that every
+    # official python image carries, so it is part of the machinery rather than part of the run.
+    assert not [
+        name
+        for name in set(environment) - image
+        if any(word in name.upper() for word in ("KEY", "TOKEN", "SECRET", "PASSWORD"))
+    ]
+
+    # 3. The answers are not in the tree the world was served from. Both halves matter: the served
+    #    tree really is readable from here, and the answers really are not in it.
+    assert filesystem["readable"].startswith("{")
+    assert filesystem["answers"] == "FileNotFoundError"
+
+
+async def test_the_served_tree_has_no_path_that_leads_to_the_answers() -> None:
+    """The route a reviewer actually walked: follow a link out of the served tree, then take the
+    sibling. It worked, because `specs.json` was a symlink into the corpus and the corpus holds
+    every task's answers next door.
+
+    Nothing in the served tree is a symlink now, and the corpus it was derived from is not mounted,
+    so a link would not resolve even if one were left. Each probe below is one step of that walk."""
+    probe = """
+_io, _os = __import__("io"), __import__("os")
+root = _os.environ["APPWORLD_ROOT"]
+task = root + "/data/tasks/%s"
+
+
+def _read(path):
+    try:
+        return _io.open(path).read()[:40]
+    except Exception as failure:
+        return type(failure).__name__
+
+
+def _target(path):
+    try:
+        return _os.readlink(path)
+    except Exception as failure:
+        return type(failure).__name__
+
+
+print(json.dumps({
+    "specs": _read(task + "/specs.json"),
+    "specs_is_link": _os.path.islink(task + "/specs.json"),
+    "specs_target": _target(task + "/specs.json"),
+    "db_is_link": _os.path.islink(task + "/dbs/gmail.jsonl"),
+    "sibling": _read(task + "/ground_truth/test_data.json"),
+    "root_links": [n for n in ("base_dbs", "datasets", "api_docs")
+                   if _os.path.islink(root + "/data/" + n)],
+}))
+""" % task_id()
+    played = await play([probe])
+    seen = json.loads(json.loads(played["outputs"][0]["content"])["output"])
+
+    # The served tree is genuinely readable from here, so the negatives below mean something.
+    assert seen["specs"].startswith("{")
+    # And nothing in it names where it came from.
+    assert seen["specs_is_link"] is False
+    assert seen["specs_target"] == "OSError"
+    assert seen["db_is_link"] is False
+    assert seen["root_links"] == []
+    assert seen["sibling"] == "FileNotFoundError"
+
+
+async def test_the_graders_tree_is_not_a_neighbour_of_the_served_one() -> None:
+    """The independent route: the grader's view used to be a fixed name beside the served root, so
+    knowing one gave you the other. It moved under a different parent with an unguessable name,
+    which raised the cost and did not close it.
+
+    **The route is not merely expensive now, it is not a route.** The probe used to substitute
+    `graded` for `seeded` in a host path the worker could reach by following one of its view's
+    shared links. Inside the container those links land on mount points: the corpus's shared parts
+    are mounted at `/corpus/data/<name>` directly, so what a walk out of the served tree reaches is
+    a name this container was given rather than a name on the machine. There is nothing to
+    substitute into, and the tree itself is absent either way, which is asserted at length in
+    :func:`test_the_run_the_grader_the_repository_and_the_corpus_are_absent`."""
+    from shogym.envs.appworld import adapter as adapter_module
+
+    served, graded = adapter_module.derived_root(), adapter_module.graded_root()
+    # On the host the two are still far apart, which is what the unguessable name is for.
+    assert graded.parent != served.parent
+    assert str(served.parent) not in str(graded)
+    probe = """
+_os = __import__("os")
+root = _os.environ["APPWORLD_ROOT"]
+base = _os.path.dirname(_os.path.dirname(_os.path.realpath(root + "/data/base_dbs")))
+print(json.dumps({
+    "root": root,
+    "base": base,
+    "beside_the_view": _os.path.exists(_os.path.dirname(root) + "/graded"),
+    "graded_by_name": _os.path.exists("/corpus/../graded"),
+}))
+"""
+    played = await play([probe])
+    seen = json.loads(json.loads(played["outputs"][0]["content"])["output"])
+    # The walk ends inside this container's own namespace rather than on the machine, so the
+    # substitution has no host name to be made on.
+    assert seen["root"] == "/corpus"
+    assert seen["base"] == "/corpus"
+    # The name the substitution needed is not in anything the world can reach: there is no
+    # `seeded` to turn into `graded`, because the walk ends on a mount point.
+    assert "seeded" not in seen["base"]
+    assert seen["beside_the_view"] is False
+    assert seen["graded_by_name"] is False
+
+
+async def test_a_read_outside_the_served_tree_is_refused() -> None:
+    """The acceptance test the audit hook was pulled in favour of, and it passes now.
+
+    It was marked expected-to-fail and strict, on the reasoning that everything the served tree
+    could have led to had been taken out of it and none of that stopped a read of a path an agent
+    names outright: the code it wrote ran as the worker, with the worker's filesystem, as the same
+    user as the run. A mount namespace is what makes this fail, and nothing short of one does. The
+    worker is in one now, so the marker is gone with it.
+
+    **The sentinel is a host-only file, deliberately.** This read `/etc/hosts`, which a correctly
+    isolated container has its own readable copy of, so the test would have gone green on a
+    container that was working exactly as intended and told us nothing about whether the boundary
+    held. The file below is written by this test on the host, outside every tree the worker is
+    given, so it can only be read by a process sharing the host's mount namespace."""
+    sentinel = adapter.cache_root().parent / f"host-only-{uuid.uuid4().hex}"
+    sentinel.write_text("readable only from the host namespace")
+    try:
+        probe = f"""
+_io = __import__("io")
+try:
+    _io.open({str(sentinel)!r}).read()
+    print(json.dumps({{"read": True}}))
+except Exception as failure:
+    print(json.dumps({{"read": False, "why": type(failure).__name__}}))
+"""
+        played = await play([probe])
+        seen = json.loads(json.loads(played["outputs"][0]["content"])["output"])
+        assert seen["read"] is False
+    finally:
+        sentinel.unlink(missing_ok=True)
+
+
+async def test_the_answers_are_not_in_the_process_that_runs_agent_code() -> None:
+    """The world is built without ground truth, so there is no evaluator to call and no expected
+    value to walk to from a frame. Grading happens in a second process that never runs agent
+    code, reading the end state off disk."""
+    probe = """
+_gc, _sys = __import__("gc"), __import__("sys")
+kind = _sys.modules["appworld.environment"].AppWorld
+live = [o for o in _gc.get_objects() if isinstance(o, kind)]
+print(json.dumps({
+    "worlds": len(live),
+    "ground_truth": [w.task.ground_truth is not None for w in live],
+}))
+"""
+    played = await play([probe])
+    seen = json.loads(json.loads(played["outputs"][0]["content"])["output"])
+    assert seen["worlds"] >= 1
+    assert seen["ground_truth"] == [False] * seen["worlds"]
+    # And the base task is still graded, by the process that does hold them.
+    assert played["feedback"]["checks"] > 0
+
+
+# ----- hazard: the payloads match on bytes even when the world does not speak ASCII -----
+
+
+async def test_the_two_arms_match_on_encoded_bytes_with_non_ascii_in_the_world() -> None:
+    hostile = "​Sectioń«\U0001f600"
+    played = await play(
+        [
+            f'''
+pw = [x for x in apis.supervisor.show_account_passwords() if x["account_name"] == "todoist"][0]
+token = apis.todoist.login(
+    username=apis.supervisor.show_profile()["email"], password=pw["password"]
+)["access_token"]
+project = [
+    p for p in apis.todoist.show_projects(access_token=token, page_limit=50)
+    if p["name"] == "Task Log"
+][0]["project_id"]
+filed = apis.todoist.create_task(
+    access_token=token, project_id=project, title="Filing",
+    description="""{hostile}, Routine""", priority="high",
+)
+print("filed")
+'''
+        ]
+    )
+    feedback = played["feedback"]
+    report, notice = feedback["report"], feedback["notice"]
+    assert len(report.encode()) == len(notice.encode())
+    assert len(json.dumps(report)) == len(json.dumps(notice))
+    assert report.isascii() and notice.isascii()
+    assert hostile not in report and hostile not in notice
+
+
+async def test_a_block_budget_of_n_allows_exactly_n_blocks_to_touch_the_world() -> None:
+    """Exercised, not read off the constructor.
+
+    The serve layer dispatches the call that *reaches* the horizon and cannot tell an `execute`
+    from a terminal, so a budget of N published as N + 1 let call N + 1 be another block, changing
+    the world after the budget it was to be scored under had run out. `execute` therefore counts
+    its own calls and refuses past the budget without touching the world.
+
+    The proof is behavioural: the over-budget call is the one that would have filed a perfect
+    ledger, and the episode scores zero on it."""
+    env = shogym.make("appworld", config={"horizon": 2})
+    # One slot past the block budget, and the slot exists so a terminal always has somewhere to go.
+    assert env.describe("0").horizon == 3
+    episode = await ServedEpisode.open_env(env, env_name="appworld", task=TASK)
+    try:
+        used = [
+            json.loads((await episode.call("execute", {"code": "print(%d)" % n})).content)
+            for n in (1, 2)
+        ]
+        assert [step["calls"] for step in used] == [1, 2]
+        assert [step["output"].strip() for step in used] == ["1", "2"]
+        # Call three reaches the horizon, so the serve layer runs it and then finalizes. What it
+        # must not do is change the world, and this one would have filed a perfect log.
+        terminal = await episode.call("execute", {"code": filing_block()})
+        verdict = json.loads(terminal.content)
+        assert verdict["ledger_fraction"] == 0.0
+        assert verdict["exercise_fraction"] == 0.0
+        assert verdict["filing_rows"] == 0.0
+    finally:
+        await episode.close()
+
+
+async def test_the_same_block_inside_the_budget_does_file_the_log() -> None:
+    """The other half, without which the test above passes for the wrong reason."""
+    env = shogym.make("appworld", config={"horizon": 2})
+    episode = await ServedEpisode.open_env(env, env_name="appworld", task=TASK)
+    try:
+        await episode.call("execute", {"code": filing_block()})
+        terminal = await episode.call("submit", {})
+        feedback = {
+            item["name"]: item["value"]
+            for item in (terminal.meta.get("shogym/feedback") or [])
+        }
+        assert feedback["ledger_fraction"] == 1.0
+        assert feedback["filing_rows"] == 1.0
+    finally:
+        await episode.close()
+
+
+async def test_one_episodes_grade_is_not_readable_by_the_next(tmp_path: Path) -> None:
+    """The failure this closes is the one the paired design cannot survive: the placebo member of
+    a pair reading the receipt of its twin.
+
+    Upstream's evaluator writes a report beside the episode's output by default, quoting the
+    requirement prose and the values behind it, and every worker used to be handed the same root
+    to find it under. Report writing is off, and an episode's output tree is now named absolutely
+    and lives outside any served corpus, so there is nothing of one episode inside another's
+    world."""
+    first = await play([filing_block()])
+    assert first["feedback"]["assertion_fraction"] >= 0.0  # the grader really ran
+
+    probe = """
+_io, _os = __import__("io"), __import__("os")
+root = _os.environ["APPWORLD_ROOT"]
+
+
+def _read(path):
+    try:
+        return _io.open(path).read()[:60]
+    except Exception as failure:
+        return type(failure).__name__
+
+
+print(json.dumps({
+    "root": root,
+    "experiments": _read(root + "/experiments/outputs"),
+    "report": _read(root + "/experiments/outputs/report.md"),
+}))
+"""
+    second = await play([probe])
+    seen = json.loads(json.loads(second["outputs"][0]["content"])["output"])
+    # Nothing of any episode's output is inside the tree a world is served from.
+    assert seen["experiments"] in ("FileNotFoundError", "IsADirectoryError", "NotADirectoryError")
+    assert seen["report"] == "FileNotFoundError"
+    # And no evaluator report exists anywhere under the served corpus.
+    served = adapter.derived_root()
+    assert list(served.rglob("report.md")) == []
+
+
+async def test_one_episodes_write_is_not_in_the_next_episodes_world() -> None:
+    """The served inputs are per episode, and under the container they are not writable at all.
+
+    The derived corpus was one deterministic global root and every worker was handed it, with its
+    files writable by the process that runs agent-authored code and nothing putting them back. A
+    write through episode A's served view was therefore still there in episode B's starting
+    inputs. Two arms of a pair are the same task served at the same time, so the arm meant to
+    differ only in what it was told could also differ in the world it was given, and that is a
+    difference the treatment did not make.
+
+    Two things close it and this checks both. The view is per episode, so one episode's writes
+    have nowhere to reach the next from; and the mount is read-only, so there is no write to
+    contain. The second is the stronger and is what the branch below said the container would
+    bring.
+
+    **The refusal is read off the mount and not off the attempt.** Upstream's own guard replaces
+    `io.open` with one that refuses every write mode, so an attempt from inside `execute` fails
+    whatever the mount says, and a test that only tried to write would pass on a container mounted
+    read-write. So the kernel's own view of the mount is what is asserted, and the attempt is kept
+    beside it as the thing an episode would actually do.
+
+    Written through the pathname the worker is actually given, which is the route an episode has,
+    rather than through a path this test worked out for itself."""
+    task = task_id()
+    marker = "written by an earlier episode"
+    views = adapter.cache_root() / f"views-{adapter.DATA_VERSION}"
+    # Snapshotted rather than assumed empty: what this checks is that the views *this test* makes
+    # do not outlive their episodes, not that the machine started tidy.
+    before = {entry.name for entry in views.iterdir()} if views.exists() else set()
+    probe = (
+        '_io, _os = __import__("io"), __import__("os")\n'
+        'root = _os.environ["APPWORLD_ROOT"]\n'
+        'target = root + "/data/tasks/%s/dbs/gmail.jsonl"\n'
+        'mounts = _io.open("/proc/self/mountinfo").read()\n'
+        'served = [line for line in mounts.splitlines() if "/corpus/data/tasks/" in line]\n'
+    ) % task
+    scribble = probe + (
+        "\n"
+        "def _write():\n"
+        '    try:\n'
+        '        _io.open(target, "w").write(%r)\n'
+        '        return "wrote"\n'
+        "    except Exception as failure:\n"
+        "        return type(failure).__name__\n"
+        "\n"
+        '\n'
+        'print(json.dumps({"root": root, "write": _write(), "served": served,'
+        ' "body": _io.open(target).read()[:64]}))\n'
+    ) % marker
+    read_back = probe + (
+        'print(json.dumps({"root": root, "body": _io.open(target).read()[:64]}))\n'
+    )
+
+    first = json.loads(json.loads((await play([scribble]))["outputs"][0]["content"])["output"])
+    second = json.loads(json.loads((await play([read_back]))["outputs"][0]["content"])["output"])
+
+    # The kernel's own word: the task tree is mounted read-only, which is the fact the attempt
+    # below cannot establish on its own.
+    assert first["served"], "no served task mount to read"
+    for line in first["served"]:
+        assert " ro," in line or line.endswith(" ro"), line
+    # And the attempt an episode would make does not succeed either.
+    assert first["write"] != "wrote", "the served tree was writable"
+    assert first["body"] != marker
+    assert second["body"] != marker, "the second episode started in the first one's leftovers"
+    # Two episodes, two views on the host, and each removed with the episode that owned it. The
+    # root inside the container is the same fixed mount point for both, which is the point: it
+    # names nothing about which episode is behind it.
+    assert first["root"] == second["root"] == "/corpus"
+    after = {entry.name for entry in views.iterdir()} if views.exists() else set()
+    assert after <= before, sorted(after - before)
+    # And the pristine copies either side of the served view never saw it.
+    pristine = adapter.derived_root() / "data" / "tasks" / task / "dbs"
+    for entry in sorted(pristine.iterdir()):
+        assert entry.read_text()[:64] != marker
+
+
+async def test_the_world_stops_before_it_is_graded() -> None:
+    """Sealing closes the tool surface and does not stop work an earlier call left running. The
+    worker is terminated before the read is scored, so the evaluator reads a snapshot nothing can
+    still be writing to."""
+    from shogym.envs.appworld import mcp_server
+
+    env = shogym.make("appworld")
+    episode = await ServedEpisode.open_env(env, env_name="appworld", task=TASK)
+    try:
+        session = mcp_server.get_session(episode.session_id)
+        assert session is not None
+        worker = session.worker
+        assert worker.process.poll() is None
+        await episode.call("submit", {})
+        # Graded, and the process that could have changed the world is already gone.
+        assert worker.process.poll() is not None
+    finally:
+        await episode.close()
+
+
+# ----- the matched pair, through a stream -----
+
+
 async def test_the_world_has_no_network_to_be_reached_over() -> None:
     """The worker used to answer on a loopback port, and the token was the whole of what kept a
     second process on the machine from asking a live world to evaluate itself. There is no port
@@ -318,193 +750,6 @@ async def test_the_container_name_and_the_served_root_reach_no_agent_visible_sur
         await episode.close()
 
 
-async def test_agent_authored_code_cannot_reach_what_the_boundary_hides() -> None:
-    """The probes a curious agent actually runs, and what each of them may not find.
-
-    These are the round-two probes, unchanged in what they ask and changed in what the answer
-    means. They used to check that things had not been *put* where agent code could reach them,
-    on a worker that was the same uid as the run and could read whatever the run could. The world
-    is a container now, so the same probes are checking that a filesystem holds one task's tree
-    and nothing else."""
-    # Written the way the review wrote them. AppWorld's own guard refuses a plain `import sys`
-    # and lets `__import__("sys")` through, which is the whole reason the guard is not a boundary
-    # and these properties have to hold without it.
-    argv_probe = """
-print(json.dumps(__import__("sys").argv))
-"""
-    env_probe = """
-print(json.dumps(dict(__import__("os").environ)))
-"""
-    disk_probe = """
-_io, _os = __import__("io"), __import__("os")
-root = _os.environ["APPWORLD_ROOT"]
-
-
-def _read(path):
-    try:
-        return _io.open(path).read()[:40]
-    except Exception as failure:
-        return type(failure).__name__
-
-
-print(json.dumps({
-    "root": root,
-    "readable": _read(root + "/data/tasks/%s/specs.json"),
-    "answers": _read(root + "/data/tasks/%s/ground_truth/answer.json"),
-}))
-""" % (task_id(), task_id())
-    played = await play([argv_probe, env_probe, disk_probe])
-    argv = json.loads(json.loads(played["outputs"][0]["content"])["output"])
-    environment = json.loads(json.loads(played["outputs"][1]["content"])["output"])
-    filesystem = json.loads(json.loads(played["outputs"][2]["content"])["output"])
-
-    # 1. Nothing on the command line but the script and the subcommand. There is no token and no
-    #    root to leak there any more: the root is a mount point named the same in every episode.
-    assert argv[-1] == "serve"
-    joined = " ".join(argv)
-    assert "--token" not in joined and "--root" not in joined
-    assert filesystem["root"] == "/corpus"
-
-    # 2. The serving process's environment did not come along. Not because it was filtered: a
-    #    container is given the image's own environment and what `docker run -e` names, so an
-    #    inherited provider key was never offered to it.
-    image = {"GPG_KEY", "HOSTNAME", "PATH", "PYTHON_SHA256", "PYTHON_VERSION", "PYTHONUNBUFFERED"}
-    ours = {"APPWORLD_ROOT", "APPWORLD_CACHE", "HOME", "LANG", "PYTHONDONTWRITEBYTECODE"}
-    assert set(environment) <= image | ours, sorted(set(environment) - image - ours)
-    # Nothing secret-shaped among the names this port passes. The base image's own `GPG_KEY` is
-    # excluded by name and not by luck: it is the published CPython release signing key that every
-    # official python image carries, so it is part of the machinery rather than part of the run.
-    assert not [
-        name
-        for name in set(environment) - image
-        if any(word in name.upper() for word in ("KEY", "TOKEN", "SECRET", "PASSWORD"))
-    ]
-
-    # 3. The answers are not in the tree the world was served from. Both halves matter: the served
-    #    tree really is readable from here, and the answers really are not in it.
-    assert filesystem["readable"].startswith("{")
-    assert filesystem["answers"] == "FileNotFoundError"
-
-
-async def test_the_served_tree_has_no_path_that_leads_to_the_answers() -> None:
-    """The route a reviewer actually walked: follow a link out of the served tree, then take the
-    sibling. It worked, because `specs.json` was a symlink into the corpus and the corpus holds
-    every task's answers next door.
-
-<<<<<<< HEAD
-    **One invariant, stated where it can be checked.** This test used to demand that the served
-    root hold no symlinks at all, which was a proxy for the thing that matters and stopped being
-    equivalent to it when an episode got a served view of its own: the view names the shared
-    derived base rather than copying 134 MB per episode. A symlink is not the defect; a symlink
-    whose *target* has the answers as a sibling is. So what is asserted here is the target
-    contract, walked the way the reviewer walked it: step through each link, ask the directory it
-    landed in for this task, and find the task there and no `ground_truth` beside it. The
-    read-only half of the same invariant, which is what keeps one arm of a pair out of the
-    other's inputs, is asserted below and at
-    `test_appworld_runtime.py::test_two_episodes_of_one_task_do_not_share_their_served_inputs`."""
-=======
-    Nothing in the served tree is a symlink now, and the corpus it was derived from is not mounted,
-    so a link would not resolve even if one were left. Each probe below is one step of that walk."""
->>>>>>> a60c8dc (appworld: test the boundary by running the probes through a real execute)
-    probe = """
-_io, _os = __import__("io"), __import__("os")
-root = _os.environ["APPWORLD_ROOT"]
-task = root + "/data/tasks/%(task)s"
-
-
-def _read(path):
-    try:
-        return _io.open(path).read()[:40]
-    except Exception as failure:
-        return type(failure).__name__
-
-
-def _mode(path):
-    # The permissions as the worker itself sees them, rather than a write attempt, because a write
-    # cannot be measured from in here: upstream's guard replaces `io.open` with one that refuses
-    # every write mode whatever the path, and null-patches `os.open`, which then reports success
-    # and creates nothing. Both would answer about the guard rather than about the filesystem.
-    try:
-        return oct(_os.stat(path).st_mode & 0o777)
-    except Exception as failure:
-        return type(failure).__name__
-
-
-def _target(path):
-    try:
-        return _os.readlink(path)
-    except Exception as failure:
-        return type(failure).__name__
-
-
-# The shared entries named by name, because AppWorld's own guard null-patches `os.listdir` inside
-# an `execute` call and there is nothing here to enumerate them with.
-shared = ["base_dbs", "datasets", "api_docs"]
-# Take every link out of the served root, step to the directory its target sits in, and ask that
-# directory for this task. That is the reviewer's walk exactly: `specs.json` was a link into the
-# corpus, and the corpus keeps every task's answers in the folder beside its specs.
-neighbours = []
-answers = []
-for name in shared:
-    if not _os.path.islink(root + "/data/" + name):
-        continue
-    here = _os.path.dirname(_os.path.realpath(root + "/data/" + name))
-    if _os.path.exists(here + "/tasks/%(task)s/specs.json"):
-        neighbours.append(name)
-    if _os.path.exists(here + "/tasks/%(task)s/ground_truth"):
-        answers.append(name)
-print(json.dumps({
-    "specs": _read(task + "/specs.json"),
-    "specs_is_link": _os.path.islink(task + "/specs.json"),
-    "specs_target": _target(task + "/specs.json"),
-    "db_is_link": _os.path.islink(task + "/dbs/gmail.jsonl"),
-    "sibling": _read(task + "/ground_truth/test_data.json"),
-    "neighbours": sorted(set(neighbours)),
-    "answers_beyond_a_link": sorted(set(answers)),
-    # The base every episode shares. A write through it would be in the next episode's inputs.
-    "shared_mode": _mode(root + "/data/api_docs"),
-    "shared_file_mode": _mode(root + "/data/base_dbs/admin.db"),
-    "own_mode": _mode(task),
-}))
-""" % {"task": task_id()}
-    played = await play([probe])
-    seen = json.loads(json.loads(played["outputs"][0]["content"])["output"])
-
-    # The served tree is genuinely readable from here, so the negatives below mean something.
-    assert seen["specs"].startswith("{")
-    # And nothing in it names where it came from.
-    assert seen["specs_is_link"] is False
-    assert seen["specs_target"] == "OSError"
-    assert seen["db_is_link"] is False
-    assert seen["sibling"] == "FileNotFoundError"
-    # Links are allowed; a link whose target has the answers next door is not. The walk really did
-    # land somewhere holding this task, which is what makes the second assertion mean something:
-    # on the head this test was written against, that somewhere was the corpus, and the corpus
-    # keeps every task's answers in the folder beside its specs.
-    assert seen["neighbours"] == ["api_docs", "base_dbs", "datasets"]
-    assert seen["answers_beyond_a_link"] == []
-    # The episode owns its task and nothing else. The shared base an episode links to is sealed
-    # read-only, so a write through it cannot reach the next episode's starting inputs or the
-    # other arm of its own pair's; its own task copy is writable and goes with the episode.
-    assert seen["shared_mode"] == "0o555"
-    assert seen["shared_file_mode"] == "0o444"
-    assert int(seen["own_mode"], 8) & 0o200
-
-
-<<<<<<< HEAD
-async def test_the_graders_tree_is_not_a_neighbour_of_the_served_one() -> None:
-    """The independent route: the grader's view used to be a fixed name beside the served root,
-    so knowing one gave you the other. It now lives under a different parent with an unguessable
-    name. This raises the cost and does not close it, and the README says so; what it checks is
-    that the tree is no longer derivable from what the worker is handed.
-
-    **The substitution is made from the derived corpus and not from `APPWORLD_ROOT`.** Since each
-    episode is served a view of its own, `APPWORLD_ROOT` names that view and has no `seeded` in
-    it, so the old probe substituted nothing and then asked whether the served root existed. It
-    does, so the test asserted the failure it was written to catch. The derived corpus is still
-    reachable from inside, by following one of the view's shared links, so the guess is made from
-    there: that is the name the grader's tree used to sit beside."""
-=======
 async def test_the_run_the_grader_the_repository_and_the_corpus_are_absent(
     tmp_path: Path,
 ) -> None:
@@ -520,7 +765,6 @@ async def test_the_run_the_grader_the_repository_and_the_corpus_are_absent(
     record a read like this and did not record one made through a live ``execute``; the read now
     fails because the path does not exist, and the record catches it as well (see
     :func:`test_the_record_catches_a_read_made_through_a_live_execute`)."""
->>>>>>> a60c8dc (appworld: test the boundary by running the probes through a real execute)
     from shogym.envs.appworld import adapter as adapter_module
 
     run_tree = tmp_path / "provenance"
@@ -605,6 +849,66 @@ print(json.dumps({
     assert seen["hostname"] in ("", "worker")
 
 
+async def test_the_two_arms_see_the_same_surface_from_inside_execute(tmp_path: Path) -> None:
+    """The paired claim, compared rather than asserted.
+
+    Two arms of a pair differ in what a terminating call hands back and in nothing else. The
+    surface an episode can read from inside `execute` is where that could quietly stop being true:
+    a mount named for its arm, an environment variable that differs, a filesystem that says which
+    policy is serving. So both arms are run and their surfaces are compared, with the parts that
+    are per episode by design masked out, rather than the words of the arms being grepped for."""
+    from shogym.serve.stream import Information, Placebo, TaskRef, TaskStream
+
+    probe = """
+_io, _os = __import__("io"), __import__("os")
+mounts = _io.open("/proc/self/mountinfo").read()
+print(json.dumps({
+    "mounts": sorted(line.split(" - ")[0].split(" ", 4)[-1] for line in mounts.splitlines()
+                     if "/corpus" in line or "/outputs" in line),
+    "env": sorted("%s=%s" % (k, v) for k, v in _os.environ.items()),
+    "root": sorted(n for n in ("corpus", "outputs", "scratch", "opt", "tmp")
+                   if _os.path.exists("/" + n)),
+    "socket": _os.path.exists("/var/run/docker.sock"),
+}))
+"""
+    seen = {}
+    identity = shogym.make("appworld").config_digest
+    for name, policy in (("information", Information()), ("placebo", Placebo())):
+        stream = TaskStream(
+            shogym.make,
+            [TaskRef("appworld", TASK)],
+            prov_dir=tmp_path / name,
+            feedback=policy,
+            identity=identity,
+        )
+        async with stream:
+            await stream.get_task()
+            answered = await stream.dispatch("execute", {"code": probe})
+            answer = json.loads(json.loads(answered.content[0].text)["content"])
+            seen[name] = json.loads(answer["output"])
+            await stream.dispatch("submit", {})
+
+    def _masked(surface):
+        # The session identifier is per episode by design and is in the output mount's host path.
+        # Everything else has to match, including every environment variable.
+        return {
+            "mounts": sorted(re.sub(r"[0-9a-f-]{20,}", "<episode>", line)
+                             for line in surface["mounts"]),
+            "env": surface["env"],
+            "root": surface["root"],
+            "socket": surface["socket"],
+        }
+
+    assert _masked(seen["information"]) == _masked(seen["placebo"])
+    # And the masking did not hide everything: the surfaces really do name the mounts.
+    assert any("/corpus" in line for line in seen["information"]["mounts"])
+    # Neither arm's own word is anywhere in what either of them can read. The surfaces only: the
+    # keys of this dictionary are the test's own names for them.
+    both = json.dumps(list(seen.values()))
+    for word in ("information", "placebo", "graded", "drawn", "report", "notice"):
+        assert word not in both.lower(), word
+
+
 async def test_only_this_episodes_task_and_output_tree_are_mounted() -> None:
     """One task, not the roster; one experiment's outputs, not the run's.
 
@@ -629,22 +933,6 @@ async def test_only_this_episodes_task_and_output_tree_are_mounted() -> None:
     probe = """
 _os = __import__("os")
 root = _os.environ["APPWORLD_ROOT"]
-<<<<<<< HEAD
-base = _os.path.dirname(_os.path.dirname(_os.path.realpath(root + "/data/base_dbs")))
-print(json.dumps({
-    "base": base,
-    "guess": _os.path.exists(base.replace("seeded", "graded")),
-    "beside_the_view": _os.path.exists(_os.path.dirname(root) + "/graded"),
-}))
-"""
-    played = await play([probe])
-    seen = json.loads(json.loads(played["outputs"][0]["content"])["output"])
-    # The walk landed on the derived corpus, so the substitution below is made on the name it
-    # would have to be made on.
-    assert seen["base"] == str(served)
-    assert seen["guess"] is False
-    assert seen["beside_the_view"] is False
-=======
 print(json.dumps({
     "mine": _os.path.exists(root + "/data/tasks/%s/specs.json"),
     "others": [n for n in json.loads(%r)
@@ -655,47 +943,9 @@ print(json.dumps({
     seen = json.loads(json.loads(played["outputs"][0]["content"])["output"])
     assert seen["mine"] is True
     assert seen["others"] == []
-<<<<<<< HEAD
-    # And the test is not vacuous: the host really does hold other tasks' derived trees by now.
-    assert others, "no sibling task derived yet; run another served test first"
->>>>>>> a60c8dc (appworld: test the boundary by running the probes through a real execute)
-=======
     # And the test is not vacuous: the host really does hold another task's derived tree, because
     # this test served one.
     assert task_id(TASK + 1) in others
->>>>>>> 887dbff (appworld: read the score off a stopped world, and stop trusting an unconfirmed removal)
-
-
-async def test_a_read_outside_the_served_tree_is_refused() -> None:
-    """The acceptance test the audit hook was pulled in favour of, and it passes now.
-
-    It was marked expected-to-fail and strict, on the reasoning that everything the served tree
-    could have led to had been taken out of it and none of that stopped a read of a path an agent
-    names outright: the code it wrote ran as the worker, with the worker's filesystem, as the same
-    user as the run. A mount namespace is what makes this fail, and nothing short of one does. The
-    worker is in one now, so the marker is gone with it.
-
-    **The sentinel is a host-only file, deliberately.** This read `/etc/hosts`, which a correctly
-    isolated container has its own readable copy of, so the test would have gone green on a
-    container that was working exactly as intended and told us nothing about whether the boundary
-    held. The file below is written by this test on the host, outside every tree the worker is
-    given, so it can only be read by a process sharing the host's mount namespace."""
-    sentinel = adapter.cache_root().parent / f"host-only-{uuid.uuid4().hex}"
-    sentinel.write_text("readable only from the host namespace")
-    try:
-        probe = f"""
-_io = __import__("io")
-try:
-    _io.open({str(sentinel)!r}).read()
-    print(json.dumps({{"read": True}}))
-except Exception as failure:
-    print(json.dumps({{"read": False, "why": type(failure).__name__}}))
-"""
-        played = await play([probe])
-        seen = json.loads(json.loads(played["outputs"][0]["content"])["output"])
-        assert seen["read"] is False
-    finally:
-        sentinel.unlink(missing_ok=True)
 
 
 async def test_activity_an_earlier_block_started_cannot_change_the_graded_bytes(
@@ -900,21 +1150,132 @@ async def test_the_worlds_container_is_gone_before_the_grader_starts(
     assert feedback["ledger_fraction"] == 1.0
 
 
-async def test_several_worlds_alive_at_once_stay_several_worlds() -> None:
-    """One env instance backs several concurrent episodes, each with a container of its own.
+async def test_a_failed_setup_leaves_no_tree_behind() -> None:
+    """A spawn or an open that fails owns what it made until something else does.
 
-    A regression against the shape of the old design as much as the new one: two worlds in one
-    interpreter are one world the other keeps unfreezing, and two episodes sharing a container
-    would be the same failure with a bigger boundary around it. Each episode must see its own
-    world, and each must have a container of its own that outlives the others' teardown."""
+    The view and the output tree are created before the session is registered, so a failure
+    between the two left both on disk with nothing holding them: the env's own close finds no
+    session, and neither is ever removed. On a paired run that is two directories per failed
+    episode, for the life of the machine."""
+    from shogym.envs.appworld import adapter as adapter_module
+
+    env = shogym.make("appworld")
+    views = adapter_module.cache_root() / f"views-{adapter_module.DATA_VERSION}"
+    outputs = adapter_module.episodes_home()
+    before = (
+        {entry.name for entry in views.iterdir()} if views.exists() else set(),
+        {entry.name for entry in outputs.iterdir()} if outputs.exists() else set(),
+    )
+    session_id = "failed-setup-probe"
+    task = env._load_task(TASK)
+    # A world that cannot open: the task the env was told to serve is not one the corpus has.
+    with pytest.raises(Exception):
+        env._begin_session(session_id, {**task, "task_id": "no_such_task_1"})
+    after = (
+        {entry.name for entry in views.iterdir()} if views.exists() else set(),
+        {entry.name for entry in outputs.iterdir()} if outputs.exists() else set(),
+    )
+    assert after[0] <= before[0], sorted(after[0] - before[0])
+    assert after[1] <= before[1], sorted(after[1] - before[1])
+
+
+async def test_teardown_never_raises_when_docker_will_not_answer(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Teardown's close is best effort by contract, and the contract has to hold on the paths that
+    actually fail.
+
+    A control call that times out or finds no CLI used to raise straight out of teardown, past the
+    pipes and the directories it was there to release. The container it could not remove belongs
+    to the sweep; the handles belong here, and dropping them is not optional."""
     from shogym.envs.appworld import container as container_module
     from shogym.envs.appworld import mcp_server
 
     env = shogym.make("appworld")
+    episode = await ServedEpisode.open_env(env, env_name="appworld", task=TASK)
+    session = mcp_server.get_session(episode.session_id)
+    assert session is not None
+    worker, view, outputs = session.worker, Path(session.view), session.outputs
+    real = container_module.remove
+
+    def _refuses(name: str, *, confirm: bool = False) -> None:
+        raise container_module.DockerError("the docker CLI is not on PATH")
+
+    monkeypatch.setattr(container_module, "remove", _refuses)
+    try:
+        await episode.close()
+    finally:
+        monkeypatch.setattr(container_module, "remove", real)
+    # The episode closed, the directories are gone, and the pipes are shut, even though the
+    # removal could not be made.
+    assert not view.exists()
+    assert not outputs.exists()
+    assert worker.process.poll() is not None
+    real(worker.container)
+
+
+async def test_a_runaway_block_does_not_slow_its_sibling_arm() -> None:
+    """Two arms of a pair are two containers on one host, so one has to be bounded against the
+    other.
+
+    A pid limit bounds a fork bomb and nothing else: a block that spins takes whatever the machine
+    will give it. The quota is what keeps the arm that was supposed to differ only in what it was
+    told from also differing in how much machine it got."""
+    import time
+
+    burn = """
+_t = __import__("threading")
+state = {"on": True}
+
+
+def _spin():
+    while state["on"]:
+        sum(i * i for i in range(100000))
+
+
+for _ in range(8):
+    _t.Thread(target=_spin, daemon=True).start()
+print("burning")
+"""
+    quiet = shogym.make("appworld")
+    busy = shogym.make("appworld")
+    calm = await ServedEpisode.open_env(quiet, env_name="appworld", task=TASK)
+    loud = await ServedEpisode.open_env(busy, env_name="appworld", task=TASK)
+    try:
+        # A baseline from the quiet arm before anything is burning.
+        start = time.monotonic()
+        await calm.call("execute", {"code": "print(1)"})
+        alone = time.monotonic() - start
+        await loud.call("execute", {"code": burn})
+        start = time.monotonic()
+        await calm.call("execute", {"code": "print(2)"})
+        beside = time.monotonic() - start
+    finally:
+        await loud.close()
+        await calm.close()
+    # Generous on purpose: what this catches is starvation, not jitter. Eight spinning threads in
+    # an unquota'd container would take the machine; inside a two-cpu quota they take their own.
+    assert beside < max(2.0, alone * 20 + 1.0), (alone, beside)
+
+
+async def test_several_worlds_alive_at_once_stay_several_worlds() -> None:
+    """One env per episode, which is what `open_env` asks for, and one closed while the rest run.
+
+    Two worlds in one interpreter are one world the other keeps unfreezing, and two episodes
+    sharing a container would be the same failure with a bigger boundary around it. This shares
+    nothing: each episode gets its own env, as a production run does, and the interesting moment
+    is the one the previous version of this test skipped by closing them together. A sibling has
+    to survive its neighbour's whole teardown, which now stops a container, confirms the stop with
+    the daemon, snapshots a tree and grades it."""
+    from shogym.envs.appworld import container as container_module
+    from shogym.envs.appworld import mcp_server
+
+    positions = (0, 1, 0)
+    envs = [shogym.make("appworld") for _ in positions]
     episodes = await asyncio.gather(
         *(
             ServedEpisode.open_env(env, env_name="appworld", task=position)
-            for position in (0, 1, 0)
+            for env, position in zip(envs, positions)
         )
     )
     try:
@@ -929,288 +1290,31 @@ async def test_several_worlds_alive_at_once_stay_several_worlds() -> None:
         # while the others are open.
         answers = await asyncio.gather(
             *(
-                episode.call("execute", {"code": "print(%d)" % position})
-                for position, episode in enumerate(episodes)
+                episode.call("execute", {"code": "print(%d)" % index})
+                for index, episode in enumerate(episodes)
             )
         )
         assert [
             json.loads(answer.content)["output"].strip() for answer in answers
         ] == ["0", "1", "2"]
-        # And two episodes of one task are two worlds, not one shared one.
+        # Two episodes of one task are two worlds, not one shared one.
         await episodes[0].call("execute", {"code": "marker = 'first'"})
         third = await episodes[2].call("execute", {"code": "print(globals().get('marker'))"})
         assert json.loads(third.content)["output"].strip() == "None"
+
+        # One goes through the whole of a production teardown while the others are mid-episode.
+        await episodes[1].call("submit", {})
+        await episodes[1].close()
+        assert not container_module.running(names[1])
+        # And a survivor is still a working world afterwards, not merely a live container.
+        assert all(container_module.running(name) for name in (names[0], names[2]))
+        after = await episodes[0].call("execute", {"code": "print(marker)"})
+        assert json.loads(after.content)["output"].strip() == "first"
+        scored = await episodes[2].call("submit", {})
+        assert json.loads(scored.content)["checks"] > 0
     finally:
         await asyncio.gather(*(episode.close() for episode in episodes))
     assert not any(container_module.running(name) for name in names)
-
-
-async def test_the_answers_are_not_in_the_process_that_runs_agent_code() -> None:
-    """The world is built without ground truth, so there is no evaluator to call and no expected
-    value to walk to from a frame. Grading happens in a second process that never runs agent
-    code, reading the end state off disk."""
-    probe = """
-_gc, _sys = __import__("gc"), __import__("sys")
-kind = _sys.modules["appworld.environment"].AppWorld
-live = [o for o in _gc.get_objects() if isinstance(o, kind)]
-print(json.dumps({
-    "worlds": len(live),
-    "ground_truth": [w.task.ground_truth is not None for w in live],
-}))
-"""
-    played = await play([probe])
-    seen = json.loads(json.loads(played["outputs"][0]["content"])["output"])
-    assert seen["worlds"] >= 1
-    assert seen["ground_truth"] == [False] * seen["worlds"]
-    # And the base task is still graded, by the process that does hold them.
-    assert played["feedback"]["checks"] > 0
-
-
-# ----- hazard: the payloads match on bytes even when the world does not speak ASCII -----
-
-
-async def test_the_two_arms_match_on_encoded_bytes_with_non_ascii_in_the_world() -> None:
-    hostile = "​Sectioń«\U0001f600"
-    played = await play(
-        [
-            f'''
-pw = [x for x in apis.supervisor.show_account_passwords() if x["account_name"] == "todoist"][0]
-token = apis.todoist.login(
-    username=apis.supervisor.show_profile()["email"], password=pw["password"]
-)["access_token"]
-project = [
-    p for p in apis.todoist.show_projects(access_token=token, page_limit=50)
-    if p["name"] == "Task Log"
-][0]["project_id"]
-filed = apis.todoist.create_task(
-    access_token=token, project_id=project, title="Filing",
-    description="""{hostile}, Routine""", priority="high",
-)
-print("filed")
-'''
-        ]
-    )
-    feedback = played["feedback"]
-    report, notice = feedback["report"], feedback["notice"]
-    assert len(report.encode()) == len(notice.encode())
-    assert len(json.dumps(report)) == len(json.dumps(notice))
-    assert report.isascii() and notice.isascii()
-    assert hostile not in report and hostile not in notice
-
-
-async def test_a_block_budget_of_n_allows_exactly_n_blocks_to_touch_the_world() -> None:
-    """Exercised, not read off the constructor.
-
-    The serve layer dispatches the call that *reaches* the horizon and cannot tell an `execute`
-    from a terminal, so a budget of N published as N + 1 let call N + 1 be another block, changing
-    the world after the budget it was to be scored under had run out. `execute` therefore counts
-    its own calls and refuses past the budget without touching the world.
-
-    The proof is behavioural: the over-budget call is the one that would have filed a perfect
-    ledger, and the episode scores zero on it."""
-    env = shogym.make("appworld", config={"horizon": 2})
-    # One slot past the block budget, and the slot exists so a terminal always has somewhere to go.
-    assert env.describe("0").horizon == 3
-    episode = await ServedEpisode.open_env(env, env_name="appworld", task=TASK)
-    try:
-        used = [
-            json.loads((await episode.call("execute", {"code": "print(%d)" % n})).content)
-            for n in (1, 2)
-        ]
-        assert [step["calls"] for step in used] == [1, 2]
-        assert [step["output"].strip() for step in used] == ["1", "2"]
-        # Call three reaches the horizon, so the serve layer runs it and then finalizes. What it
-        # must not do is change the world, and this one would have filed a perfect log.
-        terminal = await episode.call("execute", {"code": filing_block()})
-        verdict = json.loads(terminal.content)
-        assert verdict["ledger_fraction"] == 0.0
-        assert verdict["exercise_fraction"] == 0.0
-        assert verdict["filing_rows"] == 0.0
-    finally:
-        await episode.close()
-
-
-async def test_the_same_block_inside_the_budget_does_file_the_log() -> None:
-    """The other half, without which the test above passes for the wrong reason."""
-    env = shogym.make("appworld", config={"horizon": 2})
-    episode = await ServedEpisode.open_env(env, env_name="appworld", task=TASK)
-    try:
-        await episode.call("execute", {"code": filing_block()})
-        terminal = await episode.call("submit", {})
-        feedback = {
-            item["name"]: item["value"]
-            for item in (terminal.meta.get("shogym/feedback") or [])
-        }
-        assert feedback["ledger_fraction"] == 1.0
-        assert feedback["filing_rows"] == 1.0
-    finally:
-        await episode.close()
-
-
-async def test_one_episodes_grade_is_not_readable_by_the_next(tmp_path: Path) -> None:
-    """The failure this closes is the one the paired design cannot survive: the placebo member of
-    a pair reading the receipt of its twin.
-
-    Upstream's evaluator writes a report beside the episode's output by default, quoting the
-    requirement prose and the values behind it, and every worker used to be handed the same root
-    to find it under. Report writing is off, and an episode's output tree is now named absolutely
-    and lives outside any served corpus, so there is nothing of one episode inside another's
-    world."""
-    first = await play([filing_block()])
-    assert first["feedback"]["assertion_fraction"] >= 0.0  # the grader really ran
-
-    probe = """
-_io, _os = __import__("io"), __import__("os")
-root = _os.environ["APPWORLD_ROOT"]
-
-
-def _read(path):
-    try:
-        return _io.open(path).read()[:60]
-    except Exception as failure:
-        return type(failure).__name__
-
-
-print(json.dumps({
-    "root": root,
-    "experiments": _read(root + "/experiments/outputs"),
-    "report": _read(root + "/experiments/outputs/report.md"),
-}))
-"""
-    second = await play([probe])
-    seen = json.loads(json.loads(second["outputs"][0]["content"])["output"])
-    # Nothing of any episode's output is inside the tree a world is served from.
-    assert seen["experiments"] in ("FileNotFoundError", "IsADirectoryError", "NotADirectoryError")
-    assert seen["report"] == "FileNotFoundError"
-    # And no evaluator report exists anywhere under the served corpus.
-    served = adapter.derived_root()
-    assert list(served.rglob("report.md")) == []
-
-
-async def test_one_episodes_write_is_not_in_the_next_episodes_world() -> None:
-    """The served inputs are per episode, and under the container they are not writable at all.
-
-    The derived corpus was one deterministic global root and every worker was handed it, with its
-    files writable by the process that runs agent-authored code and nothing putting them back. A
-    write through episode A's served view was therefore still there in episode B's starting
-    inputs. Two arms of a pair are the same task served at the same time, so the arm meant to
-    differ only in what it was told could also differ in the world it was given, and that is a
-    difference the treatment did not make.
-
-    Two things close it and this checks both. The view is per episode, so one episode's writes
-    have nowhere to reach the next from; and the mount is read-only, so there is no write to
-    contain. The second is the stronger and is what the branch below said the container would
-    bring, so the attempt is expected to be refused rather than merely contained.
-
-<<<<<<< HEAD
-    **The write is made from here rather than from inside `execute`, and it has to be.** Upstream's
-    own guard replaces `io.open` with one that refuses every write mode and null-patches `os.open`
-    so that it reports success and creates nothing, so no code running inside an episode can write
-    a file or report truthfully that it failed to. What the route through the guard would have been
-    testing is upstream's guard; what matters here is the filesystem. So the pathname is the one
-    the worker was handed, the worker is asked to confirm it sees the write, and the episode that
-    follows is asked what it sees at the same place."""
-    task = task_id()
-    marker = "written by an earlier episode"
-    served = 'root + "/data/tasks/%s/dbs/gmail.jsonl"' % task
-    report = (
-        '_os = __import__("os")\n'
-        'root = _os.environ["APPWORLD_ROOT"]\n'
-        '_io = __import__("io")\n'
-        'print(json.dumps({"root": root, "body": _io.open(%s).read()[:64]}))\n' % served
-=======
-    Written through the pathname the worker is actually given, which is the route an episode has,
-    rather than through a path this test worked out for itself."""
-    task = task_id()
-    marker = "written by an earlier episode"
-    views = adapter.cache_root() / f"views-{adapter.DATA_VERSION}"
-    # Snapshotted rather than assumed empty: what this checks is that the views *this test* makes
-    # do not outlive their episodes, not that the machine started tidy.
-    before = {entry.name for entry in views.iterdir()} if views.exists() else set()
-    probe = (
-        '_io, _os = __import__("io"), __import__("os")\n'
-        'root = _os.environ["APPWORLD_ROOT"]\n'
-        'target = root + "/data/tasks/%s/dbs/gmail.jsonl"\n'
-    ) % task
-    scribble = probe + (
-        "\n"
-        "def _write():\n"
-        '    try:\n'
-        '        _io.open(target, "w").write(%r)\n'
-        '        return "wrote"\n'
-        "    except Exception as failure:\n"
-        "        return type(failure).__name__\n"
-        "\n"
-        '\n'
-        'print(json.dumps({"root": root, "write": _write(),'
-        ' "body": _io.open(target).read()[:64]}))\n'
-    ) % marker
-    read_back = probe + (
-        'print(json.dumps({"root": root, "body": _io.open(target).read()[:64]}))\n'
->>>>>>> 08b46fa (appworld: serve the per-episode view through the mount, and refuse the write outright)
-    )
-
-    env = shogym.make("appworld")
-    first = await ServedEpisode.open_env(env, env_name="appworld", task=TASK)
-    try:
-        before = json.loads(json.loads((await first.call("execute", {"code": report})).content)["output"])
-        target = Path(before["root"]) / "data" / "tasks" / task / "dbs" / "gmail.jsonl"
-        assert before["body"] != marker
-        # Through the pathname the worker is actually given, while that worker is running.
-        target.write_text(marker)
-        after = json.loads(json.loads((await first.call("execute", {"code": report})).content)["output"])
-        # The write really did land in the world this episode is being served, so the negative
-        # below is about isolation rather than about a write that never happened.
-        assert after["body"] == marker
-    finally:
-        await first.close()
-
-<<<<<<< HEAD
-    second = json.loads(json.loads((await play([report]))["outputs"][0]["content"])["output"])
-    assert second["body"] != marker, "the second episode started in the first one's leftovers"
-    # Two episodes, two served roots. One shared root is what carried the write.
-    assert before["root"] != second["root"]
-    # The view the first episode wrote through is gone with the episode that owned it.
-    assert not target.exists()
-    # And the pristine copy the views are built from never saw it.
-    pristine = adapter.derived_root() / "data" / "tasks" / task / "dbs" / "gmail.jsonl"
-    assert pristine.read_text()[:64] != marker
-=======
-    # Refused, not contained: the served tree is a read-only mount.
-    assert first["write"] != "wrote", "the served tree was writable"
-    assert first["body"] != marker
-    assert second["body"] != marker, "the second episode started in the first one's leftovers"
-    # Two episodes, two views on the host, and each removed with the episode that owned it. The
-    # root inside the container is the same fixed mount point for both, which is the point: it
-    # names nothing about which episode is behind it.
-    assert first["root"] == second["root"] == "/corpus"
-    after = {entry.name for entry in views.iterdir()} if views.exists() else set()
-    assert after <= before, sorted(after - before)
-    # And the pristine copies either side of the served view never saw it.
-    pristine = adapter.derived_root() / "data" / "tasks" / task / "dbs"
-    for entry in sorted(pristine.iterdir()):
-        assert entry.read_text()[:64] != marker
->>>>>>> 08b46fa (appworld: serve the per-episode view through the mount, and refuse the write outright)
-
-
-async def test_the_world_stops_before_it_is_graded() -> None:
-    """Sealing closes the tool surface and does not stop work an earlier call left running. The
-    worker is terminated before the read is scored, so the evaluator reads a snapshot nothing can
-    still be writing to."""
-    from shogym.envs.appworld import mcp_server
-
-    env = shogym.make("appworld")
-    episode = await ServedEpisode.open_env(env, env_name="appworld", task=TASK)
-    try:
-        session = mcp_server.get_session(episode.session_id)
-        assert session is not None
-        worker = session.worker
-        assert worker.process.poll() is None
-        await episode.call("submit", {})
-        # Graded, and the process that could have changed the world is already gone.
-        assert worker.process.poll() is not None
-    finally:
-        await episode.close()
 
 
 async def test_the_terminal_row_reaches_the_trace_after_an_ordinary_execute(
@@ -1257,23 +1361,123 @@ async def test_the_terminal_row_reaches_the_trace_after_an_ordinary_execute(
 # ----- the matched pair, through a stream -----
 
 
+async def test_a_row_is_refused_when_the_env_disagrees_with_the_name_it_is_filed_under(
+    tmp_path: Path,
+) -> None:
+    """The identity has to be the env's, not a string the caller remembered.
+
+    A caller supplies a name and the stream compares it against other strings on disk, which makes
+    a resume safe against a changed *caller* and does nothing about a caller whose string stopped
+    describing its env: a run relaunched under a different pulse with the same remembered name was
+    accepted, and its rows are incomparable in exactly the way the name exists to prevent. The env
+    publishes what produced every row, so the row is checked against the name it is being filed
+    under, at the moment it is written."""
+    from shogym.serve.stream import Information, TaskRef, TaskStream
+
+    stream = TaskStream(
+        shogym.make,
+        [TaskRef("appworld", TASK)],
+        prov_dir=tmp_path / "mismatched",
+        feedback=Information(),
+        identity="a name this env never produced",
+    )
+    with pytest.raises((ValueError, RuntimeError)) as refused:
+        async with stream:
+            await stream.get_task()
+            await stream.dispatch("submit", {})
+    # The seal fails with the reason, and the stream stops rather than going on to serve the rest
+    # of its queue under a name its env does not answer to.
+    said = str(refused.value)
+    assert "the environment says" in said
+    # Whatever the row says, it is not a score: the seal did not complete.
+    assert all(row.score is None for row in stream.results)
+
+
+async def test_a_resume_is_refused_under_a_changed_draw_and_under_a_changed_deadline(
+    tmp_path: Path,
+) -> None:
+    """Two things decide whether rows belong to one record, and only one of them was checked.
+
+    The draw, the payload class and the corpus decide what a score *means*, and the env says so.
+    The deadline and the capacity decide what an episode was allowed to do: a deadline turns a
+    slow episode into a timeout rather than a score, and a capacity changes the tool surface and
+    the scheduling. Two directories that differ in either hold rows about two different
+    opportunities, so both are in what a resume is checked against."""
+    from shogym.serve.stream import Information, TaskRef, TaskStream
+
+    prov = tmp_path / "run"
+    first = shogym.make("appworld")
+    stream = TaskStream(
+        shogym.make,
+        [TaskRef("appworld", TASK)],
+        prov_dir=prov,
+        feedback=Information(),
+        identity=first.config_digest,
+        deadline=600.0,
+    )
+    async with stream:
+        await stream.get_task()
+        await stream.dispatch("submit", {})
+    assert len(stream.results) == 1
+
+    # A different draw. The env says so itself, and its digest moves with it.
+    other = shogym.make("appworld", config={"pulse": 7})
+    assert other.config_digest != first.config_digest
+    with pytest.raises(ValueError) as changed_draw:
+        TaskStream(
+            shogym.make,
+            [TaskRef("appworld", TASK)],
+            prov_dir=prov,
+            feedback=Information(),
+            identity=other.config_digest,
+            deadline=600.0,
+            resume=True,
+        )
+    assert "run identity" in str(changed_draw.value)
+
+    # The same env, a different deadline. Nothing about the score changed; what an episode was
+    # allowed to do did.
+    with pytest.raises(ValueError) as changed_deadline:
+        TaskStream(
+            shogym.make,
+            [TaskRef("appworld", TASK)],
+            prov_dir=prov,
+            feedback=Information(),
+            identity=first.config_digest,
+            deadline=30.0,
+            resume=True,
+        )
+    assert "run identity" in str(changed_deadline.value)
+
+    # And the unchanged one resumes, so the refusals above are about the change rather than about
+    # resuming at all.
+    TaskStream(
+        shogym.make,
+        [TaskRef("appworld", TASK)],
+        prov_dir=prov,
+        feedback=Information(),
+        identity=first.config_digest,
+        deadline=600.0,
+        resume=True,
+    )
+
+
 async def test_information_hands_back_the_receipt_and_placebo_the_digest(
     tmp_path: Path,
 ) -> None:
     from shogym.serve.stream import Information, Placebo, TaskRef, TaskStream
 
     answers = {}
-    identity = shogym.make("appworld").config_digest
     for name, policy in (("information", Information()), ("placebo", Placebo())):
         stream = TaskStream(
             shogym.make,
             [TaskRef("appworld", TASK)],
             prov_dir=tmp_path / name,
             feedback=policy,
-            # What a resumed directory is checked against. An empty identity matches anything, so
-            # the documented construction has to carry one or a crash followed by a changed pulse
-            # appends incomparable rows to one run.
-            identity=identity,
+            # The port's own fingerprint, which is what makes two of these runs one measurement:
+            # the draw, the payload class, the block budget, the corpus contents and the scoring
+            # version. A resume under a changed pulse or a repointed corpus is refused by it.
+            identity=shogym.make("appworld").config_digest,
         )
         async with stream:
             await stream.get_task()

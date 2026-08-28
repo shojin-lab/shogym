@@ -889,6 +889,12 @@ class Worker:
                     f"{command!r} did not answer within {_CALL_TIMEOUT_SECONDS:.0f}s and is "
                     "still running, so no later answer on this pipe can be trusted"
                 )
+                # Stopped, not merely disowned. Poisoning the handle stops this process using the
+                # worker; it does nothing about the work, which goes on holding a cpu and a
+                # writable mount. The other arm of a pair is a sibling container on the same host,
+                # so a runaway left running is a difference the treatment did not make.
+                container.remove(self.container)
+                self.closed = True
                 raise WorkerError(f"the appworld worker: {self.poisoned}") from exc
         if "error" in answer:
             raise WorkerError(f"appworld worker refused {command!r}: {answer['error']}")
@@ -904,23 +910,33 @@ class Worker:
         end-of-file, which stops it, and :func:`~shogym.envs.appworld.container.reap` covers the
         parent that crashes while the worker cannot get back to that read.
 
-        Idempotent, because it is called twice on the ordinary path: finalization stops the world
-        before the grader reads its end state, and teardown then closes the session it was in.
-
-        ``confirm`` is finalization's, and it is the difference between a removal and a fact.
-        Finalization removes this container precisely so that nothing can write to the tree it is
-        about to grade; a removal the daemon did not confirm leaves that invariant unproven, so it
-        raises rather than proceeding, and the worker is *not* marked closed, so teardown will
-        try again."""
+        **Two callers, two failure modes, and the bounds compose.** ``confirm`` is finalization's,
+        and it is the difference between a removal and a fact: finalization removes this container
+        precisely so that nothing can write to the tree it is about to grade, so a removal the
+        daemon will not confirm raises, and the worker is *not* marked closed so teardown tries
+        again. Teardown's own call must never raise, whatever Docker does, because a teardown that
+        raises abandons the pipes and the directories it was there to release. The whole of this
+        is bounded well under the serve layer's own sixty seconds: three control calls of ten
+        seconds each and one process wait, never both waits and never a second grace period."""
         if self.closed:
             return
-        container.remove(self.container, confirm=confirm)
-        self.closed = True
+        try:
+            container.remove(self.container, confirm=confirm)
+        except container.DockerError:
+            if confirm:
+                # The caller is about to grade what this container could still be writing to, and
+                # it may not. Left unclosed on purpose: teardown will come back to it.
+                raise
+            # Teardown's path. The container is the reaper's problem now; what is left here is
+            # this process's own handles, and dropping them is not optional.
+        else:
+            self.closed = True
         if self.process.poll() is None:
-            self.process.terminate()
+            self.process.kill()
             try:
                 self.process.wait(timeout=_TERM_GRACE_SECONDS)
             except subprocess.TimeoutExpired:
+<<<<<<< HEAD
 <<<<<<< HEAD
                 _stop(self.process, signal.SIGKILL, pgid)
             return False
@@ -949,6 +965,9 @@ class Worker:
                     self.process.wait(timeout=_CLOSE_SECONDS)
                 except subprocess.TimeoutExpired:
                     pass
+=======
+                pass
+>>>>>>> d09b0cf (appworld: take no lifecycle fact from the process that runs the agent's code)
         _close_pipes(self.process)
 
 
@@ -1101,6 +1120,50 @@ def snapshot_outputs(outputs: Path, *, into: Path) -> Path:
 >>>>>>> f4000d8 (appworld: run the episode worker in a container, over stdio rather than a port)
 
 
+class SnapshotError(RuntimeError):
+    """The stopped output tree is not something that may be graded.
+
+    Its own type because it is an episode-level failure with a cause worth naming: the tree the
+    world left behind holds something that is not a plain file, and a grader that opened it would
+    be resolving a path the agent chose inside a namespace that also holds the answers."""
+
+
+def snapshot_outputs(outputs: Path, *, into: Path) -> Path:
+    """Copy a stopped episode's output tree into one the grader can be given, or refuse.
+
+    **Why a copy and not the tree itself.** The grading container mounts the answers. It also has
+    to mount the state to grade, and that state was writable by the process that ran the agent's
+    code. A symlink left in there resolves inside the grader's namespace, not the world's, so a
+    link planted under ``/outputs`` could make the digest and the evaluator read bytes from the
+    private tree instead of from what the episode submitted. Nothing here returns those bytes to
+    the agent, so this is score integrity rather than a leak, and it is still not a thing to leave
+    open.
+
+    So: every entry is checked to be a plain file or a plain directory whose real path is inside
+    the tree, and anything else refuses the episode outright rather than being skipped, because a
+    skipped entry is a grade computed over a tree that is not the one submitted. What is copied is
+    then a tree of regular files with no link in it, and that is what the grader is given.
+
+    Safe to walk because the container is already gone: this runs after a confirmed removal, so
+    nothing can add a link between the check and the copy."""
+    root = outputs.resolve()
+    if not root.is_dir():
+        raise SnapshotError(f"the episode left no output tree at {outputs}")
+    for path in sorted(root.rglob("*")):
+        if path.is_symlink():
+            raise SnapshotError(
+                f"the episode left a symbolic link in its output tree ({path.name} -> "
+                f"{os.readlink(path)}), which a grader must not resolve"
+            )
+        if not (path.is_file() or path.is_dir()):
+            raise SnapshotError(f"the episode left {path.name}, which is not a file or directory")
+        if not path.resolve().is_relative_to(root):
+            raise SnapshotError(f"the episode left {path.name}, which resolves outside its tree")
+    shutil.rmtree(into, ignore_errors=True)
+    shutil.copytree(root, into, symlinks=False)
+    return into
+
+
 def grade(
     *,
     graded: Path,
@@ -1117,9 +1180,14 @@ def grade(
     off the episode's own output directory, so the answers are never objects in the process the
     agent's code ran as and never files on a filesystem that process could see.
 
-    It also reads the filing and digests the databases, off that same tree and in that same
-    process, which is what makes the scored state and the graded state one state rather than two
-    observations of a live world that happened to agree. ``filing`` names what to look for: the
+    It also reads the filing, digests the databases and picks up the generator digest the world
+    wrote, off that same tree and in that same process. That is what makes the scored state and
+    the graded state one state rather than two observations of a live world that happened to
+    agree, and it is why nothing here is asked of the process that ran the agent's code.
+
+    ``outputs`` is a snapshot (see :func:`snapshot_outputs`), not the tree the world wrote: the
+    grader's namespace holds the answers, so what it is given has to be regular files and nothing
+    else. ``filing`` names what to look for: the
     supervisor whose account holds it, the project, the row's title and the label. None of it is
     an answer; it is the address of the row the appended paragraph asked for.
 
@@ -1275,6 +1343,7 @@ __all__ = [
     "graded_root",
     "private_home",
 <<<<<<< HEAD
+<<<<<<< HEAD
     "ensure_apps",
     "ensure_corpus",
     "runtime",
@@ -1285,6 +1354,12 @@ __all__ = [
     "seed",
     "served_mounts",
 >>>>>>> f4000d8 (appworld: run the episode worker in a container, over stdio rather than a port)
+=======
+    "SnapshotError",
+    "seed",
+    "served_mounts",
+    "snapshot_outputs",
+>>>>>>> d09b0cf (appworld: take no lifecycle fact from the process that runs the agent's code)
     "task_ids",
     "task_specs",
 ]

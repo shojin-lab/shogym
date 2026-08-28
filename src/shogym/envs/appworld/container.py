@@ -65,8 +65,19 @@ SCRATCH_MOUNT = "/scratch"
 #: How long the image build may take. Generous: it compiles ``psutil`` from source on arm64.
 _BUILD_TIMEOUT_SECONDS = 1800.0
 
-#: How long a ``docker`` control command (``inspect``, ``rm``) may take.
-_CONTROL_TIMEOUT_SECONDS = 60.0
+#: How long one ``docker`` control command (``inspect``, ``stop``, ``rm``) may take.
+#:
+#: **Bounded well below the serve layer's, because these compose.** The core abandons a session's
+#: release after 60 seconds and marks the episode closed; a single control call that could itself
+#: consume 60 seconds would put cleanup after that point, still holding mounts the next episode
+#: may want. Teardown makes at most a stop, a removal and two inspects, so the whole of it fits
+#: inside a fraction of the outer bound.
+_CONTROL_TIMEOUT_SECONDS = 10.0
+
+#: How long a container gets to stop politely before it is killed. Zero: there is nothing inside
+#: worth a graceful shutdown (the state upstream persists is written at the end of every block,
+#: not at exit), and every second here is a second of the teardown budget.
+_STOP_GRACE_SECONDS = 0
 
 #: Every container this port starts carries these. The first says whose they are, the second says
 #: which process started them, and together they are what lets a later run tell an abandoned
@@ -75,6 +86,11 @@ _CONTROL_TIMEOUT_SECONDS = 60.0
 LABEL_OWNER = "shogym.appworld"
 LABEL_PARENT = "shogym.appworld.parent"
 LABEL_BOOT = "shogym.appworld.boot"
+
+#: When the starting process itself began, so a pid reused within one boot is not read as the
+#: parent still being alive. A pid alone answers "is something running under that number", which
+#: is a different question from "is the process that started this container still running".
+LABEL_BIRTH = "shogym.appworld.birth"
 
 DOCKERFILE = Path(__file__).with_name("worker.Dockerfile")
 WORKER = Path(__file__).with_name("worker.py")
@@ -266,6 +282,8 @@ def run(
         f"{LABEL_PARENT}={os.getpid()}",
         "--label",
         f"{LABEL_BOOT}={_boot_id()}",
+        "--label",
+        f"{LABEL_BIRTH}={process_birth(os.getpid())}",
         # A constant, because the default is the container's own short id and Docker puts it in
         # the environment. It is not a secret and it is not this episode's to hand out.
         "--hostname",
@@ -285,6 +303,14 @@ def run(
         "no-new-privileges",
         "--pids-limit",
         "512",
+        # A quota, not just a count. Agent-authored code runs here, and a block that spins or
+        # allocates without bound is one episode taking the machine away from its own control
+        # group: the other arm of a pair is a sibling container on the same host, and an arm that
+        # ran slower because its twin was busy is a difference the treatment did not make.
+        "--cpus",
+        os.environ.get("SHOGYM_APPWORLD_CPUS", "2"),
+        "--memory",
+        os.environ.get("SHOGYM_APPWORLD_MEMORY", "2g"),
         "-w",
         SCRATCH_MOUNT,
     ]
@@ -298,7 +324,10 @@ def run(
         args += ["-e", f"{key}={value}"]
     for mount in mounts:
         args += ["-v", mount.as_argument()]
-    args += [image_name(), role, *arguments]
+    # By resolved id, not by tag. The tag is what the fingerprint was resolved from, and a tag is
+    # mutable: a rebuild between resolving the identity and starting the world would run bytes the
+    # run recorded nothing about. The id names one image and cannot move.
+    args += [image_identity(image_name()).split()[0], role, *arguments]
     process = subprocess.Popen(
         [_DOCKER, *args],
         stdin=subprocess.PIPE,
@@ -309,13 +338,32 @@ def run(
     return process, container
 
 
+#: What the daemon says when the object is genuinely not there. Anything else on a nonzero exit
+#: is the daemon, the context or the CLI failing, which is a different fact entirely.
+_NOT_FOUND = ("no such object", "no such container")
+
+
 def absent(container: str) -> bool:
     """Whether the daemon has no container by that name, running or stopped.
 
     ``docker inspect`` rather than ``docker ps``: a container that exited but was not removed is
-    still a container, still holds its mounts, and is still something a name can collide with."""
-    return (
-        _run(["inspect", container], timeout=_CONTROL_TIMEOUT_SECONDS, check=False).returncode != 0
+    still a container, still holds its mounts, and is still something a name can collide with.
+
+    **A nonzero exit is not the same fact as "not found", and this used to treat it as one.**
+    Every daemon failure, every unreachable context, every permission error and every timeout
+    exits nonzero, and reading those as absence is reading "I could not look" as "it is gone".
+    That is the one direction this must never fail in, because absence is what allows grading. So
+    the daemon's own not-found wording is what returns ``True``, presence returns ``False``, and
+    anything else raises: unknown is not a boolean."""
+    finished = _run(["inspect", container], timeout=_CONTROL_TIMEOUT_SECONDS, check=False)
+    if finished.returncode == 0:
+        return False
+    said = (finished.stderr + finished.stdout).strip().lower()
+    if any(phrase in said for phrase in _NOT_FOUND):
+        return True
+    raise DockerError(
+        f"cannot tell whether the container {container} is still there: `docker inspect` exited "
+        f"{finished.returncode} saying {said[:200]!r}"
     )
 
 
@@ -332,13 +380,23 @@ def remove(container: str, *, confirm: bool = False) -> None:
     nothing can write to the tree it is about to grade, and a removal it did not confirm is an
     invariant it cannot claim. ``confirm=True`` asks the daemon whether the container is really
     gone and raises when it is not."""
+    # Stopped first and then removed. `rm -f` alone is a signal followed by the daemon's own
+    # timeout, and an explicit stop with no grace period is the shortest path to "no process in
+    # there is running", which is the fact grading depends on.
+    _run(
+        ["stop", "--time", str(_STOP_GRACE_SECONDS), container],
+        timeout=_CONTROL_TIMEOUT_SECONDS,
+        check=False,
+    )
     _run(["rm", "-f", container], timeout=_CONTROL_TIMEOUT_SECONDS, check=False)
     if not confirm:
         return
     if not absent(container):
-        # One retry, because `rm -f` is a signal and a stop timeout, and a container in an
-        # uninterruptible call can outlive the first one.
+        # One retry, because a container in an uninterruptible call can outlive the first.
         _run(["rm", "-f", container], timeout=_CONTROL_TIMEOUT_SECONDS, check=False)
+    # `absent` raises when it cannot tell, and that raise is the point: an unconfirmed removal and
+    # an unanswerable daemon are the same fact to anything downstream, which is that nothing may
+    # treat what that container could write as final.
     if not absent(container):
         raise DockerError(
             f"the container {container} is still there after two removals; the daemon has not "
@@ -346,7 +404,7 @@ def remove(container: str, *, confirm: bool = False) -> None:
         )
 
 
-def reap(*, alive: Optional[Callable[[int], bool]] = None) -> List[str]:
+def reap(*, alive: Optional[Callable[..., bool]] = None) -> List[str]:
     """Remove this port's containers whose parent process is gone, and say which.
 
     The case it exists for is the one teardown cannot reach: a parent that dies while a world is
@@ -368,21 +426,53 @@ def reap(*, alive: Optional[Callable[[int], bool]] = None) -> List[str]:
     running = alive if alive is not None else _process_is_alive
     removed: List[str] = []
     for identifier in listed.stdout.split():
-        parent = _run(
-            ["inspect", "--format", '{{index .Config.Labels "%s"}}' % LABEL_PARENT, identifier],
+        labels = _run(
+            [
+                "inspect",
+                "--format",
+                '{{index .Config.Labels "%s"}} {{index .Config.Labels "%s"}}'
+                % (LABEL_PARENT, LABEL_BIRTH),
+                identifier,
+            ],
             timeout=_CONTROL_TIMEOUT_SECONDS,
             check=False,
-        ).stdout.strip()
+        ).stdout.split()
+        parent = labels[0] if labels else ""
+        birth = " ".join(labels[1:])
         # An unreadable or unparseable label is left alone. This removes containers, so the
         # ambiguous case has to be the one where nothing happens.
-        if not parent.isdigit() or running(int(parent)):
+        if not parent.isdigit() or running(int(parent), birth):
             continue
         _run(["rm", "-f", identifier], timeout=_CONTROL_TIMEOUT_SECONDS, check=False)
         removed.append(identifier)
     return removed
 
 
-def _process_is_alive(pid: int) -> bool:
+def process_birth(pid: int) -> str:
+    """When ``pid`` started, as the process table reports it, or the empty string if unknown.
+
+    A pid is reused, and within one boot it is reused quickly. ``kill(pid, 0)`` answers "is
+    something running under that number", and the question the reaper is asking is "is the
+    process that started this container still running". The start time is what separates them: a
+    number that came back with a different birth is a different process wearing the same badge.
+
+    Unknown is the empty string rather than an error. It is compared for equality, and two empty
+    strings comparing equal keeps the reaper on the safe side of its own rule: it removes only
+    what it can positively tell is abandoned."""
+    try:
+        finished = subprocess.run(
+            ["ps", "-o", "lstart=", "-p", str(pid)],
+            capture_output=True,
+            text=True,
+            timeout=_CONTROL_TIMEOUT_SECONDS,
+        )
+    except (OSError, subprocess.SubprocessError):
+        return ""
+    return finished.stdout.strip() if finished.returncode == 0 else ""
+
+
+def _process_is_alive(pid: int, birth: str = "") -> bool:
+    """Whether ``pid`` is the same live process that was born at ``birth``."""
     try:
         os.kill(pid, 0)
     except ProcessLookupError:
@@ -390,7 +480,12 @@ def _process_is_alive(pid: int) -> bool:
     except PermissionError:
         # Somebody else's process, which is somebody else's business and certainly alive.
         return True
-    return True
+    if not birth:
+        return True
+    now = process_birth(pid)
+    # A recorded birth that no longer matches is a recycled number, and the parent that owned this
+    # container is gone. An unreadable birth now says nothing, so it says nothing.
+    return not now or now == birth
 
 
 @lru_cache(maxsize=1)
@@ -424,6 +519,7 @@ __all__ = [
     "CORPUS_MOUNT",
     "DOCKERFILE",
     "GRADED_MOUNT",
+    "LABEL_BIRTH",
     "LABEL_BOOT",
     "LABEL_OWNER",
     "LABEL_PARENT",
@@ -437,6 +533,7 @@ __all__ = [
     "image_identity",
     "image_exists",
     "image_name",
+    "process_birth",
     "reap",
     "remove",
     "require_docker",

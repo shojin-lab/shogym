@@ -213,9 +213,9 @@ The base task's answer is recorded the way AppWorld records it, with
 
 ### finalize + verify
 
-`submit` seals the episode. `finalize` then reads the world's end state, collects the base task's
-own checks, and scores the filing against the drawn key, in the **serving** process and never in
-the world's. The worker's protocol has no field for the key and no comparison in it, so a world an
+`submit` seals the episode. `finalize` then stops its container, reads the end state upstream had
+already written, collects the base task's own checks, and scores the filing against the drawn key
+in the **serving** process, never in the world's. The worker's protocol has no field for the key and no comparison in it, so a world an
 agent had complete control of still could not be made to say what the answer was.
 
 `_verify` publishes the numbers plus the matched pair: `report` carries the receipt, `notice`
@@ -403,7 +403,8 @@ bytes, sha256 `fd9f9608c2ec71ed0ac25c3633a738b9129a318a129e31230425b9188e508250`
 - **The base task is graded in a second process that never runs agent code.** The world an
   episode is served from is built with `load_ground_truth=False`, so the answers and the checks
   are not objects in the process an agent's code runs as and there is no evaluator there to call.
-  At the seal the end state is flushed to disk and a short-lived grading process reads it.
+  Upstream persists the world at the end of every block, so the seal has nothing to flush: the
+  host stops the container and a short-lived grading container reads what is there.
 - **The generator's global-RNG state is captured and restored around every episode,** and the seed
   it is started from names the task and nothing else: not the session, not the run, not the
   feedback regime. AppWorld saves databases and not generator state, and every `login` draws from
@@ -471,20 +472,35 @@ is its own, so no episode holds another's end state, logs or verdicts; the grade
 an unguessable name; and the drawn key reaches neither process, because the protocol has no field
 for one.
 
-**The world is stopped before anything it produced is read.** `seal` flushes the end state into
-the episode's output tree and reads nothing off the live world. The container is then removed, and
-the daemon is asked to confirm it: a removal it will not confirm ends the episode under the
-design's failure rule rather than grading it, because a container that might still be running is a
-container that might still be writing. Only then is the tree opened, by the grading container,
-which reads the filing, digests the databases and runs the base task's own checks off one state.
+**Nothing the host needs to know comes from the process that runs the agent's code.** There is no
+seal command and no quiesce command: the writer on the protocol's own pipe is reachable from
+inside the interpreter that executes agent-authored Python, so a reply saying "I have flushed" or
+"I have stopped" is a reply the episode could have written. The host stops the container, asks the
+daemon to confirm it, and grades what is on disk.
 
-A block can start a thread and the thread outlives the block, so this ordering is the difference
-between one state and two observations that happened to agree. Reading the filing on a live world
-was the earlier design and it was wrong for that reason.
+**What is on disk is the world at the end of the last block, because upstream puts it there.**
+`AppWorld.execute` ends with its own save into the episode's output tree and `initialize` writes
+one before any block runs. So an episode that ran N blocks is graded on the state after block N,
+and one that ran none is graded on its opening state. Work an agent's thread does after its last
+block is lost rather than scored, which is the same rule the block budget already states, and the
+generator digest is written to the same tree for the same reason: a diagnostic read out of a reply
+is a diagnostic the episode can choose.
+
+**A removal the daemon will not confirm ends the episode.** `docker inspect` exiting nonzero is
+not the same fact as the container being gone: every daemon outage, unreachable context and
+timeout exits nonzero too. Not-found is read from the daemon's own wording, presence is read from
+success, and anything else is unknown, which fails closed. Teardown's own removal is the other
+contract and never raises, because a teardown that raises abandons the handles it was there to
+release; what it could not remove belongs to the sweep.
+
+**The grader is given a snapshot, not the tree the world wrote.** The grading container mounts the
+answers, so a symlink left under the output tree would resolve inside *its* namespace. Every entry
+is checked to be a plain file or directory resolving inside the tree, and anything else refuses the
+episode rather than being skipped; what is copied is a tree of regular files with no link in it.
 
 **Two more containers, and neither runs a line an agent wrote.** Seeding writes one task's
-database log into a staging directory, and grading reads the sealed output tree: the filing, the
-databases' digest, and the base task's own evaluator against the answers. Both are short-lived,
+database log into a staging directory, and grading reads the snapshot: the filing, the databases'
+digest, the generator digest and the base task's own evaluator against the answers. Both are short-lived,
 both are the same image, and grading is the only place ground truth is loaded at all.
 
 **The transport carries an identifier on every frame.** An ordered pipe is not HTTP: a command

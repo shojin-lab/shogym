@@ -68,12 +68,15 @@ import shutil
 import sys
 from typing import Any, BinaryIO, Dict, List, Optional, Tuple
 
+#: Where the generator's state digest is written, beside the episode's databases. Beside rather
+#: than inside them, because upstream's saver clears that directory on every save.
+RNG_DIGEST_FILE = "rng.digest"
+
 class Episode:
     """The one world this process serves, and the randomness it was handed."""
 
     def __init__(self) -> None:
         self.world: Any = None
-        self.caller_rng: Any = None
 
     # ----- the episode -----
 
@@ -81,13 +84,13 @@ class Episode:
         """Build the world and report what the agent is allowed to know about it.
 
         ``seed`` is what AppWorld seeds the global generator with when it builds the world's
-        requester, and the caller chooses it from the task alone. The process's own generator
-        state is put aside first and handed back at close, so an episode leaves the randomness
-        where it found it: AppWorld saves databases and not generator state, so a world replayed
-        from its databases alone agrees on its contents and disagrees on its next draw."""
+        requester, and the caller chooses it from the task alone. The process's own generator is
+        this container's alone, so there is nobody to hand it back to: AppWorld saves databases
+        and not generator state, so a world replayed from its databases alone agrees on its
+        contents and disagrees on its next draw, and the digest recorded beside them is what makes
+        that checkable."""
         from appworld import AppWorld
 
-        self.caller_rng = random.getstate()
         self.world = AppWorld(
             task_id=body["task_id"],
             experiment_name=body["experiment"],
@@ -98,6 +101,7 @@ class Episode:
             load_ground_truth=False,
         )
         task = self.world.task
+        self._record_rng()
         return {
             "instruction": task.instruction,
             "supervisor": dict(task.supervisor),
@@ -105,91 +109,35 @@ class Episode:
         }
 
     def execute(self, body: Dict[str, Any]) -> Dict[str, Any]:
-        """Run one snippet of the agent's code against the world and return what it printed."""
-        return {"output": self.world.execute(str(body["code"]))}
+        """Run one snippet of the agent's code against the world and return what it printed.
 
-    def quiesce(self, body: Dict[str, Any]) -> Dict[str, Any]:
-        """Stop everything this worker started, before the state below it is flushed.
+        **Upstream persists the world at the end of every execution, and that is what is graded.**
+        ``AppWorld.execute`` ends with its own ``_save_state`` into the episode's output tree, and
+        ``initialize`` writes one before any block runs. So the tree on disk is always the world as
+        it stood when the last block finished, and nothing here has to ask this process to produce
+        a final one. That matters because this process runs agent-authored code: an answer from it
+        saying "I have flushed" is an answer the agent could have written.
 
-        Sealing closes the tool surface; it does not stop work an earlier `execute` left running.
-        A subprocess still writing while :meth:`seal` saves the snapshot leaves a file that is half
-        of one moment and half of another, and no later check would see it.
+        The generator digest goes to the same tree for the same reason. It is a fact about this
+        interpreter that no file could otherwise carry, and it is a diagnostic rather than a score,
+        but a diagnostic read out of a reply is a diagnostic the episode can choose."""
+        output = self.world.execute(str(body["code"]))
+        self._record_rng()
+        return {"output": output}
 
-        Descendants only. This process is the one being asked, and killing it here would take the
-        flush with it, so it stays until the parent removes the container. What cannot be stopped
-        is a thread inside this interpreter: threads are not signallable. That one is bounded by
-        the container going away, which ends the whole namespace, so the tree the grader reads is
-        settled whatever an episode left running.
+    def _record_rng(self) -> None:
+        """Write the generator's state digest beside this episode's databases.
 
-        Read off ``/proc``, which exists because this runs on Linux in a container, and where the
-        process table is this container's alone: the pids visible here are the ones this worker is
-        responsible for and nothing else on the machine."""
-        import signal
-        import time
-
-        mine = os.getpid()
-
-        def descendants() -> List[int]:
-            found: List[int] = []
-            try:
-                entries = os.listdir("/proc")
-            except OSError:
-                return found
-            for entry in entries:
-                if not entry.isdigit() or int(entry) == mine or int(entry) == 1:
-                    continue
-                found.append(int(entry))
-            return found
-
-        stopped = 0
-        for how in (signal.SIGTERM, signal.SIGKILL):
-            live = descendants()
-            if not live:
-                break
-            for pid in live:
-                try:
-                    os.kill(pid, how)
-                    stopped += 1
-                except OSError:
-                    pass
-            deadline = time.monotonic() + 5
-            while descendants() and time.monotonic() < deadline:
-                time.sleep(0.02)
-        return {"stopped": stopped, "left": len(descendants())}
-
-
-    def seal(self, body: Dict[str, Any]) -> Dict[str, Any]:
-        """Flush the end state to the episode's output tree, and read nothing off the live world.
-
-        Call :meth:`quiesce` first: what this writes has to be one instant of the episode, and it
-        is not one instant if something the episode started is still writing underneath it.
-
-        **This used to be where the filing and the world's digest were read, and that was the
-        wrong place for them.** They were observed on a live world while whatever an earlier
-        ``execute`` had started was still running, and the container was removed only after the
-        answer came back, so the bytes a grader opened afterwards could differ from the bytes
-        those values described. What is scored now is read from this flush, in the grading
-        container, after this one is gone: one immutable tree, read once, by a process that never
-        ran a line the agent wrote.
-
-        What is still read here is the state of the process's own generator, which is a fact about
-        this interpreter and cannot be recovered from a file. It is a diagnostic that two servings
-        of one task agreed, never an input to a score, so reading it from a world that is still
-        alive costs nothing."""
-        self.world.models.reset_db_home_path()
-        # AppWorld writes the *initial* state at startup and nothing after it.
-        self.world._save_state(self.world.output_db_home_path_on_disk)
-        return {"rng_digest": _digest(repr(random.getstate()))}
-
-    def close(self, body: Dict[str, Any]) -> Dict[str, Any]:
-        """Shut the world down and give the process's randomness back to the caller."""
-        if self.world is not None:
-            self.world.close()
-            self.world = None
-        if self.caller_rng is not None:
-            random.setstate(self.caller_rng)
-            self.caller_rng = None
-        return {}
+        Beside rather than inside: upstream's saver owns the ``dbs`` directory and clears it on
+        every save, so a file written in there would last until the next block."""
+        try:
+            beside = os.path.dirname(self.world.output_db_home_path_on_disk)
+            with open(os.path.join(beside, RNG_DIGEST_FILE), "w") as handle:
+                handle.write(_digest(repr(random.getstate())))
+        except Exception:
+            # A diagnostic that cannot be written is a diagnostic that is missing, which the
+            # grader reports as absent. It is not worth failing an episode over.
+            pass
 
 
 # ----- seeding, in a container of its own -----
@@ -490,13 +438,7 @@ def serve(root: Optional[str] = None) -> int:
     root = root or os.environ.get("APPWORLD_ROOT") or os.getcwd()
     os.environ["APPWORLD_ROOT"] = root
     episode = Episode()
-    commands = {
-        "open": episode.open,
-        "execute": episode.execute,
-        "quiesce": episode.quiesce,
-        "seal": episode.seal,
-        "close": episode.close,
-    }
+    commands = {"open": episode.open, "execute": episode.execute}
     # The parent waits for this before it sends anything: a cold container importing upstream and
     # its clock-patching library is not fast, and a parent that started sending commands into an
     # interpreter that had not finished starting would have no deadline to enforce.
@@ -517,8 +459,6 @@ def serve(root: Optional[str] = None) -> int:
             send_frame(writer, {"id": identifier, "output": command(dict(request.get("body") or {}))})
         except Exception as exc:  # the world's failures are answers, not crashes
             send_frame(writer, {"id": identifier, "error": "%s: %s" % (type(exc).__name__, exc)})
-        if request.get("command") == "close":
-            break
     return 0
 
 
@@ -563,6 +503,7 @@ def grade(body: Dict[str, Any]) -> Dict[str, Any]:
     # gone; what the order buys is that this one reads what it named.
     filing = _read_filing(_models_on_disk(dbs, body["task_id"]), body)
     world_digest = _directory_digest(dbs)
+    rng_digest = _read_rng(os.path.dirname(dbs))
     with _ignoring(list(body.get("ignore") or ())):
         tracker = evaluate_task(
             task_id=body["task_id"],
@@ -591,7 +532,20 @@ def grade(body: Dict[str, Any]) -> Dict[str, Any]:
         # rather than by two observations happening to agree.
         "filing": filing,
         "world_digest": world_digest,
+        "rng_digest": rng_digest,
     }
+
+
+def _read_rng(beside: str) -> str:
+    """The generator digest the serving world wrote, or the empty string if it wrote none.
+
+    Read from the tree rather than asked of the world, for the same reason everything else here
+    is: the process that could answer is the process that runs the agent's code."""
+    try:
+        with open(os.path.join(beside, RNG_DIGEST_FILE)) as handle:
+            return handle.read().strip()
+    except OSError:
+        return ""
 
 
 def _models_on_disk(dbs: str, tag: str) -> Any:

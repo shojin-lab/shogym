@@ -112,8 +112,11 @@ def test_the_graders_view_is_the_answers_and_the_end_state_and_they_are_two_tree
 def _captured(monkeypatch: pytest.MonkeyPatch) -> List[List[str]]:
     """Run one container without a daemon, and hand back the command line it would have used."""
     # Warmed before the patch: the boot identity is read once through `subprocess` and memoized,
-    # and a stub that answers every `Popen` would otherwise answer that one too.
+    # and a stub that answers every `Popen` would otherwise answer that one too. The birth stamp
+    # and the resolved image id are read per call, so they are stubbed rather than warmed.
     container._boot_id()
+    monkeypatch.setattr(container, "process_birth", lambda pid: "Thu Jan  1 00:00:00 2026")
+    monkeypatch.setattr(container, "image_identity", lambda name: "sha256:stub linux/arm64")
     seen: List[List[str]] = []
 
     class _Fake:
@@ -411,10 +414,10 @@ def test_a_close_that_cannot_confirm_stays_retryable(monkeypatch: pytest.MonkeyP
 
 
 class _Finished:
-    def __init__(self, returncode: int, stdout: str) -> None:
+    def __init__(self, returncode: int, stdout: str, stderr: str = "") -> None:
         self.returncode = returncode
         self.stdout = stdout
-        self.stderr = ""
+        self.stderr = stderr
 
 
 def test_removal_confirms_by_asking_the_daemon(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -428,12 +431,15 @@ def test_removal_confirms_by_asking_the_daemon(monkeypatch: pytest.MonkeyPatch) 
     monkeypatch.setattr(container, "_run", _run)
     monkeypatch.setattr(container, "absent", lambda name: True)
     container.remove("c", confirm=True)
-    assert calls and calls[0][:2] == ["rm", "-f"]
+    # Stopped with no grace period and then removed. `rm -f` alone is a signal and the daemon's
+    # own timeout; an explicit stop is the shortest path to "nothing in there is running".
+    assert [call[0] for call in calls] == ["stop", "rm"]
+    assert calls[0][:3] == ["stop", "--time", "0"]
     # Without confirmation it does not ask, because teardown must not pay for a question whose
     # answer it would ignore.
     calls.clear()
     container.remove("c")
-    assert len(calls) == 1
+    assert [call[0] for call in calls] == ["stop", "rm"]
 
 
 # ----- the protocol descriptors -----
@@ -492,7 +498,7 @@ def test_the_reaper_removes_a_container_whose_parent_is_gone(
     Removing containers is destructive, so the ambiguous cases must do nothing: an unreadable
     label, and a pid that belongs to somebody else's live process, are both left alone."""
     listed = ["dead1", "alive1", "unlabelled"]
-    labels = {"dead1": "4242", "alive1": "4243", "unlabelled": ""}
+    labels = {"dead1": "4242 born-then", "alive1": "4243 born-then", "unlabelled": ""}
     removed: List[str] = []
 
     def _run(args, **_):
@@ -506,7 +512,7 @@ def test_the_reaper_removes_a_container_whose_parent_is_gone(
         raise AssertionError(args)
 
     monkeypatch.setattr(container, "_run", _run)
-    swept = container.reap(alive=lambda pid: pid == 4243)
+    swept = container.reap(alive=lambda pid, birth="": pid == 4243)
     assert swept == ["dead1"]
     assert removed == ["dead1"]
 
@@ -524,4 +530,169 @@ def test_every_container_carries_who_started_it(
     # And the hostname is a constant rather than the container's own short id, which Docker would
     # otherwise put in the environment.
     assert args[args.index("--hostname") + 1] == "worker"
+
+# ----- absence, and the difference between "gone" and "I could not look" -----
+
+
+def test_absence_is_the_daemons_word_and_not_merely_a_nonzero_exit(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The one direction this may never fail in.
+
+    Absence is what allows grading, so reading "I could not look" as "it is gone" is reading a
+    control failure as the fact that lets a score be taken over a tree something may still be
+    writing to. Every daemon outage, unreachable context, permission error and timeout exits
+    nonzero, and only one of those is not-found."""
+    monkeypatch.setattr(
+        container, "_run", lambda *a, **k: _Finished(1, "", "Error: No such object: c")
+    )
+    assert container.absent("c") is True
+    monkeypatch.setattr(container, "_run", lambda *a, **k: _Finished(0, "[{}]"))
+    assert container.absent("c") is False
+    # Anything else is unknown, and unknown is not a boolean.
+    monkeypatch.setattr(
+        container,
+        "_run",
+        lambda *a, **k: _Finished(1, "", "Cannot connect to the Docker daemon at unix:///..."),
+    )
+    with pytest.raises(container.DockerError) as unknown:
+        container.absent("c")
+    assert "cannot tell" in str(unknown.value)
+
+
+def test_a_removal_that_cannot_be_confirmed_fails_closed(monkeypatch: pytest.MonkeyPatch) -> None:
+    """And the failure travels: `remove(confirm=True)` raises rather than returning quietly."""
+    monkeypatch.setattr(
+        container,
+        "_run",
+        lambda *a, **k: _Finished(1, "", "Cannot connect to the Docker daemon"),
+    )
+    with pytest.raises(container.DockerError):
+        container.remove("c", confirm=True)
+    # Teardown's own call is the other contract: it asks nothing and raises nothing.
+    container.remove("c")
+
+
+# ----- what a runaway costs its sibling -----
+
+
+def test_a_serving_container_is_given_cpu_and_memory_quotas(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """A pid limit bounds a fork bomb and nothing else.
+
+    Agent-authored code runs in here, and a block that spins or allocates without bound takes the
+    machine away from whatever else is on it. The other arm of a pair is a sibling container on
+    the same host, so an arm that ran slower because its twin was busy is a difference the
+    treatment did not make."""
+    seen = _captured(monkeypatch)
+    container.run(role="serve", mounts=[container.Mount(tmp_path, "/corpus")])
+    args = seen[0]
+    assert args[args.index("--cpus") + 1]
+    assert args[args.index("--memory") + 1]
+
+
+def test_a_container_is_launched_by_resolved_id_rather_than_by_tag(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """A tag is mutable and the fingerprint is not.
+
+    The run records the image the world ran in by resolving the tag once. Launching the tag again
+    afterwards is launching whatever the tag names *now*, which a concurrent rebuild can change,
+    so the bytes that ran and the bytes the record names come apart."""
+    seen = _captured(monkeypatch)
+    container.run(role="serve", mounts=[container.Mount(tmp_path, "/corpus")])
+    args = seen[0]
+    assert "sha256:stub" in args
+    assert not [item for item in args if item.startswith("shogym-appworld-worker:")]
+
+
+# ----- the orphan sweep, and a recycled pid -----
+
+
+def test_a_recycled_pid_is_not_a_live_parent(monkeypatch: pytest.MonkeyPatch) -> None:
+    """`kill(pid, 0)` answers a different question from the one the sweep is asking.
+
+    It says whether something is running under that number. The sweep is asking whether the
+    process that started this container is still running, and within one boot a number comes back
+    quickly. A container whose parent died and whose number was reused would otherwise be kept
+    for ever, which is the leak the sweep exists to close."""
+    monkeypatch.setattr(container, "process_birth", lambda pid: "now")
+    # Same number, different process: the recorded birth no longer matches.
+    assert container._process_is_alive(os.getpid(), "then") is False
+    assert container._process_is_alive(os.getpid(), "now") is True
+    # An unreadable birth says nothing, so it says nothing: the pid check stands alone.
+    monkeypatch.setattr(container, "process_birth", lambda pid: "")
+    assert container._process_is_alive(os.getpid(), "then") is True
+
+
+# ----- the snapshot the grader is given -----
+
+
+def test_a_link_in_the_output_tree_refuses_the_grade(tmp_path: Path) -> None:
+    """The grader's namespace holds the answers, so what it is given may not be a link.
+
+    A symlink under the output tree resolves inside the *grader's* filesystem, not the world's, so
+    one planted there could make the digest and the evaluator read the private tree instead of
+    what the episode submitted. Nothing returns those bytes to the agent, so this is score
+    integrity rather than a leak, and it is refused rather than skipped: a grade computed over a
+    tree with an entry quietly dropped is a grade over a tree nobody submitted."""
+    outputs = tmp_path / "outputs"
+    (outputs / "tasks" / "abc_1" / "dbs").mkdir(parents=True)
+    (outputs / "tasks" / "abc_1" / "dbs" / "todoist.jsonl").write_text("rows")
+    # The ordinary case first, so the refusal below is not the only thing this can do.
+    snapshot = adapter.snapshot_outputs(outputs, into=tmp_path / "graded")
+    assert (snapshot / "tasks" / "abc_1" / "dbs" / "todoist.jsonl").read_text() == "rows"
+
+    (outputs / "tasks" / "abc_1" / "dbs" / "answers.json").symlink_to("/graded/data")
+    with pytest.raises(adapter.SnapshotError) as refused:
+        adapter.snapshot_outputs(outputs, into=tmp_path / "graded2")
+    assert "symbolic link" in str(refused.value)
+
+
+# ----- the protocol has no lifecycle commands left -----
+
+
+def test_the_worker_answers_no_lifecycle_command() -> None:
+    """Nothing the host needs to know comes from the process that runs the agent's code.
+
+    There was a `seal` and a `quiesce` and a `close`, and finalization treated the replies to them
+    as proof that a flush had happened and that work had stopped. Request identifiers correlate a
+    reply with its request; they do not say who wrote it, and the writer is reachable from inside
+    the interpreter that runs agent-authored Python. So the commands are gone: the host stops the
+    container and grades what upstream had already written to disk."""
+    import inspect
+
+    from shogym.envs.appworld import worker as worker_module
+
+    source = inspect.getsource(worker_module.serve)
+    assert '"open": episode.open' in source
+    assert '"execute": episode.execute' in source
+    for gone in ("seal", "quiesce", "close"):
+        assert f'"{gone}"' not in source, gone
+    assert not hasattr(worker_module.Episode, "seal")
+    assert not hasattr(worker_module.Episode, "quiesce")
+
+    from shogym.envs.appworld import env_v1
+
+    finalize = inspect.getsource(env_v1.AppWorldEnv.finalize)
+    assert "worker.call" not in finalize
+    # And what is graded is what upstream persisted, which it does at the end of every block.
+    assert "close, confirm=True" in finalize
+
+
+def test_a_horizon_must_be_a_positive_whole_number_of_blocks() -> None:
+    """Both ways of getting this wrong half-worked, which is worse than either failing.
+
+    Zero disabled the guard (`if session.budget` is false) and let one block through before the
+    serve layer ended the episode; a negative refused the first block and still spent the call
+    that ends the horizon."""
+    import inspect
+
+    from shogym.envs.appworld import env_v1
+
+    source = inspect.getsource(env_v1.AppWorldEnv.__init__)
+    guard = source[: source.index("adapter.ensure_image")]
+    assert "horizon < 1" in guard
+    assert "positive whole number" in guard
 
