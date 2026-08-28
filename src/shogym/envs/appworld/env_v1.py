@@ -234,9 +234,27 @@ class AppWorldEnv(Env):
         # artifacts out of the tree every other episode is served from: a shared output tree is a
         # place a later episode, including the other arm of a pair, can read an earlier grade.
         experiment = str(adapter.episode_outputs(session_id))
-        worker = adapter.Worker.spawn(self._derived.parent)
+        # The shared, pristine seeded world, written once per task. It needs a worker of its own
+        # because only the runtime's interpreter can write a database log, and it gets one only on
+        # the cold path: a task already derived needs no worker to say so.
+        if not world.already_derived(
+            derived=self._derived, graded=self._graded, task_id=task_id
+        ):
+            seeder = adapter.Worker.spawn(self._derived.parent)
+            try:
+                self._derive(seeder, task_id)
+            finally:
+                seeder.close()
+        # This episode's own view of it. Not the shared tree: see `world.derive_view` for why an
+        # episode that writes through its served inputs must not be writing through the next
+        # episode's, or the other arm of its own pair's.
+        view = world.derive_view(
+            derived=self._derived,
+            view=adapter.episode_view(session_id),
+            task_id=task_id,
+        )
+        worker = adapter.Worker.spawn(view)
         try:
-            self._derive(worker, task_id)
             worker.call(
                 "open", task_id=task_id, experiment=experiment, seed=_world_seed(task_id)
             )
@@ -250,6 +268,7 @@ class AppWorldEnv(Env):
                 task_id=task_id,
                 supervisor_email=str(task["supervisor_email"]),
                 experiment=experiment,
+                view=str(view),
                 budget=self._blocks,
             ),
         )
@@ -263,6 +282,9 @@ class AppWorldEnv(Env):
         if session is None:
             return
         session.worker.close()
+        # The episode's served view goes with it too, for the reason it existed: a view that
+        # outlived its episode is a directory the next one could be given by mistake.
+        shutil.rmtree(session.view, ignore_errors=True)
         # The episode's output tree goes with the episode. It holds this episode's end state and
         # its logs, and leaving it behind gives a later episode something of an earlier one's to
         # find; a directory that only ever grows is retention by omission rather than by policy.

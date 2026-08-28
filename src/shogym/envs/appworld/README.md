@@ -324,6 +324,7 @@ routes are closed and the expensive one is visible, each tested by running the p
 | the grader's tree | a directory with an unguessable name under a private parent, not a neighbour of the served root |
 | one episode's grade | upstream's evaluator report is disabled, and an episode's whole output tree is named absolutely and lives outside every served corpus, so no episode holds another's end state, logs or verdicts |
 | the corpus itself | served inputs are independent copies rather than hard links, so a write through the served pathname changes neither the corpus later episodes are derived from nor the baseline the grader diffs against |
+| the next episode's inputs | each episode is served its own view: its task's world is copied per episode and removed with the episode, so a write through one episode's served pathname is not in the next one's starting inputs, or the other arm of its pair's |
 | the drawn key | never sent to either process: the protocol has no field for one |
 
 **There is no file-access audit, and a run must not be read as though there were one.** An earlier

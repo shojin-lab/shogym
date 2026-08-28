@@ -391,6 +391,11 @@ def episodes_home() -> Path:
     return cache_root() / f"episodes-{DATA_VERSION}"
 
 
+def episode_view(session_id: str) -> Path:
+    """The root of one episode's own served corpus (see :func:`~world.derive_view`)."""
+    return cache_root() / f"views-{DATA_VERSION}" / f"view-{session_id}"
+
+
 @lru_cache(maxsize=1)
 def _private_tag() -> str:
     """Sixteen hex characters, drawn once per installation and kept beside the private tree.
@@ -747,6 +752,7 @@ __all__ = [
     "corpus_digest",
     "derived_root",
     "episode_outputs",
+    "episode_view",
     "episodes_home",
     "grade",
     "graded_root",

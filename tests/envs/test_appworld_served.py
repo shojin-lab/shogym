@@ -609,6 +609,48 @@ print(json.dumps({
     assert list(served.rglob("report.md")) == []
 
 
+async def test_one_episodes_write_is_not_in_the_next_episodes_world() -> None:
+    """The served inputs are per episode, so a write through one does not start the next.
+
+    The derived corpus was one deterministic global root and every worker was handed it, with its
+    files writable by the process that runs agent-authored code and nothing putting them back. A
+    write through episode A's served view was therefore still there in episode B's starting inputs.
+    Two arms of a pair are the same task served at the same time, so the arm meant to differ only
+    in what it was told could also differ in the world it was given, and that is a difference the
+    treatment did not make.
+
+    Written through the pathname the worker is actually given, which is the route an episode has,
+    rather than through a path this test worked out for itself."""
+    task_id = adapter.task_ids()[TASK]
+    marker = "written by an earlier episode"
+    probe = (
+        '_io, _os = __import__("io"), __import__("os")\n'
+        'root = _os.environ["APPWORLD_ROOT"]\n'
+        'served = _os.path.join(root, "data", "tasks", %r, "dbs")\n'
+        'target = _os.path.join(served, sorted(_os.listdir(served))[0])\n'
+    ) % task_id
+    scribble = probe + (
+        '_io.open(target, "w").write(%r)\n'
+        'print(json.dumps({"root": root, "target": target}))\n'
+    ) % marker
+    read_back = probe + (
+        'print(json.dumps({"root": root, "body": _io.open(target).read()[:64]}))\n'
+    )
+
+    first = json.loads(json.loads((await play([scribble]))["outputs"][0]["content"])["output"])
+    second = json.loads(json.loads((await play([read_back]))["outputs"][0]["content"])["output"])
+
+    assert second["body"] != marker, "the second episode started in the first one's leftovers"
+    # Two episodes, two served roots. One shared root is what carried the write.
+    assert first["root"] != second["root"]
+    # The view the first episode wrote through is gone with the episode that owned it.
+    assert not Path(first["target"]).exists()
+    # And the pristine copies either side of the served view never saw it.
+    pristine = adapter.derived_root() / "data" / "tasks" / task_id / "dbs"
+    for entry in sorted(pristine.iterdir()):
+        assert entry.read_text()[:64] != marker
+
+
 async def test_the_world_stops_before_it_is_graded() -> None:
     """Sealing closes the tool surface and does not stop work an earlier call left running. The
     worker is terminated before the read is scored, so the evaluator reads a snapshot nothing can

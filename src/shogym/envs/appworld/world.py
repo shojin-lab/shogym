@@ -233,9 +233,10 @@ def already_derived(*, derived: Path, graded: Path, task_id: str) -> bool:
 def _grading_view(target: Path, view: Path, answers: Path) -> None:
     """The grader's view of a derived task: the same world, with the answers linked back in.
 
-    Hard links to the served task's own files rather than copies, so the seeded database log has
-    one instance on disk and the two views cannot drift apart. The answers are linked from the
-    corpus, and this tree is the only place in the port that names them."""
+    Independent copies of the served task's own files. They were hard links, one instance on disk
+    under two names, which made this view move whenever a served episode wrote through its own: the
+    baseline the grader diffs against was editable by the thing being graded. The answers are
+    copied from the corpus, and this tree is the only place in the port that names them."""
     building = view.parent / f".{view.name}.{os.getpid()}.building"
     shutil.rmtree(building, ignore_errors=True)
     (building / "dbs").mkdir(parents=True)
@@ -246,6 +247,46 @@ def _grading_view(target: Path, view: Path, answers: Path) -> None:
         _materialise(entry, building / "dbs" / entry.name)
     _materialise(answers, building / "ground_truth")
     _publish(building, view)
+
+
+def derive_view(*, derived: Path, view: Path, task_id: str) -> Path:
+    """One episode's own served corpus, and return the root to hand the worker.
+
+    **Why an episode cannot share the served tree.** The derived corpus is one deterministic
+    global root and every worker was handed it as ``APPWORLD_ROOT``. The files in it are writable
+    by the process that runs agent-authored code, and nothing put them back, so a write through
+    episode A's served view was still there in episode B's starting inputs. Two arms of one pair
+    are the same task served at the same time, so the arm that was supposed to differ only in what
+    it was told could also differ in the world it was given, and the difference would be one the
+    treatment did not make.
+
+    **The task is copied; everything else is a symlink.** A task's own world is 28 KB, so a copy
+    per episode is nothing, and it is the only part an episode has state in. The rest is 129 MB of
+    databases and documentation that would make a per-episode copy absurd, so those are named
+    rather than copied.
+
+    Symlinks here and not in :func:`derive_task`, and the difference is what they point at. A
+    symlink into the *corpus* names a directory whose task folders have ``ground_truth`` siblings,
+    which is a direction to the answers. These name the derived tree, which has no answers in it
+    by construction. What they do share is writability: a write through one of them still reaches
+    the shared base, so this closes cross-episode persistence in the task's own world and not in
+    the base beneath it. That remainder is the container's to close."""
+    data = view / "data"
+    data.mkdir(parents=True, exist_ok=True)
+    for entry in sorted(derived.iterdir()):
+        if entry.name == "tasks":
+            continue
+        named = data / entry.name
+        if not named.exists():
+            named.symlink_to(entry)
+    tasks = data / "tasks"
+    tasks.mkdir(exist_ok=True)
+    served = tasks / task_id
+    # Rebuilt rather than reused. This is per episode, and an episode that found the previous
+    # episode's leftovers here would be exactly the thing this function exists to prevent.
+    shutil.rmtree(served, ignore_errors=True)
+    shutil.copytree(derived / "tasks" / task_id, served)
+    return view
 
 
 def derive_root(*, original: Path, derived: Path) -> Path:
