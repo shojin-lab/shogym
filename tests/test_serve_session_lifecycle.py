@@ -21,6 +21,7 @@ too, and a stream that builds one on the loop stops every other episode it is se
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import contextvars
 import json
 import os
@@ -60,13 +61,19 @@ class _SlowSessionEnv(_FixtureScoreEnv):
         begin_seconds: float = 0.0,
         end_seconds: float = 0.0,
         begin_error: Optional[BaseException] = None,
+        end_error: Optional[BaseException] = None,
         describe_error: Optional[BaseException] = None,
+        close_error: Optional[BaseException] = None,
+        close_seconds: float = 0.0,
         bind_loop: bool = False,
         tasks: Optional[List[Dict[str, Any]]] = None,
     ) -> None:
         self._begin_seconds = begin_seconds
         self._end_seconds = end_seconds
         self._begin_error = begin_error
+        self._end_error = end_error
+        self._close_error = close_error
+        self._close_seconds = close_seconds
         self.begins: List[float] = []
         self.begin_returned: Optional[float] = None
         self.releases: List[Dict[str, Any]] = []
@@ -107,7 +114,9 @@ class _SlowSessionEnv(_FixtureScoreEnv):
                 raise RuntimeError("closed on a loop that does not own this env's resources")
             # A yield, so a second close arriving while this one is in flight overlaps it rather
             # than queueing behind it by accident.
-            await asyncio.sleep(0.05)
+            await asyncio.sleep(self._close_seconds or 0.05)
+            if self._close_error is not None:
+                raise self._close_error
         finally:
             with self._counting:
                 self._inside_close -= 1
@@ -133,6 +142,8 @@ class _SlowSessionEnv(_FixtureScoreEnv):
             )
         try:
             time.sleep(self._end_seconds)
+            if self._end_error is not None:
+                raise self._end_error
             super()._end_session(session_id)
             with self._counting:
                 self.releases_finished += 1
@@ -634,10 +645,14 @@ def test_a_scan_that_did_not_finish_is_not_remembered_as_one(tmp_path: Path) -> 
     assert store.read("f-crash").status == "FAILED"
 
 
-def test_a_directory_holding_an_unreadable_record_is_scanned_again(tmp_path: Path) -> None:
+def test_an_unreadable_entry_is_quarantined_rather_than_re_reading_the_store(
+    tmp_path: Path,
+) -> None:
     # A file that cannot be read is skipped so the rest of the directory still loads, and that is
-    # right for a reader and wrong for a scan: the record it could not read is exactly the one
-    # recovery exists for, so the pass has not answered the question and may not be remembered.
+    # right for a reader and not enough for a scan: the record it could not read may be exactly
+    # the one recovery exists for. Naming it is what settles both. The directory is dealt with,
+    # so the known-good records beside it are never read again; the entry that was not a record
+    # is, and only it.
     directory = tmp_path / "finalizations"
     store = FinalizationStore(directory)
     store.write(
@@ -646,19 +661,29 @@ def test_a_directory_holding_an_unreadable_record_is_scanned_again(tmp_path: Pat
             source="explicit_tool",
         )
     )
-    torn = directory / "finalization-f-torn.json"
-    torn.write_text("{not json", encoding="utf-8")
-    assert [r.finalization_id for r in store.recover_once()] == ["f-crash"]
-    # Unremembered, because one entry was never read. A second pass finds nothing left to resolve,
-    # which is the point: it looked rather than assuming its predecessor had.
-    torn.unlink()
-    store.write(
-        FinalizationRecord(
-            session_id="prior", finalization_id="f-later", status="PENDING",
-            source="explicit_tool",
-        )
-    )
-    assert [r.finalization_id for r in store.recover_once()] == ["f-later"]
+    (directory / "finalization-f-torn.json").write_text("{not json", encoding="utf-8")
+    with pytest.warns(RuntimeWarning, match="f-torn"):
+        assert [r.finalization_id for r in store.recover_once()] == ["f-crash"]
+    with _reads_counted(store) as reads:
+        assert store.recover_once() == []
+    assert reads["full"] == 0, "a corrupt file sent the next pass back over the whole store"
+
+
+@contextlib.contextmanager
+def _reads_counted(store: FinalizationStore) -> Any:
+    """Count full walks of a store's directory while the body runs."""
+    counted = {"full": 0}
+    real = FinalizationStore._load_all
+
+    def counting(self: FinalizationStore) -> Any:
+        counted["full"] += 1
+        return real(self)
+
+    FinalizationStore._load_all = counting  # type: ignore[method-assign]
+    try:
+        yield counted
+    finally:
+        FinalizationStore._load_all = real  # type: ignore[method-assign]
 
 
 def test_a_forked_child_asks_the_recovery_question_for_itself(tmp_path: Path) -> None:
@@ -793,16 +818,11 @@ def test_a_file_that_is_not_a_record_does_not_stop_an_episode_opening(
     (directory / "finalization-bad.json").write_text(blob, encoding="utf-8")
     store = FinalizationStore(directory)
     assert store.load_all() == []
-    assert store.recover_once() == []
-    # And unremembered, because a directory holding an entry that could not be read has not been
-    # dealt with. A readable dangling record beside it is still resolved.
-    store.write(
-        FinalizationRecord(
-            session_id="prior", finalization_id="f-crash", status="PENDING",
-            source="explicit_tool",
-        )
-    )
-    assert [r.finalization_id for r in store.recover_once()] == ["f-crash"]
+    # Named rather than silently skipped: if one of these was a record left mid-finalize, an
+    # episode has not been resolved fail-closed, and nobody downstream can tell from an empty
+    # list that it happened.
+    with pytest.warns(RuntimeWarning, match="are not finalization records"):
+        assert store.recover_once() == []
 
 
 async def test_an_episode_opens_against_a_store_it_could_not_read(
@@ -821,3 +841,243 @@ async def test_an_episode_opens_against_a_store_it_could_not_read(
         assert result.terminated is True
     finally:
         await ep.close()
+
+
+# ----- a slot is not free until the env in it is closed -----
+
+
+async def test_a_slot_is_not_dispensed_again_until_its_env_is_closed(tmp_path: Path) -> None:
+    # `_Live.released` says an env is closed when the release task is done, and `TaskStream`
+    # refuses to dispense over an episode still closing. `close()` is bounded on purpose, so a
+    # release still inside a wedged hook leaves the env close arranged behind it and returns:
+    # right for latency, and the wrong answer to the ownership question. Answered on it, a
+    # capacity of one handed out the next task while the first env still held its worker, its
+    # port and its directory.
+    monkeypatch_bound = 0.02
+    built: List[_SlowSessionEnv] = []
+
+    def factory(_name: str) -> _SlowSessionEnv:
+        env = _SlowSessionEnv(end_seconds=0.4, tasks=list(TASKS + [dict(TASKS[0], id="q1")]))
+        built.append(env)
+        return env
+
+    stream = TaskStream(
+        factory,
+        [TaskRef(ENV_NAME, 0), TaskRef(ENV_NAME, 0)],
+        prov_dir=tmp_path / "prov",
+        max_in_flight=1,
+    )
+    original = episode_module._END_SESSION_SECONDS
+    episode_module._END_SESSION_SECONDS = monkeypatch_bound
+    try:
+        async with stream:
+            await stream.get_task()
+            await stream.dispatch(SUBMIT_TOOL, {"answer": "4"})
+            first = built[1]  # built[0] is the catalog instance, which never opens a session
+            await stream.get_task()
+            assert first.closed.is_set(), "the next task was dispensed over a closing env"
+            await stream.dispatch(SUBMIT_TOOL, {"answer": "4"})
+    finally:
+        episode_module._END_SESSION_SECONDS = original
+
+
+# ----- a caller that awaits a close is told what it did -----
+
+
+async def test_close_raises_what_the_envs_close_raised() -> None:
+    # Before the close had an owner, `ServedEpisode.close()` awaited `env.close()` and let its
+    # failure through. Recording it in a private field instead made every caller's close silently
+    # best-effort, including the ones that are not a stream with a containment boundary of its
+    # own.
+    env = _SlowSessionEnv(close_error=RuntimeError("close boom"))
+    ep = await ServedEpisode.open_env(env, task=0)
+    await ep.call(SUBMIT_TOOL, {"answer": "4"})
+    with pytest.raises(RuntimeError, match="close boom"):
+        await ep.close()
+    # And the episode is still finished with: the hook thread is not leaked over the failure.
+    assert _until(lambda: not _session_threads_alive())
+
+
+async def test_a_cancelled_close_finishes_the_close_and_hands_the_cancellation_back() -> None:
+    # A cancellation arriving mid-close is the caller going away, not an instruction to leave an
+    # env half torn down.
+    env = _SlowSessionEnv(close_seconds=0.2)
+    ep = await ServedEpisode.open_env(env, task=0)
+    await ep.call(SUBMIT_TOOL, {"answer": "4"})
+    closing = asyncio.ensure_future(ep.close())
+    await asyncio.sleep(0.05)
+    closing.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await closing
+    assert await _awaited(env.closed.is_set), "the close was abandoned half way"
+    assert env.close_entries == 1
+
+
+def test_a_close_a_loop_accepted_but_never_ran_is_not_lost() -> None:
+    # A loop accepting a callback is not a loop running it. Ownership taken at the post would be
+    # taken by a close that never happens, with every retry finding it owned and nothing left to
+    # set it: the env is released and never closed. The take happens on the loop, inside the
+    # callback, and a loop that stops first leaves it for the thread.
+    env = _SlowSessionEnv()
+    loop = asyncio.new_event_loop()
+    loop.set_exception_handler(lambda _loop, _context: None)
+    cleanup = episode_module._EnvClose(env, loop)
+    posted = threading.Event()
+
+    def from_a_worker() -> None:
+        posted.set()
+        cleanup.from_thread()
+
+    worker = threading.Thread(target=from_a_worker, name="probe-worker")
+
+    async def block_then_stop() -> None:
+        # The loop's last turn: the worker posts while this is running, and the loop stops
+        # before it can take another.
+        worker.start()
+        posted.wait(5.0)
+        time.sleep(0.1)
+
+    try:
+        loop.run_until_complete(block_then_stop())
+    finally:
+        loop.close()
+    worker.join(10.0)
+    assert env.closed.is_set(), "the close the loop accepted was never run by anyone"
+    assert env.close_entries == 1
+
+
+# ----- a CancelledError an env raised is the env's, not the caller's -----
+
+
+async def test_an_env_that_raises_cancelled_from_its_release_still_gets_closed() -> None:
+    # `CancelledError` is two unrelated things wearing one type. Caught as `Exception` it is
+    # neither: the env's own cancellation went straight past the env close on the rollback path,
+    # and out through the terminating call on the ordinary one, answering the agent with a
+    # traceback instead of the constant.
+    env = _SlowSessionEnv(end_error=asyncio.CancelledError())
+    ep = await ServedEpisode.open_env(env, task=0)
+    result = await ep.call(SUBMIT_TOOL, {"answer": "4"})
+    assert result.terminated is True
+    await ep.close()
+    assert await _awaited(env.closed.is_set), "the env's cancellation skipped its close"
+
+
+async def test_a_rollback_whose_release_raises_cancelled_still_closes_the_env() -> None:
+    env = _SlowSessionEnv(
+        end_error=asyncio.CancelledError(), describe_error=RuntimeError("no contract")
+    )
+    with pytest.raises(RuntimeError, match="no contract"):
+        await ServedEpisode.open_env(env, task=0)
+    assert await _awaited(env.closed.is_set), "the env's cancellation skipped its close"
+
+
+def test_a_loop_loss_rollback_does_not_leak_its_hook_thread() -> None:
+    # The executor is this episode's alone and used to be shut down by the caller's continuation.
+    # A continuation on a loop that closed never runs, so every abandoned setup left a live
+    # non-daemon thread behind. Shutdown belongs to the rollback, which the thread itself runs.
+    env = _SlowSessionEnv(begin_seconds=0.4)
+    loop = asyncio.new_event_loop()
+    loop.set_exception_handler(lambda _loop, _context: None)
+
+    async def give_up() -> None:
+        opening = loop.create_task(ServedEpisode.open_env(env, task=0))
+        await asyncio.sleep(0.05)
+        opening.cancel()
+        for _ in range(5):
+            await asyncio.sleep(0)
+
+    try:
+        loop.run_until_complete(give_up())
+    finally:
+        loop.close()
+    assert _until(env.closed.is_set)
+    assert _until(lambda: not _session_threads_alive()), _session_threads_alive()
+
+
+def _session_threads_alive() -> List[str]:
+    return [t.name for t in threading.enumerate() if t.name.startswith("shogym-session")]
+
+
+# ----- one bad file does not restore the scan it took a review pass to remove -----
+
+
+@pytest.mark.parametrize(
+    "owner_pid",
+    [pytest.param("not-a-pid", id="a string"), pytest.param(True, id="a boolean")],
+)
+def test_a_record_whose_owner_pid_is_not_a_pid_is_not_a_record(
+    tmp_path: Path, owner_pid: Any
+) -> None:
+    # `owner_pid` is not read back, it is *operated on*: it reaches `os.kill`, three frames from
+    # the decode, in a caller that can only suppress what it raises. And `True` is an `int` to
+    # Python, so a boolean is pid 1, which is alive on every machine: the record is left untouched
+    # forever and the pass records itself as having dealt with it.
+    directory = tmp_path / "finalizations"
+    directory.mkdir(parents=True)
+    (directory / "finalization-bad.json").write_text(
+        json.dumps(
+            {
+                "session_id": "s", "finalization_id": "f-bad", "status": "PENDING",
+                "source": "explicit_tool", "owner_pid": owner_pid,
+            }
+        ),
+        encoding="utf-8",
+    )
+    store = FinalizationStore(directory)
+    assert store.load_all() == []
+    with pytest.warns(RuntimeWarning, match="are not finalization records"):
+        assert store.recover_once() == []
+
+
+def test_one_unreadable_entry_does_not_make_every_episode_read_the_whole_store(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # The performance half, which is the whole point of the mechanism: against a store holding
+    # every record the machine has written, one malformed or unreadable file used to restore the
+    # exact O(episodes x history) scan this replaced. The directory is remembered with its bad
+    # entries named, and a later pass reads those and nothing else.
+    directory = tmp_path / "finalizations"
+    directory.mkdir(parents=True)
+    (directory / "finalization-bad.json").write_text("[]", encoding="utf-8")
+    store = FinalizationStore(directory)
+    scans = {"n": 0}
+    real = FinalizationStore._load_all
+
+    def counting(self: FinalizationStore) -> Any:
+        scans["n"] += 1
+        return real(self)
+
+    monkeypatch.setattr(FinalizationStore, "_load_all", counting)
+    with pytest.warns(RuntimeWarning):
+        store.recover_once()
+    for _ in range(2):
+        store.recover_once()
+    assert scans["n"] == 1, scans
+
+
+def test_a_quarantined_entry_is_re_read_and_resolved_once_it_becomes_a_record(
+    tmp_path: Path,
+) -> None:
+    # The correctness half. A file half-written when its writer died is not a record now and may
+    # be one later, so the entries that could not be read are the entries a later pass comes back
+    # to. Nothing else does.
+    directory = tmp_path / "finalizations"
+    directory.mkdir(parents=True)
+    torn = directory / "finalization-f-crash.json"
+    torn.write_text('{"session_id": "s", "finaliz', encoding="utf-8")
+    store = FinalizationStore(directory)
+    with pytest.warns(RuntimeWarning, match="are not finalization records"):
+        assert store.recover_once() == []
+    torn.write_text(
+        json.dumps(
+            {
+                "session_id": "s", "finalization_id": "f-crash", "status": "PENDING",
+                "source": "explicit_tool",
+            }
+        ),
+        encoding="utf-8",
+    )
+    assert [r.finalization_id for r in store.recover_once()] == ["f-crash"]
+    assert store.read("f-crash").status == "FAILED"
+    # And it stops being quarantined once it is readable.
+    assert store.recover_once() == []

@@ -5673,6 +5673,17 @@ async def _close_episode(live: _Live) -> None:
     except BaseException as exc:  # noqa: BLE001 — the row is settled; teardown is best-effort
         if _must_propagate(exc, cancellation):
             raise
+    # `close()` is bounded and this is not the same question. A release still inside a wedged
+    # hook leaves the env close arranged behind it, and `close` returns rather than holding its
+    # caller past the bound it promised. But this task *is* the slot: :attr:`_Live.released`
+    # says an env is closed when it is done, and a dispense that proceeds on that answer while
+    # the env is still closing lets a worker, a port and a directory accumulate past the
+    # capacity the caller configured. So the slot waits for the close itself.
+    try:
+        await live.episode.env_closed()
+    except BaseException as exc:  # noqa: BLE001 - same containment as the close above
+        if _must_propagate(exc, cancellation):
+            raise
 
 
 # Extension callbacks nobody is waiting on any more. Held only so the loop cannot collect a task
