@@ -74,6 +74,89 @@ _PROXY_VARIABLES: Tuple[str, ...] = tuple(
 #: what the file says is host metadata and nothing else; this says nothing.
 _NEUTRAL_RESOLV = "# no resolver: this container has no network\n"
 
+#: What every worker reads instead of the host's own procfs entries, and what each says.
+#:
+#: **A container's ``/proc`` is mostly the machine's.** The kernel virtualizes the process tree per
+#: namespace and virtualizes almost nothing else, so a block of agent-authored code could read the
+#: host's processor inventory, its memory, how long it has been up and what it has been doing. None
+#: of that is ground truth, a grade, a pulse or an arm label, and both arms of a pair on one host
+#: read the same numbers; what it is, is a description of the machine rather than of the world, and
+#: two arms placed on two hosts would read two different descriptions under one identity.
+#:
+#: **What can be covered is a fixed list, and this is the part of it that says something.** A bind
+#: over an arbitrary path inside ``/proc`` is refused by the runtime (``cannot be mounted because it
+#: is inside /proc``); the entries below are the ones it allows, which is the same set ``lxcfs``
+#: exists to virtualize. What remains readable is written down in the port's README rather than
+#: implied to be covered: ``/proc/sys/kernel/random/boot_id``, ``/proc/version``, the processor
+#: count as ``sched_getaffinity`` reports it, and ``/sys``.
+#:
+#: Well formed rather than blank, because the world's own dependencies parse these: ``psutil``
+#: reads all of them, and a truncated one is an exception on import rather than a masked fact.
+_NEUTRAL_PROC: Dict[str, str] = {
+    "cpuinfo": (
+        "processor\t: 0\n"
+        "vendor_id\t: neutral\n"
+        "cpu family\t: 0\n"
+        "model\t\t: 0\n"
+        "model name\t: neutral\n"
+        "stepping\t: 0\n"
+        "cpu MHz\t\t: 1000.000\n"
+        "cache size\t: 0 KB\n"
+        "physical id\t: 0\n"
+        "siblings\t: 1\n"
+        "core id\t\t: 0\n"
+        "cpu cores\t: 1\n"
+        "flags\t\t: fpu\n"
+        "bogomips\t: 1000.00\n"
+        "\n"
+    ),
+    "meminfo": (
+        "MemTotal:        1048576 kB\n"
+        "MemFree:          524288 kB\n"
+        "MemAvailable:     786432 kB\n"
+        "Buffers:               0 kB\n"
+        "Cached:           262144 kB\n"
+        "SwapCached:            0 kB\n"
+        "Active:           262144 kB\n"
+        "Inactive:         131072 kB\n"
+        "Active(anon):     131072 kB\n"
+        "Inactive(anon):        0 kB\n"
+        "Active(file):     131072 kB\n"
+        "Inactive(file):   131072 kB\n"
+        "Unevictable:           0 kB\n"
+        "Mlocked:               0 kB\n"
+        "SwapTotal:             0 kB\n"
+        "SwapFree:              0 kB\n"
+        "Dirty:                 0 kB\n"
+        "Writeback:             0 kB\n"
+        "AnonPages:        131072 kB\n"
+        "Mapped:            65536 kB\n"
+        "Shmem:                 0 kB\n"
+        "Slab:              32768 kB\n"
+        "SReclaimable:      16384 kB\n"
+        "SUnreclaim:        16384 kB\n"
+        "KernelStack:        2048 kB\n"
+        "PageTables:         4096 kB\n"
+        "CommitLimit:      524288 kB\n"
+        "Committed_AS:     262144 kB\n"
+    ),
+    "uptime": "0.00 0.00\n",
+    "stat": (
+        "cpu  0 0 0 0 0 0 0 0 0 0\n"
+        "cpu0 0 0 0 0 0 0 0 0 0 0\n"
+        "intr 0\n"
+        "ctxt 0\n"
+        "btime 1700000000\n"
+        "processes 1\n"
+        "procs_running 1\n"
+        "procs_blocked 0\n"
+        "softirq 0\n"
+    ),
+    "loadavg": "0.00 0.00 0.00 1/1 1\n",
+    "swaps": "Filename\t\t\t\tType\t\tSize\t\tUsed\t\tPriority\n",
+    "diskstats": "",
+}
+
 #: Where one episode's own output tree is mounted, and the only writable mount a world is given.
 #: AppWorld joins its experiment name onto its own output root, so an absolute name replaces that
 #: root outright: the world is told its experiment *is* this directory, and writes its end state,
@@ -270,13 +353,29 @@ def neutral_resolver() -> Path:
 
     Written once per process into this port's cache, because a bind needs a file on the host and
     a temporary one would have to outlive the container that mounts it."""
+    return _neutral_file("neutral-resolv.conf", _NEUTRAL_RESOLV)
+
+
+@lru_cache(maxsize=1)
+def neutral_procfs() -> Tuple[Tuple[Path, str], ...]:
+    """The neutral procfs files and where each is mounted, materialized once per process.
+
+    See :data:`_NEUTRAL_PROC` for what is covered and why the list stops where it does."""
+    return tuple(
+        (_neutral_file(f"neutral-proc-{name}", content), f"/proc/{name}")
+        for name, content in sorted(_NEUTRAL_PROC.items())
+    )
+
+
+def _neutral_file(name: str, content: str) -> Path:
+    """One fixed file in this port's cache, rewritten when its content moves."""
     base = os.environ.get("SHOGYM_CACHE")
     root = Path(base).expanduser().resolve() if base else Path.home() / ".cache" / "shogym"
     home = root / "appworld"
     home.mkdir(parents=True, exist_ok=True)
-    path = home / "neutral-resolv.conf"
-    if not path.exists() or path.read_text() != _NEUTRAL_RESOLV:
-        path.write_text(_NEUTRAL_RESOLV)
+    path = home / name
+    if not path.exists() or path.read_text() != content:
+        path.write_text(content)
     return path
 
 
@@ -387,6 +486,11 @@ def run(
     # Over the one the daemon generates from the host's resolver configuration. A world with no
     # network has nothing to resolve, so what that file holds is host metadata and nothing else.
     args += ["-v", f"{neutral_resolver()}:/etc/resolv.conf:ro"]
+    # And over the host's own procfs entries, for the same reason: what a world with no network
+    # and one task can learn from them is a description of the machine, and a paired arm on
+    # another machine would read a different one. See `_NEUTRAL_PROC`.
+    for source, target in neutral_procfs():
+        args += ["-v", f"{source}:{target}:ro"]
     for mount in mounts:
         args += ["-v", mount.as_argument()]
     # By resolved id, not by tag. The tag is what the fingerprint was resolved from, and a tag is
@@ -819,6 +923,7 @@ __all__ = [
     "Mount",
     "absent",
     "docker_available",
+    "neutral_procfs",
     "neutral_resolver",
     "ensure_image",
     "image_identity",

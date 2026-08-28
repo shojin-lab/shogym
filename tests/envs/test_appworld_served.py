@@ -858,6 +858,71 @@ print(json.dumps({
     assert seen["hostname"] in ("", "worker")
 
 
+async def test_the_machine_a_world_reads_about_is_not_the_host(tmp_path: Path) -> None:
+    """A container's `/proc` is mostly the machine's, and this is where that stopped being true.
+
+    The kernel virtualizes the process tree per namespace and virtualizes almost nothing else, so
+    `/proc/cpuinfo`, `/proc/meminfo`, `/proc/uptime`, `/proc/stat` and `/proc/loadavg` were the
+    host's own, readable from ordinary `execute` output. None of that is ground truth, a grade, a
+    pulse or an arm label, and both arms on one host read the same numbers; what it is, is a
+    description of the machine rather than of the world, and a pair split across two machines
+    would read two descriptions of two machines under one identity.
+
+    Fixed files are mounted over the ones the runtime will let a bind cover. What it will not cover
+    is documented in the port's README rather than implied to be covered: an arbitrary path inside
+    `/proc` is refused (`cannot be mounted because it is inside /proc`), so the boot identifier,
+    the kernel version string and the processor count as `sched_getaffinity` reports it are still
+    the machine's.
+
+    Both arms are read and compared rather than the values being asserted, because what the pair
+    needs is that they are the same, and the constants are the port's to change."""
+    from shogym.serve.stream import Information, Placebo, TaskRef, TaskStream
+
+    probe = """
+_io = __import__("io")
+def _read(path):
+    try:
+        return _io.open(path).read()
+    except Exception as exc:
+        return "unreadable: %s" % type(exc).__name__
+print(json.dumps({
+    "cpuinfo": _read("/proc/cpuinfo"),
+    "meminfo": _read("/proc/meminfo"),
+    "uptime": _read("/proc/uptime"),
+    "stat": _read("/proc/stat").splitlines()[:1],
+    "loadavg": _read("/proc/loadavg"),
+}))
+"""
+    seen = {}
+    identity = shogym.make("appworld").config_digest
+    for name, policy in (("information", Information()), ("placebo", Placebo())):
+        stream = TaskStream(
+            shogym.make,
+            [TaskRef("appworld", TASK)],
+            prov_dir=tmp_path / name,
+            feedback=policy,
+            identity=identity,
+        )
+        async with stream:
+            await stream.get_task()
+            answered = await stream.dispatch("execute", {"code": probe})
+            answer = json.loads(json.loads(answered.content[0].text)["content"])
+            seen[name] = json.loads(answer["output"])
+            await stream.dispatch("submit", {})
+
+    # Byte for byte the same in both arms, which is the paired claim, and none of it is this
+    # machine's, which is the boundary one.
+    assert seen["information"] == seen["placebo"]
+    read = seen["information"]
+    assert "model name\t: neutral" in read["cpuinfo"]
+    assert read["meminfo"].startswith("MemTotal:        1048576 kB")
+    assert read["uptime"].split() == ["0.00", "0.00"]
+    assert read["loadavg"].split() == ["0.00", "0.00", "0.00", "1/1", "1"]
+    assert read["stat"] == ["cpu  0 0 0 0 0 0 0 0 0 0"]
+    # Well formed rather than blank, because the world's own dependencies parse them: a truncated
+    # one would be an exception on import rather than a masked fact.
+
+
 async def test_the_two_arms_see_the_same_surface_from_inside_execute(tmp_path: Path) -> None:
     """The paired claim, compared rather than asserted.
 

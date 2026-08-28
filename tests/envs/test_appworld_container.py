@@ -1465,40 +1465,119 @@ def test_a_tree_teardown_declined_to_walk_is_reclaimed_while_the_server_lives(
 # ----- every generated tree is somebody's, and stays somebody's until it is gone -----
 
 
-def test_the_tree_handed_to_the_grader_is_claimed_before_it_is_created(
+def test_every_generated_tree_is_claimed_before_it_can_be_seen(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:
-    """A crash between the copy and the teardown left a tree nobody could ever reclaim.
+    """A tree that appeared before its record is one no sweep will ever take.
 
-    Finalization copies the stopped output tree into a sibling directory to hand the grader, and
-    that directory was created without a claim. `_reclaimable` deliberately refuses to guess about
-    a tree the control plane says nothing about, so the leftover was not a tree waiting to be
-    swept: it was a tree no sweep would ever look at again. It is claimed when the session begins,
-    long before the copy exists, which is the rule for every tree this port generates."""
+    `_reclaimable` refuses to guess about a tree the control plane says nothing about, by design,
+    so the order of the two operations decides whether a crash leaves a directory waiting to be
+    swept or a directory that is permanently invisible. This created the root and then wrote the
+    record, so an interruption between them left the second kind, and the copy handed to the
+    grader had no claim at all. The record goes down first now, and the copy's claim is made when
+    the session begins, without creating anything: finalization is what makes that directory."""
     import inspect
 
     from shogym.envs.appworld import env_v1
 
     source = inspect.getsource(env_v1.AppWorldEnv._begin_session)
-    claim = source.index("_claim_tree(_snapshot_of(outputs))")
+    claim = source.index("_claim_tree(_snapshot_of(outputs), create=False)")
     assert claim < source.index("Worker.spawn"), "claimed before anything could crash after it"
 
     home = tmp_path / "episodes"
     outputs = home / "episode-abc"
     snapshot = env_v1._snapshot_of(outputs)
     env_v1._claim_tree(outputs)
-    env_v1._claim_tree(snapshot)
-    # The claim is on file before the copy has put anything there, which is what a crash between
-    # the two would leave: a tree with an owner rather than a tree nobody has ever heard of.
+    env_v1._claim_tree(snapshot, create=False)
+    # The claim for the grader's copy is on file and the directory does not exist at all, which is
+    # what a crash before finalization would leave: a tree with an owner rather than a tree nobody
+    # has ever heard of.
     assert adapter.control_file(snapshot, "owner").exists()
-    assert not list(snapshot.iterdir())
+    assert not snapshot.exists()
 
-    (snapshot / "dbs").mkdir()
+    (snapshot / "dbs").mkdir(parents=True)
     # A dead owner, which is what a crash leaves: the sweep takes it, where before it could not.
     adapter.control_file(snapshot, "owner").write_text("999999 1700000000\n")
     assert env_v1._reclaimable(snapshot) is True
     env_v1._sweep_leftovers(home)
     assert not snapshot.exists()
+
+
+def test_a_claim_that_cannot_be_made_fails_the_setup(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """It swallowed every `OSError`, so a control home that could not be written left the episode
+    running around a tree with no owner.
+
+    Both halves fail closed now. A record that cannot be published raises before the root exists,
+    and a root that cannot be made takes its own record back down rather than leaving one standing
+    for a directory that will never be there."""
+    from shogym.envs.appworld import env_v1
+
+    home = tmp_path / "episodes"
+    root = home / "episode-refused"
+
+    def _unwritable(root: Path, kind: str) -> Path:
+        raise OSError("the control home cannot be written")
+
+    monkeypatch.setattr(adapter, "control_file", _unwritable)
+    with pytest.raises(OSError):
+        env_v1._claim_tree(root)
+    monkeypatch.undo()
+    # Nothing was made: a claim that could not be published is a tree that does not exist.
+    assert not root.exists()
+
+    # And the other way: the record is taken back down when the root cannot be made.
+    def _refuses(self: Path, *args: Any, **kwargs: Any) -> None:
+        raise OSError("the episode home cannot be written")
+
+    monkeypatch.setattr(Path, "mkdir", _refuses)
+    with pytest.raises(OSError):
+        env_v1._claim_tree(root)
+    monkeypatch.undo()
+    assert not adapter.control_file(root, "owner").exists()
+
+
+def test_a_mode_restricted_path_does_not_survive_teardown(tmp_path: Path) -> None:
+    """`/outputs` is bound writable and the container runs as this user, so a block can leave a
+    directory it owns that nothing can enter.
+
+    `shutil.rmtree(ignore_errors=True)` cannot remove what it cannot traverse and says nothing
+    about having failed, so every later pass made the same call and left the same bytes: a tree
+    recorded as still somebody's that nothing was ever going to reclaim. The owner's own bits are
+    restored once, bounded, before the second attempt, and each directory is chmod-ed before it is
+    listed rather than by a walk that cannot enter it."""
+    from shogym.envs.appworld import env_v1
+
+    home = tmp_path / "episodes"
+    root = home / "episode-locked"
+    buried = root / "outputs" / "sealed"
+    buried.mkdir(parents=True)
+    (buried / "state.jsonl").write_text("what the episode wrote")
+    env_v1._claim_tree(root)
+    # Exactly what an episode can do to its own output tree, and what nothing here could undo.
+    buried.chmod(0o000)
+    try:
+        assert env_v1._remove_tree(root) is True
+        assert not root.exists()
+    finally:
+        if buried.exists():
+            buried.chmod(0o700)
+
+    # And teardown converges on it rather than recording a leftover for ever.
+    again = home / "episode-locked-two"
+    nested = again / "outputs" / "sealed"
+    nested.mkdir(parents=True)
+    (nested / "state.jsonl").write_text("x")
+    env_v1._claim_tree(again)
+    nested.chmod(0o000)
+    try:
+        env_v1._discard(again)
+        assert not again.exists()
+        assert not adapter.control_file(again, "owner").exists()
+    finally:
+        if nested.exists():
+            nested.chmod(0o700)
 
 
 def test_a_teardown_that_cannot_walk_a_tree_still_says_the_episode_ended(
@@ -1651,3 +1730,144 @@ def test_the_disowned_ledger_is_compacted_without_losing_a_live_name(
     # And an append after the rewrite still lands where a reader finds it.
     container.disowned("arrived-later")
     assert container.outstanding() == ["still-here", "arrived-later"]
+
+
+def test_a_fatal_call_releases_the_local_client_and_its_pipes(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """The failure paths confirmed the container's removal and then kept this process's own half.
+
+    `_stop_after_failure` marks the worker closed, and `close` returns at once on a worker already
+    marked closed, so the only process wait and the only descriptor close in the class were skipped
+    for the whole life of a worker that failed. Every timeout and every broken frame therefore left
+    an attached `docker run` client and a pipe pair behind, which a run serving hundreds of
+    episodes accumulates; the six unclosed-pipe warnings a focused suite emitted were exactly
+    this. The container is somebody else's when the daemon will not answer. The client and the
+    pipes are nobody's but this one's."""
+    monkeypatch.setattr(container, "_ledger", lambda: tmp_path / "disowned.txt")
+    emit = (
+        "body = b'\"not an answer\"'\n"
+        "    w.write(str(len(body)).encode() + b'\\n')\n"
+        "    w.write(body)\n"
+        "    w.flush()"
+    )
+    stub = _ECHO.replace(
+        'send({"id": request["id"], "output": {"saw": request["command"]}})', emit
+    )
+    worker = _stub_worker(stub, monkeypatch)
+    monkeypatch.setattr(container, "remove", lambda name, confirm=False: True)
+    with pytest.raises(adapter.WorkerError):
+        worker.call("execute")
+    assert worker.poisoned
+    # The client is reaped and the descriptors are closed, by the failure path itself rather than
+    # by a `close` that will decline to do anything.
+    assert worker.process.poll() is not None
+    for stream in (worker.process.stdin, worker.process.stdout):
+        assert stream is not None and stream.closed
+    # And the ordinary close after it is still safe to make.
+    worker.close()
+
+
+def test_deferred_cleanup_gets_another_pass_in_the_same_process(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """Writing work down is not doing it, and construction was the only thing that started a pass.
+
+    Every failure that defers work happens after that pass: a container the daemon would not remove
+    is disowned during a teardown, and a tree that could not be walked is marked ended there too. A
+    run that builds one env and serves a whole queue from it, which is what the README recommends,
+    therefore recorded deferred work nothing in the process would ever come back to. A pass that
+    leaves work behind schedules the next one."""
+    from shogym.envs.appworld import env_v1
+
+    monkeypatch.setattr(container, "_ledger", lambda: tmp_path / "disowned.txt")
+    monkeypatch.setenv("SHOGYM_CACHE", str(tmp_path / "cache"))
+    monkeypatch.setattr(env_v1, "_HOUSEKEEPING_INTERVAL_SECONDS", 0.0)
+    monkeypatch.setattr(env_v1, "_HOUSEKEEPING_MAX_PASSES", 4)
+
+    # A container disowned after the construction pass, which is when teardown disowns one.
+    container.disowned("wedged-after-the-pass")
+    assert container.outstanding() == ["wedged-after-the-pass"]
+
+    passes = 0
+    removable = {"wedged-after-the-pass": False}
+
+    def _reap(**_: Any) -> List[str]:
+        nonlocal passes
+        passes += 1
+        if not removable["wedged-after-the-pass"]:
+            # The first pass finds a daemon that will not remove it, which is the case the ledger
+            # exists for; the second finds one that will.
+            removable["wedged-after-the-pass"] = True
+            return []
+        container._append("-wedged-after-the-pass")
+        return ["wedged-after-the-pass"]
+
+    monkeypatch.setattr(container, "reap", _reap)
+    env_v1._housekeeping_passes()
+    # It came back for it while this process was still the live one, rather than waiting for
+    # another env to be constructed or for a later run to start.
+    assert passes == 2
+    assert container.outstanding() == []
+
+
+def test_an_episodes_end_asks_for_a_housekeeping_pass() -> None:
+    """The trigger, which is what makes the recurrence reachable in production.
+
+    A teardown is where work gets deferred, so a teardown is where the next pass has to be asked
+    for; without it the only production trigger was a construction that had already happened."""
+    import inspect
+
+    from shogym.envs.appworld import env_v1
+
+    source = inspect.getsource(env_v1.AppWorldEnv._end_session)
+    assert "_housekeep()" in source
+    assert source.index("_discard(") < source.index("_housekeep()")
+
+
+def test_a_record_for_a_tree_that_was_never_made_is_collected(tmp_path: Path) -> None:
+    """The claim goes down before the tree, so a crash between them leaves a record and no tree.
+
+    That is the right way round and it is still a file. Without this the control home grows one
+    small record per crash for ever, so the sweep drops a record whose tree is absent and whose
+    owner is gone, which is the same question and the same evidence it asks about a tree."""
+    from shogym.envs.appworld import env_v1
+
+    home = tmp_path / "episodes"
+    home.mkdir(parents=True)
+    root = home / "episode-never-made"
+    env_v1._claim_tree(root, create=False)
+    marker = adapter.control_file(root, "owner")
+    assert marker.exists() and not root.exists()
+
+    # A live owner keeps its record, however absent the tree: this process may be about to make it.
+    env_v1._sweep_leftovers(home)
+    assert marker.exists()
+
+    marker.write_text("999999 1700000000\n")
+    env_v1._sweep_leftovers(home)
+    assert not marker.exists()
+
+
+def test_the_hosts_own_procfs_is_not_what_a_world_reads(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """A container's `/proc` is mostly the machine's.
+
+    The kernel virtualizes the process tree per namespace and virtualizes almost nothing else, so a
+    block of agent-authored code could read the host's processor inventory, its memory, how long it
+    has been up and what it had been doing. None of that is ground truth, a grade, a pulse or an
+    arm label, and both arms on one host read the same numbers; what it is, is a description of the
+    machine rather than of the world, and two arms on two hosts would read two different
+    descriptions under one identity."""
+    seen = _captured(monkeypatch)
+    container.run(role="serve", mounts=[container.Mount(tmp_path, "/corpus")])
+    flags = " ".join(seen[0])
+    for entry in ("cpuinfo", "meminfo", "uptime", "stat", "loadavg"):
+        assert f":/proc/{entry}:ro" in flags, entry
+    # Well formed rather than blank, because the world's own dependencies parse them.
+    contents = {target: source.read_text() for source, target in container.neutral_procfs()}
+    assert contents["/proc/meminfo"].startswith("MemTotal:")
+    assert "processor" in contents["/proc/cpuinfo"]
+    assert contents["/proc/uptime"].split() == ["0.00", "0.00"]
+    assert contents["/proc/stat"].splitlines()[0].startswith("cpu ")
