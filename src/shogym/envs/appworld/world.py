@@ -292,6 +292,13 @@ def derive_view(*, derived: Path, view: Path, task_id: str) -> Path:
     pair comparable is that the placebo arm cannot observe anything its twin did, and the reason
     it cannot is that its twin could not change anything they both read.
 
+    **Which covers the names as well as the bytes.** These links are absolute, so what an episode
+    resolves is the entry's content *and* the name that reaches it, and a name lives in its
+    parent. Sealing every entry and leaving the parent open left the second half of the path
+    writable: ``base_dbs`` could be renamed aside and something else put there under the same
+    name, and every view that resolved it afterwards would follow. The shared parent is therefore
+    sealed too, and opened only under the derivation lock (see :func:`derive_root`).
+
     **What the invariant rests on, and where it stops.** It rests on file permissions, and the
     worker runs as the user that owns those files, so code that goes looking can chmod them back.
     An ordinary write fails, upstream itself never writes there, and cross-arm contamination by
@@ -344,24 +351,58 @@ def derive_root(*, original: Path, derived: Path) -> Path:
     reads ``base_dbs``, ``datasets`` and ``api_docs``, and writes only under the episode's own
     output root), so read-only costs nothing and closes the ordinary write. It does not close a
     deliberate one, because the worker runs as the user that owns these files: see
-    :func:`derive_view` for where that residual is stated and what closes it."""
-    (derived / "tasks").mkdir(parents=True, exist_ok=True)
+    :func:`derive_view` for where that residual is stated and what closes it.
+
+    **And the directory holding them is sealed too, which sealing each entry does not do.** A
+    view names these by absolute path, so what an episode resolves is not only the entry's bytes
+    but the *name* that reaches them. This used to seal every entry and leave their parent
+    owner-writable: the entries could not be written through, and ``base_dbs`` could still be
+    renamed aside and a directory of the episode's own choosing put there under the same name,
+    which every current and later view would then resolve to. So the parent is opened only for
+    the length of a build (see :func:`_opened`), under the lock, and is read-only the rest of the
+    time — the same treatment the published tasks directory beside it already had.
+
+    That stops at this directory and not above it. The seeded root above holds this port's own
+    cache stamp and is written by cold construction, and the cache root above that is where the
+    port provisions; both stay writable, so a process willing to work one level up can still move
+    ``data`` itself. Nor is any of it a boundary against a process that means to defeat it, which
+    is the same residual :func:`derive_view` states: the worker runs as the user that owns these
+    files and can chmod them back. shojin-lab/shogym#140 mounts the shared base into the worker's
+    container read-only, which is a boundary rather than a convention, and it is what closes both
+    the modes and the names."""
+    derived.mkdir(parents=True, exist_ok=True)
     with _locked(derived):
-        for entry in sorted(original.iterdir()):
-            if entry.name == "tasks":
-                continue
-            target = derived / entry.name
-            if _complete(target) and _sealed(target):
-                continue
-            # A target that exists but is not both complete and sealed was left by a crash or by
-            # a chmod that failed part way through. It is not repaired in place: a fresh tree is
-            # staged beside it and published over it, so nothing ever reads a directory while it
-            # is being made correct.
-            building = _staging(derived, entry.name)
-            _materialise(entry, building)
-            _mark_complete(building)
-            _seal(building)
-            _publish(building, target, replacing=True)
+        # What is missing is decided before the directory is opened, so a construction that has
+        # nothing to build never opens it at all. That matters because the ordinary case is warm:
+        # an env is constructed while another episode of the pair is already running, and opening
+        # the parent on every construction would put a writable window beside every live worker
+        # rather than only beside a cold build.
+        #
+        # A target that exists but is not both complete and sealed was left by a crash or by a
+        # chmod that failed part way through. It is not repaired in place: a fresh tree is staged
+        # beside it and published over it, so nothing ever reads a directory while it is being
+        # made correct.
+        outstanding = [
+            entry
+            for entry in sorted(original.iterdir())
+            if entry.name != "tasks"
+            and not (_complete(derived / entry.name) and _sealed(derived / entry.name))
+        ]
+        if outstanding or not (derived / "tasks").is_dir():
+            with _opened(derived):
+                (derived / "tasks").mkdir(exist_ok=True)
+                for entry in outstanding:
+                    target = derived / entry.name
+                    building = _staging(derived, entry.name)
+                    _materialise(entry, building)
+                    _mark_complete(building)
+                    _seal(building)
+                    _publish(building, target, replacing=True)
+        elif _writable(derived):
+            # Complete, and built by a head that sealed the entries and left their parent open.
+            # Sealed here, without touching anything under it: the entries are already correct
+            # and what was missing is the name boundary above them.
+            _chmod(derived, 0o555)
     return derived
 
 

@@ -414,10 +414,16 @@ shared = ["base_dbs", "datasets", "api_docs"]
 neighbours = []
 answers = []
 writable = []
+parents = []
 for name in shared:
     if not _os.path.islink(root + "/data/" + name):
         continue
     here = _os.path.dirname(_os.path.realpath(root + "/data/" + name))
+    # The directory the link lands *in*, not the entry it lands on. These links are absolute, so
+    # what this episode resolves is the name as much as the bytes, and a name lives in its parent:
+    # a writable parent is a rename away from putting something else under `base_dbs` for this
+    # episode and for the other arm of its pair.
+    parents.append(_mode(here))
     if _os.path.exists(here + "/tasks/%(task)s/specs.json"):
         neighbours.append(name)
     if _os.path.exists(here + "/tasks/%(task)s/ground_truth"):
@@ -445,6 +451,7 @@ print(json.dumps({
     "neighbours": sorted(set(neighbours)),
     "answers_beyond_a_link": sorted(set(answers)),
     "writable_shared_inputs": sorted(set(writable)),
+    "shared_parent_modes": sorted(set(parents)),
     # The base every episode shares. A write through it would be in the next episode's inputs.
     "shared_mode": _mode(root + "/data/api_docs"),
     "shared_file_mode": _mode(root + "/data/base_dbs/admin.db"),
@@ -471,6 +478,14 @@ print(json.dumps({
     # shared base was sealed and the shared task cache beside it was not, so a served worker could
     # edit the pristine copy the next episode is built from.
     assert seen["writable_shared_inputs"] == []
+    # And the directory those names live in is read-only too, which sealing each entry did not
+    # do. The links are absolute, so what this episode resolves is the name as much as the bytes:
+    # under an owner-writable parent, `base_dbs` could be renamed aside and a directory of the
+    # episode's own choosing put there under the same name, and every view resolving it afterwards
+    # would follow — including the other arm of this one's pair. What a 0o555 directory does to a
+    # rename is proved on the host, in
+    # `test_appworld_runtime.py::test_the_shared_parent_cannot_be_renamed_around`.
+    assert seen["shared_parent_modes"] == ["0o555"]
     # The episode owns its task and nothing else. The shared base an episode links to is sealed
     # read-only, so a write through it cannot reach the next episode's starting inputs or the
     # other arm of its own pair's; its own task copy is writable and goes with the episode.
