@@ -359,16 +359,38 @@ async def test_the_served_tree_has_no_path_that_leads_to_the_answers() -> None:
     sibling. It worked, because `specs.json` was a symlink into the corpus and the corpus holds
     every task's answers next door.
 
-    Nothing in the served tree is a symlink now. Each probe below is one step of that walk."""
+    **One invariant, stated where it can be checked.** This test used to demand that the served
+    root hold no symlinks at all, which was a proxy for the thing that matters and stopped being
+    equivalent to it when an episode got a served view of its own: the view names the shared
+    derived base rather than copying 134 MB per episode. A symlink is not the defect; a symlink
+    whose *target* has the answers as a sibling is. So what is asserted here is the target
+    contract, walked the way the reviewer walked it: step through each link, ask the directory it
+    landed in for this task, and find the task there and no `ground_truth` beside it. The
+    read-only half of the same invariant, which is what keeps one arm of a pair out of the
+    other's inputs, is asserted below and at
+    `test_appworld_runtime.py::test_two_episodes_of_one_task_do_not_share_their_served_inputs`."""
     probe = """
 _io, _os = __import__("io"), __import__("os")
 root = _os.environ["APPWORLD_ROOT"]
-task = root + "/data/tasks/%s"
+task = root + "/data/tasks/%(task)s"
 
 
 def _read(path):
     try:
         return _io.open(path).read()[:40]
+    except Exception as failure:
+        return type(failure).__name__
+
+
+def _mode(path):
+    # The permissions as the worker itself sees them, rather than a write attempt, because a write
+    # cannot be measured from in here: upstream's guard replaces `io.open` with one that refuses
+    # every write mode whatever the path, and null-patches `os.open`, which then reports success
+    # and creates nothing. Both would answer about the guard rather than about the filesystem.
+    # What a 0o555 directory does to a write is proved on the host, in
+    # `test_appworld_runtime.py::test_two_episodes_of_one_task_do_not_share_their_served_inputs`.
+    try:
+        return oct(_os.stat(path).st_mode & 0o777)
     except Exception as failure:
         return type(failure).__name__
 
@@ -380,16 +402,36 @@ def _target(path):
         return type(failure).__name__
 
 
+# The shared entries named by name, because AppWorld's own guard null-patches `os.listdir` inside
+# an `execute` call and there is nothing here to enumerate them with.
+shared = ["base_dbs", "datasets", "api_docs"]
+# Take every link out of the served root, step to the directory its target sits in, and ask that
+# directory for this task. That is the reviewer's walk exactly: `specs.json` was a link into the
+# corpus, and the corpus keeps every task's answers in the folder beside its specs.
+neighbours = []
+answers = []
+for name in shared:
+    if not _os.path.islink(root + "/data/" + name):
+        continue
+    here = _os.path.dirname(_os.path.realpath(root + "/data/" + name))
+    if _os.path.exists(here + "/tasks/%(task)s/specs.json"):
+        neighbours.append(name)
+    if _os.path.exists(here + "/tasks/%(task)s/ground_truth"):
+        answers.append(name)
 print(json.dumps({
     "specs": _read(task + "/specs.json"),
     "specs_is_link": _os.path.islink(task + "/specs.json"),
     "specs_target": _target(task + "/specs.json"),
     "db_is_link": _os.path.islink(task + "/dbs/gmail.jsonl"),
     "sibling": _read(task + "/ground_truth/test_data.json"),
-    "root_links": [n for n in ("base_dbs", "datasets", "api_docs")
-                   if _os.path.islink(root + "/data/" + n)],
+    "neighbours": sorted(set(neighbours)),
+    "answers_beyond_a_link": sorted(set(answers)),
+    # The base every episode shares. A write through it would be in the next episode's inputs.
+    "shared_mode": _mode(root + "/data/api_docs"),
+    "shared_file_mode": _mode(root + "/data/base_dbs/admin.db"),
+    "own_mode": _mode(task),
 }))
-""" % task_id()
+""" % {"task": task_id()}
     played = await play([probe])
     seen = json.loads(json.loads(played["outputs"][0]["content"])["output"])
 
@@ -399,15 +441,33 @@ print(json.dumps({
     assert seen["specs_is_link"] is False
     assert seen["specs_target"] == "OSError"
     assert seen["db_is_link"] is False
-    assert seen["root_links"] == []
     assert seen["sibling"] == "FileNotFoundError"
+    # Links are allowed; a link whose target has the answers next door is not. The walk really did
+    # land somewhere holding this task, which is what makes the second assertion mean something:
+    # on the head this test was written against, that somewhere was the corpus, and the corpus
+    # keeps every task's answers in the folder beside its specs.
+    assert seen["neighbours"] == ["api_docs", "base_dbs", "datasets"]
+    assert seen["answers_beyond_a_link"] == []
+    # The episode owns its task and nothing else. The shared base an episode links to is sealed
+    # read-only, so a write through it cannot reach the next episode's starting inputs or the
+    # other arm of its own pair's; its own task copy is writable and goes with the episode.
+    assert seen["shared_mode"] == "0o555"
+    assert seen["shared_file_mode"] == "0o444"
+    assert int(seen["own_mode"], 8) & 0o200
 
 
 async def test_the_graders_tree_is_not_a_neighbour_of_the_served_one() -> None:
     """The independent route: the grader's view used to be a fixed name beside the served root,
     so knowing one gave you the other. It now lives under a different parent with an unguessable
     name. This raises the cost and does not close it, and the README says so; what it checks is
-    that the tree is no longer derivable from what the worker is handed."""
+    that the tree is no longer derivable from what the worker is handed.
+
+    **The substitution is made from the derived corpus and not from `APPWORLD_ROOT`.** Since each
+    episode is served a view of its own, `APPWORLD_ROOT` names that view and has no `seeded` in
+    it, so the old probe substituted nothing and then asked whether the served root existed. It
+    does, so the test asserted the failure it was written to catch. The derived corpus is still
+    reachable from inside, by following one of the view's shared links, so the guess is made from
+    there: that is the name the grader's tree used to sit beside."""
     from shogym.envs.appworld import adapter as adapter_module
 
     served, graded = adapter_module.derived_root(), adapter_module.graded_root()
@@ -418,11 +478,20 @@ async def test_the_graders_tree_is_not_a_neighbour_of_the_served_one() -> None:
     probe = """
 _os = __import__("os")
 root = _os.environ["APPWORLD_ROOT"]
-print(json.dumps({"root": root, "guess": _os.path.exists(root.replace("seeded", "graded"))}))
+base = _os.path.dirname(_os.path.dirname(_os.path.realpath(root + "/data/base_dbs")))
+print(json.dumps({
+    "base": base,
+    "guess": _os.path.exists(base.replace("seeded", "graded")),
+    "beside_the_view": _os.path.exists(_os.path.dirname(root) + "/graded"),
+}))
 """
     played = await play([probe])
     seen = json.loads(json.loads(played["outputs"][0]["content"])["output"])
-    assert seen["guess"] in (False, None)
+    # The walk landed on the derived corpus, so the substitution below is made on the name it
+    # would have to be made on.
+    assert seen["base"] == str(served)
+    assert seen["guess"] is False
+    assert seen["beside_the_view"] is False
 
 
 @pytest.mark.xfail(
@@ -619,36 +688,47 @@ async def test_one_episodes_write_is_not_in_the_next_episodes_world() -> None:
     in what it was told could also differ in the world it was given, and that is a difference the
     treatment did not make.
 
-    Written through the pathname the worker is actually given, which is the route an episode has,
-    rather than through a path this test worked out for itself."""
-    task_id = adapter.task_ids()[TASK]
+    **The write is made from here rather than from inside `execute`, and it has to be.** Upstream's
+    own guard replaces `io.open` with one that refuses every write mode and null-patches `os.open`
+    so that it reports success and creates nothing, so no code running inside an episode can write
+    a file or report truthfully that it failed to. What the route through the guard would have been
+    testing is upstream's guard; what matters here is the filesystem. So the pathname is the one
+    the worker was handed, the worker is asked to confirm it sees the write, and the episode that
+    follows is asked what it sees at the same place."""
+    task = task_id()
     marker = "written by an earlier episode"
-    probe = (
-        '_io, _os = __import__("io"), __import__("os")\n'
+    served = 'root + "/data/tasks/%s/dbs/gmail.jsonl"' % task
+    report = (
+        '_os = __import__("os")\n'
         'root = _os.environ["APPWORLD_ROOT"]\n'
-        'served = _os.path.join(root, "data", "tasks", %r, "dbs")\n'
-        'target = _os.path.join(served, sorted(_os.listdir(served))[0])\n'
-    ) % task_id
-    scribble = probe + (
-        '_io.open(target, "w").write(%r)\n'
-        'print(json.dumps({"root": root, "target": target}))\n'
-    ) % marker
-    read_back = probe + (
-        'print(json.dumps({"root": root, "body": _io.open(target).read()[:64]}))\n'
+        '_io = __import__("io")\n'
+        'print(json.dumps({"root": root, "body": _io.open(%s).read()[:64]}))\n' % served
     )
 
-    first = json.loads(json.loads((await play([scribble]))["outputs"][0]["content"])["output"])
-    second = json.loads(json.loads((await play([read_back]))["outputs"][0]["content"])["output"])
+    env = shogym.make("appworld")
+    first = await ServedEpisode.open_env(env, env_name="appworld", task=TASK)
+    try:
+        before = json.loads(json.loads((await first.call("execute", {"code": report})).content)["output"])
+        target = Path(before["root"]) / "data" / "tasks" / task / "dbs" / "gmail.jsonl"
+        assert before["body"] != marker
+        # Through the pathname the worker is actually given, while that worker is running.
+        target.write_text(marker)
+        after = json.loads(json.loads((await first.call("execute", {"code": report})).content)["output"])
+        # The write really did land in the world this episode is being served, so the negative
+        # below is about isolation rather than about a write that never happened.
+        assert after["body"] == marker
+    finally:
+        await first.close()
 
+    second = json.loads(json.loads((await play([report]))["outputs"][0]["content"])["output"])
     assert second["body"] != marker, "the second episode started in the first one's leftovers"
     # Two episodes, two served roots. One shared root is what carried the write.
-    assert first["root"] != second["root"]
+    assert before["root"] != second["root"]
     # The view the first episode wrote through is gone with the episode that owned it.
-    assert not Path(first["target"]).exists()
-    # And the pristine copies either side of the served view never saw it.
-    pristine = adapter.derived_root() / "data" / "tasks" / task_id / "dbs"
-    for entry in sorted(pristine.iterdir()):
-        assert entry.read_text()[:64] != marker
+    assert not target.exists()
+    # And the pristine copy the views are built from never saw it.
+    pristine = adapter.derived_root() / "data" / "tasks" / task / "dbs" / "gmail.jsonl"
+    assert pristine.read_text()[:64] != marker
 
 
 async def test_the_world_stops_before_it_is_graded() -> None:

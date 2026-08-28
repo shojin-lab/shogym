@@ -59,7 +59,10 @@ TaskStream(
 
 Passing `identity` is how a record defends itself. A directory that already names one refuses a
 resume that names a different one, and refuses a caller that names none: the record has said what
-produced its rows, and rows that decline to say make it unreadable as one run afterwards.
+produced its rows, and rows that decline to say make it unreadable as one run afterwards. A
+directory recorded before identities existed is refused too, in the other direction: it cannot say
+what produced its rows, so a named caller has to state that it knows
+(`adopt_unidentified=True`) rather than have the silence read as consent.
 
 ## Requirements
 
@@ -320,11 +323,11 @@ routes are closed and the expensive one is visible, each tested by running the p
 | the worker's token and corpus root | passed on stdin, read once and closed, so `sys.argv` carries only the script and the subcommand |
 | the serving process's environment | replaced with an allow-list, so an inherited provider key is not there to read |
 | the answers, as objects | the world is built without ground truth, and there is no evaluator in the process |
-| the answers, as files | the served tree contains no `ground_truth` and **no symlink into the corpus**: every file in it is a hard link or a copy, so no path in it names a directory the answers are a sibling of |
+| the answers, as files | the served tree contains no `ground_truth`, and **no path in it leads to a directory the answers are a sibling of**: the task's own files are copies, and the shared base is named by a link into the derived tree, which has no answers in it by construction |
 | the grader's tree | a directory with an unguessable name under a private parent, not a neighbour of the served root |
 | one episode's grade | upstream's evaluator report is disabled, and an episode's whole output tree is named absolutely and lives outside every served corpus, so no episode holds another's end state, logs or verdicts |
 | the corpus itself | served inputs are independent copies rather than hard links, so a write through the served pathname changes neither the corpus later episodes are derived from nor the baseline the grader diffs against |
-| the next episode's inputs | each episode is served its own view: its task's world is copied per episode and removed with the episode, so a write through one episode's served pathname is not in the next one's starting inputs, or the other arm of its pair's |
+| the next episode's inputs | each episode is served its own view: its task's world is copied per episode and removed with the episode, and the 134 MB of shared base it links to is sealed read-only, so a write through one episode's served pathname is not in the next one's starting inputs, or the other arm of its pair's |
 | the drawn key | never sent to either process: the protocol has no field for one |
 
 **There is no file-access audit, and a run must not be read as though there were one.** An earlier
@@ -336,18 +339,31 @@ an empty journal reads as "file access was audited and nothing was found" when i
 the kind. It has been removed rather than shipped with a caveat. Nothing here records what an
 agent's code opens.
 
-**The world is stopped before it is graded.** Sealing closes the tool surface and does not stop
-work an earlier call left running, so the worker and everything it started (it owns a process
-group) are terminated after the end state is read and before the evaluator runs. What is scored is
-a snapshot on disk that nothing can still be writing to.
+**The world is stopped before it is graded, and what could not be stopped is recorded.** Sealing
+closes the tool surface and does not stop work an earlier call left running, so the worker's
+descendants are stopped before the end state is read, and the worker and its whole process group
+are terminated before the evaluator runs.
+
+Two things that cannot be stopped are reported instead of assumed away, because a seal that
+claimed a property it had no evidence for is worse than one that names its own gap. A thread
+inside the worker's interpreter is not signallable, and a process table the worker cannot read is
+not an empty one; either makes the quiescence incomplete. And the pair the evaluator is handed is
+proved rather than trusted: the state is saved and digested on both sides of the filing read, so
+"the filing and the snapshot are one instant" is a measurement. Both answers reach the record as
+`seal_note`, at inference level, so the record keeps them and no feedback policy can reveal them.
+A clean seal is the empty string.
 
 **The residual, stated exactly.** The private tree is hard to guess and not hard to read: it is the
-same uid, so its 0700 mode stops other users and stops nothing else. The port's own source is
-readable, and with it the draw's algorithm. The run's provenance directory retains true reports
-even under `Placebo`. Anything else the user running the port can read is readable.
+same uid, so its 0700 mode stops other users and stops nothing else. The read-only seal on the
+shared base is the same kind of thing: it refuses an ordinary write, upstream never writes there,
+and the process that runs agent code owns those files and could put the write bits back. The
+port's own source is readable, and with it the draw's algorithm. The run's provenance directory
+retains true reports even under `Placebo`. Anything else the user running the port can read is
+readable.
 
 **What would close it** is an OS namespace in which none of that is mounted: the worker in a
-container with only the served tree bound in. That is assessed and not built here, because it is
+container with only the served tree bound in, and the shared base bound in read-only rather than
+merely sealed read-only ([shojin-lab/shogym#140](https://github.com/shojin-lab/shogym/pull/140)). That is assessed and not built here, because it is
 not configuration. The existing agent image mounts `/root`, `/work` and a read-only `/cfg` and
 publishes no ports, so it needs a new image (the pinned interpreter baked in), a new argument
 builder, a fixed container port published to host loopback and read back with `docker port`

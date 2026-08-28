@@ -390,11 +390,14 @@ class AppWorldEnv(Env):
         # snapshot beneath it can come from different moments and the evaluator scores a state no
         # instant of the episode ever had.
         try:
-            await asyncio.to_thread(session.worker.call, "quiesce")
-        except Exception:
+            quiesced = await asyncio.to_thread(session.worker.call, "quiesce")
+        except Exception as failure:
             # A worker too wedged to answer is about to be signalled anyway; the close below owns
-            # that, and a failure to quiesce politely must not cost the episode its grade.
-            pass
+            # that, and a failure to quiesce politely must not cost the episode its grade. What it
+            # must not do is disappear: an episode whose execution domain was never stopped is an
+            # episode whose snapshot may be of a moving world, and swallowing the exception made
+            # that indistinguishable from a clean seal.
+            quiesced = {"quiesced": False, "note": f"quiesce failed: {type(failure).__name__}"}
         read = await asyncio.to_thread(
             session.worker.call,
             "read",
@@ -406,7 +409,9 @@ class AppWorldEnv(Env):
         # Stop the world before grading it. Sealing closes the tool surface and does not stop work
         # an earlier call left running, so the process and everything it started are terminated
         # here, and the evaluator then reads a snapshot on disk that nothing can still be writing
-        # to. Idempotent, so teardown finding it already closed is not a second close.
+        # to. The close teardown makes afterwards returns without signalling anything, because
+        # `Worker.close` records that it ran rather than re-deriving a group from a pid the
+        # grader's ten minutes were long enough for the kernel to hand to someone else.
         await asyncio.to_thread(session.worker.close)
         checks = (
             await asyncio.to_thread(
@@ -438,6 +443,7 @@ class AppWorldEnv(Env):
                 "payload_class": self._report,
                 "world_digest": str(read["world_digest"]),
                 "rng_digest": str(read["rng_digest"]),
+                "seal_note": _seal_note(quiesced, read),
                 REPORT_FEEDBACK_NAME: rendered[self._report],
                 NOTICE_FEEDBACK_NAME: rendered[payload.DIGEST],
             },
@@ -501,10 +507,39 @@ class AppWorldEnv(Env):
         fb.inference.append(
             InferenceFeedback(name="config_digest", value=self._config_digest, step=0)
         )
+        # Recorded, never surfaced, and for the same two reasons. The record needs it, because an
+        # episode whose execution domain was still moving when it was snapshotted is an episode
+        # whose number is about a state no instant of it had, and a run that cannot tell those
+        # rows apart afterwards has no way to find them. The agent must not have it, because it
+        # says whether work the episode retained went unstopped, which is a fact about the seal
+        # that an episode could otherwise learn to exploit.
+        fb.inference.append(
+            InferenceFeedback(name="seal_note", value=str(verdict.get("seal_note") or ""), step=0)
+        )
         return fb
 
 
 # ----- pure helpers -----
+
+
+def _seal_note(quiesced: Any, read: Any) -> str:
+    """What about this episode's seal was not clean, or the empty string if it was.
+
+    Two questions, and the port answers both because neither implies the other. Quiescence asks
+    whether the execution domain was stopped: it can stop processes, it cannot stop threads inside
+    the worker's interpreter, and a process table it could not read is not an empty one. Stability
+    asks whether the filing and the snapshot came from one instant, which is the thing quiescence
+    exists to protect and which :meth:`worker.Episode.read` measures directly by digesting the
+    saved state on both sides of the read.
+
+    A clean seal is the empty string, so the presence of any text is the whole signal."""
+    notes = []
+    if not (isinstance(quiesced, dict) and quiesced.get("quiesced")):
+        detail = str((quiesced or {}).get("note") or "") if isinstance(quiesced, dict) else ""
+        notes.append(f"not quiesced ({detail})" if detail else "not quiesced")
+    if isinstance(read, dict) and read.get("stable") is False:
+        notes.append("the filing and the snapshot are from different moments")
+    return "; ".join(notes)
 
 
 def _numbers(verdicts: Verdicts) -> Dict[str, float]:

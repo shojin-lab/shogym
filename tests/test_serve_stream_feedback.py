@@ -750,20 +750,43 @@ async def test_a_resume_under_a_different_run_identity_is_refused(tmp_path: Path
     _stream(tmp_path, [0, 1], resume=True, identity="fingerprint-a")
 
 
-async def test_a_record_that_names_no_identity_is_resumable_by_anyone(tmp_path: Path) -> None:
-    """The wildcard that is kept, and the only one.
+async def test_a_record_that_names_no_identity_is_not_silently_adopted(tmp_path: Path) -> None:
+    """The wildcard that was removed.
 
-    A directory recorded before identities existed cannot say what produced it, so refusing it
-    would punish the record rather than a mismatch. That is compatibility owed to old records; it
-    is not owed to a new caller who could name an identity and chose not to."""
+    A directory recorded before identities existed cannot say what produced its rows, and this
+    used to read that silence as consent: any named configuration could append to it. "Nothing" is
+    not evidence that a named configuration belongs beside those rows, and the resulting mean is
+    about neither of them, so the silence is refused instead.
+
+    What compatibility actually owes such a record is being continued *as itself*, which is the
+    next test. A named caller has to say it knows what those old rows were."""
     stream = _stream(tmp_path, [0])
     async with stream:
         await stream.get_task()
         await stream.dispatch(SUBMIT_TOOL, {"answer": "4"})
     assert [row["run_identity"] for row in _rows(tmp_path)] == [""]
-    # Accepted, and the claim this leaves behind now names an identity, which is why the
-    # unidentified resume below is a separate directory rather than the next line here.
-    _stream(tmp_path, [0, 1], resume=True, identity="fingerprint-a")
+    with pytest.raises(ValueError, match="names no run identity") as refused:
+        _stream(tmp_path, [0, 1], resume=True, identity="fingerprint-a")
+    # The refusal names both ways out, because either may be the right one.
+    assert "fresh provenance directory" in str(refused.value)
+    assert "adopt_unidentified=True" in str(refused.value)
+    # And the migration is available to a caller that asks for it in those words.
+    _stream(tmp_path, [0, 1], resume=True, identity="fingerprint-a", adopt_unidentified=True)
+
+
+async def test_a_record_that_names_no_identity_is_continued_as_itself(tmp_path: Path) -> None:
+    """The compatibility that is owed, and the whole of it: a directory recorded before identities
+    existed is resumed by a caller that also names none. Nothing about that run changed, and
+    nothing about it is being claimed."""
+    stream = _stream(tmp_path, [0])
+    async with stream:
+        await stream.get_task()
+        await stream.dispatch(SUBMIT_TOOL, {"answer": "4"})
+    resumed = _stream(tmp_path, [0, 1], resume=True)
+    async with resumed:
+        await resumed.get_task()
+        await resumed.dispatch(SUBMIT_TOOL, {"answer": "6"})
+    assert [row["run_identity"] for row in _rows(tmp_path)] == ["", ""]
 
 
 async def test_the_claim_carries_the_identity_before_any_row_exists(tmp_path: Path) -> None:
@@ -1685,6 +1708,68 @@ async def test_a_record_written_before_claims_existed_still_resumes(tmp_path: Pa
         await resumed.get_task()
         await resumed.dispatch(SUBMIT_TOOL, {"answer": "6"})
     assert [row["position"] for row in _rows(tmp_path)] == [0, 1]
+
+
+@pytest.mark.parametrize(
+    ("residue", "what"),
+    [(b"", "zero-byte"), (b'{"owner": "abc", "feedb', "partial")],
+)
+async def test_a_publication_that_was_interrupted_is_still_resumable(
+    tmp_path: Path, residue: bytes, what: str
+) -> None:
+    """The state a claim must never be able to reach, reached deliberately.
+
+    An authoritative name created before the payload was written is a claim that exists and will
+    not parse. Every reading of one fails towards refusal, which is right for a stream that has no
+    business here and wrong for the run whose own crash left it: `resume=True` could not displace
+    a claim it could not read, so the exclusive create then failed against the wreckage and the
+    directory was owned by nobody, forever.
+
+    Both shapes are here because they arrive by different accidents, and neither is hypothetical:
+    the zero-byte one is a process killed between the create and the write, the partial one a
+    write that stopped part way through."""
+    stream = _stream(tmp_path, [0], identity="fingerprint-a")
+    async with stream:
+        await stream.get_task()
+        await stream.dispatch(SUBMIT_TOOL, {"answer": "4"})
+    _claim(tmp_path).write_bytes(residue)
+
+    # A fresh stream still refuses. The record this run wrote is what it trips over first here,
+    # and that is the point of the ordering rather than an accident: a caller that is not resuming
+    # never reaches the claim, so nothing about the residue can ever become a grant.
+    with pytest.raises(ValueError, match="fresh provenance directory"):
+        _stream(tmp_path, [0, 1], identity="fingerprint-a")
+
+    # The run continuing its own record gets through, and the claim it leaves is a whole one.
+    resumed = _stream(tmp_path, [0, 1], resume=True, identity="fingerprint-a")
+    async with resumed:
+        await resumed.get_task()
+        await resumed.dispatch(SUBMIT_TOOL, {"answer": "6"})
+    assert [row["position"] for row in _rows(tmp_path)] == [0, 1], what
+
+
+async def test_a_claim_is_never_authoritative_before_it_is_complete(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The fix, at the moment it matters: a publication that fails publishes nothing.
+
+    The claim is staged under a name of this process's own and given the authoritative name by a
+    link, so a failure anywhere before that link leaves a directory with no claim in it, which is
+    the state the next stream can act on, rather than one with a claim nobody can read."""
+    import os as _os
+
+    def _fails(descriptor: int) -> None:
+        raise OSError("the disk is full")
+
+    monkeypatch.setattr(_os, "fsync", _fails)
+    with pytest.raises(OSError, match="disk is full"):
+        _stream(tmp_path, [0], identity="fingerprint-a")
+    monkeypatch.undo()
+    assert not _claim(tmp_path).exists()
+    # And no staged file is left where a reader might one day look for one.
+    assert sorted(p.name for p in (tmp_path / "prov").glob(".claim.json*")) == []
+    # The directory is ordinary again: the next stream claims it without argument.
+    _stream(tmp_path, [0], identity="fingerprint-a")
 
 
 async def test_an_unreadable_claim_refuses_rather_than_grants(tmp_path: Path) -> None:
