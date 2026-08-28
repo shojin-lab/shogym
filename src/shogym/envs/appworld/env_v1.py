@@ -39,7 +39,6 @@ from __future__ import annotations
 import asyncio
 import datetime as dt
 import hashlib
-import threading
 import zlib
 from functools import partial
 from pathlib import Path
@@ -155,12 +154,6 @@ class AppWorldEnv(Env):
                 "digest is the notice channel's and is never the report's"
             )
         adapter.ensure_apps()
-        # Before anything else this construction does, because what it clears away is a world of
-        # some earlier run's holding a port and a scratch directory that nobody is coming back
-        # for. A serving process that died abruptly took the only handle on its worker with it,
-        # and a resumed harness has no way to name one; this is where a run reads what an earlier
-        # one wrote down (see `adapter.reap`).
-        adapter.reap()
         self._pulse = int(pulse)
         self._report = report
         self._original = adapter.ensure_corpus() / "data"
@@ -494,8 +487,7 @@ class AppWorldEnv(Env):
         # agent-authored code, so a reply from it saying that it had stopped, or flushed, or that
         # a value was such-and-such, is a reply the episode could have written. There is no seal
         # command, no quiesce command and no read command any more. The host stops the worker's
-        # process group, confirms from the process table that the group is empty, and grades what
-        # is on disk.
+        # process and waits for it, then grades what is on disk.
         #
         # **What is on disk is the world at the end of the last block, because upstream puts it
         # there.** `AppWorld.execute` ends with its own save into the episode's output tree and
@@ -504,31 +496,15 @@ class AppWorldEnv(Env):
         # Work an agent's thread does after its last block is lost rather than scored, which is
         # the same rule the block budget states.
         #
-        # **A stop that cannot be confirmed ends the episode unscored.** Not signalled, not
-        # reaped, or a process table that would not answer: each of those leaves a tree something
-        # may still be writing to, and a number computed over it is a number about no instant of
-        # the episode. Raising here is what makes that an infrastructure closure rather than a
-        # score: the stream files the row `finalize_error`, unscored, with nothing in `observed`,
-        # so neither feedback arm has a payload to reveal (see `TaskStream._unsealed_row`).
-        await asyncio.to_thread(session.worker.close, confirm=True)
+        await asyncio.to_thread(session.worker.close)
         # A tree of regular files, or no grade. See `adapter.snapshot_outputs`: the grading
         # process is pointed at the root that holds the answers, so a link left under the output
         # tree would resolve there.
-        # The copy runs in a thread, and cancelling an `await` does not stop a thread: a
-        # finalization the deadline gave up on would otherwise leave one walking an episode's
-        # tree, holding the file handles and the disk it needs. The flag is what the thread stops
-        # for, checked once per file.
-        abandon = threading.Event()
-        try:
-            snapshot = await asyncio.to_thread(
-                adapter.snapshot_outputs,
-                Path(session.experiment),
-                into=Path(session.experiment + ".graded"),
-                stop=abandon,
-            )
-        except BaseException:
-            abandon.set()
-            raise
+        snapshot = await asyncio.to_thread(
+            adapter.snapshot_outputs,
+            Path(session.experiment),
+            into=Path(session.experiment + ".graded"),
+        )
         graded = await asyncio.to_thread(
             adapter.grade,
             root=self._graded.parent,
