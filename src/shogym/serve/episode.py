@@ -28,6 +28,7 @@ from __future__ import annotations
 
 import asyncio
 import concurrent.futures
+import contextvars
 import json
 import os
 import threading
@@ -181,7 +182,11 @@ class _SetupRollback:
     **One owner, and no second caller beside it.** ``Env.begin_session`` records the session id
     before entering the hook, so an ``env.close()`` on the failure path would end a session the
     hook is still inside. The failure path therefore waits on :meth:`settled` instead of closing
-    the env itself, and :meth:`shogym.core.Env.claim_session` makes any later attempt a no-op."""
+    the env itself, and :meth:`shogym.core.Env.claim_session` makes any later attempt a no-op.
+
+    Releasing the session is only half of the cleanup ``open_env`` promised. The env itself is
+    this episode's, and what its constructor made is released by ``close``, which is a different
+    hook and runs after the session one: see :meth:`settled` for which loop that ends up on."""
 
     def __init__(
         self,
@@ -189,6 +194,7 @@ class _SetupRollback:
         env: Any,
         session_id: str,
     ) -> None:
+        self._hooks = hooks
         self._done = threading.Event()
 
         def release() -> None:
@@ -206,8 +212,14 @@ class _SetupRollback:
             # who can still run the release. Here rather than nowhere.
             release()
 
-    async def settled(self, timeout: Optional[float] = None) -> None:
-        """Wait for the rollback, if there is still a loop to wait on.
+    @property
+    def released(self) -> bool:
+        """Has the session release actually finished? Not "was it issued", and not "did the wait
+        return": whether the hook is out."""
+        return self._done.is_set()
+
+    async def settled(self, timeout: Optional[float] = None) -> bool:
+        """Wait for the rollback, if there is still a loop to wait on, and say whether it landed.
 
         A bound rather than a promise: the caller is already carrying an error and must not be
         held by a hook that is not coming back. What is guaranteed without any waiting at all is
@@ -225,6 +237,30 @@ class _SetupRollback:
             # it was called for, so the wait giving way never loses it. The release itself does
             # not depend on this wait.
             pass
+        return self.released
+
+    def close_when_released(self, env: Any) -> None:
+        """Close the env after the session release, on the hook thread, when the caller could not
+        wait for it.
+
+        Queued rather than awaited, so it starts only once the release ahead of it in this one
+        thread's queue has finished. That is the ordering ``Env.close`` states and this is the
+        only place it can be had without either entering ``_close`` beside a running release or
+        holding a caller for a hook that has already outrun its bound. The loop it gets is a
+        throwaway one, which an env whose ``close`` belongs to the loop it was built on will not
+        like; an env that wedges its own release has already spent that."""
+        try:
+            self._hooks.submit(_closed, env)
+        except RuntimeError:
+            pass
+
+
+def _closed(env: Any) -> None:
+    """Run one env's ``close`` to completion on a loop of its own, swallowing whatever it says."""
+    try:
+        asyncio.run(env.close())
+    except BaseException:
+        pass
 
 
 def _settled() -> "concurrent.futures.Future[None]":
@@ -242,16 +278,10 @@ def _discard(env: Any) -> None:
     it needs *a* loop, and the one this was built for is the loop the caller just abandoned.
     :func:`asyncio.run` in a fresh thread gives it one that belongs to nobody else."""
 
-    def close() -> None:
-        try:
-            asyncio.run(env.close())
-        except BaseException:
-            pass
-
     # Not a daemon: this thread is the only thing that will ever close this env, and a process
     # that exits before it runs leaks whatever the constructor made. It has no session to release,
     # because setup never started, so what it runs is the env's own `_close` and nothing else.
-    threading.Thread(target=close, name="shogym-discard", daemon=False).start()
+    threading.Thread(target=_closed, args=(env,), name="shogym-discard", daemon=False).start()
 
 
 def _discard_when_built(building: "concurrent.futures.Future[Any]") -> None:
@@ -286,12 +316,18 @@ async def _built(factory: "Callable[[], Any]") -> Any:
     exists and its caller no longer does. A thread cannot be cancelled, so a caller that gives up
     on this await still gets an env built, holding whatever its constructor made. The wait is
     therefore shielded and an abandoned build is closed by :func:`_discard`, arranged on the
-    builder's own thread so it does not depend on the loop the caller just left."""
+    builder's own thread so it does not depend on the loop the caller just left.
+
+    **Only for a factory whose caller has said it may be.** There is no running loop in the
+    thread this runs on, so a constructor that binds one raises there; callers declare the
+    difference rather than this guessing it (see ``TaskStream``'s ``off_loop_factory``). What is
+    carried across is the caller's context, so a factory that reads a context variable reads the
+    value the caller set; what is not carried is the loop, which is the whole point."""
     builder = concurrent.futures.ThreadPoolExecutor(
         max_workers=1, thread_name_prefix="shogym-build"
     )
     try:
-        building = builder.submit(factory)
+        building = builder.submit(contextvars.copy_context().run, factory)
     finally:
         # Immediately: the thread runs the job it already has and then exits. One construction,
         # one thread, no pool left behind and none created at import.
@@ -464,6 +500,9 @@ class ServedEpisode:
         self._hooks = hooks if hooks is not None else _session_hooks()
         self._released: Optional["concurrent.futures.Future[None]"] = None
         self._release_waited = False
+        # The env close, when it had to be queued behind a release that outran its bound. Kept so
+        # a second `close()` does not queue a second one (see `_close_env`).
+        self._env_closing: Optional["concurrent.futures.Future[None]"] = None
         # Set if a durable-record write ever failed (best-effort persistence — never fatal).
         self._persist_degraded = False
         # The in-flight evaluator task (retained so teardown drains it — see `_run_finalize`).
@@ -520,16 +559,23 @@ class ServedEpisode:
         trace_path: Optional[Union[str, Path]] = None,
         env_config: Optional[Dict[str, Any]] = None,
         finalize_deadline: Optional[float] = None,
+        off_loop_factory: bool = False,
     ) -> "ServedEpisode":
         """Build the env, load the task instance, open the essential MCP sessions, and push
         per-episode state into the (in-process) tool servers.
 
-        The env is built **off the loop**, for the reason its session hooks are: constructing one
-        is ordinary blocking work and some envs make it real work (provisioning a corpus,
-        walking and copying a cache, taking a file lock), so a cold or contended construction on
-        the shared loop stops every other episode this process is serving, and their watchdogs
-        and deadlines with them."""
-        env = await _built(lambda: make(env_name, config=env_config))
+        ``off_loop_factory`` declares that this env's constructor is safe to run in a worker
+        thread: no running loop bound in it, no thread-affine resources. Constructing an env is
+        blocking work and some envs make it real work (provisioning a corpus, walking and
+        copying a cache, taking a file lock), so a cold or contended construction on the shared
+        loop stops every other episode this process is serving, and their watchdogs and deadlines
+        with them. Off by default, because an env is allowed to bind loop-affine resources in its
+        constructor and a caller that has not said this one does not is a caller whose env this
+        may not move."""
+        if off_loop_factory:
+            env = await _built(lambda: make(env_name, config=env_config))
+        else:
+            env = make(env_name, config=env_config)
         return await cls.open_env(
             env,
             env_name=env_name,
@@ -563,6 +609,10 @@ class ServedEpisode:
         # it belongs to exactly one owner: the episode that was returned, or the failure handler.
         hooks = _session_hooks()
         rollback: Optional[_SetupRollback] = None
+        # The session id, once `begin_session` has returned and the env therefore holds one. It
+        # is what the failure handler below needs to release, and it is a value rather than a
+        # flag so that "there is a session to release" and "here is which one" are one answer.
+        began: Optional[str] = None
         handed_over = False
         env_name = env_name if env_name is not None else env.name
         try:
@@ -604,6 +654,11 @@ class ServedEpisode:
                 waiter.add_done_callback(_swallow)
                 rollback = _SetupRollback(hooks, env, session_id)
                 raise
+            # From here the env holds a session, so every failure below owes it a release, and
+            # that release goes the same way this one would have: through the hook thread, never
+            # on the loop. `env.close()` is what used to do it, and `Env.close` runs the hook
+            # inline, so a slow release on a `describe` that raised froze the whole server.
+            began = session_id
             # The one description this episode ever asks for. Everything published about the task
             # and everything enforced on it comes off this single answer — see the snapshot the
             # constructor takes of it.
@@ -634,15 +689,32 @@ class ServedEpisode:
                     await session.close()
                 except Exception:
                     pass
+            if rollback is None and began is not None:
+                # Setup got past `begin_session` and failed after it: `describe` raised, or the
+                # constructor's own fail-loud guard did. The env holds a session either way, and
+                # it is released the same way a cancelled one is.
+                rollback = _SetupRollback(hooks, env, began)
             if rollback is not None:
-                # The setup hook is still running and its rollback is already queued behind it on
-                # the hook thread. Closing the env here would be a second release on one
+                # The setup hook may still be running and its rollback is already queued behind
+                # it on the hook thread. Closing the env here would be a second release on one
                 # episode's resources, because `Env.begin_session` records the session id before
                 # entering the hook, so `Env.close` would find it and enter `_end_session` while
                 # `_begin_session` is still inside. Wait for the one owner instead, for as long
                 # as there is a loop to wait on; a caller that is tearing the loop down gets a
                 # thread that finishes the release without it.
-                await rollback.settled()
+                #
+                # Then the other half of what this method promised: the env is this episode's,
+                # and a failure closes it. On the caller's loop when the release has landed,
+                # which is where a loop-affine env's `close` has to run; queued behind the
+                # release otherwise, because entering `_close` beside a release still inside the
+                # hook is the ordering `Env.close` exists to prevent.
+                if await rollback.settled():
+                    try:
+                        await env.close()
+                    except Exception:
+                        pass
+                else:
+                    rollback.close_when_released(env)
             else:
                 try:
                     await env.close()
@@ -1531,10 +1603,41 @@ class ServedEpisode:
         # even a release still running in its thread leaves `Env.close` with nothing of this
         # episode's to do.
         await self._release_session()
-        try:
-            await self._env.close()
-        finally:
-            # The hook thread has no work left that anything is waiting for. `wait=False`: a
-            # release still inside a wedged hook finishes in its own time and this close is not
-            # held by it, which is the same bound the wait above already declared.
-            self._hooks.shutdown(wait=False)
+        await self._close_env()
+        # The hook thread has no work left that anything is waiting for. `wait=False`: a release
+        # still inside a wedged hook, and the env close queued behind it, finish in their own
+        # time and this close is not held by them, which is the same bound the wait above
+        # already declared.
+        self._hooks.shutdown(wait=False)
+
+    async def _close_env(self) -> None:
+        """Close the env, after this session's release and never beside it.
+
+        ``Env.close`` states the order: release the sessions, then hand off to ``_close``. The
+        claim keeps the second caller out of the release hook, but it does not by itself keep
+        ``_close`` from running while the first one is still inside it, and a ``_close`` that
+        tears down what the release is using is the same use-after-free by a different route.
+
+        So the release decides where this runs. Landed, and it is awaited here, on the loop that
+        built the env and the only loop a loop-affine env's ``close`` may use. Still inside the
+        hook, and it is queued behind the release on the hook thread instead: the caller is not
+        held past the bound it was promised, and ``_close`` still does not start until the
+        release is out. A caller that arrives second finds the close already queued and does not
+        queue another."""
+        release = self._release()
+        if release.done():
+            try:
+                await self._env.close()
+            except Exception:
+                pass
+            return
+        if self._env_closing is None:
+            try:
+                self._env_closing = self._hooks.submit(_closed, self._env)
+            except RuntimeError:
+                # The hook thread is gone, so nothing is running the release this would follow.
+                self._env_closing = _settled()
+                try:
+                    await self._env.close()
+                except Exception:
+                    pass

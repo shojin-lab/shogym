@@ -32,7 +32,7 @@ import tempfile
 import threading
 from dataclasses import asdict, dataclass
 from pathlib import Path
-from typing import Any, Dict, List, Literal, Optional, Set, Union
+from typing import Any, Dict, List, Literal, Optional, Set, Tuple, Union
 
 # The evidence-schema version. Stamped on every :class:`TerminalEvidence`, the durable
 # record, and the trace ``terminal`` event so a reader can tell which envelope it is parsing.
@@ -371,17 +371,33 @@ class FinalizationStore:
         return _record_from_dict(json.loads(path.read_text(encoding="utf-8")))
 
     def load_all(self) -> List[FinalizationRecord]:
+        return self._load_all()[0]
+
+    def _load_all(self) -> Tuple[List[FinalizationRecord], bool]:
+        """Every record this directory holds, and whether that is all of them.
+
+        The second value is ``False`` when an entry was there and could not be read: a file that
+        raised, or one whose contents are not a record. Skipping such an entry is right for a
+        caller that wants the records (one unreadable file is not a reason to refuse the rest),
+        and wrong for a caller that wants to know the directory has been dealt with, because the
+        record it could not read is exactly the one recovery exists for."""
         if not self._dir.exists():
-            return []
+            return [], True
         out: List[FinalizationRecord] = []
-        for path in sorted(self._dir.glob("finalization-*.json")):
+        complete = True
+        try:
+            paths = sorted(self._dir.glob("finalization-*.json"))
+        except OSError:
+            return [], False
+        for path in paths:
             try:
                 out.append(
                     _record_from_dict(json.loads(path.read_text(encoding="utf-8")))
                 )
             except (ValueError, OSError):
+                complete = False
                 continue
-        return out
+        return out, complete
 
     def recover(self) -> List[FinalizationRecord]:
         """Restart-recovery, fail-closed **and concurrency-safe**. For every record left
@@ -394,8 +410,15 @@ class FinalizationStore:
         resolved to a safe zero rather than re-run. ``FINALIZED`` records are left as-is (they
         replay their stored evidence); ``FAILED`` is already terminal fail-closed.
         """
+        return self._recover()[0]
+
+    def _recover(self) -> Tuple[List[FinalizationRecord], bool]:
+        """:meth:`recover`, and whether the pass covered the whole directory. A write that fails
+        is not caught here: a record this pass could not resolve is a record the next pass has to
+        see again, so the failure belongs to the caller rather than to a flag."""
+        records, complete = self._load_all()
         resolved: List[FinalizationRecord] = []
-        for record in self.load_all():
+        for record in records:
             if record.status in ("SEALED", "PENDING") and not _pid_alive(record.owner_pid):
                 record.status = "FAILED"
                 record.verdict = fail_closed_verdict(
@@ -407,7 +430,7 @@ class FinalizationStore:
                 )
                 self.write(record)
                 resolved.append(record)
-        return resolved
+        return resolved, complete
 
     def recover_once(self) -> List[FinalizationRecord]:
         """:meth:`recover` for the first caller in this process to ask about this directory, and
@@ -426,21 +449,67 @@ class FinalizationStore:
         runs* is resolved by the next process to start rather than by this one's next episode.
         Recovery is for the run before this one, and a live owner's record is left alone.
 
-        Not reset after a fork. A child shares the directory its parent has already recovered,
-        so the answer it would compute is the answer its parent already wrote."""
+        **Only a pass that finished counts.** The directory is remembered after the scan, not
+        before it, and only when the scan read every entry it found and rewrote every record it
+        had to. A write that fails raises out of here having remembered nothing, and a record
+        that could not be read leaves the directory unremembered, because a scan that skipped the
+        one dangling record it exists to resolve has not answered the question. Remembering the
+        attempt instead would suppress every later pass and leave that record ``PENDING`` for
+        good.
+
+        **Once per process means this process.** A forked child is another process: the record
+        its parent left alone belongs to an owner that was alive when the parent looked and may
+        not be now, so the child asks again. The cache is emptied in the child at fork, and keyed
+        by pid as well, for a platform that cannot register a fork handler."""
         key = str(self._dir.resolve()) if self._dir.exists() else str(self._dir)
         with _RECOVERED_LOCK:
-            if key in _RECOVERED:
+            if key in _recovered():
                 return []
-            _RECOVERED.add(key)
-        return self.recover()
+        # Outside the lock: this reads a directory that can hold every record the machine has
+        # written, and holding a process-wide lock across it would stop episodes opening against
+        # every other store. Two callers racing the same directory both scan, which costs a
+        # second read and nothing else, because resolving a record is idempotent.
+        resolved, complete = self._recover()
+        if complete:
+            with _RECOVERED_LOCK:
+                _recovered().add(key)
+        return resolved
 
 
-#: The store directories already recovered in this process, keyed by resolved path. Recovery is a
-#: startup question asked once per directory (see :meth:`FinalizationStore.recover_once`); the
-#: lock is here because episodes are opened concurrently.
+#: The store directories already recovered **by this process**, keyed by resolved path, alongside
+#: the pid they were recovered by. Recovery is a startup question asked once per directory (see
+#: :meth:`FinalizationStore.recover_once`); the lock is here because episodes are opened
+#: concurrently.
 _RECOVERED: Set[str] = set()
+_RECOVERED_PID: Optional[int] = None
 _RECOVERED_LOCK = threading.Lock()
+
+
+def _recovered() -> Set[str]:
+    """The set for the process asking. Call with :data:`_RECOVERED_LOCK` held.
+
+    A fork handler empties this in the child, and the pid is checked here as well because a
+    platform without ``register_at_fork`` would otherwise let a child answer out of its parent's
+    memory of a directory the child has never looked at."""
+    global _RECOVERED, _RECOVERED_PID
+    pid = os.getpid()
+    if _RECOVERED_PID != pid:
+        _RECOVERED = set()
+        _RECOVERED_PID = pid
+    return _RECOVERED
+
+
+def _forget_recovered() -> None:
+    """A forked child inherits the parent's answers and, worse, whatever state the lock was in
+    when the fork happened. Both are replaced."""
+    global _RECOVERED, _RECOVERED_PID, _RECOVERED_LOCK
+    _RECOVERED = set()
+    _RECOVERED_PID = os.getpid()
+    _RECOVERED_LOCK = threading.Lock()
+
+
+if hasattr(os, "register_at_fork"):
+    os.register_at_fork(after_in_child=_forget_recovered)
 
 
 def _pid_alive(pid: Optional[int]) -> bool:
