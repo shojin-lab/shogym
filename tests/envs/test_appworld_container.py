@@ -13,12 +13,16 @@ a convenient mount.
 
 from __future__ import annotations
 
+import json
+import os
+import sys
 from pathlib import Path
 from typing import Any, Dict, List
 
 import pytest
 
 from shogym.envs.appworld import adapter, container
+from shogym.envs.appworld.container import WORKER
 
 
 def _corpus(root: Path) -> Path:
@@ -107,6 +111,9 @@ def test_the_graders_view_is_the_answers_and_the_end_state_and_they_are_two_tree
 
 def _captured(monkeypatch: pytest.MonkeyPatch) -> List[List[str]]:
     """Run one container without a daemon, and hand back the command line it would have used."""
+    # Warmed before the patch: the boot identity is read once through `subprocess` and memoized,
+    # and a stub that answers every `Popen` would otherwise answer that one too.
+    container._boot_id()
     seen: List[List[str]] = []
 
     class _Fake:
@@ -279,3 +286,242 @@ def test_two_frames_in_one_buffer_are_two_frames() -> None:
     stream.seek(0)
     assert worker.read_frame(stream) == {"ready": True}
     assert worker.read_frame(stream) == {"output": {"calls": 1}}
+
+
+# ----- the frame protocol, against a stub that misbehaves -----
+
+
+def _stub_worker(script: str, monkeypatch: pytest.MonkeyPatch) -> adapter.Worker:
+    """A `Worker` around a local interpreter speaking the protocol, and no daemon anywhere.
+
+    The transport is the part under test, so the container is not: `close` is pointed at nothing,
+    and what is left is exactly the pipe pair and the frames on it."""
+    import subprocess
+
+    process = subprocess.Popen(
+        [sys.executable, "-c", script],
+        stdin=subprocess.PIPE,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.DEVNULL,
+        bufsize=0,
+    )
+    assert process.stdout is not None
+    monkeypatch.setattr(container, "remove", lambda name, confirm=False: None)
+    return adapter.Worker(
+        root=Path("/nowhere"),
+        process=process,
+        container="stub",
+        frames=adapter._Frames(process.stdout.fileno()),
+    )
+
+
+_ECHO = """
+import json, os, sys, time
+r = os.fdopen(os.dup(0), "rb", buffering=0)
+w = os.fdopen(os.dup(1), "wb", buffering=0)
+
+
+def send(payload):
+    body = json.dumps(payload).encode()
+    w.write(b"%d\\n" % len(body))
+    w.write(body)
+    w.flush()
+
+
+while True:
+    header = r.readline()
+    if not header:
+        break
+    request = json.loads(r.read(int(header.strip())))
+    if request["body"].get("slow"):
+        time.sleep(float(request["body"]["slow"]))
+    send({"id": request["id"], "output": {"saw": request["command"]}})
+"""
+
+
+def test_a_timed_out_call_makes_the_worker_unusable(monkeypatch: pytest.MonkeyPatch) -> None:
+    """A timeout on an ordered pipe is not a failure that ends when the caller stops waiting.
+
+    HTTP gave each response its own connection, so abandoning one cost nothing. A pipe is one
+    ordered stream: the command that timed out is still running, its answer is still coming, and
+    the world it is running against is still changing. There is no state in which reusing that
+    worker is right, so it is refused, and the refusal says why."""
+    monkeypatch.setattr(adapter, "_CALL_TIMEOUT_SECONDS", 0.4)
+    worker = _stub_worker(_ECHO, monkeypatch)
+    try:
+        with pytest.raises(adapter.WorkerError) as timed_out:
+            worker.call("execute", slow=3.0)
+        assert "did not answer" in str(timed_out.value)
+        with pytest.raises(adapter.WorkerError) as refused:
+            worker.call("seal")
+        # The second failure names the first, rather than being a fresh mystery.
+        assert "not usable" in str(refused.value)
+        assert "still running" in str(refused.value)
+    finally:
+        worker.close()
+
+
+def test_an_answer_to_a_command_nobody_is_waiting_for_is_not_read_as_the_next_one(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The failure the identifiers exist for, forced by hand.
+
+    A worker that answers late leaves its answer in the stream. Without an identifier the next
+    call reads it as its own, which is an earlier block's output returned under a later step, or a
+    finalizer handed the wrong shape entirely. Here the stub answers the first command twice, so
+    the second call meets a stale frame before its own."""
+    stub = _ECHO.replace(
+        'send({"id": request["id"], "output": {"saw": request["command"]}})',
+        'send({"id": request["id"], "output": {"saw": request["command"]}})\n'
+        '    if request["command"] == "first":\n'
+        '        send({"id": request["id"], "output": {"saw": "stale"}})',
+    )
+    worker = _stub_worker(stub, monkeypatch)
+    try:
+        assert worker.call("first")["saw"] == "first"
+        # The stale duplicate is sitting in the pipe. The next call must step over it.
+        assert worker.call("second")["saw"] == "second"
+    finally:
+        worker.close()
+
+
+# ----- removal, confirmed -----
+
+
+def test_a_close_that_cannot_confirm_stays_retryable(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Finalization's close is the one that establishes the invariant, so it fails closed.
+
+    It raises when the daemon will not say the container is gone, and it leaves the worker
+    unclosed, because a worker marked closed is one teardown will not try again."""
+    monkeypatch.setattr(container, "_run", lambda *a, **k: _Finished(0, ""))
+    monkeypatch.setattr(container, "absent", lambda name: False)
+    worker = _stub_worker(_ECHO, monkeypatch)
+    monkeypatch.undo()
+    monkeypatch.setattr(container, "absent", lambda name: False)
+    monkeypatch.setattr(container, "_run", lambda *a, **k: _Finished(0, ""))
+    with pytest.raises(container.DockerError) as refused:
+        worker.close(confirm=True)
+    assert "not confirmed" in str(refused.value)
+    assert worker.closed is False
+    # And the best-effort close teardown makes does not raise, so a failing removal never stops
+    # an episode being torn down.
+    monkeypatch.setattr(container, "absent", lambda name: True)
+    worker.close()
+    assert worker.closed is True
+
+
+class _Finished:
+    def __init__(self, returncode: int, stdout: str) -> None:
+        self.returncode = returncode
+        self.stdout = stdout
+        self.stderr = ""
+
+
+def test_removal_confirms_by_asking_the_daemon(monkeypatch: pytest.MonkeyPatch) -> None:
+    """`docker rm -f` returning zero is not the same fact as the container being gone."""
+    calls: List[List[str]] = []
+
+    def _run(args, **_):
+        calls.append(list(args))
+        return _Finished(0, "")
+
+    monkeypatch.setattr(container, "_run", _run)
+    monkeypatch.setattr(container, "absent", lambda name: True)
+    container.remove("c", confirm=True)
+    assert calls and calls[0][:2] == ["rm", "-f"]
+    # Without confirmation it does not ask, because teardown must not pay for a question whose
+    # answer it would ignore.
+    calls.clear()
+    container.remove("c")
+    assert len(calls) == 1
+
+
+# ----- the protocol descriptors -----
+
+
+def test_the_protocol_descriptors_are_not_handed_to_a_child(tmp_path: Path) -> None:
+    """What the redirection does and does not buy, checked rather than asserted in prose.
+
+    Redirecting 0 and 1 stops an accidental `print` corrupting a frame. It does not take the
+    duplicated endpoints away from code running in the same interpreter, and nothing can: the
+    worker needs them between commands and a closed pipe end cannot be reopened. What it can do is
+    keep them out of anything that agent code *starts*, and that is a real reduction, so it is a
+    test: a child cannot forge a frame on a descriptor it did not receive."""
+    import subprocess
+
+    script = tmp_path / "channel.py"
+    script.write_text(
+        "import json, os, subprocess, sys\n"
+        f"sys.path.insert(0, {str(WORKER.parent)!r})\n"
+        "import worker as W\n"
+        "reader, writer = W._take_channel()\n"
+        "inherited = subprocess.run(\n"
+        "    [sys.executable, '-c',\n"
+        "     'import os,sys; print([f for f in (3,4,5,6) \\n"
+        "      if os.path.exists(\"/dev/fd/%d\" % f)])'],\n"
+        "    capture_output=True, text=True)\n"
+        "W.send_frame(writer, {'inheritable': [os.get_inheritable(reader.fileno()),\n"
+        "                                      os.get_inheritable(writer.fileno())],\n"
+        "                      'stdin_is_devnull': sys.stdin.read() == '',\n"
+        "                      'child': inherited.stdout.strip()})\n"
+    )
+    finished = subprocess.run(
+        [sys.executable, str(script)], input=b"", capture_output=True
+    )
+    payload = json.loads(finished.stdout.split(b"\n", 1)[1])
+    # Neither endpoint is inheritable, so a process agent code starts does not receive them.
+    assert payload["inheritable"] == [False, False]
+    # And the ordinary standard input is /dev/null, so agent code reading it cannot eat a command.
+    assert payload["stdin_is_devnull"] is True
+
+
+# ----- the reaper -----
+
+
+def test_the_reaper_removes_a_container_whose_parent_is_gone(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The case teardown cannot reach: a parent that dies while a world is wedged in a command.
+
+    The worker learns its parent is gone only from end-of-file on its next read, and a command
+    that never returns never reaches that read, so the container never exits and `--rm` never
+    fires. A random name leaves a later run nothing to recognize it by, so every container carries
+    the pid that started it and this boot, and construction sweeps the ones whose parent is not
+    there any more.
+
+    Removing containers is destructive, so the ambiguous cases must do nothing: an unreadable
+    label, and a pid that belongs to somebody else's live process, are both left alone."""
+    listed = ["dead1", "alive1", "unlabelled"]
+    labels = {"dead1": "4242", "alive1": "4243", "unlabelled": ""}
+    removed: List[str] = []
+
+    def _run(args, **_):
+        if args[0] == "ps":
+            return _Finished(0, "\n".join(listed))
+        if args[0] == "inspect":
+            return _Finished(0, labels[args[-1]])
+        if args[0] == "rm":
+            removed.append(args[-1])
+            return _Finished(0, "")
+        raise AssertionError(args)
+
+    monkeypatch.setattr(container, "_run", _run)
+    swept = container.reap(alive=lambda pid: pid == 4243)
+    assert swept == ["dead1"]
+    assert removed == ["dead1"]
+
+
+def test_every_container_carries_who_started_it(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    seen = _captured(monkeypatch)
+    container.run(role="serve", mounts=[container.Mount(tmp_path, "/corpus")])
+    args = seen[0]
+    labels = [args[index + 1] for index, item in enumerate(args) if item == "--label"]
+    assert f"{container.LABEL_OWNER}=1" in labels
+    assert f"{container.LABEL_PARENT}={os.getpid()}" in labels
+    assert any(item.startswith(f"{container.LABEL_BOOT}=") for item in labels)
+    # And the hostname is a constant rather than the container's own short id, which Docker would
+    # otherwise put in the environment.
+    assert args[args.index("--hostname") + 1] == "worker"
+

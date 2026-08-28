@@ -38,7 +38,7 @@ import uuid
 from dataclasses import dataclass
 from functools import lru_cache
 from pathlib import Path
-from typing import Dict, List, Optional, Sequence, Tuple
+from typing import Callable, Dict, List, Optional, Sequence, Tuple
 
 from shogym.envs._upstream import _locked
 
@@ -67,6 +67,14 @@ _BUILD_TIMEOUT_SECONDS = 1800.0
 
 #: How long a ``docker`` control command (``inspect``, ``rm``) may take.
 _CONTROL_TIMEOUT_SECONDS = 60.0
+
+#: Every container this port starts carries these. The first says whose they are, the second says
+#: which process started them, and together they are what lets a later run tell an abandoned
+#: container from a live one. A random name cannot: it says nothing to anybody who did not start
+#: it, and a parent that died holding one leaves nothing behind that names it.
+LABEL_OWNER = "shogym.appworld"
+LABEL_PARENT = "shogym.appworld.parent"
+LABEL_BOOT = "shogym.appworld.boot"
 
 DOCKERFILE = Path(__file__).with_name("worker.Dockerfile")
 WORKER = Path(__file__).with_name("worker.py")
@@ -146,6 +154,25 @@ def _image_tag() -> str:
 def image_name() -> str:
     """The image an episode's world runs in, named for what it was built from."""
     return f"shogym-appworld-worker:{_image_tag()}"
+
+
+@lru_cache(maxsize=4)
+def image_identity(name: str) -> str:
+    """What was actually built, as the daemon has it: the image id and the platform.
+
+    The tag is a digest over the Dockerfile and the worker, so it moves when this repository's
+    inputs move. It does not move when the base image's own contents move under a digest pin that
+    was re-pushed, when a build resolves a different transitive version, or when the same tag was
+    built on another platform. Two runs whose rows are one measurement have to agree on the
+    interpreter their worlds ran under, and this is the value that says which one that was."""
+    finished = _run(
+        ["image", "inspect", "--format", "{{.Id}} {{.Os}}/{{.Architecture}}", name],
+        timeout=_CONTROL_TIMEOUT_SECONDS,
+        check=False,
+    )
+    if finished.returncode != 0:
+        raise DockerError(f"the image {name} is not built, so it has no identity to record")
+    return finished.stdout.strip()
 
 
 def image_exists(name: Optional[str] = None) -> bool:
@@ -231,6 +258,18 @@ def run(
         "-i",
         "--name",
         container,
+        # Whose it is, who started it, and on which boot. See :func:`reap`: a random name tells a
+        # later run nothing, and a parent that died holding one leaves nothing that names it.
+        "--label",
+        f"{LABEL_OWNER}=1",
+        "--label",
+        f"{LABEL_PARENT}={os.getpid()}",
+        "--label",
+        f"{LABEL_BOOT}={_boot_id()}",
+        # A constant, because the default is the container's own short id and Docker puts it in
+        # the environment. It is not a secret and it is not this episode's to hand out.
+        "--hostname",
+        "worker",
         "--network",
         "none",
         "--user",
@@ -270,17 +309,105 @@ def run(
     return process, container
 
 
-def remove(container: str) -> None:
-    """Remove a container, whatever state it is in, and never raise.
+def absent(container: str) -> bool:
+    """Whether the daemon has no container by that name, running or stopped.
 
-    Teardown's job, and it runs on the crash paths too. ``--rm`` covers the ordinary exit and the
-    case where the parent dies (the worker reads end-of-file on its stdin and stops), but a
-    container whose world is wedged in a native call ignores that, and one nobody removed is a
-    world holding a mount open for the rest of the machine's day."""
-    try:
+    ``docker inspect`` rather than ``docker ps``: a container that exited but was not removed is
+    still a container, still holds its mounts, and is still something a name can collide with."""
+    return (
+        _run(["inspect", container], timeout=_CONTROL_TIMEOUT_SECONDS, check=False).returncode != 0
+    )
+
+
+def remove(container: str, *, confirm: bool = False) -> None:
+    """Remove a container and, when asked, refuse to pretend it worked.
+
+    ``--rm`` covers the ordinary exit and the case where the parent dies (the worker reads
+    end-of-file on its stdin and stops), but a container whose world is wedged in a native call
+    ignores that, and one nobody removed is a world holding its mounts open.
+
+    **Two callers want two different failure modes, so they get two.** Teardown runs on the crash
+    paths and must not raise: for it, a removal that failed is a container the next attempt or the
+    reaper will get. Finalization is the other: it removes the world's container precisely so that
+    nothing can write to the tree it is about to grade, and a removal it did not confirm is an
+    invariant it cannot claim. ``confirm=True`` asks the daemon whether the container is really
+    gone and raises when it is not."""
+    _run(["rm", "-f", container], timeout=_CONTROL_TIMEOUT_SECONDS, check=False)
+    if not confirm:
+        return
+    if not absent(container):
+        # One retry, because `rm -f` is a signal and a stop timeout, and a container in an
+        # uninterruptible call can outlive the first one.
         _run(["rm", "-f", container], timeout=_CONTROL_TIMEOUT_SECONDS, check=False)
-    except DockerError:
+    if not absent(container):
+        raise DockerError(
+            f"the container {container} is still there after two removals; the daemon has not "
+            "confirmed that it stopped, so nothing may treat what it could write as final"
+        )
+
+
+def reap(*, alive: Optional[Callable[[int], bool]] = None) -> List[str]:
+    """Remove this port's containers whose parent process is gone, and say which.
+
+    The case it exists for is the one teardown cannot reach: a parent that dies while a world is
+    wedged inside a command. The worker only notices its parent through end-of-file on the next
+    read, and a container whose process never returns to that read never exits, so ``--rm`` never
+    fires. What is left is a container nobody is going to remove and nothing names.
+
+    So every container carries the pid that started it and this machine's boot time, and this runs
+    at construction: a labelled container whose parent is not running is one nobody is coming back
+    for. The boot time is in the label because pids are reused across a reboot, and removing a
+    live episode's world because an unrelated process now holds its parent's number would be a
+    worse failure than the one this fixes."""
+    listed = _run(
+        ["ps", "--all", "--quiet", "--filter", f"label={LABEL_OWNER}=1",
+         "--filter", f"label={LABEL_BOOT}={_boot_id()}"],
+        timeout=_CONTROL_TIMEOUT_SECONDS,
+        check=False,
+    )
+    running = alive if alive is not None else _process_is_alive
+    removed: List[str] = []
+    for identifier in listed.stdout.split():
+        parent = _run(
+            ["inspect", "--format", '{{index .Config.Labels "%s"}}' % LABEL_PARENT, identifier],
+            timeout=_CONTROL_TIMEOUT_SECONDS,
+            check=False,
+        ).stdout.strip()
+        # An unreadable or unparseable label is left alone. This removes containers, so the
+        # ambiguous case has to be the one where nothing happens.
+        if not parent.isdigit() or running(int(parent)):
+            continue
+        _run(["rm", "-f", identifier], timeout=_CONTROL_TIMEOUT_SECONDS, check=False)
+        removed.append(identifier)
+    return removed
+
+
+def _process_is_alive(pid: int) -> bool:
+    try:
+        os.kill(pid, 0)
+    except ProcessLookupError:
+        return False
+    except PermissionError:
+        # Somebody else's process, which is somebody else's business and certainly alive.
+        return True
+    return True
+
+
+@lru_cache(maxsize=1)
+def _boot_id() -> str:
+    """Something that changes when the machine restarts, so a reused pid is not a live parent."""
+    try:
+        stamp = subprocess.run(
+            ["sysctl", "-n", "kern.boottime"], capture_output=True, text=True, timeout=10
+        )
+        if stamp.returncode == 0 and stamp.stdout.strip():
+            return hashlib.sha256(stamp.stdout.strip().encode()).hexdigest()[:12]
+    except (FileNotFoundError, subprocess.TimeoutExpired):
         pass
+    try:
+        return hashlib.sha256(Path("/proc/sys/kernel/random/boot_id").read_bytes()).hexdigest()[:12]
+    except OSError:
+        return "unknown"
 
 
 def running(container: str) -> bool:
@@ -297,14 +424,20 @@ __all__ = [
     "CORPUS_MOUNT",
     "DOCKERFILE",
     "GRADED_MOUNT",
+    "LABEL_BOOT",
+    "LABEL_OWNER",
+    "LABEL_PARENT",
     "OUTPUTS_MOUNT",
     "SCRATCH_MOUNT",
     "DockerError",
     "Mount",
+    "absent",
     "docker_available",
     "ensure_image",
+    "image_identity",
     "image_exists",
     "image_name",
+    "reap",
     "remove",
     "require_docker",
     "run",

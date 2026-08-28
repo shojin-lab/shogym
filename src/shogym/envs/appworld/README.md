@@ -139,9 +139,10 @@ TaskStream(
     [TaskRef("appworld", 0)],
     prov_dir=...,
     feedback=Information(),
-    # This env's constructor binds no event loop, and building one is real work: say so, and each
-    # task's env is built in a thread instead of on the loop serving the other episodes.
-    off_loop_factory=True,
+    # Pass the fingerprint. It is what makes the rows of one record one measurement, and a resume
+    # under a changed draw, payload class, block budget, corpus or worker image is refused rather
+    # than appended.
+    identity=shogym.make("appworld").config_digest,
 )
 ```
 
@@ -470,16 +471,27 @@ is its own, so no episode holds another's end state, logs or verdicts; the grade
 an unguessable name; and the drawn key reaches neither process, because the protocol has no field
 for one.
 
-**The world is stopped before it is graded.** `read` flushes the end state into the episode's
-output tree, and then the world's container is removed, which ends every process in it, and only
-then does the grading container start. Sealing closes the tool surface and does not stop work an
-earlier call left running, so without this the evaluator could be reading bytes something was
-still writing.
+**The world is stopped before anything it produced is read.** `seal` flushes the end state into
+the episode's output tree and reads nothing off the live world. The container is then removed, and
+the daemon is asked to confirm it: a removal it will not confirm ends the episode under the
+design's failure rule rather than grading it, because a container that might still be running is a
+container that might still be writing. Only then is the tree opened, by the grading container,
+which reads the filing, digests the databases and runs the base task's own checks off one state.
+
+A block can start a thread and the thread outlives the block, so this ordering is the difference
+between one state and two observations that happened to agree. Reading the filing on a live world
+was the earlier design and it was wrong for that reason.
 
 **Two more containers, and neither runs a line an agent wrote.** Seeding writes one task's
-database log into a staging directory, and grading runs the base task's own evaluator against the
-answers and this episode's output tree. Both are short-lived, both are the same image, and
-grading is the only place ground truth is loaded at all.
+database log into a staging directory, and grading reads the sealed output tree: the filing, the
+databases' digest, and the base task's own evaluator against the answers. Both are short-lived,
+both are the same image, and grading is the only place ground truth is loaded at all.
+
+**The transport carries an identifier on every frame.** An ordered pipe is not HTTP: a command
+that timed out is still running and its answer still arrives, into the stream the next caller is
+reading. An answer whose identifier is not the one a call sent is discarded, and a call that
+stopped waiting poisons its worker outright, because a world with a command still running in it
+is not a world worth reusing.
 
 **The image.** Digest-pinned base (`python:3.12-slim-bookworm`), `appworld` version-pinned to the
 release this port reproduces, the app sources the wheel ships packed unpacked at build time, and
@@ -506,6 +518,20 @@ enforce rather than something to observe.
 same corpus: per-episode startup 1.87s to 2.32s, one `execute` round trip 1.8ms to 6.1ms on an
 empty block and 3.9ms to 11.1ms on one that makes an API call, grading 1.43s to 1.80s, and a whole
 served episode 8.72s to 8.99s. The image builds in about half a minute and is 95 MB.
+
+**What the world can learn about the host is names, not contents.** `/proc/self/mountinfo` is
+readable from inside and names the host-side source of every bind: the cache root, the private
+home and its tag, and this episode's own output directory. None is openable from there, none is
+the Docker socket, and none is a key, a pulse or a grade; and none of them differs between two
+arms of a pair, so a world cannot read its treatment off its own filesystem. The container's short
+id is kept out of the environment by giving every container the same hostname. The claim is about
+contents, and the port does not claim its paths are secret.
+
+**A container whose parent died is swept, not hoped about.** Every container carries the pid that
+started it and this machine's boot, and construction removes the labelled ones whose parent is
+gone. The case is a run that dies while a world is wedged in a command: the worker learns its
+parent has gone only from end-of-file on its next read, which it never reaches, so it never exits
+and `--rm` never fires.
 
 **The residual, stated exactly.** The daemon is trusted: a container is a boundary against the
 code inside it and not against whoever can talk to Docker, and this port's own parent process can

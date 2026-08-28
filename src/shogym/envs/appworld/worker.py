@@ -108,25 +108,25 @@ class Episode:
         """Run one snippet of the agent's code against the world and return what it printed."""
         return {"output": self.world.execute(str(body["code"]))}
 
-    def read(self, body: Dict[str, Any]) -> Dict[str, Any]:
-        """What is in the named project, plus digests of what the world became.
+    def seal(self, body: Dict[str, Any]) -> Dict[str, Any]:
+        """Flush the end state to the episode's output tree, and read nothing off the live world.
 
-        Read off the models rather than through the APIs: an API read is an agent action, and this
-        is not an agent. It must see what is there, not what an authenticated session is allowed
-        to see.
+        **This used to be where the filing and the world's digest were read, and that was the
+        wrong place for them.** They were observed on a live world while whatever an earlier
+        ``execute`` had started was still running, and the container was removed only after the
+        answer came back, so the bytes a grader opened afterwards could differ from the bytes
+        those values described. What is scored now is read from this flush, in the grading
+        container, after this one is gone: one immutable tree, read once, by a process that never
+        ran a line the agent wrote.
 
-        The digests are what make "the same task twice is the same world" checkable, one over the
-        world's own end-state databases and one over the global generator's state."""
+        What is still read here is the state of the process's own generator, which is a fact about
+        this interpreter and cannot be recovered from a file. It is a diagnostic that two servings
+        of one task agreed, never an input to a score, so reading it from a world that is still
+        alive costs nothing."""
         self.world.models.reset_db_home_path()
-        filing = _read_filing(self.world.models, body)
-        # Flush the end state so the grader, which is a different container, has something to
-        # read. AppWorld writes the *initial* state at startup and nothing after it.
+        # AppWorld writes the *initial* state at startup and nothing after it.
         self.world._save_state(self.world.output_db_home_path_on_disk)
-        return {
-            "filing": filing,
-            "world_digest": _directory_digest(self.world.output_db_home_path_on_disk),
-            "rng_digest": _digest(repr(random.getstate())),
-        }
+        return {"rng_digest": _digest(repr(random.getstate()))}
 
     def close(self, body: Dict[str, Any]) -> Dict[str, Any]:
         """Shut the world down and give the process's randomness back to the caller."""
@@ -388,9 +388,27 @@ def _take_channel() -> Tuple[BinaryIO, BinaryIO]:
     of a frame; agent code that reads ``sys.stdin`` would eat the parent's next command. So the
     two descriptors are duplicated for this module's own use, and then 0 is pointed at
     ``/dev/null`` and 1 at standard error. Ordinary printing still works and goes somewhere
-    harmless."""
+    harmless.
+
+    **What this is not.** The duplicates stay open in the interpreter that runs agent-authored
+    Python, and nothing here closes them, because the worker needs them between commands and a
+    pipe end that is closed cannot be reopened. Code running in this process can therefore write a
+    frame the parent will read. What that is worth is bounded, and by design rather than by luck:
+    the protocol carries no key, no grade, no answer and no host path in either direction, and
+    since the filing, the digest and the base task's checks are all read in the grading container
+    from a tree this process cannot reach once it is stopped, nothing that is scored travels over
+    it at all. The most an in-process actor gains is control of its own episode's ``execute``
+    output, which is its own output, and the ability to make its own episode fail. It is not a
+    boundary between agent code and the worker; the boundary is the container, and it is between
+    the worker and everything else.
+
+    The duplicates are marked not inheritable, so a process agent code starts does not receive
+    them. That is a real reduction rather than a claim: a child cannot forge a frame it has no
+    descriptor for."""
     reader = os.fdopen(os.dup(0), "rb", buffering=0)
     writer = os.fdopen(os.dup(1), "wb", buffering=0)
+    for handle in (reader, writer):
+        os.set_inheritable(handle.fileno(), False)
     devnull = os.open(os.devnull, os.O_RDONLY)
     try:
         os.dup2(devnull, 0)
@@ -422,7 +440,7 @@ def serve(root: Optional[str] = None) -> int:
     commands = {
         "open": episode.open,
         "execute": episode.execute,
-        "read": episode.read,
+        "seal": episode.seal,
         "close": episode.close,
     }
     # The parent waits for this before it sends anything: a cold container importing upstream and
@@ -433,14 +451,18 @@ def serve(root: Optional[str] = None) -> int:
         request = read_frame(reader)
         if request is None:
             break
+        # Echoed on the answer, whatever the answer is. The parent matches on it, so a reply
+        # that arrives after its caller stopped waiting is a reply the next caller discards
+        # rather than one it reads as its own.
+        identifier = request.get("id")
         command = commands.get(str(request.get("command")))
         if command is None:
-            send_frame(writer, {"error": "no such command: %s" % request.get("command")})
+            send_frame(writer, {"id": identifier, "error": "no such command: %s" % request.get("command")})
             continue
         try:
-            send_frame(writer, {"output": command(dict(request.get("body") or {}))})
+            send_frame(writer, {"id": identifier, "output": command(dict(request.get("body") or {}))})
         except Exception as exc:  # the world's failures are answers, not crashes
-            send_frame(writer, {"error": "%s: %s" % (type(exc).__name__, exc)})
+            send_frame(writer, {"id": identifier, "error": "%s: %s" % (type(exc).__name__, exc)})
         if request.get("command") == "close":
             break
     return 0
@@ -453,9 +475,12 @@ def _one_shot(handler: Any) -> int:
     if request is None:
         return 1
     try:
-        send_frame(writer, {"output": handler(dict(request.get("body") or request))})
+        send_frame(
+            writer,
+            {"id": request.get("id"), "output": handler(dict(request.get("body") or request))},
+        )
     except Exception as exc:
-        send_frame(writer, {"error": "%s: %s" % (type(exc).__name__, exc)})
+        send_frame(writer, {"id": request.get("id"), "error": "%s: %s" % (type(exc).__name__, exc)})
         return 1
     return 0
 
@@ -476,6 +501,14 @@ def grade(body: Dict[str, Any]) -> Dict[str, Any]:
     from appworld.evaluator import evaluate_task
     from appworld.task import Task
 
+    dbs = os.path.join(body["experiment"], "tasks", body["task_id"], "dbs")
+    # Before the evaluator, and in this order for a mechanical reason rather than a preference:
+    # AppWorld holds each app's database engine on a class attribute, so a collection loaded after
+    # the evaluator has built its own reads the evaluator's world instead of the one it asked for.
+    # Both read the same tree either way, because the container that could have changed it is
+    # gone; what the order buys is that this one reads what it named.
+    filing = _read_filing(_models_on_disk(dbs, body["task_id"]), body)
+    world_digest = _directory_digest(dbs)
     with _ignoring(list(body.get("ignore") or ())):
         tracker = evaluate_task(
             task_id=body["task_id"],
@@ -496,7 +529,30 @@ def grade(body: Dict[str, Any]) -> Dict[str, Any]:
         requirement = entry["requirement"]
         verdict = True if requirement in passed else (False if requirement in failed else None)
         checks.append(["aw.%03d" % position, verdict])
-    return {"checks": checks}
+    return {
+        "checks": checks,
+        # Read here rather than off the live world, and from the same tree the evaluator above
+        # just read. The container that could have changed these bytes was removed before this
+        # process started, so what is scored and what is graded are one state by construction
+        # rather than by two observations happening to agree.
+        "filing": filing,
+        "world_digest": world_digest,
+    }
+
+
+def _models_on_disk(dbs: str, tag: str) -> Any:
+    """Load one task's flushed databases, read-only, into an interpreter of their own.
+
+    Through upstream's own model layer rather than by parsing the statement log: the log is a
+    replayable format with a per-row hash column and full-text shadow tables behind it, and a
+    reader that got either wrong would be reading a world that is not the one that was saved."""
+    from appworld.collections.models import ModelCollection
+
+    return ModelCollection.load(
+        to_db_home_path=f":memory:shogym-read-{tag}",
+        from_db_home_path=dbs,
+        load_apps=["todoist"],
+    )
 
 
 def install() -> int:

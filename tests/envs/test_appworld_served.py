@@ -569,6 +569,42 @@ print(json.dumps({
     assert (CORPUS / "data" / "tasks" / task_id() / "ground_truth").exists()
 
 
+async def test_what_the_world_can_learn_about_the_host_is_names_and_not_contents() -> None:
+    """The claim, narrowed to what is true, and pinned by a test rather than by prose.
+
+    `/proc/self/mountinfo` is readable from inside, and it names the host-side source of every
+    bind: the cache root, the private home and its tag, and this episode's own output directory.
+    None of those is openable from here, none of them is the Docker socket, and none of them is a
+    key, a pulse or a grade. So the boundary is about *contents*, not about *names*, and the port
+    says so rather than implying that a path an agent cannot use is a path it cannot see.
+
+    What matters more than the disclosure is that none of those names encodes the feedback arm.
+    Two arms of one pair differ in their session identifiers and in nothing else a mount is named
+    after, so a world cannot read its own treatment off its filesystem."""
+    probe = """
+_io, _os = __import__("io"), __import__("os")
+mounts = _io.open("/proc/self/mountinfo").read()
+print(json.dumps({
+    "mountinfo": [line.split(" - ")[0][-160:] for line in mounts.splitlines()
+                  if "/corpus" in line or "/outputs" in line],
+    "hostname": _os.environ.get("HOSTNAME", ""),
+    "socket": _os.path.exists("/var/run/docker.sock"),
+}))
+"""
+    played = await play([probe])
+    seen = json.loads(json.loads(played["outputs"][0]["content"])["output"])
+    disclosed = " ".join(seen["mountinfo"])
+    # The disclosure is real and is what the port documents: host-side names are visible.
+    assert "/corpus" in disclosed and "/outputs" in disclosed
+    # What it is not: a Docker socket, or a name that says which arm this episode is.
+    assert seen["socket"] is False
+    for arm in ("information", "placebo", "graded", "drawn", "report", "notice"):
+        assert arm not in disclosed.lower(), arm
+    # And the container's own short id is not handed out in the environment: the hostname is a
+    # constant, so `HOSTNAME` says nothing about which container this is.
+    assert seen["hostname"] in ("", "worker")
+
+
 async def test_only_this_episodes_task_and_output_tree_are_mounted() -> None:
     """One task, not the roster; one experiment's outputs, not the run's.
 
@@ -578,6 +614,12 @@ async def test_only_this_episodes_task_and_output_tree_are_mounted() -> None:
     container holds exactly one entry."""
     from shogym.envs.appworld import adapter as adapter_module
 
+    # Served here rather than assumed. Selecting this test alone against a fresh cache used to
+    # raise `FileNotFoundError` on a tasks directory nothing had created yet, and it passed in
+    # full-file order only because an earlier test happened to derive a sibling first. A boundary
+    # test that depends on collection order is a boundary test that can go quiet.
+    await play([], position=TASK)
+    await play([], position=TASK + 1)
     derived = adapter_module.derived_root()
     others = [
         entry.name
@@ -613,9 +655,15 @@ print(json.dumps({
     seen = json.loads(json.loads(played["outputs"][0]["content"])["output"])
     assert seen["mine"] is True
     assert seen["others"] == []
+<<<<<<< HEAD
     # And the test is not vacuous: the host really does hold other tasks' derived trees by now.
     assert others, "no sibling task derived yet; run another served test first"
 >>>>>>> a60c8dc (appworld: test the boundary by running the probes through a real execute)
+=======
+    # And the test is not vacuous: the host really does hold another task's derived tree, because
+    # this test served one.
+    assert task_id(TASK + 1) in others
+>>>>>>> 887dbff (appworld: read the score off a stopped world, and stop trusting an unconfirmed removal)
 
 
 async def test_a_read_outside_the_served_tree_is_refused() -> None:
@@ -651,6 +699,112 @@ except Exception as failure:
         assert seen["read"] is False
     finally:
         sentinel.unlink(missing_ok=True)
+
+
+async def test_activity_an_earlier_block_started_cannot_change_the_graded_bytes() -> None:
+    """The scored state and the graded state have to be one state, not two that agreed.
+
+    A block can start a thread, and the thread outlives the block: AppWorld runs an agent's code
+    under an alarm on the main thread and does nothing about what that code started. The filing
+    and the world's digest used to be read off the live world in a `read` command, with the
+    container removed only after the answer came back, so a thread still writing during the read,
+    or between the digest and the removal, changed the bytes a grader opened afterwards. Nothing
+    downstream would have noticed: the receipt would describe one state and the base checks
+    another.
+
+    The flush, the removal and the reading are ordered now, and the last of them happens in a
+    container the world cannot reach. This proves the property that ordering buys: what the run
+    recorded as the world's digest is what is on disk once everything has stopped."""
+    from shogym.envs.appworld import mcp_server
+    from shogym.envs.appworld.worker import _directory_digest
+
+    spinner = """
+_t = __import__("threading")
+state = {"writes": 0}
+pw = [x for x in apis.supervisor.show_account_passwords() if x["account_name"] == "todoist"][0]
+tok = apis.todoist.login(
+    username=apis.supervisor.show_profile()["email"], password=pw["password"]
+)["access_token"]
+proj = [
+    p for p in apis.todoist.show_projects(access_token=tok, page_limit=50)
+    if p["name"] == "Task Log"
+][0]["project_id"]
+
+
+def _write():
+    while state["writes"] < 400:
+        try:
+            apis.todoist.create_task(
+                access_token=tok, project_id=proj,
+                title="Filing", description="RQ-0001, Routine",
+            )
+        except Exception:
+            pass
+        state["writes"] += 1
+
+
+_t.Thread(target=_write, daemon=True).start()
+print("started")
+"""
+    env = shogym.make("appworld")
+    episode = await ServedEpisode.open_env(env, env_name="appworld", task=TASK)
+    session = mcp_server.get_session(episode.session_id)
+    assert session is not None
+    outputs, task = session.outputs, session.task_id
+    try:
+        await episode.call("execute", {"code": spinner})
+        # The thread is demonstrably writing into the world while the episode is still open, so
+        # what follows is an assertion about a moving target rather than a quiet one.
+        seen = await episode.call("execute", {"code": 'print(state["writes"])'})
+        assert int(json.loads(seen.content)["output"].strip()) > 0
+        terminal = await episode.call("submit", {})
+    finally:
+        await episode.close()
+    feedback = {
+        item["name"]: item["value"] for item in (terminal.meta.get("shogym/feedback") or [])
+    }
+    settled = _directory_digest(str(outputs / "tasks" / task / "dbs"))
+    assert feedback["world_digest"] == settled
+    # And it stays settled, because there is no process left that could write to it.
+    assert _directory_digest(str(outputs / "tasks" / task / "dbs")) == settled
+
+
+async def test_a_removal_the_daemon_did_not_confirm_fails_the_episode(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Failing closed, because the alternative is a grade with nothing behind it.
+
+    Removal used to swallow every failure. The daemon owns the container, so a `docker rm -f` that
+    returned nonzero, or timed out, left a world that might still be writing to the output tree
+    finalization was about to mount into the grader. That is exactly the invariant the ordering
+    exists to establish, so an unconfirmed removal has to end the episode rather than grade it,
+    and it has to leave the worker unclosed so teardown can try again."""
+    from shogym.envs.appworld import container as container_module
+    from shogym.envs.appworld import mcp_server
+
+    env = shogym.make("appworld")
+    episode = await ServedEpisode.open_env(env, env_name="appworld", task=TASK)
+    session = mcp_server.get_session(episode.session_id)
+    assert session is not None
+    worker = session.worker
+    # The container really is removed; what is simulated is a daemon that will not say so.
+    monkeypatch.setattr(container_module, "absent", lambda name: False)
+    try:
+        terminal = await episode.call("submit", {})
+        feedback = {
+            item["name"]: item["value"] for item in (terminal.meta.get("shogym/feedback") or [])
+        }
+        # Not graded: the failure rule, not a score.
+        assert feedback.get("finalize_error") is True
+        assert feedback["ledger_fraction"] == 0.0
+        assert feedback["checks"] == 0.0
+    finally:
+        monkeypatch.undo()
+        await episode.close()
+    # Teardown, which is best effort rather than confirming, still cleaned up after the failure.
+    # That the confirming close leaves the worker retryable is checked where it can be seen
+    # without teardown racing the assertion: `test_a_close_that_cannot_confirm_stays_retryable`.
+    assert container_module.absent(worker.container)
 
 
 async def test_the_container_is_gone_when_the_episode_is() -> None:
@@ -992,6 +1146,47 @@ async def test_the_world_stops_before_it_is_graded() -> None:
         await episode.close()
 
 
+async def test_the_terminal_row_reaches_the_trace_after_an_ordinary_execute(
+    tmp_path: Path,
+) -> None:
+    """The run fingerprint rides on the row, and a row the trace store refuses is a row nobody has.
+
+    The fingerprint is published as inference feedback, which the store requires to carry the step
+    of the row it is on. It carried a fixed zero, so on any terminal row past the first step the
+    store refused the record; the refusal was caught, flagged as degraded persistence, and the
+    call returned success. What was left was a trace with no terminal row in it: a later read
+    reported an episode that never ended, with no feedback and no identity, and nothing anywhere
+    said so.
+
+    So this drives an episode that takes a step before it ends, which is the case that failed, and
+    reads the trace back."""
+    from shogym.trace import load_traces
+
+    trace = tmp_path / "episode.jsonl"
+    env = shogym.make("appworld")
+    episode = await ServedEpisode.open_env(
+        env, env_name="appworld", task=TASK, trace_path=trace
+    )
+    try:
+        await episode.call("execute", {"code": filing_block()})
+        await episode.call("submit", {})
+    finally:
+        await episode.close()
+
+    rows = load_traces(trace)
+    terminal = [row for row in rows if row.get("terminated")]
+    assert terminal, "the terminal row was refused and the failure was swallowed"
+    last = terminal[-1]
+    names = {item["name"] for item in last["feedback"]}
+    assert "ledger_fraction" in names
+    # The row is past the first step, which is the case that failed.
+    assert last["step"] >= 1
+    # The identity is on the row, at the row's own step, which is what the store was refusing.
+    identity = [item for item in last["feedback"] if item["name"] == "config_digest"]
+    assert identity and identity[0]["step"] == last["step"]
+    assert identity[0]["value"] == env.config_digest
+
+
 # ----- the matched pair, through a stream -----
 
 
@@ -1001,12 +1196,17 @@ async def test_information_hands_back_the_receipt_and_placebo_the_digest(
     from shogym.serve.stream import Information, Placebo, TaskRef, TaskStream
 
     answers = {}
+    identity = shogym.make("appworld").config_digest
     for name, policy in (("information", Information()), ("placebo", Placebo())):
         stream = TaskStream(
             shogym.make,
             [TaskRef("appworld", TASK)],
             prov_dir=tmp_path / name,
             feedback=policy,
+            # What a resumed directory is checked against. An empty identity matches anything, so
+            # the documented construction has to carry one or a crash followed by a changed pulse
+            # appends incomparable rows to one run.
+            identity=identity,
         )
         async with stream:
             await stream.get_task()

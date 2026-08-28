@@ -157,6 +157,10 @@ class AppWorldEnv(Env):
         # cannot serve this env, and an hour into a run is the wrong time to find that out.
         container.require_docker()
         adapter.ensure_image()
+        # Anything this port left behind whose parent is gone. The case is a run that died while a
+        # world was wedged inside a command: the worker never gets back to the read that would
+        # tell it its parent had gone, so it never exits and `--rm` never fires.
+        container.reap()
         self._pulse = int(pulse)
         self._report = report
         self._original = adapter.ensure_corpus() / "data"
@@ -182,6 +186,7 @@ class AppWorldEnv(Env):
             report=self._report,
             blocks=self._blocks,
             corpus=adapter.corpus_digest(self._original.parent),
+            runtime=container.image_identity(container.image_name()),
         )
         super().__init__(horizon=self._blocks + 1, num_tasks=len(self._task_ids))
 
@@ -429,39 +434,40 @@ class AppWorldEnv(Env):
         backlog = await asyncio.to_thread(self._backlog, session.task_id, specs)
         key = draw_key(leg_of(session.task_id), self._pulse)
 
-<<<<<<< HEAD
         # Off the event loop. Each of these blocks on another process, one of them the world's
         # own evaluator, and a coroutine that never yields would stop every other episode this
         # serving process is running and would make the serve layer's deadline unable to fire on
         # this one.
         #
-        # **Nothing here asks the world anything.** The world's process is the process that runs
-        # agent-authored code, so a reply from it saying that it had stopped, or flushed, or that
-        # a value was such-and-such, is a reply the episode could have written. There is no seal
-        # command, no quiesce command and no read command any more. The host stops the worker's
-        # process and waits for it, then grades what is on disk.
-        #
-        # **What is on disk is the world at the end of the last block, because upstream puts it
-        # there.** `AppWorld.execute` ends with its own save into the episode's output tree and
-        # `initialize` writes one before any block runs, so an episode that ran N blocks is graded
-        # on the state after block N, and an episode that ran none is graded on its opening state.
-        # Work an agent's thread does after its last block is lost rather than scored, which is
-        # the same rule the block budget states.
-        #
-        await asyncio.to_thread(session.worker.close)
-        # A tree of regular files, or no grade. See `adapter.snapshot_outputs`: the grading
-        # process is pointed at the root that holds the answers, so a link left under the output
-        # tree would resolve there.
-        snapshot = await asyncio.to_thread(
-            adapter.snapshot_outputs,
-            Path(session.experiment),
-            into=Path(session.experiment + ".graded"),
-        )
+        # **The order is the invariant, not the tidiness.** `seal` flushes the end state into the
+        # episode's output tree and reads nothing off the live world. The container is then
+        # removed, which ends every process inside it, and only then is the tree opened: by the
+        # grading container, which reads the filing, digests the databases and runs the base
+        # task's checks off one state that nothing can still be writing to. Reading the filing on
+        # a live world was the defect: whatever an earlier `execute` had started was still running
+        # while it was observed, so the values scored and the bytes graded were two observations
+        # that happened to agree rather than one state.
+        # Stop what the episode started before the flush, so what is written is one instant of
+        # it. Removing the container ends everything either way, but a subprocess still writing
+        # while the state is being saved leaves a file that is half of one moment and half of
+        # another, and no later check would see that.
+        try:
+            await asyncio.to_thread(session.worker.call, "quiesce")
+        except Exception:
+            # A worker too wedged to answer is about to have its container removed, which is what
+            # actually stops it; a failure to stop politely must not cost the episode its grade.
+            pass
+        sealed = await asyncio.to_thread(session.worker.call, "seal")
+        # Confirmed, and the episode fails if it is not. A removal the daemon did not confirm is a
+        # container that may still be writing to the tree about to be graded, and a grade taken
+        # over that is a number with no claim behind it. Raising here reaches the serve layer as a
+        # finalize error, which is the design's own rule for an episode that cannot be scored.
+        await asyncio.to_thread(session.worker.close, confirm=True)
         graded = await asyncio.to_thread(
             adapter.grade,
-            root=self._graded.parent,
+            graded=self._graded.parent,
             task_id=session.task_id,
-            outputs=snapshot,
+            outputs=session.outputs,
             ignore=world.ADDED_MODELS,
             filing={
                 "supervisor_email": session.supervisor_email,
@@ -474,50 +480,8 @@ class AppWorldEnv(Env):
         read = {
             "filing": graded["filing"],
             "world_digest": graded["world_digest"],
-            "rng_digest": graded["rng_digest"],
+            "rng_digest": sealed["rng_digest"],
         }
-=======
-        # Off the event loop. Both of these are blocking HTTP calls into another process, one of
-        # which runs the world's own evaluator, and a coroutine that never yields would stop every
-        # other episode this serving process is running and would make the serve layer's deadline
-        # unable to fire on this one.
-        # Stop what the episode started before reading it. Sealing closed the tool surface and
-        # did not stop work an earlier call left running, so without this the filing and the
-        # snapshot beneath it can come from different moments and the evaluator scores a state no
-        # instant of the episode ever had.
-        try:
-            await asyncio.to_thread(session.worker.call, "quiesce")
-        except Exception:
-            # A worker too wedged to answer is about to be signalled anyway; the close below owns
-            # that, and a failure to quiesce politely must not cost the episode its grade.
-            pass
-        read = await asyncio.to_thread(
-            session.worker.call,
-            "read",
-            supervisor_email=session.supervisor_email,
-            project=world.PROJECT_NAME,
-            title=world.LOG_TITLE,
-            label=world.LOG_LABEL,
-        )
-        # The world is stopped before it is graded, and that ordering is the point rather than
-        # tidiness. `read` flushes the end state to the episode's output directory, which is the
-        # one directory the world's container may write and the one the grading container reads.
-        # A world still running while that happens is agent-authored code with a live handle on
-        # the bytes it is about to be scored on: a thread left behind by an earlier block could
-        # rewrite the flushed state after the flush and before the grader opened it. Removing the
-        # container ends every process inside it, so the state the grader reads is the state the
-        # episode ended with. Idempotent, so teardown's own close is still free to run.
-        await asyncio.to_thread(session.worker.close)
-        checks = (
-            await asyncio.to_thread(
-                adapter.grade,
-                graded=self._graded.parent,
-                task_id=session.task_id,
-                outputs=session.outputs,
-                ignore=world.ADDED_MODELS,
-            )
-        )["checks"]
->>>>>>> f4000d8 (appworld: run the episode worker in a container, over stdio rather than a port)
         filing = world.Filing(**{**read["filing"], "lines": tuple(read["filing"]["lines"])})
         verdicts = score(
             backlog=backlog,
@@ -613,8 +577,16 @@ class AppWorldEnv(Env):
         # until it matched and then compute every later key. Inference level is exactly that
         # contract: the record keeps it, and no feedback policy can reveal it, including the one
         # that reveals everything else.
+        # On the row's own step, which is the last one the trajectory recorded. A fixed zero was
+        # rejected by the trace store on any terminal row past the first step, and the store's
+        # refusal was swallowed as degraded persistence: the trace then held no terminal row at
+        # all, and a later read of it reported an episode that never ended.
         fb.inference.append(
-            InferenceFeedback(name="config_digest", value=self._config_digest, step=0)
+            InferenceFeedback(
+                name="config_digest",
+                value=self._config_digest,
+                step=trajectory[-1].index if len(trajectory) else 0,
+            )
         )
         return fb
 
@@ -649,34 +621,26 @@ def _static_instructions() -> str:
 #: without changing any of its inputs: the scorer's rules, the payload's layout, the seeded
 #: backlog's shape. It is in the run fingerprint so that "the same pulse" is not mistaken for
 #: "the same measurement" across such a change.
-SCORING_VERSION = 2
+#:
+#: 3 is the move from a worker process on the host to a worker container, which changed where the
+#: filing and the world's digest are read from as well as what the world runs in.
+SCORING_VERSION = 3
 
 
 def run_fingerprint(
-    *, pulse: int, report: str, blocks: int, corpus: str = "", runtime: Optional[str] = None
+    *, pulse: int, report: str, blocks: int, corpus: str = "", runtime: str = ""
 ) -> str:
     """Everything two runs must agree on for their rows to be one measurement.
 
     The draw and the payload class decide what a score *means*; the block budget decides what an
-<<<<<<< HEAD
-    episode had the chance to do; the corpus, the realized interpreter and the derivation decide
-    what world it happened in; the generator's constants decide what was seeded into it; the
-    instructions, the tool guide and the appended paragraph are what the agent was asked to do;
-    every constant a payload is generated from decides what it was told afterwards; and
-    :data:`SCORING_VERSION` decides how it was read.
-
-    **What is not here, and whose it is.** A stream's ``deadline`` decides whether a slow episode
-    is scored and its ``max_in_flight`` decides the tool surface and the scheduling, so both
-    belong to a run's identity. Neither is an env's to know: an env is handed a task and is not
-    told which stream is serving it. They are carried in the stream's own persisted identity on
-    shojin-lab/shogym#140 rather than guessed at from here. ``corpus`` is what the corpus actually
-=======
     episode had the chance to do; the corpus and the interpreter decide what world it happened in;
     and :data:`SCORING_VERSION` decides how it was read. ``corpus`` is what the corpus actually
->>>>>>> f4000d8 (appworld: run the episode worker in a container, over stdio rather than a port)
     holds rather than what the pin says it should (see :func:`~adapter.corpus_digest`), because
     the root is whatever the environment points at and a repointed one would otherwise pass for
-    the pinned one. A provenance directory reopened under a
+    the pinned one. ``runtime`` is the image the world actually ran in, as the daemon has it,
+    because the tag is a digest over this repository's inputs and says nothing about a base image
+    re-pushed under its pin, a transitive version that resolved differently on the day, or the
+    same tag built on another platform. A provenance directory reopened under a
     different one of those takes incomparable rows, and none of them is visible anywhere else in a
     run's record.
 
@@ -699,42 +663,10 @@ def run_fingerprint(
             adapter.DATA_VERSION,
             adapter.DATA_BUNDLE_SHA256,
             corpus,
+            runtime,
             adapter.UPSTREAM_VERSION,
-            adapter.UPSTREAM_SHA,
-            # The runtime pin: the release, the commit it is recorded against, the interpreter
-            # series and the platform. It is the interpreter and not this process that writes a
-            # task's database file, so what the worker runs under belongs in the fingerprint. What
-            # a pin cannot say is what the resolver actually installed under it, which is the
-            # container's to name (shojin-lab/shogym#140). Passed in by an env that has already
-            # read it; computed here for a caller that has not.
-            runtime if runtime is not None else adapter.runtime_digest(),
             adapter.MANIFEST.read_text(),
             payload.PASS_COUNTS_FILE.read_text(),
-<<<<<<< HEAD
-            # Every constant a published payload is generated from, and this one was missing.
-            # `DRAWN_BASIS` seeds the drawn arm's whole visible vector: changing it re-rolls
-            # every drawn payload, which is a change to the treatment an agent is under, and a
-            # record could resume across it under an unchanged identity.
-            payload.DRAWN_BASIS,
-            # The text the agent is actually given. These are authored treatment, not scenery: an
-            # edit to the guide or to the appended chore changes what every episode was asked to
-            # do, and the digest said nothing about it.
-            _WORLD_GUIDE,
-            _TOOL_GUIDE,
-            world.APPENDED_PARAGRAPH,
-            # What decides the seeded backlog. It already names the derived cache, so changing it
-            # served a different world under a fingerprint that had not moved.
-            #
-            # This module's own bytes are inside it, and that is not incidental. `_backlog_seed`
-            # below decides the backlog written into a derived task and `_world_seed` decides the
-            # generator the live episode runs from, and both were outside a digest that hashed
-            # three named files elsewhere in the port: an implementation change to either reused a
-            # world and claimed the generator before it. The digest is now the import closure of
-            # the modules that generate a world, and this is one of them (see
-            # `adapter._generator_sources`).
-            adapter._generator_digest(),
-=======
->>>>>>> f4000d8 (appworld: run the episode worker in a container, over stdio rather than a port)
         ]
     )
     return hashlib.sha256(material.encode()).hexdigest()[:16]

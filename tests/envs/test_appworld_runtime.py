@@ -351,6 +351,12 @@ def test_the_run_fingerprint_covers_everything_that_changes_what_a_score_means()
     assert base != run_fingerprint(pulse=1, report="graded", blocks=60)
     assert base != run_fingerprint(pulse=0, report="drawn", blocks=60)
     assert base != run_fingerprint(pulse=0, report="graded", blocks=61)
+    assert base != run_fingerprint(pulse=0, report="graded", blocks=60, corpus="other")
+    # And the image the world ran in. The tag is a digest over this repository's inputs, so it
+    # does not move when a re-pushed base changes under its pin, when a transitive version
+    # resolves differently on the day, or when the same tag was built on another platform. Two
+    # runs whose rows are one measurement have to agree on the interpreter their worlds ran under.
+    assert base != run_fingerprint(pulse=0, report="graded", blocks=60, runtime="sha256:other")
     assert len(base) == 16
     assert base != run_fingerprint(pulse=0, report="graded", blocks=60, corpus="a different one")
     # And it moves when the way a score is read moves, which no input of the run would show.

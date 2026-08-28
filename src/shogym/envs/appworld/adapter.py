@@ -208,8 +208,11 @@ def _fetch_corpus(root: Path) -> None:
     business and upstream is not installed on this machine. What this function owns is the check in
     front of it. The image is built by the caller, outside this function's lock (see
     :func:`ensure_corpus`)."""
-    staging = root.with_name(root.name + ".building")
-    shutil.rmtree(staging, ignore_errors=True)
+    # Named for the process that owns it rather than fixed, and never cleared before use. A fixed
+    # name is a directory two cold starts both believe is theirs, and `_locked` is documented to
+    # yield without exclusion on a filesystem that cannot `flock`, so "the lock stops that" is not
+    # a thing this can assume. See the deferred note in the pull request.
+    staging = root.with_name(f"{root.name}.{os.getpid()}.{secrets.token_hex(4)}.building")
     staging.mkdir(parents=True)
     bundle = staging / Path(DATA_BUNDLE_URL).name
     with urllib.request.urlopen(DATA_BUNDLE_URL, timeout=_DOWNLOAD_TIMEOUT_SECONDS) as response:
@@ -221,7 +224,13 @@ def _fetch_corpus(root: Path) -> None:
         raise ProvisioningError(
             f"the bundle at {DATA_BUNDLE_URL} unpacked without a data/tasks tree"
         )
-    os.replace(staging, root)
+    try:
+        os.replace(staging, root)
+    except OSError:
+        # Somebody else published first, which is the only way this fails after the checks above.
+        shutil.rmtree(staging, ignore_errors=True)
+        if not (root / "data" / "tasks").is_dir():
+            raise
 
 
 def _unpack_in_container(staging: Path, bundle_name: str) -> None:
@@ -759,6 +768,12 @@ class Worker:
     frames: "_Frames"
     lock: threading.Lock = field(default_factory=threading.Lock)
     closed: bool = False
+    #: Set by the first call that stopped waiting for an answer. A worker whose protocol has an
+    #: outstanding command is a worker whose next answer belongs to a caller that is gone, so it
+    #: is never used again; the field holds the reason, which is what the refusal says.
+    poisoned: str = ""
+    #: The identifier of the next command. Monotonic within a worker, and echoed on the answer.
+    counter: int = 0
 
     @classmethod
     def spawn(cls, root: Path, *, task_id: str, outputs: Path) -> "Worker":
@@ -793,44 +808,76 @@ class Worker:
         return cls(root=root, process=process, container=name, frames=frames)
 
     def call(self, command: str, **body: Any) -> Any:
-        """Send one command and return what the world answered.
+        """Send one command and return the answer to *that* command.
 
         Under a lock, because the frames on one pipe are one sequence: two callers interleaving
-        writes would produce a frame neither of them sent."""
+        writes would produce a frame neither of them sent.
+
+        **Every frame carries an identifier and the answer echoes it.** The transport before this
+        was HTTP, where a response belonged to its own request by construction. An ordered pipe
+        has no such property: a command that timed out is a command still running, and its answer
+        arrives later, into a stream the next caller is reading. Without an identifier that answer
+        is read as the next command's, which is an earlier block's output returned under a later
+        step, or a finalizer handed the wrong shape entirely. So an answer whose identifier is not
+        the one this call sent is discarded and the wait continues.
+
+        **And a call that stopped waiting poisons the worker.** Discarding a stale answer keeps
+        one call honest; it does not make the world safe to keep using, because the command that
+        timed out is still running inside it and may still be changing the world. There is no
+        state in which a timed-out worker is worth reusing, so it is refused."""
         with self.lock:
+            if self.poisoned:
+                raise WorkerError(
+                    f"the appworld worker is not usable and {command!r} was refused: "
+                    f"{self.poisoned}"
+                )
+            self.counter += 1
+            identifier = self.counter
+            deadline = time.monotonic() + _CALL_TIMEOUT_SECONDS
             try:
-                _send(self.process, {"command": command, "body": body})
-                answer = self.frames.frame(_CALL_TIMEOUT_SECONDS)
+                _send(self.process, {"id": identifier, "command": command, "body": body})
+                while True:
+                    answer = self.frames.frame(max(0.0, deadline - time.monotonic()))
+                    if answer.get("id") == identifier:
+                        break
+                    # An answer to a command nobody is waiting for. Only reachable when a worker
+                    # was reused after a timeout, which it is not; kept because reading a frame
+                    # and hoping is exactly the failure this is here to prevent.
             except (BrokenPipeError, EOFError) as exc:
-                raise WorkerError(
-                    f"the appworld worker container stopped during {command!r}: {exc}"
-                ) from exc
+                self.poisoned = f"the container stopped during {command!r}: {exc}"
+                raise WorkerError(f"the appworld worker container {self.poisoned}") from exc
             except TimeoutError as exc:
-                raise WorkerError(
-                    f"the appworld worker did not answer {command!r} within "
-                    f"{_CALL_TIMEOUT_SECONDS:.0f}s"
-                ) from exc
+                self.poisoned = (
+                    f"{command!r} did not answer within {_CALL_TIMEOUT_SECONDS:.0f}s and is "
+                    "still running, so no later answer on this pipe can be trusted"
+                )
+                raise WorkerError(f"the appworld worker: {self.poisoned}") from exc
         if "error" in answer:
             raise WorkerError(f"appworld worker refused {command!r}: {answer['error']}")
         return answer["output"]
 
-    def close(self) -> None:
+    def close(self, *, confirm: bool = False) -> None:
         """Stop the worker, promptly and with a bound.
 
         The container is removed first and by name. Closing the pipe would be the polite way and
         is not the reliable one: a world wedged in a native call never reads its stdin again, and
         the ``docker run`` client does not stop a container by dying. What ``--rm`` and the pipe
         do cover is the case this cannot: a parent that crashes leaves a worker reading
-        end-of-file, which stops it.
+        end-of-file, which stops it, and :func:`~shogym.envs.appworld.container.reap` covers the
+        parent that crashes while the worker cannot get back to that read.
 
         Idempotent, because it is called twice on the ordinary path: finalization stops the world
         before the grader reads its end state, and teardown then closes the session it was in.
-        A second removal would be a wasted round trip to the daemon and a second wait on a process
-        that has already been reaped."""
+
+        ``confirm`` is finalization's, and it is the difference between a removal and a fact.
+        Finalization removes this container precisely so that nothing can write to the tree it is
+        about to grade; a removal the daemon did not confirm leaves that invariant unproven, so it
+        raises rather than proceeding, and the worker is *not* marked closed, so teardown will
+        try again."""
         if self.closed:
             return
+        container.remove(self.container, confirm=confirm)
         self.closed = True
-        container.remove(self.container)
         if self.process.poll() is None:
             self.process.terminate()
             try:
@@ -1022,6 +1069,7 @@ def grade(
     task_id: str,
     outputs: Path,
     ignore: Sequence[str],
+    filing: Dict[str, str],
     timeout: float = _GRADE_TIMEOUT_SECONDS,
 ) -> Any:
     """The base task's own checks, from a container that has never run a line the agent wrote.
@@ -1031,6 +1079,12 @@ def grade(
     off the episode's own output directory, so the answers are never objects in the process the
     agent's code ran as and never files on a filesystem that process could see.
 
+    It also reads the filing and digests the databases, off that same tree and in that same
+    process, which is what makes the scored state and the graded state one state rather than two
+    observations of a live world that happened to agree. ``filing`` names what to look for: the
+    supervisor whose account holds it, the project, the row's title and the label. None of it is
+    an answer; it is the address of the row the appended paragraph asked for.
+
     ``graded`` is the grader's root, the parent of ``data``."""
     return _one_shot(
         role="grade",
@@ -1039,6 +1093,7 @@ def grade(
             "task_id": task_id,
             "experiment": OUTPUTS_MOUNT,
             "ignore": list(ignore),
+            **filing,
         },
         mounts=graded_mounts(graded=graded, task_id=task_id, outputs=outputs),
         environment=_worker_environment(GRADED_MOUNT),
