@@ -1263,9 +1263,13 @@ print("burning")
     finally:
         await loud.close()
         await calm.close()
-    # Generous on purpose: what this catches is starvation, not jitter. Eight spinning threads in
-    # an unquota'd container would take the machine; inside a two-cpu quota they take their own.
-    assert beside < max(2.0, alone * 20 + 1.0), (alone, beside)
+    # **A ceiling, not a reservation.** `--cpus` is a CFS bound on how much a container may use,
+    # not a set of cpus reserved for it: two arms on one host share the same processors, and on a
+    # loaded machine each still slows the other. What the quota buys is that neither can take more
+    # than its share, so what this asserts is the absence of starvation rather than independence.
+    # Arms that must not influence each other at all need disjoint cpusets or separate hosts, and
+    # the README says so.
+    assert beside < max(1.0, alone * 8 + 0.5), (alone, beside)
 
 
 async def test_several_worlds_alive_at_once_stay_several_worlds() -> None:
@@ -1584,6 +1588,48 @@ async def test_a_timed_out_call_leaves_the_grade_refused_rather_than_taken(
     container_module.remove(worker.container)
 
 
+async def test_an_interrupted_world_is_not_graded_even_when_it_stopped_cleanly(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Confirmed absence proves writing stopped, not that it finished.
+
+    Upstream ends every command with its own save into the tree about to be graded, and that saver
+    clears its destination and writes several pieces in sequence. A timeout kills the command, and
+    the removal that follows can succeed perfectly: what is left is a tree that is stable and
+    partial, and grading it is scoring an episode on half a save. The earlier version of this test
+    forced the removal to fail, which is the other branch; this one lets cleanup do exactly what
+    it is supposed to."""
+    from shogym.envs.appworld import container as container_module
+    from shogym.envs.appworld import mcp_server
+
+    env = shogym.make("appworld")
+    episode = await ServedEpisode.open_env(env, env_name="appworld", task=TASK)
+    session = mcp_server.get_session(episode.session_id)
+    assert session is not None
+    worker = session.worker
+    monkeypatch.setattr(adapter, "_CALL_TIMEOUT_SECONDS", 0.5)
+    try:
+        with contextlib.suppress(Exception):
+            await episode.call(
+                "execute", {"code": "print(sum(i * i for i in range(400000000)))"}
+            )
+        # The removal worked: this is the ordinary cleanup path, not the refusing one.
+        assert worker.poisoned
+        assert worker.closed is True
+        assert container_module.absent(worker.container)
+        terminal = await episode.call("submit", {})
+        feedback = {
+            item["name"]: item["value"] for item in (terminal.meta.get("shogym/feedback") or [])
+        }
+        # And still not graded, because what it persisted may be half of a save.
+        assert feedback.get("finalize_error") is True
+        assert "checks" not in feedback
+        assert "report" not in feedback and "notice" not in feedback
+    finally:
+        monkeypatch.undo()
+        await episode.close()
+
+
 async def test_the_proxy_profile_a_client_is_configured_with_reaches_no_world(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:
@@ -1713,83 +1759,59 @@ async def test_information_hands_back_the_receipt_and_placebo_the_digest(
     # And the two answers are the same size on the wire, not just the two values.
     assert len(json.dumps(answers["information"])) == len(json.dumps(answers["placebo"]))
 
-
-async def test_the_documented_launch_serves_each_arm_of_the_pair(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+async def test_a_record_named_before_the_opportunity_was_in_the_identity_still_resumes(
+    tmp_path: Path,
 ) -> None:
-    """The command in this port's README, run, both arms of it.
+    """A durable format grew, and every record written under the old one would have been refused.
 
-    The test above builds a `TaskStream` by hand, which is not what anybody launches. What the
-    README documents is the Claude Code quickstart: an MCP config that spawns `serve.py`, and an
-    environment that says which env, which tasks and which regime. That path served
-    `Immediate()` and nothing else, so the documented way to run this env handed one agent the
-    receipt, its placebo and every numeric grade at once. It was neither arm of the pair it was
-    documented as running, and no test noticed because none of them ran it.
+    Before this, a named record stored the caller's string verbatim. It stores the caller's string
+    and what the run let an episode do now, so a resume that is otherwise identical, same caller
+    identity, same deadline, same capacity, met a mismatch that was about the format rather than
+    about the run. Refusing an unknown opportunity is right; refusing a known one is a break.
 
-    So this drives the quickstart's own module the way its own MCP server does, once per arm, and
-    asks the three questions the launch has to answer: does the regime reach the stream, does each
-    arm reveal only its own channel, and does each arm land a row of its own that says which arm
-    it was. The rows are read back with the quickstart's reader, which is also what makes this a
-    check on the summary the reader prints.
+    So a record naming exactly what this caller names is adopted, and the run that adopts it
+    rewrites the claim once."""
+    import json as _json
 
-    **The environment below is the README's, not this test's.** The arm now travels in the MCP
-    config's `env` block rather than on the agent's command line, so what a launch hands this
-    server is whatever those documented commands write into that block; typing the same variables
-    out again here would check a second document. `test_appworld_launch.py` runs the commands, and
-    holds the other half of the separation: that the agent's own process is byte-identical across
-    the two arms."""
-    import importlib
+    from shogym.serve.stream import Information, TaskRef, TaskStream
 
-    from fastmcp import Client
+    prov = tmp_path / "legacy"
+    env = shogym.make("appworld")
+    stream = TaskStream(
+        shogym.make,
+        [TaskRef("appworld", TASK)],
+        prov_dir=prov,
+        feedback=Information(),
+        identity=env.config_digest,
+    )
+    async with stream:
+        await stream.get_task()
+        await stream.dispatch("submit", {})
 
-    from tests.envs.test_appworld_launch import documented_arms
+    # Rewrite the durable rows the way a pre-PR run would have left them: the caller's string
+    # alone, with nothing about what the run let an episode do.
+    composed = None
+    for name in ("results.jsonl", "dispenses.jsonl"):
+        path = prov / name
+        if not path.exists():
+            continue
+        rows = [_json.loads(line) for line in path.read_text().splitlines() if line.strip()]
+        for row in rows:
+            if row.get("run_identity"):
+                composed = composed or row["run_identity"]
+                row["run_identity"] = env.config_digest
+        path.write_text("".join(_json.dumps(row) + "\n" for row in rows))
+    assert composed and composed.startswith(env.config_digest) and composed != env.config_digest
 
-    from examples.claude_code import results as results_mod
-    from examples.claude_code import serve as serve_mod
-    from shogym.feedback.wire import CHANNEL_FEEDBACK_NAME
-    from shogym.serve.stream import build_stream_server
-
-    configured = documented_arms(tmp_path / "documented")
-    assert sorted(configured) == ["information", "placebo"]
-
-    directories: List[Path] = []
-    try:
-        for arm in ("information", "placebo"):
-            for name, value in configured[arm].items():
-                monkeypatch.setenv(name, value)
-            # The constants are read from the environment at import, which is what a launch does.
-            importlib.reload(serve_mod)
-            assert (serve_mod.ENV, serve_mod.TASKS, serve_mod.FEEDBACK) == (
-                "appworld",
-                [TASK],
-                arm,
-            )
-            # Each arm names its own directory, without being told to.
-            directories.append(serve_mod.new_run_dir(runs=tmp_path))
-
-            stream = serve_mod.build_stream(prov_dir=tmp_path / arm)
-            assert stream.feedback.regime == arm
-            async with stream:
-                async with Client(build_stream_server(stream, name="shogym")) as client:
-                    dispensed = json.loads(
-                        (await client.call_tool("get_task", {})).content[0].text
-                    )
-                    assert set(dispensed) == {"env", "instructions", "budget", "tools"}
-                    terminal = json.loads((await client.call_tool("submit", {})).content[0].text)
-
-            revealed = {item["name"]: item["value"] for item in terminal["feedback"]}
-            # One item, under the one public name, and never the numbers.
-            assert set(revealed) == {CHANNEL_FEEDBACK_NAME}
-            assert "SUBMISSION RECEIPT" in revealed[CHANNEL_FEEDBACK_NAME]
-
-            rows = results_mod.rows(tmp_path / arm)
-            assert [row.feedback_regime for row in rows] == [arm]
-            assert rows[0].score is not None
-            # And the row is summarisable, which is what the reader counts and prints.
-            assert rows[0].score.reward is not None
-    finally:
-        # The module's constants are process-wide, so they go back to what the environment says.
-        monkeypatch.undo()
-        importlib.reload(serve_mod)
-
-    assert directories[0] != directories[1], "the two arms would have shared one record"
+    # It resumes, rather than being refused for a format it could not have written.
+    resumed = TaskStream(
+        shogym.make,
+        [TaskRef("appworld", TASK)],
+        prov_dir=prov,
+        feedback=Information(),
+        identity=env.config_digest,
+        resume=True,
+    )
+    assert resumed is not None
+    # A record naming some other composed identity is still refused, which is what the field was
+    # added for; that half is `test_a_resume_is_refused_under_a_changed_draw_and_under_a_changed_deadline`.

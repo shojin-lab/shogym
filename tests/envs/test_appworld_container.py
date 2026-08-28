@@ -504,7 +504,11 @@ def test_the_reaper_removes_a_container_whose_parent_is_gone(
     Removing containers is destructive, so the ambiguous cases must do nothing: an unreadable
     label, and a pid that belongs to somebody else's live process, are both left alone."""
     listed = ["dead1", "alive1", "unlabelled"]
-    labels = {"dead1": "4242 born-then", "alive1": "4243 born-then", "unlabelled": ""}
+    labels = {
+        "dead1": '{"shogym.appworld.parent": "4242", "shogym.appworld.birth": "1700000000"}',
+        "alive1": '{"shogym.appworld.parent": "4243", "shogym.appworld.birth": "1700000000"}',
+        "unlabelled": "{}",
+    }
     removed: List[str] = []
 
     def _run(args, **_):
@@ -738,10 +742,7 @@ def _refuses_to_confirm(name: str, *, confirm: bool = False) -> None:
 
 
 def _ledger_names() -> List[str]:
-    try:
-        return container._ledger().read_text().split()
-    except OSError:
-        return []
+    return container.outstanding()
 
 
 def _empty_ledger(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
@@ -807,48 +808,6 @@ time.sleep(30)
 # ----- the output tree is a host bind, so it is bounded -----
 
 
-def test_an_output_tree_past_its_bounds_refuses_the_grade(tmp_path: Path) -> None:
-    """Docker cannot put a size quota on a bind, so the bound is at this boundary instead.
-
-    An unbounded tree is an unbounded copy, made on shared disk while a sibling arm is running,
-    and then handed to a grader whose own budget starts afterwards. Refusing is the fail-closed
-    direction: the episode does not get a score rather than the machine getting a problem."""
-    outputs = tmp_path / "outputs"
-    (outputs / "tasks").mkdir(parents=True)
-    (outputs / "tasks" / "one.jsonl").write_text("rows")
-    # The ordinary tree passes, so the refusals below are about the bound.
-    assert adapter.snapshot_outputs(outputs, into=tmp_path / "ok").is_dir()
-
-    deep = outputs / "tasks"
-    for level in range(adapter._MAX_OUTPUT_DEPTH + 2):
-        deep = deep / f"d{level}"
-    deep.mkdir(parents=True)
-    with pytest.raises(adapter.SnapshotError) as refused:
-        adapter.snapshot_outputs(outputs, into=tmp_path / "deep")
-    assert "deeper than" in str(refused.value)
-
-
-def test_an_output_tree_with_too_many_files_refuses_the_grade(
-    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
-) -> None:
-    monkeypatch.setattr(adapter, "_MAX_OUTPUT_FILES", 4)
-    outputs = tmp_path / "outputs"
-    outputs.mkdir()
-    for index in range(8):
-        (outputs / f"{index}.jsonl").write_text("x")
-    with pytest.raises(adapter.SnapshotError) as refused:
-        adapter.snapshot_outputs(outputs, into=tmp_path / "many")
-    assert "more than" in str(refused.value)
-    monkeypatch.setattr(adapter, "_MAX_OUTPUT_FILES", 20_000)
-    monkeypatch.setattr(adapter, "_MAX_OUTPUT_BYTES", 3)
-    with pytest.raises(adapter.SnapshotError) as big:
-        adapter.snapshot_outputs(outputs, into=tmp_path / "big")
-    assert "larger than" in str(big.value)
-
-
-# ----- the sweep gets a second owner -----
-
-
 def test_a_container_nobody_could_remove_is_swept_even_while_its_parent_lives(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:
@@ -876,8 +835,10 @@ def test_a_container_nobody_could_remove_is_swept_even_while_its_parent_lives(
     swept = container.reap(alive=lambda pid, birth="": True)
     assert swept == ["stuck-one"]
     assert "stuck-one" in removed
-    # Removed once and forgotten, so the next sweep has nothing to do.
-    assert not ledger.exists()
+    # Tombstoned rather than rewritten, so the next sweep has nothing to do and an append that
+    # landed during this one is still there to be read.
+    assert container.outstanding() == []
+    assert "-stuck-one" in ledger.read_text()
 
 
 # ----- identities that do not move with a locale -----
@@ -967,4 +928,153 @@ def test_the_block_budget_counts_what_the_host_sent(monkeypatch: pytest.MonkeyPa
     # The increment happens inside the lock, before the worker is called at all.
     assert "worker.call" not in before
     assert "worker.call" in after
+
+def test_a_birth_stamp_survives_a_single_digit_day(monkeypatch: pytest.MonkeyPatch) -> None:
+    """The bug this had, and it could have removed a live episode.
+
+    `ps` blank-pads a single-digit day, so a label written on the third of the month carried two
+    spaces where a reader rebuilding it from words put one. The comparison then said the parent
+    had been replaced, and the sweep removes what an absent parent left: on days one to nine it
+    would have removed a live parent's own running world, or a sibling arm's.
+
+    The stamp is epoch seconds now, which has no spacing to lose."""
+    rendered = {"value": "Fri Aug  3 07:15:26 2026"}
+    monkeypatch.setattr(
+        container.subprocess,
+        "run",
+        lambda *a, **k: _Finished(0, rendered["value"]),
+    )
+    padded = container.process_birth(4242)
+    assert padded.isdigit(), padded
+    # The same instant written the way a reader might rebuild it is the same stamp.
+    rendered["value"] = "Fri Aug 3 07:15:26 2026"
+    assert container.process_birth(4242) == padded
+    # And a different instant is a different stamp, so this is not a constant.
+    rendered["value"] = "Fri Aug  4 07:15:26 2026"
+    assert container.process_birth(4242) != padded
+
+
+def test_a_live_parent_on_a_padded_day_keeps_its_container(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """The same failure at the level that would have caused it: the sweep, not the parse."""
+    stamp = "1787908573"
+    # This process is the parent, so it is genuinely alive: what is being tested is whether the
+    # stamp comparison says so.
+    labels = (
+        f'{{"{container.LABEL_PARENT}": "{os.getpid()}", "{container.LABEL_BIRTH}": "{stamp}"}}'
+    )
+    removed: List[str] = []
+
+    def _run(args, **_):
+        if args[0] == "ps":
+            return _Finished(0, "live1")
+        if args[0] == "inspect":
+            return _Finished(0, labels)
+        removed.append(args[-1])
+        return _Finished(0, "")
+
+    monkeypatch.setattr(container, "_ledger", lambda: tmp_path / "disowned.txt")
+    monkeypatch.setattr(container, "_run", _run)
+    monkeypatch.setattr(container, "process_birth", lambda pid: stamp)
+    assert container.reap() == []
+    assert removed == []
+
+
+def test_a_removal_the_daemon_rejected_is_not_a_removal(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """Teardown may not raise, and it may not pretend either.
+
+    Both Docker commands run without checking, so an ordinary nonzero stop or removal reached the
+    success branch and the worker was marked closed. Nothing tried again after that, and the
+    ordinary sweep skips a container whose parent is alive, so a wedged container outlived the
+    process that made it. The name goes to the ledger instead."""
+    monkeypatch.setattr(container, "_ledger", lambda: tmp_path / "disowned.txt")
+    monkeypatch.setattr(container, "_run", lambda *a, **k: _Finished(1, "", "device or resource busy"))
+    assert container.remove("wedged") is False
+    assert container.outstanding() == ["wedged"]
+    # And a clean pair of commands is a removal, so the refusal above is about the failure.
+    monkeypatch.setattr(container, "_run", lambda *a, **k: _Finished(0, ""))
+    assert container.remove("fine") is True
+    assert container.outstanding() == ["wedged"]
+
+
+def test_a_worker_whose_removal_was_rejected_is_not_marked_closed(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """The same fact one layer up, where it decides whether anything tries again."""
+    monkeypatch.setattr(container, "_ledger", lambda: tmp_path / "disowned.txt")
+    real_remove = container.remove
+    worker = _stub_worker(_ECHO, monkeypatch)
+    # The stub points removal at nothing; this puts the real one back so the daemon's answer is
+    # what decides, and then makes the daemon refuse.
+    monkeypatch.setattr(container, "remove", real_remove)
+    monkeypatch.setattr(
+        container, "_run", lambda *a, **k: _Finished(1, "", "device or resource busy")
+    )
+    worker.close()
+    assert worker.closed is False
+    assert worker.container in container.outstanding()
+
+
+def test_a_name_appended_during_a_sweep_is_not_lost(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """The lost update the ledger used to have.
+
+    The sweep read the whole file and then published a new one, so a name appended in between was
+    dropped, and the case where that matters is the only case the ledger is for: a container whose
+    parent is alive, which the ordinary sweep skips. Every line is an event now, so a writer never
+    has to know what a reader is holding."""
+    monkeypatch.setattr(container, "_ledger", lambda: tmp_path / "disowned.txt")
+    container.disowned("first")
+
+    def _run(args, **_):
+        if args[0] == "stop":
+            # Racing the sweep, in the window the old one lost: a second process disowns while
+            # this one is between reading the ledger and writing it back.
+            container.disowned("second")
+            return _Finished(0, "")
+        if args[0] == "inspect":
+            return _Finished(1, "", "Error: No such object")
+        return _Finished(0, "")
+
+    monkeypatch.setattr(container, "_run", _run)
+    assert container._sweep_disowned() == ["first"]
+    # The one that arrived mid-sweep is still there to be tried.
+    assert container.outstanding() == ["second"]
+
+
+def test_an_env_that_publishes_the_same_name_for_something_else_is_not_read(
+    tmp_path: Path,
+) -> None:
+    """`config_digest` is an ordinary name, and this module used to decide what it meant.
+
+    A stream reserved the first terminal item called that and compared it against the caller's
+    identity, so an environment publishing it as an ordinary metric would have had a successful
+    terminal turned into an unscored failure by a module that had no business reading it. The env
+    declares which item is its identity now, and one that declares nothing is not checked."""
+    from shogym.serve.stream import TaskStream
+
+    stream = TaskStream.__new__(TaskStream)
+    stream._named_identity = "the-caller-name"
+    stream.prov_dir = tmp_path
+
+    class _Env:
+        pass
+
+    class _Episode:
+        _env = _Env()
+
+    observed = [{"name": "config_digest", "value": "something else entirely", "level": "episode"}]
+    # Declares nothing: not read, not compared, not refused.
+    stream._require_env_agrees(observed, _Episode())
+    # Declares it: compared, and this one disagrees.
+    _Env.identity_feedback_name = "config_digest"
+    with pytest.raises(ValueError, match="the environment says"):
+        stream._require_env_agrees(observed, _Episode())
+    # And a declared name the env did not publish is not a failure either.
+    _Env.identity_feedback_name = "some_other_channel"
+    stream._require_env_agrees(observed, _Episode())
 

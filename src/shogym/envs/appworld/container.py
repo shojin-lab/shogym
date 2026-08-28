@@ -27,10 +27,13 @@ edit to either builds a new image rather than reusing one built under the old te
 
 from __future__ import annotations
 
+import calendar
 import hashlib
+import json
 import os
 import re
 import subprocess
+import time
 import uuid
 from dataclasses import dataclass
 from functools import lru_cache
@@ -398,12 +401,15 @@ def absent(container: str) -> bool:
     )
 
 
-def remove(container: str, *, confirm: bool = False) -> None:
+def remove(container: str, *, confirm: bool = False) -> bool:
     """Remove a container and, when asked, refuse to pretend it worked.
 
     ``--rm`` covers the ordinary exit and the case where the parent dies (the worker reads
     end-of-file on its stdin and stops), but a container whose world is wedged in a native call
     ignores that, and one nobody removed is a world holding its mounts open.
+
+    Returns whether the container is known to be gone. Teardown reads that; finalization does
+    not have to, because for it the alternative to certainty is an exception.
 
     **Two callers want two different failure modes, so they get two.** Teardown runs on the crash
     paths and must not raise: for it, a removal that failed is a container the next attempt or the
@@ -414,14 +420,21 @@ def remove(container: str, *, confirm: bool = False) -> None:
     # Stopped first and then removed. `rm -f` alone is a signal followed by the daemon's own
     # timeout, and an explicit stop with no grace period is the shortest path to "no process in
     # there is running", which is the fact grading depends on.
-    _run(
+    stopped = _run(
         ["stop", "--time", str(_STOP_GRACE_SECONDS), container],
         timeout=_CONTROL_TIMEOUT_SECONDS,
         check=False,
     )
-    _run(["rm", "-f", container], timeout=_CONTROL_TIMEOUT_SECONDS, check=False)
+    removed = _run(["rm", "-f", container], timeout=_CONTROL_TIMEOUT_SECONDS, check=False)
     if not confirm:
-        return
+        # **A nonzero status is not a removal.** Teardown may not raise, so what it does instead is
+        # hand the name to the sweep: a container the daemon refused to stop or remove outlives
+        # this process otherwise, because the ordinary sweep skips containers whose parent is still
+        # alive.
+        if stopped.returncode != 0 or removed.returncode != 0:
+            disowned(container)
+            return False
+        return True
     if not absent(container):
         # One retry, because a container in an uninterruptible call can outlive the first.
         _run(["rm", "-f", container], timeout=_CONTROL_TIMEOUT_SECONDS, check=False)
@@ -433,6 +446,7 @@ def remove(container: str, *, confirm: bool = False) -> None:
             f"the container {container} is still there after two removals; the daemon has not "
             "confirmed that it stopped, so nothing may treat what it could write as final"
         )
+    return True
 
 
 def reap(*, alive: Optional[Callable[..., bool]] = None) -> List[str]:
@@ -458,19 +472,20 @@ def reap(*, alive: Optional[Callable[..., bool]] = None) -> List[str]:
     # The ones nobody could remove, whoever is alive. See `disowned`.
     removed: List[str] = _sweep_disowned()
     for identifier in listed.stdout.split():
-        labels = _run(
-            [
-                "inspect",
-                "--format",
-                '{{index .Config.Labels "%s"}} {{index .Config.Labels "%s"}}'
-                % (LABEL_PARENT, LABEL_BIRTH),
-                identifier,
-            ],
+        # Read as structure rather than as words. Two labels printed side by side and split on
+        # whitespace is a value rebuilt rather than read, and a value rebuilt is a value whose
+        # spacing can change, which makes a live parent look like a different process.
+        answered = _run(
+            ["inspect", "--format", "{{json .Config.Labels}}", identifier],
             timeout=_CONTROL_TIMEOUT_SECONDS,
             check=False,
-        ).stdout.split()
-        parent = labels[0] if labels else ""
-        birth = " ".join(labels[1:])
+        )
+        try:
+            labels = json.loads(answered.stdout or "{}") or {}
+        except ValueError:
+            labels = {}
+        parent = str(labels.get(LABEL_PARENT, ""))
+        birth = str(labels.get(LABEL_BIRTH, ""))
         # An unreadable or unparseable label is left alone. This removes containers, so the
         # ambiguous case has to be the one where nothing happens.
         if not parent.isdigit() or running(int(parent), birth):
@@ -487,6 +502,12 @@ def process_birth(pid: int) -> str:
     something running under that number", and the question the reaper is asking is "is the
     process that started this container still running". The start time is what separates them: a
     number that came back with a different birth is a different process wearing the same badge.
+
+    **A number, not a rendering.** ``ps`` blank-pads a single-digit day, so a label written on the
+    third of the month comes back with its spacing changed by anything that rebuilds it from words,
+    and a live parent then reads as a different process: the sweep would remove that parent's
+    running episode, which is the one failure this must never have. What is returned is epoch
+    seconds, which has no spacing to lose and compares exactly.
 
     **Read in a fixed locale and a fixed zone.** `ps` renders this start time for a human, so the
     same live process under `TZ=UTC` and under `America/Los_Angeles` prints two different strings,
@@ -510,7 +531,19 @@ def process_birth(pid: int) -> str:
         )
     except (OSError, subprocess.SubprocessError):
         return ""
-    return finished.stdout.strip() if finished.returncode == 0 else ""
+    if finished.returncode != 0:
+        return ""
+    rendered = " ".join(finished.stdout.split())
+    if not rendered:
+        return ""
+    try:
+        # Normalised first, so the padded day the platform writes and the single space a reader
+        # might rebuild parse to the same instant. The zone is pinned above, so this is UTC.
+        return str(calendar.timegm(time.strptime(rendered, "%a %b %d %H:%M:%S %Y")))
+    except ValueError:
+        # A format this does not know is not a birth this can compare. Unknown is the empty
+        # string, which keeps the sweep on the safe side of its own rule.
+        return ""
 
 
 def _ledger() -> Path:
@@ -529,41 +562,57 @@ def _ledger() -> Path:
 def disowned(container: str) -> None:
     """Record a container this process could not remove, so a sweep will try again.
 
-    Appended rather than rewritten, and failures here are swallowed: this is called from teardown,
-    which may not raise, and a name that could not be written is a container the ordinary reaper
-    still finds once its parent exits."""
+    **Appended and never rewritten.** Reading the whole file and publishing a new one drops a name
+    appended between the read and the write, and the case where that matters is exactly this one: a
+    container whose parent is alive, which the ordinary sweep skips. Every line is an event, ``+``
+    for a name to try and ``-`` for one confirmed gone, and what is live is what the events say
+    rather than what any writer last decided.
+
+    Failures here are swallowed: this is called from teardown, which may not raise, and a name
+    that could not be written is a container the ordinary reaper still finds once its parent
+    exits."""
+    _append(f"+{container}")
+
+
+def _append(line: str) -> None:
     try:
         with open(_ledger(), "a") as handle:
-            handle.write(container + "\n")
+            handle.write(line + "\n")
     except OSError:
         pass
+
+
+def outstanding() -> List[str]:
+    """The names appended and not yet tombstoned, in the order they were first written."""
+    try:
+        lines = _ledger().read_text().splitlines()
+    except OSError:
+        return []
+    live: List[str] = []
+    gone = set()
+    for line in lines:
+        line = line.strip()
+        if line.startswith("-"):
+            gone.add(line[1:])
+        elif line.startswith("+") and line[1:] not in live:
+            live.append(line[1:])
+    return [name for name in live if name not in gone]
 
 
 def _sweep_disowned() -> List[str]:
-    """Remove every container the ledger names, and forget the ones that are gone.
+    """Remove every container the ledger still names, and tombstone the ones that went.
 
-    A name that cannot be removed stays in the ledger for the next sweep; a name that is already
-    absent is dropped. Nothing here consults the parent, because the ledger's whole point is a
-    container whose parent is alive and out of ways to remove it."""
-    ledger = _ledger()
-    try:
-        names = [line.strip() for line in ledger.read_text().splitlines() if line.strip()]
-    except OSError:
-        return []
-    removed, left = [], []
-    for name in dict.fromkeys(names):
+    Nothing here consults the parent, because the ledger's whole point is a container whose parent
+    is alive and out of ways to remove it. A name that cannot be removed is left with no tombstone,
+    so the next sweep tries it again."""
+    removed = []
+    for name in outstanding():
         try:
             remove(name, confirm=True)
-            removed.append(name)
         except DockerError:
-            left.append(name)
-    try:
-        if left:
-            ledger.write_text("\n".join(left) + "\n")
-        else:
-            ledger.unlink(missing_ok=True)
-    except OSError:
-        pass
+            continue
+        _append(f"-{name}")
+        removed.append(name)
     return removed
 
 
@@ -647,6 +696,7 @@ __all__ = [
     "process_birth",
     "reap",
     "disowned",
+    "outstanding",
     "remove",
     "require_docker",
     "run",

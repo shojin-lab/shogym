@@ -507,10 +507,23 @@ clock the snapshot may take, with a tree past any of them refusing the episode r
 copied. An episode can still fill a disk while it runs; bounding that needs a filesystem quota this
 port does not have.
 
+**`--cpus` is a ceiling, not a reservation.** It is a CFS bound on how much a container may use,
+not a set of processors reserved for it, so two arms on one host share the same cpus and on a
+loaded machine each still slows the other. What the quota buys is that neither can take more than
+its share, which is the absence of starvation rather than independence. Arms that must not
+influence each other at all need disjoint cpusets or separate hosts.
+
+**The cache path is part of the surface, so it has to be arm-neutral.** A world can read the
+host-side source of its own mounts, and those are rooted at `SHOGYM_CACHE`. Two arms configured
+with cache roots named for their policy or their draw would therefore be able to read their own
+treatment off a mount table. Run both arms against one cache root, which is the default, or name
+it after nothing.
+
 **A container nobody could remove is written down.** The sweep skips containers whose parent is
 alive, which is right for the ordinary case and wrong for a long-lived process that failed to
 remove one and has no later chance to try. A removal that could not be confirmed records the name
-where the sweep also looks.
+where the sweep also looks, as an append rather than a rewrite: the sweep used to read the whole
+ledger and publish a new one, which dropped a name appended in between.
 
 **The grader is given a snapshot, not the tree the world wrote.** The grading container mounts the
 answers, so a symlink left under the output tree would resolve inside *its* namespace. Every entry

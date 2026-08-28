@@ -39,6 +39,7 @@ from __future__ import annotations
 import asyncio
 import datetime as dt
 import hashlib
+import threading
 import zlib
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, Dict, Optional
@@ -135,6 +136,12 @@ class AppWorldEnv(Env):
     function_name = "agent"
     score_terminal_tool = SUBMIT_TOOL_NAME
 
+    #: The item a runner may compare against the identity it is filing rows under. Declared here
+    #: rather than assumed there: `config_digest` is an ordinary name any env may publish as a
+    #: metric, and a module that decided what it meant would turn another env's successful
+    #: terminal into an unscored failure. An env that declares nothing is not checked.
+    identity_feedback_name = "config_digest"
+
     def __init__(
         self,
         pulse: int = DEFAULT_PULSE,
@@ -162,6 +169,9 @@ class AppWorldEnv(Env):
         # world was wedged inside a command: the worker never gets back to the read that would
         # tell it its parent had gone, so it never exits and `--rm` never fires.
         container.reap()
+        # And the trees teardown declined to walk, plus anything a crash left behind. Nothing is
+        # waiting on this, which is why it is here rather than in teardown.
+        _sweep_leftovers(adapter.episodes_home(), adapter.cache_root() / f"views-{adapter.DATA_VERSION}")
         self._pulse = int(pulse)
         self._report = report
         self._original = adapter.ensure_corpus() / "data"
@@ -195,7 +205,6 @@ class AppWorldEnv(Env):
             report=self._report,
             blocks=self._blocks,
             corpus=self._corpus,
-            runtime=container.image_identity(container.image_name()),
             # What machine an episode was given. Captured once for this process and passed to
             # every launch, so an environment changed mid-run cannot move it and a run relaunched
             # under a changed one does not pass for the earlier measurement.
@@ -474,12 +483,36 @@ class AppWorldEnv(Env):
         # on the state after block N, and an episode that ran none is graded on its opening state.
         # Work an agent's thread does after its last block is lost rather than scored, which is
         # the same rule the block budget states.
+        # **A poisoned worker is not gradeable, however cleanly it was stopped.** A timeout or a
+        # broken frame interrupts a command, and upstream ends every command with its own save
+        # into the tree about to be graded: that saver clears its destination and writes several
+        # pieces in sequence, so a stop in the middle of it leaves a tree that is stable and
+        # partial. Confirmed absence proves that writing has stopped, not that it finished, so the
+        # episode is refused here rather than scored on whatever the interruption left.
+        if session.worker.poisoned:
+            await asyncio.to_thread(session.worker.close, confirm=False)
+            raise RuntimeError(
+                "this episode cannot be scored: its world was interrupted mid-command "
+                f"({session.worker.poisoned}), so what it persisted may be half of a save"
+            )
         await asyncio.to_thread(session.worker.close, confirm=True)
         # A tree of regular files, or no grade. See `adapter.snapshot_outputs`: the grader's
         # namespace holds the answers, so a link left under the output tree would resolve there.
-        snapshot = await asyncio.to_thread(
-            adapter.snapshot_outputs, session.outputs, into=Path(str(session.outputs) + ".graded")
-        )
+        # The copy runs in a thread, and cancelling an `await` does not stop a thread: a
+        # finalization the deadline gave up on would otherwise leave one walking an episode's
+        # tree, holding the file handles and the disk it needs. The flag is what the thread stops
+        # for, checked once per file.
+        abandon = threading.Event()
+        try:
+            snapshot = await asyncio.to_thread(
+                adapter.snapshot_outputs,
+                session.outputs,
+                into=Path(str(session.outputs) + ".graded"),
+                stop=abandon,
+            )
+        except BaseException:
+            abandon.set()
+            raise
         graded = await asyncio.to_thread(
             adapter.grade,
             graded=self._graded.parent,
@@ -624,12 +657,60 @@ class AppWorldEnv(Env):
         return fb
 
 
+#: How many entries teardown will delete before it leaves a tree for the sweep. Teardown runs on
+#: the serve layer's own bounded release, so an unbounded walk over a tree an episode wrote is a
+#: walk that can outlast the bound and be re-entered on the loop.
+_DISCARD_MAX_NODES = 50_000
+
+
 def _discard(*paths: Path) -> None:
-    """Remove what an episode owned, and never raise while doing it."""
+    """Remove what an episode owned, bounded, and never raise while doing it.
+
+    **Bounded, because this runs inside somebody else's deadline.** The serve layer gives a
+    session's release sixty seconds and then abandons the wait, and an unbounded `rmtree` over a
+    tree an episode wrote can outlast that and be entered a second time. So the count is capped:
+    a tree past it is left where it is and swept at the next construction, which is a directory
+    nobody is reading rather than a deletion nobody can bound.
+
+    The snapshot copy is always small, because :func:`adapter.snapshot_outputs` refused anything
+    that was not; the original is the one that can be large, and it is the one this may leave."""
     import shutil
 
     for path in paths:
+        try:
+            nodes = 0
+            for _ in path.rglob("*"):
+                nodes += 1
+                if nodes > _DISCARD_MAX_NODES:
+                    break
+            if nodes > _DISCARD_MAX_NODES:
+                continue
+        except OSError:
+            continue
         shutil.rmtree(path, ignore_errors=True)
+
+
+def _sweep_leftovers(*homes: Path) -> None:
+    """Remove episode trees whose owning process is gone, at construction rather than at teardown.
+
+    What teardown declined to walk lands here, where nothing is waiting on a bound. A tree is
+    somebody's until its process exits, so age is what says it is nobody's: an hour is far longer
+    than an episode and far shorter than a run."""
+    import shutil
+    import time
+
+    cutoff = time.time() - 3600
+    for home in homes:
+        try:
+            entries = sorted(home.iterdir())
+        except OSError:
+            continue
+        for entry in entries:
+            try:
+                if entry.stat().st_mtime < cutoff:
+                    shutil.rmtree(entry, ignore_errors=True)
+            except OSError:
+                continue
 
 
 # ----- pure helpers -----
@@ -673,13 +754,7 @@ SCORING_VERSION = 4
 
 
 def run_fingerprint(
-    *,
-    pulse: int,
-    report: str,
-    blocks: int,
-    corpus: str = "",
-    runtime: str = "",
-    resources: str = "",
+    *, pulse: int, report: str, blocks: int, corpus: str = "", resources: str = ""
 ) -> str:
     """Everything two runs must agree on for their rows to be one measurement.
 
@@ -711,19 +786,37 @@ def run_fingerprint(
             report,
             str(blocks),
             str(SCORING_VERSION),
-            str(adapter.DERIVATION_VERSION),
             adapter.DATA_VERSION,
+            str(adapter.DERIVATION_VERSION),
             adapter.DATA_BUNDLE_SHA256,
             corpus,
-            runtime,
-            resources,
             adapter.UPSTREAM_VERSION,
+            # What the interpreter and its dependency set turned out to be, rather than the one
+            # version that was asked for. The runtime cache is named for the direct AppWorld
+            # release while it is built by resolving that release's ranges against whatever the
+            # host and the index offer on the day, so two runs could sit under one name and one
+            # identity with different worlds underneath them.
+            adapter.runtime_digest(),
             adapter.MANIFEST.read_text(),
             payload.PASS_COUNTS_FILE.read_text(),
-            # The constant every drawn payload is re-rolled by. It is agent-visible treatment
-            # rather than a score, and a run that changed it and kept its identity would resume
-            # into a record whose earlier rows were drawn from something else.
+            # Every constant a published payload is generated from, and this one was missing.
+            # `DRAWN_BASIS` seeds the drawn arm's whole visible vector: changing it re-rolls
+            # every drawn payload, which is a change to the treatment an agent is under, and a
+            # record could resume across it under an unchanged identity.
             payload.DRAWN_BASIS,
+            # The text the agent is actually given. These are authored treatment, not scenery: an
+            # edit to the guide or to the appended chore changes what every episode was asked to
+            # do, and the digest said nothing about it.
+            _WORLD_GUIDE,
+            _TOOL_GUIDE,
+            world.APPENDED_PARAGRAPH,
+            # What decides the seeded backlog. It already names the derived cache, so changing it
+            # served a different world under a fingerprint that had not moved.
+            adapter._generator_digest(),
+            # What machine an episode was given. Captured once for this process and passed to
+            # every launch, so an environment changed mid-run cannot move it and a run relaunched
+            # under a changed one does not pass for the earlier measurement.
+            resources,
         ]
     )
     return hashlib.sha256(material.encode()).hexdigest()[:16]
