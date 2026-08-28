@@ -126,6 +126,36 @@ def _named(stored: Any) -> str:
     return stored["caller"] if isinstance(stored, dict) else stored
 
 
+def _restamp_identity(tmp_path: Path, stored: Any) -> None:
+    """Rewrite every stored record's ``run_identity`` to ``stored``.
+
+    A record that names no identity at all is what a directory written *before* this member
+    existed holds, and no stream produces one any more: every record this module writes now
+    carries the harness facts, whether or not a caller named anything. So the one way to have a
+    genuinely unidentified record to test the migration against is to make one, which is also the
+    only way such a record ever comes into being."""
+    for name in ("results.jsonl", "dispenses.jsonl"):
+        path = tmp_path / "prov" / name
+        if not path.is_file():
+            continue
+        rewritten = []
+        for line in path.read_text().splitlines():
+            if not line.strip():
+                continue
+            record = json.loads(line)
+            record["run_identity"] = stored
+            rewritten.append(json.dumps(record))
+        path.write_text("\n".join(rewritten) + "\n")
+
+
+async def _unidentified_record(tmp_path: Path) -> None:
+    """Serve one task and leave behind the record a pre-identity directory holds."""
+    async with _stream(tmp_path, [0]) as stream:
+        await stream.get_task()
+        await stream.dispatch(SUBMIT_TOOL, {"answer": "4"})
+    _restamp_identity(tmp_path, "")
+
+
 def _episode_level(items: Sequence[Dict[str, Any]]) -> List[Dict[str, Any]]:
     return [dict(item) for item in items if item.get("level") == "episode"]
 
@@ -683,15 +713,22 @@ def test_the_record_type_and_the_wire_agree_about_an_unstamped_row() -> None:
 async def test_the_regime_is_additive_on_the_wire(tmp_path: Path) -> None:
     # Wire compatibility: a `Never` row is still the row an existing reader parses, plus the two
     # members added since. Anything renamed or dropped here breaks a consumer that never asked
-    # for either. `run_identity` is empty for a run whose caller named none, so an existing
-    # reader sees a field it can ignore rather than a value it has to understand.
+    # for either. `run_identity` is a member an existing reader can ignore rather than a value it
+    # has to understand, and it is present even when nobody named anything: what a caller did not
+    # say is blank *inside* the record, because the deadline and the capacity are true of every
+    # run and are the two members a collapsed record used to lose.
     async with _stream(tmp_path, [0]) as stream:
         await stream.get_task()
         await stream.dispatch(SUBMIT_TOOL, {"answer": "4"})
     wire = stream.results[0].to_wire()
     assert set(wire) == _ROW_MEMBERS_BEFORE_THE_REGIME | {"feedback_regime", "run_identity"}
     assert wire["feedback_regime"] == "never"
-    assert wire["run_identity"] == ""
+    assert wire["run_identity"] == {
+        "caller": "",
+        "envs": {},
+        "deadline": None,
+        "max_in_flight": 1,
+    }
     assert _rows(tmp_path) == [wire]
 
 
@@ -808,11 +845,8 @@ async def test_a_record_that_names_no_identity_is_not_silently_adopted(tmp_path:
 
     What compatibility actually owes such a record is being continued *as itself*, which is the
     next test. A named caller has to say it knows what those old rows were."""
-    stream = _stream(tmp_path, [0])
-    async with stream:
-        await stream.get_task()
-        await stream.dispatch(SUBMIT_TOOL, {"answer": "4"})
-    assert [_named(row["run_identity"]) for row in _rows(tmp_path)] == [""]
+    await _unidentified_record(tmp_path)
+    assert [row["run_identity"] for row in _rows(tmp_path)] == [""]
     with pytest.raises(ValueError, match="names no run identity") as refused:
         _stream(tmp_path, [0, 1], resume=True, identity="fingerprint-a")
     # The refusal names both ways out, because either may be the right one.
@@ -826,15 +860,16 @@ async def test_a_record_that_names_no_identity_is_continued_as_itself(tmp_path: 
     """The compatibility that is owed, and the whole of it: a directory recorded before identities
     existed is resumed by a caller that also names none. Nothing about that run changed, and
     nothing about it is being claimed."""
-    stream = _stream(tmp_path, [0])
-    async with stream:
-        await stream.get_task()
-        await stream.dispatch(SUBMIT_TOOL, {"answer": "4"})
+    await _unidentified_record(tmp_path)
     resumed = _stream(tmp_path, [0, 1], resume=True)
     async with resumed:
         await resumed.get_task()
         await resumed.dispatch(SUBMIT_TOOL, {"answer": "6"})
-    assert [_named(row["run_identity"]) for row in _rows(tmp_path)] == ["", ""]
+    # The old row is left exactly as it was, and the new one says what this run was: the
+    # continuation is not asked to pretend it knows less than it does.
+    stored = [row["run_identity"] for row in _rows(tmp_path)]
+    assert stored[0] == ""
+    assert stored[1] == {"caller": "", "envs": {}, "deadline": None, "max_in_flight": 1}
 
 
 async def test_an_adoption_is_recorded_and_the_next_resume_is_ordinary(tmp_path: Path) -> None:
@@ -845,11 +880,8 @@ async def test_an_adoption_is_recorded_and_the_next_resume_is_ordinary(tmp_path:
     then an ordinary resume under the very identity that had adopted those rows was turned away
     by a directory that had already been told the answer. The alternative was to pass the flag
     forever, which suspends the check for configurations nobody ever adopted."""
-    stream = _stream(tmp_path, [0])
-    async with stream:
-        await stream.get_task()
-        await stream.dispatch(SUBMIT_TOOL, {"answer": "4"})
-    assert [_named(row["run_identity"]) for row in _rows(tmp_path)] == [""]
+    await _unidentified_record(tmp_path)
+    assert [row["run_identity"] for row in _rows(tmp_path)] == [""]
 
     adopting = _stream(
         tmp_path, [0, 1], resume=True, identity="fingerprint-a", adopt_unidentified=True
@@ -892,11 +924,8 @@ async def test_unidentified_rows_are_adopted_by_one_identity_and_no_other(
     two runs, which is the whole of what an adoption exists to rule out. Nothing else stood in the
     way here: the adopting run appends no named row, so there is no row for the second caller to
     trip over and the adoption record is the only thing that can refuse it."""
-    stream = _stream(tmp_path, [0])
-    async with stream:
-        await stream.get_task()
-        await stream.dispatch(SUBMIT_TOOL, {"answer": "4"})
-    assert [_named(row["run_identity"]) for row in _rows(tmp_path)] == [""]
+    await _unidentified_record(tmp_path)
+    assert [row["run_identity"] for row in _rows(tmp_path)] == [""]
 
     # The first identity adopts and serves nothing at all.
     async with _stream(
@@ -906,7 +935,7 @@ async def test_unidentified_rows_are_adopted_by_one_identity_and_no_other(
     assert [_named(record["run_identity"]) for record in read_adoptions(tmp_path / "prov")] == [
         "fingerprint-a"
     ]
-    assert [_named(row["run_identity"]) for row in _rows(tmp_path)] == [""]
+    assert [row["run_identity"] for row in _rows(tmp_path)] == [""]
 
     # The second is refused, flag and all, and told whose those rows are.
     with pytest.raises(ValueError, match="already been adopted by caller='fingerprint-a'"):
@@ -917,14 +946,209 @@ async def test_unidentified_rows_are_adopted_by_one_identity_and_no_other(
     assert len(read_adoptions(tmp_path / "prov")) == 1
 
 
+async def test_a_run_that_names_nothing_still_records_what_it_let_an_episode_do(
+    tmp_path: Path,
+) -> None:
+    """The two members that are true of every run, including the one nobody named.
+
+    The wire form used to collapse to the empty string whenever the caller and the envs were both
+    silent, which threw away the deadline and the capacity along with them. A capacity decides
+    whether a task is served with a lease and how episodes are scheduled against each other; a
+    deadline decides whether a slow episode is scored or timed out. So a record made under one
+    pair was resumed under another and scored a second row into it, which is the mixed-opportunity
+    record the identity exists to refuse."""
+    async with _stream(tmp_path, [0], deadline=30.0, max_in_flight=1) as first:
+        await first.get_task()
+        await first.dispatch(SUBMIT_TOOL, {"answer": "4"})
+    assert [row["run_identity"] for row in _rows(tmp_path)] == [
+        {"caller": "", "envs": {}, "deadline": 30.0, "max_in_flight": 1}
+    ]
+
+    with pytest.raises(ValueError, match="deadline: the record says 30.0") as loosened:
+        _stream(tmp_path, [0, 1], resume=True, deadline=None, max_in_flight=1)
+    assert "run identity" in str(loosened.value)
+    with pytest.raises(ValueError, match="max_in_flight: the record says 1"):
+        _stream(tmp_path, [0, 1], resume=True, deadline=30.0, max_in_flight=2)
+    # Nothing was appended by either refusal, and the same opportunity still resumes.
+    assert len(_rows(tmp_path)) == 1
+    async with _stream(tmp_path, [0, 1], resume=True, deadline=30.0, max_in_flight=1) as same:
+        await same.get_task()
+        await same.dispatch(SUBMIT_TOOL, {"answer": "6"})
+    assert len(_rows(tmp_path)) == 2
+
+
+async def test_an_unnamed_run_may_not_continue_a_record_someone_has_adopted(
+    tmp_path: Path,
+) -> None:
+    """The way past the one-time adoption, closed from the other side.
+
+    A blank recorded identity used to be waved through by "blank continued as blank" before the
+    adoption on file was consulted at all. So after a named configuration had taken a directory's
+    unidentified rows on, an unnamed resume appended a *second* blank row beside them, outside the
+    cutoff the adoption recorded, and the next ordinary resume under the adopting identity then
+    read that row as one it had adopted too."""
+    await _unidentified_record(tmp_path)
+    async with _stream(
+        tmp_path, [0, 1], resume=True, identity="fingerprint-a", adopt_unidentified=True
+    ):
+        pass
+    (adoption,) = read_adoptions(tmp_path / "prov")
+    assert adoption["through_seq"] == 1
+
+    with pytest.raises(ValueError, match="already been adopted by caller='fingerprint-a'"):
+        _stream(tmp_path, [0, 1], resume=True)
+    # Nothing was appended, so the adoption's cutoff still covers the whole of what it adopted.
+    assert [row["run_identity"] for row in _rows(tmp_path)] == [""]
+    assert len(read_adoptions(tmp_path / "prov")) == 1
+
+
+async def test_a_rollback_cannot_remove_an_adoption_it_did_not_write(tmp_path: Path) -> None:
+    """A truncation aimed at a log somebody else owns deletes their records.
+
+    The offset an adoption's rollback truncates to used to be measured outside the ownership
+    section its append held, so it named a place another writer could already have moved. In a
+    same-identity takeover the successor committed one adoption line and the displaced
+    constructor's cleanup then reduced the log from one line to zero, leaving the successor's
+    adopted rows unaudited. Both halves of the span are taken inside that section now, and the
+    rollback removes nothing unless this stream still holds the claim and the log is still exactly
+    the length it left it."""
+    await _unidentified_record(tmp_path)
+    adopting = _stream(
+        tmp_path, [0, 1], resume=True, identity="fingerprint-a", adopt_unidentified=True
+    )
+    log = tmp_path / "prov" / "adoptions.jsonl"
+    committed = log.read_bytes()
+    assert len(read_adoptions(tmp_path / "prov")) == 1
+
+    # The directory changes hands. Whatever the displaced stream still holds about where its own
+    # line sat, that line is now part of a record it does not own.
+    successor = _stream(tmp_path, [0, 1], resume=True, identity="fingerprint-a")
+    adopting._undo_adoption()
+    assert log.read_bytes() == committed
+    assert len(read_adoptions(tmp_path / "prov")) == 1
+
+    await successor.aclose()
+    await adopting.aclose()
+
+
+async def test_two_constructors_racing_one_adoption_leave_exactly_one(tmp_path: Path) -> None:
+    """The reviewer's sequence end to end: the losing constructor may not take the winner's line.
+
+    The capture, the append and the possible rollback are one ownership-checked section, so a
+    second constructor cannot read the log between another's capture and its append. Whichever of
+    the two ends up owning the directory, the log holds exactly one committed adoption and it is
+    the one the owner wrote."""
+    await _unidentified_record(tmp_path)
+    captured = threading.Event()
+    release = threading.Event()
+    real_drop = stream_module._drop_uncommitted_tail
+
+    def _slow_drop(path: Path) -> int:
+        committed = real_drop(path)
+        if path.name == "adoptions.jsonl":
+            captured.set()
+            release.wait(10)
+        return committed
+
+    monkeypatch_target = stream_module
+    monkeypatch_target._drop_uncommitted_tail = _slow_drop  # type: ignore[assignment]
+    built: List[Any] = []
+    failed: List[BaseException] = []
+
+    def _first() -> None:
+        try:
+            built.append(
+                _stream(
+                    tmp_path,
+                    [0, 1],
+                    resume=True,
+                    identity="fingerprint-a",
+                    adopt_unidentified=True,
+                )
+            )
+        except BaseException as exc:  # noqa: BLE001 — reported back to the test
+            failed.append(exc)
+
+    thread = threading.Thread(target=_first)
+    thread.start()
+    try:
+        assert captured.wait(10), "the adoption never reached its append"
+        stream_module._drop_uncommitted_tail = real_drop  # type: ignore[assignment]
+        # The second constructor cannot get between the capture and the append: it queues on the
+        # same exclusion, and what it finds when it is let in is a finished adoption.
+        release.set()
+        thread.join(10)
+        second = _stream(
+            tmp_path, [0, 1], resume=True, identity="fingerprint-a", adopt_unidentified=True
+        )
+    finally:
+        stream_module._drop_uncommitted_tail = real_drop  # type: ignore[assignment]
+        release.set()
+        thread.join(10)
+
+    assert not failed
+    assert len(read_adoptions(tmp_path / "prov")) == 1
+    await second.aclose()
+    for stream in built:
+        await stream.aclose()
+
+
+@pytest.mark.parametrize(
+    "stored",
+    [
+        7,
+        [1, 2],
+        {"caller": 7, "envs": {}, "deadline": None, "max_in_flight": 1},
+        {"caller": "", "envs": {ENV_NAME: 7}, "deadline": None, "max_in_flight": 1},
+        {"caller": "", "envs": {}, "deadline": None},
+        {"caller": "", "envs": {}, "deadline": None, "max_in_flight": True},
+    ],
+)
+async def test_a_stored_identity_this_module_did_not_write_is_refused(
+    tmp_path: Path, stored: Any
+) -> None:
+    """Refused, never coerced into something that might match.
+
+    A stored value that was neither a name nor a record used to be rendered with ``repr`` and read
+    back as an ordinary legacy caller, so a stored ``7`` matched a caller really called ``"7"``;
+    the members inside a record were coerced with ``str()`` for the same result one level down.
+    Each member is now required to be the type the writer emits, and a member that is not becomes
+    a value nothing equals, so a record this module did not write is refused by the comparison
+    rather than passed by it."""
+    async with _stream(tmp_path, [0], identity="7") as first:
+        await first.get_task()
+        await first.dispatch(SUBMIT_TOOL, {"answer": "4"})
+    _restamp_identity(tmp_path, stored)
+
+    with pytest.raises(ValueError, match="run identity"):
+        _stream(tmp_path, [0, 1], resume=True, identity="7")
+    # ...and not by a caller that named nothing either, which is the direction a blank member
+    # could otherwise have been read as.
+    with pytest.raises(ValueError, match="run identity"):
+        _stream(tmp_path, [0, 1], resume=True)
+
+
+async def test_an_unreadable_member_does_not_match_another_unreadable_one(
+    tmp_path: Path,
+) -> None:
+    """Two records that both hold junk are not thereby one run.
+
+    The stand-in for an unreadable member used to be the string ``"<unreadable>"``, which is a
+    value a record can hold: two junk members compared equal to each other, and a caller really
+    named ``"<unreadable>"`` matched one."""
+    async with _stream(tmp_path, [0], identity="<unreadable>") as first:
+        await first.get_task()
+        await first.dispatch(SUBMIT_TOOL, {"answer": "4"})
+    _restamp_identity(tmp_path, {"caller": 7, "envs": {}, "deadline": None, "max_in_flight": 1})
+    with pytest.raises(ValueError, match="run identity"):
+        _stream(tmp_path, [0, 1], resume=True, identity="<unreadable>")
+
+
 async def test_a_construction_that_refuses_leaves_the_record_unadopted(tmp_path: Path) -> None:
     """A call that refuses has served nothing and recorded nothing, and it may not be the reason
     a later resume looks reasonable. The adoption is the only write this constructor makes to a
     record, so it is the one mark a refusal could otherwise leave behind."""
-    stream = _stream(tmp_path, [0])
-    async with stream:
-        await stream.get_task()
-        await stream.dispatch(SUBMIT_TOOL, {"answer": "4"})
+    await _unidentified_record(tmp_path)
 
     # A queue the record was not written against, asserted with the migration flag on.
     with pytest.raises(ValueError, match="queue position"):

@@ -669,11 +669,39 @@ RunIdentity = Union[str, Dict[str, Any]]
 #: name with unrelated text around a digest was accepted and stamped on a scored row.
 _IDENTITY_FIELDS: Tuple[str, ...] = ("caller", "envs", "deadline", "max_in_flight")
 
-#: Stands in for a member this module could not read as the type it writes. Never equal to a
-#: value a stream serving now holds, so a record carrying junk fails the comparison rather than
-#: crashing it or, worse, matching through a coercion (`True == 1` is true, and a capacity of
-#: `true` is not a capacity).
-_UNREADABLE = "<unreadable>"
+class _Unreadable:
+    """A member this module could not read as the type it writes, standing in for the value.
+
+    **It equals nothing, including another one of itself.** A record carrying junk under a member
+    has to fail the comparison rather than crash it, and it may not pass the comparison either:
+    two records that both hold something unreadable are not thereby known to be one run. So this
+    is a value the comparison can carry all the way through without ever being satisfied by.
+
+    It used to be the *string* ``"<unreadable>"``, which is two mistakes. A stored member holding
+    exactly that text would have matched a live one, and two junk records matched each other. A
+    sentinel that a wire value could ever be is not a sentinel."""
+
+    __slots__ = ()
+
+    def __eq__(self, other: Any) -> bool:
+        return False
+
+    def __ne__(self, other: Any) -> bool:
+        return True
+
+    __hash__ = None  # type: ignore[assignment]
+
+    def __repr__(self) -> str:
+        return "<unreadable>"
+
+
+#: The one instance, so a rendering of an identity says the same thing wherever it came from.
+_UNREADABLE = _Unreadable()
+
+#: An identity nothing can match, for a stored value that is not a shape this module writes.
+_UNREADABLE_IDENTITY: Mapping[str, Any] = MappingProxyType(
+    {name: _UNREADABLE for name in _IDENTITY_FIELDS}
+)
 
 
 def _identity_number(value: Any) -> Any:
@@ -748,56 +776,101 @@ def _identity_from_wire(value: Any) -> Dict[str, Any]:
     write is refused by the comparison rather than crashing it."""
     if isinstance(value, str):
         if not value:
-            return _identity(caller="", envs={}, deadline=None, max_in_flight=1)
+            # An unidentified record: no members at all, and marked as such rather than read as
+            # an identity whose members happen to be blank. Since every record this module writes
+            # now carries the harness facts, "the caller named nothing" and "this record predates
+            # the field" would otherwise be the same shape, and only the second is what an
+            # adoption is about (see :meth:`TaskStream._require_identity_matches`).
+            return {"unidentified": True, "caller": "", "envs": {}}
         return {"caller": value, "named_only": True}
-    if not isinstance(value, Mapping):
-        # Neither shape, so it cannot be read as either. Rendered rather than dropped: a record
-        # holding something else here is a record about a run this stream cannot describe, and
-        # the message it earns should say what was there.
-        return {"caller": repr(value), "named_only": True}
-    envs = value.get("envs")
+    if not isinstance(value, Mapping) or any(name not in value for name in _IDENTITY_FIELDS):
+        # Neither shape, so it cannot be read as either. Every member is unreadable, which is a
+        # refusal the comparison carries rather than a caller name made out of a `repr`: rendering
+        # a stored `7` as a string used to make it match a caller who really is called "7". An
+        # object missing a member this module always writes is refused the same way, because a
+        # member that is absent is not a member that is blank.
+        return {**_UNREADABLE_IDENTITY, "unreadable": repr(value)}
     return {
-        "caller": str(value.get("caller", "")),
-        "envs": (
-            {str(name): str(digest) for name, digest in sorted(envs.items()) if digest}
-            if isinstance(envs, Mapping)
-            else _UNREADABLE
-        ),
-        "deadline": (
-            None if value.get("deadline") is None else _identity_number(value.get("deadline"))
-        ),
-        "max_in_flight": _identity_capacity(value.get("max_in_flight")),
+        "caller": _identity_text_member(value["caller"]),
+        "envs": _identity_envs(value["envs"]),
+        "deadline": None if value["deadline"] is None else _identity_number(value["deadline"]),
+        "max_in_flight": _identity_capacity(value["max_in_flight"]),
     }
 
 
-def _identity_wire(identity: Mapping[str, Any]) -> RunIdentity:
-    """What goes on disk for ``identity``: the empty string for a run that names nothing, and the
-    object otherwise.
+def _identity_text_member(value: Any) -> Any:
+    """One textual identity member, or :data:`_UNREADABLE`.
 
-    The empty string rather than an object full of blanks, so a run with no identity writes byte
-    for byte the record this module wrote before identities existed — and so that "this record
-    names nothing" stays one value a reader can test rather than a shape it has to inspect."""
-    if _identity_names_nothing(identity):
-        return ""
+    Exactly the type the writer emits, and never coerced into it. ``str()`` around this made a
+    stored ``7`` compare equal to a caller named ``"7"`` and a numeric env value compare equal to
+    a textual digest, which is the coercion the members beside it already refuse."""
+    return value if isinstance(value, str) else _UNREADABLE
+
+
+def _identity_envs(value: Any) -> Any:
+    """What each env said about itself, as this module writes it, or :data:`_UNREADABLE`.
+
+    All or nothing, and the whole member rather than the offending entry: a mapping this module
+    did not write is not a partial answer about which envs were involved, so dropping the bad
+    entries would leave a member that compares as though the rest were the whole of it."""
+    if not isinstance(value, Mapping):
+        return _UNREADABLE
+    if any(not isinstance(name, str) or not isinstance(said, str) for name, said in value.items()):
+        return _UNREADABLE
+    return {name: said for name, said in sorted(value.items()) if said}
+
+
+def _identity_wire(identity: Mapping[str, Any]) -> RunIdentity:
+    """What goes on disk for ``identity``: the object, always, every member of it.
+
+    **Even when nobody named anything, and that is the correction.** This used to collapse the
+    whole record to the empty string whenever the caller and the envs were both silent, on the
+    grounds that a run naming nothing should write what this module wrote before identities
+    existed. But the caller and the envs are only two of the four members. A run that named
+    nothing still had a deadline and a capacity, and both are facts about what an episode was
+    allowed to do: the capacity decides whether a task is served with a lease and how episodes
+    are scheduled against each other, and the deadline decides whether a slow episode is scored
+    or timed out. Collapsing them threw exactly that away, so a record made at ``deadline=30,
+    max_in_flight=1`` was resumed at ``deadline=None, max_in_flight=2`` and scored another row
+    into it: the mixed-opportunity record this field exists to refuse, produced by the field.
+
+    The empty string survives as a *read* shape and nothing else (see :func:`_identity_from_wire`):
+    it is what a record written before this member existed holds, and continuing one is a
+    migration rather than a comparison."""
     return {field: identity[field] for field in _IDENTITY_FIELDS}
 
 
-def _identity_names_nothing(identity: Mapping[str, Any]) -> bool:
-    """Whether this identity says anything about what produced a row.
+def _identity_unidentified(identity: Mapping[str, Any]) -> bool:
+    """Whether this is a record that says nothing at all about what produced its rows.
 
-    The caller's name and what the envs said, and neither the deadline nor the capacity: those
-    two are properties of every run, including a run whose caller could not say what it was, so
-    an identity built out of nothing else would stop being the wildcard it is for. An env that
-    describes itself does identify the run, though — that half is observed rather than asserted,
-    and it works for a caller that named nothing precisely because nobody had to say it."""
+    Only ever true of something read back: the empty string, which is what a directory recorded
+    before this member existed holds. It is not a wildcard and it is not an identity whose
+    members are blank; it is the absence of the member, and what it earns is an adoption."""
+    return bool(identity.get("unidentified"))
+
+
+def _identity_names_nothing(identity: Mapping[str, Any]) -> bool:
+    """Whether this identity's *asserted* half says anything about what produced a row.
+
+    The caller's name and what the envs said, and neither the deadline nor the capacity: this is
+    the question of whether anybody claimed anything, which is what decides whether continuing an
+    unidentified record is a migration or simply carrying on as before. The harness facts beside
+    them are properties of every run including that one, so they are compared whenever both sides
+    have them and are not what makes a run *named*. An env that describes itself does name the
+    run, though: that half is observed rather than asserted, and it works for a caller that named
+    nothing precisely because nobody had to say it."""
     return not identity.get("caller") and not identity.get("envs")
 
 
 def _identity_text(identity: Mapping[str, Any]) -> str:
     """A run identity as it appears in a refusal, short enough to read in one line."""
+    if "unreadable" in identity:
+        return f"an unreadable identity ({identity['unreadable']})"
     if identity.get("named_only"):
         return repr(identity.get("caller", ""))
     if _identity_names_nothing(identity):
+        # Never an unreadable member: `_UNREADABLE` is truthy, so a member this module could not
+        # read is one that says *something*, and what it says is that this record is not readable.
         return "no identity"
     envs = identity.get("envs")
     return (
@@ -836,14 +909,19 @@ def _recorded_identity(record: Mapping[str, Any]) -> RunIdentity:
     """The run identity a stored dispense record or result row was written under, in wire form.
 
     Passed through rather than coerced, because the two legal shapes are a string and an object
-    and the reader that has to tell them apart is :func:`_identity_from_wire`. A member that is
-    neither reaches that function too, and is refused there."""
+    and the reader that has to tell them apart is :func:`_identity_from_wire`.
+
+    **A value that is neither is kept as evidence and never as a name.** This used to render one
+    with ``repr``, which reads back as an ordinary legacy caller: a stored ``7`` became the string
+    ``'7'`` and matched a caller really called ``"7"``. What comes back instead is an object with
+    no identity members at all, so every member reads as unreadable, nothing it is compared with
+    can match it, and the refusal can still say what was there."""
     stored = record.get("run_identity", "")
     if isinstance(stored, str):
         return stored
     if isinstance(stored, Mapping):
         return dict(stored)
-    return repr(stored)
+    return {"unreadable": repr(stored)}
 
 
 def _recorded_regime(record: Mapping[str, Any]) -> str:
@@ -1006,9 +1084,13 @@ class ResultRow:
     feedback_regime: str = _NEVER_REGIME
     #: What the run was configured with: a record, not a name (see :func:`_identity`). Its
     #: members are the caller's own opaque summary, what each env said about itself, the deadline
-    #: and the capacity, and a resume compares them one by one and exactly. Empty — the string —
-    #: for a run that names nothing and for every record written before this field existed, which
-    #: is the one value that is not a wildcard and the one an adoption is about. What the *env*
+    #: and the capacity, and a resume compares them one by one and exactly. **Every row this
+    #: module writes carries all four**, including a row of a run whose caller named nothing: what
+    #: was not said is blank inside the record rather than instead of it, because the deadline and
+    #: the capacity are true of that run too and are what a collapsed record used to lose. The
+    #: empty string is a *read* shape and nothing else: a record written before this member
+    #: existed, which is the one value that is not a wildcard and the one an adoption is about.
+    #: A value that is neither reads as unreadable and matches nothing. What the *env*
     #: said produced this particular row also travels in ``observed``, under the name the env
     #: declares, and the two are checked against each other before the row lands (see
     #: :meth:`TaskStream._require_env_agrees`).
@@ -1692,6 +1774,18 @@ def _undo_failed_append(path: Path, committed: int) -> None:
         pass
 
 
+def _file_length(path: Path) -> int:
+    """How long ``path`` is right now, or 0 if it is not there.
+
+    Read rather than computed from the bytes just written, because what a rollback has to compare
+    against is the file's own length: if it is not the length this writer left it at, something
+    was appended afterwards and the suffix is no longer this writer's to remove."""
+    try:
+        return path.stat().st_size
+    except OSError:
+        return 0
+
+
 def _drop_uncommitted_tail(path: Path) -> int:
     """Discard a trailing record whose terminator never landed, before appending past it, and
     report how many committed bytes are left (0 for a file that does not exist yet).
@@ -2308,8 +2402,9 @@ class TaskStream:
             rows were; it is a migration, and it makes the resumed claim name this identity from
             then on. It is also performed **once**: the adoption is written into the directory,
             so the next ordinary ``resume=True`` under the same identity needs no flag (see
-            :meth:`_record_adoption` and :func:`read_adoptions`). The alternative, and usually
-            the better one, is a fresh provenance directory.
+            :meth:`_record_adoption` and :func:`read_adoptions`), and every *other* identity is
+            refused from then on, including a caller that names nothing. The alternative, and
+            usually the better one, is a fresh provenance directory.
     """
 
     def __init__(
@@ -2510,10 +2605,13 @@ class TaskStream:
         # Whether a blank record was met while this stream held the migration flag, and so
         # whether an adoption is owed to the directory once construction is past every refusal.
         self._adopting = False
-        # How long the adoption log was before this constructor appended to it, kept only until
-        # construction is past every refusal: a call that raises leaves the directory as it found
-        # it, and an adoption is the one thing a refused constructor could otherwise leave behind.
-        self._adoption_undo: Optional[int] = None
+        # The span this constructor's adoption occupies in the log: how long the file was before
+        # the append, and how long it was after. Kept only until construction is past every
+        # refusal — a call that raises leaves the directory as it found it, and an adoption is the
+        # one thing a refused constructor could otherwise leave behind — and both halves are
+        # measured inside the append's own ownership section, because a rollback that cannot prove
+        # the bytes are its own is a rollback that deletes somebody else's (see `_undo_adoption`).
+        self._adoption_undo: Optional[Tuple[int, int]] = None
         # What each ENV said produced this record's rows, as opposed to what the caller asserted.
         # Bound per env from the first row of that env's that says anything — this run's or, on a
         # resume, the record's — and every later row of the same env is held to it. Keyed by env
@@ -3398,7 +3496,9 @@ class TaskStream:
             "under one set of queue positions"
         )
 
-    def _append_owned(self, path: Path, record: Dict[str, Any]) -> None:
+    def _append_owned(
+        self, path: Path, record: Dict[str, Any], *, undoable: bool = False
+    ) -> Optional[Tuple[int, int]]:
         """Add one line to this stream's record — **the only way this module ever does.**
 
         Both durable logs go through here, because ownership that is checked before a write and
@@ -3424,10 +3524,22 @@ class TaskStream:
         than merely doubled. One writer at a time is what rules that out.
 
         Durable always: both logs are read back after a crash, and a record that reached only the
-        page cache is exactly the record a hard kill loses."""
+        page cache is exactly the record a hard kill loses.
+
+        ``undoable`` is for the one append a constructor may have to take back (see
+        :meth:`_record_adoption`). It returns the span this append occupies — the committed length
+        before it, and the length of the file after it — measured **inside** this same section, so
+        the offset a rollback would truncate to is one no other writer could have moved in the
+        meantime. Taken outside it, the pair was a rollback aimed at a moving target: a
+        constructor that captured the offset, lost the directory to a takeover and then failed its
+        own ownership check truncated away the *successor's* committed adoption on its way out."""
         with _locked(self.prov_dir):
             self._require_claim()
+            committed = _drop_uncommitted_tail(path) if undoable else None
             _append_jsonl(path, record, durable=True)
+            if committed is None:
+                return None
+            return committed, _file_length(path)
 
     def _release_claim(self, *, restoring: bool = False) -> None:
         """Let the provenance directory go, if this stream still holds it.
@@ -3676,10 +3788,12 @@ class TaskStream:
         look reasonable."""
         if not self._adopting or self._already_adopted():
             return
-        # The committed length before this append, which is what an undo truncates back to. Taken
-        # with the same helper the append itself uses, so the two agree about where the log ends.
-        self._adoption_undo = _drop_uncommitted_tail(self.adoptions_path)
-        self._append_owned(
+        # The span this append occupies, taken INSIDE the ownership section the append itself
+        # holds (see :meth:`_append_owned`). It used to be measured out here, before the lock, and
+        # the rollback then aimed at an offset another writer could already have moved: a
+        # constructor that captured it, lost the directory to a takeover and failed its own
+        # ownership check truncated the successor's committed adoption away on its way out.
+        self._adoption_undo = self._append_owned(
             self.adoptions_path,
             {
                 "run_identity": self._identity_stamp,
@@ -3690,6 +3804,7 @@ class TaskStream:
                 "pid": os.getpid(),
                 "adopted_at": time.time(),
             },
+            undoable=True,
         )
         self._adopted = self._adopted + (dict(self._run_identity),)
         self._adopting = False
@@ -3722,11 +3837,32 @@ class TaskStream:
         Nothing that runs after :meth:`_record_adoption` can refuse today: it is the last thing
         the replay does, and what follows it is assignment. This is what keeps the constructor's
         contract true if something ever does — the adoption is the only write this call makes to
-        a record, and a refusal may not leave a mark that makes the next call look reasonable."""
+        a record, and a refusal may not leave a mark that makes the next call look reasonable.
+
+        **It proves the bytes are its own before it removes them, twice over.** A rollback is a
+        truncation, and a truncation aimed at a log somebody else now owns deletes their records.
+        So this runs under the same exclusion the append ran under, it removes nothing unless this
+        stream still holds the claim, and it removes nothing unless the log is still exactly the
+        length this stream left it: anything else means a line landed afterwards, and a line that
+        landed afterwards is not this one. That was a real loss rather than a hypothetical. A
+        constructor that had captured its offset, been displaced by a same-identity takeover and
+        then failed its own ownership check reduced the successor's committed adoption log from
+        one line to zero, leaving the successor's adopted rows unaudited.
+
+        Never raises, for :meth:`_release_claim`'s reason: it runs beside an error already on its
+        way out, and a rollback that could not run is untidy where a masked error is wrong."""
         if self._adoption_undo is None:
             return
-        committed, self._adoption_undo = self._adoption_undo, None
-        _undo_failed_append(self.adoptions_path, committed)
+        (committed, appended), self._adoption_undo = self._adoption_undo, None
+        try:
+            with _locked(self.prov_dir):
+                if not self._holds_claim(self._read_claim() or {}):
+                    return
+                if _file_length(self.adoptions_path) != appended:
+                    return
+                _undo_failed_append(self.adoptions_path, committed)
+        except OSError:
+            pass
 
     def _require_identity_matches(self, recorded: RunIdentity, *, source: str) -> None:
         """A stored record must have been written under the same run configuration as this stream.
@@ -3746,6 +3882,13 @@ class TaskStream:
         this job: composing several facts into one name and then asking whether one of them
         occurs *inside* it accepts a name with unrelated text around a digest, and matches by
         accident once a name holds more than one field.
+
+        **Every record this module writes carries all four members, including one nobody named.**
+        The wire form used to collapse to the empty string whenever the caller and the envs were
+        silent, which threw away the two members that are true of every run: a record made at one
+        deadline and capacity was resumed at another and scored a row into it. What is blank is
+        now blank *inside* a record, and the empty string means only what it has always meant on
+        disk, which is a directory recorded before this member existed (see :func:`_identity_wire`).
 
         **A blank recorded identity is not a wildcard.** It used to be one, in the name of
         compatibility with records written before this field existed, and it is the wrong shape
@@ -3777,16 +3920,19 @@ class TaskStream:
         ``adoptions.jsonl`` then named both. The same unidentified rows were auditable as
         belonging to two runs, which is the whole of what an adoption exists to rule out. So an
         adoption already on record refuses every identity but its own, whatever flag the caller
-        passes, and the refusal says whose those rows are.
+        passes, and the refusal says whose those rows are. **Including a caller that names
+        nothing**, which is the case that got past it: an unnamed resume used to be waved through
+        by "blank continued as blank" before the adoption was consulted at all, so it appended a
+        second blank row *outside* the adoption's recorded cutoff, and the next ordinary resume
+        under the adopting identity then folded that row in as though it had been adopted too. The
+        adoption is now the first thing this reads, and continuing an unidentified record as
+        itself is only available while nobody has taken those rows on.
 
         **The other asymmetry stands.** A caller that names none is not accepted by a record that
         does: the record has already said what produced its rows, and appending rows that decline
         to say makes a directory nobody can read as one run afterwards."""
         stored = _identity_from_wire(recorded)
-        if _identity_names_nothing(stored):
-            if _identity_names_nothing(self._run_identity):
-                # Blank continued as blank. Nothing is asserted that was not asserted before.
-                return
+        if _identity_unidentified(stored):
             if self._already_adopted():
                 # Adopted already by this identity, and the directory says so rather than the
                 # caller. An ordinary resume from here on needs no flag.
@@ -3800,6 +3946,14 @@ class TaskStream:
                     "; unidentified rows are taken on once, by one configuration, or the record "
                     "says they belong to two. Serve into a fresh provenance directory"
                 )
+            if _identity_names_nothing(self._run_identity):
+                # Nothing was asserted before and nothing is asserted now, and no adoption stands
+                # over these rows, so the record is continued as itself. Checked *after* the
+                # adoption and not before it: a named run that had taken these rows on left a
+                # record saying so, and an unnamed resume used to walk straight past it and append
+                # beside them — rows outside the adoption's own cutoff, silently folded into the
+                # adopter by the next ordinary resume under its identity.
+                return
             if self._adopt_unidentified:
                 # The migration is being performed *now*. Remembered rather than written here:
                 # this runs while the record is still being read, and an adoption is owed only by

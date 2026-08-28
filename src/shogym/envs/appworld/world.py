@@ -180,6 +180,7 @@ def derive_task(
     graded: Path,
     task_id: str,
     write_log: Callable[[Path, Path], None],
+    verify: Optional[Callable[[str], None]] = None,
 ) -> Path:
     """Materialise one task's world twice: once for the agent, once for the grader.
 
@@ -196,7 +197,15 @@ def derive_task(
     **Two streams starting the same cold task is the ordinary case, not a hypothetical.** Paired
     forks are launched together and both derive on first use, so the work is done under a lock on
     the tasks directory and published with one rename, into a staging directory named for the
-    process that owns it. A loser finds the target already there and uses it."""
+    process that owns it. A loser finds the target already there and uses it.
+
+    ``verify`` is handed the name of the unit about to be read and raises if the corpus no longer
+    holds what the caller was built against. It is called under the lock, after the decision to
+    build and before a byte is copied, so a warm task pays nothing for it. A task is derived on its
+    first use, which may be hours and two hundred episodes after the env stated what corpus it
+    serves; without this, an in-place edit in that window put changed databases and a changed
+    ground truth into a world and its grading baseline under a run identity that had never read
+    them (see :meth:`~adapter.CorpusSnapshot.verify` for what it does and does not prove)."""
     target = derived / "tasks" / task_id
     if already_derived(derived=derived, graded=graded, task_id=task_id):
         return target
@@ -214,6 +223,8 @@ def derive_task(
     ):
         if already_derived(derived=derived, graded=graded, task_id=task_id):
             return target
+        if verify is not None:
+            verify(f"tasks/{task_id}")
         source = original / "tasks" / task_id
         building = _staging(derived / "tasks", task_id)
         (building / "dbs").mkdir(parents=True)
@@ -337,7 +348,9 @@ def derive_view(*, derived: Path, view: Path, task_id: str) -> Path:
     return view
 
 
-def derive_root(*, original: Path, derived: Path) -> Path:
+def derive_root(
+    *, original: Path, derived: Path, verify: Optional[Callable[[str], None]] = None
+) -> Path:
     """Materialise the parts of a corpus that no task changes, and return the derived root.
 
     Copies rather than symlinks, for the reason :func:`derive_task` gives: a symlink to the
@@ -381,7 +394,14 @@ def derive_root(*, original: Path, derived: Path) -> Path:
     is the same residual :func:`derive_view` states: the worker runs as the user that owns these
     files and can chmod them back. shojin-lab/shogym#140 mounts the shared base into the worker's
     container read-only, which is a boundary rather than a convention, and it is what closes both
-    the modes and the names."""
+    the modes and the names.
+
+    ``verify`` is handed each entry's name before that entry is copied, and raises if the corpus no
+    longer holds what the caller was built against. Only outstanding entries are checked, so the
+    ordinary warm construction pays nothing: it copies nothing, so there is nothing to be wrong
+    about. On the cold path this is 134 MB of shared base databases about to become every episode's
+    starting state, and reading them without a check would build that state out of whatever the
+    corpus held at the moment of the copy rather than out of what the run says it is serving."""
     derived.mkdir(parents=True, exist_ok=True)
     # Required, for the reason :func:`derive_task`'s is: the body below opens this directory for
     # writing and seals it again, and what a second process without exclusion would find is not a
@@ -407,6 +427,8 @@ def derive_root(*, original: Path, derived: Path) -> Path:
             with _opened(derived):
                 (derived / "tasks").mkdir(exist_ok=True)
                 for entry in outstanding:
+                    if verify is not None:
+                        verify(entry.name)
                     target = derived / entry.name
                     building = _staging(derived, entry.name)
                     _materialise(entry, building)

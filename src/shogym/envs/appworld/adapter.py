@@ -142,6 +142,13 @@ WORKER = Path(__file__).with_name("worker.py")
 #: tree replaced, restored or half-deleted under a name that still claims the old identity.
 _RUNTIME_FILE = ".shogym-runtime"
 
+#: What a runtime whose app sources have been unpacked says about itself, written inside it once
+#: the unpack has finished. Beside the runtime stamp rather than inside the installed package,
+#: because a runtime that is rebuilt is published by a rename over this directory and takes its
+#: marker with it, and because it can then be read without starting the interpreter to find out
+#: where the package lives (see :func:`ensure_apps`).
+_APPS_FILE = ".shogym-apps"
+
 
 def runtime() -> Path:
     """The interpreter every world runs under, building it if it is not there yet.
@@ -326,27 +333,131 @@ def ensure_apps() -> None:
 
     A fresh install has ``appworld.apps`` with the shared library in it and none of the nine
     apps, so the first import of a model module fails with a plain ``ModuleNotFoundError`` that
-    says nothing about the missing step. Idempotent, and silent when there is nothing to do."""
+    says nothing about the missing step. Idempotent, and silent when there is nothing to do.
+
+    **What says it is done is a stamp written after the unpack returned, not a file the unpack
+    happens to create early.** The test used to be that ``apps/todoist/models.py`` existed.
+    Upstream's ``install_package`` goes on doing in-place work after the individual app files are
+    there, and the runtime is already published and stamped by the time this runs, so an unpack
+    interrupted anywhere after that one file appeared left a runtime every later construction
+    skipped: a half-unpacked interpreter under a name and a stamp that both say it is finished.
+    The stamp below is written only once the unpacking subprocess has exited zero, so what is
+    trusted is a completed unpack rather than a step of one.
+
+    **And it is read before the interpreter is asked anything**, which is what makes the warm path
+    free. Locating the installed package means importing ``appworld`` in a subprocess, and that is
+    most of a second on every env construction; the stamp lives in the runtime's own directory, so
+    a runtime that has been unpacked is recognised without starting a process at all."""
     python = runtime()
-    installed = _installed_package(python)
-    if (installed / "apps" / "todoist" / "models.py").exists():
+    marker = python.parent.parent / _APPS_FILE
+    if _apps_unpacked(marker):
         return
+    installed = _installed_package(python)
     # Required: this one unpacks *in place*, into the interpreter every world runs under, so two
     # unpackers without exclusion are two processes writing one tree. There is no staging name to
     # publish from and no rename to make it atomic.
     with _locked(installed, required=True):
-        if (installed / "apps" / "todoist" / "models.py").exists():
+        if _apps_unpacked(marker):
             return
         _run([str(python), str(WORKER), "install"])
+        _compile_runtime(python)
+        _mark_apps(marker)
+
+
+def _compile_runtime(python: Path) -> None:
+    """Rewrite every bytecode cache in the interpreter as a hash-based one.
+
+    **This is what lets :func:`runtime_digest` leave ``__pycache__`` out and still be true.** A
+    default ``.pyc`` records the source's modification time and size and is honoured whenever those
+    two numbers still match, whatever bytes the cache itself holds, so a cache under the installed
+    tree is executable code that no digest over the sources has read. A hash-based cache records a
+    hash of the source and the import system checks it on every import, so a cache that disagrees
+    with the source beside it is discarded and the source is what runs. Every ``.pyc`` a worker can
+    consult then stands for a source :func:`runtime_digest` did read.
+
+    Forced, because ``compileall`` decides whether a cache is current by comparing a *timestamp*
+    header, so an existing timestamp cache that is up to date is skipped and left in the form this
+    is here to replace.
+
+    Run after the app sources are unpacked, because those are the modules with the most in them,
+    and run once: three seconds at provisioning, against three on every worker start, which is
+    what sending each worker to a cache directory of its own would have cost instead."""
+    _run(
+        [
+            str(python),
+            "-m",
+            "compileall",
+            "-q",
+            "-f",
+            "-j",
+            "0",
+            "--invalidation-mode",
+            "checked-hash",
+            *(str(packages) for packages in _site_packages(python.parent.parent)),
+        ]
+    )
+
+
+def _apps_stamp() -> str:
+    """What a runtime whose app sources are unpacked says about itself."""
+    return json.dumps({"version": UPSTREAM_VERSION, "sha": UPSTREAM_SHA, "apps": "unpacked"})
+
+
+def _apps_unpacked(marker: Path) -> bool:
+    """Whether this runtime's apps were unpacked by a run that got to the end of the unpack.
+
+    Anything other than this code's own stamp reads as not done and is answered by unpacking
+    again, which is idempotent. There is no refusal here of the kind :func:`_stamped` makes: the
+    runtime directory the marker sits in already carries the pins in its name and in its own
+    stamp, so a marker that says something else is a leftover rather than a claim to be an
+    interpreter this run did not build."""
+    try:
+        return marker.read_text().strip() == _apps_stamp()
+    except OSError:
+        return False
+
+
+def _mark_apps(marker: Path) -> None:
+    """Record that the unpack finished, whole or not at all.
+
+    Written to a name of this process's own and renamed into place, because a marker written
+    directly is a name that exists before it holds anything: a crash between the create and the
+    write leaves a file that is not this stamp, which reads as unfinished and unpacks again, and a
+    concurrent reader would see the same. ``os.replace`` is atomic within a directory."""
+    staged = marker.with_name(f"{marker.name}.{os.getpid()}.{secrets.token_hex(8)}")
+    staged.write_text(_apps_stamp())
+    os.replace(staged, marker)
+
+
+#: How long the provisioned interpreter gets to import ``appworld`` and say where it lives.
+#:
+#: Bounded for the reason :func:`_run` is bounded, and it is the same reason stated about a
+#: different subprocess: env construction waits on this one, and a construction that never returns
+#: is a queue that never starts and a run that reports nothing at all. Generous, because it is a
+#: cold import of a large package on a machine that may just have installed it.
+_IMPORT_TIMEOUT_SECONDS = 300.0
 
 
 def _installed_package(python: Path) -> Path:
-    """Where ``appworld`` sits inside the provisioned interpreter."""
-    finished = subprocess.run(
-        [str(python), "-c", "import appworld, os; print(os.path.dirname(appworld.__file__))"],
-        capture_output=True,
-        text=True,
-    )
+    """Where ``appworld`` sits inside the provisioned interpreter.
+
+    **Under a deadline**, which it was not. This starts a process and waits for it with no bound,
+    on an interpreter that was provisioned rather than shipped: an import that wedges on a broken
+    shared library or a filesystem that stopped answering held construction open for the life of
+    the run, before any task existed to file a timeout row against."""
+    try:
+        finished = subprocess.run(
+            [str(python), "-c", "import appworld, os; print(os.path.dirname(appworld.__file__))"],
+            capture_output=True,
+            text=True,
+            timeout=_IMPORT_TIMEOUT_SECONDS,
+        )
+    except subprocess.TimeoutExpired as expired:
+        # `subprocess.run` has already killed and reaped the child by the time this is raised.
+        raise ProvisioningError(
+            f"the provisioned appworld runtime at {python} did not finish importing appworld "
+            f"within {_IMPORT_TIMEOUT_SECONDS:.0f}s"
+        ) from expired
     if finished.returncode != 0:
         raise ProvisioningError(
             f"the provisioned appworld runtime cannot import appworld:\n"
@@ -478,27 +589,47 @@ def runtime_digest() -> str:
     exists to catch. A ``.dist-info`` name is a label, and a label is not a fingerprint of the code
     behind it.
 
-    **``__pycache__`` is skipped, and that is not a hole.** Bytecode caches are derived from the
-    sources this already reads, and they are written lazily by whatever the last process happened
-    to import, so hashing them would make the identity depend on which worker ran first rather
-    than on what is installed. Nothing can be hidden in one that is not in the source beside it:
-    Python discards a ``.pyc`` whose source is newer.
+    **What is hashed, exactly: the installed source and data bytes of ``site-packages``, plus the
+    base interpreter's own binary.** Every regular file under every ``site-packages`` of the
+    virtual environment, by relative path and by content; every symbolic link there by its target
+    text, by where that text resolves to and by the resolved file's bytes; ``pyvenv.cfg``; the
+    platform; the pins; and the executable ``bin/python`` resolves to, which is the real
+    interpreter the venv borrows and which nothing else here would have covered.
 
-    **Symbolic links are recorded, never followed.** A link's target may be outside the tree
-    entirely, and what a link contributes to this interpreter's identity is where it points.
+    **What is not hashed, and why each is out of scope.** The base interpreter's *standard
+    library* is not read: it is thousands of files belonging to the host's Python rather than to
+    anything this port installs, and the base binary's own bytes already move with a reinstalled
+    or repointed interpreter. Bytecode caches are not read: see below. A digest that named those
+    would be a longer walk and a claim this code cannot keep, so the claim is the narrower one and
+    it is true.
+
+    **``__pycache__`` is skipped, and the runtime is built so that skipping it is not a hole.**
+    Bytecode caches are written lazily by whatever process imported a module first, so hashing
+    them would make the interpreter's identity depend on which worker ran before rather than on
+    what is installed. What makes leaving them out honest is not that a stale cache is unlikely to
+    be executed: an ordinary ``.pyc`` whose recorded source mtime and size match the source beside
+    it is executed whatever its contents say. It is that every cache in this interpreter is
+    rewritten at provisioning as a hash-based one, which the import system checks against the
+    source's own hash, and that a worker writes none back (see :func:`_compile_runtime` and
+    :func:`_worker_environment`). Every ``.pyc`` that can be consulted therefore stands for a
+    source this function read.
 
     Read off the filesystem rather than by running the interpreter, so a broken install still gets
-    an answer. It costs about half a second warm over the roughly ten thousand installed files of
-    this runtime, paid once per env construction beside a corpus digest that costs four times that
-    (:func:`corpus_digest` is the only other thing on the same path, and both are read by
-    :func:`~env_v1.run_fingerprint`, which runs once in a constructor). Not memoized, for the
-    reason :func:`corpus_digest` is not."""
-    home = runtime().parent.parent
+    an answer. It costs about a second warm over the roughly fifteen thousand installed files of
+    this runtime, of which the base binary is under ten milliseconds, paid once per env
+    construction beside a corpus digest that costs half as much again (:func:`corpus_digest` is
+    the only other thing on the same path, and both are read once in a constructor). Not
+    memoized, for the reason :func:`corpus_digest` is not."""
+    python = runtime()
+    home = python.parent.parent
     material = hashlib.sha256()
     material.update(f"{platform.system()}|{platform.machine()}".encode())
     material.update(f"{UPSTREAM_VERSION}|{UPSTREAM_SHA}".encode())
     config = home / "pyvenv.cfg"
     material.update(config.read_bytes() if config.exists() else b"")
+    # The interpreter the venv borrows. `pyvenv.cfg` names its directory, which is a label; this
+    # is the executable that actually runs, read through whatever chain of links `bin/python` is.
+    _absorb_target(material, b"base", python)
     for packages in _site_packages(home):
         for relative, path in _installed_files(packages):
             material.update(relative.encode())
@@ -506,6 +637,11 @@ def runtime_digest() -> str:
             if path.is_symlink():
                 material.update(b"link\0")
                 material.update(os.readlink(path).encode())
+                material.update(b"\0")
+                # And what the link resolves to, which the target text alone does not say: a
+                # relative target reaches a different file from a different directory, and the
+                # bytes behind an unchanged target can change without the text moving.
+                _absorb_target(material, b"target", path)
                 continue
             material.update(b"file\0")
             with path.open("rb") as handle:
@@ -515,6 +651,34 @@ def runtime_digest() -> str:
                         break
                     material.update(block)
     return material.hexdigest()[:16]
+
+
+def _absorb_target(material: Any, label: bytes, path: Path) -> None:
+    """Fold in where ``path`` resolves to and the bytes that are there, if it is a regular file.
+
+    Resolved and then read, rather than opened through the link: what goes into the identity is
+    the pair, because the same target text under two directories is two files and the same file
+    under one name can be replaced. A resolution that is not a regular file (a directory, a
+    dangling link, a device) contributes its path and the fact that it is not readable as bytes;
+    following a link to a *directory* would make this walk unbounded, which is the same reason
+    :func:`_installed_files` never descends into one."""
+    material.update(label)
+    material.update(b"\0")
+    try:
+        resolved = Path(os.path.realpath(path))
+        material.update(str(resolved).encode())
+        material.update(b"\0")
+        if not resolved.is_file():
+            material.update(b"not-a-file\0")
+            return
+        with resolved.open("rb") as handle:
+            while True:
+                block = handle.read(1 << 20)
+                if not block:
+                    break
+                material.update(block)
+    except OSError:
+        material.update(b"unreadable\0")
 
 
 def _installed_files(packages: Path) -> "Iterator[Tuple[str, Path]]":
@@ -549,18 +713,26 @@ DERIVATION_VERSION = 1
 _SOURCE_FILE = ".shogym-source"
 
 
-def derived_root(source: Optional[str] = None) -> Path:
+def derived_root(source: Optional[str] = None, *, runtime: Optional[str] = None) -> Path:
     """Where the seeded copy of the corpus lives, named for what it was built from.
 
-    Three things are in the name, and each of them changes what the tree holds. The generator
-    digest covers the backlog generator's own constants, so changing a cut value, an option set or
-    the number of requests derives a new corpus instead of serving a stale one. The derivation
-    version covers the *layout*: what is copied, what is linked and what is sealed. And the source
-    digest covers the corpus this was derived from, which used to be missing entirely:
-    ``APPWORLD_ROOT`` takes any directory with a ``data/tasks`` in it, so a process pointed at a
-    second corpus computed a fingerprint for that one and then reused and served task material
-    derived from the first."""
-    return cache_root() / f"seeded-{DATA_VERSION}-{DERIVATION_VERSION}-{_source(source)}"
+    Four things are in the name, and each of them changes what the tree holds. The generator
+    digest covers the backlog generator's constants *and its implementation*, so changing a cut
+    value, an option set, the number of requests or the code that draws them derives a new corpus
+    instead of serving a stale one. The derivation version covers the *layout*: what is copied,
+    what is linked and what is sealed. The runtime digest covers the interpreter that wrote the
+    seeded rows, because it is the interpreter and not this process that writes them: a task's
+    database file is a replayable statement log written through upstream's own model layer, so a
+    resolved dependency that changed how a row is serialized changed the world under a name that
+    had not moved. And the source digest covers the corpus this was derived from, which used to be
+    missing entirely: ``APPWORLD_ROOT`` takes any directory with a ``data/tasks`` in it, so a
+    process pointed at a second corpus computed a fingerprint for that one and then reused and
+    served task material derived from the first.
+
+    ``runtime`` is passed in rather than read, for the reason ``source`` is: an env reads it once
+    at construction and hands the same value to both roots and to its own fingerprint, so the
+    three cannot disagree, and a caller that only wants to name a path does not have to."""
+    return cache_root() / f"seeded-{DATA_VERSION}-{DERIVATION_VERSION}-{_source(source, runtime)}"
 
 
 def private_home() -> Path:
@@ -572,7 +744,7 @@ def private_home() -> Path:
     return base.parent / f"{base.name}-private" / "appworld"
 
 
-def graded_root(source: Optional[str] = None) -> Path:
+def graded_root(source: Optional[str] = None, *, runtime: Optional[str] = None) -> Path:
     """Where the grader's view of the corpus lives: a private directory with an unguessable name.
 
     **This raises the cost of finding it and does not close the route.** The worker runs as the
@@ -582,7 +754,10 @@ def graded_root(source: Optional[str] = None) -> Path:
     does is stop the tree being derivable from what the worker is given, which the previous
     layout, a fixed name beside the served root, was."""
     home = private_home()
-    return home / f"graded-{DATA_VERSION}-{DERIVATION_VERSION}-{_source(source)}-{_private_tag()}"
+    return (
+        home
+        / f"graded-{DATA_VERSION}-{DERIVATION_VERSION}-{_source(source, runtime)}-{_private_tag()}"
+    )
 
 
 def _read_tag(keyfile: Path) -> Optional[str]:
@@ -594,16 +769,24 @@ def _read_tag(keyfile: Path) -> Optional[str]:
     return tag if len(tag) == 16 else None
 
 
-def _source(source: Optional[str]) -> str:
-    """The source digest a cache name is keyed by, computed from the served corpus if not given.
+def _source(source: Optional[str], runtime: Optional[str] = None) -> str:
+    """Everything but the layout that a cache name is keyed by: the generator, the interpreter
+    that ran it, and the corpus it read.
 
-    The argument exists so that the env computes this once and hands the same value to both roots;
-    the default is for callers that only want to name a path (tests, tooling) and would otherwise
-    have to reach for the corpus themselves."""
-    return f"{_generator_digest()}-{source or corpus_digest(ensure_corpus())}"
+    The arguments exist so that the env reads each of these once and hands the same values to both
+    roots and to its own fingerprint; the defaults are for callers that only want to name a path
+    (tests, tooling) and would otherwise have to reach for the corpus and the runtime
+    themselves."""
+    return "-".join(
+        (
+            _generator_digest(),
+            runtime if runtime is not None else runtime_digest(),
+            source or corpus_digest(ensure_corpus()),
+        )
+    )
 
 
-def stamp_cache(root: Path, *, source: str) -> None:
+def stamp_cache(root: Path, *, source: str, runtime: str) -> None:
     """Record what a derived cache was built from, and refuse one built from something else.
 
     The name already carries the same values, so this cannot normally disagree. It is here for the
@@ -617,7 +800,14 @@ def stamp_cache(root: Path, *, source: str) -> None:
     root.mkdir(parents=True, exist_ok=True)
     stamp = root / _SOURCE_FILE
     material = json.dumps(
-        {"source": source, "derivation": DERIVATION_VERSION, "data": DATA_VERSION}, sort_keys=True
+        {
+            "source": source,
+            "runtime": runtime,
+            "generator": _generator_digest(),
+            "derivation": DERIVATION_VERSION,
+            "data": DATA_VERSION,
+        },
+        sort_keys=True,
     )
     held = ""
     try:
@@ -653,20 +843,63 @@ def stamp_cache(root: Path, *, source: str) -> None:
 
 @dataclass(frozen=True)
 class CorpusSnapshot:
-    """One reading of a corpus: what it held, and the authored text it held while it was read.
+    """One reading of a corpus: what it held, the authored text it held, and how to prove it still
+    holds it.
 
-    The two travel together because they have to be one observation. A digest and a later
+    The first two travel together because they have to be one observation. A digest and a later
     ``specs.json`` read are two, and the gap between them is a corpus that can change: the env
     fixed its fingerprint and its cache names from the first and then went on serving instructions
     and dates read from the second, so an in-place edit served authored text under an identity
     that had never seen it. Here the spec is parsed from the very bytes the digest was computed
     over, so ``digest`` states what ``specs`` came from and there is no window between them to
-    edit."""
+    edit.
+
+    **``units`` is what closes the same gap for everything the digest is not made of.** Holding a
+    task's *text* was never enough: derivation copies a task's databases and its ground truth out
+    of the live corpus, and it copies the shared base out of it too, so a corpus edited after
+    construction could still put changed bytes into a served world and into the tree it is graded
+    against, under the unchanged ``config_digest`` computed before the edit. Rehashing all 183 MB
+    before every task is a second and a half nobody can pay per episode. So the one walk that
+    computes the whole digest also records a digest per *unit*, a unit being one task or one
+    top-level entry of ``data``, and derivation checks the unit it is about to read (see
+    :meth:`verify`)."""
 
     #: What the whole of ``data`` held, as sixteen hex characters.
     digest: str
     #: Task id to its shipped specification, for the tasks that were asked for and no others.
     specs: Dict[str, Dict[str, Any]]
+    #: Unit name to what that unit held, as sixteen hex characters. A unit is ``tasks/<task_id>``
+    #: or a top-level name under ``data``; the whole corpus is partitioned by them.
+    units: Dict[str, str]
+
+    def verify(self, root: Path, unit: str) -> None:
+        """Refuse to derive from bytes that are not the ones this snapshot read.
+
+        **What this verifies:** that every regular file under ``data/<unit>`` of the corpus at
+        ``root`` is byte-for-byte what it was when this snapshot was taken, path for path. For a
+        task that is its ``specs.json``, its databases and its ground truth, which is the whole of
+        what deriving that task reads. For a shared entry it is every file of it.
+
+        **What it does not:** anything outside the named unit, and the instant after it returns. A
+        corpus edited *during* the derivation it guards is not covered, and cannot be by anything
+        short of a copy taken under the same lock. What it removes is the window that mattered,
+        which was measured in minutes and episodes rather than in the microseconds between this
+        check and the read that follows it: an env states its identity once at construction and
+        then derives tasks lazily, first-use, for as long as the run lasts.
+
+        Cost is the unit's own size: about a millisecond for a task's 32 KB, paid once per task on
+        the cold path and never on the warm one, because derivation asks nothing of a task that is
+        already on disk."""
+        held = self.units.get(unit)
+        found = _unit_digest(root / "data", unit)
+        if held is None or found != held:
+            raise ProvisioningError(
+                f"the corpus at {root} no longer holds the {unit} this run was built against "
+                f"(read as {held or 'absent'}, now {found or 'absent'}); every task, every "
+                "database and every ground truth in the measurement comes out of these bytes, so "
+                "this refuses to derive from them rather than serving a world the run's identity "
+                "has never seen"
+            )
 
 
 def corpus_digest(root: Path) -> str:
@@ -707,11 +940,18 @@ def corpus_snapshot(root: Path, *, task_ids: Sequence[str]) -> CorpusSnapshot:
     for what the two-observation version let through.
 
     A named task whose spec the walk never reached is a manifest and a corpus that disagree, which
-    is refused here rather than at the two-hundredth episode of a run."""
+    is refused here rather than at the two-hundredth episode of a run.
+
+    **The same walk also records what each unit held on its own**, so that a derivation months of
+    episodes later can prove the bytes it is about to copy are still the ones this reading saw
+    without rehashing the corpus (see :meth:`CorpusSnapshot.verify`). It costs a second hash
+    update over bytes already in memory, about a tenth of a second on this corpus, and a
+    dictionary of a few hundred entries."""
     digest = hashlib.sha256()
     data = root / "data"
     wanted = set(task_ids)
     specs: Dict[str, Dict[str, Any]] = {}
+    units: Dict[str, Any] = {}
     for path in sorted(data.rglob("*")):
         if path.is_symlink():
             # **Refused rather than skipped.** A skipped link is a file the digest does not cover
@@ -727,7 +967,6 @@ def corpus_snapshot(root: Path, *, task_ids: Sequence[str]) -> CorpusSnapshot:
         if not path.is_file():
             continue
         relative = path.relative_to(data)
-        digest.update(str(relative).encode())
         # `tasks/<task_id>/specs.json` and nothing else: a `specs.json` anywhere else in the tree
         # is not a task's, and a task not asked for is not read into memory.
         keeping = (
@@ -736,17 +975,10 @@ def corpus_snapshot(root: Path, *, task_ids: Sequence[str]) -> CorpusSnapshot:
             and relative.parts[2] == "specs.json"
             and relative.parts[1] in wanted
         )
-        blocks: List[bytes] = []
-        with path.open("rb") as handle:
-            while True:
-                block = handle.read(1 << 20)
-                if not block:
-                    break
-                digest.update(block)
-                if keeping:
-                    blocks.append(block)
+        unit = units.setdefault(_unit_of(relative), hashlib.sha256())
+        kept = _absorb((digest, unit), str(relative), path, keep=keeping)
         if keeping:
-            specs[relative.parts[1]] = json.loads(b"".join(blocks))
+            specs[relative.parts[1]] = json.loads(kept)
     missing = sorted(wanted - set(specs))
     if missing:
         raise ProvisioningError(
@@ -754,7 +986,76 @@ def corpus_snapshot(root: Path, *, task_ids: Sequence[str]) -> CorpusSnapshot:
             f"serves (first: {missing[0]}); the manifest at {MANIFEST} and this corpus are not "
             "describing the same split"
         )
-    return CorpusSnapshot(digest=digest.hexdigest()[:16], specs=specs)
+    return CorpusSnapshot(
+        digest=digest.hexdigest()[:16],
+        specs=specs,
+        units={name: unit.hexdigest()[:16] for name, unit in units.items()},
+    )
+
+
+def _unit_of(relative: Path) -> str:
+    """Which unit of a corpus a file belongs to: its task, or its top-level entry.
+
+    One task per unit rather than one for the whole task tree, because that is the granularity
+    derivation works at: a task is materialised on its first use and the rest of the tree is not
+    touched, so a check at task granularity is a millisecond and a check at tree granularity is a
+    second and a half."""
+    head, *rest = relative.parts
+    if head == "tasks" and rest:
+        return f"tasks/{rest[0]}"
+    return head
+
+
+def _absorb(
+    material: "Sequence[Any]", relative: str, path: Path, *, keep: bool = False
+) -> bytes:
+    """Fold one file's name and content into every hasher given, and hand back the bytes if asked.
+
+    One definition, used by the walk that reads a whole corpus and by the check that re-reads one
+    unit of it. They have to agree byte for byte on what a file contributes or the second would
+    report a corpus that never changed as changed, and a check that cries wolf is a check somebody
+    turns off."""
+    for hasher in material:
+        hasher.update(relative.encode())
+    kept: List[bytes] = []
+    with path.open("rb") as handle:
+        while True:
+            block = handle.read(1 << 20)
+            if not block:
+                break
+            for hasher in material:
+                hasher.update(block)
+            if keep:
+                kept.append(block)
+    return b"".join(kept)
+
+
+def _unit_digest(data: Path, unit: str) -> Optional[str]:
+    """Re-read one unit of a corpus exactly as :func:`corpus_snapshot` read it.
+
+    ``None`` where there is nothing readable to state a digest over: the unit is gone, or
+    something in it is a symbolic link, which the whole-corpus walk refuses outright rather than
+    hashes. Both are answered by the caller as a mismatch, because a unit that cannot be read is
+    not a unit that was proved unchanged."""
+    top = data / unit
+    try:
+        mode = top.lstat().st_mode
+    except OSError:
+        return None
+    if stat.S_ISLNK(mode):
+        return None
+    material = hashlib.sha256()
+    paths = sorted(top.rglob("*")) if stat.S_ISDIR(mode) else [top]
+    for path in paths:
+        if path.is_symlink():
+            return None
+        if not path.is_file():
+            continue
+        try:
+            _absorb((material,), str(path.relative_to(data)), path)
+        except OSError:
+            return None
+    return material.hexdigest()[:16]
 
 
 def episode_outputs(session_id: str) -> Path:
@@ -830,27 +1131,61 @@ def _private_tag() -> str:
     return published
 
 
+def _generator_sources() -> Tuple[Path, ...]:
+    """The files whose bytes decide what a derived corpus holds.
+
+    What a backlog is drawn as (``ledger``), what a derived tree is made of and what the seeded
+    rows say (``world``), and how those rows are actually written into a task's database log
+    (``worker``)."""
+    here = Path(__file__).parent
+    return tuple(here / name for name in ("ledger.py", "world.py", "worker.py"))
+
+
 @lru_cache(maxsize=1)
 def _generator_digest() -> str:
-    """Eight hex characters over everything that decides what a backlog looks like."""
+    """Eight hex characters over everything that decides what a backlog looks like: the constants
+    it is drawn from, and the code that draws it.
+
+    **The implementation as well as its constants, which it was not.** This hashed eleven values
+    out of :mod:`~shogym.envs.appworld.ledger` and nothing else, so an edit to *how* a backlog is
+    drawn, how a task is materialised or how a seeded row is written left every one of them alone
+    and left this digest alone with them. The cache the digest names is the world every episode of
+    a task starts in and the baseline it is graded against, so an unchanged key meant a new
+    generator comparing itself against rows an old one had seeded, silently and for the life of
+    the cache.
+
+    Read off the files rather than declared in a constant somebody has to remember to bump, which
+    is the failure this is fixing rather than a variant of it. The price is that an edit anywhere
+    in those three files, a comment included, derives the corpus again: a few minutes once, in the
+    direction that cannot be wrong. The constants are still hashed on their own, so that moving
+    one out of ``ledger.py`` cannot quietly take it out of the key.
+
+    Memoized, because it reads three files and nothing under it can change inside a process."""
     from shogym.envs.appworld import ledger
 
-    material = repr(
-        (
-            ledger.ROLES,
-            ledger.BASIS_OPTIONS,
-            ledger.BOUNDARY_OPTIONS,
-            ledger.MISSING_OPTIONS,
-            ledger.CUTS,
-            ledger.BANDS,
-            ledger.SECTIONS,
-            ledger.SPAN,
-            ledger.DATED,
-            ledger.UNDATED,
-            ledger.ATTEMPTS,
-        )
+    material = hashlib.sha256()
+    material.update(
+        repr(
+            (
+                ledger.ROLES,
+                ledger.BASIS_OPTIONS,
+                ledger.BOUNDARY_OPTIONS,
+                ledger.MISSING_OPTIONS,
+                ledger.CUTS,
+                ledger.BANDS,
+                ledger.SECTIONS,
+                ledger.SPAN,
+                ledger.DATED,
+                ledger.UNDATED,
+                ledger.ATTEMPTS,
+            )
+        ).encode()
     )
-    return hashlib.sha256(material.encode()).hexdigest()[:8]
+    for source in _generator_sources():
+        material.update(source.name.encode())
+        material.update(b"\0")
+        material.update(source.read_bytes())
+    return material.hexdigest()[:8]
 
 
 # ----- one episode's worker -----
@@ -869,12 +1204,29 @@ _ENV_ALLOW_LIST: Tuple[str, ...] = ("PATH", "LANG", "LC_ALL", "LC_CTYPE", "SYSTE
 
 
 def _worker_environment(scratch: Path) -> Dict[str, str]:
-    """A scrubbed environment for one worker."""
+    """A scrubbed environment for one worker.
+
+    **``PYTHONDONTWRITEBYTECODE`` is half of what makes the runtime digest's claim true**, and
+    :func:`ensure_apps` is the other half. :func:`runtime_digest` skips ``__pycache__``, and the
+    usual defence of that is that Python discards a cache whose source has changed. It discards
+    one whose recorded source *mtime and size* have changed, which is weaker than it sounds: a
+    ``.pyc`` carrying the right two numbers is executed whatever bytes are in it, so a cache
+    written or edited under the installed tree would be executable code the run's identity has
+    never read. Provisioning therefore compiles the whole interpreter with hash-based caches,
+    which the import system validates against the source's own hash rather than against its
+    timestamp; this is what stops a *new* cache being written in the default timestamp form
+    afterwards, by a worker or by anything else. Between them, every ``.pyc`` that can be
+    consulted is one whose source hash still matches a source the digest did read.
+
+    Not the same thing as ``PYTHONPYCACHEPREFIX``, which was the first attempt and which sends
+    each worker to a cache directory of its own. That is also correct and costs about three
+    seconds of recompilation on every worker start, of which an episode pays two."""
     scrubbed = {
         name: os.environ[name] for name in _ENV_ALLOW_LIST if os.environ.get(name) is not None
     }
     scrubbed["HOME"] = str(scratch)
     scrubbed["APPWORLD_CACHE"] = str(scratch / "appworld-cache")
+    scrubbed["PYTHONDONTWRITEBYTECODE"] = "1"
     return scrubbed
 
 
@@ -919,46 +1271,65 @@ class Worker:
 
         The token and the root go over stdin, which is read once and closed, rather than on the
         command line, which any code running in that process can read back off ``sys.argv`` for
-        the life of it."""
+        the life of it.
+
+        **Nothing escapes this without an owner.** Only the empty-line branch used to clean up, so
+        a handshake that failed any other way left a live worker process, its whole group, and its
+        scratch directory behind with nobody holding a reference: a stdin the child never read and
+        closed, a first line that is not JSON, a JSON object with no ``port`` in it, a port that is
+        not an integer. All of those happen at construction, before there is a task to file a
+        failure row against, so the run's own record would not have said either. The process, its
+        group and the scratch belong to this method until a ``Worker`` is returned, and are killed,
+        reaped and removed on every other exit.
+
+        The whole handshake is under :data:`_SPAWN_TIMEOUT_SECONDS`. The write is not, and does not
+        need to be: it is a couple of hundred bytes into an empty pipe, which cannot block."""
         token = secrets.token_urlsafe(32)
         scratch = Path(tempfile.mkdtemp(prefix="shogym-appworld-"))
-        process = subprocess.Popen(
-            [str(runtime()), str(WORKER), "serve"],
-            stdin=subprocess.PIPE,
-            stdout=subprocess.PIPE,
-            stderr=subprocess.DEVNULL,
-            text=True,
-            cwd=str(scratch),
-            env=_worker_environment(scratch),
-            # Its own process group, so stopping the episode stops everything it started. Agent
-            # code runs in this process and is free to spawn; signalling the direct child alone
-            # would leave those descendants running against the world after it was scored.
-            start_new_session=True,
-        )
-        # Read here and kept, rather than resolved from the pid later: see `pgid`.
-        pgid = _group_of(process)
-        assert process.stdin is not None
-        process.stdin.write(json.dumps({"root": str(root), "token": token}) + "\n")
-        process.stdin.flush()
-        process.stdin.close()
-        assert process.stdout is not None
-        line = _first_line(process, _SPAWN_TIMEOUT_SECONDS)
-        if not line:
-            _stop(process, signal.SIGKILL, pgid)
-            process.wait(timeout=10)
-            shutil.rmtree(scratch, ignore_errors=True)
-            raise WorkerError(
-                "the appworld worker never bound a port "
-                f"(status {process.returncode}, waited {_SPAWN_TIMEOUT_SECONDS:.0f}s)"
+        process: Optional[subprocess.Popen] = None
+        pgid: Optional[int] = None
+        published = False
+        try:
+            process = subprocess.Popen(
+                [str(runtime()), str(WORKER), "serve"],
+                stdin=subprocess.PIPE,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.DEVNULL,
+                text=True,
+                cwd=str(scratch),
+                env=_worker_environment(scratch),
+                # Its own process group, so stopping the episode stops everything it started.
+                # Agent code runs in this process and is free to spawn; signalling the direct
+                # child alone would leave those descendants running against the world after it
+                # was scored.
+                start_new_session=True,
             )
-        return cls(
-            root=root,
-            process=process,
-            port=int(json.loads(line)["port"]),
-            token=token,
-            scratch=scratch,
-            pgid=pgid,
-        )
+            # Read here and kept, rather than resolved from the pid later: see `pgid`.
+            pgid = _group_of(process)
+            assert process.stdin is not None
+            process.stdin.write(json.dumps({"root": str(root), "token": token}) + "\n")
+            process.stdin.flush()
+            process.stdin.close()
+            assert process.stdout is not None
+            line = _first_line(process, _SPAWN_TIMEOUT_SECONDS)
+            if not line:
+                raise WorkerError(
+                    "the appworld worker never bound a port "
+                    f"(status {process.poll()}, waited {_SPAWN_TIMEOUT_SECONDS:.0f}s)"
+                )
+            worker = cls(
+                root=root,
+                process=process,
+                port=int(json.loads(line)["port"]),
+                token=token,
+                scratch=scratch,
+                pgid=pgid,
+            )
+            published = True
+            return worker
+        finally:
+            if not published:
+                _abandon(process, pgid, scratch)
 
     def call(self, command: str, **body: Any) -> Any:
         """Send one command and return what the world answered."""
@@ -1492,17 +1863,81 @@ def _stop(process: subprocess.Popen, how: int, pgid: Optional[int]) -> None:
         pass
 
 
+def _abandon(process: Optional[subprocess.Popen], pgid: Optional[int], scratch: Path) -> None:
+    """Take back everything a worker that never got published was given.
+
+    Killed rather than asked to stop: a handshake that did not complete is a process that never
+    said anything, so there is nothing to be polite to and nothing that could be lost. The whole
+    group, because the leader may already have started something. Reaped, because an unreaped
+    child holds its pid and this is the one moment at which nobody else will ever wait on it. And
+    the scratch directory last, which is this worker's ``HOME``, its working directory and its
+    bytecode cache."""
+    if process is not None:
+        _stop(process, signal.SIGKILL, pgid)
+        try:
+            process.wait(timeout=_CLOSE_SECONDS)
+        except subprocess.TimeoutExpired:
+            pass
+        for stream in (process.stdin, process.stdout, process.stderr):
+            if stream is not None:
+                try:
+                    stream.close()
+                except Exception:
+                    pass
+    shutil.rmtree(scratch, ignore_errors=True)
+
+
+#: How much of a worker's first line will be read before it is refused. A handshake is one small
+#: JSON object; anything past this is a process saying something else, and a deadline alone would
+#: let it say it for the whole of the spawn timeout at whatever rate it liked.
+_HANDSHAKE_MAX_BYTES = 1 << 16
+
+
 def _first_line(process: subprocess.Popen, timeout: float) -> str:
     """The worker's first line of output, or the empty string if it does not arrive in time.
 
     ``readline`` on a pipe cannot be given a deadline, so the descriptor is waited on instead: a
     worker that dies without printing closes the pipe and is readable immediately, and one that
-    hangs on an import is caught by the deadline rather than hanging its caller with it."""
+    hangs on an import is caught by the deadline rather than hanging its caller with it.
+
+    **The whole line is under the deadline, not the first byte of it.** Waiting for readability
+    once and then calling ``readline`` bounds only the wait: readability means *some* byte arrived,
+    and the blocking read that followed it ran until a newline that a worker which wrote half a
+    line and then wedged was never going to send. That is a construction that hangs for good, on
+    the path that runs before any task exists to record a timeout against. So the descriptor is
+    waited on before every read, what is waited for is the time that is left, and each read takes
+    only what is already there.
+
+    Read off the file descriptor rather than through ``process.stdout``. A text stream buffers
+    ahead, and a ``select`` on the descriptor underneath a stream holding buffered bytes reports
+    nothing to read while the line sits in the buffer, which is the deadlock this is meant to
+    remove rather than a version of it. Nothing else reads this descriptor before the handshake."""
     assert process.stdout is not None
-    ready, _, _ = select.select([process.stdout], [], [], timeout)
-    if not ready:
-        return ""
-    return process.stdout.readline()
+    handle = process.stdout.fileno()
+    deadline = time.monotonic() + timeout
+    chunks: List[bytes] = []
+    seen = 0
+    while True:
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            return ""
+        ready, _, _ = select.select([handle], [], [], remaining)
+        if not ready:
+            return ""
+        try:
+            block = os.read(handle, 4096)
+        except OSError:
+            return ""
+        if not block:
+            # The worker closed its pipe without finishing a line, which is a worker that died.
+            return ""
+        chunks.append(block)
+        seen += len(block)
+        if b"\n" in block:
+            break
+        if seen > _HANDSHAKE_MAX_BYTES:
+            return ""
+    return b"".join(chunks).decode(errors="replace").split("\n", 1)[0] + "\n"
 
 
 __all__ = [
