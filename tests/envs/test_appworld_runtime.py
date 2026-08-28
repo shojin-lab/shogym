@@ -13,10 +13,11 @@ import asyncio
 import errno
 import json
 import os
+import subprocess
 import threading
 import time
 from pathlib import Path
-from typing import Any, Dict, List
+from typing import Any, Dict, List, Tuple
 
 import pytest
 
@@ -593,6 +594,66 @@ def test_an_output_tree_with_a_link_in_it_is_refused_rather_than_graded(tmp_path
 def test_an_episode_that_never_started_has_no_tree_to_grade(tmp_path: Path) -> None:
     with pytest.raises(adapter.SnapshotError, match="no output tree"):
         adapter.snapshot_outputs(tmp_path / "never", into=tmp_path / "into")
+
+
+def test_a_grader_that_outruns_its_bound_leaves_no_container_behind(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """The same property as the host branch's group kill, by the boundary rather than by signals.
+
+    There a grader that outran its timeout was killed as a process group, because a child it had
+    started would otherwise outlive it holding the tree. Here the grader is a container: killing
+    the local client stops nothing, and what ends everything in the namespace is removing the
+    container by name. So the assertion is that the timeout path releases it, which is one call
+    rather than a leader, a group and a race with whoever reaps it."""
+    from shogym.envs.appworld import container as container_module
+
+    released: List[str] = []
+
+    # A pipe pair with nobody on the other end: the request is written and no answer arrives,
+    # which is the shape of a grader that has stopped answering.
+    to_worker_read, to_worker_write = os.pipe()
+    from_worker_read, from_worker_write = os.pipe()
+
+    class _End:
+        def __init__(self, descriptor: int) -> None:
+            self._descriptor = descriptor
+
+        def fileno(self) -> int:
+            return self._descriptor
+
+        def close(self) -> None:
+            pass
+
+    class _Never:
+        stdout = _End(from_worker_read)
+        stdin = _End(to_worker_write)
+        stderr = None
+
+        def wait(self, timeout: float = 0.0) -> int:
+            raise subprocess.TimeoutExpired("docker", timeout)
+
+        def poll(self) -> None:
+            return None
+
+        def kill(self) -> None:
+            pass
+
+    monkeypatch.setattr(container_module, "run", lambda **kw: (_Never(), "grader-1"))
+    monkeypatch.setattr(container_module, "remove", lambda name, confirm=False: released.append(name))
+    monkeypatch.setattr(adapter, "_GRADE_TIMEOUT_SECONDS", 0.1)
+    with pytest.raises(adapter.WorkerError, match="did not finish"):
+        adapter.grade(
+            graded=tmp_path / "graded",
+            task_id="abc_1",
+            outputs=tmp_path / "outputs",
+            ignore=(),
+            filing={},
+            timeout=0.1,
+        )
+    assert released == ["grader-1"], "the grading container outlived its own bound"
+    for descriptor in (to_worker_read, to_worker_write, from_worker_read, from_worker_write):
+        os.close(descriptor)
 
 
 # ----- the caches say what they were built from -----
