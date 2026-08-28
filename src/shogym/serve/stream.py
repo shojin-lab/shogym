@@ -1891,6 +1891,21 @@ def _admitted(policy: Any) -> Optional[Tuple[str, bool, _Reveal]]:
     return None
 
 
+def _same_context(one: "contextvars.Context", other: "contextvars.Context") -> bool:
+    """Do these two contexts name the same thing?
+
+    By the variables they set and the values they set them to, which is what "the same caller"
+    means to code that reads a tenant or an auth subject out of one. Compared rather than
+    identity-checked, because every task copies its context and no two callers ever hold the same
+    object. A value that will not compare is a value this cannot vouch for, so it says no."""
+    try:
+        return {var.name: value for var, value in one.items()} == {
+            var.name: value for var, value in other.items()
+        }
+    except Exception:  # noqa: BLE001 - a comparison that raises has not established sameness
+        return False
+
+
 @dataclass
 class _Builder:
     """One queue position's env build: its episode's lifecycle, the build itself, and the context
@@ -3604,6 +3619,17 @@ class TaskStream:
         A synchronous factory has nothing to keep, so its entry carries no future and the caller
         calls it inline on its own loop, which is where that contract says it belongs."""
         held = self._builders.get(position)
+        if held is not None and not _same_context(held.context, contextvars.copy_context()):
+            # A build made for one caller is not a build for another. The constructor selected
+            # whatever its context named (a tenant, an auth subject, a connection), so handing it
+            # to a caller whose context names something else hands them another request's
+            # resources, and files the session hooks that follow under theirs. Let go of it and
+            # build the one this caller asked for.
+            del self._builders[position]
+            held.lifecycle.stop_when(
+                _discarded(held.lifecycle, held.building, held.close_context)
+            )
+            held = None
         if held is None:
             lifecycle = _Lifecycle(ref.env)
             # The constructor's context, kept with the build. A build made by one pull and
@@ -3838,24 +3864,25 @@ class TaskStream:
                 else:
                     env = self._env_for(ref.env)
             except BaseException:
-                # Not this pull's any more: the next one for this position adopts it, and a
-                # shutdown may discard it, because nobody is waiting for it now. Unless the
-                # shutdown has already been and gone: `_drop_builders` skipped this one while it
-                # was adopted and nothing scans again, so there is no later pull and no second
-                # sweep, and letting go of it here means letting go of it for good.
+                # Not this pull's any more. One decision, not two: the shutdown test and the
+                # finished-build test were independent `if`s, and when both were true the build
+                # was discarded twice, by two `_EnvClose` objects neither of which could see the
+                # other's claim.
                 held.adopted = False
-                if self._closed:
+                orphaned = (
+                    self._closed
+                    # `_drop_builders` skipped this one while it was adopted and nothing scans
+                    # again, so there is no later pull and no second sweep coming for it.
+                    or building is None
+                    or building.done()
+                    # Nothing left to hand on: a synchronous factory that raised, or a build that
+                    # has already failed. One that is merely still running stays where it is,
+                    # owed to this position.
+                )
+                if orphaned:
                     self._builders.pop(position, None)
                     held.lifecycle.stop_when(
                         _discarded(held.lifecycle, held.building, held.close_context)
-                    )
-                if building is None or building.done():
-                    # Nothing left to hand to a later pull: a synchronous factory that raised,
-                    # or a build that has already failed. The one that is merely still running
-                    # stays where it is, owed to this position.
-                    self._builders.pop(position, None)
-                    lifecycle.stop_when(
-                        _discarded(lifecycle, building, held.close_context)
                     )
                 raise
             self._builders.pop(position, None)
@@ -3873,7 +3900,12 @@ class TaskStream:
                 # raises, times out or is cancelled used to drop a built env and its lifecycle on
                 # the floor, once per retry and outside `max_in_flight`.
                 lifecycle.stop_when(
-                    _discarded_env(lifecycle, env, held.close_context)
+                    _discarded_env(
+                        lifecycle,
+                        env,
+                        held.close_context,
+                        None if self._off_loop_factory else asyncio.get_running_loop(),
+                    )
                 )
                 raise
             episode = await ServedEpisode.open_env(

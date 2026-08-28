@@ -587,6 +587,18 @@ if hasattr(os, "register_at_fork"):
     os.register_at_fork(after_in_child=_forget_recovered)
 
 
+def _too_deep(value: Any, depth: int = 0) -> bool:
+    """Is this nested past what a record may be? Iterative in the sense that matters: it stops at
+    the bound rather than at the interpreter's stack."""
+    if depth > _MAX_RECORD_DEPTH:
+        return True
+    if isinstance(value, dict):
+        return any(_too_deep(item, depth + 1) for item in value.values())
+    if isinstance(value, (list, tuple)):
+        return any(_too_deep(item, depth + 1) for item in value)
+    return False
+
+
 def _has_unwritable_number(value: Any) -> bool:
     """Is there a ``NaN`` or an infinity anywhere in here?
 
@@ -700,7 +712,20 @@ def _fsync_dir(directory: Path) -> None:
 #: constructor), or an object whose fields are the wrong shape, which raises wherever they are
 #: first used rather than where they were read. All of it means one thing to a reader, which is
 #: that this file is not a record.
-_UNREADABLE = (ValueError, TypeError, AttributeError, KeyError, IndexError, OSError)
+_UNREADABLE = (
+    ValueError,
+    TypeError,
+    AttributeError,
+    KeyError,
+    IndexError,
+    OSError,
+    RecursionError,
+)
+
+#: How deep a record may nest before this reader stops calling it a record. `json.loads` accepts
+#: far deeper than anything this store writes, and the difference is an untrusted file that loads
+#: and then raises inside the validator, which is the one exception that is not a refusal.
+_MAX_RECORD_DEPTH = 32
 
 
 def _record_from_dict(data: Dict[str, Any]) -> FinalizationRecord:
@@ -712,6 +737,12 @@ def _record_from_dict(data: Dict[str, Any]) -> FinalizationRecord:
     an episode opening against a directory shared with every session the machine has ever run."""
     if not isinstance(data, dict):
         raise TypeError(f"a finalization record is a JSON object, not {type(data).__name__}")
+    # Checked before anything walks it. A valid-looking file five hundred objects deep loads
+    # through `json.loads` and then raises `RecursionError` inside the validator below, which is
+    # not an exception this reader was refusing anything with: the pass raised, nothing was
+    # cached, and every episode after it scanned the whole store again.
+    if _too_deep(data):
+        raise ValueError("a finalization record is not nested this deep")
     for name in ("session_id", "finalization_id", "status", "source"):
         if not isinstance(data.get(name), str):
             raise TypeError(f"a record's {name} is a string, not {type(data.get(name)).__name__}")
