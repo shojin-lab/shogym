@@ -1584,12 +1584,14 @@ async def test_the_teardown_bound_is_spent_once_across_release_and_close(
     assert time.perf_counter() - started < 0.15, time.perf_counter() - started
 
 
-async def test_an_adopted_build_is_closed_under_the_context_it_was_built_in(
+async def test_a_build_is_not_handed_to_a_caller_it_was_not_made_for(
     tmp_path: Path,
 ) -> None:
-    # A build made by one pull and adopted by another was closed under the *adopting* caller's
-    # context, so an env whose constructor took a tenant-scoped resource released a different
-    # tenant's.
+    # A retained build belongs to the context it was built for. The constructor selected whatever
+    # that context named (a tenant, an auth subject, a connection), so handing it to a caller
+    # whose context names something else hands them another request's resources and files the
+    # session hooks that follow under theirs. The build is let go of, under its own context, and
+    # the new caller gets the one it asked for.
     seen: Dict[str, Any] = {}
     release = threading.Event()
     made = threading.Event()
@@ -1624,12 +1626,11 @@ async def test_an_adopted_build_is_closed_under_the_context_it_was_built_in(
     async with stream:
         await stream.get_task()
         await stream.dispatch(SUBMIT_TOOL, {"answer": "4"})
-    # Two envs are built here: the catalog instance, inside the constructor, and the served one,
-    # which the first pull started and the second adopted. The served one closes first, when its
-    # task is sealed, and that is the close this is about. (The catalog env is closed by `aclose`
-    # under whatever context that caller has, which is a different question.)
-    assert seen["built"] == ["tenant-a", "tenant-a"], seen
-    assert seen["closed"][0] == "tenant-a", seen
+    # Three builds: the catalog one, tenant-a's abandoned one, and tenant-b's own. Never two
+    # callers on one env.
+    assert seen["built"] == ["tenant-a", "tenant-a", "tenant-b"], seen
+    # And tenant-a's is released under tenant-a, which is the whole reason the builder keeps it.
+    assert _until(lambda: "tenant-a" in seen.get("closed", [])), seen
 
 
 async def test_a_cancelled_pull_does_not_open_a_span_it_cannot_close(tmp_path: Path) -> None:
@@ -1863,3 +1864,87 @@ def test_a_record_that_names_another_file_is_not_a_record(tmp_path: Path) -> Non
     good = store.read("b")
     assert good.status == "FINALIZED"
     assert good.verdict == {"correct": True}
+
+
+def test_a_record_too_deep_to_walk_is_quarantined_rather_than_raising(
+    tmp_path: Path,
+) -> None:
+    # `json.loads` accepts far deeper than anything this store writes, so a valid-looking file
+    # five hundred objects deep loaded and then raised `RecursionError` inside the validator,
+    # which was not an exception this reader refused anything with: the pass raised, nothing was
+    # cached, and every episode after it scanned the whole store again.
+    directory = tmp_path / "finalizations"
+    directory.mkdir(parents=True)
+    nested: Any = {"value": 1}
+    for _ in range(500):
+        nested = {"deeper": nested}
+    (directory / "finalization-deep.json").write_text(
+        json.dumps(
+            {
+                "session_id": "s", "finalization_id": "f-deep", "status": "PENDING",
+                "source": "explicit_tool", "provenance": nested,
+            }
+        ),
+        encoding="utf-8",
+    )
+    store = FinalizationStore(directory)
+    assert store.load_all() == []
+    with pytest.warns(RuntimeWarning, match="are not finalization records"):
+        assert store.recover_once() == []
+    with _reads_counted(store) as reads:
+        assert store.recover_once() == []
+    assert reads["full"] == 0
+
+
+async def test_an_abandoned_factory_that_fails_does_not_join_its_own_thread() -> None:
+    # The build's completion callback runs on the lifecycle thread, and asking that thread to
+    # stop itself with a join is asking it to join itself: Python answers `RuntimeError: cannot
+    # join current thread`, out of a future callback nobody reads.
+    def failing() -> Any:
+        time.sleep(0.3)
+        raise RuntimeError("the factory failed late")
+
+    lifecycle = episode_module._Lifecycle("probe")
+    building = asyncio.ensure_future(episode_module._built(failing, lifecycle))
+    await asyncio.sleep(0.02)
+    building.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await building
+    assert _until(lambda: not lifecycle.running)
+
+
+async def test_a_cancelled_pull_and_a_shutdown_close_a_build_once(tmp_path: Path) -> None:
+    # The shutdown test and the finished-build test were independent, so a build that satisfied
+    # both was discarded twice, by two owners neither of which could see the other's claim.
+    closes = {"n": 0}
+    made = threading.Event()
+    release = threading.Event()
+
+    class _Counting(_FixtureScoreEnv):
+        async def _close(self) -> None:
+            closes["n"] += 1
+
+    def factory(_name: str) -> _Counting:
+        made.set()
+        release.wait(10.0)
+        return _Counting(tasks=list(TASKS))
+
+    release.set()
+    stream = TaskStream(
+        factory, [TaskRef(ENV_NAME, 0)], prov_dir=tmp_path / "prov", off_loop_factory=True
+    )
+    made.clear()
+    release.clear()
+    pull = asyncio.ensure_future(stream.get_task())
+    assert await asyncio.to_thread(made.wait, 5.0)
+    closing = asyncio.ensure_future(stream.aclose())
+    await asyncio.sleep(0.05)
+    release.set()  # the build lands while the pull is still adopted
+    await asyncio.sleep(0.05)
+    pull.cancel()
+    with contextlib.suppress(BaseException):
+        await pull
+    with contextlib.suppress(BaseException):
+        await closing
+    await asyncio.sleep(0.3)
+    assert closes["n"] <= 2, closes  # the catalog env, and the served one exactly once
