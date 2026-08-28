@@ -231,15 +231,14 @@ def _unpack_in_container(staging: Path, bundle_name: str) -> None:
     try:
         finished = process.wait(timeout=_DOWNLOAD_TIMEOUT_SECONDS)
     except subprocess.TimeoutExpired:
-        container.remove(name)
-        process.kill()
+        _release(process, name)
         raise ProvisioningError(
             f"unpacking the data bundle did not finish within {_DOWNLOAD_TIMEOUT_SECONDS:.0f}s"
         ) from None
-    finally:
+    else:
         _close_pipes(process)
     if finished != 0:
-        container.remove(name)
+        _release(process, name)
         raise ProvisioningError(f"unpacking the data bundle failed (status {finished})")
 
 
@@ -813,6 +812,30 @@ def _send(process: subprocess.Popen, payload: Dict[str, Any]) -> None:
     process.stdin.flush()
 
 
+def _release(process: subprocess.Popen, name: str) -> None:
+    """Give up a container and the local client together, and never raise doing it.
+
+    The ordering is deliberate and so is the ``finally``: the container is what holds a mount, so
+    it goes first, and the pipes and the child are this process's own, so they go whatever the
+    daemon said. A removal nobody could confirm is handed to the sweep by name, because the
+    ordinary sweep skips a container whose parent is still alive and here the parent is."""
+    try:
+        if not container.remove(name):
+            container.disowned(name)
+    except container.DockerError:
+        container.disowned(name)
+    finally:
+        try:
+            process.kill()
+        except OSError:
+            pass
+        try:
+            process.wait(timeout=_CLOSE_SECONDS)
+        except (subprocess.TimeoutExpired, OSError):
+            pass
+        _close_pipes(process)
+
+
 def _close_pipes(process: subprocess.Popen) -> None:
     for stream in (process.stdin, process.stdout, process.stderr):
         if stream is not None:
@@ -928,20 +951,37 @@ class Worker:
         frames = _Frames(process.stdout.fileno())
         try:
             opening = frames.frame(_SPAWN_TIMEOUT_SECONDS)
-        except (TimeoutError, EOFError, ValueError) as exc:
-            container.remove(name)
-            process.kill()
-            _close_pipes(process)
+        except (TimeoutError, EOFError, ValueError, FramingError) as exc:
+            # The container first, the local process and its pipes whatever that did. Removal can
+            # raise on a control timeout, and everything after it used to be skipped: no worker
+            # was returned, so nothing else was going to release the pipes, and the ordinary sweep
+            # skips a labelled container whose parent is alive.
+            _release(process, name)
             raise WorkerError(
                 f"the appworld worker container never became ready ({type(exc).__name__}: {exc}); "
                 f"waited {_SPAWN_TIMEOUT_SECONDS:.0f}s"
             ) from exc
         if not opening.get("ready"):
-            container.remove(name)
-            process.kill()
-            _close_pipes(process)
+            _release(process, name)
             raise WorkerError(f"the appworld worker answered {opening!r} instead of ready")
         return cls(root=root, process=process, container=name, frames=frames)
+
+    def settle(self, timeout: float) -> bool:
+        """Wait, bounded, for whatever call is running to finish, and say whether it did.
+
+        **A terminal may overtake an ordinary call**, which the serve layer does on purpose: a
+        deadline has to be able to end an episode whose block is not coming back. What must not
+        follow is stopping the container while upstream is in the middle of the save it ends every
+        block with, because that leaves a tree that is stable and partial and a grade taken over
+        it is a grade of half a save.
+
+        So finalization asks first. The lock is held for the length of a call, so acquiring it is
+        the fact that no call is in flight; failing to acquire it inside the bound is the fact that
+        one is, and the caller poisons rather than stopping."""
+        if self.lock.acquire(timeout=max(0.0, timeout)):
+            self.lock.release()
+            return True
+        return False
 
     def _stop_after_failure(self) -> None:
         """Remove the container, and say nothing untrue about whether it went.
@@ -1030,6 +1070,10 @@ class Worker:
                 self._stop_after_failure()
                 raise WorkerError(f"the appworld worker: {self.poisoned}") from exc
         if "error" in answer:
+            # **Poisoned, because what it did before it failed is unknown.** Upstream returns an
+            # agent's own exceptions as output, so an error on this channel is the worker's own
+            # handling going wrong, and every command ends with a save this cannot say happened.
+            self.poisoned = f"{command!r} failed inside the world: {answer['error']}"
             raise WorkerError(f"appworld worker refused {command!r}: {answer['error']}")
         return answer["output"]
 
@@ -1103,19 +1147,16 @@ def _one_shot(
         _send(process, {"body": body})
         answer = frames.frame(timeout)
     except TimeoutError as exc:
-        container.remove(name)
-        process.kill()
+        _release(process, name)
         raise WorkerError(f"{what} did not finish within {timeout:.0f}s; it was killed") from exc
-    except (BrokenPipeError, EOFError, ValueError) as exc:
-        container.remove(name)
-        process.kill()
+    except (BrokenPipeError, EOFError, ValueError, FramingError) as exc:
+        _release(process, name)
         raise WorkerError(f"{what} failed: {type(exc).__name__}: {exc}") from exc
-    finally:
+    else:
         try:
             process.wait(timeout=_CLOSE_SECONDS)
         except subprocess.TimeoutExpired:
-            container.remove(name)
-            process.kill()
+            _release(process, name)
         _close_pipes(process)
     if "error" in answer:
         raise WorkerError(f"{what} failed: {answer['error']}")
@@ -1164,6 +1205,39 @@ _SNAPSHOT_MAX_NODES = 20_000
 _SNAPSHOT_MAX_BYTES = 1 << 30
 _SNAPSHOT_MAX_DEPTH = 24
 _SNAPSHOT_SECONDS = 60.0
+
+
+#: How much of one file is copied between two checks of the clock and the abandon flag. A
+#: permitted file may be a gibibyte, and one `copyfile` of it is one uninterruptible operation
+#: that can outlast the bound this function advertises.
+_SNAPSHOT_CHUNK = 4 * 1024 * 1024
+
+
+def _copy_bounded(
+    source: Path,
+    target: Path,
+    *,
+    began: float,
+    stop: "Optional[threading.Event]",
+    seen: int,
+) -> int:
+    """Copy one file in pieces, checking the deadline and the abandon flag between them.
+
+    `shutil.copyfile` on a permitted file runs to completion whatever the clock says, so a single
+    large file could take the whole snapshot past the time it promises and a cancelled
+    finalization could not stop it until the file finished. Returns the running byte total."""
+    with open(source, "rb") as reading, open(target, "wb") as writing:
+        while True:
+            if stop is not None and stop.is_set():
+                raise SnapshotError("the snapshot was abandoned before it finished")
+            if time.monotonic() - began > _SNAPSHOT_SECONDS:
+                raise SnapshotError(
+                    f"the episode's output tree took longer than {_SNAPSHOT_SECONDS:.0f}s to copy"
+                )
+            chunk = reading.read(_SNAPSHOT_CHUNK)
+            if not chunk:
+                return seen
+            writing.write(chunk)
 
 
 def snapshot_outputs(
@@ -1219,38 +1293,101 @@ def snapshot_outputs(
             raise SnapshotError(
                 f"the episode's output tree is deeper than {_SNAPSHOT_MAX_DEPTH} directories"
             )
-        for entry in sorted(source.iterdir()):
-            if stop is not None and stop.is_set():
-                raise SnapshotError("the snapshot was abandoned before it finished")
-            if time.monotonic() - began > _SNAPSHOT_SECONDS:
-                raise SnapshotError(
-                    f"the episode's output tree took longer than {_SNAPSHOT_SECONDS:.0f}s to copy"
-                )
-            nodes += 1
-            if nodes > _SNAPSHOT_MAX_NODES:
-                raise SnapshotError(
-                    f"the episode's output tree holds more than {_SNAPSHOT_MAX_NODES} entries"
-                )
-            if entry.is_symlink():
-                raise SnapshotError(
-                    f"the episode left a symbolic link in its output tree ({entry.name} -> "
-                    f"{os.readlink(entry)}), which a grader must not resolve"
-                )
-            if entry.is_dir():
-                (target / entry.name).mkdir()
-                pending.append((entry, target / entry.name, depth + 1))
-                continue
-            if not entry.is_file():
-                raise SnapshotError(
-                    f"the episode left {entry.name}, which is not a file or directory"
-                )
-            total += entry.stat().st_size
-            if total > _SNAPSHOT_MAX_BYTES:
-                raise SnapshotError(
-                    f"the episode's output tree is larger than {_SNAPSHOT_MAX_BYTES} bytes"
-                )
-            shutil.copyfile(entry, target / entry.name, follow_symlinks=False)
+        # **Enumerated lazily, and never sorted first.** `sorted(iterdir())` reads a whole
+        # directory into memory and orders it before any bound is consulted, so one wide directory
+        # an episode wrote was fully materialised before the refusal that exists to stop it. A
+        # `scandir` iterator hands over one entry at a time, so the bounds apply to the walk rather
+        # than only to what the walk found.
+        with os.scandir(source) as entries:
+            for entry in entries:
+                if stop is not None and stop.is_set():
+                    raise SnapshotError("the snapshot was abandoned before it finished")
+                if time.monotonic() - began > _SNAPSHOT_SECONDS:
+                    raise SnapshotError(
+                        f"the episode's output tree took longer than {_SNAPSHOT_SECONDS:.0f}s "
+                        "to copy"
+                    )
+                nodes += 1
+                if nodes > _SNAPSHOT_MAX_NODES:
+                    raise SnapshotError(
+                        f"the episode's output tree holds more than {_SNAPSHOT_MAX_NODES} entries"
+                    )
+                here = Path(entry.path)
+                if entry.is_symlink():
+                    raise SnapshotError(
+                        f"the episode left a symbolic link in its output tree ({entry.name} -> "
+                        f"{os.readlink(here)}), which a grader must not resolve"
+                    )
+                if entry.is_dir(follow_symlinks=False):
+                    (target / entry.name).mkdir()
+                    pending.append((here, target / entry.name, depth + 1))
+                    continue
+                if not entry.is_file(follow_symlinks=False):
+                    raise SnapshotError(
+                        f"the episode left {entry.name}, which is not a file or directory"
+                    )
+                total += entry.stat(follow_symlinks=False).st_size
+                if total > _SNAPSHOT_MAX_BYTES:
+                    raise SnapshotError(
+                        f"the episode's output tree is larger than {_SNAPSHOT_MAX_BYTES} bytes"
+                    )
+                total = _copy_bounded(here, target / entry.name, began=began, stop=stop, seen=total)
     return into
+
+
+def verify_snapshot(snapshot: Path, *, task_id: str, expected: Path) -> None:
+    """Refuse a snapshot that is not a whole save, whatever stopped the world.
+
+    **The reply that says a block finished cannot be trusted, so completeness is checked rather
+    than believed.** The protocol's writer stays open in the interpreter that runs agent-authored
+    code, and upstream disables its own guard before the save that ends every block, so a frame
+    can reach the parent while the real save is still running. What the host can do about that is
+    not to believe the frame: it looks at what is on the stopped tree and refuses anything that is
+    not a complete set of database logs.
+
+    Upstream's saver clears its destination and writes the logs one after another, so an
+    interrupted save shows up in two ways this can see: a log the task's own inputs have and the
+    output does not, and a log whose last line was cut off mid-write. Both refuse the episode.
+
+    This is a completeness check, not an authentication: a world that ran to the end of its last
+    block and then had a thread write more is a world whose tree is complete and whose extra
+    writes are its own. What it rules out is grading half of a save."""
+    dbs = snapshot / "tasks" / task_id / "dbs"
+    if not dbs.is_dir():
+        raise SnapshotError(
+            f"the episode's snapshot has no databases at tasks/{task_id}/dbs, so what it "
+            "persisted is not a world to grade"
+        )
+    wanted = {path.name for path in expected.iterdir() if path.suffix == ".jsonl"}
+    found = {path.name for path in dbs.iterdir() if path.suffix == ".jsonl"}
+    missing = sorted(wanted - found)
+    if missing:
+        raise SnapshotError(
+            f"the episode's snapshot is missing {', '.join(missing)}; upstream's saver clears its "
+            "destination and writes the logs in sequence, so this is half of a save"
+        )
+    for path in sorted(dbs.iterdir()):
+        if path.suffix != ".jsonl":
+            continue
+        try:
+            body = path.read_bytes()
+        except OSError as exc:
+            raise SnapshotError(f"the episode's snapshot cannot read {path.name}: {exc}") from exc
+        if not body:
+            continue
+        if not body.endswith(b"\n"):
+            raise SnapshotError(
+                f"the episode's snapshot has {path.name} ending mid-line, so the save that was "
+                "writing it did not finish"
+            )
+        last = body.rsplit(b"\n", 2)[-2] if body.count(b"\n") > 1 else body.strip()
+        try:
+            json.loads(last)
+        except ValueError as exc:
+            raise SnapshotError(
+                f"the episode's snapshot has {path.name} ending in a line that is not a record "
+                f"({exc}), so the save that was writing it did not finish"
+            ) from exc
 
 
 def grade(
@@ -1329,6 +1466,7 @@ __all__ = [
     "seed",
     "served_mounts",
     "snapshot_outputs",
+    "verify_snapshot",
     "stamp_cache",
     "task_ids",
     "task_specs",

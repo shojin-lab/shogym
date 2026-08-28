@@ -139,10 +139,12 @@ TaskStream(
     [TaskRef("appworld", 0)],
     prov_dir=...,
     feedback=Information(),
-    # Pass the fingerprint. It is what makes the rows of one record one measurement, and a resume
-    # under a changed draw, payload class, block budget, corpus or worker image is refused rather
-    # than appended.
-    identity=shogym.make("appworld").config_digest,
+    # Pass the fingerprint, and whatever else about this run makes its rows one measurement. The
+    # env's digest covers the draw, the payload class, the block budget, the corpus, the worker
+    # image and the machine it was given; the deadline and the capacity are the stream's, and a
+    # record whose rows ran under two of them is a record about two different opportunities. The
+    # string is compared and never read, so what goes in it is the runner's to decide.
+    identity=f"{shogym.make('appworld').config_digest}|deadline=600.0|flight=1",
 )
 ```
 
@@ -524,6 +526,30 @@ alive, which is right for the ordinary case and wrong for a long-lived process t
 remove one and has no later chance to try. A removal that could not be confirmed records the name
 where the sweep also looks, as an append rather than a rewrite: the sweep used to read the whole
 ledger and publish a new one, which dropped a name appended in between.
+
+**A terminal may overtake a block, and finalization waits before it stops anything.** The serve
+layer lets a terminal jump the queue on purpose, so a submit can arrive while upstream is inside
+the save it ends every block with; removing the container then leaves a tree that is stable and
+partial. The accepted call is waited for, bounded, and a world that will not settle is refused
+rather than stopped underneath it.
+
+**And the wait is not the only thing standing there, because the reply that ends a call cannot be
+authenticated.** Upstream disables its own guard before that save, so a thread an earlier block
+left running can put a well-formed completion on the protocol's writer while the real save is in
+progress. What the host does about it is not believe it: the snapshot is checked for a whole set
+of database logs, none of them cut off mid-write, and an episode whose tree is half a save is
+refused. Two things follow: a forged reply earns no block, because the budget is spent when a
+request goes out, and moves no grade, because what is graded is the tree and the tree is checked.
+
+**A per-episode tree is removed when its owner is gone, never because it is old.** Every one
+carries the pid and the birth stamp of the process that made it, and a sweep asks whether that
+process is still there, which is the same question and the same evidence the container sweep
+asks. An episode can legitimately run for hours; a directory nobody has touched is not evidence
+that anybody left.
+
+**The resolver a world reads says nothing about the host.** Docker writes one from the host's or
+the daemon's configuration even under `--network none`, naming a nameserver and saying where it
+came from. There is nothing to resolve in here, so a fixed file is mounted over it.
 
 **The grader is given a snapshot, not the tree the world wrote.** The grading container mounts the
 answers, so a symlink left under the output tree would resolve inside *its* namespace. Every entry

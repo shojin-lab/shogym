@@ -63,6 +63,11 @@ _PROXY_VARIABLES: Tuple[str, ...] = tuple(
     for name in (base, base.upper())
 )
 
+#: What every worker gets for ``/etc/resolv.conf``. Docker writes one from the host's or the
+#: daemon's resolver configuration even under ``--network none``. There is no network to resolve
+#: anything on, so what that file says is host metadata and nothing else; this says nothing.
+_NEUTRAL_RESOLV = "# no resolver: this container has no network\n"
+
 #: Where one episode's own output tree is mounted, and the only writable mount a world is given.
 #: AppWorld joins its experiment name onto its own output root, so an absolute name replaces that
 #: root outright: the world is told its experiment *is* this directory, and writes its end state,
@@ -253,6 +258,22 @@ def limits() -> Tuple[str, str]:
     )
 
 
+@lru_cache(maxsize=1)
+def neutral_resolver() -> Path:
+    """A fixed ``resolv.conf`` to mount over the one Docker generates.
+
+    Written once per process into this port's cache, because a bind needs a file on the host and
+    a temporary one would have to outlive the container that mounts it."""
+    base = os.environ.get("SHOGYM_CACHE")
+    root = Path(base).expanduser().resolve() if base else Path.home() / ".cache" / "shogym"
+    home = root / "appworld"
+    home.mkdir(parents=True, exist_ok=True)
+    path = home / "neutral-resolv.conf"
+    if not path.exists() or path.read_text() != _NEUTRAL_RESOLV:
+        path.write_text(_NEUTRAL_RESOLV)
+    return path
+
+
 def _identity() -> str:
     """The uid and gid the container runs as: the host user's own.
 
@@ -356,6 +377,9 @@ def run(
     # environment because they were never offered to it.
     for key, value in sorted((environment or {}).items()):
         args += ["-e", f"{key}={value}"]
+    # Over the one the daemon generates from the host's resolver configuration. A world with no
+    # network has nothing to resolve, so what that file holds is host metadata and nothing else.
+    args += ["-v", f"{neutral_resolver()}:/etc/resolv.conf:ro"]
     for mount in mounts:
         args += ["-v", mount.as_argument()]
     # By resolved id, not by tag. The tag is what the fingerprint was resolved from, and a tag is
@@ -688,6 +712,7 @@ __all__ = [
     "Mount",
     "absent",
     "docker_available",
+    "neutral_resolver",
     "ensure_image",
     "image_identity",
     "limits",
