@@ -1954,6 +1954,20 @@ class TaskStream:
             :class:`EvalStream` rather than this argument for a run whose scores are meant to be
             evaluation-grade: the argument says what this run did, and the construction says what
             no argument could undo.
+        identity: an opaque name for the configuration this run's rows are produced under:
+            whatever makes two runs one measurement rather than two. Written into the ownership
+            claim, stamped on every dispense record and every result row, and compared before a
+            takeover. This module never reads it, only compares it: what belongs in it is a
+            property of the env and the harness rather than of the queue (see
+            :meth:`_require_identity_matches`).
+        adopt_unidentified: whether a named caller may append to a record that names no identity.
+            Off, and it has to be asked for. A directory recorded before identities existed can be
+            *read* by anyone, because it cannot say what produced it, but appending rows from a
+            named configuration to unknown ones produces a record whose mean is about neither, and
+            nothing in the unknown half can say whether that is safe. Passing this is the caller
+            saying it knows what those old rows were; it is a migration, and it makes the resumed
+            claim name this identity from then on. The alternative, and usually the better one, is
+            a fresh provenance directory.
     """
 
     def __init__(
@@ -1972,6 +1986,7 @@ class TaskStream:
         # (a `Delayed` queue, a `Noisy` generator) may not be a default for exactly that reason.
         feedback: FeedbackPolicy = Never(),
         identity: str = "",
+        adopt_unidentified: bool = False,
     ) -> None:
         if not isinstance(max_in_flight, int):
             # A capacity is a count of slots, and everything downstream reads it as one: it
@@ -2117,6 +2132,9 @@ class TaskStream:
         # written into the claim before the first dispense, stamped on every durable record, and
         # compared before a takeover, and never read (see `_require_identity_matches`).
         self._run_identity = str(identity)
+        # Whether this caller has said it knows what an unidentified record's rows were, and so
+        # may add its own named ones to them (see `_require_identity_matches`).
+        self._adopt_unidentified = bool(adopt_unidentified)
         self._reveals = reveals
         self._reveal = reveal
         # The validated names, bound to the extensions they were validated for. Uniqueness and
@@ -2686,6 +2704,23 @@ class TaskStream:
                         # a takeover means the claim it displaced, not merely no claim of its own
                         # (see :meth:`_release_claim`).
                         self._displaced = held
+                elif self.claim_path.exists():
+                    # A claim that will not parse, on the one path that is allowed to clear it.
+                    #
+                    # `_write_claim` publishes a complete payload by link now, so this file can no
+                    # longer be a publication caught half done; a directory carrying one was
+                    # written by an older head or by a filesystem that lost the bytes. Either way
+                    # the residue is unresumable on its own terms: `_read_claim` cannot make it a
+                    # dict, so the takeover above never runs, and the exclusive create below then
+                    # fails against a file that names no owner, no regime and no identity. The
+                    # answer was "claimed by another stream", permanently, for a directory whose
+                    # own run was asking to continue.
+                    #
+                    # Cleared rather than displaced: there is nothing here to check a resume
+                    # against and nothing to put back if this constructor goes on to refuse. That
+                    # is the honest cost of an unreadable claim, and it is paid only by a caller
+                    # that has already asserted the run is its own.
+                    self.claim_path.unlink(missing_ok=True)
             # The freshness refusal, here rather than before the lock, because this is the only
             # place its answer can authorise anything (see :meth:`_require_fresh_provenance`).
             # Immediately before the create, so nothing — not even the takeover above — sits
@@ -2718,16 +2753,47 @@ class TaskStream:
             self._claimed = True
 
     def _write_claim(self, payload: Mapping[str, Any]) -> None:
-        """Create the claim file holding ``payload``, or raise ``FileExistsError`` if one is
+        """Publish the claim file holding ``payload``, or raise ``FileExistsError`` if one is
         already there. **Callers hold :func:`_locked`.**
 
-        The exclusive create is the whole mechanism (see :meth:`_claim_provenance`), so it stays in
-        one place: the claim a stream takes and the claim a refused construction puts back are
-        written by the same three lines, and neither can become an ordinary open under a later
-        edit."""
-        descriptor = os.open(self.claim_path, os.O_CREAT | os.O_EXCL | os.O_WRONLY, 0o644)
-        with os.fdopen(descriptor, "w", encoding="utf-8") as handle:
-            handle.write(json.dumps(payload, allow_nan=False) + "\n")
+        The exclusive publication is the whole mechanism (see :meth:`_claim_provenance`), so it
+        stays in one place: the claim a stream takes and the claim a refused construction puts back
+        are written by the same few lines, and neither can become an ordinary open under a later
+        edit.
+
+        **Staged whole, then published by link.** This used to create the authoritative name first
+        and write the JSON into it afterwards, which made the file authoritative before it was
+        valid. Anything between the two (an interruption, a full disk, a failed close) left a
+        claim that exists and will not parse, and that is the worst state this file has: the fresh
+        path refuses on its existence, and the resume path could not displace it either, because
+        the takeover only ran on a claim it could read. A directory whose own run was asking to
+        continue was told it belonged to another stream, permanently.
+
+        So the payload is written to a staged name of this process's own, flushed to the platter,
+        and only then given the authoritative name. ``os.link`` is what makes the last step both
+        atomic and non-replacing: ``rename`` would silently overwrite a live claim, which is the
+        exclusion this whole mechanism exists to provide. What a crash can leave now is a staged
+        file that no reader consults; :meth:`_read_claim` is never pointed at one, and the next
+        publication makes its own."""
+        encoded = json.dumps(payload, allow_nan=False) + "\n"
+        # A name nothing reads, so it needs uniqueness and not unguessability: `os.urandom`
+        # rather than `secrets`, because `secrets` in this module is the source leases are minted
+        # from and a staged filename has no business drawing from that sequence.
+        staged = self.prov_dir / f".{_CLAIM_FILE}.{os.getpid()}.{os.urandom(8).hex()}"
+        try:
+            descriptor = os.open(staged, os.O_CREAT | os.O_EXCL | os.O_WRONLY, 0o644)
+            with os.fdopen(descriptor, "w", encoding="utf-8") as handle:
+                handle.write(encoded)
+                handle.flush()
+                os.fsync(handle.fileno())
+            # Atomic, and it fails rather than replaces: `FileExistsError` here is one stream
+            # finding another's claim, which is what every caller of this reads it as.
+            os.link(staged, self.claim_path)
+        finally:
+            try:
+                staged.unlink()
+            except OSError:
+                pass
 
     def _read_claim(self) -> Optional[Dict[str, Any]]:
         """Whatever is in the claim file, or ``None`` if there is nothing readable there.
@@ -3037,19 +3103,37 @@ class TaskStream:
 
         What goes in the string is the caller's to decide and opaque here: this module compares it
         and never reads it, because what makes two runs one measurement is a property of the env
-        and the harness rather than of the queue. A caller that names nothing gets the behaviour
-        it had before, and so does a record written before this field existed: an empty identity
-        matches anything, because refusing every directory recorded without one would punish the
-        record rather than the mismatch.
+        and the harness rather than of the queue.
 
-        **The wildcard runs one way only.** An old record that names no identity is accepted by
-        any caller, because it cannot say what it was. A caller that names none is *not* accepted
-        by a record that does: the record has already said what produced its rows, and appending
-        rows that decline to say makes a directory nobody can read as one run afterwards. The
-        asymmetry is the whole point. Compatibility is owed to records written before this field
-        existed, not to a caller who could name an identity now and did not."""
-        if not recorded or recorded == self._run_identity:
+        **A blank recorded identity is not a wildcard.** It used to be one, in the name of
+        compatibility with records written before this field existed, and it is the wrong shape
+        for that job: an unidentified record says *nothing* about what produced its rows, and
+        "nothing" is not evidence that a named configuration belongs beside them. A blank record
+        was therefore an open invitation to average one env's rows with another's, and the only
+        thing standing between a run and that outcome was that nobody had tried it.
+
+        What compatibility actually needs is reading such a record and continuing it *as itself*,
+        which is what a caller that also names no identity gets: blank matches blank, unchanged.
+        A caller that names one is asserting that it knows what those old rows were, and that
+        assertion is ``adopt_unidentified``. It is a migration and it reads as one; the usual
+        answer is a fresh provenance directory.
+
+        **The other asymmetry stands.** A caller that names none is not accepted by a record that
+        does: the record has already said what produced its rows, and appending rows that decline
+        to say makes a directory nobody can read as one run afterwards."""
+        if recorded == self._run_identity:
             return
+        if not recorded:
+            if not self._run_identity or self._adopt_unidentified:
+                return
+            raise ValueError(
+                f"{self.prov_dir} holds {source} that names no run identity, but this stream "
+                f"serves under {self._run_identity!r}; an unidentified record cannot say what "
+                "produced its rows, so nothing here can tell whether averaging them with this "
+                "configuration's describes anything at all. Serve into a fresh provenance "
+                "directory, or pass adopt_unidentified=True to state that those rows were this "
+                "configuration's"
+            )
         raise ValueError(
             f"{self.prov_dir} holds {source} written under run identity {recorded!r}, but this "
             f"stream serves under {self._run_identity or 'no identity'!r}; the rows of one record "
@@ -5540,6 +5624,7 @@ class EvalStream(TaskStream):
         # and pass the policy there, which is exactly the move this class exists to make visible.
         feedback: Any = _REFUSED,
         identity: str = "",
+        adopt_unidentified: bool = False,
     ) -> None:
         if feedback is not _REFUSED:
             # `Never()` is refused too, and that is the point rather than an oversight. A value
@@ -5565,6 +5650,7 @@ class EvalStream(TaskStream):
             provenance_timeout=provenance_timeout,
             feedback=Never(),
             identity=identity,
+            adopt_unidentified=adopt_unidentified,
         )
 
 

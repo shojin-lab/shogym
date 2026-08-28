@@ -177,7 +177,8 @@ class Episode:
         return {"output": self.world.execute(str(body["code"]))}
 
     def quiesce(self, body: Dict[str, Any]) -> Dict[str, Any]:
-        """Stop everything this worker started, before the state below it is read.
+        """Stop everything this worker started, before the state below it is read, and say what
+        is still running if anything is.
 
         Sealing closes the tool surface; it does not stop work an earlier `execute` left running.
         A subprocess still writing while :meth:`read` takes its filing and saves the snapshot
@@ -185,39 +186,81 @@ class Episode:
         instant of the episode ever had.
 
         Descendants only. This process is the one being asked, and killing it here would take the
-        snapshot with it, so it stays until the host closes it. What cannot be stopped is a thread
-        inside this interpreter: threads are not signallable, and an episode that left one running
-        is bounded by the host closing this process rather than by anything here."""
+        snapshot with it, so it stays until the host closes it.
+
+        **What this cannot do, it reports rather than implies.** A thread inside this interpreter
+        is not signallable, so an episode that left one running cannot be quiesced at all, only
+        observed; and a process table this cannot read is not an empty process table. Both used to
+        come back as ``stopped: 0``, which is the same answer a clean episode gives. The answer
+        now carries ``quiesced``, which is true only when the group was enumerated, the group is
+        empty, and no thread but this one is alive. :meth:`read` proves separately that the
+        pair it took is one instant, because a thread this cannot stop is exactly the thing that
+        would spoil it."""
         import os
         import signal
         import subprocess
+        import threading
         import time
 
         mine = os.getpid()
+        threads = [
+            thread.name
+            for thread in threading.enumerate()
+            if thread is not threading.main_thread() and thread.is_alive()
+        ]
         try:
             group = os.getpgid(mine)
-        except (OSError, AttributeError):
-            return {"stopped": 0}
+        except (OSError, AttributeError) as failure:
+            return {
+                "stopped": 0,
+                "descendants": [],
+                "threads": threads,
+                "quiesced": False,
+                "note": "this process is not in a readable process group: %s" % failure,
+            }
 
-        def descendants() -> List[int]:
+        def descendants() -> Optional[List[int]]:
+            """Every live process in this worker's group but this one, or ``None`` if the table
+            could not be read.
+
+            ``ps`` runs in a session of its own. It used to inherit this worker's group and so
+            appear in the very listing it was producing, which meant the group was never seen
+            empty: both settle windows ran to their five seconds on every submission, whether or
+            not the episode had left anything behind, and a terminal that would have been prompt
+            paid ten seconds for the privilege.
+
+            Exited-but-unreaped entries are not counted. A process this call killed is in the
+            table until somebody waits on it, and a zombie holds no memory, no descriptors and no
+            ability to write: counting one as unquiesced would report the success of this function
+            as its failure."""
             try:
                 listing = subprocess.run(
-                    ["ps", "-o", "pid=,pgid=", "-A"], capture_output=True, text=True, timeout=5
+                    ["ps", "-o", "pid=,pgid=,stat=", "-A"],
+                    capture_output=True,
+                    text=True,
+                    timeout=5,
+                    # Out of the group being enumerated. See above.
+                    start_new_session=True,
                 )
             except (OSError, subprocess.SubprocessError):
-                return []
+                return None
+            if listing.returncode != 0:
+                # A `ps` that ran and refused is a table this could not read. Reported as such
+                # rather than as the empty listing it hands back, which is the answer a quiet
+                # group gives.
+                return None
             found: List[int] = []
             for line in listing.stdout.splitlines():
                 fields = line.split()
-                if len(fields) == 2 and fields[1].isdigit() and fields[0].isdigit():
-                    pid, pgid = int(fields[0]), int(fields[1])
-                    if pgid == group and pid != mine:
+                if len(fields) >= 3 and fields[1].isdigit() and fields[0].isdigit():
+                    pid, pgid, state = int(fields[0]), int(fields[1]), fields[2]
+                    if pgid == group and pid != mine and not state.startswith("Z"):
                         found.append(pid)
             return found
 
         stopped = 0
+        live = descendants()
         for how in (signal.SIGTERM, signal.SIGKILL):
-            live = descendants()
             if not live:
                 break
             for pid in live:
@@ -227,9 +270,26 @@ class Episode:
                 except OSError:
                     pass
             deadline = time.monotonic() + 5
-            while descendants() and time.monotonic() < deadline:
+            live = descendants()
+            while live and time.monotonic() < deadline:
                 time.sleep(0.02)
-        return {"stopped": stopped}
+                live = descendants()
+        note = ""
+        if live is None:
+            note = "the process table could not be read, so the group is unknown rather than empty"
+        elif live:
+            note = "%d process(es) outlived SIGKILL: %s" % (len(live), sorted(live))
+        elif threads:
+            note = "thread(s) still running in this interpreter, which cannot be signalled: %s" % (
+                sorted(threads),
+            )
+        return {
+            "stopped": stopped,
+            "descendants": sorted(live or []),
+            "threads": sorted(threads),
+            "quiesced": live is not None and not live and not threads,
+            "note": note,
+        }
 
     def read(self, body: Dict[str, Any]) -> Dict[str, Any]:
         """What is in the named project, plus digests of what the world became.
@@ -242,16 +302,30 @@ class Episode:
         world's own end-state databases and one over the global generator's state.
 
         Call :meth:`quiesce` first. What is read here has to be one instant of the episode, and it
-        is not one instant if something the episode started is still writing underneath it."""
+        is not one instant if something the episode started is still writing underneath it.
+
+        **The pair is proved rather than assumed.** The filing is read off the live models and the
+        snapshot is written from those same models, so anything writing between the two makes the
+        evaluator score a state no instant of the episode had. Quiescence stops processes and
+        cannot stop threads, so the two are bracketed instead: the state is saved and digested,
+        the filing is read, and the state is saved and digested again. Equal digests mean nothing
+        touched any model across the read, which makes the filing and the snapshot the same
+        instant. Unequal digests mean the pair is not one instant, and ``stable`` says so rather
+        than a number quietly being wrong. Saving twice is what the world already does at the end
+        of every ``execute``, over a tree that is tens of kilobytes."""
         self.world.models.reset_db_home_path()
-        filing = _read_filing(self.world.models, body)
         # Flush the end state so the grader, which is a different process, has something to read.
         # AppWorld writes the *initial* state at startup and nothing after it.
         self.world._save_state(self.world.output_db_home_path_on_disk)
+        before = _directory_digest(self.world.output_db_home_path_on_disk)
+        filing = _read_filing(self.world.models, body)
+        self.world._save_state(self.world.output_db_home_path_on_disk)
+        after = _directory_digest(self.world.output_db_home_path_on_disk)
         return {
             "filing": filing,
-            "world_digest": _directory_digest(self.world.output_db_home_path_on_disk),
+            "world_digest": after,
             "rng_digest": _digest(repr(random.getstate())),
+            "stable": before == after,
         }
 
     def close(self, body: Dict[str, Any]) -> Dict[str, Any]:

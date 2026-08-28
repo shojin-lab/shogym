@@ -501,6 +501,19 @@ class Worker:
     port: int
     token: str
     scratch: Path
+    #: The group this worker leads, read once while the worker was certainly alive.
+    #:
+    #: A group used to be resolved from the stored pid at close time, and a pid is only that
+    #: process's for as long as that process exists. An ordinary episode closes its worker twice:
+    #: once when the sealed world is read, and once from teardown. Between them runs the grader,
+    #: which is allowed ten minutes, and a pid freed at the start of that window can belong to
+    #: something else by the end of it. Asked then, the kernel answers about the stranger, and the
+    #: second close signals a group this port never started. Read at spawn, the answer is about
+    #: this worker or it is nothing.
+    pgid: Optional[int] = None
+    #: Whether :meth:`close` has begun. Set before the first signal, so a close interrupted part
+    #: way through is still a worker no later call will signal for.
+    closed: bool = False
 
     @classmethod
     def spawn(cls, root: Path) -> "Worker":
@@ -524,6 +537,8 @@ class Worker:
             # would leave those descendants running against the world after it was scored.
             start_new_session=True,
         )
+        # Read here and kept, rather than resolved from the pid later: see `pgid`.
+        pgid = _group_of(process)
         assert process.stdin is not None
         process.stdin.write(json.dumps({"root": str(root), "token": token}) + "\n")
         process.stdin.flush()
@@ -531,7 +546,7 @@ class Worker:
         assert process.stdout is not None
         line = _first_line(process, _SPAWN_TIMEOUT_SECONDS)
         if not line:
-            process.kill()
+            _stop(process, signal.SIGKILL, pgid)
             process.wait(timeout=10)
             shutil.rmtree(scratch, ignore_errors=True)
             raise WorkerError(
@@ -544,6 +559,7 @@ class Worker:
             port=int(json.loads(line)["port"]),
             token=token,
             scratch=scratch,
+            pgid=pgid,
         )
 
     def call(self, command: str, **body: Any) -> Any:
@@ -573,14 +589,28 @@ class Worker:
         still alive and then wait only for that leader. A leader that had already exited left its
         children unsignalled, and a child that outlived the leader was never noticed: the world
         had been scored and something was still running in it. The group is signalled whatever the
-        leader is doing, and what is waited for is the group emptying."""
-        pgid = _group_of(self.process)
+        leader is doing, and what is waited for is the group emptying.
+
+        **Stateful, and that is what makes it idempotent.** An ordinary episode calls this twice:
+        once when the sealed world has been read, and once from teardown. It used to answer the
+        second call by asking the kernel which group the stored pid was in, and by then the pid
+        may not be this worker's: the grader runs between the two closes with ten minutes to do
+        it in, which is long enough for a freed pid to be handed out again. The second call would
+        then have signalled a stranger's group. Nothing here asks about a pid after the first
+        call: the group was read at spawn, and the flag below is set before the first signal, so
+        the second call is a return."""
+        if self.closed:
+            return
+        # Before the signals rather than after them: a close that raises part way through is
+        # still a close, and a worker signalled once must not be looked up a second time.
+        self.closed = True
+        pgid = self.pgid
         if self.process.poll() is None:
-            _stop(self.process, signal.SIGTERM)
+            _stop(self.process, signal.SIGTERM, pgid)
             try:
                 self.process.wait(timeout=_CLOSE_SECONDS)
             except subprocess.TimeoutExpired:
-                _stop(self.process, signal.SIGKILL)
+                _stop(self.process, signal.SIGKILL, pgid)
                 try:
                     self.process.wait(timeout=_CLOSE_SECONDS)
                 except subprocess.TimeoutExpired:
@@ -647,7 +677,10 @@ def grade(
 
 
 def _group_of(process: subprocess.Popen) -> Optional[int]:
-    """The worker's process group, while it is still possible to ask."""
+    """The worker's process group, asked once while the answer is still about this worker.
+
+    Called at spawn and nowhere else. A pid names a process only while that process exists, so
+    asking later is asking about whoever holds the pid then (see :attr:`Worker.pgid`)."""
     try:
         return os.getpgid(process.pid)
     except (OSError, AttributeError):
@@ -708,18 +741,32 @@ def _reap_group(pgid: int) -> None:
         time.sleep(0.02)
 
 
-def _stop(process: subprocess.Popen, how: int) -> None:
+def _stop(process: subprocess.Popen, how: int, pgid: Optional[int]) -> None:
     """Signal the worker's whole process group, or the worker alone if it has no group of its own.
 
     The group is the point: agent code runs in that process and may have started others, and a
-    signal to the direct child alone leaves them running against a world that has been scored."""
-    try:
-        os.killpg(os.getpgid(process.pid), how)
-    except (OSError, AttributeError):
+    signal to the direct child alone leaves them running against a world that has been scored.
+
+    ``pgid`` is passed in rather than looked up. The group is read once, while the process is
+    certainly alive, and a signal aimed at a group resolved from a pid afterwards is a signal
+    aimed at whoever holds that pid now (see :attr:`Worker.pgid`).
+
+    **A worker that has a group is signalled through it and through nothing else.** A ``killpg``
+    that fails on a group this worker leads means the group is empty, which is the answer "there
+    is nothing left to signal", and not an invitation to try the stored pid, which is the very
+    value that may since have been handed to somebody else. The pid is the fallback only where there
+    was never a group to begin with, which is a platform without ``setsid`` rather than a worker
+    that has finished."""
+    if pgid is not None:
         try:
-            process.send_signal(how)
-        except OSError:
+            os.killpg(pgid, how)
+        except (OSError, AttributeError):
             pass
+        return
+    try:
+        process.send_signal(how)
+    except OSError:
+        pass
 
 
 def _first_line(process: subprocess.Popen, timeout: float) -> str:

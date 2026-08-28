@@ -268,9 +268,20 @@ def derive_view(*, derived: Path, view: Path, task_id: str) -> Path:
     Symlinks here and not in :func:`derive_task`, and the difference is what they point at. A
     symlink into the *corpus* names a directory whose task folders have ``ground_truth`` siblings,
     which is a direction to the answers. These name the derived tree, which has no answers in it
-    by construction. What they do share is writability: a write through one of them still reaches
-    the shared base, so this closes cross-episode persistence in the task's own world and not in
-    the base beneath it. That remainder is the container's to close."""
+    by construction.
+
+    **The invariant, stated once.** *Nothing an episode can reach through its served root is both
+    shared with another episode and writable by this one.* The task is per episode and writable;
+    everything else is shared and read-only, sealed by :func:`_seal` when the derived base is
+    built. That is what makes the two arms of a pair comparable: the placebo arm cannot observe
+    anything its twin did, because its twin could not change anything they both read.
+
+    **What the invariant rests on, and where it stops.** It rests on file permissions, and the
+    worker runs as the user that owns those files, so code that goes looking can chmod them back.
+    An ordinary write fails, upstream itself never writes there, and cross-arm contamination by
+    accident is closed; a deliberate one is not, in the same way and for the same reason that the
+    corpus stays host-readable (see the README). shojin-lab/shogym#140 mounts the shared base into
+    the worker's container read-only, which is the boundary rather than the convention."""
     data = view / "data"
     data.mkdir(parents=True, exist_ok=True)
     for entry in sorted(derived.iterdir()):
@@ -292,24 +303,93 @@ def derive_view(*, derived: Path, view: Path, task_id: str) -> Path:
 def derive_root(*, original: Path, derived: Path) -> Path:
     """Materialise the parts of a corpus that no task changes, and return the derived root.
 
-    Hard links rather than symlinks, for the reason :func:`derive_task` gives: a symlink to the
+    Copies rather than symlinks, for the reason :func:`derive_task` gives: a symlink to the
     corpus's own ``datasets`` directory is a path to the corpus, and the corpus holds every task's
-    answers. The base databases are 129 MB and the API documentation 4.5 MB, so linking rather
-    than copying is also what makes this free."""
+    answers. The base databases are 129 MB and the API documentation 4.5 MB, so this is built once
+    per corpus and every episode's view names it rather than copying it.
+
+    **Sealed read-only, which is what lets a view name it.** Every episode's served root reaches
+    these directories, so an episode that could write to one could leave something in the next
+    episode's inputs, including the other arm of its own pair's. Upstream never writes here (it
+    reads ``base_dbs``, ``datasets`` and ``api_docs``, and writes only under the episode's own
+    output root), so read-only costs nothing and closes the ordinary write. It does not close a
+    deliberate one, because the worker runs as the user that owns these files: see
+    :func:`derive_view` for where that residual is stated and what closes it."""
     (derived / "tasks").mkdir(parents=True, exist_ok=True)
     with _locked(derived):
         for entry in sorted(original.iterdir()):
             if entry.name == "tasks":
                 continue
-            if not _complete(derived / entry.name):
+            target = derived / entry.name
+            if not _complete(target):
                 # Rebuilt rather than trusted. A directory left half copied by a crash exists, and
                 # existence was all this used to ask for, so the next process served a truncated
                 # corpus and called it ready. The marker below is written last and is what
-                # "finished" means here.
-                shutil.rmtree(derived / entry.name, ignore_errors=True)
-                _materialise(entry, derived / entry.name)
-                _mark_complete(derived / entry.name)
+                # "finished" means here. Unsealed first, because a sealed tree is a tree whose
+                # parent directories refuse the unlink.
+                _unseal(target)
+                shutil.rmtree(target, ignore_errors=True)
+                _materialise(entry, target)
+                _mark_complete(target)
+            # Sealed last and top-down last, so a read-only top is proof the whole entry was
+            # sealed. That makes the seal skippable on the warm path, which every construction
+            # takes: one `stat` per top-level entry rather than a walk of 134 MB.
+            if _sealable(target):
+                _seal(target)
     return derived
+
+
+def _sealable(target: Path) -> bool:
+    """Whether ``target`` still has a writable top, and so has not been sealed yet."""
+    try:
+        return bool(target.lstat().st_mode & 0o222)
+    except OSError:
+        return False
+
+
+def _seal(target: Path) -> None:
+    """Take the write bits off ``target`` and everything under it, children first.
+
+    Children first so that the top-level mode is the last thing to change: a caller that finds the
+    top read-only can then take it as proof the whole entry was sealed, rather than as proof that
+    a seal had begun.
+
+    A symlink is left alone rather than followed: ``chmod`` through one changes the mode of
+    whatever it names, which here would be something outside the tree being sealed. Nothing this
+    is called on is a symlink; that is the point of :func:`_materialise`, and this is what keeps
+    it true if it ever stops being."""
+    if target.is_symlink():
+        return
+    if target.is_dir():
+        for child in sorted(target.iterdir()):
+            _seal(child)
+    _chmod(target, 0o555 if target.is_dir() else 0o444)
+
+
+def _unseal(target: Path) -> None:
+    """Put the owner's write bit back on ``target`` and everything under it, top down.
+
+    Top down, because removing a file needs write permission on the directory holding it, so the
+    parent has to be writable before the child can be reached for. Symlinks are skipped, for the
+    reason :func:`_seal` gives."""
+    if target.is_symlink() or not target.exists():
+        return
+    if target.is_dir():
+        _chmod(target, 0o755)
+        for child in sorted(target.iterdir()):
+            _unseal(child)
+    else:
+        _chmod(target, 0o644)
+
+
+def _chmod(target: Path, mode: int) -> None:
+    """``chmod``, tolerating a filesystem that will not do it. A tree this could not seal is a
+    weaker guarantee and not a failed derivation: the derived corpus is still correct, and the
+    property that rests on the mode is documented as a host-side convenience either way."""
+    try:
+        os.chmod(target, mode)
+    except OSError:
+        pass
 
 
 #: Written into a materialised directory once every file under it is there. A directory without it
