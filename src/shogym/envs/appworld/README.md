@@ -147,20 +147,24 @@ TaskStream(
 
 `config_digest` covers the draw, the payload class, the block budget, every constant a payload is
 generated from, the text the agent is given (the world guide, the tool guide and the appended
-paragraph), the generator constants that decide the seeded backlog, the corpus this run actually
-serves (all of it, including the 134 MB of shared base episodes read as input), the derivation
-layout, what the worker image turned out to be rather than the release it was asked for, the cpu
-and memory a container is given, and a
+paragraph), the generator that decides the seeded backlog (its constants and the bytes of the
+three modules that implement it), the corpus this run actually serves (all of it, including the
+134 MB of shared base episodes read as input), the derivation layout, what the worker image turned
+out to be rather than the release it was asked for, the cpu and memory a container is given, and a
 hand-bumped scoring version that moves when how a score is read moves. An env serves the corpus it
 read at construction for the whole of its life: the instructions, the supervisors and the dates
 come from that one reading, so a corpus edited underneath a running env cannot put new authored
-text behind an unchanged fingerprint. A stream's `deadline` and
+text behind an unchanged fingerprint. Pinning the text is not the whole of it, because a task's
+databases and its ground truth are read when that task is first served rather than at
+construction, so each unit of the corpus is checked against what the snapshot read before it is
+derived, and a unit that moved is an episode that does not happen. A stream's `deadline` and
 `max_in_flight` belong to a run's identity too and are not an env's to know, so the stream folds
 them in itself: what a record is filed under is a structured identity whose members are the name
 passed here, the digest each env in the queue published about itself, the deadline and the
 capacity, compared member by member on every resume. The derived and grader caches are named by
-the same source digest and carry a stamp inside them saying what they were built from, so a run
-pointed at a second corpus cannot serve material derived from the first.
+that source digest, by the image that filled them and by the bytes of the generator's own modules,
+and they carry a stamp inside them saying the same, so a run pointed at a second corpus cannot
+serve material derived from the first and neither can a run whose image or whose generator moved.
 
 Passing `identity` is how a record defends itself. A directory that already names one refuses a
 resume that names a different one, and refuses a caller that names none: the record has said what

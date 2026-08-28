@@ -1353,3 +1353,238 @@ def test_a_mount_that_cannot_lock_refuses_the_builders_and_still_serves_the_down
             task_id="abc_1",
             write_log=lambda source, into: into.write_text("seeded"),
         )
+
+
+# ----- the bytes a derivation reads are the bytes the run was built against -----
+
+
+def _derivable_corpus(root: Path, *, answer: str = "the answer", shared: str = "shared") -> Path:
+    """A corpus holding one whole task: text, databases and ground truth, plus a shared base."""
+    task = root / "data" / "tasks" / "abc_1"
+    (task / "dbs").mkdir(parents=True)
+    (task / "dbs" / "gmail.jsonl").write_text("mail")
+    (task / "dbs" / "todoist.jsonl").write_text("[]")
+    (task / "ground_truth").mkdir()
+    (task / "ground_truth" / "answer.json").write_text(json.dumps(answer))
+    (task / "specs.json").write_text(
+        json.dumps(
+            {
+                "instruction": "do the thing",
+                "datetime": "2023-05-18T12:00:00",
+                "supervisor": {
+                    "first_name": "Ada",
+                    "last_name": "Lovelace",
+                    "email": "ada@example.com",
+                    "phone_number": "555",
+                },
+            }
+        )
+    )
+    (root / "data" / "version.txt").write_text("0.1.0")
+    (root / "data" / "base_dbs").mkdir()
+    (root / "data" / "base_dbs" / "big.jsonl").write_text(shared)
+    return root
+
+
+class _StubBacklog:
+    """Enough of a backlog for `world.seeding` to describe, and nothing that costs a second."""
+
+    description = "a project description"
+    requests: List[Any] = []
+
+
+class _StubSeeder:
+    """A stand-in for the seeding container, which is what writes a task's log on this branch.
+
+    Upstream's version of this test hands a worker into `_derive`; here seeding is a short-lived
+    container of its own and `adapter.seed` is what starts it, so the count is of calls to that."""
+
+    def __init__(self) -> None:
+        self.calls = 0
+
+    def __call__(self, *, root: Path, source_dbs: Path, into: Path, rows: Any) -> Any:
+        self.calls += 1
+        into.write_text("[]")
+        return {}
+
+
+def _stub_env(root: Path, tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Any:
+    """An env holding one corpus's snapshot, without the provisioning a constructor does."""
+    from functools import partial
+
+    from shogym.envs.appworld import env_v1
+
+    snapshot = adapter.corpus_snapshot(root, task_ids=("abc_1",))
+    env = env_v1.AppWorldEnv.__new__(env_v1.AppWorldEnv)
+    env._original = root / "data"
+    env._task_ids = ("abc_1",)
+    env._specs = snapshot.specs
+    env._corpus = snapshot.digest
+    env._backlogs = {}
+    env._blocks = 60
+    env._source_check = partial(snapshot.verify, root)
+    env._derived = tmp_path / "served" / "data"
+    env._graded = tmp_path / "graded" / "data"
+    monkeypatch.setattr(env_v1, "build_backlog", lambda seed, reference: _StubBacklog())
+    return env
+
+
+def test_a_task_edited_after_the_snapshot_is_not_derived_into_a_world(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Pinning a task's authored text pinned the text and nothing else it is made of.
+
+    The snapshot fixed the instruction, the supervisor and the date at construction; the
+    databases, and the ground truth the grader diffs against, went on being read out of the live
+    corpus at the moment a task was first served, which can be hours and two hundred episodes
+    later. So an in-place edit in that window built a world and a grading baseline out of bytes the
+    run's own identity had never seen, under an unchanged `config_digest`. The unit is checked
+    before it is read, and a mismatch is an episode that does not happen rather than one that is
+    scored against something else."""
+    root = _derivable_corpus(tmp_path / "corpus")
+    env = _stub_env(root, tmp_path, monkeypatch)
+    (root / "data" / "tasks" / "abc_1" / "ground_truth" / "answer.json").write_text('"moved"')
+
+    seeder = _StubSeeder()
+    monkeypatch.setattr(adapter, "seed", seeder)
+    with pytest.raises(adapter.ProvisioningError, match="no longer holds"):
+        env._derive("abc_1")
+    assert seeder.calls == 0, "nothing was written out of the changed corpus"
+    assert not (env._derived / "tasks" / "abc_1").exists()
+
+    # And the same env derives the task it was built against, so what is refused is the change.
+    (root / "data" / "tasks" / "abc_1" / "ground_truth" / "answer.json").write_text(
+        json.dumps("the answer")
+    )
+    env._derive("abc_1")
+    assert (env._derived / "tasks" / "abc_1" / "dbs" / "todoist.jsonl").exists()
+    assert (env._graded / "tasks" / "abc_1" / "ground_truth").exists()
+
+
+def test_a_shared_entry_edited_after_the_snapshot_is_not_derived_into_a_root(
+    tmp_path: Path,
+) -> None:
+    """The other derivation path, and the larger one.
+
+    `derive_root` copies the base databases and the documentation, which is 134 MB of starting
+    state every episode of the run reads as input. It read them from the live corpus with nothing
+    saying they were still what the digest had been computed over."""
+    from functools import partial
+
+    root = _derivable_corpus(tmp_path / "corpus")
+    snapshot = adapter.corpus_snapshot(root, task_ids=("abc_1",))
+    check = partial(snapshot.verify, root)
+    derived = tmp_path / "served" / "data"
+
+    (root / "data" / "base_dbs" / "big.jsonl").write_text("a different starting state")
+    with pytest.raises(adapter.ProvisioningError, match="no longer holds"):
+        world.derive_root(original=root / "data", derived=derived, verify=check)
+    assert not (derived / "base_dbs").exists()
+
+    (root / "data" / "base_dbs" / "big.jsonl").write_text("shared")
+    world.derive_root(original=root / "data", derived=derived, verify=check)
+    assert (derived / "base_dbs" / "big.jsonl").read_text() == "shared"
+
+
+# ----- what a finalizer may do before it yields -----
+
+
+async def test_a_warm_finalize_draws_its_backlog_off_the_event_loop(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The production path the synthetic loop test could not reach.
+
+    A task served for the first time draws its backlog while it is being seeded. A task already on
+    disk skips that, so the first draw happened at the top of `finalize`, synchronously, before
+    that coroutine had yielded once: between a tenth of a second and three seconds of auditing
+    depending on the task, during which every other episode on this loop is stopped and the
+    `wait_for` that is supposed to be able to time this one out cannot fire."""
+    from shogym.envs.appworld import env_v1, mcp_server
+    from shogym.serve.lifecycle import FinalizeRequest
+
+    ticks = 0
+
+    async def ticker() -> None:
+        nonlocal ticks
+        while True:
+            ticks += 1
+            await asyncio.sleep(0.005)
+
+    def _slow_draw(seed: int, reference: Any) -> Any:
+        time.sleep(0.4)
+        return _StubBacklog()
+
+    monkeypatch.setattr(env_v1, "build_backlog", _slow_draw)
+
+    class _wedged:
+        # A container this finalization cannot stop. `settle` answers first on this branch,
+        # because a terminal may overtake an ordinary call and a world in the middle of the save
+        # upstream ends every block with must not be removed underneath it.
+        poisoned = ""
+
+        def settle(self, timeout: float) -> bool:
+            return True
+
+        def close(self, *, confirm: bool = False) -> None:
+            raise adapter.WorkerError("the container could not be confirmed removed")
+
+    env = env_v1.AppWorldEnv.__new__(env_v1.AppWorldEnv)
+    env._pulse = 0
+    env._backlogs = {}
+    env._specs = {"abc_1": {"datetime": "2023-05-18T12:00:00"}}
+    mcp_server.begin_session(
+        "warm",
+        mcp_server.Session(
+            worker=_wedged(),
+            task_id="abc_1",
+            supervisor_email="ada@example.com",
+            experiment="/nowhere",
+        ),
+    )
+    beat = asyncio.create_task(ticker())
+    try:
+        with pytest.raises(adapter.WorkerError):
+            await env.finalize(
+                FinalizeRequest(
+                    source="explicit_tool", finalization_id="f", session_id="warm"
+                )
+            )
+    finally:
+        beat.cancel()
+        mcp_server.end_session("warm")
+    # A draw made from the coroutine itself would leave this at one or two.
+    assert ticks > 20, ticks
+
+
+def test_session_setup_draws_the_backlog_for_a_task_that_is_already_derived(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """And the reason the finalizer normally finds one waiting.
+
+    The draw used to happen only on the branch that seeds a cold task, so every later episode of
+    that task reached the terminal without one. The serve layer runs this hook in a thread, which
+    is where an audit that can take three seconds belongs."""
+    from shogym.envs.appworld import mcp_server
+
+    monkeypatch.setenv("SHOGYM_CACHE", str(tmp_path / "cache"))
+    root = _derivable_corpus(tmp_path / "corpus")
+    env = _stub_env(root, tmp_path, monkeypatch)
+
+    class _opened:
+        def call(self, command: str, **body: Any) -> Any:
+            return {}
+
+        def close(self, *, confirm: bool = False) -> None:
+            pass
+
+    monkeypatch.setattr(world, "already_derived", lambda **kw: True)
+    monkeypatch.setattr(world, "derive_view", lambda **kw: tmp_path / "view")
+    monkeypatch.setattr(
+        adapter.Worker, "spawn", classmethod(lambda cls, root, **kw: _opened())
+    )
+
+    try:
+        env._begin_session("warm", {"task_id": "abc_1", "supervisor_email": "ada@example.com"})
+        assert "abc_1" in env._backlogs, "the warm path drew nothing and left it to finalize"
+    finally:
+        mcp_server.end_session("warm")
