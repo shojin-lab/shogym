@@ -33,11 +33,11 @@ def test_provisioning_the_corpus_does_not_wait_on_a_lock_it_already_holds(
 ) -> None:
     """A genuinely cold machine has to get past this, and it is CI's ordinary path.
 
-    The interpreter and the corpus live under one cache directory and both were guarded by an
-    ``flock`` on it. Two ``flock`` calls through two opens are two lock requests even inside one
-    process, so provisioning the interpreter from inside the corpus's lock is a process waiting on
-    itself, with no error and no timeout. The fix is an ordering, so the test is over the
-    ordering: nothing may be locked while that same path is already held."""
+    The image build and the corpus fetch are guarded by an ``flock`` on the same cache directory.
+    Two ``flock`` calls through two opens are two lock requests even inside one process, so
+    building the image from inside the corpus's lock is a process waiting on itself, with no error
+    and no timeout. The fix is an ordering, so the test is over the ordering: nothing may be
+    locked while that same path is already held."""
     held: List[Path] = []
 
     class _recorder:
@@ -57,8 +57,7 @@ def test_provisioning_the_corpus_does_not_wait_on_a_lock_it_already_holds(
     monkeypatch.setattr(adapter, "_locked", _recorder)
 
     ordered: List[str] = []
-    monkeypatch.setattr(adapter, "runtime", lambda: ordered.append("runtime") or Path("python"))
-    monkeypatch.setattr(adapter, "ensure_apps", lambda: ordered.append("apps"))
+    monkeypatch.setattr(adapter, "ensure_image", lambda: ordered.append("image") or "image")
 
     def _fetch(root: Path) -> None:
         ordered.append("corpus")
@@ -66,8 +65,9 @@ def test_provisioning_the_corpus_does_not_wait_on_a_lock_it_already_holds(
 
     monkeypatch.setattr(adapter, "_fetch_corpus", _fetch)
     adapter.ensure_corpus()
-    # And the ordering is the one the fix is: the interpreter exists before the corpus is fetched.
-    assert ordered == ["runtime", "apps", "corpus"]
+    # And the ordering is the one the fix is: the image exists before the corpus is fetched, since
+    # the bundle is opened by a container of that image.
+    assert ordered == ["image", "corpus"]
     assert not held
 
 
@@ -397,27 +397,23 @@ def test_what_is_recorded_and_never_revealed_stays_that_way() -> None:
     assert stream_module._EPISODE_LEVEL == "episode"
 
 
-def test_a_worker_environment_carries_nothing_it_was_not_given(
-    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+def test_a_worker_container_is_given_its_whole_environment_rather_than_a_filtered_one(
+    monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """Agent-authored code runs as the worker, so everything the serving process exported is one
-    ``os.environ`` away from it unless it is taken away first."""
+    """Agent-authored code runs as the worker, so everything the serving process exported used to
+    be one ``os.environ`` away from it unless an allow-list took it away first. An allow-list is
+    the same list with a worse failure mode: a name nobody thought of still gets through.
+
+    A container is given the image's own environment and what ``docker run -e`` names, and nothing
+    else, so this is a test that the port never *offers* a host variable rather than a test that
+    it removes the ones it knows about."""
     monkeypatch.setenv("ANTHROPIC_API_KEY", "sk-secret")
     monkeypatch.setenv("OPENAI_API_KEY", "sk-also-secret")
     monkeypatch.setenv("SHOGYM_APPWORLD_PROV", "/runs/somewhere")
-    scrubbed: Dict[str, str] = adapter._worker_environment(tmp_path)
-    assert "ANTHROPIC_API_KEY" not in scrubbed
-    assert "OPENAI_API_KEY" not in scrubbed
-    assert "SHOGYM_APPWORLD_PROV" not in scrubbed
-    assert scrubbed["HOME"] == str(tmp_path)
-    # No cache is written back, which is what keeps every `.pyc` a worker can consult a hash-based
-    # one and lets the runtime digest leave `__pycache__` out and still be true about what runs.
-    assert scrubbed["PYTHONDONTWRITEBYTECODE"] == "1"
-    assert set(scrubbed) <= set(adapter._ENV_ALLOW_LIST) | {
-        "HOME",
-        "APPWORLD_CACHE",
-        "PYTHONDONTWRITEBYTECODE",
-    }
+    given: Dict[str, str] = adapter._worker_environment("/corpus")
+    assert set(given) == {"APPWORLD_ROOT", "HOME", "LANG", "PYTHONDONTWRITEBYTECODE"}
+    assert given["APPWORLD_ROOT"] == "/corpus"
+    assert "sk-secret" not in "".join(given.values())
 
 
 def test_two_episodes_of_one_task_do_not_share_their_served_inputs(tmp_path: Path) -> None:
