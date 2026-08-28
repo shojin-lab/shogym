@@ -262,15 +262,6 @@ def _verify(bundle: Path) -> None:
 
 MANIFEST = Path(__file__).with_name("task_manifest.txt")
 
-#: Bumped when the shape of a derived tree changes: what is copied, what is linked, what is
-#: sealed. It is in both cache names, so a tree built under an older layout is a different cache
-#: rather than a stale one wearing the same name.
-DERIVATION_VERSION = 1
-
-#: What a derived cache was built from, written inside it once it is complete.
-_SOURCE_FILE = ".shogym-source"
-
-
 @lru_cache(maxsize=1)
 def task_ids() -> Tuple[str, ...]:
     """The tasks this port serves, in split order.
@@ -302,30 +293,89 @@ def task_specs(root: Path, task_id: str) -> Dict[str, Any]:
     return json.loads((root / "data" / "tasks" / task_id / "specs.json").read_text())
 
 
-def derived_root(source: Optional[str] = None) -> Path:
+#: Bumped when the shape of a derived tree changes: what is copied, what is linked, what is
+#: sealed. It is in both cache names, so a tree built under an older layout is a different cache
+#: rather than a stale one wearing the same name.
+DERIVATION_VERSION = 1
+
+#: What a derived cache was built from, written inside it once it is complete.
+_SOURCE_FILE = ".shogym-source"
+
+
+def derived_root(source: Optional[str] = None, *, runtime: Optional[str] = None) -> Path:
     """Where the seeded copy of the corpus lives, named for what it was built from.
 
-    Three things are in the name, and each of them changes what the tree holds. The generator
-    digest covers the backlog generator's own constants, so changing a cut value, an option set or
-    the number of requests derives a new corpus instead of serving a stale one. The derivation
-    version covers the *layout*: what is copied, what is linked and what is sealed. And the source
-    digest covers the corpus this was derived from, which used to be missing entirely:
-    ``APPWORLD_ROOT`` takes any directory with a ``data/tasks`` in it, so a process pointed at a
-    second corpus computed a fingerprint for that one and then reused and served task material
-    derived from the first."""
-    return cache_root() / f"seeded-{DATA_VERSION}-{DERIVATION_VERSION}-{_source(source)}"
+    Four things are in the name, and each of them changes what the tree holds. The generator
+    digest covers the backlog generator's constants *and its implementation*, so changing a cut
+    value, an option set, the number of requests or the code that draws them derives a new corpus
+    instead of serving a stale one. The derivation version covers the *layout*: what is copied,
+    what is linked and what is sealed. The runtime digest covers the interpreter that wrote the
+    seeded rows, because it is the interpreter and not this process that writes them: a task's
+    database file is a replayable statement log written through upstream's own model layer, so a
+    resolved dependency that changed how a row is serialized changed the world under a name that
+    had not moved. And the source digest covers the corpus this was derived from, which used to be
+    missing entirely: ``APPWORLD_ROOT`` takes any directory with a ``data/tasks`` in it, so a
+    process pointed at a second corpus computed a fingerprint for that one and then reused and
+    served task material derived from the first.
+
+    ``runtime`` is passed in rather than read, for the reason ``source`` is: an env reads it once
+    at construction and hands the same value to both roots and to its own fingerprint, so the
+    three cannot disagree, and a caller that only wants to name a path does not have to."""
+    return cache_root() / f"seeded-{DATA_VERSION}-{DERIVATION_VERSION}-{_source(source, runtime)}"
 
 
-def _source(source: Optional[str]) -> str:
-    """The source digest a cache name is keyed by, computed from the served corpus if not given.
+def private_home() -> Path:
+    """The directory holding everything an agent's world must not be handed.
 
-    The argument exists so that the env computes this once and hands the same value to both roots;
-    the default is for callers that only want to name a path (tests, tooling) and would otherwise
-    have to reach for the corpus themselves."""
-    return f"{_generator_digest()}-{source or corpus_digest(ensure_corpus())}"
+    Not a sibling of the served root and not under this port's ordinary cache, because the served
+    root's own path is in the worker's environment and a neighbour of it is a guess away."""
+    base = cache_root().parent
+    return base.parent / f"{base.name}-private" / "appworld"
 
 
-def stamp_cache(root: Path, *, source: str) -> None:
+def graded_root(source: Optional[str] = None, *, runtime: Optional[str] = None) -> Path:
+    """Where the grader's view of the corpus lives: a private directory with an unguessable name.
+
+    **This raises the cost of finding it and does not close the route.** The worker runs as the
+    same user as the process that built this, so no directory mode keeps it out: 0700 stops other
+    users and stops nothing else. What closes it is a namespace in which the directory is not
+    mounted at all, which is a container and is not built here (see the port's README). What this
+    does is stop the tree being derivable from what the worker is given, which the previous
+    layout, a fixed name beside the served root, was."""
+    home = private_home()
+    return (
+        home
+        / f"graded-{DATA_VERSION}-{DERIVATION_VERSION}-{_source(source, runtime)}-{_private_tag()}"
+    )
+
+
+def _read_tag(keyfile: Path) -> Optional[str]:
+    """The published tag, or ``None`` if there is not a complete one there yet."""
+    try:
+        tag = keyfile.read_text().strip()
+    except FileNotFoundError:
+        return None
+    return tag if len(tag) == 16 else None
+
+
+def _source(source: Optional[str], runtime: Optional[str] = None) -> str:
+    """Everything but the layout that a cache name is keyed by: the generator, the interpreter
+    that ran it, and the corpus it read.
+
+    The arguments exist so that the env reads each of these once and hands the same values to both
+    roots and to its own fingerprint; the defaults are for callers that only want to name a path
+    (tests, tooling) and would otherwise have to reach for the corpus and the runtime
+    themselves."""
+    return "-".join(
+        (
+            _generator_digest(),
+            runtime if runtime is not None else runtime_digest(),
+            source or corpus_digest(ensure_corpus()),
+        )
+    )
+
+
+def stamp_cache(root: Path, *, source: str, runtime: str) -> None:
     """Record what a derived cache was built from, and refuse one built from something else.
 
     The name already carries the same values, so this cannot normally disagree. It is here for the
@@ -339,7 +389,14 @@ def stamp_cache(root: Path, *, source: str) -> None:
     root.mkdir(parents=True, exist_ok=True)
     stamp = root / _SOURCE_FILE
     material = json.dumps(
-        {"source": source, "derivation": DERIVATION_VERSION, "data": DATA_VERSION}, sort_keys=True
+        {
+            "source": source,
+            "runtime": runtime,
+            "generator": _generator_digest(),
+            "derivation": DERIVATION_VERSION,
+            "data": DATA_VERSION,
+        },
+        sort_keys=True,
     )
     held = ""
     try:
@@ -373,53 +430,65 @@ def stamp_cache(root: Path, *, source: str) -> None:
             pass
 
 
-def private_home() -> Path:
-    """The directory holding everything an agent's world must not be handed.
-
-    Kept out of this port's ordinary cache, and now also out of every mount an episode's container
-    is given, which is the half that makes it a boundary rather than a hiding place."""
-    base = cache_root().parent
-    return base.parent / f"{base.name}-private" / "appworld"
-
-
-def graded_root(source: Optional[str] = None) -> Path:
-    """Where the grader's view of the corpus lives: a private directory with an unguessable name.
-
-    **This raises the cost of finding it and does not close the route.** The worker runs as the
-    same user as the process that built this, so no directory mode keeps it out: 0700 stops other
-    users and stops nothing else. What closes it is a namespace in which the directory is not
-    mounted at all, which is a container and is not built here (see the port's README). What this
-    does is stop the tree being derivable from what the worker is given, which the previous
-    layout, a fixed name beside the served root, was."""
-    home = private_home()
-    return home / f"graded-{DATA_VERSION}-{DERIVATION_VERSION}-{_source(source)}-{_private_tag()}"
-
-
-def _read_tag(keyfile: Path) -> Optional[str]:
-    """The published tag, or ``None`` if there is not a complete one there yet."""
-    try:
-        tag = keyfile.read_text().strip()
-    except FileNotFoundError:
-        return None
-    return tag if len(tag) == 16 else None
-
-
 @dataclass(frozen=True)
 class CorpusSnapshot:
-    """One reading of a corpus: what it held, and the authored text it held while it was read.
+    """One reading of a corpus: what it held, the authored text it held, and how to prove it still
+    holds it.
 
-    The two travel together because they have to be one observation. A digest and a later
+    The first two travel together because they have to be one observation. A digest and a later
     ``specs.json`` read are two, and the gap between them is a corpus that can change: the env
     fixed its fingerprint and its cache names from the first and then went on serving instructions
     and dates read from the second, so an in-place edit served authored text under an identity
     that had never seen it. Here the spec is parsed from the very bytes the digest was computed
     over, so ``digest`` states what ``specs`` came from and there is no window between them to
-    edit."""
+    edit.
+
+    **``units`` is what closes the same gap for everything the digest is not made of.** Holding a
+    task's *text* was never enough: derivation copies a task's databases and its ground truth out
+    of the live corpus, and it copies the shared base out of it too, so a corpus edited after
+    construction could still put changed bytes into a served world and into the tree it is graded
+    against, under the unchanged ``config_digest`` computed before the edit. Rehashing all 183 MB
+    before every task is a second and a half nobody can pay per episode. So the one walk that
+    computes the whole digest also records a digest per *unit*, a unit being one task or one
+    top-level entry of ``data``, and derivation checks the unit it is about to read (see
+    :meth:`verify`)."""
 
     #: What the whole of ``data`` held, as sixteen hex characters.
     digest: str
     #: Task id to its shipped specification, for the tasks that were asked for and no others.
     specs: Dict[str, Dict[str, Any]]
+    #: Unit name to what that unit held, as sixteen hex characters. A unit is ``tasks/<task_id>``
+    #: or a top-level name under ``data``; the whole corpus is partitioned by them.
+    units: Dict[str, str]
+
+    def verify(self, root: Path, unit: str) -> None:
+        """Refuse to derive from bytes that are not the ones this snapshot read.
+
+        **What this verifies:** that every regular file under ``data/<unit>`` of the corpus at
+        ``root`` is byte-for-byte what it was when this snapshot was taken, path for path. For a
+        task that is its ``specs.json``, its databases and its ground truth, which is the whole of
+        what deriving that task reads. For a shared entry it is every file of it.
+
+        **What it does not:** anything outside the named unit, and the instant after it returns. A
+        corpus edited *during* the derivation it guards is not covered, and cannot be by anything
+        short of a copy taken under the same lock. What it removes is the window that mattered,
+        which was measured in minutes and episodes rather than in the microseconds between this
+        check and the read that follows it: an env states its identity once at construction and
+        then derives tasks lazily, first-use, for as long as the run lasts.
+
+        Cost is the unit's own size: about a millisecond for a task's 32 KB, paid once per task on
+        the cold path and never on the warm one, because derivation asks nothing of a task that is
+        already on disk."""
+        held = self.units.get(unit)
+        found = _unit_digest(root / "data", unit)
+        if held is None or found != held:
+            raise ProvisioningError(
+                f"the corpus at {root} no longer holds the {unit} this run was built against "
+                f"(read as {held or 'absent'}, now {found or 'absent'}); every task, every "
+                "database and every ground truth in the measurement comes out of these bytes, so "
+                "this refuses to derive from them rather than serving a world the run's identity "
+                "has never seen"
+            )
 
 
 def corpus_digest(root: Path) -> str:
@@ -460,11 +529,18 @@ def corpus_snapshot(root: Path, *, task_ids: Sequence[str]) -> CorpusSnapshot:
     for what the two-observation version let through.
 
     A named task whose spec the walk never reached is a manifest and a corpus that disagree, which
-    is refused here rather than at the two-hundredth episode of a run."""
+    is refused here rather than at the two-hundredth episode of a run.
+
+    **The same walk also records what each unit held on its own**, so that a derivation months of
+    episodes later can prove the bytes it is about to copy are still the ones this reading saw
+    without rehashing the corpus (see :meth:`CorpusSnapshot.verify`). It costs a second hash
+    update over bytes already in memory, about a tenth of a second on this corpus, and a
+    dictionary of a few hundred entries."""
     digest = hashlib.sha256()
     data = root / "data"
     wanted = set(task_ids)
     specs: Dict[str, Dict[str, Any]] = {}
+    units: Dict[str, Any] = {}
     for path in sorted(data.rglob("*")):
         if path.is_symlink():
             # **Refused rather than skipped.** A skipped link is a file the digest does not cover
@@ -480,7 +556,6 @@ def corpus_snapshot(root: Path, *, task_ids: Sequence[str]) -> CorpusSnapshot:
         if not path.is_file():
             continue
         relative = path.relative_to(data)
-        digest.update(str(relative).encode())
         # `tasks/<task_id>/specs.json` and nothing else: a `specs.json` anywhere else in the tree
         # is not a task's, and a task not asked for is not read into memory.
         keeping = (
@@ -489,17 +564,10 @@ def corpus_snapshot(root: Path, *, task_ids: Sequence[str]) -> CorpusSnapshot:
             and relative.parts[2] == "specs.json"
             and relative.parts[1] in wanted
         )
-        blocks: List[bytes] = []
-        with path.open("rb") as handle:
-            while True:
-                block = handle.read(1 << 20)
-                if not block:
-                    break
-                digest.update(block)
-                if keeping:
-                    blocks.append(block)
+        unit = units.setdefault(_unit_of(relative), hashlib.sha256())
+        kept = _absorb((digest, unit), str(relative), path, keep=keeping)
         if keeping:
-            specs[relative.parts[1]] = json.loads(b"".join(blocks))
+            specs[relative.parts[1]] = json.loads(kept)
     missing = sorted(wanted - set(specs))
     if missing:
         raise ProvisioningError(
@@ -507,7 +575,76 @@ def corpus_snapshot(root: Path, *, task_ids: Sequence[str]) -> CorpusSnapshot:
             f"serves (first: {missing[0]}); the manifest at {MANIFEST} and this corpus are not "
             "describing the same split"
         )
-    return CorpusSnapshot(digest=digest.hexdigest()[:16], specs=specs)
+    return CorpusSnapshot(
+        digest=digest.hexdigest()[:16],
+        specs=specs,
+        units={name: unit.hexdigest()[:16] for name, unit in units.items()},
+    )
+
+
+def _unit_of(relative: Path) -> str:
+    """Which unit of a corpus a file belongs to: its task, or its top-level entry.
+
+    One task per unit rather than one for the whole task tree, because that is the granularity
+    derivation works at: a task is materialised on its first use and the rest of the tree is not
+    touched, so a check at task granularity is a millisecond and a check at tree granularity is a
+    second and a half."""
+    head, *rest = relative.parts
+    if head == "tasks" and rest:
+        return f"tasks/{rest[0]}"
+    return head
+
+
+def _absorb(
+    material: "Sequence[Any]", relative: str, path: Path, *, keep: bool = False
+) -> bytes:
+    """Fold one file's name and content into every hasher given, and hand back the bytes if asked.
+
+    One definition, used by the walk that reads a whole corpus and by the check that re-reads one
+    unit of it. They have to agree byte for byte on what a file contributes or the second would
+    report a corpus that never changed as changed, and a check that cries wolf is a check somebody
+    turns off."""
+    for hasher in material:
+        hasher.update(relative.encode())
+    kept: List[bytes] = []
+    with path.open("rb") as handle:
+        while True:
+            block = handle.read(1 << 20)
+            if not block:
+                break
+            for hasher in material:
+                hasher.update(block)
+            if keep:
+                kept.append(block)
+    return b"".join(kept)
+
+
+def _unit_digest(data: Path, unit: str) -> Optional[str]:
+    """Re-read one unit of a corpus exactly as :func:`corpus_snapshot` read it.
+
+    ``None`` where there is nothing readable to state a digest over: the unit is gone, or
+    something in it is a symbolic link, which the whole-corpus walk refuses outright rather than
+    hashes. Both are answered by the caller as a mismatch, because a unit that cannot be read is
+    not a unit that was proved unchanged."""
+    top = data / unit
+    try:
+        mode = top.lstat().st_mode
+    except OSError:
+        return None
+    if stat.S_ISLNK(mode):
+        return None
+    material = hashlib.sha256()
+    paths = sorted(top.rglob("*")) if stat.S_ISDIR(mode) else [top]
+    for path in paths:
+        if path.is_symlink():
+            return None
+        if not path.is_file():
+            continue
+        try:
+            _absorb((material,), str(path.relative_to(data)), path)
+        except OSError:
+            return None
+    return material.hexdigest()[:16]
 
 
 def control_home() -> Path:
@@ -725,6 +862,16 @@ def _imported_modules(name: str, source: Path) -> "Iterator[str]":
             yield base
             for alias in node.names:
                 yield f"{base}.{alias.name}"
+
+
+def _generator_sources() -> Tuple[Path, ...]:
+    """The files whose bytes decide what a derived corpus holds.
+
+    What a backlog is drawn as (``ledger``), what a derived tree is made of and what the seeded
+    rows say (``world``), and how those rows are actually written into a task's database log
+    (``worker``)."""
+    here = Path(__file__).parent
+    return tuple(here / name for name in ("ledger.py", "world.py", "worker.py"))
 
 
 @lru_cache(maxsize=1)

@@ -46,6 +46,7 @@ import stat
 import threading
 import time
 import zlib
+from functools import partial
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, Dict, Optional, Sequence
 
@@ -201,16 +202,31 @@ class AppWorldEnv(Env):
         snapshot = adapter.corpus_snapshot(self._original.parent, task_ids=self._task_ids)
         self._corpus = snapshot.digest
         self._specs = snapshot.specs
+        # What the image turned out to be, read once here and used for three things that have to
+        # agree: both cache names, both stamps, and the run fingerprint. It is the image that
+        # writes a task's seeded database log, so a cache it did not write is a world this run did
+        # not make; and reading it twice is a second control call for an answer that cannot have
+        # changed in between.
+        self._runtime = adapter.runtime_digest()
+        # Bound to the corpus this snapshot was taken of, and handed to both derivations. A task
+        # is materialised on its first use, which can be hours and two hundred episodes after the
+        # digest above was computed, and the bytes it copies are the world an agent is served and
+        # the baseline it is graded against. Pinning the authored text was never enough for those.
+        self._source_check = partial(snapshot.verify, self._original.parent)
         served, graded = (
-            adapter.derived_root(self._corpus),
-            adapter.graded_root(self._corpus),
+            adapter.derived_root(self._corpus, runtime=self._runtime),
+            adapter.graded_root(self._corpus, runtime=self._runtime),
         )
-        adapter.stamp_cache(served, source=self._corpus)
-        adapter.stamp_cache(graded, source=self._corpus)
-        self._derived = world.derive_root(original=self._original, derived=served / "data")
+        adapter.stamp_cache(served, source=self._corpus, runtime=self._runtime)
+        adapter.stamp_cache(graded, source=self._corpus, runtime=self._runtime)
+        self._derived = world.derive_root(
+            original=self._original, derived=served / "data", verify=self._source_check
+        )
         # The grader's view of the same corpus, with the answers linked back in. Only the grading
         # process is ever given this root; the world an agent drives is given the other one.
-        self._graded = world.derive_root(original=self._original, derived=graded / "data")
+        self._graded = world.derive_root(
+            original=self._original, derived=graded / "data", verify=self._source_check
+        )
         self._backlogs: Dict[str, Any] = {}
         self.function = FunctionConfig(example_system_template=_static_instructions())
         # The step budget the serve layer enforces is one past the configured block budget, so
@@ -224,6 +240,9 @@ class AppWorldEnv(Env):
             report=self._report,
             blocks=self._blocks,
             corpus=self._corpus,
+            # Passed in rather than read again: the env has already read it, reading it is a
+            # control call, and the answer cannot have changed between the two reads.
+            runtime=self._runtime,
             # What machine an episode was given. Captured once for this process and passed to
             # every launch, so an environment changed mid-run cannot move it and a run relaunched
             # under a changed one does not pass for the earlier measurement.
@@ -318,12 +337,17 @@ class AppWorldEnv(Env):
         so a spawn that fails, a world that will not open, or anything else that raises in between
         used to leave a copied task directory, and sometimes a live worker, with nothing holding a
         reference to either: ``_end_session`` cleans up what a *published* session names, and there
-        is no published session on this path. This is the same teardown, owed by whoever failed."""
-        import shutil
-
+        is no published session on this path. Everything made here is made under one guard that
+        discards all of it, which is the same teardown, owed by whoever failed."""
         from shogym.envs.appworld import mcp_server
 
         task_id = str(task["task_id"])
+        # Drawn here rather than where a task has to be seeded. A task served a second time
+        # reached `finalize` without one and drew it there: at the top of a coroutine, on the loop
+        # every other episode is running on, for between a tenth of a second and three seconds
+        # depending on the task. This hook runs in a thread, and drawing a backlog twice is free
+        # because it is kept.
+        self._backlog(task_id, self._task_specs(task_id))
         # One output tree per episode, outside every served corpus, mounted alone into this
         # episode's container at a fixed name. The world is told its experiment *is* that
         # directory: AppWorld joins an experiment name onto its own output root, so an absolute
@@ -1152,7 +1176,13 @@ SCORING_VERSION = 4
 
 
 def run_fingerprint(
-    *, pulse: int, report: str, blocks: int, corpus: str = "", resources: str = ""
+    *,
+    pulse: int,
+    report: str,
+    blocks: int,
+    corpus: str = "",
+    resources: str = "",
+    runtime: Optional[str] = None,
 ) -> str:
     """Everything two runs must agree on for their rows to be one measurement.
 
@@ -1198,7 +1228,7 @@ def run_fingerprint(
             # The Dockerfile asks for a release and the resolver answers with a transitive set
             # that depends on the day and on the architecture, so two runs could sit under one
             # tag and one identity with different worlds underneath them.
-            adapter.runtime_digest(),
+            runtime if runtime is not None else adapter.runtime_digest(),
             adapter.MANIFEST.read_text(),
             payload.PASS_COUNTS_FILE.read_text(),
             # Every constant a published payload is generated from, and this one was missing.
