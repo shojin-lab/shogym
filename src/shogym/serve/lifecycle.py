@@ -576,6 +576,24 @@ if hasattr(os, "register_at_fork"):
     os.register_at_fork(after_in_child=_forget_recovered)
 
 
+def _has_unwritable_number(value: Any) -> bool:
+    """Is there a ``NaN`` or an infinity anywhere in here?
+
+    Recursive, because :meth:`FinalizationStore.write` is: it serialises with
+    ``allow_nan=False``, which walks the whole structure, so a check that stops at the first level
+    passes records the writer will never accept."""
+    if isinstance(value, float):
+        return not math.isfinite(value)
+    if isinstance(value, dict):
+        return any(
+            _has_unwritable_number(key) or _has_unwritable_number(item)
+            for key, item in value.items()
+        )
+    if isinstance(value, (list, tuple)):
+        return any(_has_unwritable_number(item) for item in value)
+    return False
+
+
 def _pid_alive(pid: Optional[int]) -> bool:
     """Is process ``pid`` currently alive? ``None`` (a legacy/hand-written record with no owner)
     counts as **not alive** — it belongs to no tracked live episode, so recovery may resolve it.
@@ -730,14 +748,13 @@ def _record_from_dict(data: Dict[str, Any]) -> FinalizationRecord:
         )
     # `json.loads` accepts `NaN` and `Infinity`, and the writer refuses them (`allow_nan=False`),
     # so a record carrying one can be read and never written back: recovery rewrites it, the
-    # write raises, and the same failure repeats on every pass. Refused where it is read.
+    # write raises, and the same failure repeats on every pass. Refused where it is read, and
+    # refused the way the writer refuses it: all the way down.
     for name in ("verdict", "provenance"):
-        section = data.get(name)
-        if isinstance(section, dict) and any(
-            isinstance(value, float) and not math.isfinite(value) for value in section.values()
-        ):
-            raise ValueError(f"a record's {name} carries a number JSON can be read with and "
-                             "not written back")
+        if _has_unwritable_number(data.get(name)):
+            raise ValueError(
+                f"a record's {name} carries a number JSON can be read with and not written back"
+            )
     digest = data.get("args_digest")
     if digest is not None and not isinstance(digest, str):
         raise TypeError(

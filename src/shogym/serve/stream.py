@@ -282,6 +282,7 @@ import secrets
 import time
 import weakref
 from abc import ABC, abstractmethod
+import contextvars
 from dataclasses import dataclass, field
 from pathlib import Path
 from types import MappingProxyType
@@ -1889,6 +1890,21 @@ def _admitted(policy: Any) -> Optional[Tuple[str, bool, _Reveal]]:
     return None
 
 
+@dataclass
+class _Builder:
+    """One queue position's env build: its episode's lifecycle, the build itself, and the context
+    the constructor ran under.
+
+    ``adopted`` says whether a live pull is waiting for it. It is set under the dispense lock and
+    cleared when a pull walks away, which is the difference between a build that has an owner and
+    one a shutdown may close."""
+
+    lifecycle: Any
+    building: Any
+    context: "contextvars.Context"
+    adopted: bool = False
+
+
 class TaskStream:
     """Serve a queue of env tasks: one episode per dispensed task, sealed and scored by the
     stream, one :class:`ResultRow` each.
@@ -1915,10 +1931,14 @@ class TaskStream:
             ``off_loop_factory`` says otherwise.** That is a contract and not an accident: an
             env is allowed to bind loop-affine resources in its constructor, and one that calls
             ``asyncio.get_running_loop()`` there is a supported env.
-        off_loop_factory: declare that ``env_for`` is safe to call in a worker thread: no
-            running loop, no thread-affine resources, nothing read out of a context variable
-            that the caller's context would have to supply (the context is copied, so a value
-            set before the call is still visible). Constructing an env is blocking work, and for
+        off_loop_factory: declare that ``env_for`` may be called on a loop that is not the
+            caller's: no thread-affine resources, and any loop it binds is a loop it is content
+            to be built on, served on and closed on. It is **not** a promise of no running loop:
+            the factory runs on its episode's lifecycle loop, so a constructor calling
+            ``asyncio.get_running_loop()`` gets that loop, and one calling ``asyncio.run()``
+            fails the way it would on any running loop. Context variables are carried across, so
+            a value the caller set before the call is still visible. Constructing an env is
+            blocking work, and for
             some envs it is real work (provisioning a corpus, walking and copying two views of
             it, taking a file lock), so an env that can say this gets its **per-task**
             construction moved off the serving loop, where a cold or contended one would
@@ -2412,7 +2432,7 @@ class TaskStream:
             self._dispense_lock = asyncio.Lock()
             # The env build in flight for each still-owed queue position, so a cancelled pull
             # hands its builder to the next one rather than leaving it running beside a second.
-            self._builders: Dict[int, Tuple[Any, Any]] = {}
+            self._builders: Dict[int, "_Builder"] = {}
             self._closed = False
             self._stopped: Optional[_Stopped] = None
             self._watchdog: Optional[asyncio.Task[None]] = None
@@ -3567,28 +3587,45 @@ class TaskStream:
             releasing = self._releasing = asyncio.ensure_future(self._release_stream())
         await asyncio.shield(releasing)
 
-    def _builder(self, position: int, ref: TaskRef) -> "Tuple[Any, Any]":
+    def _builder(self, position: int, ref: TaskRef) -> "_Builder":
         """The build owed to one queue position: the one already running, or a new one.
 
-        A synchronous factory has nothing to keep, so this hands back no future and the caller
+        **Adopted here, under the dispense lock, and that is what makes shutdown safe.** An entry
+        is in this map both while a live pull is awaiting it and while it is waiting for the next
+        pull after a cancellation, and those are not the same thing: a shutdown that discards the
+        first closes an env its pull is about to open a session on. The pull says which it is
+        before it lets go of the lock.
+
+        A synchronous factory has nothing to keep, so its entry carries no future and the caller
         calls it inline on its own loop, which is where that contract says it belongs."""
         held = self._builders.get(position)
-        if held is not None:
-            return held
-        lifecycle = _Lifecycle(ref.env)
-        building = (
-            lifecycle.run(_build(lambda: self._env_for(ref.env)))
-            if self._off_loop_factory
-            else None
-        )
-        held = self._builders[position] = (lifecycle, building)
+        if held is None:
+            lifecycle = _Lifecycle(ref.env)
+            # The constructor's context, kept with the build. A build made by one pull and
+            # adopted by another was closed under the *adopting* caller's context, so an env
+            # whose constructor took a tenant-scoped resource released a different tenant's.
+            context = contextvars.copy_context()
+            building = (
+                lifecycle.run(_build(lambda: self._env_for(ref.env)), context)
+                if self._off_loop_factory
+                else None
+            )
+            held = self._builders[position] = _Builder(lifecycle, building, context)
+        held.adopted = True
         return held
 
     def _drop_builders(self) -> None:
-        """Discard every build still owed to a position nobody came back for."""
-        held, self._builders = self._builders, {}
-        for lifecycle, building in held.values():
-            lifecycle.stop_when(_discarded(lifecycle, building))
+        """Discard every build **nobody is waiting for**.
+
+        A build a live pull has adopted is that pull's, and closing it here would close an env
+        the pull is about to open a session on. What is left over is a build a cancelled pull
+        walked away from and no later pull came back for, which is the only thing here with no
+        owner."""
+        for position, held in list(self._builders.items()):
+            if held.adopted:
+                continue
+            del self._builders[position]
+            held.lifecycle.stop_when(_discarded(held.lifecycle, held.building))
 
     async def _release_stream(self) -> None:
         """Let go of what only this stream holds: its deadline watchdog, then its catalog envs.
@@ -3763,9 +3800,8 @@ class TaskStream:
                 ref = self._queue[position]
 
             # Everything below is outside the registry lock, and none of it has been exposed
-            # yet: if a span refuses to open, the episode never starts and the position is
-            # still owed. Spans first, so nothing needs cleaning up when one fails.
-            spans, dispensed_extensions = await self._begin_spans(ref)
+            # yet: if a span refuses to open, the episode never starts and the position is still
+            # owed.
             # Off the loop only if the caller said this factory may be (see `off_loop_factory`).
             # Constructing an env is blocking work and a cold one stops every other episode this
             # stream is serving, but the factory is the caller's own code and the contract is
@@ -3780,13 +3816,17 @@ class TaskStream:
             # inside `max_in_flight`, and a wedged one leaves a thread behind each time. So the
             # build is the *position's*, not the pull's: a pull that is cancelled leaves it here
             # and the next pull for that position joins it instead of starting another.
-            lifecycle, building = self._builder(position, ref)
+            held = self._builder(position, ref)
+            lifecycle, building = held.lifecycle, held.building
             try:
                 if building is not None:
                     env = await asyncio.shield(asyncio.wrap_future(building))
                 else:
                     env = self._env_for(ref.env)
             except BaseException:
+                # Not this pull's any more: the next one for this position adopts it, and a
+                # shutdown may discard it, because nobody is waiting for it now.
+                held.adopted = False
                 if building is None or building.done():
                     # Nothing left to hand to a later pull: a synchronous factory that raised,
                     # or a build that has already failed. The one that is merely still running
@@ -3795,12 +3835,20 @@ class TaskStream:
                     lifecycle.stop_when(_discarded(lifecycle, building))
                 raise
             self._builders.pop(position, None)
+            # Spans after the build, not before it. A build survives a cancelled pull and the
+            # next pull joins it; spans do not, so opening them first meant three cancelled pulls
+            # and one retry called `begin()` four times and `finalize()` once, and whatever the
+            # three abandoned spans had taken was never given back. Nothing below this line needs
+            # cleaning up when a span refuses to open, because the build it would have belonged
+            # to is still owed to the position and still has an owner.
+            spans, dispensed_extensions = await self._begin_spans(ref)
             episode = await ServedEpisode.open_env(
                 env,
                 env_name=ref.env,
                 task=ref.task_idx,
                 lifecycle=lifecycle,
                 built_on_lifecycle=self._off_loop_factory,
+                context=held.context,
             )
             try:
                 # The episode's own snapshot, taken when it was opened and the same for every
@@ -4944,6 +4992,9 @@ class TaskStream:
         in the last of those steps still builds the row from the ones before it, and leaves it on
         the entry for the retry that may not run them again."""
         episode = live.episode
+        # The wall clock, and only the wall clock, may overtake an ordinary call this episode has
+        # already accepted (see `_force_terminal`).
+        overtaking = forced == "timeout"
         # A terminal call whose caller was cancelled leaves its finalization running: the episode
         # is already sealed while its verdict is still landing. Adopt that outcome rather than
         # forcing a second terminal over the top of it — a forced call on a sealed episode reads
@@ -4959,9 +5010,13 @@ class TaskStream:
             score_terminal = self._score_terminal.get(live.ref.env)
             refused: Optional[BaseException] = None
             if score_terminal is not None:
-                drove, refused = await self._force_terminal(live, score_terminal)
+                drove, refused = await self._force_terminal(
+                    live, score_terminal, overtaking=overtaking
+                )
             if not episode.terminated:
-                ended, abort_refusal = await self._force_terminal(live, TERMINATE_TOOL_NAME)
+                ended, abort_refusal = await self._force_terminal(
+                    live, TERMINATE_TOOL_NAME, overtaking=overtaking
+                )
                 drove = drove or ended
                 # The first refusal is the one that explains the run, and the fallback's own
                 # answer may not stand in for it. An abort that succeeds does not make the score
@@ -5135,7 +5190,7 @@ class TaskStream:
         return row
 
     async def _force_terminal(
-        self, live: _Live, tool: str
+        self, live: _Live, tool: str, *, overtaking: bool = False
     ) -> Tuple[bool, Optional[BaseException]]:
         """Drive one terminal on the agent's behalf. Reports whether this call is what ended the
         task, and — only when it raised *without* ending it — what it raised, so the caller can
@@ -5168,7 +5223,17 @@ class TaskStream:
         shutdown reconciles as a crash."""
         cancellation = _Cancellation()
         try:
-            call = await live.episode.call(tool, {})
+            # `overtaking` is the wall clock and nothing else. A drain, an abort and an agent's
+            # own submission all queue behind an ordinary call the episode has already accepted,
+            # because a terminal that jumps it produces a scored row whose causal history is
+            # missing the call that was still running. The deadline is the one caller that must
+            # not queue: the episode it exists for is exactly the one whose ordinary call is not
+            # coming back.
+            call = (
+                await live.episode.call(tool, {}, forced=True)
+                if overtaking
+                else await live.episode.call(tool, {})
+            )
         except BaseException as exc:  # noqa: BLE001 — classified above, never raised at the agent
             if _must_propagate(exc, cancellation):
                 raise

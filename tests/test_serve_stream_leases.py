@@ -925,10 +925,10 @@ async def _block_the_forced_terminal(live: Any, gate: asyncio.Event) -> asyncio.
     entered = asyncio.Event()
     original = live.episode.call
 
-    async def blocked(tool: str, arguments: Any = None) -> Any:
+    async def blocked(tool: str, arguments: Any = None, **kwargs: Any) -> Any:
         entered.set()
         await gate.wait()
-        return await original(tool, arguments)
+        return await original(tool, arguments, **kwargs)
 
     live.episode.call = blocked
     return entered

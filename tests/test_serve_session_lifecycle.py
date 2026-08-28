@@ -35,7 +35,7 @@ import pytest
 from shogym.serve import ServedEpisode
 from shogym.serve import episode as episode_module
 from shogym.serve.lifecycle import FinalizationRecord, FinalizationStore
-from shogym.serve.stream import TaskRef, TaskStream
+from shogym.serve.stream import Immediate, TaskRef, TaskStream
 
 from tests._fixtures.score_env import ENV_NAME, SUBMIT_TOOL, _FixtureScoreEnv
 
@@ -82,6 +82,7 @@ class _SlowSessionEnv(_FixtureScoreEnv):
         self.closed = threading.Event()
         self.closed_during_release = False
         self.closed_after_sessions: Optional[bool] = None
+        self.closed_during_begin = False
         self.sessions_closed = threading.Event()
         self.close_entries = 0
         self.peak_closes = 0
@@ -127,6 +128,8 @@ class _SlowSessionEnv(_FixtureScoreEnv):
             self.closed.set()
 
     def _begin_session(self, session_id: str, task: Dict[str, Any]) -> None:
+        if self.close_entries:
+            self.closed_during_begin = True
         self.begin_context = _TENANT.get()
         self.begins.append(time.perf_counter())
         time.sleep(self._begin_seconds)
@@ -1014,7 +1017,7 @@ def test_a_loop_loss_rollback_does_not_leak_its_hook_thread() -> None:
 
 
 def _session_threads_alive() -> List[str]:
-    return [t.name for t in threading.enumerate() if t.name.startswith("shogym-session")]
+    return [t.name for t in threading.enumerate() if t.name.startswith("shogym-episode")]
 
 
 # ----- one bad file does not restore the scan it took a review pass to remove -----
@@ -1383,6 +1386,306 @@ def test_a_record_carrying_nan_is_quarantined_rather_than_rewritten_forever(
         encoding="utf-8",
     )
     store = FinalizationStore(directory)
+    with pytest.warns(RuntimeWarning, match="are not finalization records"):
+        assert store.recover_once() == []
+    with _reads_counted(store) as reads:
+        assert store.recover_once() == []
+    assert reads["full"] == 0
+
+
+# ----- the lifecycle owns every decision; callers only observe -----
+
+
+async def test_closing_a_stream_does_not_discard_a_build_a_pull_is_waiting_for(
+    tmp_path: Path,
+) -> None:
+    # A builder is in the map both while a live pull awaits it and while it waits for the next
+    # pull after a cancellation, and those are not the same thing. Shutdown used to treat both as
+    # abandoned, so it closed an env the pull went on to open a session on.
+    made = threading.Event()
+    release = threading.Event()
+    built: List[_SlowSessionEnv] = []
+
+    def factory(_name: str) -> _SlowSessionEnv:
+        env = _SlowSessionEnv()
+        built.append(env)
+        made.set()
+        release.wait(10.0)
+        return env
+
+    stream = TaskStream(
+        factory, [TaskRef(ENV_NAME, 0)], prov_dir=tmp_path / "prov", off_loop_factory=True
+    )
+    made.clear()
+    release.clear()
+    pull = asyncio.ensure_future(stream.get_task())
+    assert await asyncio.to_thread(made.wait, 5.0)
+    closing = asyncio.ensure_future(stream.aclose())
+    await asyncio.sleep(0.05)
+    release.set()
+    with contextlib.suppress(BaseException):
+        await pull
+    with contextlib.suppress(BaseException):
+        await closing
+    served = built[-1]
+    # Whatever the race decided about the task, the env the pull was holding was not closed out
+    # from under it: no close began before its session did.
+    assert served.begins == [] or served.close_entries <= 1
+    assert served.closed_during_begin is False
+
+
+async def test_a_cancelled_start_closes_the_env_its_factory_finally_returns() -> None:
+    # `_built` arranges the discard, and `start()` used to stop the lifecycle beside it: marked
+    # stopped, the lifecycle could no longer take that discard when the build landed, so the env
+    # was built and then nothing could close it.
+    closed = threading.Event()
+
+    class _Noticing(_FixtureScoreEnv):
+        async def _close(self) -> None:
+            closed.set()
+
+    def slow_make(_name: str, config: Optional[Dict[str, Any]] = None) -> _Noticing:
+        time.sleep(0.3)
+        return _Noticing(tasks=list(TASKS))
+
+    original = episode_module.make
+    episode_module.make = slow_make  # type: ignore[assignment]
+    try:
+        starting = asyncio.ensure_future(
+            ServedEpisode.start(ENV_NAME, task=0, off_loop_factory=True)
+        )
+        await asyncio.sleep(0.02)
+        starting.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await starting
+        assert _until(closed.is_set), "the env the factory returned was never closed"
+    finally:
+        episode_module.make = original  # type: ignore[assignment]
+
+
+async def test_a_rollback_that_outran_its_bound_is_not_raced_by_the_caller(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # `settled()` says whether the release actually landed, and the handler ignored it: it
+    # claimed the close over a release still inside the hook, which is the exact overlap this
+    # design exists to remove.
+    monkeypatch.setattr(episode_module, "_ROLLBACK_SECONDS", 0.02)
+    env = _SlowSessionEnv(end_seconds=0.3, describe_error=RuntimeError("no contract"))
+    with pytest.raises(RuntimeError, match="no contract"):
+        await ServedEpisode.open_env(env, task=0)
+    assert env.closed_during_release is False
+    assert await _awaited(lambda: env.releases_finished == 1)
+    assert await _awaited(env.closed.is_set)
+    assert env.close_entries == 1
+
+
+def test_a_loop_loss_rollback_stops_its_own_lifecycle() -> None:
+    # The rollback used to end after arranging the close and leave the shutdown to a caller
+    # continuation. A continuation on a loop that closed never runs, so the env was closed and
+    # its thread stayed alive for the life of the process.
+    env = _SlowSessionEnv(begin_seconds=0.3)
+    loop = asyncio.new_event_loop()
+    loop.set_exception_handler(lambda _loop, _context: None)
+
+    async def give_up() -> None:
+        opening = loop.create_task(ServedEpisode.open_env(env, task=0))
+        await asyncio.sleep(0.05)
+        opening.cancel()
+        for _ in range(5):
+            await asyncio.sleep(0)
+
+    try:
+        loop.run_until_complete(give_up())
+    finally:
+        loop.close()
+    assert _until(env.closed.is_set)
+    assert _until(lambda: not _session_threads_alive()), _session_threads_alive()
+
+
+async def test_a_cancelled_close_still_closes_the_env_and_stops_the_lifecycle() -> None:
+    # A cancellation while waiting for the release used to leave `close()` before it had arranged
+    # either the env close or the shutdown. What the `finally` does is arrangement rather than
+    # waiting, so it runs the same way on a cancellation as on a return.
+    env = _SlowSessionEnv(end_seconds=0.3)
+    ep = await ServedEpisode.open_env(env, task=0)
+    await ep.call(SUBMIT_TOOL, {"answer": "4"})
+    closing = asyncio.ensure_future(ep.close())
+    await asyncio.sleep(0.05)
+    closing.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await closing
+    assert await _awaited(env.closed.is_set), "the cancelled close left the env open"
+    assert _until(lambda: not ep._lifecycle.running)
+
+
+async def test_two_closes_join_rather_than_moving_the_env_to_another_loop(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # A flag meaning "somebody started a wait" let the second close skip it, find the release
+    # incomplete and hand a caller-built env to the lifecycle loop: one caller saw the affinity
+    # failure and the other reported success over the same env.
+    monkeypatch.setattr(episode_module, "_END_SESSION_SECONDS", 0.05)
+    env = _SlowSessionEnv(end_seconds=0.3, bind_loop=True)
+    ep = await ServedEpisode.open_env(env, task=0)
+    await ep.call(SUBMIT_TOOL, {"answer": "4"})
+    outcomes = await asyncio.gather(ep.close(), ep.close(), return_exceptions=True)
+    assert await _awaited(env.closed.is_set)
+    assert env.closed_on_a_foreign_loop is False, outcomes
+    assert env.close_entries == 1
+
+
+async def test_a_flagged_envs_finalize_runs_on_the_loop_it_was_built_on(
+    tmp_path: Path,
+) -> None:
+    # The contract says a flagged env may bind `get_running_loop()` in its constructor because
+    # its work and its close use that loop. `finalize` is env work, and running it on the serving
+    # caller's loop broke exactly that promise: the affinity error came back as a fail-closed
+    # verdict, so a valid episode scored zero.
+    seen: Dict[str, Any] = {}
+
+    class _LoopChecking(_FixtureScoreEnv):
+        def __init__(self, **kwargs: Any) -> None:
+            self.loop = asyncio.get_running_loop()
+            super().__init__(**kwargs)
+
+        async def finalize(self, req: Any) -> Any:
+            seen["foreign"] = asyncio.get_running_loop() is not self.loop
+            return await super().finalize(req)
+
+    stream = TaskStream(
+        lambda _name: _LoopChecking(tasks=list(TASKS)),
+        [TaskRef(ENV_NAME, 0)],
+        prov_dir=tmp_path / "prov",
+        off_loop_factory=True,
+        feedback=Immediate(),
+    )
+    async with stream:
+        await stream.get_task()
+        answer = await stream.dispatch(SUBMIT_TOOL, {"answer": "4"})
+    assert seen["foreign"] is False
+    assert "finalize_error" not in json.loads(answer.content[0].text)
+
+
+async def test_the_teardown_bound_is_spent_once_across_release_and_close(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # The release and the env close behind it are two halves of one operation. A full bound for
+    # each turned a stated bound into twice one for the env that needs it least: the one whose
+    # release never comes back.
+    monkeypatch.setattr(episode_module, "_END_SESSION_SECONDS", 0.1)
+    env = _SlowSessionEnv(end_seconds=5.0)
+    ep = await ServedEpisode.open_env(env, task=0)
+    await ep.call(SUBMIT_TOOL, {"answer": "4"})
+    started = time.perf_counter()
+    await ep.close()
+    assert time.perf_counter() - started < 0.15, time.perf_counter() - started
+
+
+async def test_an_adopted_build_is_closed_under_the_context_it_was_built_in(
+    tmp_path: Path,
+) -> None:
+    # A build made by one pull and adopted by another was closed under the *adopting* caller's
+    # context, so an env whose constructor took a tenant-scoped resource released a different
+    # tenant's.
+    seen: Dict[str, Any] = {}
+    release = threading.Event()
+    made = threading.Event()
+
+    class _Noticing(_FixtureScoreEnv):
+        def __init__(self, **kwargs: Any) -> None:
+            seen.setdefault("built", []).append(_TENANT.get())
+            super().__init__(**kwargs)
+
+        async def _close(self) -> None:
+            seen.setdefault("closed", []).append(_TENANT.get())
+
+    def factory(_name: str) -> _Noticing:
+        made.set()
+        release.wait(10.0)
+        return _Noticing(tasks=list(TASKS))
+
+    _TENANT.set("tenant-a")
+    release.set()  # the catalog build runs inside the constructor and may not be held
+    stream = TaskStream(
+        factory, [TaskRef(ENV_NAME, 0)], prov_dir=tmp_path / "prov", off_loop_factory=True
+    )
+    made.clear()
+    release.clear()
+    pull = asyncio.ensure_future(stream.get_task())
+    assert await asyncio.to_thread(made.wait, 5.0)
+    pull.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await pull
+    _TENANT.set("tenant-b")
+    release.set()
+    async with stream:
+        await stream.get_task()
+        await stream.dispatch(SUBMIT_TOOL, {"answer": "4"})
+    # Two envs are built here: the catalog instance, inside the constructor, and the served one,
+    # which the first pull started and the second adopted. The served one closes first, when its
+    # task is sealed, and that is the close this is about. (The catalog env is closed by `aclose`
+    # under whatever context that caller has, which is a different question.)
+    assert seen["built"] == ["tenant-a", "tenant-a"], seen
+    assert seen["closed"][0] == "tenant-a", seen
+
+
+async def test_a_cancelled_pull_does_not_open_a_span_it_cannot_close(tmp_path: Path) -> None:
+    # Spans were opened before the retained build was joined, so a cancelled pull left one open
+    # with nothing to finalize it: three cancels and a retry opened four and closed one, and
+    # whatever the three abandoned ones had taken was never given back. Opened after the build
+    # now, which is the step a cancellation can survive.
+    opened = {"n": 0}
+    release = threading.Event()
+    made = threading.Event()
+    real_spans = TaskStream._begin_spans
+
+    async def counting(self: TaskStream, ref: TaskRef) -> Any:
+        opened["n"] += 1
+        return await real_spans(self, ref)
+
+    def factory(_name: str) -> _FixtureScoreEnv:
+        made.set()
+        release.wait(10.0)
+        return _FixtureScoreEnv(tasks=list(TASKS))
+
+    release.set()  # the catalog build runs inside the constructor and may not be held
+    stream = TaskStream(
+        factory, [TaskRef(ENV_NAME, 0)], prov_dir=tmp_path / "prov", off_loop_factory=True
+    )
+    TaskStream._begin_spans = counting  # type: ignore[method-assign]
+    try:
+        made.clear()
+        release.clear()
+        for _ in range(3):
+            pull = asyncio.ensure_future(stream.get_task())
+            assert await asyncio.to_thread(made.wait, 5.0)
+            pull.cancel()
+            with pytest.raises(asyncio.CancelledError):
+                await pull
+        release.set()
+        async with stream:
+            await stream.get_task()
+            await stream.dispatch(SUBMIT_TOOL, {"answer": "4"})
+    finally:
+        TaskStream._begin_spans = real_spans  # type: ignore[method-assign]
+    assert opened["n"] == 1, opened
+
+
+def test_a_number_json_cannot_write_back_is_refused_however_deep_it_is(
+    tmp_path: Path,
+) -> None:
+    # The writer serialises with `allow_nan=False`, which walks the whole structure, so a check
+    # that stopped at the first level passed records the writer would never accept: the rewrite
+    # raised on every pass and the store was never cached.
+    directory = tmp_path / "finalizations"
+    directory.mkdir(parents=True)
+    (directory / "finalization-nested.json").write_text(
+        '{"session_id": "s", "finalization_id": "f", "status": "PENDING", '
+        '"source": "explicit_tool", "provenance": {"nested": {"value": NaN}}}',
+        encoding="utf-8",
+    )
+    store = FinalizationStore(directory)
+    assert store.load_all() == []
     with pytest.warns(RuntimeWarning, match="are not finalization records"):
         assert store.recover_once() == []
     with _reads_counted(store) as reads:
