@@ -151,14 +151,14 @@ generated from, the text the agent is given (the world guide, the tool guide and
 paragraph), the generator that decides the seeded backlog (its constants, and the bytes of every
 module the world generators import, walked rather than listed), the corpus this run actually
 serves (all of it, including the 134 MB of shared base episodes read as input), the derivation
-layout, what the worker's interpreter turned out to hold, and a hand-bumped scoring version that
-moves when how a score is read moves. "What the interpreter holds" is a stated scope rather than a
-slogan: it is every installed byte under `site-packages`, bytecode caches included, plus the base
-executable `bin/python` resolves to. The caches are in it because a checked-hash `.pyc` binds the
-*source* hash recorded in its header and not the marshalled payload beside it, so a payload edited
-under a matching header is executable code no digest over the sources would have read. It is not
-the base interpreter's standard library, which belongs to the host rather than to anything this
-port installs. An env serves the corpus it
+layout, the runtime pin, and a hand-bumped scoring version that moves when how a score is read
+moves. The runtime is a *pin* and not a reading of what was installed: the release, the commit it
+is recorded against, the Python series and the platform. The pinned release's own dependencies are
+ranges, so two machines can resolve different transitive versions under one pin, and a module
+edited in place inside the runtime moves nothing. Reading the installed bytes is what would close
+that, and it belongs with the container the worker runs in
+([shojin-lab/shogym#140](https://github.com/shojin-lab/shogym/pull/140)), where the image digest
+names the whole tree at once. An env serves the corpus it
 read at construction for the whole of its life: the instructions, the supervisors and the dates
 come from that one reading, so a corpus edited underneath a running env cannot put new authored
 text behind an unchanged fingerprint. Pinning the text is not the whole of it, because a task's
@@ -191,11 +191,13 @@ Pin-and-install mechanics are shared; see [`../README.md`](../README.md). What i
   build that resolved something else never gets served and a pin that moves builds a second
   interpreter rather than reusing the first. What the wheel cannot say is which commit it was cut
   from; that half of the pin names the runtime and is not verifiable against the artifact, and
-  what the realized code actually is comes from hashing the installed bytes instead. The app
-  sources the wheel ships packed are unpacked into that interpreter afterwards, its bytecode
-  caches are rewritten as hash-based ones, and a second stamp written once both have exited zero
-  is what says it is done: the runtime is already published by then, so an unpack interrupted part
-  way through would otherwise leave a complete runtime with an incomplete package inside it.
+  what the realized code actually is is not read here at all: `config_digest` carries the pin,
+  and the container ([shojin-lab/shogym#140](https://github.com/shojin-lab/shogym/pull/140)) is
+  where an image digest names the realized tree. The app sources the wheel ships packed are
+  unpacked into that interpreter afterwards, and a second stamp written once the unpack has
+  exited zero is what says it is done: the runtime is already published by then, so an unpack
+  interrupted part way through would otherwise leave a complete runtime with an incomplete
+  package inside it.
 - **The data bundle is fetched and checked.** ~33 MB, once, into
   `~/.cache/shogym/appworld/corpus-0.1.0/`. Upstream's own downloader verifies nothing; this one
   refuses a bundle whose size and sha256 are not the pinned pair. `APPWORLD_ROOT` pointing at a
@@ -444,14 +446,11 @@ bytes, sha256 `fd9f9608c2ec71ed0ac25c3633a738b9129a318a129e31230425b9188e508250`
   moved or restored under it. So pointing `APPWORLD_ROOT` at a second corpus, editing how a task
   is derived without touching a ledger constant, or reinstalling the runtime, all derive a fresh
   tree rather than reusing one an older combination seeded.
-- **A derived task is reused only when it is still the task that was derived.** Every path in it,
-  with its mode, its size and its digest, is written into a manifest as the last act of its
-  derivation, and that manifest arrives under the task's name in the same rename that publishes
-  the tree, so it is the completion marker as well as the contents. A warm episode checks the
-  whole of it before reusing anything. The check used to be that two paths existed, which said
-  yes to a tree with everything else missing, to one whose databases had been changed since, and
-  to one whose read-only seal had come off. Verifying the pair costs about two milliseconds
-  against a construction of about four seconds.
+- **A derived task is reused only when its derivation finished.** A completion marker is the last
+  thing written into the staging tree, so it arrives under the task's name in the same rename that
+  publishes it: there is no ordering in which a reader sees the marker over a half-built task. It
+  says the derivation finished and not that the bytes are still the ones that were written, which
+  on a development host is the operator's own filesystem to answer for.
 - **Not built:** the yoked payload (a donor's submission and the receipt computed on it), the
   foreign rendering of a verdict vector as prose and the parser that round-trips it, the fixed-size
   envelope that would pad those to one predeclared size, and any assignment, forking or analysis
@@ -476,8 +475,7 @@ routes are closed and the expensive one is visible, each tested by running the p
 | the grader's tree | a directory with an unguessable name under a private parent, not a neighbour of the served root |
 | one episode's grade | upstream's evaluator report is disabled, and an episode's whole output tree is named absolutely and lives outside every served corpus, so no episode holds another's end state, logs or verdicts |
 | the corpus itself | served inputs are independent copies rather than hard links, so a write through the served pathname changes neither the corpus later episodes are derived from nor the baseline the grader diffs against |
-| the next episode's inputs | each episode is served its own view: its task's world is copied per episode and removed with the episode, and everything else it can reach (the 134 MB of shared base, and the shared task cache the views are copied out of) is sealed read-only, so a write through one episode's served pathname is not in the next one's starting inputs, or the other arm of its pair's |
-| the *names* the next episode resolves | a view names the shared entries by absolute path, so the directory holding those names is sealed read-only too and opened only under the derivation lock; without it, `base_dbs` could be renamed aside and something else put there under the same name, which every current and later view would follow |
+| the next episode's inputs, by accident | each episode is served its own view: its task's world is copied per episode and removed with the episode, so an ordinary write through one episode's served pathname is that episode's own. What it can still reach and write is the shared base and the shared task cache the views are copied out of, which the container binds read-only ([shojin-lab/shogym#140](https://github.com/shojin-lab/shogym/pull/140)) and this host worker does not |
 | the drawn key | never sent to either process: the protocol has no field for one |
 
 **There is no file-access audit, and a run must not be read as though there were one.** An earlier
@@ -493,8 +491,7 @@ agent's code opens.
 seal command, no quiesce command and no read command: the writer on the protocol's own socket is
 reachable from inside the interpreter that executes agent-authored Python, so a reply saying "I
 have flushed", "I have stopped" or "the filing says X" is a reply the episode could have written.
-The host signals the worker's process group, confirms from the process table that the group is
-empty, and grades what is on disk.
+The host signals the worker's process, waits for it, and grades what is on disk.
 
 **What is on disk is the world as upstream last persisted it.** `AppWorld.execute` ends with its
 own save into the episode's output tree and `initialize` writes one before any block runs. So an
@@ -503,77 +500,54 @@ its opening state. The generator digest is written to the same tree for the same
 lifecycle fact is not asked for: a diagnostic read out of a reply is a diagnostic the episode can
 choose.
 
-**What an empty process group proves, and what it does not.** It proves quiescence *at the moment
-the snapshot is taken*: nothing of the episode's was running when the tree was copied, so the
-filing, the digests and the evaluator all read one state. It does not prove that nothing was
-written on the way down. The stop is SIGTERM, a short grace, then SIGKILL, and SIGTERM is
-catchable, so a process that ran agent-authored code has that grace in which an exit path of its
-own could still write. The grace is short for exactly this reason and it is not zero, so the
-honest reading of a graded tree is "the state upstream persisted, plus anything the episode's own
-shutdown persisted inside the grace", not "the state at the end of block N and nothing else".
-Making the two the same needs a namespace that can be destroyed rather than a signal that can be
-handled, which is
-[shojin-lab/shogym#140](https://github.com/shojin-lab/shogym/pull/140).
+**What a stopped worker proves, and what it does not.** It proves that the process this port
+started was signalled and reaped before the tree was copied, so the filing, the digests and the
+evaluator all read one state. It does not prove that nothing was written on the way down, and it
+does not prove that nothing of the episode's is still running. The stop is SIGTERM, a short grace,
+then SIGKILL, and SIGTERM is catchable, so a process that ran agent-authored code has that grace
+in which an exit path of its own could still write. And what is stopped is that process and not
+everything it started: agent code runs there and is free to spawn, and a descendant of it survives
+the stop, holds whatever it holds, and can go on writing into the tree about to be graded. So the
+honest reading of a graded tree on this worker is "the state upstream persisted, plus anything the
+episode's own shutdown or its descendants persisted", not "the state at the end of block N and
+nothing else".
 
-**A stop the process table will not confirm ends the episode unscored.** Not reaped inside the
-bound, or a process table that would not answer: each of those leaves a tree something may still
-be writing to. The group is signalled *before* the leader is reaped, which is what makes the
-number safe to use and what stops an episode buying an unscored row by killing its own world: a
-pid is reserved until its parent reaps it and a group exists while any member does, so an
-exited-but-unreaped leader is still holding the group and is stopped and confirmed like any other.
-A leader something else reaped first leaves a number nothing may signal or enumerate. The
-episode is closed as an infrastructure failure rather than scored on it, so the row is `unscored`
-with a `finalize_error` closure and nothing in `observed` at all, which means neither feedback arm
-has a payload to reveal. The same is true of an output tree the grader refuses.
+**A serving process that dies abruptly leaves a world running.** Teardown is the ordinary path and
+it needs a parent to run it, so the case it cannot reach is the parent dying with an episode open.
+Nothing here covers that: the worker is reparented and goes on serving a world nobody holds a
+handle on, holding a port and a scratch directory, and this port neither notices nor comes back
+for it.
 
-**A serving process that dies abruptly does not leave a world running.** Teardown is the ordinary
-path and it needs a parent to run it, so the case it cannot reach is the parent dying with an
-episode open. The worker is started in a session of its own, which is what makes stopping an
-episode stop everything the episode spawned and also what stops anything reaping it when its
-owner goes: it would be handed to init and go on serving a world nobody holds a handle on, since
-the port, the token, the process handle and the group number lived only in the parent's memory.
-Two things close that. The worker holds the read end of a pipe from its parent and kills its own
-group when that reaches end of file, which is the kernel reporting the parent's exit rather than
-any process saying so, and which happens however the parent exits (`PR_SET_PDEATHSIG` is asked
-for too on Linux, and is not what this rests on). And every worker is written down in a file under
-the cache root with the pid and the start time of the process that started it, so a later
-construction can tell an abandoned worker from a live one and clear it away: the start time is
-there beside the pid because pids are reused, and reclaiming a live episode's world because an
-unrelated process now holds its owner's number would be worse than the failure this fixes.
+**Both of those are the same fact, and it is the reason for the container.** A signal aimed at one
+process cannot promise anything about a tree of them, and a handle held in one process's memory
+cannot outlive that process. A namespace can do both: it can be destroyed rather than asked, and
+destroying it takes every process inside it, whatever they are and whoever started them.
+[shojin-lab/shogym#140](https://github.com/shojin-lab/shogym/pull/140) runs the episode worker in a
+container for exactly that, and **the host worker in this file is for development.** Use it to
+build a port, watch an episode and run the suite. A run whose scores have to survive an adversary
+needs the container, and a run made on the host worker should be read knowing that nothing was
+watching.
 
 **The grader is given a snapshot, not the tree the world wrote.** The grading process is pointed
 at the root that holds the answers, so a link left under the output tree would resolve there. The
 root itself is checked before it is resolved, and every entry under it must be a plain file or
 directory; anything else refuses the episode rather than being skipped, because a grade over a
-tree with an entry quietly dropped is a grade over a tree nobody submitted. The walk is bounded in
-nodes, bytes, depth and elapsed time, and it stops on a flag the finalizer sets if its own await
-is abandoned, because an episode wrote this tree and nothing else here would stop it deciding how
-long finalization takes. It reads the filing, the databases' digest, the generator digest and the base
-task's own evaluator, all from those same bytes, so what is scored and what is graded are one
-state by construction rather than two observations that happened to agree.
+tree with an entry quietly dropped is a grade over a tree nobody submitted. It is an ordinary
+copy otherwise: an episode wrote this tree, so its size and its depth are the episode's to choose,
+and what bounds them is the container's disk rather than anything here. It reads the filing, the
+databases' digest, the generator digest and the base task's own evaluator, all from those same
+bytes, so what is scored and what is graded are one state by construction rather than two
+observations that happened to agree.
 
-**The residual, stated exactly.** The private tree is hard to guess and not hard to read: it is the
-same uid, so its 0700 mode stops other users and stops nothing else. The read-only seal on the
-shared base, the shared task cache and the directory holding their names is the same kind of thing: it refuses an ordinary write,
-upstream never writes there, and the process that runs agent code owns those files and could put
-the write bits back. Two ancestors above that directory stay writable as well, because the port
-writes its cache stamp in one and provisions in the other, so the shared root's own name is
-movable by a process willing to work a level up. The confirmed stop is likewise the process table's word rather than a
-namespace: a process that left this group is outside what it can see. The
-port's own source is readable, and with it the draw's algorithm. The run's provenance directory
-retains true reports even under `Placebo`. Anything else the user running the port can read is
-readable.
-
-**What would close it** is an OS namespace in which none of that is mounted: the worker in a
-container with only the served tree bound in, and the shared base bound in read-only rather than
-merely sealed read-only ([shojin-lab/shogym#140](https://github.com/shojin-lab/shogym/pull/140)). That is assessed and not built here, because it is
-not configuration. The existing agent image mounts `/root`, `/work` and a read-only `/cfg` and
-publishes no ports, so it needs a new image (the pinned interpreter baked in), a new argument
-builder, a fixed container port published to host loopback and read back with `docker port`
-(a container-loopback listener cannot be forwarded, and `--network none` and `-p` are mutually
-exclusive), and container-aware teardown. Until it lands there is no mitigation, only the closed
-routes above: a run whose scores must survive an adversary needs that container, and a run made
-before it should be read knowing that nothing was watching.
+**The residual, stated exactly.** The private tree is hard to guess and not hard to read: it is
+the same uid, so its 0700 mode stops other users and stops nothing else. The shared base and the
+shared task cache are writable by the process that runs agent code, because it owns those files,
+so cross-episode contamination is closed against upstream (which never writes there) and against
+accident, and not against an episode that goes looking. The stop is one process's, and its
+descendants are outside it. The port's own source is readable, and with it the draw's algorithm.
+The run's provenance directory retains true reports even under `Placebo`. Anything else the user
+running the port can read is readable. Every one of those is closed by the container and by
+nothing in this file.
 
 ## Gotchas
 

@@ -28,22 +28,17 @@ Importing this module imports nothing from upstream. Provisioning happens when a
 from __future__ import annotations
 
 import ast
-import calendar
-import fcntl
 import hashlib
 import json
 import os
 import platform
-import re
 import secrets
 import select
-import signal
 import shutil
 import stat
 import subprocess
 import time
 import tempfile
-import threading
 import sys
 import urllib.error
 import urllib.request
@@ -241,8 +236,8 @@ def _build_runtime(home: Path) -> None:
 def _publish_runtime(staging: Path, home: Path) -> None:
     """Give the staged tree its final name, moving any incumbent aside first.
 
-    ``os.replace`` will not rename a directory over a non-empty one, and there is now a way to
-    reach this with something already under the name: a tree that is not one this code stamped is
+    ``os.replace`` will not rename a directory over a non-empty one, and there is a way to reach
+    this with something already under the name: a tree that is not one this code stamped is
     rebuilt rather than reused, and the tree it is rebuilding over is still there. So the
     incumbent is renamed away and the publish stays the single atomic step it has to be. A worker
     already running out of the old tree keeps every file it has open, because a rename moves a
@@ -250,43 +245,12 @@ def _publish_runtime(staging: Path, home: Path) -> None:
     the same thing it would lose to any rebuild.
 
     Removing the incumbent afterwards is housekeeping and is allowed to fail: the publish has
-    already happened by then, and a directory left behind costs disk rather than correctness.
-
-    **A publish that fails puts the incumbent back.** Two renames are two operations, and the
-    displaced tree used to be removed whatever had happened between them: a failure at the second
-    left the canonical name absent and the only remaining interpreter under a ``.replaced`` name
-    nothing ever looks for. Injected once, the probe found no runtime at all afterwards. That is
-    worse than a failed build, because a worker already serving out of the old tree keeps its open
-    files but resolves every new import through the name that has just disappeared. So the
-    incumbent goes back, and if the restore itself fails the displaced copy is *retained* under
-    its own name rather than removed, because it is then the only copy of the interpreter there
-    is. Either way the caller is told the publish did not happen: :func:`runtime` returns a path
-    to an interpreter, and returning one that was never published would hand every world a name
-    with nothing under it. The same rule, for the same reason, as
-    :func:`~shogym.envs.appworld.world._publish`."""
+    already happened by then, and a directory left behind costs disk rather than correctness."""
     displaced = home.with_name(f"{home.name}.replaced.{os.getpid()}.{secrets.token_hex(8)}")
-    published = False
-    # Whether the incumbent is sitting under `displaced` and is the only copy of it there is.
-    aside = False
-    try:
-        if home.exists():
-            os.replace(home, displaced)
-            aside = True
-        os.replace(staging, home)
-        published = True
-    except OSError:
-        shutil.rmtree(staging, ignore_errors=True)
-        if aside:
-            try:
-                os.replace(displaced, home)
-            except OSError:
-                # Left where it is. The `finally` below removes a displaced tree only after a
-                # publish that worked, so this one survives this call and can be found by name.
-                pass
-        raise
-    finally:
-        if published and aside:
-            shutil.rmtree(displaced, ignore_errors=True)
+    if home.exists():
+        os.replace(home, displaced)
+    os.replace(staging, home)
+    shutil.rmtree(displaced, ignore_errors=True)
 
 
 def _check_pin(home: Path) -> None:
@@ -393,46 +357,7 @@ def ensure_apps() -> None:
         if _apps_unpacked(marker):
             return
         _run([str(python), str(WORKER), "install"])
-        _compile_runtime(python)
         _mark_apps(marker)
-
-
-def _compile_runtime(python: Path) -> None:
-    """Rewrite every bytecode cache in the interpreter as a hash-based one.
-
-    **Two things, and neither of them is the identity.** A default ``.pyc`` records the source's
-    modification time and size and is honoured whenever those two numbers still match, whatever
-    bytes the cache itself holds; a hash-based one records a hash of the source and the import
-    system checks it, so a cache whose source was edited beside it is discarded and the source is
-    what runs. That closes the stale-cache case and not the changed-payload one, because the
-    recorded hash covers the source and not the marshalled code, which is why
-    :func:`runtime_digest` reads these bytes rather than reasoning about them.
-
-    What this buys is the other half: the whole tree is compiled once, here, so no later import
-    has a cache to write, and the identity computed after this call is the identity every worker
-    afterwards runs under.
-
-    Forced, because ``compileall`` decides whether a cache is current by comparing a *timestamp*
-    header, so an existing timestamp cache that is up to date is skipped and left in the form this
-    is here to replace.
-
-    Run after the app sources are unpacked, because those are the modules with the most in them,
-    and run once: three seconds at provisioning, against three on every worker start, which is
-    what sending each worker to a cache directory of its own would have cost instead."""
-    _run(
-        [
-            str(python),
-            "-m",
-            "compileall",
-            "-q",
-            "-f",
-            "-j",
-            "0",
-            "--invalidation-mode",
-            "checked-hash",
-            *(str(packages) for packages in _site_packages(python.parent.parent)),
-        ]
-    )
 
 
 def _apps_stamp() -> str:
@@ -611,146 +536,39 @@ def task_specs(root: Path, task_id: str) -> Dict[str, Any]:
 
 
 def runtime_digest() -> str:
-    """What the worker's interpreter actually holds, as sixteen hex characters.
+    """What the worker runs under, as sixteen hex characters: the pins, and the host's Python.
 
-    The runtime cache is named for the pins, while it is built by resolving the pinned release's
-    ranged dependencies against whatever the host's Python and the index offer on the day. Two
-    machines, or one machine a month apart, therefore run a world under different transitive
-    versions under a name that says they are the same. This reads what was realized rather than
-    what was asked for.
+    A pin rather than a reading of the installed bytes. It names the release this port asks for,
+    the commit that release is recorded against, the Python series the virtual environment is
+    built on, and the platform it is built for, which together are what decides which runtime
+    directory is built and reused (see :func:`runtime`).
 
-    **Every installed byte, not the distribution names.** This once hashed the platform, the venv
-    config and the ``.dist-info`` directory *names*, which is a list of what was asked for a second
-    time: two different artifacts published under one version were one identity, and so was a
-    module edited in place, which is the one thing a digest over a tree an interpreter runs from
-    exists to catch. A ``.dist-info`` name is a label, and a label is not a fingerprint of the code
-    behind it.
-
-    **What is hashed, exactly: every byte of ``site-packages`` an import can reach, plus the base
-    interpreter's own binary.** Every regular file under every ``site-packages`` of the virtual
-    environment, by relative path and by content, ``__pycache__`` included; every symbolic link
-    there by its target text, by where that text resolves to and by the resolved file's bytes;
-    ``pyvenv.cfg``; the platform; the pins; and the executable ``bin/python`` resolves to, which is
-    the real interpreter the venv borrows and which nothing else here would have covered.
-
-    **The bytecode caches are in, and used not to be.** The argument for leaving them out was that
-    provisioning rewrites every cache as a hash-based one, which the import system validates
-    against the source's own hash, so a ``.pyc`` stood for a source this function had read. That
-    validation compares the *source hash recorded in the cache header* with the source; it does
-    not bind the marshalled payload to those bytes. So a cache whose header still matched and
-    whose payload had been changed was executable code this digest had never read, and the
-    identity said nothing. Reading the caches costs a quarter of a second on this runtime, against
-    the second and a half per worker start that deleting them and re-parsing every import would
-    cost instead, so they are read.
-
-    That is stable rather than lucky, because nothing writes one after provisioning:
-    :func:`_compile_runtime` compiles the whole tree once with ``-f``, every process this port
-    starts under that interpreter afterwards carries ``PYTHONDONTWRITEBYTECODE`` (see
-    :func:`_worker_environment`), and a valid checked-hash cache is not rewritten by the import
-    that reads it. A cache appearing or changing under this tree is therefore a change to the code
-    the worker runs, which is exactly what this digest is for.
-
-    **What is not hashed, and why it is out of scope.** The base interpreter's *standard library*
-    is not read: it is thousands of files belonging to the host's Python rather than to anything
-    this port installs, and the base binary's own bytes already move with a reinstalled or
-    repointed interpreter. A digest that named that would be a longer walk and a claim this code
-    cannot keep, so the claim is the narrower one and it is true.
-
-    Read off the filesystem rather than by running the interpreter, so a broken install still gets
-    an answer. It costs about a second warm over the roughly fifteen thousand installed files of
-    this runtime, of which the base binary is under ten milliseconds, paid once per env
-    construction beside a corpus digest that costs half as much again (:func:`corpus_digest` is
-    the only other thing on the same path, and both are read once in a constructor). Not
-    memoized, for the reason :func:`corpus_digest` is not."""
-    python = runtime()
-    home = python.parent.parent
-    material = hashlib.sha256()
-    material.update(f"{platform.system()}|{platform.machine()}".encode())
-    material.update(f"{UPSTREAM_VERSION}|{UPSTREAM_SHA}".encode())
-    config = home / "pyvenv.cfg"
-    material.update(config.read_bytes() if config.exists() else b"")
-    # The interpreter the venv borrows. `pyvenv.cfg` names its directory, which is a label; this
-    # is the executable that actually runs, read through whatever chain of links `bin/python` is.
-    _absorb_target(material, b"base", python)
-    for packages in _site_packages(home):
-        for relative, path in _installed_files(packages):
-            material.update(relative.encode())
-            material.update(b"\0")
-            if path.is_symlink():
-                material.update(b"link\0")
-                material.update(os.readlink(path).encode())
-                material.update(b"\0")
-                # And what the link resolves to, which the target text alone does not say: a
-                # relative target reaches a different file from a different directory, and the
-                # bytes behind an unchanged target can change without the text moving.
-                _absorb_target(material, b"target", path)
-                continue
-            material.update(b"file\0")
-            with path.open("rb") as handle:
-                while True:
-                    block = handle.read(1 << 20)
-                    if not block:
-                        break
-                    material.update(block)
-    return material.hexdigest()[:16]
-
-
-def _absorb_target(material: Any, label: bytes, path: Path) -> None:
-    """Fold in where ``path`` resolves to and the bytes that are there, if it is a regular file.
-
-    Resolved and then read, rather than opened through the link: what goes into the identity is
-    the pair, because the same target text under two directories is two files and the same file
-    under one name can be replaced. A resolution that is not a regular file (a directory, a
-    dangling link, a device) contributes its path and the fact that it is not readable as bytes;
-    following a link to a *directory* would make this walk unbounded, which is the same reason
-    :func:`_installed_files` never descends into one."""
-    material.update(label)
-    material.update(b"\0")
-    try:
-        resolved = Path(os.path.realpath(path))
-        material.update(str(resolved).encode())
-        material.update(b"\0")
-        if not resolved.is_file():
-            material.update(b"not-a-file\0")
-            return
-        with resolved.open("rb") as handle:
-            while True:
-                block = handle.read(1 << 20)
-                if not block:
-                    break
-                material.update(block)
-    except OSError:
-        material.update(b"unreadable\0")
-
-
-def _installed_files(packages: Path) -> "Iterator[Tuple[str, Path]]":
-    """Every file under ``packages``, bytecode caches included, in one order on every machine.
-
-    Sorted at each level rather than by collecting and sorting the whole tree, so a digest over a
-    hundred thousand files still holds one directory's names at a time.
-
-    A symlinked *directory* is yielded like any other link and never descended into, so it
-    contributes where it points and not a second copy of whatever is over there. Descending would
-    also be how one link makes this walk unbounded."""
-    for directory, children, names in os.walk(packages, followlinks=False):
-        here = Path(directory)
-        linked = [child for child in children if (here / child).is_symlink()]
-        children[:] = sorted(child for child in children if child not in linked)
-        for name in sorted([*names, *linked]):
-            path = here / name
-            yield str(path.relative_to(packages)), path
+    **What it does not cover, said plainly.** The pinned release's own dependencies are ranges,
+    so two machines can resolve different transitive versions under one pin, and a module edited
+    in place inside the runtime moves nothing here. Reading the installed bytes is what would
+    close that, and it belongs with the container the worker runs in
+    (shojin-lab/shogym#140), where the image digest names the whole tree at once rather than a
+    walk of the host's cache standing in for one."""
+    return hashlib.sha256(
+        "|".join(
+            (
+                UPSTREAM_VERSION,
+                UPSTREAM_SHA,
+                _python_series(),
+                platform.system(),
+                platform.machine(),
+            )
+        ).encode()
+    ).hexdigest()[:16]
 
 
 # ----- the derived corpus -----
 
 
-#: Bumped when the shape of a derived tree changes: what is copied, what is linked, what is
-#: sealed, and what a task carries to say it is whole. It is part of a cache's name and of its
-#: stamp, so a tree built under an older layout is a different cache rather than one this code
-#: will read as its own. At 2 because a derived task now carries a manifest of everything in it
-#: (see :func:`~world._write_manifest`), and a tree from before it has nothing to be checked
-#: against.
-DERIVATION_VERSION = 2
+#: Bumped when the shape of a derived tree changes: what is copied, what is linked, and what a
+#: task carries to say it is whole. It is part of a cache's name and of its stamp, so a tree built
+#: under an older layout is a different cache rather than one this code will read as its own.
+DERIVATION_VERSION = 3
 
 #: What a derived cache was built from, written inside it once it is complete.
 _SOURCE_FILE = ".shogym-source"
@@ -1351,42 +1169,20 @@ class WorkerError(RuntimeError):
 #: the episode's own.
 _ENV_ALLOW_LIST: Tuple[str, ...] = ("PATH", "LANG", "LC_ALL", "LC_CTYPE", "SYSTEMROOT", "TMPDIR")
 
-#: What every worker's scratch directory is named for. It is also what a sweep checks before
-#: removing one whose name it read out of a file: the ledger is a file, and a file can be edited.
+#: What every worker's scratch directory is named for, so a directory this port left behind on a
+#: host is one an operator can recognise.
 _SCRATCH_PREFIX = "shogym-appworld-"
 
-#: A grader's scratch directory, which is a worker's with a word added. It carries the prefix
-#: above because a grader is written into the same ledger as a serving worker and is reclaimed by
-#: the same sweep, which will only remove a directory whose name it recognises (see
-#: :func:`_clear_scratch`).
+#: A grader's scratch directory, which is a worker's with a word added.
 _GRADE_SCRATCH_PREFIX = _SCRATCH_PREFIX + "grade-"
-
-
-def _close_descriptor(descriptor: Optional[int]) -> None:
-    """Close a raw descriptor, and treat one that is already closed as closed."""
-    if descriptor is None:
-        return
-    try:
-        os.close(descriptor)
-    except OSError:
-        pass
 
 
 def _worker_environment(scratch: Path) -> Dict[str, str]:
     """A scrubbed environment for one worker.
 
-    **``PYTHONDONTWRITEBYTECODE`` is what keeps the runtime's identity a constant of the run.**
-    :func:`runtime_digest` reads every ``.pyc`` under the installed tree, because a cache is
-    executable input and a checked-hash header binds the source and not the payload. That digest
-    names the derived cache, so a cache file appearing or changing mid-run would rename the world
-    every later episode is served from. Nothing this port starts under that interpreter writes
-    one: provisioning compiles the tree once (:func:`_compile_runtime`) and every process after it
-    carries this variable, so the only way those bytes move is somebody changing what the worker
-    executes, which is the fact the digest exists to carry.
-
-    Not the same thing as ``PYTHONPYCACHEPREFIX``, which was the first attempt and which sends
-    each worker to a cache directory of its own. That is also correct and costs about three
-    seconds of recompilation on every worker start, of which an episode pays two."""
+    ``PYTHONDONTWRITEBYTECODE`` because this is the process that runs agent-authored code and the
+    interpreter it runs under is shared by every episode on this machine: a worker that wrote
+    bytecode caches into it would be writing into what the next episode imports."""
     scrubbed = {
         name: os.environ[name] for name in _ENV_ALLOW_LIST if os.environ.get(name) is not None
     }
@@ -1394,478 +1190,6 @@ def _worker_environment(scratch: Path) -> Dict[str, str]:
     scrubbed["APPWORLD_CACHE"] = str(scratch / "appworld-cache")
     scrubbed["PYTHONDONTWRITEBYTECODE"] = "1"
     return scrubbed
-
-
-# ----- workers whose parent is gone -----
-
-#: Where the workers this port has started are written down, one event per line. A file rather
-#: than anything held in memory, because the case it exists for is a serving process that is no
-#: longer there to hold anything: what a later construction reads has to have outlived the process
-#: that wrote it.
-_WORKER_LEDGER = "workers.txt"
-
-#: What one sweep holds while it decides. Its own file rather than the ledger's, because the two
-#: locks bound different things: the ledger's is taken for one short append or one rewrite, and
-#: this one is held across a ``ps`` per record and the signals that follow. Taking the ledger's
-#: for the whole of a sweep would block every sibling's spawn on this machine behind it.
-_REAP_LOCK = "workers.reaping"
-
-#: When the ledger is rewritten rather than appended to. Two lines per worker that started and
-#: stopped, so a file only ever appended to is a file every later construction reads in full.
-_LEDGER_MAX_LINES = 4096
-
-#: What one sweep spends before it leaves the rest for the next one. Deciding whether an owner is
-#: still alive can cost a ``ps`` per record, and this runs inside a constructor a serve layer may
-#: call while it is dispensing. The work is idempotent and the leftovers do not spoil, so stopping
-#: early costs nothing but a second pass.
-_REAP_SECONDS = 10.0
-_REAP_MAX_WORKERS = 16
-
-
-def _ledger() -> Path:
-    """The ledger's path, made if this is the first worker on this machine."""
-    home = cache_root()
-    home.mkdir(parents=True, exist_ok=True)
-    return home / _WORKER_LEDGER
-
-
-def _reap_lock() -> Path:
-    """The file one sweep locks, made if this is the first construction on this machine."""
-    home = cache_root()
-    home.mkdir(parents=True, exist_ok=True)
-    return home / _REAP_LOCK
-
-
-def _append(line: str) -> None:
-    """Add one event, under the lock a rewrite takes, and never raise.
-
-    One ``O_APPEND`` write of one short line, which the kernel does not interleave with another
-    process's. The lock is not what makes that atomic; it is what keeps this out of the middle of
-    a compaction, which is a read and a write with a gap in it (see :func:`_compact`)."""
-    try:
-        with open(_ledger(), "a") as handle:
-            _exclusive(handle)
-            handle.write(line + "\n")
-    except OSError:
-        pass
-
-
-def _exclusive(handle: Any) -> bool:
-    """Take the ledger's own lock, or say that this filesystem does not have one.
-
-    Blocking, because everyone who takes it holds it for one small write and the honest reading of
-    "somebody else has it" is that they are a line ahead of this one."""
-    try:
-        fcntl.flock(handle.fileno(), fcntl.LOCK_EX)
-    except OSError:
-        # Including the errnos that mean "this mount has no locks". The appends stay correct
-        # without it, because each is one `O_APPEND` write; what is not attempted without it is
-        # the rewrite, which is the operation that needs the exclusion.
-        return False
-    return True
-
-
-def record_worker(**fields: Any) -> str:
-    """Write down one worker this process has started, and return the name it was written under.
-
-    Appended before the handshake rather than after it, so a parent that dies during a spawn has
-    still said what it started. The record is what a later construction has instead of the
-    ``Worker`` object: who owns it (:func:`process_birth` beside the owner's pid, so a recycled
-    number is not read as a live owner), which boot it belongs to, what to signal, and what to
-    remove.
-
-    Never raises. A worker that could not be written down is a worker whose parent-death pipe
-    still stops it; the ledger is what lets a later run *find* it, not what stops it."""
-    name = f"{os.getpid()}-{secrets.token_hex(8)}"
-    _append(
-        "+"
-        + json.dumps(
-            {
-                "name": name,
-                "parent": os.getpid(),
-                "birth": _own_birth(),
-                "boot": _boot_id(),
-                **fields,
-            },
-            sort_keys=True,
-        )
-    )
-    return name
-
-
-def forget_worker(name: str) -> None:
-    """Tombstone a worker this process has stopped."""
-    _append(f"-{name}")
-
-
-def outstanding() -> List[Dict[str, Any]]:
-    """The workers written down and not yet tombstoned, in the order they were first written."""
-    try:
-        lines = _ledger().read_text().splitlines()
-    except OSError:
-        return []
-    return _live(lines)
-
-
-def _live(lines: Sequence[str]) -> List[Dict[str, Any]]:
-    """The records a ledger's events leave outstanding, in the order they were first written.
-
-    Every line is an event, ``+`` for a worker to account for and ``-`` for one confirmed stopped,
-    and what is live is what the events say rather than what any writer last decided. A line that
-    will not parse is a line from a version of this code or a torn write, and is skipped rather
-    than treated as a worker."""
-    live: Dict[str, Dict[str, Any]] = {}
-    gone: set = set()
-    for line in lines:
-        line = line.strip()
-        if line.startswith("-"):
-            gone.add(line[1:])
-        elif line.startswith("+"):
-            try:
-                record = json.loads(line[1:])
-            except ValueError:
-                continue
-            name = str(record.get("name", ""))
-            if name and name not in live:
-                live[name] = record
-    return [record for name, record in live.items() if name not in gone]
-
-
-def _spent(began: float, reclaimed: Sequence[str]) -> bool:
-    """Whether this sweep has used the budget one call gets."""
-    return len(reclaimed) >= _REAP_MAX_WORKERS or time.monotonic() - began > _REAP_SECONDS
-
-
-def reap(*, alive: Optional[Any] = None) -> List[str]:
-    """Stop and clear away this port's workers whose owner is gone, and say which.
-
-    **The case teardown cannot reach.** A worker is started in a session of its own so that
-    stopping an episode stops everything the episode spawned, and only the parent's own ``Worker``
-    object held its port, its token, its process handle and its group. A serving process that died
-    abruptly took all four with it: the worker was reparented and went on running, and a resumed
-    harness could neither adopt it nor name it for teardown and simply started another. What is
-    left is a process nobody is going to stop and nothing names.
-
-    So every worker is written down with the pid and the birth of the process that started it, and
-    this runs at construction: a record whose owner is not running is a worker nobody is coming
-    back for. The birth is beside the pid because pids are reused, and the boot id is beside both
-    because they are reused across a restart; stopping a live episode's world because an unrelated
-    process now holds its owner's number would be worse than the failure this fixes.
-
-    **Bounded in aggregate**, because deciding an owner is dead can cost a ``ps`` per record and
-    this is called from a constructor a serve layer may run while it is dispensing. Nothing is lost
-    by stopping early: what is left is still in the ledger, and the next construction starts again
-    from the front of it.
-
-    This is the second defence and not the first. The worker holds the read end of a pipe from its
-    parent and stops itself when that closes (see :func:`~worker.watch_parent`), so in the ordinary
-    crash the process is already gone by the time anything reads this file and what is reclaimed
-    here is the scratch directory and the record. This is what covers a worker that was stopped
-    before it armed the pipe, or one whose group outlived it.
-
-    **One sweep at a time on this machine, and that is what makes a reclamation a decision rather
-    than a race.** Reading the record, checking the leader's birth and signalling its group are
-    three steps, and the ledger's own lock covers none of that: it is taken for one append and
-    released. Two constructions therefore used to snapshot the same outstanding record, both pass
-    the birth check, and both signal; a synchronized probe caught exactly that, two kills aimed at
-    one record. The second of them is the dangerous one, because by then the first has killed the
-    leader and the number it is aiming at may already have been handed to somebody else. So a
-    sweep takes an exclusive lock of its own first and reads the ledger under it, which makes the
-    check, the signal and the tombstone one owner's from end to end.
-
-    Taken without waiting: a second construction that finds the lock held has nothing to add,
-    because the sweep already running will read every record it would have read. It returns having
-    reclaimed nothing, which is what this call already does when it runs out of budget.
-
-    A filesystem with no locks gets no sweep at all. Every other operation on this ledger is a
-    single append that survives without exclusion, but this one sends signals, and a signal that
-    may be duplicated onto a recycled group number is the failure this whole file exists to
-    prevent. The parent-death pipe is still the first defence there, and the records keep."""
-    try:
-        handle = open(_reap_lock(), "a")
-    except OSError:
-        return []
-    try:
-        try:
-            fcntl.flock(handle.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
-        except BlockingIOError:
-            # Somebody else is sweeping this machine right now.
-            return []
-        except OSError:
-            # Including the errnos that mean "this mount has no locks". See above.
-            return []
-        return _sweep(alive=alive)
-    finally:
-        handle.close()
-
-
-def _sweep(*, alive: Optional[Any] = None) -> List[str]:
-    """One pass over the outstanding records, under the lock :func:`reap` holds for the whole of
-    it. Split out so that every path back to the caller releases that lock."""
-    began = time.monotonic()
-    running = alive if alive is not None else _process_is_alive
-    reclaimed: List[str] = []
-    for record in outstanding():
-        if _spent(began, reclaimed):
-            break
-        name = str(record.get("name", ""))
-        if record.get("boot") != _boot_id():
-            # From before this machine last restarted. Every number in it belongs to somebody
-            # else now, so nothing is signalled; the record goes, and so does whatever scratch
-            # directory survived the reboot.
-            _clear_scratch(record)
-            forget_worker(name)
-            reclaimed.append(name)
-            continue
-        owner = str(record.get("parent", ""))
-        # An unreadable record is left alone. This stops processes, so the ambiguous case has to
-        # be the one where nothing happens.
-        if not owner.isdigit() or running(int(owner), str(record.get("birth", ""))):
-            continue
-        if not _stop_orphan(record):
-            # Nothing was stopped and nothing was seen to be gone, so this record is still the
-            # only durable trace of a worker that may be running. It used to be tombstoned here
-            # anyway, along with its scratch directory: an entry with a live worker pid and an
-            # unreadable birth was reported reclaimed by a sweep that had signalled nothing, which
-            # leaves a world serving with nothing left naming it: exactly the failure this whole
-            # file exists to close. Left where it is, for the next construction to try again.
-            continue
-        _clear_scratch(record)
-        forget_worker(name)
-        reclaimed.append(name)
-    _compact()
-    return reclaimed
-
-
-def _stop_orphan(record: Dict[str, Any]) -> bool:
-    """Stop an abandoned worker's group, and say whether the worker was positively dealt with.
-
-    The same rule :meth:`Worker.close` follows, for the same reason and with less to go on: a pgid
-    is a number, and a number is that worker's only while the process holding it exists. The
-    leader's own birth was read at spawn and written down beside its pid, so this can ask whether
-    the number still names the process it was written for. A leader that is gone leaves a number
-    nothing here may signal, and its descendants are then beyond reach: that is the honest
-    boundary rather than a signal aimed at whoever holds the number now.
-
-    A birth that was never readable is treated the same way. Elsewhere an unknown birth reads as
-    "says nothing" and the pid is believed, which is the safe direction for a question about
-    whether to *leave something alone*; here the answer decides whether to send a signal, so
-    unknown has to mean no.
-
-    **The answer is what the caller tombstones on, and that is the change.** This used to return
-    nothing whatever it had done, so every one of the silent paths below reported the same thing
-    to :func:`reap` as a delivered kill: an entry with a live worker pid and a birth the process
-    table would not answer for had its scratch removed and its ledger line tombstoned without a
-    signal being sent, which is a running world with no durable record of itself left. Only two
-    outcomes are true here now, and both of them are positive:
-
-    * the group was addressed. The signal went out, or there was no group left to take it, which
-      is the same fact about this worker's execution domain.
-    * the worker was observed gone. Its pid names nothing at all, or it names a process born at
-      some other time, and in either case the process this record was written for has exited.
-
-    Everything else is ambiguity: a record this cannot read, a birth nobody wrote down, a process
-    table that will not answer, a pid this uid may not query. Ambiguity keeps the record and the
-    scratch rather than spending them."""
-    pid, pgid = record.get("pid"), record.get("pgid")
-    birth = str(record.get("pid_birth") or "")
-    if not isinstance(pid, int) or not isinstance(pgid, int) or pid != pgid:
-        return False
-    if not birth:
-        return False
-    now = process_birth(pid)
-    if now == birth:
-        return _signal_group(pgid, signal.SIGKILL)
-    if now:
-        # A different process is wearing this number, so the worker that was written down here has
-        # exited. Nothing of its own is left to signal, and the number is not this port's to aim
-        # at.
-        return True
-    # The table said nothing, which is not the same as saying the process is gone. One question
-    # left that does not need it: whether the number names anything at all.
-    return _pid_is_absent(pid)
-
-
-def _pid_is_absent(pid: int) -> bool:
-    """Whether ``pid`` names no process at all, as far as this process is allowed to tell.
-
-    The narrow half of :func:`_process_is_alive`, and it answers the opposite way where it cannot
-    tell. A number this uid may not signal belongs to somebody else and is certainly not absent,
-    and an error that is neither is not an observation of anything."""
-    try:
-        os.kill(pid, 0)
-    except ProcessLookupError:
-        return True
-    except OSError:
-        return False
-    return False
-
-
-def _clear_scratch(record: Dict[str, Any]) -> None:
-    """Remove an abandoned worker's scratch directory, which was its ``HOME``.
-
-    Only one this port made. The name is read out of a file, and a file is a thing that can be
-    edited, so what is removed has to carry the prefix :func:`Worker.spawn` gives every scratch
-    directory. That is not a boundary against somebody who writes this file on purpose, and it is
-    not meant to be: it is what keeps a mangled or truncated line from naming a directory this
-    would then delete."""
-    scratch = record.get("scratch")
-    if not isinstance(scratch, str) or not scratch:
-        return
-    path = Path(scratch)
-    if not path.name.startswith(_SCRATCH_PREFIX):
-        return
-    shutil.rmtree(path, ignore_errors=True)
-
-
-def _compact() -> None:
-    """Rewrite the ledger as just the records still outstanding, once it has grown enough to matter.
-
-    **In place and under the file's own lock, because a rewrite is the one operation here that can
-    lose a record.** Everything else is a single ``O_APPEND`` write, which the kernel will not
-    interleave; a rewrite is a read and a write with a gap in the middle, and a record appended by
-    a live sibling in that gap is a worker nobody would ever come back for. A rename would swap the
-    inode the lock is on, so the file is truncated and rewritten rather than replaced.
-
-    Never raises, and does nothing at all where the filesystem cannot lock: a ledger that is merely
-    long is a file this port reads a little more of."""
-    try:
-        with open(_ledger(), "r+") as handle:
-            if not _exclusive(handle):
-                return
-            lines = handle.read().splitlines()
-            if len(lines) <= _LEDGER_MAX_LINES:
-                return
-            keeping = _live(lines)
-            handle.seek(0)
-            handle.write("".join("+" + json.dumps(r, sort_keys=True) + "\n" for r in keeping))
-            handle.truncate()
-    except OSError:
-        pass
-
-
-def _process_is_alive(pid: int, birth: str = "") -> bool:
-    """Whether ``pid`` is the same live process that was born at ``birth``.
-
-    **This process's own number is not a free pass.** The shortcut used to return ``True`` for it
-    without reading the birth beside it, which throws away the very fact that field carries: a
-    record written by an earlier holder of this number names an owner that has exited, and reading
-    it as "the owner is me, so it is alive" leaves that worker unreclaimable for as long as this
-    process runs. So the birth is compared here too, and only an unreadable one on either side
-    reads as "says nothing"."""
-    if pid == os.getpid():
-        mine = _own_birth()
-        return not birth or not mine or birth == mine
-    try:
-        os.kill(pid, 0)
-    except ProcessLookupError:
-        return False
-    except PermissionError:
-        # Somebody else's process, which is somebody else's business and certainly alive.
-        return True
-    except OSError:
-        return True
-    if not birth:
-        return True
-    now = process_birth(pid)
-    # A recorded birth that no longer matches is a recycled number, and the process that owned
-    # this worker is gone. An unreadable birth now says nothing, so it says nothing.
-    return not now or now == birth
-
-
-@lru_cache(maxsize=1)
-def _own_birth() -> str:
-    """When this process started. Memoized: it is one ``ps`` and it cannot change.
-
-    **It cannot change, but the process can.** A fork does not start a new interpreter: the child
-    inherits every cached value the parent had warmed, and one of them says when the *parent* was
-    born. A child that warmed it in its parent then wrote that birth into the ledger beside its
-    own pid, and a sibling construction reading that record saw a live worker pid under a birth
-    that did not match it: an active child's worker, offered up as an orphan to reclaim. A fork
-    probe on this code confirmed the child answering with the parent's value rather than with its
-    own. So the cache is cleared in the child at every fork, below, which is the one moment the
-    answer stops being true."""
-    return process_birth(os.getpid())
-
-
-# The child of a fork inherits the parent's cache and none of its identity. Registered at import
-# because a fork can happen at any moment after it, including inside a library this port never
-# calls, and there is no later point that is reliably before the first read (see `_own_birth`).
-os.register_at_fork(after_in_child=_own_birth.cache_clear)
-
-
-def process_birth(pid: int) -> str:
-    """When ``pid`` started, as the process table reports it, or the empty string if unknown.
-
-    A pid is reused, and within one boot it is reused quickly. ``kill(pid, 0)`` answers "is
-    something running under that number", and the question a sweep is asking is "is the process
-    that started this worker still running". The start time is what separates them: a number that
-    came back with a different birth is a different process wearing the same badge.
-
-    **A number, not a rendering.** ``ps`` blank-pads a single-digit day and renders the time in the
-    caller's zone, so the same live process read under two locales or two ``TZ`` values prints two
-    different strings, and an owner would then read as replaced. The environment is pinned and the
-    result converted to epoch seconds, which has no spacing to lose and compares exactly.
-
-    One second of precision is what ``ps`` offers, so a pid reused inside the same second is still
-    indistinguishable. That is the residual, and it is narrower than the pid alone was.
-
-    Unknown is the empty string rather than an error, and two empty strings compare equal, which
-    keeps a sweep on the safe side of its own rule: it stops only what it can positively tell is
-    abandoned."""
-    try:
-        finished = subprocess.run(
-            ["ps", "-o", "lstart=", "-p", str(pid)],
-            capture_output=True,
-            text=True,
-            timeout=_CLOSE_SECONDS,
-            env={**os.environ, "TZ": "UTC", "LC_ALL": "C", "LANG": "C"},
-        )
-    except (OSError, subprocess.SubprocessError):
-        return ""
-    if finished.returncode != 0:
-        return ""
-    rendered = " ".join(finished.stdout.split())
-    if not rendered:
-        return ""
-    try:
-        # Normalised first, so the padded day the platform writes and the single space a reader
-        # might rebuild parse to the same instant. The zone is pinned above, so this is UTC.
-        return str(calendar.timegm(time.strptime(rendered, "%a %b %d %H:%M:%S %Y")))
-    except ValueError:
-        # A format this does not know is not a birth this can compare. Unknown is the empty
-        # string, which keeps a sweep on the safe side of its own rule.
-        return ""
-
-
-@lru_cache(maxsize=1)
-def _boot_id() -> str:
-    """Something that changes when the machine restarts, so a reused pid is not a live owner.
-
-    **The number, not the rendering.** ``sysctl -n kern.boottime`` prints a struct and then a human
-    date, and the date is rendered in the caller's zone: hashing the whole line gives two boot
-    identities for one boot under two ``TZ`` values, which would hide an orphan from a sweep run in
-    another zone. The seconds field inside the struct is the kernel's own value and does not move,
-    so that is what is taken. Linux's boot id is already a value rather than a rendering."""
-    try:
-        stamp = subprocess.run(
-            ["sysctl", "-n", "kern.boottime"],
-            capture_output=True,
-            text=True,
-            timeout=_CLOSE_SECONDS,
-            env={**os.environ, "TZ": "UTC", "LC_ALL": "C", "LANG": "C"},
-        )
-        if stamp.returncode == 0 and stamp.stdout.strip():
-            seconds = re.search(r"sec\s*=\s*(\d+)", stamp.stdout)
-            if seconds:
-                return seconds.group(1)
-            return hashlib.sha256(stamp.stdout.strip().encode()).hexdigest()[:12]
-    except (OSError, subprocess.SubprocessError):
-        pass
-    try:
-        return hashlib.sha256(Path("/proc/sys/kernel/random/boot_id").read_bytes()).hexdigest()[:12]
-    except OSError:
-        return "unknown"
 
 
 @dataclass
@@ -1892,30 +1216,6 @@ class Worker:
     port: int
     token: str
     scratch: Path
-    #: The group this worker leads, read once while the worker was certainly alive.
-    #:
-    #: A group used to be resolved from the stored pid at close time, and a pid is only that
-    #: process's for as long as that process exists. An ordinary episode closes its worker twice:
-    #: once when the sealed world is read, and once from teardown. Between them runs the grader,
-    #: which is allowed ten minutes, and a pid freed at the start of that window can belong to
-    #: something else by the end of it. Asked then, the kernel answers about the stranger, and the
-    #: second close signals a group this port never started. Read at spawn, the answer is about
-    #: this worker or it is nothing.
-    pgid: Optional[int] = None
-    #: The writing end of the pipe whose end-of-file tells the worker this process is gone. Held
-    #: open for the worker's whole life and closed by nothing but :meth:`close` and the death of
-    #: this process, which is the event it exists to signal (see :func:`~worker.watch_parent`).
-    keepalive: Optional[int] = None
-    #: What this worker is written down as in the durable ledger, so a later construction can tell
-    #: an abandoned worker from a live one (see :func:`reap`).
-    record: Optional[str] = None
-    #: Whether :meth:`close` has begun. Set before the first signal, so a close interrupted part
-    #: way through is still a worker no later call will signal for.
-    closed: bool = False
-    #: Whether the execution domain is *provably* gone: the leader was signalled while it was
-    #: alive, was reaped, and the process table was read and showed nothing left in the group.
-    #: What finalize grades on, and false wherever the answer is "I could not tell".
-    stopped: bool = False
 
     @classmethod
     def spawn(cls, root: Path) -> "Worker":
@@ -1926,33 +1226,19 @@ class Worker:
         the life of it.
 
         **Nothing escapes this without an owner.** Only the empty-line branch used to clean up, so
-        a handshake that failed any other way left a live worker process, its whole group, and its
-        scratch directory behind with nobody holding a reference: a stdin the child never read and
-        closed, a first line that is not JSON, a JSON object with no ``port`` in it, a port that is
-        not an integer. All of those happen at construction, before there is a task to file a
-        failure row against, so the run's own record would not have said either. The process, its
-        group and the scratch belong to this method until a ``Worker`` is returned, and are killed,
-        reaped and removed on every other exit.
+        a handshake that failed any other way left a live worker process and its scratch directory
+        behind with nobody holding a reference: a stdin the child never read and closed, a first
+        line that is not JSON, a JSON object with no ``port`` in it, a port that is not an
+        integer. All of those happen at construction, before there is a task to file a failure row
+        against, so the run's own record would not have said either. The process and the scratch
+        belong to this method until a ``Worker`` is returned, and are killed, reaped and removed on
+        every other exit.
 
         The whole handshake is under :data:`_SPAWN_TIMEOUT_SECONDS`. The write is not, and does not
-        need to be: it is a couple of hundred bytes into an empty pipe, which cannot block.
-
-        **The worker is given a way to notice this process dying, and is written down so a later
-        one can find it.** Stdin is closed after the handshake, so nothing on it says anything
-        afterwards; the keep-alive pipe is a second descriptor, held open for the worker's whole
-        life and closed by the kernel when this process exits however it exits. Its number is sent
-        in the handshake rather than fixed by convention, because ``pass_fds`` does not renumber.
-        The ledger record beside it is what a construction after a crash reads (see :func:`reap`),
-        and it is written before the handshake so that a parent which dies inside a spawn has still
-        said what it started."""
+        need to be: it is a couple of hundred bytes into an empty pipe, which cannot block."""
         token = secrets.token_urlsafe(32)
         scratch = Path(tempfile.mkdtemp(prefix=_SCRATCH_PREFIX))
         process: Optional[subprocess.Popen] = None
-        pgid: Optional[int] = None
-        record: Optional[str] = None
-        # Non-inheritable by default, so no other child of this process holds the writing end open
-        # and reports this one alive after it has gone.
-        listening, holding = os.pipe()
         published = False
         try:
             process = subprocess.Popen(
@@ -1963,38 +1249,14 @@ class Worker:
                 text=True,
                 cwd=str(scratch),
                 env=_worker_environment(scratch),
-                # Its own process group, so stopping the episode stops everything it started.
-                # Agent code runs in this process and is free to spawn; signalling the direct
-                # child alone would leave those descendants running against the world after it
-                # was scored.
-                start_new_session=True,
-                pass_fds=(listening,),
-            )
-            # Read here and kept, rather than resolved from the pid later: see `pgid`.
-            pgid = _group_of(process)
-            record = record_worker(
-                pid=process.pid,
-                pid_birth=process_birth(process.pid),
-                pgid=pgid,
-                scratch=str(scratch),
             )
             assert process.stdin is not None
-            process.stdin.write(
-                json.dumps({"root": str(root), "token": token, "keepalive": listening}) + "\n"
-            )
+            process.stdin.write(json.dumps({"root": str(root), "token": token}) + "\n")
             process.stdin.flush()
             process.stdin.close()
             assert process.stdout is not None
             line = _first_line(process, _SPAWN_TIMEOUT_SECONDS)
             if not line:
-                # The group is stopped first and the status read after it, because ``poll`` reaps
-                # an exited child and a reaped leader's group number is the kernel's to hand on.
-                # Read for the diagnostic before anything had stopped the group, it left the
-                # cleanup below signalling a number that might already have been somebody else's,
-                # which is the stale-group ordering :meth:`_stop_the_group` refuses. A worker that
-                # closed its pipe without printing is also a worker that may have started
-                # something first, and this is what stops that too.
-                _stop(process, signal.SIGKILL, pgid)
                 raise WorkerError(
                     "the appworld worker never bound a port "
                     f"(status {process.poll()}, waited {_SPAWN_TIMEOUT_SECONDS:.0f}s)"
@@ -2005,21 +1267,12 @@ class Worker:
                 port=int(json.loads(line)["port"]),
                 token=token,
                 scratch=scratch,
-                pgid=pgid,
-                keepalive=holding,
-                record=record,
             )
             published = True
             return worker
         finally:
-            # The child has its own copy; a reading end still open here would be a pipe that never
-            # reaches end-of-file for the worker either.
-            _close_descriptor(listening)
             if not published:
-                _close_descriptor(holding)
-                _abandon(process, pgid, scratch)
-                if record is not None:
-                    forget_worker(record)
+                _abandon(process, scratch)
 
     def call(self, command: str, **body: Any) -> Any:
         """Send one command and return what the world answered."""
@@ -2036,130 +1289,52 @@ class Worker:
             detail = exc.read().decode(errors="replace")
             raise WorkerError(f"appworld worker refused {command!r}: {detail}") from exc
 
-    def close(self, *, confirm: bool = False) -> None:
-        """Stop the worker, promptly and with a bound, and say whether it is provably gone.
+    def close(self) -> None:
+        """Stop the worker and wait for it, so what is graded is a tree nothing is writing to.
 
         Signalled and reaped rather than asked over the socket. There is no close command to ask
         for: this is the process that runs agent-authored code, so a reply from it saying that it
         had stopped is a reply the episode could have written. The fact the host needs is that the
         process stopped, and that fact is the kernel's.
 
-        **The group, and not only its leader.** Agent code runs in that process and is free to
-        spawn, so a signal to the direct child alone leaves descendants running against a world
-        that has been scored. The group is signalled and what is waited for is the group emptying.
+        SIGTERM, a short grace, then SIGKILL whatever happened. The grace buys an ordinary exit
+        for a process that wants one; it must not buy time, because every second of it is a second
+        in which the process that ran agent-authored code can still write into the tree that is
+        about to be graded.
 
-        **Only while the group is still this worker's.** A pgid is a number, and the kernel
-        recycles numbers once nothing holds them. The group is therefore signalled before the
-        leader is reaped, which is the window in which the number is certainly this worker's even
-        if the leader is already a zombie; a leader something else reaped first leaves a number
-        nothing here may use, and the honest report is then that the execution domain cannot be
-        addressed rather than that it was cleaned up (see :meth:`_stop_the_group`).
+        Idempotent, and safe to call twice, which an ordinary episode does: once when the sealed
+        world is read, once from teardown. Both go through the same terminate-and-wait, and a
+        process already reaped is not signalled again.
 
-        **Stateful, and that is what makes it idempotent.** An ordinary episode calls this twice:
-        once from finalize, once from teardown. Between them runs the grader, which is allowed ten
-        minutes, and that is long enough for a freed pid to be handed out again. Nothing here asks
-        about a pid after the first call.
-
-        ``confirm`` turns a best effort into an assertion. It returns only when the leader was
-        signalled while it was alive, was reaped, and the process table was read and showed nothing
-        left in the group. Anything else raises, including a process table that could not be read,
-        because "I could not look" is not "there is nothing there" and an episode graded on the
-        strength of it is graded on a tree something may still be writing to.
-
-        **What is spent, and only once the group is positively gone.** The ledger record and the
-        scratch directory are the only handles a later construction has on this worker, and they
-        used to be spent on every close whatever the stop had reported: a group that could not be
-        confirmed empty had its record tombstoned and its scratch removed anyway, so a descendant
-        the signal did not reach became a process nothing named. Finalization refuses the score in
-        that case, which is right and is not enough on its own, because teardown then removes the
-        trees while the untracked descendant may still be writing to them. An ambiguous stop keeps
-        both now, which is the rule :func:`_stop_orphan` and :func:`reap` already follow: a record
-        kept costs one line and one directory, and a record spent costs the only way back to a
-        running world."""
-        if not self.closed:
-            self.closed = True
-            self.stopped = self._stop_the_group()
-            # After the stop, not before it. The ordinary teardown is the signal and the process
-            # table; the pipe is the crash path, and closing it first would put a second killer
-            # in the middle of the one that reports.
-            _close_descriptor(self.keepalive)
-            self.keepalive = None
-            for stream in (self.process.stdout, self.process.stderr):
-                if stream is not None:
-                    try:
-                        stream.close()
-                    except Exception:
-                        pass
-            if self.stopped:
-                shutil.rmtree(self.scratch, ignore_errors=True)
-                if self.record is not None:
-                    forget_worker(self.record)
-                    self.record = None
-        if confirm and not self.stopped:
-            raise WorkerError(
-                "the appworld worker's execution domain could not be confirmed stopped, so there "
-                "is no state it is safe to grade: the process group was not observed empty (see "
-                "`Worker.close`)"
-            )
-
-    def _stop_the_group(self) -> bool:
-        """Signal and reap this worker's group, and report whether it is provably empty.
-
-        **Signalled before anything reaps the leader, which is what makes the number safe to
-        use.** A pid is reserved until its parent reaps it, and a process group exists while it
-        has any member, a zombie included. So a leader that exited on its own, even one an agent
-        killed from inside its own block, is still holding this group when this runs: the number
-        is unambiguously this worker's and the signal reaches whatever it started. What is never
-        safe is signalling *after* the reap, because the kernel is free to hand the number on from
-        that instant.
-
-        The one case this cannot serve is a leader something else already reaped, which
-        ``returncode`` is the record of. Then the number may be anybody's, so it is neither
-        signalled nor enumerated and the stop is reported unconfirmed.
-
-        The ordering matters for a second reason. Reaping first and refusing an already-exited
-        leader would have handed an episode a way out of a bad score: kill the worker from inside
-        a block and the seal cannot be confirmed, so the row is unscored rather than low. Under
-        this order that episode is stopped, confirmed and graded on what upstream persisted, which
-        is the same answer any other episode gets."""
-        pgid = self.pgid
-        if self.process.returncode is not None:
-            # Reaped before this call, so the pid and the group number may already have been
-            # handed on. Nothing is signalled and nothing is enumerated.
-            return False
-        if pgid is None:
-            # A platform without `setsid`: there is no group, so the leader is all there is to
-            # stop and there is nothing that could say what it started.
-            _stop(self.process, signal.SIGTERM, pgid)
+        **This stops the worker and not everything the worker started.** Agent code runs in that
+        process and is free to spawn, and a descendant of it survives this call. That is the
+        development host worker's boundary, and it is why the container the worker runs in
+        (shojin-lab/shogym#140) is the one this port's isolation claims rest on: a container that
+        goes away takes its whole process tree with it, which no arrangement of signals here
+        can promise."""
+        if self.process.returncode is None:
+            try:
+                self.process.terminate()
+            except OSError:
+                pass
             try:
                 self.process.wait(timeout=_TERM_GRACE_SECONDS)
             except subprocess.TimeoutExpired:
-                _stop(self.process, signal.SIGKILL, pgid)
-            return False
-        # SIGTERM, a short grace, then SIGKILL whatever happened. The grace used to be ten
-        # seconds of a signal any process may catch, ignore or take its time over, and every one
-        # of those seconds is time in which the process that ran agent-authored code is still
-        # able to write into the tree about to be graded. It is short because it buys only an
-        # ordinary exit, and it ends in a signal nothing can decline.
-        _signal_group(pgid, signal.SIGTERM)
-        # The grace, watched through the process table rather than through `wait`: `wait` reaps,
-        # and a group is enumerable only while its number is still held. A leader that exits
-        # tidily becomes a zombie, which the enumeration steps over, so this returns as soon as
-        # the group is really empty and otherwise costs the grace.
-        _group_emptied(pgid, within=_TERM_GRACE_SECONDS)
-        _signal_group(pgid, signal.SIGKILL)
-        # Enumerated while the leader is still unreaped, and that ordering is the point. Reaping
-        # releases the pid, and a process group exists only while it has a member: reap first and
-        # the number is free, so an enumeration or an escalation after it is about whatever holds
-        # it now. An unreaped leader is a zombie, which holds the number and is excluded from the
-        # count (see `_group_members`), so this asks about descendants and about nothing else.
-        empty = _group_emptied(pgid, within=_CLOSE_SECONDS) is True
-        # Reaped last.
-        try:
-            self.process.wait(timeout=_CLOSE_SECONDS)
-        except subprocess.TimeoutExpired:
-            return False
-        return empty
+                try:
+                    self.process.kill()
+                except OSError:
+                    pass
+                try:
+                    self.process.wait(timeout=_CLOSE_SECONDS)
+                except subprocess.TimeoutExpired:
+                    pass
+        for stream in (self.process.stdout, self.process.stderr):
+            if stream is not None:
+                try:
+                    stream.close()
+                except Exception:
+                    pass
+        shutil.rmtree(self.scratch, ignore_errors=True)
 
 
 class SnapshotError(RuntimeError):
@@ -2170,154 +1345,7 @@ class SnapshotError(RuntimeError):
     be resolving a path the agent chose in a process that also holds the answers."""
 
 
-#: What a snapshot may hold before it is refused. An episode's real output tree is tens of
-#: kilobytes across a few dozen files at a depth of four, so these bound a pathological case and
-#: not an ordinary one: the tree was writable by the process that ran agent-authored code, and an
-#: unbounded walk of it holds finalization open and fills the host's disk.
-_SNAPSHOT_MAX_NODES = 20_000
-_SNAPSHOT_MAX_BYTES = 1 << 30
-_SNAPSHOT_MAX_DEPTH = 24
-_SNAPSHOT_SECONDS = 60.0
-
-#: How much of one file is moved between two readings of the clock and the stop flag. A bound that
-#: is only checked between files is not a bound on a tree that may hold one enormous file, and a
-#: cancelled finalization would wait out the whole of it. A megabyte is small against the sixty
-#: seconds and large against the cost of a check.
-_SNAPSHOT_CHUNK_BYTES = 1 << 20
-
-
-class _Bound:
-    """The four bounds one snapshot runs under, and the only place any of them is read.
-
-    A class rather than four locals threaded through the walk, because the walk is no longer one
-    loop: enumerating a directory, removing the previous copy and moving one file's bytes are
-    three operations that each have to be able to say "the budget is gone" from inside themselves.
-    The limits are read off the module once, at construction, so a caller that shrinks them for a
-    test shrinks them for the whole of the call and not for half of it."""
-
-    def __init__(self, stop: "Optional[threading.Event]") -> None:
-        self.stop = stop
-        self.began = time.monotonic()
-        self.nodes = 0
-        self.bytes = 0
-        self.max_nodes = _SNAPSHOT_MAX_NODES
-        self.max_bytes = _SNAPSHOT_MAX_BYTES
-        self.max_depth = _SNAPSHOT_MAX_DEPTH
-        self.seconds = _SNAPSHOT_SECONDS
-
-    def alive(self) -> None:
-        """The two bounds that are about *when*, checked before anything that can take time.
-
-        Once per directory entry as it arrives and once per chunk of a file, which is what makes
-        the deadline and the cancellation bounds on the work rather than on the gaps between
-        pieces of it."""
-        if self.stop is not None and self.stop.is_set():
-            raise SnapshotError("the snapshot was abandoned before it finished")
-        if time.monotonic() - self.began > self.seconds:
-            raise SnapshotError(
-                f"the episode's output tree took longer than {self.seconds:.0f}s to copy"
-            )
-
-    def node(self) -> None:
-        """Count one directory entry, having first checked that there is still a budget to spend."""
-        self.alive()
-        self.nodes += 1
-        if self.nodes > self.max_nodes:
-            raise SnapshotError(
-                f"the episode's output tree holds more than {self.max_nodes} entries"
-            )
-
-    def descend(self, depth: int) -> None:
-        if depth > self.max_depth:
-            raise SnapshotError(
-                f"the episode's output tree is deeper than {self.max_depth} directories"
-            )
-
-    def offer(self, size: int) -> None:
-        """Refuse a file whose length alone breaks the budget, before any of it is read."""
-        if self.bytes + size > self.max_bytes:
-            raise SnapshotError(
-                f"the episode's output tree is larger than {self.max_bytes} bytes"
-            )
-
-    def spend(self, count: int) -> None:
-        """Account for bytes actually moved, so a file that grew past its own ``stat`` is caught."""
-        self.bytes += count
-        if self.bytes > self.max_bytes:
-            raise SnapshotError(
-                f"the episode's output tree is larger than {self.max_bytes} bytes"
-            )
-
-
-def _names(source: Path, bound: _Bound) -> List[str]:
-    """One directory's entry names, counted against the bound as they arrive, then sorted.
-
-    ``sorted(source.iterdir())`` read and sorted the whole directory before a single bound was
-    consulted, so a directory holding a million names spent all of that time and memory *after*
-    the deadline had passed and after the finalization had been cancelled. ``os.scandir`` hands
-    them over one at a time, so the bound is spent per entry and the enumeration stops inside the
-    directory rather than at the end of it.
-
-    The order is still the sorted one, and the sort still happens: it runs on the names that got
-    past the bound, which is the difference. A deterministic order is worth keeping, because it
-    decides which of several refusals an episode gets told about."""
-    names: List[str] = []
-    with os.scandir(source) as entries:
-        for entry in entries:
-            bound.node()
-            names.append(entry.name)
-    return sorted(names)
-
-
-def _clear(target: Path, bound: _Bound, depth: int = 0) -> None:
-    """Remove ``target`` and everything under it, under the same bound as the copy that follows.
-
-    ``shutil.rmtree`` was outside every bound, and what it removes is the previous snapshot, which
-    lives at a name one character away from the output root the world is handed: the process that
-    ran the agent's code could work out the name and fill the tree. So a cancelled finalization
-    waited out a deletion the episode had sized, before it reached the copy the bounds cover.
-
-    Depth is bounded here as well as in the copy, and for a second reason: this recurses, so a
-    tree nested ten thousand deep would otherwise be an interpreter stack rather than a refusal."""
-    bound.alive()
-    try:
-        mode = target.lstat().st_mode
-    except FileNotFoundError:
-        return
-    if stat.S_ISDIR(mode) and not stat.S_ISLNK(mode):
-        bound.descend(depth)
-        for name in _names(target, bound):
-            _clear(target / name, bound, depth + 1)
-        target.rmdir()
-        return
-    # A symlink is unlinked, never followed: what it names is outside the tree being removed.
-    target.unlink()
-
-
-def _copy(source: Path, target: Path, bound: _Bound) -> None:
-    """Move one file's bytes, reading the clock and the stop flag between chunks.
-
-    ``shutil.copyfile`` was one call with no way in: a single large or slow file ran to completion
-    however long the copy had already taken and however long ago the finalization it belongs to
-    was abandoned. Checking once per file bounds a tree of small files and bounds nothing about a
-    tree with one big one in it.
-
-    A refused copy leaves a partial file behind in the destination, and that is harmless by
-    construction: a snapshot that raises is an episode refused outright, nothing reads the
-    destination afterwards, and the next call removes it before it writes anything."""
-    with source.open("rb") as reader, target.open("wb") as writer:
-        while True:
-            bound.alive()
-            block = reader.read(_SNAPSHOT_CHUNK_BYTES)
-            if not block:
-                return
-            bound.spend(len(block))
-            writer.write(block)
-
-
-def snapshot_outputs(
-    outputs: Path, *, into: Path, stop: "Optional[threading.Event]" = None
-) -> Path:
+def snapshot_outputs(outputs: Path, *, into: Path) -> Path:
     """Copy a stopped episode's output tree into one the grader can be given, or refuse.
 
     **Why a copy and not the tree itself.** The grading process is pointed at the root that holds
@@ -2333,26 +1361,16 @@ def snapshot_outputs(
     inspected, so substituting the episode's own output directory substituted the whole tree. It
     is ``lstat``-ed first, and a link there refuses the episode like a link anywhere else.
 
-    **Bounded in four ways, because this walks a tree an episode wrote.** Nodes, bytes, depth and
-    elapsed time. Without them a large or deep tree holds finalization open for as long as it
-    likes and fills the host's disk on the way, and neither the finalize deadline nor the grader's
-    own timeout covers it: a deadline cancels the *await*, and the thread doing the copying does
-    not stop for that. Which is what ``stop`` is for: the caller sets it when its await is
-    cancelled, and it is read from inside the work rather than between pieces of it.
-
-    **Every operation that can consume the bound is inside it, which three of them were not.** The
-    previous snapshot was removed by an unbounded ``rmtree`` before the clock was ever consulted;
-    each directory was read and sorted in full before the first check of the entries it produced;
-    and one file was copied by a single call that could not be interrupted however large it was.
-    So a tree an episode had sized could hold finalization open through any of the three while
-    every stated bound stood unbroken. The removal, the enumeration and the copy now each spend
-    the same budget as they go (see :class:`_Bound`).
-
     Every refusal is an episode refused outright rather than an entry skipped, because a grade
     computed over a tree with something quietly dropped is a grade over a tree nobody submitted.
 
-    Safe to walk because the worker is already gone: this runs after a confirmed stop, so nothing
-    can add a link between the check and the copy."""
+    Safe to walk because the worker is already gone: this runs after the worker has been stopped
+    and waited on, so nothing ordinary can add a link between the check and the copy.
+
+    **Unbounded, and that is the host worker's boundary rather than an oversight.** The tree was
+    written by the process that ran agent-authored code, so its size, its depth and how long it
+    takes to walk are the episode's to choose. What bounds them is the container the worker runs
+    in (shojin-lab/shogym#140), which owns the disk the tree is written to."""
     if outputs.is_symlink():
         raise SnapshotError(
             f"the episode's output root {outputs} is a symbolic link, so what would be graded is "
@@ -2361,26 +1379,15 @@ def snapshot_outputs(
     root = outputs.resolve()
     if not root.is_dir():
         raise SnapshotError(f"the episode left no output tree at {outputs}")
-    bound = _Bound(stop)
-    try:
-        _clear(into, bound)
-    except OSError as exc:
-        # Typed rather than let out raw: a destination that will not go away is this episode
-        # ending unscored, and that is a snapshot's own kind of failure rather than a bug.
-        raise SnapshotError(
-            f"the previous snapshot at {into} could not be removed ({exc}), so this episode "
-            "cannot be handed to the grader as the tree it submitted"
-        ) from exc
+    shutil.rmtree(into, ignore_errors=True)
     into.mkdir(parents=True)
     # One pass: what is checked is what is copied. A validate-then-`copytree` would walk the tree
-    # twice and bound neither walk.
-    pending: List[Tuple[Path, Path, int]] = [(root, into, 0)]
+    # twice, and `copytree` on its own resolves the links this refuses.
+    pending: List[Tuple[Path, Path]] = [(root, into)]
     while pending:
-        source, target, depth = pending.pop()
-        bound.descend(depth)
-        for name in _names(source, bound):
+        source, target = pending.pop()
+        for name in sorted(os.listdir(source)):
             entry = source / name
-            bound.alive()
             if entry.is_symlink():
                 raise SnapshotError(
                     f"the episode left a symbolic link in its output tree ({name} -> "
@@ -2388,15 +1395,11 @@ def snapshot_outputs(
                 )
             if entry.is_dir():
                 (target / name).mkdir()
-                pending.append((entry, target / name, depth + 1))
+                pending.append((entry, target / name))
                 continue
             if not entry.is_file():
                 raise SnapshotError(f"the episode left {name}, which is not a file or directory")
-            # Offered before it is opened, so a file whose length alone breaks the budget costs a
-            # `stat` rather than a gigabyte, and accounted for again as it is read, so a file that
-            # is longer than it said cannot spend more than the budget either.
-            bound.offer(entry.stat().st_size)
-            _copy(entry, target / name, bound)
+            shutil.copyfile(entry, target / name)
     return into
 
 
@@ -2413,9 +1416,8 @@ def grade(
     a line the agent wrote.
 
     A second, short-lived worker rather than the one that served the episode. It is the only place
-    ground truth is loaded, it starts after the serving worker has been confirmed stopped, and it
-    reads the end state off disk, so the answers are never objects in the process the agent's code
-    ran as.
+    ground truth is loaded, it starts after the serving worker has been stopped, and it reads the
+    end state off disk, so the answers are never objects in the process the agent's code ran as.
 
     **The filing and the digests come back from here too.** They used to be asked of the serving
     world over the protocol, which made the process that runs agent-authored code the process
@@ -2423,38 +1425,13 @@ def grade(
     the databases' digest and the evaluator's verdicts are one state by construction rather than
     two observations that happened to agree.
 
-    **A session of its own, and the same two lifelines the serving worker has.** This used to be
-    an ordinary child with captured pipes, which made the advertised bound a bound on nothing: the
-    timeout killed the leader alone and then read the pipes again with no deadline, so a
-    descendant holding either of them kept a sealed episode's terminal open indefinitely. It ran
-    for twenty seconds under a one-second bound in a probe, with the descendant still running
-    afterwards. The group is what is signalled now, its emptying is what is waited for, and every
-    wait on the way down has a bound of its own (see :func:`_end_grader`).
-
-    The other half is the crash: this process is short-lived but it is not instant, and a serving
-    parent that dies inside those ten minutes would have left it running under init with nothing
-    naming it. So it holds the reading end of a pipe from here and stops its own group when that
-    reaches end of file (see :func:`~worker.watch_parent`), and it is written into the same
-    durable ledger the serving workers are, so a later construction reclaims it (see
-    :func:`reap`).
-
-    **The group is read on the way out of every exit, and not only the timeout's.** An ordinary
-    exit used to be taken as the end of everything this grader had started: the scratch directory
-    went and the ledger line was tombstoned without anything asking what was left in the group. A
-    descendant that no longer holds the captured pipes lets ``communicate`` return at once, so a
-    leader that exited 0 with such a child behind it left an untracked process and no record of
-    it, which a probe confirmed. What the group says decides now (see :func:`_grader_stopped`),
-    and an answer that is not "empty" keeps both handles for :func:`reap`."""
+    Bounded, killed and reaped. An evaluator that hangs would otherwise hold a sealed episode's
+    terminal open forever: ``to_thread`` does not make a child process cancellable, so a deadline
+    on the coroutine stops the waiting and leaves the child running. The bound covers the leader
+    and not what the leader started, which is the same boundary :meth:`Worker.close` has and the
+    same reason the container is what the isolation claims rest on."""
     scratch = Path(tempfile.mkdtemp(prefix=_GRADE_SCRATCH_PREFIX))
     process: Optional[subprocess.Popen] = None
-    pgid: Optional[int] = None
-    record: Optional[str] = None
-    # Set by the timeout path, which stops the group itself and reads it while the number is still
-    # certainly this grader's. `None` means no exit has answered for the group yet.
-    stopped: Optional[bool] = None
-    # Non-inheritable by default, so no other child of this process holds the writing end open and
-    # keeps the grader reporting this one alive after it has gone.
-    listening, holding = os.pipe()
     try:
         process = subprocess.Popen(
             [str(runtime()), str(WORKER), "grade"],
@@ -2464,19 +1441,6 @@ def grade(
             text=True,
             cwd=str(scratch),
             env=_worker_environment(scratch),
-            # Its own process group, for the reason the serving worker has one: what is stopped on
-            # a timeout has to be everything this process started, and the evaluator is upstream
-            # code this port does not get to promise is childless.
-            start_new_session=True,
-            pass_fds=(listening,),
-        )
-        # Read once, while the answer is certainly about this process (see `Worker.pgid`).
-        pgid = _group_of(process)
-        record = record_worker(
-            pid=process.pid,
-            pid_birth=process_birth(process.pid),
-            pgid=pgid,
-            scratch=str(scratch),
         )
         opening = json.dumps(
             {
@@ -2485,34 +1449,17 @@ def grade(
                 "experiment": str(outputs),
                 "ignore": list(ignore),
                 "filing": dict(filing),
-                "keepalive": listening,
             }
         )
         try:
-            # Bounded, killed and reaped. An evaluator that hangs would otherwise hold a sealed
-            # episode's terminal open forever: `to_thread` does not make a child process
-            # cancellable, so a deadline on the coroutine stops the waiting and leaves the child
-            # running.
             out, err = process.communicate(input=opening + "\n", timeout=timeout)
         except subprocess.TimeoutExpired:
-            stopped = _end_grader(process, pgid)
+            _abandon(process, scratch)
             raise WorkerError(
-                f"grading {task_id} did not finish within {timeout:.0f}s; the grader's process "
-                "group was stopped"
+                f"grading {task_id} did not finish within {timeout:.0f}s; the grader was stopped"
             ) from None
     finally:
-        # The child has its own copy; a reading end still open here would be a pipe that never
-        # reaches end-of-file for the grader either.
-        _close_descriptor(listening)
-        _close_descriptor(holding)
-        if stopped is None:
-            stopped = _grader_stopped(process, pgid)
-        # Spent only against a group that is positively gone. Anything else keeps the record and
-        # the scratch directory, which are what a later construction has instead of this frame.
-        if stopped:
-            shutil.rmtree(scratch, ignore_errors=True)
-            if record is not None:
-                forget_worker(record)
+        shutil.rmtree(scratch, ignore_errors=True)
     # Reached only by a spawn that happened and a `communicate` that returned; anything else left
     # through the `finally` above.
     assert process is not None
@@ -2523,219 +1470,19 @@ def grade(
     return json.loads(out.strip().splitlines()[-1])["output"]
 
 
-def _group_of(process: subprocess.Popen) -> Optional[int]:
-    """The worker's process group, asked once while the answer is still about this worker.
-
-    Called at spawn and nowhere else. A pid names a process only while that process exists, so
-    asking later is asking about whoever holds the pid then (see :attr:`Worker.pgid`)."""
-    try:
-        return os.getpgid(process.pid)
-    except (OSError, AttributeError):
-        return None
-
-
-def _signal_group(pgid: int, how: int) -> bool:
-    """Signal every process in ``pgid``, and say whether the group was addressed at all.
-
-    True is "the signal was delivered, or there was no member left to deliver it to": both are
-    answers about this group, and the second is the one a stop is aiming at. False is this process
-    being unable to address it at all (a platform with no ``killpg``, or a group this uid may not
-    signal), which is not an outcome anything may be concluded from.
-
-    :meth:`Worker._stop_the_group` ignores the answer because it reads the process table
-    afterwards, which is the stronger evidence. :func:`_stop_orphan` has no such reader and
-    tombstones a durable record on the strength of this, so it needs the difference."""
-    try:
-        os.killpg(pgid, how)
-    except ProcessLookupError:
-        return True
-    except (OSError, AttributeError):
-        return False
-    return True
-
-
-def _group_members(pgid: int) -> Optional[List[int]]:
-    """Every live process still in ``pgid`` but this one, or ``None`` if the table was unreadable.
-
-    Asked of `ps` rather than of `/proc`, which macOS does not have.
-
-    **A table this could not read is not an empty table.** It used to answer both with an empty
-    sequence, so a `ps` that would not run reported the same fact as a group that had emptied, and
-    a caller confirming a stop confirmed it on no evidence. The two answers are now different
-    values and the caller that needs proof treats the missing one as a refusal.
-
-    Exited-but-unreaped entries are excluded. A process that was killed sits in the table until
-    somebody waits on it, and a zombie holds no memory, no descriptors and no ability to write, so
-    counting one as live would report a completed stop as an incomplete one."""
-    try:
-        listing = subprocess.run(
-            ["ps", "-o", "pid=,pgid=,stat=", "-A"],
-            capture_output=True,
-            text=True,
-            timeout=_CLOSE_SECONDS,
-        )
-    except (OSError, subprocess.SubprocessError):
-        return None
-    if listing.returncode != 0:
-        return None
-    live: List[int] = []
-    mine = os.getpid()
-    for line in listing.stdout.splitlines():
-        fields = line.split()
-        if len(fields) < 3:
-            continue
-        try:
-            pid, group = int(fields[0]), int(fields[1])
-        except ValueError:
-            continue
-        if group == pgid and pid != mine and not fields[2].startswith("Z"):
-            live.append(pid)
-    return live
-
-
-def _group_emptied(pgid: int, *, within: float) -> Optional[bool]:
-    """Whether ``pgid`` emptied inside ``within`` seconds, or ``None`` if that cannot be read.
-
-    Waiting for the leader says nothing about what the leader started. Agent code runs in that
-    process and may have left something behind, and something still running after the world has
-    been scored is either changing what was scored or holding a port the next episode wants.
-
-    Three answers rather than two, because the caller grades on the strength of this: ``True`` is
-    a process table that was read and held nothing of this group, ``False`` is one that still did
-    when the time ran out, and ``None`` is a table that could not be read at all.
-
-    Escalation belongs to the caller. This used to send its own SIGKILL when its first deadline
-    passed, which made "how long a tidy exit gets" and "how long a killed group gets to disappear"
-    one number and put the signal in the helper that reports rather than in the one that stops
-    (see :meth:`Worker._stop_the_group`)."""
-    deadline = time.monotonic() + within
-    while True:
-        members = _group_members(pgid)
-        if members is None:
-            return None
-        if not members:
-            return True
-        if time.monotonic() >= deadline:
-            return False
-        time.sleep(0.02)
-
-
-def _stop(process: subprocess.Popen, how: int, pgid: Optional[int]) -> None:
-    """Signal the worker's whole process group, or the worker alone if it has no group of its own.
-
-    The group is the point: agent code runs in that process and may have started others, and a
-    signal to the direct child alone leaves them running against a world that has been scored.
-
-    ``pgid`` is passed in rather than looked up. The group is read once, while the process is
-    certainly alive, and a signal aimed at a group resolved from a pid afterwards is a signal
-    aimed at whoever holds that pid now (see :attr:`Worker.pgid`).
-
-    **A worker that has a group is signalled through it and through nothing else.** A ``killpg``
-    that fails on a group this worker leads means the group is empty, which is the answer "there
-    is nothing left to signal", and not an invitation to try the stored pid, which is the very
-    value that may since have been handed to somebody else. The pid is the fallback only where there
-    was never a group to begin with, which is a platform without ``setsid`` rather than a worker
-    that has finished."""
-    if pgid is not None:
-        try:
-            os.killpg(pgid, how)
-        except (OSError, AttributeError):
-            pass
-        return
-    try:
-        process.send_signal(how)
-    except OSError:
-        pass
-
-
-def _end_grader(process: subprocess.Popen, pgid: Optional[int]) -> bool:
-    """Stop a grader that outran its bound, wait for its group to go, and say whether it did.
-
-    Every step here is one the plain ``kill``-then-``communicate`` pair got wrong. The group is
-    signalled rather than the leader, because the evaluator is upstream code that may have started
-    something and a descendant of it holds the captured pipes; the signal goes out *before*
-    anything reaps the leader, which is the window in which the number is certainly this grader's
-    (the ordering :meth:`Worker._stop_the_group` exists for); the group's emptying is read from the
-    process table rather than inferred; and the final read of the pipes carries a deadline, because
-    an unbounded ``communicate`` on a descendant's pipe is exactly how a 600-second bound became no
-    bound at all.
-
-    Every wait is bounded, including this one: a teardown that cannot finish is reported by the
-    caller as a grading failure, and an episode is better left unscored than left waiting on a
-    process nothing can account for.
-
-    **The answer is what the caller spends the grader's record on.** The emptying used to be
-    waited for and then dropped, so a group that never emptied and a table that could not be read
-    reached :func:`grade` as the same silence as a clean stop, and it tombstoned the record on all
-    three. Only a table that was read and held nothing of this group is ``True`` here."""
-    _stop(process, signal.SIGKILL, pgid)
-    emptied: Optional[bool] = None
-    if pgid is not None:
-        # Enumerated while the leader is still unreaped, so this asks about descendants and about
-        # nothing else (see `_group_members`).
-        emptied = _group_emptied(pgid, within=_CLOSE_SECONDS)
-    try:
-        process.communicate(timeout=_CLOSE_SECONDS)
-    except (subprocess.TimeoutExpired, ValueError, OSError):
-        # A pipe something still holds, or one already closed underneath this. The group has been
-        # killed and confirmed above; what is left here is a read this call will not wait on.
-        pass
-    for stream in (process.stdin, process.stdout, process.stderr):
-        if stream is not None:
-            try:
-                stream.close()
-            except Exception:
-                pass
-    return emptied is True
-
-
-def _grader_stopped(process: Optional[subprocess.Popen], pgid: Optional[int]) -> bool:
-    """Whether a grader that ended on its own left nothing behind in its group.
-
-    The exits :func:`_end_grader` does not cover: a leader that exited 0, one that exited nonzero,
-    and a spawn that never produced a process at all. None of them used to ask about the group,
-    and all of them spent the grader's record; a leader that exited 0 having started a child which
-    holds none of the captured pipes is the shape that costs, because ``communicate`` returns at
-    once and the descendant is left with nothing naming it.
-
-    **Read for evidence, never signalled.** ``communicate`` has reaped the leader by the time this
-    runs, and a reaped leader releases the pid and, once the last member goes, the group number
-    with it. Signalling after that is signalling whoever holds the number now, which is what this
-    file refuses everywhere else. Enumerating is safe in a way signalling is not: a member found
-    under a recycled number can only produce a false "not empty", which costs a record kept for
-    the next construction, and a record kept is the cheap direction. So the timeout path stays the
-    only one that stops anything.
-
-    A process that has no group of its own is the platform without ``setsid``, where there is
-    nothing that could say what the leader started; the leader itself has been waited on, so that
-    is as gone as this can be told."""
-    if process is None or pgid is None:
-        return True
-    return _group_emptied(pgid, within=_CLOSE_SECONDS) is True
-
-
-def _abandon(process: Optional[subprocess.Popen], pgid: Optional[int], scratch: Path) -> None:
-    """Take back everything a worker that never got published was given.
+def _abandon(process: Optional[subprocess.Popen], scratch: Path) -> None:
+    """Take back everything a worker that never got published, or outran its bound, was given.
 
     Killed rather than asked to stop: a handshake that did not complete is a process that never
-    said anything, so there is nothing to be polite to and nothing that could be lost. The whole
-    group, because the leader may already have started something. Reaped, because an unreaped
+    said anything, and a grader past its deadline has had its time. Reaped, because an unreaped
     child holds its pid and this is the one moment at which nobody else will ever wait on it. And
-    the scratch directory last, which is this worker's ``HOME``, its working directory and its
-    bytecode cache.
-
-    **A leader something already reaped is not signalled**, which is the rule
-    :meth:`Worker._stop_the_group` follows and which this used to break. A pid is reserved until
-    its parent reaps it and a group exists while any member holds it, so an unreaped leader makes
-    the stored number unambiguously this worker's; once the leader has been waited on, the kernel
-    is free to hand both numbers to somebody else, and a ``killpg`` after that is a signal into a
-    stranger's group. The reap can happen before this call as easily as inside it: the failed
-    handshake's own diagnostic used to call ``poll()``, which reaps an exited child, and then this
-    function signalled the released number. There is then nothing of this worker's left to stop,
-    and the scratch directory is still cleared."""
+    the scratch directory last, which is this worker's ``HOME`` and its working directory."""
     if process is not None:
         if process.returncode is None:
-            _stop(process, signal.SIGKILL, pgid)
+            try:
+                process.kill()
+            except OSError:
+                pass
         try:
             process.wait(timeout=_CLOSE_SECONDS)
         except subprocess.TimeoutExpired:
