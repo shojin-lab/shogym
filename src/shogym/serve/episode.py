@@ -139,12 +139,39 @@ def _wire_form(spec: TaskSpec) -> TaskSpec:
     return spec.model_copy(update={"tools": tools}) if changed else spec
 
 
-#: The threads session hooks run on. A pool rather than `asyncio.to_thread`, because what it
-#: hands back is a plain `concurrent.futures.Future` whose completion callback runs in the worker
-#: thread. That is what lets a rollback finish after the caller has been cancelled and after the
-#: event loop it was running on has gone: an episode's resources are released by the thread that
-#: created them, not by whatever is left of the caller.
-_SESSION_THREADS = concurrent.futures.ThreadPoolExecutor(thread_name_prefix="shogym-session")
+# The threads session hooks run on. A pool rather than `asyncio.to_thread`, because what it hands
+# back is a plain `concurrent.futures.Future` whose completion callback runs in the worker thread.
+# That is what lets a rollback finish after the caller has been cancelled and after the event loop
+# it was running on has gone: an episode's resources are released by the thread that created them,
+# not by whatever is left of the caller.
+#
+# **Created on first use, and forgotten in a forked child.** A pool built at import gives every
+# process in the system threads it never asked for, and a fork inherits the pool's locks without
+# the threads that would release them, so the first submit in the child waits forever. This module
+# is imported by a stream that has a test which forks, so that is not a hypothetical.
+_SESSION_THREADS: Optional[concurrent.futures.ThreadPoolExecutor] = None
+_SESSION_THREADS_LOCK = threading.Lock()
+
+
+def _session_threads() -> concurrent.futures.ThreadPoolExecutor:
+    global _SESSION_THREADS
+    with _SESSION_THREADS_LOCK:
+        if _SESSION_THREADS is None:
+            _SESSION_THREADS = concurrent.futures.ThreadPoolExecutor(
+                thread_name_prefix="shogym-session"
+            )
+        return _SESSION_THREADS
+
+
+def _forget_session_threads() -> None:
+    """A forked child inherits the pool object and none of its threads, so it starts again."""
+    global _SESSION_THREADS, _SESSION_THREADS_LOCK
+    _SESSION_THREADS = None
+    _SESSION_THREADS_LOCK = threading.Lock()
+
+
+if hasattr(os, "register_at_fork"):
+    os.register_at_fork(after_in_child=_forget_session_threads)
 
 
 class _SetupRelease:
@@ -438,7 +465,7 @@ class ServedEpisode:
             # hook running, and whatever it goes on to create (a process, a port, a directory)
             # has nobody left to release it. The wait is therefore shielded and, if it is
             # abandoned, the release is arranged for the moment the hook lands.
-            beginning = _SESSION_THREADS.submit(env.begin_session, session_id, task_data)
+            beginning = _session_threads().submit(env.begin_session, session_id, task_data)
             try:
                 await asyncio.shield(asyncio.wrap_future(beginning))
             except BaseException:
@@ -1163,7 +1190,7 @@ class ServedEpisode:
             # episode's resources, and `close()` observes this same future rather than calling the
             # hook again through `env.close()`.
             if self._release is None:
-                self._release = _SESSION_THREADS.submit(
+                self._release = _session_threads().submit(
                     self._env.end_session, self._session_id
                 )
             await asyncio.wait_for(
