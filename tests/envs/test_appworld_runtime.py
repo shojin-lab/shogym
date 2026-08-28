@@ -10,8 +10,7 @@ a tree of links resolving to nothing.
 from __future__ import annotations
 
 import asyncio
-import subprocess
-import sys
+import os
 import threading
 import time
 from pathlib import Path
@@ -30,11 +29,12 @@ def test_provisioning_the_corpus_does_not_wait_on_a_lock_it_already_holds(
 ) -> None:
     """A genuinely cold machine has to get past this, and it is CI's ordinary path.
 
-    The image build and the corpus fetch are guarded by an ``flock`` on the same cache directory.
-    Two ``flock`` calls through two opens are two lock requests even inside one process, so
-    building the image from inside the corpus's lock is a process waiting on itself, with no error
-    and no timeout. The fix is an ordering, so the test is over the ordering: nothing may be
-    locked while that same path is already held."""
+    The image and the corpus live under one cache directory and both were guarded by an
+    ``flock`` on it. Two ``flock`` calls through two opens are two lock requests even inside one
+    process, so provisioning the interpreter from inside the corpus's lock is a process waiting on
+    itself, with no error and no timeout. The fix is an ordering, so the test is over the
+    ordering: nothing may be locked while that same path is already held. The image is what the
+    bundle is opened by, so it is built before the corpus lock is taken."""
     held: List[Path] = []
 
     class _recorder:
@@ -62,8 +62,7 @@ def test_provisioning_the_corpus_does_not_wait_on_a_lock_it_already_holds(
 
     monkeypatch.setattr(adapter, "_fetch_corpus", _fetch)
     adapter.ensure_corpus()
-    # And the ordering is the one the fix is: the image exists before the corpus is fetched, since
-    # the bundle is opened by a container of that image.
+    # And the ordering is the one the fix is: the interpreter exists before the corpus is fetched.
     assert ordered == ["image", "corpus"]
     assert not held
 
@@ -80,11 +79,6 @@ def test_a_relative_cache_root_still_produces_links_that_resolve(
     assert adapter.cache_root().is_absolute()
     assert adapter.graded_root().is_absolute()
 
-    # Cleared again at the end, not only at the start: the tag is memoized for the process, and a
-    # value drawn under this test's own relative cache root would otherwise be the tag every later
-    # test in the same session computed the grader's directory name from.
-    request_cleanup = adapter._private_tag.cache_clear
-
     original = tmp_path / "corpus" / "data"
     (original / "tasks").mkdir(parents=True)
     (original / "shared").write_text("base databases")
@@ -94,7 +88,6 @@ def test_a_relative_cache_root_still_produces_links_that_resolve(
     # No symlink to resolve at all now, which is the stronger form of the same guarantee.
     assert not materialised.is_symlink()
     assert materialised.exists() and materialised.read_text() == "base databases"
-    request_cleanup()
 
 
 # ----- concurrency -----
@@ -164,7 +157,11 @@ def test_a_write_through_the_served_tree_changes_nothing_else(tmp_path: Path) ->
     A hard link removes the pathname that led back to the corpus and keeps the file: same inode,
     two names, and the worker runs as the user that made it. A write through the served name would
     then change the corpus every later episode is derived from and the baseline the grader diffs
-    against, which is a served episode editing the thing it is scored on."""
+    against, which is a served episode editing the thing it is scored on.
+
+    The copies are half of it and the seal is the other half. The shared task is what every
+    episode's view is built from, so it is read-only from the moment it is published; only the
+    per-episode copy of it is writable."""
     original = tmp_path / "corpus"
     task = original / "tasks" / "abc_1"
     (task / "dbs").mkdir(parents=True)
@@ -182,18 +179,35 @@ def test_a_write_through_the_served_tree_changes_nothing_else(tmp_path: Path) ->
         task_id="abc_1",
         write_log=lambda source, into: into.write_text("seeded"),
     )
-    served = derived / "tasks" / "abc_1" / "dbs" / "gmail.jsonl"
+    shared = derived / "tasks" / "abc_1" / "dbs" / "gmail.jsonl"
     source = task / "dbs" / "gmail.jsonl"
     baseline = graded / "tasks" / "abc_1" / "dbs" / "gmail.jsonl"
-    assert served.stat().st_ino != source.stat().st_ino
-    assert served.stat().st_ino != baseline.stat().st_ino
+    assert shared.stat().st_ino != source.stat().st_ino
+    assert shared.stat().st_ino != baseline.stat().st_ino
 
-    served.write_text("rewritten by the agent")
+    # The shared task is the pristine source every later episode's view is copied out of, so it
+    # is sealed along with the rest of the derived tree: an episode that could write here would be
+    # writing into what the next one, or the other arm of its own pair, starts from.
+    for name in ("gmail.jsonl", "todoist.jsonl"):
+        with pytest.raises(PermissionError):
+            (derived / "tasks" / "abc_1" / "dbs" / name).write_text("rewritten by the agent")
+    # And a name cannot be added or taken away either, which is the other half of owning a cache.
+    with pytest.raises(PermissionError):
+        (derived / "tasks" / "abc_1" / "dbs" / "planted.jsonl").write_text("hello")
+    with pytest.raises(PermissionError):
+        (derived / "tasks" / "planted_1").mkdir()
+
+    # A write through the episode's own copy reaches nothing but itself, which is the property the
+    # copies are for and which the seal alone would not give.
+    view = world.derive_view(derived=derived, view=tmp_path / "a", task_id="abc_1")
+    (view / "data" / "tasks" / "abc_1" / "dbs" / "gmail.jsonl").write_text("rewritten by the agent")
     assert source.read_text() == "mail"
     assert baseline.read_text() == "mail"
+    assert shared.read_text() == "mail"
     # And the seeded log the episode is scored against is the grader's own copy too.
-    (derived / "tasks" / "abc_1" / "dbs" / "todoist.jsonl").write_text("a different backlog")
     assert (graded / "tasks" / "abc_1" / "dbs" / "todoist.jsonl").read_text() == "seeded"
+    world._unseal(derived)
+    world._unseal(graded)
 
 
 def test_nothing_in_a_served_task_names_where_it_came_from(tmp_path: Path) -> None:
@@ -341,22 +355,26 @@ def test_the_run_fingerprint_covers_everything_that_changes_what_a_score_means()
     assert base != run_fingerprint(pulse=1, report="graded", blocks=60)
     assert base != run_fingerprint(pulse=0, report="drawn", blocks=60)
     assert base != run_fingerprint(pulse=0, report="graded", blocks=61)
-    assert base != run_fingerprint(pulse=0, report="graded", blocks=60, corpus="other")
-    # And the image the world ran in. The tag is a digest over this repository's inputs, so it
-    # does not move when a re-pushed base changes under its pin, when a transitive version
-    # resolves differently on the day, or when the same tag was built on another platform. Two
-    # runs whose rows are one measurement have to agree on the interpreter their worlds ran under.
-    assert base != run_fingerprint(pulse=0, report="graded", blocks=60, runtime="sha256:other")
     assert len(base) == 16
+    assert base != run_fingerprint(pulse=0, report="graded", blocks=60, corpus="a different one")
     # And it moves when the way a score is read moves, which no input of the run would show.
-    from shogym.envs.appworld import env_v1
+    from shogym.envs.appworld import adapter, env_v1, payload
 
-    original = env_v1.SCORING_VERSION
-    try:
-        env_v1.SCORING_VERSION = original + 1
-        assert base != run_fingerprint(pulse=0, report="graded", blocks=60)
-    finally:
-        env_v1.SCORING_VERSION = original
+    for module, name in (
+        (env_v1, "SCORING_VERSION"),
+        (adapter, "DERIVATION_VERSION"),
+        # Every constant a published payload is generated from, and this is the one that was
+        # missing. `DRAWN_BASIS` seeds the drawn arm's whole visible vector: changing it re-rolls
+        # every drawn payload, which is a change to what the agent is told, and a record could
+        # resume across it under an identity that had not moved.
+        (payload, "DRAWN_BASIS"),
+    ):
+        original = getattr(module, name)
+        try:
+            setattr(module, name, f"{original}-moved")
+            assert base != run_fingerprint(pulse=0, report="graded", blocks=60), name
+        finally:
+            setattr(module, name, original)
 
 
 def test_what_is_recorded_and_never_revealed_stays_that_way() -> None:
@@ -364,13 +382,6 @@ def test_what_is_recorded_and_never_revealed_stays_that_way() -> None:
     the fingerprint has to be on every row. It is a digest over a usually small integer pulse, so
     it must reach no agent: one handed it can enumerate pulses until it matches and then compute
     every later key.
-
-    **There is no seal note here, and there is nothing for one to say.** The branch below reported
-    whether an episode's snapshot had been taken of a moving world, because the snapshot was taken
-    by the world's own process while a thread it started might still be writing. Nothing asks that
-    process anything now: the host stops the container, and what is graded is the state upstream
-    persisted at the end of the last block, read afterwards by a process the episode never
-    touched. A note about how clean the seal was is a note about a seal that no longer exists.
 
     Inference level is exactly that contract, and it is the only channel an env has that satisfies
     both: `_revealable` filters a row's feedback to episode level, so even `Immediate`, which
@@ -381,15 +392,15 @@ def test_what_is_recorded_and_never_revealed_stays_that_way() -> None:
     from shogym.serve import stream as stream_module
 
     verify = inspect.getsource(env_v1.AppWorldEnv._verify)
-    published, _, private = verify.partition("fb.inference.append(")
-    # Split at the first inference append, which is sound because everything episode-level is
-    # built before it. Asserted rather than assumed, since it is what the two checks below rest on.
-    assert private and "fb.episode.append(" not in private
-    # On the row, at the level that is recorded rather than surfaced.
-    assert 'name="config_digest"' in private
-    # And nowhere among the items a terminating call can reveal, in either shape: the named
-    # appends, and the tuples of names the loops above build episode items out of.
-    assert "config_digest" not in published
+    # On the row, at the level that is recorded rather than surfaced, and nowhere among the items
+    # a terminating call can reveal: not as a named episode append, and not in the tuples of names
+    # the loops build episode items out of.
+    # Matched on the name rather than on the call written on one line: this branch's appends carry
+    # the row's own step, which puts the name on a line of its own.
+    inference = verify.count("fb.inference.append(")
+    assert inference and verify.count('name="config_digest"') == inference
+    assert 'EpisodeFeedback(name="config_digest"' not in verify
+    assert verify.count('"config_digest"') == verify.count('name="config_digest"')
     # And off the terminal evidence, which a direct caller reads back verbatim.
     assert "config_digest" not in inspect.getsource(env_v1.AppWorldEnv.finalize)
     # The filter that makes the level mean what it is being relied on to mean: what a terminating
@@ -397,25 +408,6 @@ def test_what_is_recorded_and_never_revealed_stays_that_way() -> None:
     revealable = inspect.getsource(stream_module._revealable)
     assert "_EPISODE_LEVEL" in revealable
     assert stream_module._EPISODE_LEVEL == "episode"
-
-
-def test_a_worker_container_is_given_its_whole_environment_rather_than_a_filtered_one(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    """Agent-authored code runs as the worker, so everything the serving process exported used to
-    be one ``os.environ`` away from it unless an allow-list took it away first. An allow-list is
-    the same list with a worse failure mode: a name nobody thought of still gets through.
-
-    A container is given the image's own environment and what ``docker run -e`` names, and nothing
-    else, so this is a test that the port never *offers* a host variable rather than a test that
-    it removes the ones it knows about."""
-    monkeypatch.setenv("ANTHROPIC_API_KEY", "sk-secret")
-    monkeypatch.setenv("OPENAI_API_KEY", "sk-also-secret")
-    monkeypatch.setenv("SHOGYM_APPWORLD_PROV", "/runs/somewhere")
-    given: Dict[str, str] = adapter._worker_environment("/corpus")
-    assert set(given) == {"APPWORLD_ROOT", "HOME", "LANG", "PYTHONDONTWRITEBYTECODE"}
-    assert given["APPWORLD_ROOT"] == "/corpus"
-    assert "sk-secret" not in "".join(given.values())
 
 
 def test_two_episodes_of_one_task_do_not_share_their_served_inputs(tmp_path: Path) -> None:
@@ -518,12 +510,215 @@ def test_the_shared_parent_cannot_be_renamed_around(tmp_path: Path) -> None:
 # ----- stopping a worker, and stopping what it started -----
 
 
-def _sleeper(seconds: float) -> subprocess.Popen:
-    """A process of its own session, standing in for a worker or for a stranger."""
-    return subprocess.Popen(
-        [sys.executable, "-c", f"import time; time.sleep({seconds})"],
-        start_new_session=True,
+def test_an_output_tree_with_a_link_in_it_is_refused_rather_than_graded(tmp_path: Path) -> None:
+    """The grading process is pointed at the root that holds the answers and also has to read the
+    state to grade, which was writable by the process that ran the agent's code. A link planted
+    under the output tree resolves in the grader, so it could make the filing, the digest and the
+    evaluator read the graded tree instead of what the episode submitted."""
+    outputs = tmp_path / "episode"
+    (outputs / "tasks" / "abc_1" / "dbs").mkdir(parents=True)
+    (outputs / "tasks" / "abc_1" / "dbs" / "todoist.jsonl").write_text("[]")
+    snapshot = adapter.snapshot_outputs(outputs, into=tmp_path / "episode.graded")
+    assert (snapshot / "tasks" / "abc_1" / "dbs" / "todoist.jsonl").read_text() == "[]"
+
+    (outputs / "tasks" / "abc_1" / "answers").symlink_to(tmp_path)
+    with pytest.raises(adapter.SnapshotError, match="symbolic link"):
+        adapter.snapshot_outputs(outputs, into=tmp_path / "episode.graded")
+
+
+def test_an_episode_that_never_started_has_no_tree_to_grade(tmp_path: Path) -> None:
+    with pytest.raises(adapter.SnapshotError, match="no output tree"):
+        adapter.snapshot_outputs(tmp_path / "never", into=tmp_path / "into")
+
+
+# ----- the caches say what they were built from -----
+
+
+def test_two_corpora_under_one_cache_root_are_two_caches(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Source A then source B, which is the case the cache name could not tell apart.
+
+    The name carried the data version and the generator's constants and nothing about the corpus,
+    while `already_derived` trusted a path existing. A process pointed at a second corpus therefore
+    computed a fingerprint for that one and served task material derived from the first."""
+    monkeypatch.setenv("SHOGYM_CACHE", str(tmp_path / "cache"))
+    adapter.cache_root.cache_clear() if hasattr(adapter.cache_root, "cache_clear") else None
+
+    def _corpus(where: Path, mail: str) -> Path:
+        task = where / "data" / "tasks" / "abc_1"
+        (task / "dbs").mkdir(parents=True)
+        (task / "dbs" / "gmail.jsonl").write_text(mail)
+        (where / "data" / "version.txt").write_text("0.1.0")
+        (where / "data" / "base_dbs").mkdir()
+        (where / "data" / "base_dbs" / "big.jsonl").write_text(mail)
+        return where
+
+    first = adapter.corpus_digest(_corpus(tmp_path / "a", "one"))
+    second = adapter.corpus_digest(_corpus(tmp_path / "b", "two"))
+    assert first != second
+    assert adapter.derived_root(first) != adapter.derived_root(second)
+    assert adapter.graded_root(first) != adapter.graded_root(second)
+    # And the shared base is inside the digest, which it was not: only `version.txt` and the task
+    # tree were, so 134 MB of starting state every episode reads could change invisibly.
+    (tmp_path / "a" / "data" / "base_dbs" / "big.jsonl").write_text("edited")
+    assert adapter.corpus_digest(tmp_path / "a") != first
+
+
+def test_a_cache_that_was_built_from_something_else_is_refused(tmp_path: Path) -> None:
+    """The name cannot cover a tree edited, moved or restored in place under the old name, and a
+    cache is the material a run is scored against, so the stamp inside it is checked too."""
+    root = tmp_path / "seeded"
+    adapter.stamp_cache(root, source="aaaa")
+    adapter.stamp_cache(root, source="aaaa")  # idempotent
+    with pytest.raises(adapter.ProvisioningError, match="was built from"):
+        adapter.stamp_cache(root, source="bbbb")
+
+
+# ----- the seal is verified, not inferred -----
+
+
+def test_a_nested_chmod_that_failed_leaves_the_entry_unsealed(tmp_path: Path) -> None:
+    """The warm path used to read the top-level mode alone, on the reasoning that `_seal` sets it
+    last. That held only while every nested chmod succeeded, and `_chmod` swallowed the ones that
+    did not, so one failure left a writable child permanently behind a read-only top."""
+    tree = tmp_path / "entry"
+    (tree / "nested").mkdir(parents=True)
+    (tree / "nested" / "file.jsonl").write_text("x")
+    world._seal(tree)
+    assert world._sealed(tree) is True
+
+    # Exactly the state a swallowed failure produced: read-only top, writable child.
+    os.chmod(tree, 0o755)
+    os.chmod(tree / "nested" / "file.jsonl", 0o644)
+    os.chmod(tree, 0o555)
+    assert world._sealed(tree) is False
+    world._unseal(tree)
+
+
+def test_a_seal_that_cannot_be_taken_fails_the_derivation(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """`_chmod` swallowed every error, which turned a filesystem that cannot hold the invariant
+    into a derivation that claims it does."""
+    monkeypatch.setattr(world.os, "chmod", lambda *a, **k: (_ for _ in ()).throw(OSError("nope")))
+    with pytest.raises(OSError):
+        world._chmod(tmp_path, 0o555)
+
+
+def test_a_derivation_publishes_rather_than_building_in_place(tmp_path: Path) -> None:
+    """A crash leaves a staging directory and never a half-made target.
+
+    `derive_root` used to unseal, delete, copy and mark the live target while holding a lock the
+    helper may decline to take at all, so two cold processes on a lockless filesystem rebuilt the
+    same directory under each other."""
+    original = tmp_path / "corpus" / "data"
+    (original / "base_dbs").mkdir(parents=True)
+    (original / "base_dbs" / "big.jsonl").write_text("shared")
+    derived = tmp_path / "derived" / "data"
+
+    published: List[Path] = []
+    real_publish = world._publish
+
+    def _watch(building: Path, target: Path, *, replacing: bool = False) -> None:
+        # Whatever is published is complete and sealed before it has a name.
+        assert (building / world._COMPLETE).exists()
+        assert world._sealed(building)
+        published.append(target)
+        real_publish(building, target, replacing=replacing)
+
+    world._publish = _watch
+    try:
+        world.derive_root(original=original, derived=derived)
+    finally:
+        world._publish = real_publish
+    assert published == [derived / "base_dbs"]
+    # Nothing staged survives a completed build.
+    assert [p.name for p in derived.iterdir() if ".building" in p.name] == []
+    # And the warm path publishes nothing at all.
+    world.derive_root(original=original, derived=derived)
+    assert len(published) == 1
+    world._unseal(derived)
+
+
+# ----- a seal that failed publishes no verdict -----
+
+
+def test_a_failed_terminal_publishes_the_failure_and_neither_arm() -> None:
+    """The row an unconfirmed stop leaves, and what used to be on it.
+
+    A finalize that fails closed used to publish a row of zeroed fractions with an empty receipt
+    and an empty notice beside them. That is a scored-looking row for an episode nothing scored:
+    the zeros average into a mean, and an empty receipt is still an item a paired policy selects,
+    renames and reveals. There is no verdict behind such an episode, so the honest record of it is
+    that fact alone."""
+    from shogym.envs.appworld import env_v1
+    from shogym.serve.lifecycle import TerminalEvidence
+
+    class _Env:
+        _config_digest = "fingerprint"
+
+    evidence = TerminalEvidence(
+        source="explicit_tool", status="finalize_error", verdict={}, diagnostic="the stop was not"
     )
+    fb = env_v1.AppWorldEnv._verify(
+        _Env(),  # pyright: ignore[reportArgumentType]
+        trajectory=None,  # pyright: ignore[reportArgumentType]
+        task={},
+        terminated=True,
+        evidence=evidence,
+    )
+    published = {item.name for item in fb.episode}
+    # The failure, and nothing that could be read as a score or revealed as a dose.
+    assert published == {"finalize_error"}
+    assert [item.value for item in fb.episode] == [True]
+    # The record still says which configuration the failure happened under, off every wire.
+    assert [(item.name, item.value) for item in fb.inference] == [("config_digest", "fingerprint")]
+
+
+def test_an_ordinary_terminal_still_publishes_both_arms() -> None:
+    """The other side of the same branch, so the check above is about the failure rather than
+    about `_verify` having stopped publishing."""
+    from shogym.envs.appworld import env_v1
+    from shogym.serve.lifecycle import TerminalEvidence
+
+    class _Env:
+        _config_digest = "fingerprint"
+
+    evidence = TerminalEvidence(
+        source="explicit_tool",
+        status="ok",
+        verdict={"ledger_fraction": 1.0, "report": "a receipt", "notice": "a digest"},
+    )
+    fb = env_v1.AppWorldEnv._verify(
+        _Env(),  # pyright: ignore[reportArgumentType]
+        trajectory=None,  # pyright: ignore[reportArgumentType]
+        task={},
+        terminated=True,
+        evidence=evidence,
+    )
+    published = {item.name: item.value for item in fb.episode}
+    assert published["ledger_fraction"] == 1.0
+    assert published["report"] == "a receipt"
+    assert published["notice"] == "a digest"
+    assert "finalize_error" not in published
+def test_a_worker_container_is_given_its_whole_environment_rather_than_a_filtered_one(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Agent-authored code runs as the worker, so everything the serving process exported used to
+    be one ``os.environ`` away from it unless an allow-list took it away first. An allow-list is
+    the same list with a worse failure mode: a name nobody thought of still gets through.
+
+    A container is given the image's own environment and what ``docker run -e`` names, and nothing
+    else, so this is a test that the port never *offers* a host variable rather than a test that
+    it removes the ones it knows about."""
+    monkeypatch.setenv("ANTHROPIC_API_KEY", "sk-secret")
+    monkeypatch.setenv("OPENAI_API_KEY", "sk-also-secret")
+    monkeypatch.setenv("SHOGYM_APPWORLD_PROV", "/runs/somewhere")
+    given: Dict[str, str] = adapter._worker_environment("/corpus")
+    assert set(given) == {"APPWORLD_ROOT", "HOME", "LANG", "PYTHONDONTWRITEBYTECODE"}
+    assert given["APPWORLD_ROOT"] == "/corpus"
+    assert "sk-secret" not in "".join(given.values())
 
 
 def _worker_module() -> Any:
@@ -564,113 +759,6 @@ class _StubWorld:
     def _save_state(self, directory: str) -> None:
         (Path(directory) / "todoist.jsonl").write_text(self._contents[-1])
 
-
-<<<<<<< HEAD
-
-def _worker(tmp_path: Path, process: subprocess.Popen) -> Any:
-    scratch = tmp_path / f"scratch-{process.pid}"
-    scratch.mkdir(parents=True, exist_ok=True)
-    return adapter.Worker(
-        root=tmp_path,
-        process=process,
-        port=0,
-        token="unused",
-        scratch=scratch,
-        pgid=adapter._group_of(process),
-    )
-
-
-def test_a_confirmed_close_needs_the_process_table_to_have_answered(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
-) -> None:
-    """"I could not look" is not "there is nothing there", and it used to be recorded as one.
-
-    `_group_members` mapped every failure of `ps` onto an empty sequence, which is the same value
-    a group that had emptied gives. A confirmed stop built on that confirmed nothing, and the
-    episode graded on the strength of it was graded on a tree something might still be writing
-    to."""
-    process = _sleeper(30)
-    worker = _worker(tmp_path, process)
-    monkeypatch.setattr(adapter, "_group_members", lambda pgid: None)
-    with pytest.raises(adapter.WorkerError, match="could not be confirmed stopped"):
-        worker.close(confirm=True)
-    # The worker itself is gone either way: what failed is the evidence, not the stop.
-    assert process.poll() is not None
-    assert worker.stopped is False
-
-
-def test_a_confirmed_close_needs_the_group_to_be_empty(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
-) -> None:
-    """A descendant that outlives SIGKILL is a domain that was not contained, and grading a tree
-    it can still write to is grading a state no instant of the episode had."""
-    process = _sleeper(30)
-    worker = _worker(tmp_path, process)
-    monkeypatch.setattr(adapter, "_group_members", lambda pgid: [999999])
-    monkeypatch.setattr(adapter, "_CLOSE_SECONDS", 0.05)
-    with pytest.raises(adapter.WorkerError, match="could not be confirmed stopped"):
-        worker.close(confirm=True)
-    assert worker.stopped is False
-
-
-def test_a_leader_something_else_reaped_leaves_a_number_nobody_may_signal(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
-) -> None:
-    """Saving a pgid at spawn does not reserve the number; reaping the leader releases it.
-
-    A leader that merely exited is still holding its group, so the close below signals it and
-    confirms it, which is what stops an episode buying an unscored row by killing its own world.
-    A leader something *else* has already reaped is a different fact: the number may have been
-    handed on, so it is neither signalled nor enumerated."""
-    process = _sleeper(0.01)
-    worker = _worker(tmp_path, process)
-    process.wait(timeout=10)  # reaped here, before the close
-
-    signalled: List[Any] = []
-    monkeypatch.setattr(adapter, "_signal_group", lambda pgid, how: signalled.append((pgid, how)))
-    monkeypatch.setattr(adapter, "_group_members", lambda pgid: signalled.append(pgid) or [])
-    with pytest.raises(adapter.WorkerError, match="could not be confirmed stopped"):
-        worker.close(confirm=True)
-    # Nothing was signalled and nothing was enumerated: the number is not this worker's to use.
-    assert signalled == []
-
-
-def test_a_worker_that_exited_on_its_own_is_still_stopped_and_confirmed(tmp_path: Path) -> None:
-    """The exploit the obvious ordering would have opened.
-
-    Reaping the leader first and refusing an already-exited one hands an episode a way out of a
-    bad score: kill the world from inside a block, and the seal cannot be confirmed, so the row is
-    unscored rather than low. A pid is reserved until its parent reaps it and a group exists while
-    any member does, so an exited-but-unreaped leader is still holding this group: it is signalled,
-    reaped and confirmed like any other, and the episode is graded on what upstream persisted."""
-    process = _sleeper(0.01)
-    worker = _worker(tmp_path, process)
-    time.sleep(0.3)
-    # Exited, and deliberately not polled: the pid is a zombie this process still holds.
-    assert process.returncode is None
-    worker.close(confirm=True)
-    assert worker.stopped is True
-
-
-def test_an_ordinary_teardown_close_still_never_raises(tmp_path: Path) -> None:
-    """The confirmation is the finalizer's demand, not teardown's. Teardown runs on a shared loop
-    and its job is to release, so it takes the same stop without the assertion."""
-    process = _sleeper(0.01)
-    worker = _worker(tmp_path, process)
-    process.wait(timeout=10)
-    worker.close()
-    assert worker.closed is True and worker.stopped is False
-
-
-def test_a_process_table_that_cannot_be_read_is_not_an_empty_one(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    """The value beneath both of the above, at the helper that produces it."""
-    monkeypatch.setenv("PATH", "")
-    assert adapter._group_members(os.getpid()) is None
-
-
-# ----- what the grader reads, and what it refuses -----
 
 
 def test_an_output_tree_with_a_link_in_it_is_refused_rather_than_graded(tmp_path: Path) -> None:
@@ -1068,7 +1156,7 @@ def test_the_headline_is_published_under_the_name_a_row_is_summarised_from() -> 
         assert [item["value"] for item in revealed] == [summary[channel]]
 
 
-# ----- what the grader may be handed -----
+# ----- what a stop is signalled with, and in what order -----
 
 
 def test_a_symlinked_output_root_is_refused(tmp_path: Path) -> None:
@@ -1148,5 +1236,3 @@ def test_a_corpus_with_a_link_in_it_is_refused_rather_than_half_digested(
     (data / "tasks" / "abc_1" / "linked.json").symlink_to(elsewhere)
     with pytest.raises(adapter.ProvisioningError, match="symbolic link"):
         adapter.corpus_digest(tmp_path)
-=======
->>>>>>> d09b0cf (appworld: take no lifecycle fact from the process that runs the agent's code)

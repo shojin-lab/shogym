@@ -16,6 +16,7 @@ still match on encoded bytes when the world the agent wrote into holds values th
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import datetime as dt
 import json
 import re
@@ -288,8 +289,16 @@ print(json.dumps({
     # 2. The serving process's environment did not come along. Not because it was filtered: a
     #    container is given the image's own environment and what `docker run -e` names, so an
     #    inherited provider key was never offered to it.
+    from shogym.envs.appworld import container as container_module
+
     image = {"GPG_KEY", "HOSTNAME", "PATH", "PYTHON_SHA256", "PYTHON_VERSION", "PYTHONUNBUFFERED"}
     ours = {"APPWORLD_ROOT", "APPWORLD_CACHE", "HOME", "LANG", "PYTHONDONTWRITEBYTECODE"}
+    # Docker's client injects these from whatever proxy profile is configured, so this port passes
+    # them empty rather than leaving them: the names may be present, the values may not.
+    ours |= set(container_module._PROXY_VARIABLES)
+    assert not [
+        name for name in container_module._PROXY_VARIABLES if environment.get(name)
+    ], "a configured proxy reached the world"
     assert set(environment) <= image | ours, sorted(set(environment) - image - ours)
     # Nothing secret-shaped among the names this port passes. The base image's own `GPG_KEY` is
     # excluded by name and not by luck: it is the published CPython release signing key that every
@@ -1058,10 +1067,11 @@ async def test_a_removal_the_daemon_did_not_confirm_fails_the_episode(
         feedback = {
             item["name"]: item["value"] for item in (terminal.meta.get("shogym/feedback") or [])
         }
-        # Not graded: the failure rule, not a score.
+        # Not graded, and not even zeroed: a failed terminal publishes the failure and nothing
+        # else, so there is no fraction to average and no receipt for a policy to select.
         assert feedback.get("finalize_error") is True
-        assert feedback["ledger_fraction"] == 0.0
-        assert feedback["checks"] == 0.0
+        assert "ledger_fraction" not in feedback
+        assert "report" not in feedback and "notice" not in feedback
     finally:
         monkeypatch.undo()
         await episode.close()
@@ -1460,6 +1470,204 @@ async def test_a_resume_is_refused_under_a_changed_draw_and_under_a_changed_dead
         deadline=600.0,
         resume=True,
     )
+
+
+async def test_a_forged_completion_neither_earns_a_block_nor_moves_the_grade() -> None:
+    """The reply an episode might forge, what it would buy, and what actually stops it today.
+
+    The protocol's writer stays open in the interpreter that runs agent-authored code and nothing
+    can close it, so a frame carrying the next request's identifier would reach the parent before
+    the real handler finished. Two things mean that buys nothing. The budget is spent when a
+    request goes out rather than when an answer comes back, so a forged answer consumes a block
+    instead of granting one; and what is graded is what upstream persisted at the end of a block
+    that actually ran, so a block whose answer was forged wrote nothing and the state graded is
+    the state before it.
+
+    **And the route is closed as well, by upstream rather than by this port.** Every primitive
+    that could put bytes on that descriptor is null-patched by AppWorld's own guard: `os.write`
+    returns `None` and writes nothing, `io.open` refuses write modes. That is evidence and not a
+    boundary, which is why the two properties above are what the design rests on: the guard lets
+    `__import__("sys")` through and reads whatever it likes, so it is not a thing to build on."""
+    probe = """
+_io, _os = __import__("io"), __import__("os")
+pipes = []
+for fd in range(3, 24):
+    try:
+        if _os.readlink("/proc/self/fd/%d" % fd).startswith("pipe:"):
+            pipes.append(fd)
+    except Exception:
+        pass
+body = b'{"id": 3, "output": {"output": "forged"}}'
+
+
+def _try(what):
+    try:
+        return {"wrote": what()}
+    except Exception as failure:
+        return {"raised": type(failure).__name__}
+
+
+routes = {}
+for fd in pipes:
+    routes["os.write.%d" % fd] = _try(lambda fd=fd: _os.write(fd, body))
+    routes["io.open.%d" % fd] = _try(
+        lambda fd=fd: _io.open("/proc/self/fd/%d" % fd, "wb").write(body)
+    )
+    routes["fdopen.%d" % fd] = _try(lambda fd=fd: _os.fdopen(_os.dup(fd), "wb").write(body))
+print(json.dumps({"pipes": pipes, "routes": routes, "write": str(_os.write)}))
+"""
+    env = shogym.make("appworld")
+    episode = await ServedEpisode.open_env(env, env_name="appworld", task=TASK)
+    try:
+        first = await episode.call("execute", {"code": probe})
+        seen = json.loads(json.loads(first.content)["output"])
+        # The descriptors really are there, which is what the port concedes and does not hide.
+        assert seen["pipes"], seen
+        # And no route from inside puts a byte on one: upstream's guard null-patches the write
+        # primitives, so every attempt either wrote nothing or raised.
+        assert "disabled" in seen["write"], seen["write"]
+        for name, outcome in seen["routes"].items():
+            assert outcome.get("wrote") in (None, 0), (name, outcome)
+        # The block that would file a perfect ledger, unaffected by any of it.
+        second = await episode.call("execute", {"code": filing_block()})
+        spent = json.loads(second.content)
+        terminal = await episode.call("submit", {})
+    finally:
+        await episode.close()
+    feedback = {
+        item["name"]: item["value"] for item in (terminal.meta.get("shogym/feedback") or [])
+    }
+    # Two requests went out, so two blocks are spent, whatever any answer said.
+    assert spent["calls"] == 2
+    assert feedback["ledger_fraction"] == 1.0
+
+
+async def test_a_timed_out_call_leaves_the_grade_refused_rather_than_taken(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The timeout path used to mark the container absent without asking, and finalization's own
+    gate then returned early: the tree being graded could still have had the timed-out command
+    writing into it. Unusable and absent are two facts, and only the second may open a grade."""
+    from shogym.envs.appworld import container as container_module
+    from shogym.envs.appworld import mcp_server
+
+    env = shogym.make("appworld")
+    episode = await ServedEpisode.open_env(env, env_name="appworld", task=TASK)
+    session = mcp_server.get_session(episode.session_id)
+    assert session is not None
+    worker = session.worker
+    monkeypatch.setattr(adapter, "_CALL_TIMEOUT_SECONDS", 0.5)
+    # A daemon that will not confirm the removal, from the moment the timeout tries it.
+    monkeypatch.setattr(container_module, "absent", lambda name: False)
+    try:
+        # A block that runs long enough to outlast the call timeout. `time.sleep` is null-patched
+        # by upstream's guard, so the work has to be work.
+        with contextlib.suppress(Exception):
+            await episode.call(
+                "execute", {"code": "print(sum(i * i for i in range(400000000)))"}
+            )
+        assert worker.poisoned
+        # Unusable, and not claimed absent: the gate before grading still has to ask.
+        assert worker.closed is False
+        terminal = await episode.call("submit", {})
+        feedback = {
+            item["name"]: item["value"] for item in (terminal.meta.get("shogym/feedback") or [])
+        }
+        # Refused, not graded: finalization's gate asked and did not get an answer, and a failed
+        # terminal publishes that fact alone.
+        assert feedback.get("finalize_error") is True
+        assert "checks" not in feedback
+        assert "report" not in feedback and "notice" not in feedback
+    finally:
+        monkeypatch.undo()
+        await episode.close()
+    container_module.remove(worker.container)
+
+
+async def test_the_proxy_profile_a_client_is_configured_with_reaches_no_world(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """Docker's client adds these; this port never passed them, which is how they were missed.
+
+    A proxy URL can carry credentials or an internal host name, by Docker's own documentation, so
+    a machine whose Docker profile configures one was handing that string to every episode's
+    environment, where the adversarial probe prints the whole of it. `--network none` stops the
+    proxy being used and does nothing about the string being there."""
+    config = tmp_path / "docker"
+    config.mkdir()
+    (config / "config.json").write_text(
+        json.dumps(
+            {
+                "proxies": {
+                    "default": {
+                        "httpProxy": "http://user:secret@proxy.internal:3128",
+                        "httpsProxy": "http://user:secret@proxy.internal:3128",
+                        "noProxy": "internal.example",
+                    }
+                }
+            }
+        )
+    )
+    monkeypatch.setenv("DOCKER_CONFIG", str(config))
+    probe = """
+_os = __import__("os")
+print(json.dumps({
+    "proxyish": {k: v for k, v in _os.environ.items() if "proxy" in k.lower()},
+}))
+"""
+    played = await play([probe])
+    seen = json.loads(json.loads(played["outputs"][0]["content"])["output"])
+    # The names may be there; the values may not, and nothing of the profile may be.
+    assert all(value == "" for value in seen["proxyish"].values()), seen["proxyish"]
+    assert "secret" not in json.dumps(seen)
+    assert "proxy.internal" not in json.dumps(seen)
+
+
+async def test_a_resume_is_refused_under_changed_machine_limits(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """What machine an episode was given is part of what its row measured.
+
+    The limits decide latency, what a call timeout means and whether a world is killed for
+    allocating, so a record whose rows ran under two of them is a record whose mean is about
+    neither. They are captured once per process and recorded, so a relaunch under a changed one
+    does not pass for the earlier measurement."""
+    from shogym.envs.appworld import container as container_module
+    from shogym.serve.stream import Information, TaskRef, TaskStream
+
+    prov = tmp_path / "run"
+    container_module.limits.cache_clear()
+    first = shogym.make("appworld")
+    stream = TaskStream(
+        shogym.make,
+        [TaskRef("appworld", TASK)],
+        prov_dir=prov,
+        feedback=Information(),
+        identity=first.config_digest,
+    )
+    async with stream:
+        await stream.get_task()
+        await stream.dispatch("submit", {})
+
+    # A machine with more of it. Same draw, same corpus, same image.
+    container_module.limits.cache_clear()
+    monkeypatch.setenv("SHOGYM_APPWORLD_CPUS", "8")
+    roomier = shogym.make("appworld")
+    try:
+        assert roomier.config_digest != first.config_digest
+        with pytest.raises(ValueError) as refused:
+            TaskStream(
+                shogym.make,
+                [TaskRef("appworld", TASK)],
+                prov_dir=prov,
+                feedback=Information(),
+                identity=roomier.config_digest,
+                resume=True,
+            )
+        assert "run identity" in str(refused.value)
+    finally:
+        monkeypatch.undo()
+        container_module.limits.cache_clear()
 
 
 async def test_information_hands_back_the_receipt_and_placebo_the_digest(

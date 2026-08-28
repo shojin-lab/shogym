@@ -446,7 +446,7 @@ a container now, so the boundary is the machine's rather than the arrangement's.
 |---|---|
 | the corpus's shared parts (`base_dbs`, `api_docs`, `datasets`, `version.txt`) | read-only |
 | **one** task's world, from this episode's own view of the corpus | read-only, mounted by name, so `data/tasks` inside the container holds exactly one directory |
-| **one** episode's output tree, at `/outputs` | the only writable mount there is |
+| **one** episode's output tree, at `/outputs` | the only writable mount there is, and bounded before it is graded |
 
 **What it cannot see, and the word is *absent* rather than refused:** the run's provenance
 directory, the grader's tree and its private parent, the downloaded corpus, this port's cache, the
@@ -493,6 +493,25 @@ success, and anything else is unknown, which fails closed. Teardown's own remova
 contract and never raises, because a teardown that raises abandons the handles it was there to
 release; what it could not remove belongs to the sweep.
 
+**Docker's own proxy profile is emptied rather than left alone.** The client adds
+`HTTP_PROXY` and its variants to every container it creates, from whatever profile is configured,
+and a proxy URL can carry credentials or an internal host name. This port never passed them, which
+is how they were missed; they are now passed empty, which is what overrides an injection.
+
+**Two boundaries are bounded because they are the host's, not the container's.** The reader's frame
+buffer is a host allocation that the container's memory limit does not reach, so a header that is
+not a length and a body larger than any block's output are refused before anything is read, and
+either is fatal to that worker. And `/outputs` is a host bind that Docker cannot put a quota on, so
+what an episode wrote there is bounded at the boundary instead: bytes, files, depth and the wall
+clock the snapshot may take, with a tree past any of them refusing the episode rather than being
+copied. An episode can still fill a disk while it runs; bounding that needs a filesystem quota this
+port does not have.
+
+**A container nobody could remove is written down.** The sweep skips containers whose parent is
+alive, which is right for the ordinary case and wrong for a long-lived process that failed to
+remove one and has no later chance to try. A removal that could not be confirmed records the name
+where the sweep also looks.
+
 **The grader is given a snapshot, not the tree the world wrote.** The grading container mounts the
 answers, so a symlink left under the output tree would resolve inside *its* namespace. Every entry
 is checked to be a plain file or directory resolving inside the tree, and anything else refuses the
@@ -529,6 +548,12 @@ IPython shell, but it did not record a file read through a served `execute` call
 A control that works on some paths and not the one that matters is worse than none. It was removed
 rather than caveated, and the container makes the property it was proxying for something to
 enforce rather than something to observe.
+
+**What a run is filed under.** The fingerprint carries the draw, the payload class, the block
+budget, what the corpus actually holds (every file the world reads, not only the tasks), the image
+the world ran in as the daemon has it, the cpu and memory that image was given, and how a score is
+read. Both derived caches are named for the corpus they were built from, so a tree warmed under one
+`APPWORLD_ROOT` cannot be served under another.
 
 **What it costs.** Measured on darwin/arm64 against the host worker it replaces, same task and
 same corpus: per-episode startup 1.87s to 2.32s, one `execute` round trip 1.8ms to 6.1ms on an

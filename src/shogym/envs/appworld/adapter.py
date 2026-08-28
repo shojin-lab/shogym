@@ -43,7 +43,6 @@ import ast
 import hashlib
 import json
 import os
-import platform
 import secrets
 import select
 import shutil
@@ -51,11 +50,6 @@ import stat
 import subprocess
 import threading
 import time
-<<<<<<< HEAD
-import tempfile
-import sys
-=======
->>>>>>> f4000d8 (appworld: run the episode worker in a container, over stdio rather than a port)
 import urllib.error
 import urllib.request
 from dataclasses import dataclass, field
@@ -114,13 +108,6 @@ _SPAWN_TIMEOUT_SECONDS = 180.0
 
 #: How long the ``docker run`` client gets to exit after its container has been removed.
 _CLOSE_SECONDS = 10.0
-
-#: How long SIGTERM is given before SIGKILL follows it, whatever happened.
-#:
-#: Short on purpose. SIGTERM is catchable, so every second of it is a second in which the process
-#: that ran agent-authored code can still write into the tree that is about to be graded. What the
-#: grace buys is an ordinary exit for a process that wants one; what it must not buy is time.
-_TERM_GRACE_SECONDS = 0.5
 
 #: How long the grader gets. Generous, because the base task's evaluator replays a whole task's
 #: database changes, and bounded, because a grader that never finishes would hold a sealed
@@ -273,6 +260,14 @@ def _verify(bundle: Path) -> None:
 
 MANIFEST = Path(__file__).with_name("task_manifest.txt")
 
+#: Bumped when the shape of a derived tree changes: what is copied, what is linked, what is
+#: sealed. It is in both cache names, so a tree built under an older layout is a different cache
+#: rather than a stale one wearing the same name.
+DERIVATION_VERSION = 1
+
+#: What a derived cache was built from, written inside it once it is complete.
+_SOURCE_FILE = ".shogym-source"
+
 
 @lru_cache(maxsize=1)
 def task_ids() -> Tuple[str, ...]:
@@ -286,62 +281,84 @@ def task_ids() -> Tuple[str, ...]:
     return tuple(line.strip() for line in MANIFEST.read_text().splitlines() if line.strip())
 
 
+@lru_cache(maxsize=None)
 def task_specs(root: Path, task_id: str) -> Dict[str, Any]:
-    """One task's shipped specification: its instruction, its supervisor and its datetime.
-
-    **Read every time, not memoized.** This was cached on ``(root, task_id)``, which is a key that
-    says where a spec was rather than what it said: a corpus edited in place produced a new
-    ``corpus_digest`` and a new cache name, and the same process went on serving the instruction,
-    the supervisor and the datetime it had read the first time. The identity moved and the task
-    did not. It is a few kilobytes of JSON, and the cache was also unbounded across a roster of
-    318.
-
-    **A served env does not call this.** It reads its whole roster's specs once, out of the same
-    walk that computes its corpus digest (:func:`corpus_snapshot`), and serves those for its life:
-    an env whose fingerprint and cache names were fixed at construction must not go on reading
-    authored text from a corpus that can change under it. This remains for the callers that want
-    one spec off a corpus as it stands rather than a pinned view of one, which is tooling and the
-    tests that check a committed table against the corpus it was generated from."""
+    """One task's shipped specification: its instruction, its supervisor and its datetime."""
     return json.loads((root / "data" / "tasks" / task_id / "specs.json").read_text())
-
-
-def runtime_digest() -> str:
-    """What the worker runs under, as sixteen hex characters: the pins, and the host's Python.
-
-    A pin rather than a reading of the installed bytes. It names the release this port asks for,
-    the commit that release is recorded against, the Python series the virtual environment is
-    built on, and the platform it is built for, which together are what decides which runtime
-    directory is built and reused (see :func:`runtime`).
-
-    **What it does not cover, said plainly.** The pinned release's own dependencies are ranges,
-    so two machines can resolve different transitive versions under one pin, and a module edited
-    in place inside the runtime moves nothing here. Reading the installed bytes is what would
-    close that, and it belongs with the container the worker runs in
-    (shojin-lab/shogym#140), where the image digest names the whole tree at once rather than a
-    walk of the host's cache standing in for one."""
-    return hashlib.sha256(
-        "|".join(
-            (
-                UPSTREAM_VERSION,
-                UPSTREAM_SHA,
-                _python_series(),
-                platform.system(),
-                platform.machine(),
-            )
-        ).encode()
-    ).hexdigest()[:16]
 
 
 # ----- the derived corpus -----
 
 
-def derived_root() -> Path:
-    """Where the seeded copy of the corpus lives, named for what generated it.
+def derived_root(source: Optional[str] = None) -> Path:
+    """Where the seeded copy of the corpus lives, named for what it was built from.
 
-    The name carries a digest of the backlog generator's own constants, so changing a cut value,
-    an option set or the number of requests derives a new corpus instead of serving a stale one
-    that was built under the old ones."""
-    return cache_root() / f"seeded-{DATA_VERSION}-{_generator_digest()}"
+    Three things are in the name, and each of them changes what the tree holds. The generator
+    digest covers the backlog generator's own constants, so changing a cut value, an option set or
+    the number of requests derives a new corpus instead of serving a stale one. The derivation
+    version covers the *layout*: what is copied, what is linked and what is sealed. And the source
+    digest covers the corpus this was derived from, which used to be missing entirely:
+    ``APPWORLD_ROOT`` takes any directory with a ``data/tasks`` in it, so a process pointed at a
+    second corpus computed a fingerprint for that one and then reused and served task material
+    derived from the first."""
+    return cache_root() / f"seeded-{DATA_VERSION}-{DERIVATION_VERSION}-{_source(source)}"
+
+
+def _source(source: Optional[str]) -> str:
+    """The source digest a cache name is keyed by, computed from the served corpus if not given.
+
+    The argument exists so that the env computes this once and hands the same value to both roots;
+    the default is for callers that only want to name a path (tests, tooling) and would otherwise
+    have to reach for the corpus themselves."""
+    return f"{_generator_digest()}-{source or corpus_digest(ensure_corpus())}"
+
+
+def stamp_cache(root: Path, *, source: str) -> None:
+    """Record what a derived cache was built from, and refuse one built from something else.
+
+    The name already carries the same values, so this cannot normally disagree. It is here for the
+    case the name cannot cover: a tree edited, moved or restored in place under a name that still
+    claims the old identity. A cache is the material a run is scored against, and the failure mode
+    without this is silent, so the check is worth one file read per construction.
+
+    Published by link rather than written in place, for the reason :func:`world._publish` gives:
+    two cold processes reach this together and the loser must find the winner's whole stamp rather
+    than half of its own."""
+    root.mkdir(parents=True, exist_ok=True)
+    stamp = root / _SOURCE_FILE
+    material = json.dumps(
+        {"source": source, "derivation": DERIVATION_VERSION, "data": DATA_VERSION}, sort_keys=True
+    )
+    held = ""
+    try:
+        held = stamp.read_text().strip()
+    except OSError:
+        held = ""
+    if held:
+        if held != material:
+            raise ProvisioningError(
+                f"the derived cache at {root} says it was built from {held}, but this run serves "
+                f"{material}; a cache is the material a run is scored against, so this refuses "
+                "rather than reusing it. Remove that directory, or point SHOGYM_CACHE elsewhere"
+            )
+        return
+    staged = root / f"{_SOURCE_FILE}.{os.getpid()}.{secrets.token_hex(8)}"
+    try:
+        staged.write_text(material)
+        os.link(staged, stamp)
+    except FileExistsError:
+        # Another process published first. Its stamp is the one that counts, and it is checked
+        # rather than trusted: this is the same comparison as above.
+        if stamp.read_text().strip() != material:
+            raise ProvisioningError(
+                f"the derived cache at {root} was stamped by another process with a different "
+                "identity while this one was building it"
+            ) from None
+    finally:
+        try:
+            staged.unlink()
+        except OSError:
+            pass
 
 
 def private_home() -> Path:
@@ -353,16 +370,17 @@ def private_home() -> Path:
     return base.parent / f"{base.name}-private" / "appworld"
 
 
-def graded_root() -> Path:
+def graded_root(source: Optional[str] = None) -> Path:
     """Where the grader's view of the corpus lives: a private directory with an unguessable name.
 
-    The unguessable name is now belt to the container's braces. It used to be the whole of the
-    defence, and the port said so: the worker ran as the user who built this, so no directory mode
-    kept it out and only the cost of finding it was raised. The episode's container mounts one
-    task's served tree and nothing else, so this directory is not on a filesystem the world can
-    see, whatever its name."""
+    **This raises the cost of finding it and does not close the route.** The worker runs as the
+    same user as the process that built this, so no directory mode keeps it out: 0700 stops other
+    users and stops nothing else. What closes it is a namespace in which the directory is not
+    mounted at all, which is a container and is not built here (see the port's README). What this
+    does is stop the tree being derivable from what the worker is given, which the previous
+    layout, a fixed name beside the served root, was."""
     home = private_home()
-    return home / f"graded-{DATA_VERSION}-{_generator_digest()}-{_private_tag()}"
+    return home / f"graded-{DATA_VERSION}-{DERIVATION_VERSION}-{_source(source)}-{_private_tag()}"
 
 
 def _read_tag(keyfile: Path) -> Optional[str]:
@@ -374,7 +392,6 @@ def _read_tag(keyfile: Path) -> Optional[str]:
     return tag if len(tag) == 16 else None
 
 
-@lru_cache(maxsize=4)
 def corpus_digest(root: Path) -> str:
     """What the corpus at ``root`` actually holds, as sixteen hex characters.
 
@@ -382,6 +399,11 @@ def corpus_digest(root: Path) -> str:
     takes any directory with a ``data/tasks`` in it, so a repointed or edited corpus would
     otherwise be served under a name that claims to be the pinned one, and would reuse a derived
     tree built from something else.
+
+    **Every file the world reads is read, not only the tasks.** This covered `version.txt` and
+    `data/tasks` alone, and a world also reads `base_dbs`, `datasets`, `api_docs` and every other
+    entry under `data` that :func:`served_mounts` binds into it. Those bytes decide what the world
+    does and what the grader compares against, and a change in them moved no digest at all.
 
     **Every scoring-relevant file is read, not sized.** This once hashed `specs.json` in full and
     took path and size for everything else, which left the ground truth and the evaluation
@@ -393,24 +415,7 @@ def corpus_digest(root: Path) -> str:
     every fresh process, which is the price of the digest meaning what it says."""
     digest = hashlib.sha256()
     data = root / "data"
-<<<<<<< HEAD
     for path in sorted(data.rglob("*")):
-        if path.is_symlink():
-            # **Refused rather than skipped.** A skipped link is a file the digest does not cover
-            # and derivation copies anyway: `_materialise` follows links, so the served world held
-            # bytes the identity had never read, and changing what a link pointed at changed the
-            # world without changing the digest that claims to say what the world is. The pinned
-            # bundle contains none, so this refuses a corpus rather than growing a rule about how
-            # to hash one.
-            raise ProvisioningError(
-                f"the corpus at {root} contains a symbolic link ({path.relative_to(data)}), and "
-                "this port cannot state the identity of a tree whose contents are somewhere else"
-            )
-=======
-    version = data / "version.txt"
-    digest.update(version.read_bytes() if version.exists() else b"")
-    for path in sorted((data / "tasks").rglob("*")):
->>>>>>> f4000d8 (appworld: run the episode worker in a container, over stdio rather than a port)
         if not path.is_file():
             continue
         digest.update(str(path.relative_to(data)).encode())
@@ -652,6 +657,25 @@ def _generator_digest() -> str:
 # ----- one episode's worker -----
 
 
+#: The most a length header may be before the frame is refused. A decimal byte count is twenty
+#: digits at the outside; anything longer is not a header this protocol writes.
+_MAX_HEADER_BYTES = 32
+
+#: The most one frame may declare. The parent's buffer is a host allocation and the container's
+#: memory limit does not bound it, so a writer inside the container asking for more memory than
+#: the host has is a writer this must refuse rather than obey. Sixteen mebibytes is far past any
+#: block's printed output and far below anything that hurts.
+_MAX_FRAME_BYTES = 16 * 1024 * 1024
+
+
+class FramingError(RuntimeError):
+    """A frame this protocol would not have written arrived on the pipe.
+
+    Fatal by construction rather than by policy: the stream's position is no longer known, so
+    there is no next frame to read, and the writer is reachable from inside the interpreter that
+    runs agent code. Its caller poisons the worker and removes the container."""
+
+
 class WorkerError(RuntimeError):
     """The worker refused a command, the world raised inside one, or the container went away."""
 
@@ -681,17 +705,45 @@ class _Frames:
         self.buffer += chunk
 
     def frame(self, timeout: float) -> Dict[str, Any]:
+        """The next frame, bounded at both ends.
+
+        **Both limits are about this process rather than about the worker.** The buffer is a host
+        allocation, and the container's memory limit does not reach it: a writer inside the
+        container declaring a body of a hundred gigabytes would have the parent allocate it. So a
+        header longer than a length, a header that is not a length, and a body larger than any
+        block's output could be are all refused before anything is read, and the refusal is fatal:
+        once a frame is not what this protocol writes, the stream's position is unknown and there
+        is no next frame to look for."""
         deadline = time.monotonic() + timeout
         while b"\n" not in self.buffer:
+            if len(self.buffer) > _MAX_HEADER_BYTES:
+                raise FramingError(
+                    f"the appworld worker sent {len(self.buffer)} bytes with no length header; "
+                    f"a header is at most {_MAX_HEADER_BYTES}"
+                )
             self._fill(deadline)
         header, _, rest = bytes(self.buffer).partition(b"\n")
         self.buffer = bytearray(rest)
-        length = int(header.strip())
+        try:
+            length = int(header.strip())
+        except ValueError:
+            raise FramingError(
+                f"the appworld worker sent {header[:_MAX_HEADER_BYTES]!r} where a byte count "
+                "belongs"
+            ) from None
+        if length < 0 or length > _MAX_FRAME_BYTES:
+            raise FramingError(
+                f"the appworld worker declared a {length} byte frame; the most this reads is "
+                f"{_MAX_FRAME_BYTES}"
+            )
         while len(self.buffer) < length:
             self._fill(deadline)
         body = bytes(self.buffer[:length])
         del self.buffer[:length]
-        return json.loads(body)
+        try:
+            return json.loads(body)
+        except ValueError as exc:
+            raise FramingError(f"the appworld worker sent a frame that is not JSON: {exc}") from exc
 
 #: What every worker's scratch directory is named for, so a directory this port left behind on a
 #: host is one an operator can recognise.
@@ -845,6 +897,29 @@ class Worker:
             raise WorkerError(f"the appworld worker answered {opening!r} instead of ready")
         return cls(root=root, process=process, container=name, frames=frames)
 
+    def _stop_after_failure(self) -> None:
+        """Remove the container, and say nothing untrue about whether it went.
+
+        ``closed`` means one thing: the daemon has confirmed this container is gone. A failure
+        path that set it on a best-effort removal marked the container absent without asking, and
+        finalization's own gate then returned early and graded a tree the container might still
+        have been writing to. So this asks, and hands the container to the sweep when the answer
+        does not come."""
+        try:
+            container.remove(self.container, confirm=True)
+            self.closed = True
+        except container.DockerError:
+            self.disown()
+
+    def disown(self) -> None:
+        """Hand this container to the sweep, by name, because nothing here can remove it.
+
+        The sweep skips containers whose parent is alive, which is right for the ordinary case and
+        wrong for this one: a long-lived serving process that could not remove a container has no
+        later chance to try, and the container holds a writable mount until the process exits.
+        Writing the name where the sweep also looks is what gives it a second owner."""
+        container.disowned(self.container)
+
     def call(self, command: str, **body: Any) -> Any:
         """Send one command and return the answer to *that* command.
 
@@ -881,6 +956,12 @@ class Worker:
                     # An answer to a command nobody is waiting for. Only reachable when a worker
                     # was reused after a timeout, which it is not; kept because reading a frame
                     # and hoping is exactly the failure this is here to prevent.
+            except FramingError as exc:
+                # Fatal, and the container goes with it: the stream is out of position, and what
+                # put it there is reachable from inside the interpreter that runs agent code.
+                self.poisoned = f"the protocol was broken during {command!r}: {exc}"
+                self._stop_after_failure()
+                raise WorkerError(f"the appworld worker: {self.poisoned}") from exc
             except (BrokenPipeError, EOFError) as exc:
                 self.poisoned = f"the container stopped during {command!r}: {exc}"
                 raise WorkerError(f"the appworld worker container {self.poisoned}") from exc
@@ -893,8 +974,14 @@ class Worker:
                 # worker; it does nothing about the work, which goes on holding a cpu and a
                 # writable mount. The other arm of a pair is a sibling container on the same host,
                 # so a runaway left running is a difference the treatment did not make.
-                container.remove(self.container)
-                self.closed = True
+                #
+                # **And it does not claim the removal worked.** `closed` means one thing: the
+                # daemon has confirmed this container is gone. A timeout that set it marked the
+                # container absent on a best-effort removal that ignores an ordinary nonzero
+                # status, and finalization's own gate then returned early and graded a tree the
+                # timed-out command might still have been writing to. Unusable and absent are two
+                # facts; this sets the first and attempts the second.
+                self._stop_after_failure()
                 raise WorkerError(f"the appworld worker: {self.poisoned}") from exc
         if "error" in answer:
             raise WorkerError(f"appworld worker refused {command!r}: {answer['error']}")
@@ -927,47 +1014,18 @@ class Worker:
                 # The caller is about to grade what this container could still be writing to, and
                 # it may not. Left unclosed on purpose: teardown will come back to it.
                 raise
-            # Teardown's path. The container is the reaper's problem now; what is left here is
-            # this process's own handles, and dropping them is not optional.
+            # Teardown's path. What is left here is this process's own handles, and dropping them
+            # is not optional; the container is handed to the sweep by name so that a removal
+            # nobody could confirm is still somebody's, even while this parent is alive.
+            self.disown()
         else:
             self.closed = True
         if self.process.poll() is None:
             self.process.kill()
             try:
-                self.process.wait(timeout=_TERM_GRACE_SECONDS)
+                self.process.wait(timeout=_CLOSE_SECONDS)
             except subprocess.TimeoutExpired:
-<<<<<<< HEAD
-<<<<<<< HEAD
-                _stop(self.process, signal.SIGKILL, pgid)
-            return False
-        # SIGTERM, a short grace, then SIGKILL whatever happened. The grace used to be ten
-        # seconds of a signal any process may catch, ignore or take its time over, and every one
-        # of those seconds is time in which the process that ran agent-authored code is still
-        # able to write into the tree about to be graded. It is short because it buys only an
-        # ordinary exit, and it ends in a signal nothing can decline.
-        _signal_group(pgid, signal.SIGTERM)
-        # The grace, watched through the process table rather than through `wait`: `wait` reaps,
-        # and a group is enumerable only while its number is still held. A leader that exits
-        # tidily becomes a zombie, which the enumeration steps over, so this returns as soon as
-        # the group is really empty and otherwise costs the grace.
-        _group_emptied(pgid, within=_TERM_GRACE_SECONDS)
-        _signal_group(pgid, signal.SIGKILL)
-        # Enumerated while the leader is still unreaped, and that ordering is the point. Reaping
-        # releases the pid, and a process group exists only while it has a member: reap first and
-        # the number is free, so an enumeration or an escalation after it is about whatever holds
-        # it now. An unreaped leader is a zombie, which holds the number and is excluded from the
-        # count (see `_group_members`), so this asks about descendants and about nothing else.
-        empty = _group_emptied(pgid, within=_CLOSE_SECONDS) is True
-        # Reaped last.
-=======
-                self.process.kill()
-                try:
-                    self.process.wait(timeout=_CLOSE_SECONDS)
-                except subprocess.TimeoutExpired:
-                    pass
-=======
                 pass
->>>>>>> d09b0cf (appworld: take no lifecycle fact from the process that runs the agent's code)
         _close_pipes(self.process)
 
 
@@ -1002,96 +1060,20 @@ def _one_shot(
         process.kill()
         raise WorkerError(f"{what} failed: {type(exc).__name__}: {exc}") from exc
     finally:
->>>>>>> f4000d8 (appworld: run the episode worker in a container, over stdio rather than a port)
         try:
             process.wait(timeout=_CLOSE_SECONDS)
         except subprocess.TimeoutExpired:
-<<<<<<< HEAD
-            return False
-        return empty
-=======
             container.remove(name)
             process.kill()
         _close_pipes(process)
     if "error" in answer:
         raise WorkerError(f"{what} failed: {answer['error']}")
     return answer["output"]
->>>>>>> f4000d8 (appworld: run the episode worker in a container, over stdio rather than a port)
 
 
 def seed(*, root: Path, source_dbs: Path, into: Path, rows: Dict[str, Any]) -> Any:
     """Write one task's seeded database log, in a container of its own.
 
-<<<<<<< HEAD
-    Its own type because it is an episode-level failure with a cause worth naming: the tree the
-    world left behind holds something that is not a plain file, and a grader that opened it would
-    be resolving a path the agent chose in a process that also holds the answers."""
-
-
-def snapshot_outputs(outputs: Path, *, into: Path) -> Path:
-    """Copy a stopped episode's output tree into one the grader can be given, or refuse.
-
-    **Why a copy and not the tree itself.** The grading process is pointed at the root that holds
-    the answers, and it also has to read the state to grade, which was writable by the process
-    that ran the agent's code. A symlink left in there resolves in the grader, so a link planted
-    under the output tree could make the digest, the filing and the evaluator read bytes from the
-    graded tree instead of from what the episode submitted. Nothing here returns those bytes to
-    the agent, so this is score integrity rather than a leak, and it is still not a thing to leave
-    open.
-
-    **The root is checked before it is resolved.** ``resolve()`` erases the question: a root that
-    was itself a symlink came back as whatever it pointed at, and only its descendants were then
-    inspected, so substituting the episode's own output directory substituted the whole tree. It
-    is ``lstat``-ed first, and a link there refuses the episode like a link anywhere else.
-
-    Every refusal is an episode refused outright rather than an entry skipped, because a grade
-    computed over a tree with something quietly dropped is a grade over a tree nobody submitted.
-
-    Safe to walk because the worker is already gone: this runs after the worker has been stopped
-    and waited on, so nothing ordinary can add a link between the check and the copy.
-
-    **Unbounded, and that is the host worker's boundary rather than an oversight.** The tree was
-    written by the process that ran agent-authored code, so its size, its depth and how long it
-    takes to walk are the episode's to choose. What bounds them is the container the worker runs
-    in (shojin-lab/shogym#140), which owns the disk the tree is written to."""
-    if outputs.is_symlink():
-        raise SnapshotError(
-            f"the episode's output root {outputs} is a symbolic link, so what would be graded is "
-            "whatever it names rather than what the episode wrote"
-        )
-    root = outputs.resolve()
-    if not root.is_dir():
-        raise SnapshotError(f"the episode left no output tree at {outputs}")
-    # Whatever is under the destination name goes, whatever it is. `rmtree` alone leaves a plain
-    # file or a symbolic link exactly where it is, and the destination is a sibling of the tree the
-    # episode wrote and so a name the episode can create: one left as a file turned the next
-    # `mkdir` into a bare `FileExistsError` rather than this module's own refusal.
-    if into.is_symlink() or into.is_file():
-        into.unlink()
-    else:
-        shutil.rmtree(into, ignore_errors=True)
-    into.mkdir(parents=True)
-    # One pass: what is checked is what is copied. A validate-then-`copytree` would walk the tree
-    # twice, and `copytree` on its own resolves the links this refuses.
-    pending: List[Tuple[Path, Path]] = [(root, into)]
-    while pending:
-        source, target = pending.pop()
-        for name in sorted(os.listdir(source)):
-            entry = source / name
-            if entry.is_symlink():
-                raise SnapshotError(
-                    f"the episode left a symbolic link in its output tree ({name} -> "
-                    f"{os.readlink(entry)}), which a grader must not resolve"
-                )
-            if entry.is_dir():
-                (target / name).mkdir()
-                pending.append((entry, target / name))
-                continue
-            if not entry.is_file():
-                raise SnapshotError(f"the episode left {name}, which is not a file or directory")
-            shutil.copyfile(entry, target / name)
-    return into
-=======
     ``source_dbs`` is the task's own input databases in the downloaded corpus and ``into`` is the
     file being written inside a staging directory. ``root`` is the derived root, mounted because
     upstream's model layer resolves an app's base database under ``APPWORLD_ROOT`` and a load with
@@ -1117,7 +1099,6 @@ def snapshot_outputs(outputs: Path, *, into: Path) -> Path:
         timeout=_SEED_TIMEOUT_SECONDS,
         what=f"seeding {into.parent.parent.name}",
     )
->>>>>>> f4000d8 (appworld: run the episode worker in a container, over stdio rather than a port)
 
 
 class SnapshotError(RuntimeError):
@@ -1126,6 +1107,17 @@ class SnapshotError(RuntimeError):
     Its own type because it is an episode-level failure with a cause worth naming: the tree the
     world left behind holds something that is not a plain file, and a grader that opened it would
     be resolving a path the agent chose inside a namespace that also holds the answers."""
+
+
+#: What an episode's output tree may hold before the grade is refused. An episode's databases and
+#: logs are a few megabytes; these are far past that and far below anything that hurts a machine.
+_MAX_OUTPUT_BYTES = 256 * 1024 * 1024
+_MAX_OUTPUT_FILES = 20_000
+_MAX_OUTPUT_DEPTH = 16
+
+#: How long the walk and the copy get. The grader's own budget starts after them, so an unbounded
+#: snapshot would sit outside every bound the episode has.
+_SNAPSHOT_TIMEOUT_SECONDS = 120.0
 
 
 def snapshot_outputs(outputs: Path, *, into: Path) -> Path:
@@ -1141,15 +1133,29 @@ def snapshot_outputs(outputs: Path, *, into: Path) -> Path:
 
     So: every entry is checked to be a plain file or a plain directory whose real path is inside
     the tree, and anything else refuses the episode outright rather than being skipped, because a
-    skipped entry is a grade computed over a tree that is not the one submitted. What is copied is
-    then a tree of regular files with no link in it, and that is what the grader is given.
+    skipped entry is a grade computed over a tree that is not the one submitted.
+
+    **And it is bounded, because the tree is not.** ``/outputs`` is a host bind, which Docker
+    cannot put a size quota on, so what an episode may write there is bounded here instead: bytes,
+    files, depth, and the wall clock this walk and copy may take. A tree past any of them refuses
+    the episode rather than being copied, which is the fail-closed direction: the alternative is a
+    finalization that duplicates an arbitrary number of bytes on shared disk while a sibling arm is
+    running. The residual is that the writing happens before this sees it, so an episode can fill a
+    disk during its own execution; bounding that needs a filesystem quota this port does not have.
 
     Safe to walk because the container is already gone: this runs after a confirmed removal, so
     nothing can add a link between the check and the copy."""
+    deadline = time.monotonic() + _SNAPSHOT_TIMEOUT_SECONDS
     root = outputs.resolve()
     if not root.is_dir():
         raise SnapshotError(f"the episode left no output tree at {outputs}")
+    total, count = 0, 0
     for path in sorted(root.rglob("*")):
+        if time.monotonic() > deadline:
+            raise SnapshotError(
+                f"reading the episode's output tree took longer than "
+                f"{_SNAPSHOT_TIMEOUT_SECONDS:.0f}s"
+            )
         if path.is_symlink():
             raise SnapshotError(
                 f"the episode left a symbolic link in its output tree ({path.name} -> "
@@ -1159,8 +1165,28 @@ def snapshot_outputs(outputs: Path, *, into: Path) -> Path:
             raise SnapshotError(f"the episode left {path.name}, which is not a file or directory")
         if not path.resolve().is_relative_to(root):
             raise SnapshotError(f"the episode left {path.name}, which resolves outside its tree")
+        if len(path.relative_to(root).parts) > _MAX_OUTPUT_DEPTH:
+            raise SnapshotError(
+                f"the episode's output tree is deeper than {_MAX_OUTPUT_DEPTH} directories"
+            )
+        count += 1
+        if count > _MAX_OUTPUT_FILES:
+            raise SnapshotError(
+                f"the episode's output tree holds more than {_MAX_OUTPUT_FILES} entries"
+            )
+        if path.is_file():
+            total += path.stat().st_size
+            if total > _MAX_OUTPUT_BYTES:
+                raise SnapshotError(
+                    f"the episode's output tree is larger than {_MAX_OUTPUT_BYTES} bytes"
+                )
     shutil.rmtree(into, ignore_errors=True)
     shutil.copytree(root, into, symlinks=False)
+    if time.monotonic() > deadline:
+        raise SnapshotError(
+            f"copying the episode's output tree took longer than "
+            f"{_SNAPSHOT_TIMEOUT_SECONDS:.0f}s"
+        )
     return into
 
 
@@ -1206,113 +1232,6 @@ def grade(
         timeout=timeout,
         what=f"grading {task_id}",
     )
-<<<<<<< HEAD
-    scratch = Path(tempfile.mkdtemp(prefix="shogym-appworld-grade-"))
-    process = subprocess.Popen(
-        [str(runtime()), str(WORKER), "grade"],
-        stdin=subprocess.PIPE,
-        stdout=subprocess.PIPE,
-        stderr=subprocess.PIPE,
-        text=True,
-        cwd=str(scratch),
-        env=_worker_environment(scratch),
-    )
-    try:
-        process = subprocess.Popen(
-            [str(runtime()), str(WORKER), "grade"],
-            stdin=subprocess.PIPE,
-            stdout=subprocess.PIPE,
-            stderr=subprocess.PIPE,
-            text=True,
-            cwd=str(scratch),
-            env=_worker_environment(scratch),
-        )
-        opening = json.dumps(
-            {
-                "root": str(root),
-                "task_id": task_id,
-                "experiment": str(outputs),
-                "ignore": list(ignore),
-                "filing": dict(filing),
-            }
-        )
-        try:
-            out, err = process.communicate(input=opening + "\n", timeout=timeout)
-        except subprocess.TimeoutExpired:
-            _abandon(process, scratch)
-            raise WorkerError(
-                f"grading {task_id} did not finish within {timeout:.0f}s; the grader was stopped"
-            ) from None
-    finally:
-        shutil.rmtree(scratch, ignore_errors=True)
-    # Reached only by a spawn that happened and a `communicate` that returned; anything else left
-    # through the `finally` above.
-    assert process is not None
-    if process.returncode != 0:
-        raise WorkerError(
-            f"grading {task_id} failed (status {process.returncode}): {err.strip()[-2000:]}"
-        )
-    return json.loads(out.strip().splitlines()[-1])["output"]
-
-
-def _abandon(process: Optional[subprocess.Popen], scratch: Path) -> None:
-    """Take back everything a worker that never got published, or outran its bound, was given.
-
-    Killed rather than asked to stop: a handshake that did not complete is a process that never
-    said anything, and a grader past its deadline has had its time. Reaped, because an unreaped
-    child holds its pid and this is the one moment at which nobody else will ever wait on it. And
-    the scratch directory last, which is this worker's ``HOME`` and its working directory."""
-    if process is not None:
-        if process.returncode is None:
-            try:
-                process.kill()
-            except OSError:
-                pass
-        try:
-            process.wait(timeout=_CLOSE_SECONDS)
-        except subprocess.TimeoutExpired:
-            pass
-        for stream in (process.stdin, process.stdout, process.stderr):
-            if stream is not None:
-                try:
-                    stream.close()
-                except Exception:
-                    pass
-    shutil.rmtree(scratch, ignore_errors=True)
-
-
-#: How much of a worker's first line will be read before it is refused. A handshake is one small
-#: JSON object; anything past this is a process saying something else, and a deadline alone would
-#: let it say it for the whole of the spawn timeout at whatever rate it liked.
-_HANDSHAKE_MAX_BYTES = 1 << 16
-
-
-def _first_line(process: subprocess.Popen, timeout: float) -> str:
-    """The worker's first line of output, or the empty string if it does not arrive in time.
-
-    ``readline`` on a pipe cannot be given a deadline, so the descriptor is waited on instead: a
-    worker that dies without printing closes the pipe and is readable immediately, and one that
-    hangs on an import is caught by the deadline rather than hanging its caller with it.
-
-    **The whole line is under the deadline, not the first byte of it.** Waiting for readability
-    once and then calling ``readline`` bounds only the wait: readability means *some* byte arrived,
-    and the blocking read that followed it ran until a newline that a worker which wrote half a
-    line and then wedged was never going to send. That is a construction that hangs for good, on
-    the path that runs before any task exists to record a timeout against. So the descriptor is
-    waited on before every read, what is waited for is the time that is left, and each read takes
-    only what is already there.
-
-    Read off the file descriptor rather than through ``process.stdout``. A text stream buffers
-    ahead, and a ``select`` on the descriptor underneath a stream holding buffered bytes reports
-    nothing to read while the line sits in the buffer, which is the deadlock this is meant to
-    remove rather than a version of it. Nothing else reads this descriptor before the handshake."""
-    assert process.stdout is not None
-    ready, _, _ = select.select([process.stdout], [], [], timeout)
-    if not ready:
-        return ""
-    return process.stdout.readline()
-=======
->>>>>>> f4000d8 (appworld: run the episode worker in a container, over stdio rather than a port)
 
 
 __all__ = [
@@ -1330,6 +1249,7 @@ __all__ = [
     "WorkerError",
     "WORKER",
     "cache_root",
+    "DERIVATION_VERSION",
     "corpus_digest",
     "corpus_snapshot",
     "derived_root",
@@ -1342,24 +1262,11 @@ __all__ = [
     "graded_mounts",
     "graded_root",
     "private_home",
-<<<<<<< HEAD
-<<<<<<< HEAD
-    "ensure_apps",
-    "ensure_corpus",
-    "runtime",
-    "runtime_digest",
-    "snapshot_outputs",
-    "stamp_cache",
-=======
-    "seed",
-    "served_mounts",
->>>>>>> f4000d8 (appworld: run the episode worker in a container, over stdio rather than a port)
-=======
     "SnapshotError",
     "seed",
     "served_mounts",
     "snapshot_outputs",
->>>>>>> d09b0cf (appworld: take no lifecycle fact from the process that runs the agent's code)
+    "stamp_cache",
     "task_ids",
     "task_specs",
 ]

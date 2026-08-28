@@ -184,7 +184,10 @@ def test_a_worker_container_is_offered_nothing_from_the_hosts_environment(
     )
     args = seen[0]
     passed = [args[index + 1] for index, item in enumerate(args) if item == "-e"]
-    assert passed == ["APPWORLD_ROOT=/corpus"]
+    # What this port names, and the proxy profile it empties (see the test below). Nothing else.
+    assert set(passed) == {"APPWORLD_ROOT=/corpus"} | {
+        f"{name}=" for name in container._PROXY_VARIABLES
+    }
     assert "sk-secret" not in " ".join(args)
 
 
@@ -342,7 +345,9 @@ while True:
 """
 
 
-def test_a_timed_out_call_makes_the_worker_unusable(monkeypatch: pytest.MonkeyPatch) -> None:
+def test_a_timed_out_call_makes_the_worker_unusable(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
     """A timeout on an ordered pipe is not a failure that ends when the caller stops waiting.
 
     HTTP gave each response its own connection, so abandoning one cost nothing. A pipe is one
@@ -350,6 +355,7 @@ def test_a_timed_out_call_makes_the_worker_unusable(monkeypatch: pytest.MonkeyPa
     the world it is running against is still changing. There is no state in which reusing that
     worker is right, so it is refused, and the refusal says why."""
     monkeypatch.setattr(adapter, "_CALL_TIMEOUT_SECONDS", 0.4)
+    monkeypatch.setattr(container, "_ledger", lambda: tmp_path / "disowned.txt")
     worker = _stub_worker(_ECHO, monkeypatch)
     try:
         with pytest.raises(adapter.WorkerError) as timed_out:
@@ -485,7 +491,7 @@ def test_the_protocol_descriptors_are_not_handed_to_a_child(tmp_path: Path) -> N
 
 
 def test_the_reaper_removes_a_container_whose_parent_is_gone(
-    monkeypatch: pytest.MonkeyPatch,
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:
     """The case teardown cannot reach: a parent that dies while a world is wedged in a command.
 
@@ -506,11 +512,12 @@ def test_the_reaper_removes_a_container_whose_parent_is_gone(
             return _Finished(0, "\n".join(listed))
         if args[0] == "inspect":
             return _Finished(0, labels[args[-1]])
-        if args[0] == "rm":
+        if args[0] in ("rm", "stop"):
             removed.append(args[-1])
             return _Finished(0, "")
         raise AssertionError(args)
 
+    monkeypatch.setattr(container, "_ledger", lambda: tmp_path / "disowned.txt")
     monkeypatch.setattr(container, "_run", _run)
     swept = container.reap(alive=lambda pid, birth="": pid == 4243)
     assert swept == ["dead1"]
@@ -695,4 +702,269 @@ def test_a_horizon_must_be_a_positive_whole_number_of_blocks() -> None:
     guard = source[: source.index("adapter.ensure_image")]
     assert "horizon < 1" in guard
     assert "positive whole number" in guard
+
+# ----- what a timeout may and may not claim -----
+
+
+def test_a_timeout_that_cannot_confirm_removal_leaves_the_worker_unclosed(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """Unusable and absent are two facts, and a timeout used to set both.
+
+    The timeout path removed the container best effort and then marked the worker closed. Best
+    effort ignores an ordinary nonzero stop or removal, so it can return while the daemon still
+    owns a running container, and every later close, including finalization's own gate immediately
+    before the snapshot, then returned early. The tree being graded could still have had the
+    timed-out command writing into it."""
+    monkeypatch.setattr(adapter, "_CALL_TIMEOUT_SECONDS", 0.4)
+    monkeypatch.setattr(container, "_ledger", lambda: tmp_path / "disowned.txt")
+    worker = _stub_worker(_ECHO, monkeypatch)
+    # A daemon that will not say the container is gone, patched after the stub's own no-op.
+    monkeypatch.setattr(container, "remove", _refuses_to_confirm)
+    with pytest.raises(adapter.WorkerError):
+        worker.call("execute", slow=3.0)
+    # Poisoned, so nothing uses it again; and not closed, so the gate before grading still asks.
+    assert worker.poisoned
+    assert worker.closed is False
+    with pytest.raises(container.DockerError):
+        worker.close(confirm=True)
+    # And handed to the sweep, because this process has no other way to get rid of it.
+    assert worker.container in _ledger_names()
+
+
+def _refuses_to_confirm(name: str, *, confirm: bool = False) -> None:
+    if confirm:
+        raise container.DockerError("the daemon has not confirmed that it stopped")
+
+
+def _ledger_names() -> List[str]:
+    try:
+        return container._ledger().read_text().split()
+    except OSError:
+        return []
+
+
+def _empty_ledger(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
+    monkeypatch.setattr(container, "_ledger", lambda: tmp_path / "disowned.txt")
+
+
+# ----- the decoder is a host allocation, so it is bounded -----
+
+
+def test_a_frame_larger_than_the_reader_will_hold_is_fatal(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The container's memory limit does not reach the parent's buffer.
+
+    A writer inside the container declares a length and this process allocates it. That writer is
+    reachable from inside the interpreter that runs agent-authored code, so an unbounded declared
+    length is an unbounded host allocation asked for by the episode. A frame past the limit, a
+    header that is not a length, and a header with no newline in it are all refused before
+    anything is read, and all of them are fatal: once a frame is not one this protocol writes, the
+    stream's position is unknown and there is no next frame to look for."""
+    oversized = """
+import os, sys
+r = os.fdopen(os.dup(0), "rb", buffering=0)
+w = os.fdopen(os.dup(1), "wb", buffering=0)
+r.readline()
+w.write(b"%d\\n" % (64 * 1024 * 1024 * 1024))
+w.flush()
+import time; time.sleep(30)
+"""
+    monkeypatch.setattr(adapter, "_CALL_TIMEOUT_SECONDS", 5.0)
+    stopped: List[str] = []
+    worker = _stub_worker(oversized, monkeypatch)
+    # After the stub, which points removal at nothing of its own.
+    monkeypatch.setattr(container, "remove", lambda name, confirm=False: stopped.append(name))
+    with pytest.raises(adapter.WorkerError) as refused:
+        worker.call("execute")
+    assert "declared a" in str(refused.value)
+    # Fatal: the worker is refused from here on, and its container is gone rather than merely
+    # unused.
+    assert worker.poisoned
+    assert stopped == [worker.container]
+    with pytest.raises(adapter.WorkerError):
+        worker.call("execute")
+
+
+def test_a_header_that_is_not_a_length_is_fatal(monkeypatch: pytest.MonkeyPatch) -> None:
+    junk = """
+import os, time
+r = os.fdopen(os.dup(0), "rb", buffering=0)
+w = os.fdopen(os.dup(1), "wb", buffering=0)
+r.readline()
+w.write(b"not-a-length\\n{}")
+w.flush()
+time.sleep(30)
+"""
+    monkeypatch.setattr(adapter, "_CALL_TIMEOUT_SECONDS", 5.0)
+    worker = _stub_worker(junk, monkeypatch)
+    with pytest.raises(adapter.WorkerError) as refused:
+        worker.call("execute")
+    assert "where a byte count belongs" in str(refused.value)
+
+
+# ----- the output tree is a host bind, so it is bounded -----
+
+
+def test_an_output_tree_past_its_bounds_refuses_the_grade(tmp_path: Path) -> None:
+    """Docker cannot put a size quota on a bind, so the bound is at this boundary instead.
+
+    An unbounded tree is an unbounded copy, made on shared disk while a sibling arm is running,
+    and then handed to a grader whose own budget starts afterwards. Refusing is the fail-closed
+    direction: the episode does not get a score rather than the machine getting a problem."""
+    outputs = tmp_path / "outputs"
+    (outputs / "tasks").mkdir(parents=True)
+    (outputs / "tasks" / "one.jsonl").write_text("rows")
+    # The ordinary tree passes, so the refusals below are about the bound.
+    assert adapter.snapshot_outputs(outputs, into=tmp_path / "ok").is_dir()
+
+    deep = outputs / "tasks"
+    for level in range(adapter._MAX_OUTPUT_DEPTH + 2):
+        deep = deep / f"d{level}"
+    deep.mkdir(parents=True)
+    with pytest.raises(adapter.SnapshotError) as refused:
+        adapter.snapshot_outputs(outputs, into=tmp_path / "deep")
+    assert "deeper than" in str(refused.value)
+
+
+def test_an_output_tree_with_too_many_files_refuses_the_grade(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    monkeypatch.setattr(adapter, "_MAX_OUTPUT_FILES", 4)
+    outputs = tmp_path / "outputs"
+    outputs.mkdir()
+    for index in range(8):
+        (outputs / f"{index}.jsonl").write_text("x")
+    with pytest.raises(adapter.SnapshotError) as refused:
+        adapter.snapshot_outputs(outputs, into=tmp_path / "many")
+    assert "more than" in str(refused.value)
+    monkeypatch.setattr(adapter, "_MAX_OUTPUT_FILES", 20_000)
+    monkeypatch.setattr(adapter, "_MAX_OUTPUT_BYTES", 3)
+    with pytest.raises(adapter.SnapshotError) as big:
+        adapter.snapshot_outputs(outputs, into=tmp_path / "big")
+    assert "larger than" in str(big.value)
+
+
+# ----- the sweep gets a second owner -----
+
+
+def test_a_container_nobody_could_remove_is_swept_even_while_its_parent_lives(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """The sweep skips containers whose parent is alive, which is right for the ordinary case and
+    wrong for the one where removal failed.
+
+    A long-lived serving process that could not remove a container has no later chance to try, and
+    the container holds a writable mount until that process exits. Writing the name where the
+    sweep also looks is what gives it a second owner."""
+    ledger = tmp_path / "disowned.txt"
+    monkeypatch.setattr(container, "_ledger", lambda: ledger)
+    container.disowned("stuck-one")
+    container.disowned("stuck-one")  # twice, because a retry writes again
+    removed: List[str] = []
+
+    def _run(args, **_):
+        if args[0] == "ps":
+            return _Finished(0, "")
+        if args[0] in ("stop", "rm"):
+            removed.append(args[-1])
+            return _Finished(0, "")
+        return _Finished(1, "", "Error: No such object: stuck-one")
+
+    monkeypatch.setattr(container, "_run", _run)
+    swept = container.reap(alive=lambda pid, birth="": True)
+    assert swept == ["stuck-one"]
+    assert "stuck-one" in removed
+    # Removed once and forgotten, so the next sweep has nothing to do.
+    assert not ledger.exists()
+
+
+# ----- identities that do not move with a locale -----
+
+
+def test_the_birth_and_boot_stamps_do_not_move_with_the_timezone(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Both stamps were renderings rather than values.
+
+    `ps` prints a start time for a human and `sysctl` prints a date beside its struct, so one live
+    process and one boot produced two different identities under two `TZ` values. A sweep run in
+    another zone would then either hide an orphan behind a different boot hash or read a live
+    parent as replaced."""
+    container._boot_id.cache_clear()
+    monkeypatch.setenv("TZ", "UTC")
+    utc = (container.process_birth(os.getpid()), container._boot_id())
+    container._boot_id.cache_clear()
+    monkeypatch.setenv("TZ", "America/Los_Angeles")
+    pacific = (container.process_birth(os.getpid()), container._boot_id())
+    container._boot_id.cache_clear()
+    assert utc == pacific, (utc, pacific)
+    assert utc[0] and utc[1]
+
+
+# ----- what the client adds that this port never passed -----
+
+
+def test_the_proxy_profile_docker_injects_is_emptied(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """Docker's client adds these from whatever proxy profile is configured, so leaving them out
+    of the command line leaves them in the container.
+
+    A proxy URL can carry credentials or an internal host name, by Docker's own documentation, and
+    a world with no network has no use for one. An explicit assignment is what overrides an
+    injected one."""
+    seen = _captured(monkeypatch)
+    container.run(role="serve", mounts=[container.Mount(tmp_path, "/corpus")])
+    passed = {
+        args.split("=", 1)[0]: args.split("=", 1)[1]
+        for index, args in enumerate(seen[0])
+        if index and seen[0][index - 1] == "-e" and "=" in args
+    }
+    for name in container._PROXY_VARIABLES:
+        assert name in passed, name
+        assert passed[name] == "", name
+
+
+# ----- what a machine was, in the fingerprint -----
+
+
+def test_the_resource_limits_are_captured_once_and_recorded(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """They decide latency, what a call timeout means, and whether a world is killed for
+    allocating, which is exactly the kind of opportunity the deadline and the capacity are already
+    identity-bearing for."""
+    from shogym.envs.appworld.env_v1 import run_fingerprint
+
+    base = run_fingerprint(pulse=0, report="graded", blocks=60, resources="2|2g")
+    assert base != run_fingerprint(pulse=0, report="graded", blocks=60, resources="8|16g")
+    # Captured once for the process, so an environment changed under a running run cannot move
+    # what its later episodes were given.
+    container.limits.cache_clear()
+    monkeypatch.setenv("SHOGYM_APPWORLD_CPUS", "3")
+    first = container.limits()
+    monkeypatch.setenv("SHOGYM_APPWORLD_CPUS", "7")
+    assert container.limits() == first
+    container.limits.cache_clear()
+
+
+def test_the_block_budget_counts_what_the_host_sent(monkeypatch: pytest.MonkeyPatch) -> None:
+    """A reply cannot earn a block, because a block is spent when the request goes out.
+
+    The protocol's writer is reachable from inside the interpreter that runs agent code, so a
+    forged completion can reach the parent before the real one. What it cannot do is add to the
+    budget: the count is incremented under the session lock before the call is made, so it counts
+    requests this process sent and not answers it received."""
+    import inspect
+
+    from shogym.envs.appworld import mcp_server
+
+    source = inspect.getsource(mcp_server.execute)
+    before, _, after = source.partition("session.calls += 1")
+    assert before and after
+    # The increment happens inside the lock, before the worker is called at all.
+    assert "worker.call" not in before
+    assert "worker.call" in after
 

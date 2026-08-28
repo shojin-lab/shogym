@@ -33,6 +33,7 @@ from __future__ import annotations
 
 import hashlib
 import os
+import re
 import subprocess
 import uuid
 from dataclasses import dataclass
@@ -51,6 +52,17 @@ CORPUS_MOUNT = "/corpus"
 
 #: Where the grader's view of a task is mounted. Only the grading container ever sees it.
 GRADED_MOUNT = "/graded"
+
+#: Every proxy variable Docker's client injects into a container it creates, in both cases the
+#: daemon accepts. They are not passed by this port and never appear in its argv, which is how they
+#: were missed: the client adds them from whatever proxy profile is configured, and Docker's own
+#: documentation notes that a proxy URL can carry credentials or an internal host name. A world
+#: with no network has no use for one, and an agent reading its environment would read them.
+_PROXY_VARIABLES: Tuple[str, ...] = tuple(
+    name
+    for base in ("http_proxy", "https_proxy", "ftp_proxy", "no_proxy", "all_proxy")
+    for name in (base, base.upper())
+)
 
 #: Where one episode's own output tree is mounted, and the only writable mount a world is given.
 #: AppWorld joins its experiment name onto its own output root, so an absolute name replaces that
@@ -224,6 +236,24 @@ def ensure_image(*, cache: Path, timeout: float = _BUILD_TIMEOUT_SECONDS) -> str
     return name
 
 
+@lru_cache(maxsize=1)
+def limits() -> Tuple[str, str]:
+    """The cpu and memory a serving container gets, read once for this process.
+
+    **Read once and then fixed, because it is part of what a run measured.** These decide latency,
+    what a call timeout means, and whether a world is killed for allocating; two arms that ran
+    under different ones are two arms that were given different machines, which is exactly the
+    kind of opportunity the deadline and the capacity are already identity-bearing for. So the
+    value is captured here, every launch in this process uses the captured one, and
+    :func:`~shogym.envs.appworld.env_v1.run_fingerprint` records it: an environment changed under
+    a running process cannot move it, and a run relaunched under a changed one does not pass for
+    the earlier measurement."""
+    return (
+        os.environ.get("SHOGYM_APPWORLD_CPUS", "2"),
+        os.environ.get("SHOGYM_APPWORLD_MEMORY", "2g"),
+    )
+
+
 def _identity() -> str:
     """The uid and gid the container runs as: the host user's own.
 
@@ -308,16 +338,22 @@ def run(
         # group: the other arm of a pair is a sibling container on the same host, and an arm that
         # ran slower because its twin was busy is a difference the treatment did not make.
         "--cpus",
-        os.environ.get("SHOGYM_APPWORLD_CPUS", "2"),
+        limits()[0],
         "--memory",
-        os.environ.get("SHOGYM_APPWORLD_MEMORY", "2g"),
+        limits()[1],
         "-w",
         SCRATCH_MOUNT,
     ]
     platform = os.environ.get("SHOGYM_APPWORLD_PLATFORM")
     if platform:
         args += ["--platform", platform]
-    # Nothing is inherited. `docker run` passes only what the image declares and what is named
+    # Emptied rather than omitted. The client puts these into every container it creates from the
+    # active proxy profile, so leaving them out of this list leaves them in the container: an
+    # explicit assignment is what overrides an injected one, and an empty value is what a world
+    # with no network should see.
+    for name in _PROXY_VARIABLES:
+        args += ["-e", f"{name}="]
+    # Nothing else is inherited. `docker run` passes only what the image declares and what is named
     # here, so the serving process's provider keys and run paths are not in this container's
     # environment because they were never offered to it.
     for key, value in sorted((environment or {}).items()):
@@ -424,7 +460,8 @@ def reap(*, alive: Optional[Callable[..., bool]] = None) -> List[str]:
         check=False,
     )
     running = alive if alive is not None else _process_is_alive
-    removed: List[str] = []
+    # The ones nobody could remove, whoever is alive. See `disowned`.
+    removed: List[str] = _sweep_disowned()
     for identifier in listed.stdout.split():
         labels = _run(
             [
@@ -456,6 +493,15 @@ def process_birth(pid: int) -> str:
     process that started this container still running". The start time is what separates them: a
     number that came back with a different birth is a different process wearing the same badge.
 
+    **Read in a fixed locale and a fixed zone.** `ps` renders this start time for a human, so the
+    same live process under `TZ=UTC` and under `America/Los_Angeles` prints two different strings,
+    and a stamp written by one harness process and compared by another under a different zone
+    would say the parent had been replaced. The environment is pinned rather than the output
+    parsed, because the format is the platform's and the pinning is what makes it comparable.
+
+    One second of precision is what `ps` offers, so a pid reused inside the same second is still
+    indistinguishable. That is the residual, and it is narrower than the pid alone was.
+
     Unknown is the empty string rather than an error. It is compared for equality, and two empty
     strings comparing equal keeps the reaper on the safe side of its own rule: it removes only
     what it can positively tell is abandoned."""
@@ -465,10 +511,65 @@ def process_birth(pid: int) -> str:
             capture_output=True,
             text=True,
             timeout=_CONTROL_TIMEOUT_SECONDS,
+            env={**os.environ, "TZ": "UTC", "LC_ALL": "C", "LANG": "C"},
         )
     except (OSError, subprocess.SubprocessError):
         return ""
     return finished.stdout.strip() if finished.returncode == 0 else ""
+
+
+def _ledger() -> Path:
+    """Where containers nobody could remove are written down, one name per line.
+
+    Session-scoped would be no use: the case is a removal that failed while this process is still
+    running and still holding the session it belongs to. So it is a file, under this port's own
+    cache, that any later sweep reads."""
+    base = os.environ.get("SHOGYM_CACHE")
+    root = Path(base).expanduser().resolve() if base else Path.home() / ".cache" / "shogym"
+    home = root / "appworld"
+    home.mkdir(parents=True, exist_ok=True)
+    return home / "disowned.txt"
+
+
+def disowned(container: str) -> None:
+    """Record a container this process could not remove, so a sweep will try again.
+
+    Appended rather than rewritten, and failures here are swallowed: this is called from teardown,
+    which may not raise, and a name that could not be written is a container the ordinary reaper
+    still finds once its parent exits."""
+    try:
+        with open(_ledger(), "a") as handle:
+            handle.write(container + "\n")
+    except OSError:
+        pass
+
+
+def _sweep_disowned() -> List[str]:
+    """Remove every container the ledger names, and forget the ones that are gone.
+
+    A name that cannot be removed stays in the ledger for the next sweep; a name that is already
+    absent is dropped. Nothing here consults the parent, because the ledger's whole point is a
+    container whose parent is alive and out of ways to remove it."""
+    ledger = _ledger()
+    try:
+        names = [line.strip() for line in ledger.read_text().splitlines() if line.strip()]
+    except OSError:
+        return []
+    removed, left = [], []
+    for name in dict.fromkeys(names):
+        try:
+            remove(name, confirm=True)
+            removed.append(name)
+        except DockerError:
+            left.append(name)
+    try:
+        if left:
+            ledger.write_text("\n".join(left) + "\n")
+        else:
+            ledger.unlink(missing_ok=True)
+    except OSError:
+        pass
+    return removed
 
 
 def _process_is_alive(pid: int, birth: str = "") -> bool:
@@ -490,12 +591,25 @@ def _process_is_alive(pid: int, birth: str = "") -> bool:
 
 @lru_cache(maxsize=1)
 def _boot_id() -> str:
-    """Something that changes when the machine restarts, so a reused pid is not a live parent."""
+    """Something that changes when the machine restarts, so a reused pid is not a live parent.
+
+    **The number, not the rendering.** `sysctl -n kern.boottime` prints a struct and then a human
+    date, and the date is rendered in the caller's zone: hashing the whole line gave two different
+    boot identities for one boot under two `TZ` values, which would hide an orphan from a sweep run
+    in another zone. The seconds field inside the struct is the kernel's own value and does not
+    move, so that is what is taken. Linux's boot id is already a value rather than a rendering."""
     try:
         stamp = subprocess.run(
-            ["sysctl", "-n", "kern.boottime"], capture_output=True, text=True, timeout=10
+            ["sysctl", "-n", "kern.boottime"],
+            capture_output=True,
+            text=True,
+            timeout=_CONTROL_TIMEOUT_SECONDS,
+            env={**os.environ, "TZ": "UTC", "LC_ALL": "C", "LANG": "C"},
         )
         if stamp.returncode == 0 and stamp.stdout.strip():
+            seconds = re.search(r"sec\s*=\s*(\d+)", stamp.stdout)
+            if seconds:
+                return seconds.group(1)
             return hashlib.sha256(stamp.stdout.strip().encode()).hexdigest()[:12]
     except (FileNotFoundError, subprocess.TimeoutExpired):
         pass
@@ -524,6 +638,7 @@ __all__ = [
     "LABEL_OWNER",
     "LABEL_PARENT",
     "OUTPUTS_MOUNT",
+    "_PROXY_VARIABLES",
     "SCRATCH_MOUNT",
     "DockerError",
     "Mount",
@@ -531,10 +646,12 @@ __all__ = [
     "docker_available",
     "ensure_image",
     "image_identity",
+    "limits",
     "image_exists",
     "image_name",
     "process_birth",
     "reap",
+    "disowned",
     "remove",
     "require_docker",
     "run",

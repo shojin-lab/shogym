@@ -165,14 +165,22 @@ class AppWorldEnv(Env):
         self._pulse = int(pulse)
         self._report = report
         self._original = adapter.ensure_corpus() / "data"
-        self._derived = world.derive_root(
-            original=self._original, derived=adapter.derived_root() / "data"
+        # Read once, from the corpus this run actually serves, and used for three things that all
+        # have to agree: the name of the served cache, the name of the grader's cache, and the run
+        # fingerprint a resumed record is checked against. They used to be able to disagree, so a
+        # process pointed at a second corpus computed a fingerprint for that one and then reused
+        # and served task material derived from the first.
+        self._corpus = adapter.corpus_digest(self._original.parent)
+        served, graded = (
+            adapter.derived_root(self._corpus),
+            adapter.graded_root(self._corpus),
         )
+        adapter.stamp_cache(served, source=self._corpus)
+        adapter.stamp_cache(graded, source=self._corpus)
+        self._derived = world.derive_root(original=self._original, derived=served / "data")
         # The grader's view of the same corpus, with the answers linked back in. Only the grading
         # process is ever given this root; the world an agent drives is given the other one.
-        self._graded = world.derive_root(
-            original=self._original, derived=adapter.graded_root() / "data"
-        )
+        self._graded = world.derive_root(original=self._original, derived=graded / "data")
         self._task_ids = adapter.task_ids()
         self._backlogs: Dict[str, Any] = {}
         self.function = FunctionConfig(example_system_template=_static_instructions())
@@ -186,8 +194,12 @@ class AppWorldEnv(Env):
             pulse=self._pulse,
             report=self._report,
             blocks=self._blocks,
-            corpus=adapter.corpus_digest(self._original.parent),
+            corpus=self._corpus,
             runtime=container.image_identity(container.image_name()),
+            # What machine an episode was given. Captured once for this process and passed to
+            # every launch, so an environment changed mid-run cannot move it and a run relaunched
+            # under a changed one does not pass for the earlier measurement.
+            resources="|".join(container.limits()),
         )
         super().__init__(horizon=self._blocks + 1, num_tasks=len(self._task_ids))
 
@@ -543,6 +555,22 @@ class AppWorldEnv(Env):
         fb = FeedbackCollection()
         if not terminated:
             return fb
+        if evidence is not None and evidence.finalize_error:
+            # **A failed terminal publishes the failure and nothing else.** It used to publish a
+            # row of zeroed fractions and an empty receipt beside them, which is a scored-looking
+            # row for an episode that was never scored: the zeros average into a mean and the
+            # empty receipt is still an item a paired policy selects and reveals. There is no
+            # verdict behind this episode, so the honest record of it is that fact alone, and the
+            # stream files the row unscored on the core's own stamp rather than on this item.
+            fb.episode.append(EpisodeFeedback(name="finalize_error", value=True))
+            fb.inference.append(
+                InferenceFeedback(
+                    name="config_digest",
+                    value=self._config_digest,
+                    step=trajectory[-1].index if trajectory else 0,
+                )
+            )
+            return fb
         verdict = evidence.verdict if evidence is not None else {}
         for name in (
             "ledger_fraction",
@@ -590,7 +618,7 @@ class AppWorldEnv(Env):
             InferenceFeedback(
                 name="config_digest",
                 value=self._config_digest,
-                step=trajectory[-1].index if len(trajectory) else 0,
+                step=trajectory[-1].index if trajectory else 0,
             )
         )
         return fb
@@ -637,11 +665,21 @@ def _static_instructions() -> str:
 #:
 #: 3 is the move from a worker process on the host to a worker container, which changed where the
 #: filing and the world's digest are read from as well as what the world runs in.
-SCORING_VERSION = 3
+#:
+#: 4 is grading the state upstream persists at the end of every block rather than one this port
+#: asked the world to write at the seal: two runs that differ across it read a score off two
+#: different moments of the same episode.
+SCORING_VERSION = 4
 
 
 def run_fingerprint(
-    *, pulse: int, report: str, blocks: int, corpus: str = "", runtime: str = ""
+    *,
+    pulse: int,
+    report: str,
+    blocks: int,
+    corpus: str = "",
+    runtime: str = "",
+    resources: str = "",
 ) -> str:
     """Everything two runs must agree on for their rows to be one measurement.
 
@@ -673,13 +711,19 @@ def run_fingerprint(
             report,
             str(blocks),
             str(SCORING_VERSION),
+            str(adapter.DERIVATION_VERSION),
             adapter.DATA_VERSION,
             adapter.DATA_BUNDLE_SHA256,
             corpus,
             runtime,
+            resources,
             adapter.UPSTREAM_VERSION,
             adapter.MANIFEST.read_text(),
             payload.PASS_COUNTS_FILE.read_text(),
+            # The constant every drawn payload is re-rolled by. It is agent-visible treatment
+            # rather than a score, and a run that changed it and kept its identity would resume
+            # into a record whose earlier rows were drawn from something else.
+            payload.DRAWN_BASIS,
         ]
     )
     return hashlib.sha256(material.encode()).hexdigest()[:16]
