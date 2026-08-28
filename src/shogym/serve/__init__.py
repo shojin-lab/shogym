@@ -38,6 +38,7 @@ from shogym.serve.stream import (
     read_adoptions,
     read_dispenses,
     read_exposures,
+    read_record,
     read_results,
     reconcile,
 )
@@ -72,6 +73,7 @@ __all__ = [
     "read_adoptions",
     "read_dispenses",
     "read_exposures",
+    "read_record",
     "read_results",
     "reconcile",
 ]

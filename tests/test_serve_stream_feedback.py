@@ -56,6 +56,8 @@ from shogym.serve.stream import (
     build_stream_server,
     read_adoptions,
     read_dispenses,
+    read_exposures,
+    read_record,
     read_results,
     reconcile,
 )
@@ -2627,7 +2629,9 @@ async def test_a_result_row_that_disagrees_with_its_dispense_is_refused(
             records[0]["position"],
         )
     else:
-        records[1]["seq"] = records[0]["seq"]
+        # A number no dispense uses, so what breaks is the pairing rather than the uniqueness
+        # the reader checks one step earlier.
+        records[1]["seq"] = 99
     path.write_text("\n".join(json.dumps(record) for record in records) + "\n")
 
     with pytest.raises(ValueError, match="the dispense it answers records"):
@@ -2650,6 +2654,118 @@ async def test_two_result_rows_for_one_opportunity_are_refused(tmp_path: Path) -
 
     with pytest.raises(ValueError, match="two result rows for queue position 0"):
         _stream(tmp_path, [0, 0], resume=True)
+
+
+async def test_the_durable_readers_refuse_a_record_whose_halves_disagree(
+    tmp_path: Path,
+) -> None:
+    """The cross-check has to live where an analysis reads, not only where a resume does.
+
+    `reconcile()` built its sealed set from the result file alone and rebuilt each dispense with
+    coercions, so a result answering no dispense left that dispense unmatched and reported as a
+    crash while the orphan row was counted as its outcome. Resume refused exactly that record;
+    the shipped readers, which are what a run is actually counted with, accepted it and
+    miscounted."""
+    async with _stream(tmp_path, [0, 1]) as first:
+        await first.get_task()
+        await first.dispatch(SUBMIT_TOOL, {"answer": "4"})
+
+    path = tmp_path / "prov" / "results.jsonl"
+    rewritten = []
+    for line in path.read_text().splitlines():
+        if not line.strip():
+            continue
+        record = json.loads(line)
+        record["lease"] = "z" * 32
+        rewritten.append(json.dumps(record))
+    path.write_text("\n".join(rewritten) + "\n")
+
+    for reader in (reconcile, read_record):
+        with pytest.raises(ValueError, match="which no dispense") as refused:
+            reader(tmp_path / "prov")
+        assert "broker abort" in str(refused.value)
+    # The single-file reader still reads: it can prove each row's own shape and nothing about one
+    # file can prove the row answers a task this record handed out.
+    assert len(read_results(tmp_path / "prov")) == 1
+
+
+async def test_a_record_that_agrees_with_itself_reads_through_every_reader(
+    tmp_path: Path,
+) -> None:
+    """The other direction, so the refusals above are not vacuous: an ordinary record with an
+    abandoned dispense in it reads through all three, and the crash still reconciles."""
+    crashed = _stream(tmp_path, [0, 1], feedback=Information())
+    await crashed.get_task()
+    await crashed.dispatch(SUBMIT_TOOL, {"answer": "4"})
+    await crashed.get_task()  # dispensed, never sealed
+
+    dispenses, results = read_record(tmp_path / "prov")
+    assert len(dispenses) == 2 and len(results) == 1
+    assert [row.closure for row in reconcile(tmp_path / "prov")] == ["broker_abort"]
+    assert len(read_exposures(tmp_path / "prov")) == 1
+
+    # The drain seals what it was holding, and the completed record still reads through all three.
+    await crashed.aclose()
+    dispenses, results = read_record(tmp_path / "prov")
+    assert len(dispenses) == 2 and len(results) == 2
+    assert reconcile(tmp_path / "prov") == []
+
+
+@pytest.mark.parametrize(
+    "damage",
+    ["duplicate", "orphan", "regime", "position", "negative_items"],
+)
+async def test_a_delivery_log_that_does_not_describe_its_rows_is_refused(
+    tmp_path: Path, damage: str
+) -> None:
+    """The one log whose *silence* is read as a failed delivery.
+
+    A row with no line here is a task nobody was told about, and that reading only works if a
+    line means the other thing. Nothing checked: the file was raw JSONL, and resume never opened
+    it at all, so a duplicated, orphaned or edited line survived into the run that continued the
+    record and counted as a delivery for a task it did not describe."""
+    async with _stream(tmp_path, [0, 1], feedback=Information()) as first:
+        await first.get_task()
+        await first.dispatch(SUBMIT_TOOL, {"answer": "4"})
+
+    path = tmp_path / "prov" / "exposures.jsonl"
+    (line,) = [json.loads(text) for text in path.read_text().splitlines() if text.strip()]
+    if damage == "duplicate":
+        written = [line, line]
+        expected = "two deliveries"
+    elif damage == "orphan":
+        written = [{**line, "lease": "z" * 32}]
+        expected = "no result row of this record answers"
+    elif damage == "regime":
+        written = [{**line, "feedback_regime": "placebo"}]
+        expected = "but its row was assigned"
+    elif damage == "position":
+        written = [{**line, "position": line["position"] + 5}]
+        expected = "the row it joins records"
+    else:
+        written = [{**line, "items": -1}]
+        expected = "this is a count"
+    path.write_text("\n".join(json.dumps(record) for record in written) + "\n")
+
+    with pytest.raises(ValueError, match=expected):
+        _stream(tmp_path, [0, 1], resume=True, feedback=Information())
+    with pytest.raises(ValueError, match=expected):
+        read_record(tmp_path / "prov")
+
+
+async def test_a_delivery_that_carried_nothing_is_still_a_delivery(tmp_path: Path) -> None:
+    """Zero is a count and not an absence: an answer that carried no item is a different fact
+    from no answer, which is exactly the distinction the silence rule depends on."""
+    async with _stream(tmp_path, [0, 1], feedback=Information()) as first:
+        await first.get_task()
+        await first.dispatch(SUBMIT_TOOL, {"answer": "4"})
+    path = tmp_path / "prov" / "exposures.jsonl"
+    (line,) = [json.loads(text) for text in path.read_text().splitlines() if text.strip()]
+    path.write_text(json.dumps({**line, "items": 0}) + "\n")
+
+    async with _stream(tmp_path, [0, 1], resume=True, feedback=Information()) as resumed:
+        assert resumed is not None
+    assert [record["items"] for record in read_exposures(tmp_path / "prov")] == [0]
 
 
 async def test_a_dispense_with_no_result_is_still_the_row_a_resume_replays(

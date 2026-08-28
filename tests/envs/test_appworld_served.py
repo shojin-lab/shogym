@@ -903,30 +903,33 @@ async def test_the_documented_launch_serves_each_arm_of_the_pair(
     asks the three questions the launch has to answer: does the regime reach the stream, does each
     arm reveal only its own channel, and does each arm land a row of its own that says which arm
     it was. The rows are read back with the quickstart's reader, which is also what makes this a
-    check on the summary the reader prints."""
+    check on the summary the reader prints.
+
+    **The environment below is the README's, not this test's.** The arm now travels in the MCP
+    config's `env` block rather than on the agent's command line, so what a launch hands this
+    server is whatever those documented commands write into that block; typing the same variables
+    out again here would check a second document. `test_appworld_launch.py` runs the commands, and
+    holds the other half of the separation: that the agent's own process is byte-identical across
+    the two arms."""
     import importlib
 
     from fastmcp import Client
+
+    from tests.envs.test_appworld_launch import documented_arms
 
     from examples.claude_code import results as results_mod
     from examples.claude_code import serve as serve_mod
     from shogym.feedback.wire import CHANNEL_FEEDBACK_NAME
     from shogym.serve.stream import build_stream_server
 
-    quickstart = Path(serve_mod.__file__).resolve().parent
-    config = json.loads((quickstart / ".mcp.json").read_text())
-    # The launch is only this file's if this is still what the documented config spawns.
-    assert config["mcpServers"]["shogym"]["args"] == ["run", "python", "serve.py"]
+    configured = documented_arms(tmp_path / "documented")
+    assert sorted(configured) == ["information", "placebo"]
 
     directories: List[Path] = []
     try:
         for arm in ("information", "placebo"):
-            monkeypatch.setenv("SHOGYM_ENV", "appworld")
-            monkeypatch.setenv("SHOGYM_TASKS", str(TASK))
-            monkeypatch.setenv("SHOGYM_FEEDBACK", arm)
-            monkeypatch.setenv("SHOGYM_IDENTITY", "the-pair")
-            monkeypatch.setenv("SHOGYM_DEADLINE", "1800")
-            monkeypatch.setenv("SHOGYM_IN_FLIGHT", "1")
+            for name, value in configured[arm].items():
+                monkeypatch.setenv(name, value)
             # The constants are read from the environment at import, which is what a launch does.
             importlib.reload(serve_mod)
             assert (serve_mod.ENV, serve_mod.TASKS, serve_mod.FEEDBACK) == (

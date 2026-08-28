@@ -15,13 +15,20 @@ Run it after a run::
 
 from __future__ import annotations
 
+import os
 import sys
 from pathlib import Path
 from typing import List, Optional, Sequence
 
 from shogym.serve.stream import ResultRow, read_results, reconcile
 
-RUNS = Path(__file__).resolve().parent / "runs"
+# The same knob ``serve.py`` writes under, so a run that put its records outside the agent's
+# working directory is read back without naming the directory again.
+RUNS = (
+    Path(os.environ["SHOGYM_RUNS"]).expanduser()
+    if os.environ.get("SHOGYM_RUNS")
+    else Path(__file__).resolve().parent / "runs"
+)
 
 
 def latest_run(runs: Path = RUNS) -> Path:

@@ -274,6 +274,7 @@ import asyncio
 import contextlib
 import copy
 import fcntl
+import inspect
 import json
 import math
 import os
@@ -342,6 +343,7 @@ __all__ = [
     "reconcile",
     "read_adoptions",
     "read_dispenses",
+    "read_record",
     "read_exposures",
     "read_results",
 ]
@@ -1265,6 +1267,24 @@ class ProvenanceSpan(Protocol):
         """What was observed after the task was sealed, scored and classified. Strict JSON."""
         ...
 
+    # ``async def undispensed(self) -> None`` — **optional, and called instead of `finalize`.**
+    #
+    # A span is opened before the task is exposed, and several things between there and the
+    # durable dispense can still refuse it: a sibling extension whose own `begin` fails, an env
+    # the factory cannot build, a manifest this stream cannot serve, a stream that closed inside
+    # the window. None of those is an outcome, so `finalize` is the wrong call to make: there is
+    # no closure and no score to hand it, and a span closed against an invented one would put a
+    # value on nothing. They used to be dropped instead, which is worse for any extension that
+    # took a real resource in `begin` — a lock, a snapshot, an open handle — because the object
+    # holding it was simply let go and the extension was never told the dispense had failed.
+    #
+    # So this is the other ending, and an extension that has nothing to undo need not define it.
+    # It is not part of the structural protocol precisely so that adding it is not a breaking
+    # change for an extension already written against `dispensed` and `finalize`; the stream
+    # calls it when it is there (see `TaskStream._unwind_spans`). Its return value is discarded,
+    # it is bounded by `provenance_timeout` like every other callback, and a failure in it cannot
+    # change the refusal the caller of `get_task` is owed.
+
 
 class Provenance(Protocol):
     """An extension that records something extra about every dispensed task.
@@ -2024,6 +2044,206 @@ def read_adoptions(prov_dir: Path) -> List[Dict[str, Any]]:
     return _read_jsonl(Path(prov_dir) / _ADOPTIONS_FILE)
 
 
+class _Dispensed(NamedTuple):
+    """One dispense record's half of the pairing, in the types the writer emitted."""
+
+    lease: str
+    seq: int
+    position: int
+    env: str
+    task_idx: int
+
+
+def _paired_record(prov_dir: Path) -> Tuple[Dict[str, _Dispensed], List[ResultRow]]:
+    """Read both durable logs and prove they describe one run, or refuse.
+
+    **The two files are not two records.** A dispense is the durable half a crash leaves behind
+    and a result is the answer to it; one call wrote both halves, and :func:`reconcile` decides
+    which opportunities were lost by pairing them on the lease alone. So a result whose lease
+    names no dispense, or whose position, env, task index or ``seq`` is not the one that dispense
+    recorded, is not a row about this record at all. Left unchecked it retires a queue position
+    while ``reconcile`` goes on reporting a ``broker_abort`` for the dispense nothing now answers:
+    one opportunity holding a score and a crash at once.
+
+    That check used to live only in the resume path, so the shipped readers — the ones an analysis
+    actually calls — accepted exactly what a resume refused. It lives here now, and resume, the
+    reconciler and the exposure join all read through it.
+
+    What is proved: every stored field is the type the writer emitted (see :func:`_wire_int`);
+    every ``seq`` is a positive number no other dispense uses; every lease is dispensed once;
+    every result answers exactly one dispense on all five fields; no dispense is answered twice;
+    and no queue position holds two results. **A dispense with no result is not an error** and
+    must never become one: that is the abandoned dispense a resume replays and the crash
+    ``reconcile`` exists to report.
+
+    Same scope as the exact wire types beside it: the provenance directory is the harness's own,
+    so what reaches here is corruption, a mixed writer, or a hand-edited recovery. That is what
+    makes failing closed cheap rather than what makes it unnecessary."""
+    prov_dir = Path(prov_dir)
+    dispenses_path = prov_dir / _DISPENSES_FILE
+    results_path = prov_dir / _RESULTS_FILE
+    dispensed: Dict[str, _Dispensed] = {}
+    numbered: Dict[int, str] = {}
+    for record in read_dispenses(prov_dir):
+        where = f"{dispenses_path}: a dispense record"
+        entry = _Dispensed(
+            lease=_wire_str(record, "lease", source=where),
+            seq=_wire_int(record, "seq", source=where),
+            position=_wire_int(record, "position", source=where),
+            env=_wire_str(record, "env", source=where),
+            task_idx=_wire_int(record, "task_idx", source=where),
+        )
+        if entry.lease in dispensed:
+            raise ValueError(
+                f"{dispenses_path} records two dispenses under one lease ({entry.lease!r}); a "
+                "result is paired with a dispense by its lease, so one of them can never be "
+                "answered and a crash on it would be invisible to reconciliation"
+            )
+        if entry.seq < 1:
+            raise ValueError(
+                f"{dispenses_path} records a dispense at seq {entry.seq}; this module numbers "
+                "from one, so a record starting anywhere else cannot say which of its rows came "
+                "first"
+            )
+        if entry.seq in numbered:
+            raise ValueError(
+                f"{dispenses_path} records two dispenses at seq {entry.seq} (leases "
+                f"{numbered[entry.seq]!r} and {entry.lease!r}); the number is what orders a "
+                "record, so two rows sharing one cannot be read in the order they happened"
+            )
+        numbered[entry.seq] = entry.lease
+        dispensed[entry.lease] = entry
+    results: List[ResultRow] = []
+    answered: Dict[str, int] = {}
+    done: Dict[int, int] = {}
+    for row in read_results(prov_dir):
+        match = dispensed.get(row.lease)
+        if match is None:
+            raise ValueError(
+                f"{results_path} holds a result row under lease {row.lease!r}, which no dispense "
+                f"in {dispenses_path.name} records; a result is paired with a dispense by its "
+                "lease, so this row retires a queue position while the dispense it should have "
+                "answered reconciles as a crash, leaving one opportunity holding both a score "
+                "and a broker abort"
+            )
+        produced = (row.position, row.env, row.task_idx, row.seq)
+        recorded = (match.position, match.env, match.task_idx, match.seq)
+        if recorded != produced:
+            raise ValueError(
+                f"{results_path} holds a result row under lease {row.lease!r} naming "
+                f"(position, env, task, seq) {produced!r}, but the dispense it answers records "
+                f"{recorded!r}; one call wrote both halves, so a record whose halves disagree "
+                "cannot say which opportunity this outcome belongs to"
+            )
+        if row.lease in answered:
+            raise ValueError(
+                f"{results_path} holds two result rows under lease {row.lease!r} (seq "
+                f"{answered[row.lease]} and {row.seq}); one dispense is answered once, and a "
+                "record holding two answers for it has an outcome nothing can attribute"
+            )
+        if row.position in done:
+            raise ValueError(
+                f"{results_path} holds two result rows for queue position {row.position}; a "
+                "position is one opportunity, so a mean over this record would average two "
+                "outcomes for a task that was played once"
+            )
+        answered[row.lease] = row.seq
+        done[row.position] = row.seq
+        results.append(row)
+    return dispensed, results
+
+
+def _require_exposures_join(
+    prov_dir: Path, results: Sequence[ResultRow]
+) -> List[Dict[str, Any]]:
+    """Every exposure line must describe a row this record holds, or refuse.
+
+    This log is the one that says which verdicts actually reached an agent, and a dose analysis
+    reads a row's *absence* from it as a delivery that failed (see :func:`read_exposures`). An
+    absence only means that if a presence means the other thing, and nothing checked: the file
+    was raw JSONL nobody validated, resume never opened it at all, and a duplicated, orphaned or
+    edited line therefore counted as a delivery for a task it did not describe.
+
+    So a line joins its row on the lease and the ``seq``, and then has to agree with it about the
+    position, the env, the task, the regime it was served under and the identity it was filed
+    under. One line per row, because one terminating call is answered once.
+
+    ``items`` is a count and zero is a real value: a delivered answer that carried nothing is a
+    different fact from no delivery, which is exactly the distinction the absence rule depends on
+    (see :meth:`TaskStream._terminal_answer`). Negative is not a count at all.
+
+    A row with no line stays what it has always been: a task nobody was told about."""
+    exposures_path = Path(prov_dir) / _EXPOSURES_FILE
+    rows = {(row.lease, row.seq): row for row in results}
+    seen: set[Tuple[str, int]] = set()
+    lines = _read_jsonl(exposures_path)
+    for line in lines:
+        where = f"{exposures_path}: an exposure record"
+        key = (
+            _wire_str(line, "lease", source=where),
+            _wire_int(line, "seq", source=where),
+        )
+        row = rows.get(key)
+        if row is None:
+            raise ValueError(
+                f"{exposures_path} says lease {key[0]!r} at seq {key[1]} was told what its task "
+                "ended as, but no result row of this record answers that dispense; a delivery "
+                "recorded against a row nobody has is a run that cannot say which of its "
+                "verdicts reached the agent"
+            )
+        if key in seen:
+            raise ValueError(
+                f"{exposures_path} records two deliveries for lease {key[0]!r} at seq {key[1]}; "
+                "one terminating call is answered once, so a second line here is a delivery that "
+                "did not happen counted as one that did"
+            )
+        stated = (
+            _wire_int(line, "position", source=where),
+            _wire_str(line, "env", source=where),
+            _wire_int(line, "task_idx", source=where),
+        )
+        if stated != (row.position, row.env, row.task_idx):
+            raise ValueError(
+                f"{exposures_path} records a delivery for lease {key[0]!r} naming "
+                f"(position, env, task) {stated!r}, but the row it joins records "
+                f"{(row.position, row.env, row.task_idx)!r}; the two were written by one call"
+            )
+        if _recorded_regime(line) != row.feedback_regime:
+            raise ValueError(
+                f"{exposures_path} records a delivery for lease {key[0]!r} under regime "
+                f"{_recorded_regime(line)!r}, but its row was assigned "
+                f"{row.feedback_regime!r}; a delivery is evidence about the arm the row names, "
+                "so the two saying different things describes no run"
+            )
+        if _recorded_identity(line) != row.run_identity:
+            raise ValueError(
+                f"{exposures_path} records a delivery for lease {key[0]!r} under a run identity "
+                "that is not the one its row was filed under; one call wrote both"
+            )
+        items = _wire_int(line, "items", source=where)
+        if items < 0:
+            raise ValueError(
+                f"{exposures_path} records a delivery of {items} items for lease {key[0]!r}; "
+                "this is a count of what the answer carried, and zero already means an answer "
+                "that said nothing"
+            )
+        seen.add(key)
+    return lines
+
+
+def read_record(prov_dir: Path) -> Tuple[List[Dict[str, Any]], List[ResultRow]]:
+    """Both durable logs, checked against each other, or a refusal (see :func:`_paired_record`).
+
+    The reader to reach for when an analysis is about to count a run: :func:`read_results` reads
+    one file and can prove each row's own shape, and nothing about a single file can prove that
+    the row is an answer to a task this record handed out. This pairs them and refuses a record
+    whose halves disagree, rather than quietly miscounting it."""
+    prov_dir = Path(prov_dir)
+    _, results = _paired_record(prov_dir)
+    _require_exposures_join(prov_dir, results)
+    return read_dispenses(prov_dir), results
+
+
 def reconcile(prov_dir: Path) -> List[ResultRow]:
     """Pair dispense records with results and report the unmatched ones.
 
@@ -2053,7 +2273,12 @@ def reconcile(prov_dir: Path) -> List[ResultRow]:
     A dispense record written before provenance was recorded on it has no ``extensions`` member at
     all, and reconciles to an empty map — the same answer a run with no extensions gives."""
     prov_dir = Path(prov_dir)
-    sealed = {row.lease for row in read_results(prov_dir)}
+    # Both halves, proved to describe one run before any of it is counted. This used to build its
+    # sealed set out of the result file alone and rebuild each dispense with coercions, so a
+    # result that answered no dispense left that dispense unmatched and reported as a crash while
+    # the orphan row was read as its outcome (see :func:`_paired_record`).
+    _, results = _paired_record(prov_dir)
+    sealed = {row.lease for row in results}
     return [
         ResultRow(
             seq=int(record["seq"]),
@@ -3392,48 +3617,27 @@ class TaskStream:
         putting the claim file back: if the displaced stream reached an append in between, it saw
         a foreign claim, stopped itself permanently and raised out of its own ``aclose`` — a
         correct run killed by a construction that went on to refuse."""
-        # Every dispense, by the lease its result is paired with. `reconcile` pairs the two logs
-        # that way and so does the cross-check below, so the map is built once and read twice.
-        dispensed: Dict[str, Tuple[int, str, int, int]] = {}
+        # Both logs, proved to describe one run before any of it is trusted. The pairing lives in
+        # `_paired_record` rather than here, because the readers an analysis calls need exactly
+        # the same proof and used to accept what this refused.
+        dispensed, results = _paired_record(self.prov_dir)
         for record in read_dispenses(self.prov_dir):
             stored = _recorded_identity(record)
             self._blank_dispenses += not stored
-            where = f"{self.dispenses_path}: a dispense record"
-            position = _wire_int(record, "position", source=where)
-            ref = TaskRef(
-                _wire_str(record, "env", source=where),
-                _wire_int(record, "task_idx", source=where),
-            )
             self._require_position_matches(
-                position,
-                ref,
+                int(record["position"]),
+                TaskRef(str(record["env"]), int(record["task_idx"])),
                 source="a dispense record",
             )
             self._require_regime_matches(_recorded_regime(record), source="a dispense record")
             self._require_identity_matches(stored, source="a dispense record")
-            lease = _wire_str(record, "lease", source=where)
-            if lease in self._issued:
-                # Already ambiguous on disk, before this run adds anything: the pairing
-                # `reconcile` does cannot answer two dispenses with one result, so whichever of
-                # them was sealed reports both as sealed. Continuing would append to a record that
-                # has already lost a row.
-                raise ValueError(
-                    f"{self.dispenses_path} records two dispenses under one lease "
-                    f"({lease!r}); a result is paired with a dispense by its lease, so "
-                    "one of them can never be answered and a crash on it would be "
-                    "invisible to reconciliation"
-                )
-            self._issued.add(lease)
-            seq = _wire_int(record, "seq", source=where)
-            dispensed[lease] = (position, ref.env, ref.task_idx, seq)
-            self._seq = max(self._seq, seq)
-        answered: Dict[str, int] = {}
-        for row in read_results(self.prov_dir):
+            self._issued.add(str(record["lease"]))
+            self._seq = max(self._seq, int(record["seq"]))
+        for row in results:
             self._blank_results += not row.run_identity
             self._require_position_matches(
                 row.position, TaskRef(row.env, row.task_idx), source="a result row"
             )
-            self._require_answers_a_dispense(row, dispensed, answered)
             self._require_regime_matches(row.feedback_regime, source="a result row")
             self._require_identity_matches(row.run_identity, source="a result row")
             # What the env said, as against what the caller asserted — and the binding this
@@ -3446,69 +3650,11 @@ class TaskStream:
             self._issued.add(row.lease)
             self._done_positions.add(row.position)
             self._seq = max(self._seq, row.seq)
-
-    def _require_answers_a_dispense(
-        self,
-        row: ResultRow,
-        dispensed: Mapping[str, Tuple[int, str, int, int]],
-        answered: Dict[str, int],
-    ) -> None:
-        """A stored result must answer exactly one stored dispense, and no dispense twice.
-
-        The two logs were read independently, each row checked against the queue and neither
-        against the other. That is not enough, because they are not two records: a dispense is the
-        durable half a crash leaves behind and a result is the answer to it, and
-        :func:`reconcile` pairs them **by lease alone** to decide which opportunities were lost.
-        A result whose lease names no dispense therefore marked its position done and skipped,
-        while ``reconcile`` went on emitting a ``broker_abort`` for the dispense nothing now
-        answered: one queue position holding a scored outcome and a crash at the same time, in a
-        record a resume considered complete.
-
-        So the pairing is checked here, on the five fields the two halves are written from at
-        once — the lease, and the position, env, task index and ``seq`` that must be the same on
-        both sides because one call wrote them. A result that answers a dispense already answered
-        is refused for the same reason, and so is a second result for a position already done: a
-        position is one opportunity, and two outcomes for it cannot both be the one a mean
-        averages.
-
-        **A dispense with no result is not an error**, and must not become one: that is exactly
-        the abandoned dispense a resume exists to replay, and the row ``reconcile`` reports for
-        the crash that left it.
-
-        Same scope as the exact wire types beside it: the provenance directory is the harness's
-        own, so what reaches here is corruption, a mixed writer, or a hand-edited recovery. That
-        is what makes failing closed cheap rather than what makes it unnecessary."""
-        match = dispensed.get(row.lease)
-        if match is None:
-            raise ValueError(
-                f"{self.results_path} holds a result row under lease {row.lease!r}, which no "
-                f"dispense in {self.dispenses_path.name} records; a result is paired with a "
-                "dispense by its lease, so this row retires a queue position while the dispense "
-                "it should have answered reconciles as a crash, leaving one opportunity holding "
-                "both a score and a broker abort"
-            )
-        recorded = (match[0], match[1], match[2], match[3])
-        produced = (row.position, row.env, row.task_idx, row.seq)
-        if recorded != produced:
-            raise ValueError(
-                f"{self.results_path} holds a result row under lease {row.lease!r} naming "
-                f"(position, env, task, seq) {produced!r}, but the dispense it answers records "
-                f"{recorded!r}; one call wrote both halves, so a record whose halves disagree "
-                "cannot say which opportunity this outcome belongs to"
-            )
-        if row.lease in answered:
-            raise ValueError(
-                f"{self.results_path} holds two result rows under lease {row.lease!r} (seq "
-                f"{answered[row.lease]} and {row.seq}); one dispense is answered once, and a "
-                "record holding two answers for it has an outcome nothing can attribute"
-            )
-        if row.position in self._done_positions:
-            raise ValueError(
-                f"{self.results_path} holds two result rows for queue position {row.position}; a "
-                "position is one opportunity, so a mean over this record would average two "
-                "outcomes for a task that was played once"
-            )
-        answered[row.lease] = row.seq
+        # The delivery log, joined to the rows it claims to describe. A resume never opened this
+        # file, so a duplicated or orphaned line survived into the run that continued the record
+        # and was counted as a delivery for a task it did not describe — in the one log whose
+        # silence is read as a delivery that failed (see :func:`_require_exposures_join`).
+        _require_exposures_join(self.prov_dir, results)
 
     def _write_claim(self, payload: Mapping[str, Any]) -> None:
         """Publish the claim file holding ``payload``, or raise ``FileExistsError`` if one is
@@ -4869,12 +5015,22 @@ class TaskStream:
                 ref = self._queue[position]
 
             # Everything below is outside the registry lock, and none of it has been exposed
-            # yet: if a span refuses to open, the episode never starts and the position is
-            # still owed. Spans first, so nothing needs cleaning up when one fails.
+            # yet: if a span refuses to open, the episode never starts and the position is still
+            # owed. Spans first, and every exit from here to the durable dispense unwinds them:
+            # they were opened for a task that is not going to be handed out, and an extension
+            # that took a resource in `begin` has to be told so (see :meth:`_unwind_spans`).
             spans, dispensed_extensions = await self._begin_spans(ref)
-            episode = await ServedEpisode.open_env(
-                self._env_for(ref.env), env_name=ref.env, task=ref.task_idx
-            )
+            try:
+                episode = await ServedEpisode.open_env(
+                    self._env_for(ref.env), env_name=ref.env, task=ref.task_idx
+                )
+            except BaseException:
+                # The factory or the session refused, so no episode exists to release and the
+                # spans are the only thing this call has taken. Building the env used to sit
+                # outside every handler, so this was the one pre-dispense exit that dropped them
+                # all rather than closing them.
+                await self._unwind_spans(spans)
+                raise
             try:
                 # The episode's own snapshot, taken when it was opened and the same for every
                 # reader (see :meth:`ServedEpisode.describe`). That is what makes the check below
@@ -4903,6 +5059,7 @@ class TaskStream:
                 # re-raised below, and one the env's close merely raised would otherwise replace
                 # the refusal every caller of `get_task` is told to expect.
                 cancellation = _Cancellation()
+                await self._unwind_spans(spans)
                 try:
                     await episode.close()
                 except BaseException as exc:  # noqa: BLE001 — teardown must not mask the failure
@@ -5007,8 +5164,11 @@ class TaskStream:
             if undispensed is not None:
                 # Same shape as the manifest refusal above: this close is teardown, and its
                 # failure — cancellation included — may not stand in for the answer the caller
-                # is owed just below.
+                # is owed just below. The spans go with it, for the same reason: this is a task
+                # nobody was handed, so there is no outcome to close them against and no reason
+                # to leave whatever `begin` took held (see :meth:`_unwind_spans`).
                 cancellation = _Cancellation()
+                await self._unwind_spans(spans)
                 try:
                     await undispensed.close()
                 except BaseException as exc:  # noqa: BLE001 — teardown of a task nobody ever saw
@@ -6437,12 +6597,54 @@ class TaskStream:
                 span = await self._with_timeout(extension.begin(ref))
                 observed = _strict_json_object(span.dispensed)
             except BaseException as exc:  # noqa: BLE001 — reported, never swallowed
+                # The spans this loop already opened are closed before the refusal leaves, newest
+                # first: they were opened for a dispense that is not going to happen, and dropping
+                # them left every earlier extension holding whatever `begin` took (see
+                # :meth:`_unwind_spans`).
+                await self._unwind_spans(spans)
                 if _must_propagate(exc, cancellation):
                     raise
                 raise refused(namespace, exc) from exc
             spans[namespace] = span
             dispensed[namespace] = observed
         return spans, dispensed
+
+    async def _unwind_spans(self, spans: Mapping[str, ProvenanceSpan]) -> None:
+        """Close spans opened for a dispense that never happened, newest first.
+
+        Every path from :meth:`_begin_spans` to the durable dispense can still refuse the task:
+        a sibling extension whose own ``begin`` raises, an env the factory cannot build, a
+        manifest this stream will not serve, a stream that closed inside the window. The spans
+        already open for that task were dropped on the floor — the map went out of scope and the
+        extensions were never told — so an extension that took a real resource in ``begin`` kept
+        holding it, once per refused dispense, for the life of the run.
+
+        There is no outcome to close them against, so this is not :meth:`_finalize_spans` with a
+        fabricated closure: it calls the optional ``undispensed`` hook (see
+        :class:`ProvenanceSpan`) and nothing else, and an extension that has nothing to undo does
+        not define one.
+
+        **Reverse order**, because opening is ordered and an extension may reasonably assume the
+        one before it is still open while it is: unwinding forwards would tear down a
+        predecessor while its successor is still live.
+
+        Nothing here may raise. This runs while the refusal that caused it is on its way to the
+        caller, and a teardown failure that replaced it would answer ``get_task`` with an
+        extension's exception in place of the :class:`ProvenanceError` every caller is told to
+        expect. A cancellation aimed at *this* call still propagates, for the reason it does
+        everywhere else in this module."""
+        cancellation = _Cancellation()
+        for span in reversed(list(spans.values())):
+            hook = getattr(span, "undispensed", None)
+            if hook is None:
+                continue
+            try:
+                closing = hook()
+                if inspect.isawaitable(closing):
+                    await self._with_timeout(closing)
+            except BaseException as exc:  # noqa: BLE001 — may not replace the caller's refusal
+                if _must_propagate(exc, cancellation):
+                    raise
 
     async def _finalize_spans(
         self, live: _Live, closure: Closure, score: Optional[Score]
