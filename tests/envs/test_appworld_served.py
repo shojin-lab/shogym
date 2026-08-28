@@ -1375,36 +1375,50 @@ async def test_the_terminal_row_reaches_the_trace_after_an_ordinary_execute(
 # ----- the matched pair, through a stream -----
 
 
-async def test_a_row_is_refused_when_the_env_disagrees_with_the_name_it_is_filed_under(
+async def test_the_identity_a_row_is_filed_under_carries_what_this_env_said_it_was(
     tmp_path: Path,
 ) -> None:
-    """The identity has to be the env's, not a string the caller remembered.
+    """The env's half of the identity is the env's own, and the caller's half is never parsed.
 
-    A caller supplies a name and the stream compares it against other strings on disk, which makes
-    a resume safe against a changed *caller* and does nothing about a caller whose string stopped
-    describing its env: a run relaunched under a different pulse with the same remembered name was
-    accepted, and its rows are incomparable in exactly the way the name exists to prevent. The env
-    publishes what produced every row, so the row is checked against the name it is being filed
-    under, at the moment it is written."""
+    The check used to be containment: this env's digest had to occur somewhere inside the caller's
+    string, which is not a comparison of anything. A name with unrelated text around a digest
+    passed and was stamped on a scored row, and a name composing several fields could match by
+    accident. What a record is filed under is a record now: the caller's opaque name, and beside
+    it what each env in the queue said about itself, read off the env at construction under the
+    item the env declares (`identity_feedback_name`, which this env sets and answers to).
+
+    So the value reaches the ownership claim before the first task is dispensed rather than
+    waiting for a row to publish one, and a caller may call itself whatever it likes without the
+    record losing track of which configuration produced its rows. What a resume is held to is that
+    member, which is the test below."""
     from shogym.serve.stream import Information, TaskRef, TaskStream
 
     stream = TaskStream(
         shogym.make,
         [TaskRef("appworld", TASK)],
-        prov_dir=tmp_path / "mismatched",
+        prov_dir=tmp_path / "named",
         feedback=Information(),
         identity="a name this env never produced",
     )
-    with pytest.raises((ValueError, RuntimeError)) as refused:
-        async with stream:
-            await stream.get_task()
-            await stream.dispatch("submit", {})
-    # The seal fails with the reason, and the stream stops rather than going on to serve the rest
-    # of its queue under a name its env does not answer to.
-    said = str(refused.value)
-    assert "the environment says" in said
-    # Whatever the row says, it is not a score: the seal did not complete.
-    assert all(row.score is None for row in stream.results)
+    async with stream:
+        # Read while the claim is held, and before any row exists: this is the window a run killed
+        # early leaves behind, and it used to hold nothing but the caller's own string.
+        claim = json.loads((tmp_path / "named" / "claim.json").read_text())
+        await stream.get_task()
+        await stream.dispatch("submit", {})
+
+    identity = claim["run_identity"]
+    assert identity["caller"] == "a name this env never produced"
+    published = [
+        item["value"]
+        for row in stream.results
+        for item in row.observed
+        if item.get("name") == "config_digest"
+    ]
+    # What the claim recorded before the first task is what the env went on to publish on the row.
+    assert identity["envs"] == {"appworld": published[0]}
+    # And the episode scored: an env that says what it is does not need its caller to repeat it.
+    assert [row.score is not None for row in stream.results] == [True]
 
 
 async def test_a_resume_is_refused_under_a_changed_draw_and_under_a_changed_deadline(

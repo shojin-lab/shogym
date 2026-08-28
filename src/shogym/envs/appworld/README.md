@@ -605,6 +605,15 @@ process is still there, which is the same question and the same evidence the con
 asks. An episode can legitimately run for hours; a directory nobody has touched is not evidence
 that anybody left.
 
+**Claimed before it is created, and forgotten only once it is gone.** Every tree this port
+generates is claimed first, including the copy handed to the grader, which does not exist until
+finalization makes it: a tree the control plane has never heard of is one a sweep deliberately
+refuses to guess about, so a crash between a copy and its teardown used to leave a directory that
+was not waiting to be swept but permanently invisible. In the other direction, a teardown that
+could not walk a tree, or removed only part of one, says the episode ended and keeps the records:
+they are dropped when the root is confirmed absent, and not because a removal that ignores its
+own errors returned.
+
 **The resolver a world reads says nothing about the host.** Docker writes one from the host's or
 the daemon's configuration even under `--network none`, naming a nameserver and saying where it
 came from. There is nothing to resolve in here, so a fixed file is mounted over it.
@@ -624,6 +633,23 @@ that timed out is still running and its answer still arrives, into the stream th
 reading. An answer whose identifier is not the one a call sent is discarded, and a call that
 stopped waiting poisons its worker outright, because a world with a command still running in it
 is not a world worth reusing.
+
+**And a shape, per command.** A spawn is answered by a startup frame and a command by an answer,
+and a frame carrying the other one is a framing failure rather than a surprise in the caller. The
+deadline covers the request as well as the answer: a worker that has stopped reading its pipe is
+the same wait as one that never replies, and a blocking write into a full pipe is a wait no
+timeout above it can end.
+
+**Nothing the world writes is read as an instruction.** The save record the world leaves beside
+its databases says which block it had finished and how long each log it wrote was, which is what
+tells a save that finished from one that was interrupted mid-sequence — the bytes cannot, because
+an interrupted save leaves every filename and a syntactically perfect tail. It is written by the
+process that runs agent-authored code, so what it establishes is completeness against an
+interruption rather than against an adversary, and it is read that way: the names walked are the
+served task's own input logs, read off a tree no episode can reach, and the record is consulted
+by those names and never iterated. A key that is not one plain `.jsonl` basename refuses the
+episode, the record is read through a handle under a size and entry cap of its own, and no path
+outside the stopped snapshot is ever built from anything it says.
 
 **The image.** Digest-pinned base (`python:3.12-slim-bookworm`), `appworld` version-pinned to the
 release this port reproduces, the app sources the wheel ships packed unpacked at build time, and
@@ -682,20 +708,16 @@ rather than the env's, but it is no longer readable from inside an episode.
 ## Gotchas
 
 - **`env.num_tasks` is 318, not 417.** Task indices address the manifest, not the split.
-- **Construction is slow, online, and blocking, and it happens on the serving loop.** Building the
-  runtime, fetching the corpus and copying it into the two derived views is a one-time cost;
-  deriving a task's seeded world costs about a second the first time it is served and nothing
-  after that. A warm construction is still about four seconds, and `TaskStream.get_task()` calls
-  the env factory synchronously, on the loop it serves on. So while one task is being constructed
-  nothing else on that loop runs: a live sibling episode cannot dispatch a call and its deadline
-  cannot fire, and a 50 ms heartbeat was measured arriving 4.689 s late behind one construction.
-  At `max_in_flight=1` that is dead time and nothing worse; above it, the capacity is not what it
-  says. The mechanism that fixes it is the `off_loop_factory=True` keyword on
-  `TaskStream` / `ServedEpisode` from
-  [shojin-lab/shogym#141](https://github.com/shojin-lab/shogym/pull/141), which this port depends
-  on and which is not on this branch, so nothing here passes it yet. A caller constructing an env
-  directly on a loop it is also serving on has the same problem for the same reason and should
-  build it in a thread. Set `APPWORLD_ROOT` to skip the download.
+- **Construction is slow, online, and blocking, and it happens on the caller's own thread.**
+  Building the image, fetching the corpus and copying it into the two derived views is a one-time
+  cost; deriving a task's seeded world costs about a second the first time it is served and
+  nothing after that. What every construction pays is the Docker check and one reading of the
+  corpus, which is about two seconds. `TaskStream` calls its env factory on the loop it dispenses
+  from, so that cost lands on the loop: clearing up after a previous run is kept off it (a thread
+  of its own, bounded, and nothing waits on it), and the rest is not something an env can move.
+  A queue served with `shogym.make` as its factory builds one env per dispensed task, so a runner
+  serving many tasks should hand it a factory that keeps the env it built. Set `APPWORLD_ROOT` to
+  skip the download.
 - **A different `pulse` is a different experiment.** It fixes the convention and the four stored
   slots for every leg. Scores drawn under two pulses are not comparable, and neither the pulse nor
   the payload class appears anywhere else in a run's record, so every row carries a

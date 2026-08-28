@@ -55,7 +55,7 @@ import urllib.request
 from dataclasses import dataclass, field
 from functools import lru_cache
 from pathlib import Path
-from typing import Any, Dict, List, Optional, Sequence, Tuple
+from typing import Any, Dict, List, Mapping, Optional, Sequence, Tuple
 
 from shogym.envs._upstream import _locked
 from shogym.envs.appworld import container
@@ -831,8 +831,8 @@ class _Frames:
             raise EOFError("the appworld worker closed its output")
         self.buffer += chunk
 
-    def frame(self, timeout: float) -> Dict[str, Any]:
-        """The next frame, bounded at both ends.
+    def frame(self, timeout: float, *, expect: Sequence[str]) -> Dict[str, Any]:
+        """The next frame, bounded at both ends and of the shape this command's answer has.
 
         **Both limits are about this process rather than about the worker.** The buffer is a host
         allocation, and the container's memory limit does not reach it: a writer inside the
@@ -871,20 +871,28 @@ class _Frames:
             answer = json.loads(body)
         except ValueError as exc:
             raise FramingError(f"the appworld worker sent a frame that is not JSON: {exc}") from exc
-        # **Shape is part of framing.** Valid JSON of the wrong kind used to travel straight into
-        # the caller, which then did `.get` on a list or indexed `output` on an object that had
-        # none: an `AttributeError` or a `KeyError` out of the transport, with the worker neither
-        # poisoned nor stopped and the spawn path skipping its own release. The writer is reachable
-        # from inside the interpreter that runs agent code, so an answer that is not an answer is
-        # exactly the thing this boundary is for.
+        # **Shape is part of framing, and the shape is this command's.** Valid JSON of the wrong
+        # kind used to travel straight into the caller, which then did `.get` on a list or indexed
+        # `output` on an object that had none: an `AttributeError` or a `KeyError` out of the
+        # transport, with the worker neither poisoned nor stopped and the spawn path skipping its
+        # own release.
+        #
+        # **Per command, because "one of three keys" is not a shape.** A startup frame carrying
+        # only `ready` satisfied that test, so a `ready` arriving in answer to an `execute` left
+        # the protected read loop and raised `KeyError('output')` outside every handler here,
+        # after the worker's lock had been released and while the command it belonged to might
+        # still have been running. What a spawn expects and what a call expects are two different
+        # frames, so each one says which it is waiting for. The writer is reachable from inside
+        # the interpreter that runs agent code, so an answer that is not an answer to what was
+        # asked is exactly the thing this boundary is for.
         if not isinstance(answer, dict):
             raise FramingError(
                 f"the appworld worker sent a {type(answer).__name__} where a frame belongs"
             )
-        if not ({"output", "error", "ready"} & set(answer)):
+        if not (set(expect) & set(answer)):
             raise FramingError(
-                f"the appworld worker sent a frame carrying none of output, error or ready: "
-                f"{sorted(answer)[:8]}"
+                f"the appworld worker sent a frame carrying none of "
+                f"{', '.join(expect)}: {sorted(answer)[:8]}"
             )
         return answer
 
@@ -906,12 +914,57 @@ def _close_descriptor(descriptor: Optional[int]) -> None:
         pass
 
 
-def _send(process: subprocess.Popen, payload: Dict[str, Any]) -> None:
+#: The two frames this protocol has. A spawn is answered by a startup frame and a command by an
+#: answer; nothing on this pipe is ever both, so neither is ever accepted where the other belongs.
+_READY_FRAME: Tuple[str, ...] = ("ready",)
+_ANSWER_FRAME: Tuple[str, ...] = ("output", "error")
+
+#: The most one request may be. Everything this sends is a short command or one block of the
+#: agent's code, and a block arrives over the wire under the serve layer's own limits, so this is
+#: an upper bound rather than a budget anything spends. It exists because the check below is a
+#: bound on *waiting*: a request larger than the pipe's capacity cannot be written in one go, and
+#: a refusal is a better answer than a partial write nobody can take back.
+_MAX_REQUEST_BYTES = 16 * 1024 * 1024
+
+
+def _send(process: subprocess.Popen, payload: Dict[str, Any], *, deadline: float) -> None:
+    """Write one frame, under the same deadline the answer is read under.
+
+    **The write is inside the bound, and it was not.** ``stdin.write`` and ``flush`` are blocking
+    calls into a pipe with a finite buffer, and the worker is the only reader. A worker that has
+    stopped reading — wedged in a native call, stopped by a signal, running agent code that never
+    returns — leaves a request bigger than the remaining pipe capacity blocking in the host's
+    ``write`` for ever, and the deadline was not consulted until the first read afterwards. So a
+    call that promised to time out did not, and neither the poison nor the removal that follows a
+    timeout ever ran.
+
+    The descriptor is put in non-blocking mode and written through ``select``, so the wait is on
+    the deadline rather than on the reader. Every write to this pipe goes through here, so nothing
+    else can be surprised by that mode."""
     assert process.stdin is not None
     encoded = json.dumps(payload).encode()
-    process.stdin.write(b"%d\n" % len(encoded))
-    process.stdin.write(encoded)
-    process.stdin.flush()
+    if len(encoded) > _MAX_REQUEST_BYTES:
+        # Refused before a byte is written, so the stream is still in position and the worker is
+        # still usable: this is a request this process declined to make, not a protocol that
+        # broke. A partial write is the other thing entirely, and it poisons.
+        raise WorkerError(
+            f"a {len(encoded)} byte request is more than the {_MAX_REQUEST_BYTES} this writes"
+        )
+    fd = process.stdin.fileno()
+    os.set_blocking(fd, False)
+    pending = memoryview(b"%d\n" % len(encoded) + encoded)
+    while pending:
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            raise TimeoutError("the appworld worker did not read its request in time")
+        _, ready, _ = select.select([], [fd], [], remaining)
+        if not ready:
+            raise TimeoutError("the appworld worker did not read its request in time")
+        try:
+            written = os.write(fd, pending)
+        except BlockingIOError:
+            continue
+        pending = pending[written:]
 
 
 def _release(process: subprocess.Popen, name: str) -> None:
@@ -1052,7 +1105,7 @@ class Worker:
         assert process.stdout is not None
         frames = _Frames(process.stdout.fileno())
         try:
-            opening = frames.frame(_SPAWN_TIMEOUT_SECONDS)
+            opening = frames.frame(_SPAWN_TIMEOUT_SECONDS, expect=_READY_FRAME)
         except (TimeoutError, EOFError, ValueError, FramingError) as exc:
             # The container first, the local process and its pipes whatever that did. Removal can
             # raise on a control timeout, and everything after it used to be skipped: no worker
@@ -1136,9 +1189,15 @@ class Worker:
             identifier = self.counter
             deadline = time.monotonic() + _CALL_TIMEOUT_SECONDS
             try:
-                _send(self.process, {"id": identifier, "command": command, "body": body})
+                _send(
+                    self.process,
+                    {"id": identifier, "command": command, "body": body},
+                    deadline=deadline,
+                )
                 while True:
-                    answer = self.frames.frame(max(0.0, deadline - time.monotonic()))
+                    answer = self.frames.frame(
+                        max(0.0, deadline - time.monotonic()), expect=_ANSWER_FRAME
+                    )
                     if answer.get("id") == identifier:
                         break
                     # An answer to a command nobody is waiting for. Only reachable when a worker
@@ -1155,8 +1214,8 @@ class Worker:
                 raise WorkerError(f"the appworld worker container {self.poisoned}") from exc
             except TimeoutError as exc:
                 self.poisoned = (
-                    f"{command!r} did not answer within {_CALL_TIMEOUT_SECONDS:.0f}s and is "
-                    "still running, so no later answer on this pipe can be trusted"
+                    f"{command!r} did not finish within {_CALL_TIMEOUT_SECONDS:.0f}s ({exc}) and "
+                    "is still running, so no later frame on this pipe can be trusted"
                 )
                 # Stopped, not merely disowned. Poisoning the handle stops this process using the
                 # worker; it does nothing about the work, which goes on holding a cpu and a
@@ -1246,12 +1305,15 @@ def _one_shot(
     frames = _Frames(process.stdout.fileno()) if process.stdout is not None else None
     try:
         assert frames is not None
-        _send(process, {"body": body})
-        answer = frames.frame(timeout)
+        # One deadline over the write and the read together, for the reason `_send` gives: a
+        # container that never reads its request is the same wait as one that never answers.
+        deadline = time.monotonic() + timeout
+        _send(process, {"body": body}, deadline=deadline)
+        answer = frames.frame(max(0.0, deadline - time.monotonic()), expect=_ANSWER_FRAME)
     except TimeoutError as exc:
         _release(process, name)
         raise WorkerError(f"{what} did not finish within {timeout:.0f}s; it was killed") from exc
-    except (BrokenPipeError, EOFError, ValueError, FramingError) as exc:
+    except (BrokenPipeError, EOFError, ValueError, FramingError, WorkerError) as exc:
         _release(process, name)
         raise WorkerError(f"{what} failed: {type(exc).__name__}: {exc}") from exc
     else:
@@ -1547,6 +1609,14 @@ _VERIFY_CHUNK = 1 << 20
 #: line longer than this is not a record this port wrote.
 _VERIFY_MAX_RECORD = 8 << 20
 
+#: The manifest's own bounds, which are not the tree's. It is written inside a tree an episode
+#: could fill to a gibibyte, and it is read into the serving process, where the container's memory
+#: limit does not reach: a name and a length for a few dozen logs is a few kilobytes, so sixty-four
+#: is generous and a megabyte would not be. The entry cap bounds the loop that reads it as well as
+#: the allocation.
+_MANIFEST_MAX_BYTES = 64 * 1024
+_MANIFEST_MAX_FILES = 256
+
 
 def verify_snapshot(
     snapshot: Path,
@@ -1572,9 +1642,18 @@ def verify_snapshot(
     controls its own tree, and nothing it can write there improves its grade.
 
     **Bounded and cancellable, like the copy before it.** A permitted tree may approach a
-    gibibyte, so nothing here reads a file whole: each log is streamed in chunks with a byte
-    budget and a record cap, the deadline and the abandon flag are checked between chunks, and a
-    name the manifest does not list is not opened at all."""
+    gibibyte, so nothing here reads a file whole: the manifest is read through a handle under a
+    cap of its own, each log is streamed in chunks with a byte budget and a record cap, and the
+    deadline and the abandon flag are checked between chunks.
+
+    **The manifest names nothing; it only answers about names the host already had.** It is
+    written inside the tree the episode could write, so every key in it is text an episode chose.
+    What is walked is the trusted set — the basenames of the served task's own input logs, read
+    off a tree no episode can reach — and the manifest is consulted by those names and never
+    iterated. A key that is not a plain ``.jsonl`` basename refuses the episode rather than being
+    skipped, because a manifest naming ``../`` or an absolute path is not a save record with an
+    extra field in it; and a name the trusted set lacks is never joined to a path, so no path
+    outside the stopped snapshot is ever built, let alone opened."""
     began = time.monotonic()
     dbs = snapshot / "tasks" / task_id / "dbs"
     if not dbs.is_dir():
@@ -1582,47 +1661,135 @@ def verify_snapshot(
             f"the episode's snapshot has no databases at tasks/{task_id}/dbs, so what it "
             "persisted is not a world to grade"
         )
-    recorded = dbs.parent / _SAVE_MANIFEST
-    try:
-        manifest = json.loads(recorded.read_text(errors="replace")[:_VERIFY_CHUNK])
-    except (OSError, ValueError) as exc:
-        raise SnapshotError(
-            f"the episode's snapshot carries no record of the save that made it ({exc}); a save "
-            "that finished writes one, so this did not finish"
-        ) from exc
-    if not isinstance(manifest, dict) or not isinstance(manifest.get("files"), dict):
-        raise SnapshotError("the episode's snapshot carries a save record of the wrong shape")
+    manifest = _save_record(dbs.parent / _SAVE_MANIFEST, began=began, stop=stop)
     if int(manifest.get("block", -1)) != int(blocks):
         raise SnapshotError(
             f"the episode's snapshot records the save after block {manifest.get('block')!r} while "
             f"the host ran {blocks}; the save for the last block did not finish"
         )
-    wanted = {path.name for path in expected.iterdir() if path.suffix == ".jsonl"}
-    listed = {str(name): int(size) for name, size in manifest["files"].items()}
-    missing = sorted(wanted - set(listed))
+    listed = _save_lengths(manifest["files"])
+    wanted = sorted(path.name for path in expected.iterdir() if path.suffix == ".jsonl")
+    missing = [name for name in wanted if name not in listed]
     if missing:
         raise SnapshotError(
             f"the episode's snapshot is missing {', '.join(missing)}; upstream's saver clears its "
             "destination and writes the logs in sequence, so this is half of a save"
         )
-    for name, size in sorted(listed.items()):
+    for name in wanted:
         if stop is not None and stop.is_set():
             raise SnapshotError("the snapshot check was abandoned before it finished")
         if time.monotonic() - began > _SNAPSHOT_SECONDS:
             raise SnapshotError(
                 f"checking the episode's snapshot took longer than {_SNAPSHOT_SECONDS:.0f}s"
             )
+        # `name` came from the served tree rather than from the manifest, and it is one path
+        # component: this join cannot leave `dbs`, whatever the manifest said.
         path = dbs / name
         try:
-            actual = path.stat().st_size
+            status = path.lstat()
         except OSError as exc:
             raise SnapshotError(f"the episode's snapshot is missing {name}: {exc}") from exc
-        if actual != size:
+        if not stat.S_ISREG(status.st_mode):
+            # Unreachable through `snapshot_outputs`, which refuses a tree holding anything else,
+            # and asserted here anyway: what follows opens this path and reads it to the end, and
+            # a device or a fifo is a read with no bound that a deadline between chunks cannot
+            # reach, because the first one never returns.
             raise SnapshotError(
-                f"the episode's snapshot has {name} at {actual} bytes where the save that "
-                f"produced it recorded {size}; the save did not finish"
+                f"the episode's snapshot has {name} as something other than a plain file, which "
+                "is not a database log and is not a thing this reads"
+            )
+        if status.st_size != listed[name]:
+            raise SnapshotError(
+                f"the episode's snapshot has {name} at {status.st_size} bytes where the save "
+                f"that produced it recorded {listed[name]}; the save did not finish"
             )
         _verify_records(path, began=began, stop=stop)
+
+
+def _save_record(
+    recorded: Path, *, began: float, stop: "Optional[threading.Event]"
+) -> Dict[str, Any]:
+    """Read the save record, under a cap of its own and with the same clock as everything else.
+
+    ``read_text()[:cap]`` reads the file and *then* takes the slice, so an episode that left a
+    manifest approaching the tree's own gibibyte had that gibibyte allocated and decoded in the
+    serving process before a single bound was consulted. The container's memory limit does not
+    reach a host allocation, and cancelling the ``to_thread`` await does not interrupt one. So the
+    handle is opened and at most a cap and one byte are read, in chunks, with the deadline and the
+    abandon flag read between them; the extra byte is what tells an oversized manifest from one
+    that merely fills the cap."""
+    blocks: List[bytes] = []
+    seen = 0
+    try:
+        with recorded.open("rb") as handle:
+            while seen <= _MANIFEST_MAX_BYTES:
+                if stop is not None and stop.is_set():
+                    raise SnapshotError("the snapshot check was abandoned before it finished")
+                if time.monotonic() - began > _SNAPSHOT_SECONDS:
+                    raise SnapshotError(
+                        f"checking the episode's snapshot took longer than "
+                        f"{_SNAPSHOT_SECONDS:.0f}s"
+                    )
+                block = handle.read(min(_VERIFY_CHUNK, _MANIFEST_MAX_BYTES + 1 - seen))
+                if not block:
+                    break
+                seen += len(block)
+                blocks.append(block)
+    except OSError as exc:
+        raise SnapshotError(
+            f"the episode's snapshot carries no record of the save that made it ({exc}); a save "
+            "that finished writes one, so this did not finish"
+        ) from exc
+    if seen > _MANIFEST_MAX_BYTES:
+        raise SnapshotError(
+            f"the episode's snapshot carries a save record of more than {_MANIFEST_MAX_BYTES} "
+            "bytes, which is not a record this port wrote"
+        )
+    try:
+        manifest = json.loads(b"".join(blocks).decode(errors="replace"))
+    except ValueError as exc:
+        raise SnapshotError(
+            f"the episode's snapshot carries no record of the save that made it ({exc}); a save "
+            "that finished writes one, so this did not finish"
+        ) from exc
+    if not isinstance(manifest, dict) or not isinstance(manifest.get("files"), dict):
+        raise SnapshotError("the episode's snapshot carries a save record of the wrong shape")
+    return manifest
+
+
+def _save_lengths(files: Mapping[str, Any]) -> Dict[str, int]:
+    """The lengths a save record claims, keyed by name, or a refusal.
+
+    Every key is proved to be one plain ``.jsonl`` basename here, and that is the whole of what
+    this port will accept in it. Nothing downstream joins one of these names to a path — the walk
+    uses the served tree's own names — so this is not what stops the escape; what it stops is the
+    quieter thing, which is a save record that says something this port's saver would never write
+    being read as a save record with an extra entry."""
+    if len(files) > _MANIFEST_MAX_FILES:
+        raise SnapshotError(
+            f"the episode's snapshot records {len(files)} files, and no world this port serves "
+            f"writes more than {_MANIFEST_MAX_FILES} database logs"
+        )
+    lengths: Dict[str, int] = {}
+    for name, size in files.items():
+        name = str(name)
+        if (
+            name != os.path.basename(name)
+            or name in (".", "..", "")
+            or not name.endswith(".jsonl")
+            or os.path.isabs(name)
+        ):
+            raise SnapshotError(
+                f"the episode's snapshot records a saved file as {name!r}, which is not the name "
+                "of a database log; a save record names the logs it wrote and nothing else"
+            )
+        try:
+            lengths[name] = int(size)
+        except (TypeError, ValueError) as exc:
+            raise SnapshotError(
+                f"the episode's snapshot records {name} at {size!r}, which is not a length"
+            ) from exc
+    return lengths
 
 
 def _verify_records(path: Path, *, began: float, stop: "Optional[threading.Event]") -> None:
