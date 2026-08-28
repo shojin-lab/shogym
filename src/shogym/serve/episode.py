@@ -497,6 +497,20 @@ class _EnvClose:
         else:
             self._outcome.set_exception(error)
 
+    async def closed_by(self, timeout: Optional[float] = None) -> None:
+        """Close the env wherever it belongs, and tell this caller what that did.
+
+        The caller's loop when the caller built it there, this lifecycle's loop when this
+        lifecycle built it. Setup cleanup used to call :meth:`here` on both, which runs
+        ``env.close()`` on whatever loop is asking: a flagged env that had bound its constructor
+        loop was closed on the caller's, which is the one thing building it off that loop was
+        meant to make impossible."""
+        if self._owner is not None:
+            await self.here()
+            return
+        self.close_env()
+        await self.joined(timeout)
+
     async def here(self) -> None:
         """Close on the caller's loop, which is where a caller-built env belongs.
 
@@ -549,10 +563,18 @@ class _EnvClose:
         while not owner.is_closed():
             if self._outcome.done():
                 return
-            if not posted and self._claimed:
-                # A caller took it: theirs to finish, and this stops watching once it has.
-                await self._joined_here()
+            if not self._lifecycle.running:
+                # This loop is being stopped. Watching from a task on a loop that is going away
+                # is watching nothing, and a task still parked when it goes is a diagnostic at
+                # interpreter exit rather than a fact anyone can act on. `_abandoned` has already
+                # told every joiner what happened.
                 return
+            if not posted and self._claimed:
+                # A caller took it. Theirs to finish, and this keeps watching rather than
+                # waiting: a close its loop never finishes because that loop closed is a joiner
+                # who would otherwise wait for ever, and the branch below is the one that says so.
+                await asyncio.sleep(0.01)
+                continue
             if not posted:
                 posted = self._post_to(owner)
             await asyncio.sleep(0.01)
@@ -583,10 +605,6 @@ class _EnvClose:
         except RuntimeError:
             return False
         return True
-
-    async def _joined_here(self) -> None:
-        with contextlib.suppress(BaseException):
-            await asyncio.wrap_future(self._outcome)
 
     async def _run(self, *, warn_on_failure: bool = False, orphaned: bool = False) -> None:
         self.orphaned = orphaned
@@ -817,7 +835,9 @@ def _discard_when_built(
 
 
 def _discarded(
-    lifecycle: "_Lifecycle", building: "Optional[concurrent.futures.Future[Any]]"
+    lifecycle: "_Lifecycle",
+    building: "Optional[concurrent.futures.Future[Any]]",
+    context: "Optional[contextvars.Context]" = None,
 ) -> "concurrent.futures.Future[None]":
     """Close whatever a build hands back that nobody is going to take, and say when that is done.
 
@@ -831,18 +851,29 @@ def _discarded(
     # Captured here, before the callback below runs: that callback fires in whichever thread
     # finished the build, long after the caller's `Context.run` has exited, so a close scheduled
     # from it would otherwise release a tenant-scoped resource under no tenant at all.
-    context = contextvars.copy_context()
+    closing_context = context if context is not None else contextvars.copy_context()
 
     def discard(finished: "concurrent.futures.Future[Any]") -> None:
         if finished.cancelled() or finished.exception() is not None:
             done.set_result(None)
             return
-        cleanup = _EnvClose(finished.result(), lifecycle, None, context)
+        cleanup = _EnvClose(finished.result(), lifecycle, None, closing_context)
         closing = cleanup.close_env()
         closing.add_done_callback(lambda _f: done.set_result(None))
 
     building.add_done_callback(discard)
     return done
+
+
+def _discarded_env(
+    lifecycle: "_Lifecycle", env: Any, context: "Optional[contextvars.Context]" = None
+) -> "concurrent.futures.Future[None]":
+    """Close an env that was built and then never handed to an episode, and say when that is
+    done. The future is what a lifecycle is stopped behind."""
+    cleanup = _EnvClose(
+        env, lifecycle, None, context if context is not None else contextvars.copy_context()
+    )
+    return cleanup.close_env()
 
 
 def _close_and_stop(lifecycle: "_Lifecycle", env: Any) -> None:
@@ -1006,6 +1037,9 @@ class ServedEpisode:
         # The one deadline the whole teardown shares: the release and the env close behind it are
         # two halves of one operation and get one bound between them (see `_teardown_budget`).
         self._teardown_deadline: Optional[float] = None
+        # Whether the env close and this lifecycle's shutdown have been handed over. Once, and
+        # never in front of a finalization that is still writing its verdict (`_arrange_teardown`).
+        self._teardown_arranged = False
         # The one close of this env. Every path that wants the env closed goes through it, so
         # exactly one of them runs `Env.close` and the rest join and are told what it did.
         self._cleanup = (
@@ -1270,7 +1304,7 @@ class ServedEpisode:
                     # keeps loop affinity on the ordinary failure path; the rollback finds it
                     # claimed and stands down.
                     try:
-                        await cleanup.here()
+                        await cleanup.closed_by()
                     except BaseException as closing_failed:  # noqa: BLE001 - noted, not raised
                         # Including a `CancelledError` the env raised: contained, so it neither
                         # replaces the setup failure nor skips the lifecycle shutdown below.
@@ -1286,7 +1320,7 @@ class ServedEpisode:
             else:
                 # No session was ever begun, so there is nothing for the close to follow.
                 try:
-                    await cleanup.here()
+                    await cleanup.closed_by()
                 except BaseException as closing_failed:  # noqa: BLE001 - noted, not raised
                     if isinstance(closing_failed, asyncio.CancelledError) and (
                         _caller_cancelled()
@@ -1484,6 +1518,15 @@ class ServedEpisode:
             args.pop("_session_id", None)
 
             if not self._seal_enabled:
+                if overtakes and self._inflight is not None and not self._inflight.done():
+                    # The deadline, over a call this episode has already accepted. Dispatching a
+                    # second one here put two `_legacy_step` coroutines on the same next index:
+                    # the forced one ended the episode, then the old one landed, appended after
+                    # `end_session`, and set `_terminated` back to False over a row the stream
+                    # had already published. So this ends the episode against the operation that
+                    # is running rather than starting another beside it, and the operation is
+                    # tombstoned when it lands.
+                    return self._forced_legacy_ending(tool_name)
                 # Non-seal env: the single-step path. Owned and awaited outside the lock for the
                 # same reasons the seal-enabled one is, because the defect was never about the
                 # seal: a cancelled caller abandoned an operation that was already in the env.
@@ -1509,7 +1552,7 @@ class ServedEpisode:
                 horizon = self._env.horizon
                 is_horizon = horizon is not None and (self._step + 1) >= horizon
                 dispatch = self._begin_dispatch(
-                    tool_name, args, write_trace=not is_horizon
+                    tool_name, args, write_trace=not is_horizon, seals_on_horizon=is_horizon
                 )
 
         # Phase 2 (lock released). The lock is deliberately not held across an ordinary
@@ -1521,16 +1564,16 @@ class ServedEpisode:
             result, _ = await self._settle(dispatch)
             if not is_horizon:
                 return result
-            async with self._lock:
-                # The world may have been sealed under this call while it ran: the deadline
-                # forces a terminal without waiting for it. Then there is no horizon terminal to
-                # begin, and this caller reads the same tombstone any post-seal call reads.
-                if self._state is not LifecycleState.OPEN or self._terminated:
-                    return self._sealed_tombstone()
-                # Horizon has no submission: finalize with source=horizon and no args, but keep
-                # the real tool name so the terminal trace row is labelled with the call that hit
-                # the budget.
-                finalization = self._begin_finalization("horizon", tool_name, None)
+            # The horizon finalization was begun by the dispatch itself, as part of committing
+            # the step that reached the budget (see `_begin_dispatch`). Deciding it here, in the
+            # caller's continuation, meant a caller cancelled while the horizon-reaching tool was
+            # blocked left the step committed and nobody to seal it: the episode stayed open past
+            # its budget, accepted another call, and closed as an abort rather than a horizon.
+            finalization = self._finalization
+            if finalization is None:
+                # Sealed under this call while it ran: only the deadline's forced terminal does
+                # that, and this caller reads the tombstone any post-seal call reads.
+                return self._sealed_tombstone()
 
         # Await the single in-flight finalization, *shielded* so a cancellation/disconnect of
         # THIS request never cancels the evaluator or re-dispatches it. If we are cancelled the
@@ -1557,6 +1600,21 @@ class ServedEpisode:
         else:
             result = await session.call_tool(tool_name, args, tool_call_id=f"call-{step}")
             content = result.result
+        # Ended while this was in the env: only the deadline's forced terminal does that, and the
+        # row it published is the episode's outcome. Committing now would append after
+        # `end_session`, take an index the terminal already accounted for, and set `_terminated`
+        # back to False over a result the stream has already filed. Checked before anything is
+        # written rather than after, because the write is the damage.
+        if self._terminated:
+            return (
+                CallResult(
+                    content="<episode ended while this call was running>",
+                    meta=build_meta(terminate=True),
+                    terminated=True,
+                    tombstoned=True,
+                ),
+                self._step,
+            )
         # The await completed; commit the step atomically with its Step. Everything from here
         # on is synchronous, so no cancellation point can split them.
         self._step = step
@@ -1637,6 +1695,61 @@ class ServedEpisode:
             except Exception:  # noqa: BLE001 (a previous caller's failure is not this one's)
                 pass
 
+    async def _sealing_on_horizon(
+        self, runner: "Any", tool_name: str
+    ) -> "tuple[CallResult, int]":
+        """Run the dispatch and, in the same operation, seal the episode it just finished.
+
+        The horizon terminal is not a second decision made about a committed step; it is part of
+        committing it. Left to the caller, a cancellation between the two produced an episode
+        whose budget was spent, whose step was in the trajectory, and which nothing had ended:
+        the next call was accepted over it, and a close recorded an abort where the horizon
+        outcome belonged."""
+        outcome = await runner
+        async with self._lock:
+            # The world may have been sealed under this call while it ran: only the deadline's
+            # forced terminal does that, and then there is no horizon terminal to begin.
+            if self._state is LifecycleState.OPEN and not self._terminated:
+                # Horizon has no submission: finalize with source=horizon and no args, but keep
+                # the real tool name so the terminal trace row is labelled with the call that hit
+                # the budget.
+                self._begin_finalization("horizon", tool_name, None)
+        return outcome
+
+    def _forced_legacy_ending(self, tool_name: str) -> CallResult:
+        """End a non-seal episode against the ordinary call it is still running.
+
+        **Called under the lock, and it dispatches nothing.** A non-seal env has no seal
+        transaction to end an episode with, so the deadline's terminal used to be an ordinary
+        call like any other; forced past the queue it became a *second* operation on one
+        episode's next index. This ends the episode where it stands instead: what the trajectory
+        holds is what was committed, the verifier is run over exactly that, and the call still in
+        the env is tombstoned when it lands (see `_legacy_step`)."""
+        self._terminated = True
+        self._preempted = self._inflight_tool
+        feedback = self._env.verify(self._trajectory, self._task, terminated=True)
+        items = [*feedback.inference, *feedback.episode]
+        self._terminal_feedback = [dump_item(item) for item in items]
+        if self._trace_path is not None:
+            append_trace(
+                self._trace_path,
+                step_record(
+                    session_id=self._session_id,
+                    env_name=self._env_name,
+                    task_id=self._task_id,
+                    step=self._step,
+                    tool=tool_name,
+                    feedback=items,
+                    terminated=True,
+                ),
+            )
+        inband = select_inband(items, terminal=True, surface_inference=False)
+        return CallResult(
+            content="<episode ended by the deadline; no further tool calls are dispatched>",
+            meta=build_meta(inband, terminate=True),
+            terminated=True,
+        )
+
     def _begin_dispatch(
         self,
         tool_name: str,
@@ -1644,8 +1757,13 @@ class ServedEpisode:
         *,
         write_trace: bool = True,
         legacy: bool = False,
+        seals_on_horizon: bool = False,
     ) -> "asyncio.Future[tuple[CallResult, int]]":
-        """Start the one ordinary dispatch this episode owns. **Called under the lock.**"""
+        """Start the one ordinary dispatch this episode owns. **Called under the lock.**
+
+        ``seals_on_horizon`` makes the seal part of committing rather than something a caller
+        does afterwards. The call that reaches the budget *is* the terminal step, and a caller
+        that is cancelled while it is still in the env is a caller who never gets to say so."""
         runner = (
             self._legacy_step(tool_name, args)
             if legacy
@@ -1653,6 +1771,8 @@ class ServedEpisode:
                 tool_name, args, terminated=False, write_trace=write_trace
             )
         )
+        if seals_on_horizon:
+            runner = self._sealing_on_horizon(runner, tool_name)
         dispatch: "asyncio.Future[tuple[CallResult, int]]" = asyncio.ensure_future(runner)
         # Read whatever it ends with, so an operation whose caller went away does not leave an
         # unretrieved exception for asyncio to complain about at collection. Nothing acts on it:
@@ -2289,12 +2409,38 @@ class ServedEpisode:
             await self._close_env()
         finally:
             # Arrangement, not waiting, so this runs the same way on a cancellation as on an
-            # ordinary return. `close_env` is idempotent and `stop_when` queues the shutdown
-            # behind the close, so a release still inside a wedged hook and the env close behind
-            # it both finish, and this caller is not held for either.
-            self._cleanup.close_env()
-            self._lifecycle.stop_when(self._cleanup.outcome)
+            # ordinary return.
+            self._arrange_teardown()
 
+
+    def _arrange_teardown(self) -> None:
+        """Hand the env close and this lifecycle's shutdown to the lifecycle, in that order and
+        behind anything that still owns the env.
+
+        **Behind the finalization, when there is one.** A finalization owns the env until it has
+        written its verdict: it is reading the session's state to grade with. Arranged in front of
+        it, a cancelled `close()` released that session and ran `_close` while `finalize` was
+        still using it, and a correct submission came back `correct=false` because the gold answer
+        had been taken out from under it. For a lifecycle-built env it was worse: the loop hosting
+        `finalize` was stopped while `finalize` was on it.
+
+        So a cancelled close does not jump the queue; it joins it. What it arranges is that the
+        teardown happens *after* the finalization, which the finalization's own completion is
+        what triggers, on whichever loop is running it and without a caller having to be there."""
+        if self._teardown_arranged:
+            return
+        finalization = self._finalization
+        if finalization is not None and not finalization.done():
+            self._teardown_arranged = True
+            finalization.add_done_callback(lambda _f: self._teardown_now())
+            return
+        self._teardown_arranged = True
+        self._teardown_now()
+
+    def _teardown_now(self) -> None:
+        """The arrangement itself: one close, then the shutdown behind it."""
+        self._cleanup.close_env()
+        self._lifecycle.stop_when(self._cleanup.outcome)
 
     async def _close_env(self) -> None:
         """Close the env, after this session's release and never beside it.
