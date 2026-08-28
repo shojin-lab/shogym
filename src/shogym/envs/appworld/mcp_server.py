@@ -34,6 +34,8 @@ class Session:
     task_id: str
     supervisor_email: str
     experiment: str
+    #: This episode's own served corpus, removed when the session ends (see `world.derive_view`).
+    view: str = ""
     #: How many blocks of code this episode may run. The step budget the serve layer enforces has
     #: one slot more than this, so that `submit` always has somewhere to go; without a separate
     #: count the spare slot is just another `execute`, and a task's world can be changed after the

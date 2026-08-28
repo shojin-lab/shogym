@@ -364,3 +364,34 @@ def test_a_worker_environment_carries_nothing_it_was_not_given(
     assert "SHOGYM_APPWORLD_PROV" not in scrubbed
     assert scrubbed["HOME"] == str(tmp_path)
     assert set(scrubbed) <= set(adapter._ENV_ALLOW_LIST) | {"HOME", "APPWORLD_CACHE"}
+
+
+def test_two_episodes_of_one_task_do_not_share_their_served_inputs(tmp_path: Path) -> None:
+    """A write through one episode's served view is not in the next episode's starting inputs.
+
+    The end-to-end version of this drives two real episodes; this is the same property at the
+    level that decides it, so it runs everywhere and in a second. The derived corpus was one
+    deterministic global root handed to every worker, writable by the process that runs
+    agent-authored code, with nothing putting it back: episode A's write was still there when
+    episode B started. Two arms of a pair are the same task served at the same time, so the arm
+    meant to differ only in what it was told could also differ in the world it was given.
+    """
+    derived = tmp_path / "derived" / "data"
+    (derived / "tasks" / "abc_1" / "dbs").mkdir(parents=True)
+    (derived / "tasks" / "abc_1" / "dbs" / "gmail.jsonl").write_text("pristine")
+    (derived / "base_dbs").mkdir()
+    (derived / "base_dbs" / "big.jsonl").write_text("shared base")
+
+    first = world.derive_view(derived=derived, view=tmp_path / "a", task_id="abc_1")
+    second = world.derive_view(derived=derived, view=tmp_path / "b", task_id="abc_1")
+    assert first != second
+
+    served = first / "data" / "tasks" / "abc_1" / "dbs" / "gmail.jsonl"
+    served.write_text("written by an earlier episode")
+
+    assert (second / "data" / "tasks" / "abc_1" / "dbs" / "gmail.jsonl").read_text() == "pristine"
+    assert (derived / "tasks" / "abc_1" / "dbs" / "gmail.jsonl").read_text() == "pristine"
+    # The 129 MB of shared databases are named rather than copied, which is what makes a view
+    # cheap enough to build per episode. That sharing is the stated remainder: a write through
+    # this one still reaches the base, and the container is what closes it.
+    assert (first / "data" / "base_dbs").is_symlink()
