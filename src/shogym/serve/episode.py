@@ -426,9 +426,12 @@ def _lifecycle_for(name: str) -> "_Lifecycle":
 
 def _forget_live_lifecycles() -> None:
     """A forked child inherits the set and none of the threads in it."""
-    global _LIVE, _LIVE_LOCK
+    global _LIVE, _LIVE_LOCK, _ENV_CLOSE_LOCK
     _LIVE = set()
     _LIVE_LOCK = threading.Lock()
+    # And this one. A child that inherits it held by a thread that no longer exists blocks in
+    # `_env_close` for ever, which is the same fork hazard the pool had and the same repair.
+    _ENV_CLOSE_LOCK = threading.Lock()
 
 
 _register_atexit = getattr(threading, "_register_atexit", None)
@@ -832,6 +835,29 @@ async def _disposed(
                 )
 
 
+def _closed_when_disposed(
+    disposing: "asyncio.Future[None]",
+    lifecycle: "_Lifecycle",
+    cleanup: "_EnvClose",
+    rollback: "Optional[_SetupRollback]",
+) -> None:
+    """Close the env and stop the lifecycle once the sessions have finished disposing.
+
+    Chained rather than called, because the caller that would have called it is being cancelled.
+    A rollback, when there is one, releases the session first and closes the env after; without
+    one there is no session and the close is the whole of it."""
+
+    def then(_finished: "asyncio.Future[None]") -> None:
+        if rollback is None:
+            cleanup.close_env()
+        lifecycle.stop_when(cleanup.watching())
+
+    if disposing.done():
+        then(disposing)
+    else:
+        disposing.add_done_callback(then)
+
+
 def _noted(carried: BaseException, what: str, failure: BaseException) -> None:
     """Attach a cleanup failure to the failure already on its way out, without replacing it.
 
@@ -1141,6 +1167,9 @@ class ServedEpisode:
         # The one deadline the whole teardown shares: the release and the env close behind it are
         # two halves of one operation and get one bound between them (see `_teardown_budget`).
         self._teardown_deadline: Optional[float] = None
+        # The one clock a terminal transaction answers against: the evaluator and the verifier
+        # share it rather than each getting the whole of it (see `_verify_budget`).
+        self._answer_deadline: Optional[float] = None
         # Whether the env close and this lifecycle's shutdown have been handed over. Once, and
         # never in front of a finalization that is still writing its verdict (`_arrange_teardown`).
         self._teardown_arranged = False
@@ -1405,16 +1434,14 @@ class ServedEpisode:
                 await asyncio.shield(disposing)
             except BaseException as closing_failed:  # noqa: BLE001 - noted, not raised
                 if isinstance(closing_failed, asyncio.CancelledError) and _caller_cancelled():
-                    # Handed back, but only after everything above has an owner: the rollback is
-                    # queued on the lifecycle and is told by the disposal task itself, and the
-                    # close and the shutdown are started here rather than left to a line this
-                    # cancellation is about to skip. Without a rollback there is no session to
-                    # release and nothing else would ever start the close, so the env stayed open
-                    # and its lifecycle stayed alive.
-                    if rollback is None and not handed_over:
-                        cleanup.close_env()
+                    # Handed back, and everything after it is *chained from the disposal* rather
+                    # than started here. Started here, the close ran before the sessions this
+                    # setup opened had finished closing, on both branches: with a rollback,
+                    # because `watching()` starts the close itself; and without one, because this
+                    # was the only line that ever would. `Env.close` releases what the constructor
+                    # made and those clients are still using it, so it goes behind them.
                     if not handed_over:
-                        lifecycle.stop_when(cleanup.watching())
+                        _closed_when_disposed(disposing, lifecycle, cleanup, rollback)
                     raise
                 _noted(setup_failed, "an MCP session", closing_failed)
             if rollback is not None:
@@ -1423,8 +1450,6 @@ class ServedEpisode:
                 # close, and the lifecycle stops behind that. What follows is a wait, not a
                 # decision, and a wait is the one thing a cancellation may take.
                 rollback.sessions_closed()
-                if not handed_over:
-                    lifecycle.stop_when(cleanup.watching())
                 # The sessions above are closed before the env is, because `Env.close` releases
                 # what the *constructor* made and those clients may still be using it. The
                 # rollback is told rather than raced: it waits for this line before it arranges
@@ -1979,6 +2004,12 @@ class ServedEpisode:
             Step(index=step, tool=tool_name, arguments=args, result=content)
         )
         feedback = await self._env_verify(terminated=terminated)
+        if self._terminated or self._state is not LifecycleState.OPEN:
+            # Sealed while this was verifying. The check before the step was not enough: the
+            # verifier is awaited, and the deadline's forced terminal can seal in that gap, so
+            # this caller used to come back holding the forced terminal's own result with
+            # `tombstoned` false, as a second terminal caller over one episode.
+            return self._sealed_tombstone(), self._step
         items = [*feedback.inference, *feedback.episode]
         if self._trace_path is not None and write_trace:
             append_trace(
@@ -2065,6 +2096,8 @@ class ServedEpisode:
     ) -> "asyncio.Future[CallResult]":
         """Atomically seal the episode (OPEN -> SEALED -> FINALIZING), persist the durable
         ``SEALED`` record, and spawn the single finalization task. Called under the lock."""
+        # One clock from here: the evaluator and the verifier both answer inside it.
+        self._start_answer_clock()
         finalization_id = str(uuid7())
         self._finalization_id = finalization_id
         self._finalization_source = source
@@ -2127,7 +2160,7 @@ class ServedEpisode:
                     # long we *await* the verdict before failing closed. The evaluator keeps
                     # running and is drained by `_teardown`.
                     evidence = await asyncio.wait_for(
-                        asyncio.shield(eval_task), timeout=self._finalize_deadline
+                        asyncio.shield(eval_task), timeout=self._verify_budget()
                     )
                 else:
                     evidence = await eval_task
@@ -2233,7 +2266,7 @@ class ServedEpisode:
                 try:
                     feedback = await asyncio.wait_for(
                         self._env_verify(terminated=True, evidence=evidence),
-                        timeout=self._verify_budget(),
+                        timeout=self._scoring_budget(),
                     )
                     items = [*feedback.inference, *feedback.episode]
                 except BaseException as exc:  # noqa: BLE001 (verifier failure => fail closed)
@@ -2464,6 +2497,23 @@ class ServedEpisode:
             functools.partial(self._env.verify, self._trajectory, self._task, **kwargs)
         )
 
+    def _scoring_budget(self) -> float:
+        """What the verifier gets, which is not always what is left of the answer.
+
+        While the answer is still owed, the verifier is inside it and gets what remains of it.
+        Once the deadline has already answered fail-closed, the caller has its result and what
+        the verifier is still doing is labelling the evidence for the record: that belongs to the
+        teardown's bound, not to a promise that has already been kept."""
+        remaining = self._verify_budget()
+        if remaining is None:
+            return self._teardown_budget()
+        return remaining if remaining > 0 else self._teardown_budget()
+
+    def _start_answer_clock(self) -> None:
+        """Start the one clock the whole terminal transaction shares."""
+        if self._finalize_deadline is not None and self._answer_deadline is None:
+            self._answer_deadline = time.monotonic() + self._finalize_deadline
+
     async def _env_call(self, fn: "Callable[..., Any]", *args: Any) -> Any:
         """One synchronous env method, on the loop that owns the env.
 
@@ -2474,15 +2524,25 @@ class ServedEpisode:
         failed on the first dispense. An env the caller built keeps the caller's loop here, where
         this is a direct call and costs nothing."""
         if self._cleanup.owned_by_caller:
-            return fn(*args)
+            # Off the serving loop even here. These are the env's own synchronous hooks, and one
+            # that blocks blocks everything this process is serving; run inline, a `wait_for`
+            # around it could not preempt it either, so a bound over it was not a bound. The
+            # context travels, as it does for every other hook.
+            context = contextvars.copy_context()
+            return await asyncio.to_thread(context.run, fn, *args)
         return await asyncio.wrap_future(self._lifecycle.call(fn, *args))
 
     def _verify_budget(self) -> Optional[float]:
-        """What a verifier gets, when this transaction is running against a clock at all.
+        """What is left of the caller's answer deadline, not another whole one.
 
-        The finalize deadline is the caller's promise about when an answer arrives, and the
-        verifier is inside that promise, not after it."""
-        return self._finalize_deadline
+        The deadline is a promise about when an answer arrives, and the evaluator and the verifier
+        are both inside it. Given the full value each, the promise was worth twice what it said,
+        and a terminal call took the evaluator's share plus the verifier's on top."""
+        if self._finalize_deadline is None:
+            return None
+        if self._answer_deadline is None:
+            return self._finalize_deadline
+        return max(0.0, self._answer_deadline - time.monotonic())
 
     def _teardown_budget(self) -> float:
         """What is left of the one bound this episode's teardown gets, in seconds.
@@ -2704,7 +2764,15 @@ class ServedEpisode:
                 pass
 
     def _teardown_now(self) -> None:
-        """The arrangement itself: one close, then the shutdown behind it."""
+        """The arrangement itself: the release, then one close, then the shutdown behind it.
+
+        The release is issued *here* and not only on the path that awaited it. A cancellation at
+        an earlier await jumped straight to the arrangement with the session still unclaimed, and
+        the base `Env.close` this ends in releases any session it still finds, synchronously, on
+        whichever loop it was posted to: a three-hundred-millisecond hook ran on the serving loop
+        and stopped everything else on it. Claimed first, that close has nothing of this
+        episode's left to do."""
+        self._release()
         self._lifecycle.stop_when(self._cleanup.watching())
 
     async def _close_env(self) -> None:
