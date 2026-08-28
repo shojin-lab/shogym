@@ -29,8 +29,19 @@ before any world exists, and closed.
 ``load_ground_truth=False``, so the answers and the base task's checks are not objects in the
 process that runs agent-authored code, and there is no evaluator here to call. Grading the base
 task happens in a second, short-lived process that never runs agent code (:func:`grade`), reading
-the end state this one flushes to disk. The convention the filing is graded against is never sent
+the end state upstream flushed to disk. The convention the filing is graded against is never sent
 to either: there is no field in the protocol for one and no comparison in this file.
+
+**And no lifecycle fact comes from this process either.** There is no seal, quiesce, read or close
+command. The writer on this process's own socket is reachable from inside the interpreter that
+executes agent-authored Python, so a reply saying "I have stopped", "nothing else is running" or
+"the filing says X" is a reply the episode could have written. The host stops this process's group,
+confirms it is gone by reading the process table itself, and grades the tree on disk. Nothing here
+has to flush a final state, because upstream already did: ``AppWorld.execute`` ends with its own
+save into the episode's output tree and ``initialize`` writes one before any block runs, so an
+episode that ran N blocks is graded on the state after block N and one that ran none is graded on
+its opening state. Work an agent's thread does after its last block is lost rather than scored,
+which is the same rule the block budget already states.
 
 **What it still cannot do is contain an agent.** The code an agent writes runs as this process,
 with this process's filesystem and network. The environment is scrubbed to an allow-list and the
@@ -44,7 +55,7 @@ inside it.
 Usage::
 
     python worker.py serve            # {"root": ..., "token": ...} on stdin
-    python worker.py grade            # {"root": ..., "task_id": ..., "experiment": ...} on stdin
+    python worker.py grade            # {"root", "task_id", "experiment", "filing"} on stdin
     python worker.py install
     python worker.py unpack --bundle <bundle> --into <directory>
 """
@@ -58,7 +69,6 @@ import os
 import random
 import shutil
 import sys
-import threading
 from http.server import BaseHTTPRequestHandler, HTTPServer
 from typing import Any, Dict, List, Optional
 
@@ -75,12 +85,16 @@ from typing import Any, Dict, List, Optional
 TOKEN_HEADER = "X-Shogym-Worker-Token"
 
 
+#: Where the generator's state digest is written, beside the episode's databases. Beside rather
+#: than inside them, because upstream's saver clears that directory on every save.
+RNG_DIGEST_FILE = "rng.digest"
+
+
 class Episode:
-    """The one world this process serves, and the randomness it was handed."""
+    """The one world this process serves."""
 
     def __init__(self) -> None:
         self.world: Any = None
-        self.caller_rng: Any = None
 
     # ----- seeding, before any world exists -----
 
@@ -149,13 +163,13 @@ class Episode:
         """Build the world and report what the agent is allowed to know about it.
 
         ``seed`` is what AppWorld seeds the global generator with when it builds the world's
-        requester, and the caller chooses it from the task alone. The process's own generator
-        state is put aside first and handed back at close, so an episode leaves the randomness
-        where it found it: AppWorld saves databases and not generator state, so a world replayed
-        from its databases alone agrees on its contents and disagrees on its next draw."""
+        requester, and the caller chooses it from the task alone. The process's own generator is
+        this worker's alone, so there is nobody to hand it back to: AppWorld saves databases and
+        not generator state, so a world replayed from its databases alone agrees on its contents
+        and disagrees on its next draw, and the digest recorded beside them is what makes that
+        checkable."""
         from appworld import AppWorld
 
-        self.caller_rng = random.getstate()
         self.world = AppWorld(
             task_id=body["task_id"],
             experiment_name=body["experiment"],
@@ -166,6 +180,7 @@ class Episode:
             load_ground_truth=False,
         )
         task = self.world.task
+        self._record_rng()
         return {
             "instruction": task.instruction,
             "supervisor": dict(task.supervisor),
@@ -173,170 +188,35 @@ class Episode:
         }
 
     def execute(self, body: Dict[str, Any]) -> Dict[str, Any]:
-        """Run one snippet of the agent's code against the world and return what it printed."""
-        return {"output": self.world.execute(str(body["code"]))}
+        """Run one snippet of the agent's code against the world and return what it printed.
 
-    def quiesce(self, body: Dict[str, Any]) -> Dict[str, Any]:
-        """Stop everything this worker started, before the state below it is read, and say what
-        is still running if anything is.
+        **Upstream persists the world at the end of every execution, and that is what is graded.**
+        ``AppWorld.execute`` ends with its own ``_save_state`` into the episode's output tree, and
+        ``initialize`` writes one before any block runs. So the tree on disk is always the world as
+        it stood when the last block finished, and nothing here has to be asked to produce a final
+        one. That matters because this process runs agent-authored code: an answer from it saying
+        "I have flushed" or "I have stopped" is an answer the agent could have written.
 
-        Sealing closes the tool surface; it does not stop work an earlier `execute` left running.
-        A subprocess still writing while :meth:`read` takes its filing and saves the snapshot
-        leaves the two from different moments, and the evaluator then scores a state no single
-        instant of the episode ever had.
+        The generator digest goes to the same tree for the same reason. It is a fact about this
+        interpreter that no file could otherwise carry, and it is a diagnostic rather than a score,
+        but a diagnostic read out of a reply is a diagnostic the episode can choose."""
+        output = self.world.execute(str(body["code"]))
+        self._record_rng()
+        return {"output": output}
 
-        Descendants only. This process is the one being asked, and killing it here would take the
-        snapshot with it, so it stays until the host closes it.
+    def _record_rng(self) -> None:
+        """Write the generator's state digest beside this episode's databases.
 
-        **What this cannot do, it reports rather than implies.** A thread inside this interpreter
-        is not signallable, so an episode that left one running cannot be quiesced at all, only
-        observed; and a process table this cannot read is not an empty process table. Both used to
-        come back as ``stopped: 0``, which is the same answer a clean episode gives. The answer
-        now carries ``quiesced``, which is true only when the group was enumerated, the group is
-        empty, and no thread but this one is alive. :meth:`read` proves separately that the
-        pair it took is one instant, because a thread this cannot stop is exactly the thing that
-        would spoil it."""
-        import os
-        import signal
-        import subprocess
-        import threading
-        import time
-
-        mine = os.getpid()
-        threads = [
-            thread.name
-            for thread in threading.enumerate()
-            if thread is not threading.main_thread() and thread.is_alive()
-        ]
+        Beside rather than inside: upstream's saver owns the ``dbs`` directory and clears it on
+        every save, so a file written in there would last until the next block."""
         try:
-            group = os.getpgid(mine)
-        except (OSError, AttributeError) as failure:
-            return {
-                "stopped": 0,
-                "descendants": [],
-                "threads": threads,
-                "quiesced": False,
-                "note": "this process is not in a readable process group: %s" % failure,
-            }
-
-        def descendants() -> Optional[List[int]]:
-            """Every live process in this worker's group but this one, or ``None`` if the table
-            could not be read.
-
-            ``ps`` runs in a session of its own. It used to inherit this worker's group and so
-            appear in the very listing it was producing, which meant the group was never seen
-            empty: both settle windows ran to their five seconds on every submission, whether or
-            not the episode had left anything behind, and a terminal that would have been prompt
-            paid ten seconds for the privilege.
-
-            Exited-but-unreaped entries are not counted. A process this call killed is in the
-            table until somebody waits on it, and a zombie holds no memory, no descriptors and no
-            ability to write: counting one as unquiesced would report the success of this function
-            as its failure."""
-            try:
-                listing = subprocess.run(
-                    ["ps", "-o", "pid=,pgid=,stat=", "-A"],
-                    capture_output=True,
-                    text=True,
-                    timeout=5,
-                    # Out of the group being enumerated. See above.
-                    start_new_session=True,
-                )
-            except (OSError, subprocess.SubprocessError):
-                return None
-            if listing.returncode != 0:
-                # A `ps` that ran and refused is a table this could not read. Reported as such
-                # rather than as the empty listing it hands back, which is the answer a quiet
-                # group gives.
-                return None
-            found: List[int] = []
-            for line in listing.stdout.splitlines():
-                fields = line.split()
-                if len(fields) >= 3 and fields[1].isdigit() and fields[0].isdigit():
-                    pid, pgid, state = int(fields[0]), int(fields[1]), fields[2]
-                    if pgid == group and pid != mine and not state.startswith("Z"):
-                        found.append(pid)
-            return found
-
-        stopped = 0
-        live = descendants()
-        for how in (signal.SIGTERM, signal.SIGKILL):
-            if not live:
-                break
-            for pid in live:
-                try:
-                    os.kill(pid, how)
-                    stopped += 1
-                except OSError:
-                    pass
-            deadline = time.monotonic() + 5
-            live = descendants()
-            while live and time.monotonic() < deadline:
-                time.sleep(0.02)
-                live = descendants()
-        note = ""
-        if live is None:
-            note = "the process table could not be read, so the group is unknown rather than empty"
-        elif live:
-            note = "%d process(es) outlived SIGKILL: %s" % (len(live), sorted(live))
-        elif threads:
-            note = "thread(s) still running in this interpreter, which cannot be signalled: %s" % (
-                sorted(threads),
-            )
-        return {
-            "stopped": stopped,
-            "descendants": sorted(live or []),
-            "threads": sorted(threads),
-            "quiesced": live is not None and not live and not threads,
-            "note": note,
-        }
-
-    def read(self, body: Dict[str, Any]) -> Dict[str, Any]:
-        """What is in the named project, plus digests of what the world became.
-
-        Read off the models rather than through the APIs: an API read is an agent action, and this
-        is not an agent. It must see what is there, not what an authenticated session is allowed
-        to see.
-
-        The digests are what make "the same task twice is the same world" checkable, one over the
-        world's own end-state databases and one over the global generator's state.
-
-        Call :meth:`quiesce` first. What is read here has to be one instant of the episode, and it
-        is not one instant if something the episode started is still writing underneath it.
-
-        **The pair is proved rather than assumed.** The filing is read off the live models and the
-        snapshot is written from those same models, so anything writing between the two makes the
-        evaluator score a state no instant of the episode had. Quiescence stops processes and
-        cannot stop threads, so the two are bracketed instead: the state is saved and digested,
-        the filing is read, and the state is saved and digested again. Equal digests mean nothing
-        touched any model across the read, which makes the filing and the snapshot the same
-        instant. Unequal digests mean the pair is not one instant, and ``stable`` says so rather
-        than a number quietly being wrong. Saving twice is what the world already does at the end
-        of every ``execute``, over a tree that is tens of kilobytes."""
-        self.world.models.reset_db_home_path()
-        # Flush the end state so the grader, which is a different process, has something to read.
-        # AppWorld writes the *initial* state at startup and nothing after it.
-        self.world._save_state(self.world.output_db_home_path_on_disk)
-        before = _directory_digest(self.world.output_db_home_path_on_disk)
-        filing = _read_filing(self.world.models, body)
-        self.world._save_state(self.world.output_db_home_path_on_disk)
-        after = _directory_digest(self.world.output_db_home_path_on_disk)
-        return {
-            "filing": filing,
-            "world_digest": after,
-            "rng_digest": _digest(repr(random.getstate())),
-            "stable": before == after,
-        }
-
-    def close(self, body: Dict[str, Any]) -> Dict[str, Any]:
-        """Shut the world down and give the process's randomness back to the caller."""
-        if self.world is not None:
-            self.world.close()
-            self.world = None
-        if self.caller_rng is not None:
-            random.setstate(self.caller_rng)
-            self.caller_rng = None
-        return {}
+            beside = os.path.dirname(self.world.output_db_home_path_on_disk)
+            with open(os.path.join(beside, RNG_DIGEST_FILE), "w") as handle:
+                handle.write(_digest(repr(random.getstate())))
+        except Exception:
+            # A diagnostic that cannot be written is a diagnostic that is missing, which the
+            # grader reports as absent. It is not worth failing an episode over.
+            pass
 
 
 # ----- reading and writing the world -----
@@ -486,14 +366,19 @@ def _directory_digest(directory: str) -> str:
 
 
 def build_handler(episode: Episode, token: str, server: List[Any]) -> type:
-    """The request handler: one method per protocol command, and a token on every one of them."""
+    """The request handler: one method per protocol command, and a token on every one of them.
+
+    **There are no lifecycle commands, and that is the point.** ``seal``, ``quiesce``, ``read``
+    and ``close`` are gone: this is the process that runs agent-authored Python, so a reply from
+    it saying "I have stopped", "nothing else is running" or "the filing says X" is a reply the
+    episode could have written. The host stops this process's group, confirms it is gone by
+    reading the process table itself, and grades the tree upstream already wrote (see
+    :meth:`Episode.execute`). What is left here is the two commands that have to come from the
+    world because only the world can answer them."""
     commands = {
         "/seed": episode.seed,
         "/open": episode.open,
         "/execute": episode.execute,
-        "/quiesce": episode.quiesce,
-        "/read": episode.read,
-        "/close": episode.close,
     }
 
     class Handler(BaseHTTPRequestHandler):
@@ -515,10 +400,6 @@ def build_handler(episode: Episode, token: str, server: List[Any]) -> type:
                 self._answer(200, {"output": command(body)})
             except Exception as exc:  # the world's failures are answers, not crashes
                 self._answer(500, {"error": "%s: %s" % (type(exc).__name__, exc)})
-            if self.path == "/close":
-                # From a thread of its own: `shutdown` blocks until the serving loop stops, and
-                # the serving loop is this thread.
-                threading.Thread(target=server[0].shutdown, daemon=True).start()
 
         def _answer(self, status: int, payload: Dict[str, Any]) -> None:
             encoded = json.dumps(payload).encode()
@@ -544,11 +425,27 @@ def grade(body: Dict[str, Any]) -> Dict[str, Any]:
     Checks are reported by position rather than by requirement text: a requirement is a paragraph
     of English naming the models and values it asserts on, so carrying one out of here would carry
     part of the task's answer with it. The position is the task's own order and is all a row
-    identifier has to be."""
+    identifier has to be.
+
+    **The filing and the digests are read here too, and that is the change.** They used to be
+    asked of the serving world over the protocol, which meant the process that runs agent-authored
+    code was the process reporting what the episode had done. Now one process reads one stopped
+    tree: the filing, the databases' digest, the generator digest and the evaluator's verdicts all
+    come from the same bytes, so they cannot be two instants, and none of them can be composed by
+    the episode."""
     os.environ["APPWORLD_ROOT"] = body["root"]
     from appworld.evaluator import evaluate_task
     from appworld.task import Task
 
+    dbs = os.path.join(body["experiment"], "tasks", body["task_id"], "dbs")
+    # Before the evaluator, and in this order for a mechanical reason rather than a preference:
+    # AppWorld holds each app's database engine on a class attribute, so a collection loaded after
+    # the evaluator has built its own reads the evaluator's world instead of the one it asked for.
+    # Both read the same tree either way, because the process that could have changed it is gone;
+    # what the order buys is that this one reads what it named.
+    filing = _read_filing(_models_on_disk(dbs, body["task_id"]), body["filing"])
+    world_digest = _directory_digest(dbs)
+    rng_digest = _read_rng(os.path.dirname(dbs))
     with _ignoring(list(body.get("ignore") or ())):
         tracker = evaluate_task(
             task_id=body["task_id"],
@@ -569,7 +466,43 @@ def grade(body: Dict[str, Any]) -> Dict[str, Any]:
         requirement = entry["requirement"]
         verdict = True if requirement in passed else (False if requirement in failed else None)
         checks.append(["aw.%03d" % position, verdict])
-    return {"checks": checks}
+    return {
+        "checks": checks,
+        # Read above rather than off a live world, and from the same tree the evaluator just read.
+        # The process that could have changed these bytes was stopped and confirmed gone before
+        # this one started, so what is scored and what is graded are one state by construction
+        # rather than by two observations happening to agree.
+        "filing": filing,
+        "world_digest": world_digest,
+        "rng_digest": rng_digest,
+    }
+
+
+def _read_rng(beside: str) -> str:
+    """The generator digest the serving world wrote, or the empty string if it wrote none.
+
+    Read from the tree rather than asked of the world, for the same reason everything else here
+    is: the process that could answer is the process that runs the agent's code."""
+    try:
+        with open(os.path.join(beside, RNG_DIGEST_FILE)) as handle:
+            return handle.read().strip()
+    except OSError:
+        return ""
+
+
+def _models_on_disk(dbs: str, tag: str) -> Any:
+    """Load one task's flushed databases into an interpreter of their own.
+
+    Through upstream's own model layer rather than by parsing the statement log: the log is a
+    replayable format with a per-row hash column and full-text shadow tables behind it, and a
+    reader that got either wrong would be reading a world that is not the one that was saved."""
+    from appworld.collections.models import ModelCollection
+
+    return ModelCollection.load(
+        to_db_home_path=f":memory:shogym-read-{tag}",
+        from_db_home_path=dbs,
+        load_apps=["todoist"],
+    )
 
 
 def _handshake() -> Dict[str, Any]:
@@ -583,13 +516,18 @@ def _handshake() -> Dict[str, Any]:
 
 
 def serve(root: str, token: str) -> int:
-    """Bind a loopback port, say which one, and serve until told to close.
+    """Bind a loopback port, say which one, and serve until the host stops this process.
 
     One request at a time, and every one of them on the main thread. AppWorld runs an agent's code
     under a signal alarm, and the standard library only lets the main thread install one, so a
     handler on a worker thread fails on the first line of code an agent runs. Sequential is right
     anyway: there is one world here, and two commands into it at once is two commands into the
-    same mutable state."""
+    same mutable state.
+
+    **This loop is ended from outside and never from inside.** There is no close command to ask
+    for; the host signals this process's group and confirms it is gone. A shutdown the protocol
+    could request would be a shutdown agent-authored code could request, and the fact the host
+    needs is that this process stopped rather than that it said so."""
     os.environ["APPWORLD_ROOT"] = root
     episode = Episode()
     holder: List[Any] = []
@@ -599,7 +537,6 @@ def serve(root: str, token: str) -> int:
     # is what keeps two episodes started at the same moment off each other's port.
     print(json.dumps({"port": server.server_port}), flush=True)
     server.serve_forever()
-    episode.close({})
     return 0
 
 

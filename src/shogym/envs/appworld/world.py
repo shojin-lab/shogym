@@ -21,9 +21,11 @@ wrong. Everything else in the derived copy is a link.
 from __future__ import annotations
 
 import os
+import secrets
 import shutil
+from contextlib import contextmanager
 from pathlib import Path
-from typing import Any, Callable, Dict, NamedTuple, Optional, Tuple
+from typing import Any, Callable, Dict, Iterator, NamedTuple, Optional, Tuple
 
 from shogym.envs._upstream import _locked
 from shogym.envs.appworld.ledger import ROLES, SECTIONS, Backlog, Request
@@ -200,12 +202,11 @@ def derive_task(
         return target
     (derived / "tasks").mkdir(parents=True, exist_ok=True)
     (graded / "tasks").mkdir(parents=True, exist_ok=True)
-    with _locked(derived / "tasks"):
+    with _locked(derived / "tasks"), _opened(derived / "tasks"), _opened(graded / "tasks"):
         if already_derived(derived=derived, graded=graded, task_id=task_id):
             return target
         source = original / "tasks" / task_id
-        building = derived / "tasks" / f".{task_id}.{os.getpid()}.building"
-        shutil.rmtree(building, ignore_errors=True)
+        building = _staging(derived / "tasks", task_id)
         (building / "dbs").mkdir(parents=True)
         for entry in sorted(source.iterdir()):
             # `ground_truth` is deliberately absent: see the docstring.
@@ -215,6 +216,11 @@ def derive_task(
             if entry.name != "todoist.jsonl":
                 _materialise(entry, building / "dbs" / entry.name)
         write_log(source / "dbs", building / "dbs" / "todoist.jsonl")
+        # Sealed before it is published, so what appears under the name is read-only from the
+        # instant it exists. This is a *shared* task: every episode of it copies its own view out
+        # of here, so a served worker able to write to it could change what a later episode, or
+        # the other arm of its own pair, starts from. See `derive_view` for the invariant.
+        _seal(building)
         _publish(building, target)
         _grading_view(target, graded / "tasks" / task_id, source / "ground_truth")
     return target
@@ -237,8 +243,7 @@ def _grading_view(target: Path, view: Path, answers: Path) -> None:
     under two names, which made this view move whenever a served episode wrote through its own: the
     baseline the grader diffs against was editable by the thing being graded. The answers are
     copied from the corpus, and this tree is the only place in the port that names them."""
-    building = view.parent / f".{view.name}.{os.getpid()}.building"
-    shutil.rmtree(building, ignore_errors=True)
+    building = _staging(view.parent, view.name)
     (building / "dbs").mkdir(parents=True)
     for entry in sorted(target.iterdir()):
         if entry.name != "dbs":
@@ -246,6 +251,9 @@ def _grading_view(target: Path, view: Path, answers: Path) -> None:
     for entry in sorted((target / "dbs").iterdir()):
         _materialise(entry, building / "dbs" / entry.name)
     _materialise(answers, building / "ground_truth")
+    # Sealed for the same reason the served copy is: this is the baseline the evaluator diffs
+    # against, and a baseline that anything can edit is not one.
+    _seal(building)
     _publish(building, view)
 
 
@@ -271,10 +279,18 @@ def derive_view(*, derived: Path, view: Path, task_id: str) -> Path:
     by construction.
 
     **The invariant, stated once.** *Nothing an episode can reach through its served root is both
-    shared with another episode and writable by this one.* The task is per episode and writable;
-    everything else is shared and read-only, sealed by :func:`_seal` when the derived base is
-    built. That is what makes the two arms of a pair comparable: the placebo arm cannot observe
-    anything its twin did, because its twin could not change anything they both read.
+    shared with another episode and writable by this one.* The copy of the task under this view is
+    the episode's own and is writable; everything else it can reach is shared and read-only,
+    sealed by :func:`_seal` when it is built.
+
+    That covers the shared *tasks* as well as the shared base, and it did not use to. The links
+    below name the derived tree, and the derived tree's own task cache is the pristine source that
+    every later view is copied out of: a served worker that could write to it would be writing
+    into what the next episode, or the other arm of its own pair, starts from. So a published task
+    is sealed in its staging directory before it is given its name, and the directory they are
+    published into is sealed too, opened only under the derivation lock. What makes two arms of a
+    pair comparable is that the placebo arm cannot observe anything its twin did, and the reason
+    it cannot is that its twin could not change anything they both read.
 
     **What the invariant rests on, and where it stops.** It rests on file permissions, and the
     worker runs as the user that owns those files, so code that goes looking can chmod them back.
@@ -295,8 +311,13 @@ def derive_view(*, derived: Path, view: Path, task_id: str) -> Path:
     served = tasks / task_id
     # Rebuilt rather than reused. This is per episode, and an episode that found the previous
     # episode's leftovers here would be exactly the thing this function exists to prevent.
+    _unseal(served)
     shutil.rmtree(served, ignore_errors=True)
     shutil.copytree(derived / "tasks" / task_id, served)
+    # The shared task is sealed and `copytree` carries its modes across, so the copy arrives
+    # read-only. This one is the episode's own and has to be writable: it is the only thing under
+    # the served root that is, which is the invariant above stated as a permission.
+    _unseal(served)
     return view
 
 
@@ -307,6 +328,15 @@ def derive_root(*, original: Path, derived: Path) -> Path:
     corpus's own ``datasets`` directory is a path to the corpus, and the corpus holds every task's
     answers. The base databases are 129 MB and the API documentation 4.5 MB, so this is built once
     per corpus and every episode's view names it rather than copying it.
+
+    **Staged and published, never built in place.** This used to unseal, delete, copy and mark
+    the final directory while holding :func:`_locked`, and that helper deliberately yields with no
+    exclusion on a filesystem whose ``flock`` it cannot take. Under it, two cold processes both
+    deleted and rebuilt the same live target, and either could publish the completeness marker over
+    a tree the other was halfway through writing. So each entry is built under a staging name of
+    this process's own, sealed and marked there, and given its final name by one rename; a loser
+    finds the target already published and drops what it built. That is the protocol
+    :func:`derive_task` already uses, and it is correct without a lock rather than because of one.
 
     **Sealed read-only, which is what lets a view name it.** Every episode's served root reaches
     these directories, so an episode that could write to one could leave something in the next
@@ -321,30 +351,76 @@ def derive_root(*, original: Path, derived: Path) -> Path:
             if entry.name == "tasks":
                 continue
             target = derived / entry.name
-            if not _complete(target):
-                # Rebuilt rather than trusted. A directory left half copied by a crash exists, and
-                # existence was all this used to ask for, so the next process served a truncated
-                # corpus and called it ready. The marker below is written last and is what
-                # "finished" means here. Unsealed first, because a sealed tree is a tree whose
-                # parent directories refuse the unlink.
-                _unseal(target)
-                shutil.rmtree(target, ignore_errors=True)
-                _materialise(entry, target)
-                _mark_complete(target)
-            # Sealed last and top-down last, so a read-only top is proof the whole entry was
-            # sealed. That makes the seal skippable on the warm path, which every construction
-            # takes: one `stat` per top-level entry rather than a walk of 134 MB.
-            if _sealable(target):
-                _seal(target)
+            if _complete(target) and _sealed(target):
+                continue
+            # A target that exists but is not both complete and sealed was left by a crash or by
+            # a chmod that failed part way through. It is not repaired in place: a fresh tree is
+            # staged beside it and published over it, so nothing ever reads a directory while it
+            # is being made correct.
+            building = _staging(derived, entry.name)
+            _materialise(entry, building)
+            _mark_complete(building)
+            _seal(building)
+            _publish(building, target, replacing=True)
     return derived
 
 
-def _sealable(target: Path) -> bool:
-    """Whether ``target`` still has a writable top, and so has not been sealed yet."""
+def _sealed(target: Path) -> bool:
+    """Whether every node under ``target`` has had its write bits taken off.
+
+    Walked rather than inferred. The top-level mode used to stand for the whole subtree, on the
+    reasoning that :func:`_seal` sets it last, and that reasoning depended on every nested
+    ``chmod`` having succeeded. One that failed left a writable child permanently hidden behind a
+    read-only top, which is the shape of failure the seal exists to prevent, reported as success.
+    The walk is a few hundred ``lstat`` calls on this corpus, once per construction."""
+    if not target.exists():
+        return False
+    if _writable(target):
+        return False
+    if target.is_dir() and not target.is_symlink():
+        return all(_sealed(child) for child in sorted(target.iterdir()))
+    return True
+
+
+def _writable(target: Path) -> bool:
     try:
         return bool(target.lstat().st_mode & 0o222)
     except OSError:
-        return False
+        return True
+
+
+@contextmanager
+def _opened(directory: Path) -> "Iterator[None]":
+    """Make ``directory`` itself writable for the length of the body, then seal it again.
+
+    The directory node only, never what is under it. The published tasks below it are sealed and
+    stay sealed; what this opens is the right to add a name to the directory, which is what
+    publishing one needs and what a served worker must not have. A worker that could add or remove
+    a name here could take a task out of the cache the next episode is built from.
+
+    Sealed again in a ``finally``, so a build that raises does not leave the directory open."""
+    directory.mkdir(parents=True, exist_ok=True)
+    try:
+        os.chmod(directory, 0o755)
+    except OSError:
+        pass
+    try:
+        yield
+    finally:
+        _chmod(directory, 0o555)
+
+
+def _staging(parent: Path, name: str) -> Path:
+    """A directory to build ``name`` in, under a name no other process can be using.
+
+    The pid alone was the old answer and it is not unique enough: pids are recycled, and a
+    crashed builder's leftovers under the same number would be deleted out from under a live one.
+    Eight random bytes beside it make the name this call's."""
+    parent.mkdir(parents=True, exist_ok=True)
+    building = parent / f".{name}.{os.getpid()}.{secrets.token_hex(8)}.building"
+    _unseal(building)
+    shutil.rmtree(building, ignore_errors=True)
+    return building
 
 
 def _seal(target: Path) -> None:
@@ -371,25 +447,34 @@ def _unseal(target: Path) -> None:
 
     Top down, because removing a file needs write permission on the directory holding it, so the
     parent has to be writable before the child can be reached for. Symlinks are skipped, for the
-    reason :func:`_seal` gives."""
+    reason :func:`_seal` gives.
+
+    Unlike :func:`_seal`, a failure here is tolerated: this is called to make something removable,
+    and the removal that follows reports its own failure. There is no invariant resting on a mode
+    this function set."""
     if target.is_symlink() or not target.exists():
         return
-    if target.is_dir():
-        _chmod(target, 0o755)
-        for child in sorted(target.iterdir()):
-            _unseal(child)
-    else:
-        _chmod(target, 0o644)
+    try:
+        if target.is_dir():
+            os.chmod(target, 0o755)
+            for child in sorted(target.iterdir()):
+                _unseal(child)
+        else:
+            os.chmod(target, 0o644)
+    except OSError:
+        pass
 
 
 def _chmod(target: Path, mode: int) -> None:
-    """``chmod``, tolerating a filesystem that will not do it. A tree this could not seal is a
-    weaker guarantee and not a failed derivation: the derived corpus is still correct, and the
-    property that rests on the mode is documented as a host-side convenience either way."""
-    try:
-        os.chmod(target, mode)
-    except OSError:
-        pass
+    """``chmod``, and a failure is a failure.
+
+    This used to swallow every error, on the reasoning that a tree it could not seal was a weaker
+    guarantee rather than a broken derivation. That was wrong in the direction that matters: the
+    seal is what keeps one episode out of the next one's inputs, and the caller that checks it
+    reads a mode. A chmod that failed silently left a writable child under a read-only parent,
+    which reads as sealed and is not. A filesystem that cannot do this cannot host the served
+    corpus, and saying so at derivation is better than a run that discovers it in its numbers."""
+    os.chmod(target, mode)
 
 
 #: Written into a materialised directory once every file under it is there. A directory without it
@@ -432,18 +517,31 @@ def _materialise(source: Path, target: Path) -> None:
     shutil.copy2(source, target)
 
 
-def _publish(building: Path, target: Path) -> None:
-    """Move a staging tree into place, or drop it if someone else got there first."""
-    if target.exists():
+def _publish(building: Path, target: Path, *, replacing: bool = False) -> None:
+    """Give a staging tree its final name, or drop it if someone else got there first.
+
+    ``replacing`` is for the one caller that has to displace an existing target: a shared base
+    entry left incomplete or partly sealed by a crash. It is still not a build in place. The
+    finished tree is renamed *aside* first and the staged one renamed in, so the name is never
+    absent and never holds a half-made tree; the displaced one is then removed at leisure."""
+    if target.exists() and not replacing:
+        _unseal(building)
         shutil.rmtree(building, ignore_errors=True)
         return
     target.parent.mkdir(parents=True, exist_ok=True)
+    displaced = target.with_name(f".{target.name}.{os.getpid()}.{secrets.token_hex(8)}.displaced")
     try:
+        if target.exists():
+            os.replace(target, displaced)
         os.replace(building, target)
     except OSError:
+        _unseal(building)
         shutil.rmtree(building, ignore_errors=True)
         if not target.exists():
             raise
+    finally:
+        _unseal(displaced)
+        shutil.rmtree(displaced, ignore_errors=True)
 
 
 def _link(source: Path, target: Path) -> None:

@@ -57,6 +57,13 @@ TaskStream(
 )
 ```
 
+`config_digest` covers the draw, the payload class, the block budget, every constant a payload is
+generated from, the corpus this run actually serves (all of it, including the 134 MB of shared base
+episodes read as input), the derivation layout, and a hand-bumped scoring version that moves when
+how a score is read moves. The derived and grader caches are named by the same source digest and
+carry a stamp inside them saying what they were built from, so a run pointed at a second corpus
+cannot serve material derived from the first.
+
 Passing `identity` is how a record defends itself. A directory that already names one refuses a
 resume that names a different one, and refuses a caller that names none: the record has said what
 produced its rows, and rows that decline to say make it unreadable as one run afterwards. A
@@ -327,7 +334,7 @@ routes are closed and the expensive one is visible, each tested by running the p
 | the grader's tree | a directory with an unguessable name under a private parent, not a neighbour of the served root |
 | one episode's grade | upstream's evaluator report is disabled, and an episode's whole output tree is named absolutely and lives outside every served corpus, so no episode holds another's end state, logs or verdicts |
 | the corpus itself | served inputs are independent copies rather than hard links, so a write through the served pathname changes neither the corpus later episodes are derived from nor the baseline the grader diffs against |
-| the next episode's inputs | each episode is served its own view: its task's world is copied per episode and removed with the episode, and the 134 MB of shared base it links to is sealed read-only, so a write through one episode's served pathname is not in the next one's starting inputs, or the other arm of its pair's |
+| the next episode's inputs | each episode is served its own view: its task's world is copied per episode and removed with the episode, and everything else it can reach (the 134 MB of shared base, and the shared task cache the views are copied out of) is sealed read-only, so a write through one episode's served pathname is not in the next one's starting inputs, or the other arm of its pair's |
 | the drawn key | never sent to either process: the protocol has no field for one |
 
 **There is no file-access audit, and a run must not be read as though there were one.** An earlier
@@ -339,24 +346,46 @@ an empty journal reads as "file access was audited and nothing was found" when i
 the kind. It has been removed rather than shipped with a caveat. Nothing here records what an
 agent's code opens.
 
-**The world is stopped before it is graded, and what could not be stopped is recorded.** Sealing
-closes the tool surface and does not stop work an earlier call left running, so the worker's
-descendants are stopped before the end state is read, and the worker and its whole process group
-are terminated before the evaluator runs.
+**Nothing the host needs to know comes from the process that runs the agent's code.** There is no
+seal command, no quiesce command and no read command: the writer on the protocol's own socket is
+reachable from inside the interpreter that executes agent-authored Python, so a reply saying "I
+have flushed", "I have stopped" or "the filing says X" is a reply the episode could have written.
+The host signals the worker's process group, confirms from the process table that the group is
+empty, and grades what is on disk.
 
-Two things that cannot be stopped are reported instead of assumed away, because a seal that
-claimed a property it had no evidence for is worse than one that names its own gap. A thread
-inside the worker's interpreter is not signallable, and a process table the worker cannot read is
-not an empty one; either makes the quiescence incomplete. And the pair the evaluator is handed is
-proved rather than trusted: the state is saved and digested on both sides of the filing read, so
-"the filing and the snapshot are one instant" is a measurement. Both answers reach the record as
-`seal_note`, at inference level, so the record keeps them and no feedback policy can reveal them.
-A clean seal is the empty string.
+**What is on disk is the world at the end of the last block, because upstream puts it there.**
+`AppWorld.execute` ends with its own save into the episode's output tree and `initialize` writes
+one before any block runs. So an episode that ran N blocks is graded on the state after block N,
+and one that ran none is graded on its opening state. Work an agent's thread does after its last
+block is lost rather than scored, which is the same rule the block budget already states, and the
+generator digest is written to the same tree for the same reason: a diagnostic read out of a reply
+is a diagnostic the episode can choose.
+
+**A stop the process table will not confirm ends the episode unscored.** Not reaped inside the
+bound, or a process table that would not answer: each of those leaves a tree something may still
+be writing to. The group is signalled *before* the leader is reaped, which is what makes the
+number safe to use and what stops an episode buying an unscored row by killing its own world: a
+pid is reserved until its parent reaps it and a group exists while any member does, so an
+exited-but-unreaped leader is still holding the group and is stopped and confirmed like any other.
+A leader something else reaped first leaves a number nothing may signal or enumerate. The
+episode is closed as an infrastructure failure rather than scored on it, so the row is `unscored`
+with a `finalize_error` closure and nothing in `observed` at all, which means neither feedback arm
+has a payload to reveal. The same is true of an output tree the grader refuses.
+
+**The grader is given a snapshot, not the tree the world wrote.** The grading process is pointed
+at the root that holds the answers, so a link left under the output tree would resolve there.
+Every entry is checked to be a plain file or directory resolving inside the tree, and anything
+else refuses the episode rather than being skipped; what is copied is a tree of regular files with
+no link in it. It reads the filing, the databases' digest, the generator digest and the base
+task's own evaluator, all from those same bytes, so what is scored and what is graded are one
+state by construction rather than two observations that happened to agree.
 
 **The residual, stated exactly.** The private tree is hard to guess and not hard to read: it is the
 same uid, so its 0700 mode stops other users and stops nothing else. The read-only seal on the
-shared base is the same kind of thing: it refuses an ordinary write, upstream never writes there,
-and the process that runs agent code owns those files and could put the write bits back. The
+shared base and the shared task cache is the same kind of thing: it refuses an ordinary write,
+upstream never writes there, and the process that runs agent code owns those files and could put
+the write bits back. The confirmed stop is likewise the process table's word rather than a
+namespace: a process that left this group is outside what it can see. The
 port's own source is readable, and with it the draw's algorithm. The run's provenance directory
 retains true reports even under `Placebo`. Anything else the user running the port can read is
 readable.
