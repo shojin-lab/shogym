@@ -1088,15 +1088,21 @@ print(json.dumps({
 
 
 async def test_one_episodes_write_is_not_in_the_next_episodes_world() -> None:
-    """The served inputs are per episode, so a write through one does not start the next.
+    """The served inputs are per episode, and under the container they are not writable at all.
 
     The derived corpus was one deterministic global root and every worker was handed it, with its
     files writable by the process that runs agent-authored code and nothing putting them back. A
-    write through episode A's served view was therefore still there in episode B's starting inputs.
-    Two arms of a pair are the same task served at the same time, so the arm meant to differ only
-    in what it was told could also differ in the world it was given, and that is a difference the
-    treatment did not make.
+    write through episode A's served view was therefore still there in episode B's starting
+    inputs. Two arms of a pair are the same task served at the same time, so the arm meant to
+    differ only in what it was told could also differ in the world it was given, and that is a
+    difference the treatment did not make.
 
+    Two things close it and this checks both. The view is per episode, so one episode's writes
+    have nowhere to reach the next from; and the mount is read-only, so there is no write to
+    contain. The second is the stronger and is what the branch below said the container would
+    bring, so the attempt is expected to be refused rather than merely contained.
+
+<<<<<<< HEAD
     **The write is made from here rather than from inside `execute`, and it has to be.** Upstream's
     own guard replaces `io.open` with one that refuses every write mode and null-patches `os.open`
     so that it reports success and creates nothing, so no code running inside an episode can write
@@ -1112,6 +1118,36 @@ async def test_one_episodes_write_is_not_in_the_next_episodes_world() -> None:
         'root = _os.environ["APPWORLD_ROOT"]\n'
         '_io = __import__("io")\n'
         'print(json.dumps({"root": root, "body": _io.open(%s).read()[:64]}))\n' % served
+=======
+    Written through the pathname the worker is actually given, which is the route an episode has,
+    rather than through a path this test worked out for itself."""
+    task = task_id()
+    marker = "written by an earlier episode"
+    views = adapter.cache_root() / f"views-{adapter.DATA_VERSION}"
+    # Snapshotted rather than assumed empty: what this checks is that the views *this test* makes
+    # do not outlive their episodes, not that the machine started tidy.
+    before = {entry.name for entry in views.iterdir()} if views.exists() else set()
+    probe = (
+        '_io, _os = __import__("io"), __import__("os")\n'
+        'root = _os.environ["APPWORLD_ROOT"]\n'
+        'target = root + "/data/tasks/%s/dbs/gmail.jsonl"\n'
+    ) % task
+    scribble = probe + (
+        "\n"
+        "def _write():\n"
+        '    try:\n'
+        '        _io.open(target, "w").write(%r)\n'
+        '        return "wrote"\n'
+        "    except Exception as failure:\n"
+        "        return type(failure).__name__\n"
+        "\n"
+        '\n'
+        'print(json.dumps({"root": root, "write": _write(),'
+        ' "body": _io.open(target).read()[:64]}))\n'
+    ) % marker
+    read_back = probe + (
+        'print(json.dumps({"root": root, "body": _io.open(target).read()[:64]}))\n'
+>>>>>>> 08b46fa (appworld: serve the per-episode view through the mount, and refuse the write outright)
     )
 
     env = shogym.make("appworld")
@@ -1129,6 +1165,7 @@ async def test_one_episodes_write_is_not_in_the_next_episodes_world() -> None:
     finally:
         await first.close()
 
+<<<<<<< HEAD
     second = json.loads(json.loads((await play([report]))["outputs"][0]["content"])["output"])
     assert second["body"] != marker, "the second episode started in the first one's leftovers"
     # Two episodes, two served roots. One shared root is what carried the write.
@@ -1138,6 +1175,22 @@ async def test_one_episodes_write_is_not_in_the_next_episodes_world() -> None:
     # And the pristine copy the views are built from never saw it.
     pristine = adapter.derived_root() / "data" / "tasks" / task / "dbs" / "gmail.jsonl"
     assert pristine.read_text()[:64] != marker
+=======
+    # Refused, not contained: the served tree is a read-only mount.
+    assert first["write"] != "wrote", "the served tree was writable"
+    assert first["body"] != marker
+    assert second["body"] != marker, "the second episode started in the first one's leftovers"
+    # Two episodes, two views on the host, and each removed with the episode that owned it. The
+    # root inside the container is the same fixed mount point for both, which is the point: it
+    # names nothing about which episode is behind it.
+    assert first["root"] == second["root"] == "/corpus"
+    after = {entry.name for entry in views.iterdir()} if views.exists() else set()
+    assert after <= before, sorted(after - before)
+    # And the pristine copies either side of the served view never saw it.
+    pristine = adapter.derived_root() / "data" / "tasks" / task / "dbs"
+    for entry in sorted(pristine.iterdir()):
+        assert entry.read_text()[:64] != marker
+>>>>>>> 08b46fa (appworld: serve the per-episode view through the mount, and refuse the write outright)
 
 
 async def test_the_world_stops_before_it_is_graded() -> None:

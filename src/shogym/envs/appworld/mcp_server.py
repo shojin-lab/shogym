@@ -34,6 +34,10 @@ class Session:
     task_id: str
     supervisor_email: str
     experiment: str
+    #: This episode's own served corpus on the host, removed when the session ends (see
+    #: `world.derive_view`). The world never sees this path: inside the container it is mounted
+    #: at a fixed name.
+    view: str = ""
     #: This episode's own output tree on the host, mounted alone into the world's container and
     #: again into the grading one. Two containers, one directory, and no other episode's.
     outputs: Any = None

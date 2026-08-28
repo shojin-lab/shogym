@@ -289,13 +289,18 @@ class AppWorldEnv(Env):
         # one replaces the root, and inside the container the absolute one is the mount point.
         outputs = adapter.episode_outputs(session_id)
         experiment = container.OUTPUTS_MOUNT
-        # Deriving comes first now, and has to: the world's container mounts this one task's tree,
-        # so the tree has to exist before there is a container to mount it into. Seeding is a
+        # Deriving comes first, and has to: the world's container mounts this one task's tree, so
+        # the tree has to exist before there is a container to mount it into. Seeding is a
         # container of its own, which is also why it no longer needs this episode's worker.
         self._derive(task_id)
-        worker = adapter.Worker.spawn(
-            self._derived.parent, task_id=task_id, outputs=outputs
+        # This episode's own view of the derived corpus. Under the container the served tree is
+        # mounted read-only, so the write this exists to contain cannot happen at all; it is kept
+        # because it is the property at the layer below, and a run of this env without the
+        # container is a run where it is the only thing holding it.
+        view = world.derive_view(
+            derived=self._derived, view=adapter.episode_view(session_id), task_id=task_id
         )
+        worker = adapter.Worker.spawn(view, task_id=task_id, outputs=outputs)
         try:
             # This episode's own view of the seeded world. Not the shared tree: see
             # `world.derive_view` for why an episode that writes through its served inputs must
@@ -316,6 +321,7 @@ class AppWorldEnv(Env):
                 worker=worker,
                 task_id=task_id,
                 outputs=outputs,
+                view=str(view),
                 supervisor_email=str(task["supervisor_email"]),
                 experiment=experiment,
                 budget=self._blocks,
@@ -331,6 +337,9 @@ class AppWorldEnv(Env):
         if session is None:
             return
         session.worker.close()
+        # The episode's served view goes with it too, for the reason it existed: a view that
+        # outlived its episode is a directory the next one could be given by mistake.
+        shutil.rmtree(session.view, ignore_errors=True)
         # The episode's output tree goes with the episode. It holds this episode's end state and
         # its logs, and leaving it behind gives a later episode something of an earlier one's to
         # find; a directory that only ever grows is retention by omission rather than by policy.
