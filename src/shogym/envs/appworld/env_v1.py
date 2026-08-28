@@ -255,11 +255,19 @@ class AppWorldEnv(Env):
         )
 
     def _end_session(self, session_id: str) -> None:
+        import shutil
+
         from shogym.envs.appworld import mcp_server
 
         session = mcp_server.end_session(session_id)
-        if session is not None:
-            session.worker.close()
+        if session is None:
+            return
+        session.worker.close()
+        # The episode's output tree goes with the episode. It holds this episode's end state and
+        # its logs, and leaving it behind gives a later episode something of an earlier one's to
+        # find; a directory that only ever grows is retention by omission rather than by policy.
+        # After the worker is closed, so nothing is still writing into what is being removed.
+        shutil.rmtree(session.experiment, ignore_errors=True)
 
     def _derive(self, worker: adapter.Worker, task_id: str) -> None:
         """Make sure the seeded copy of ``task_id``'s world exists, writing it if it does not.
@@ -355,6 +363,16 @@ class AppWorldEnv(Env):
         # which runs the world's own evaluator, and a coroutine that never yields would stop every
         # other episode this serving process is running and would make the serve layer's deadline
         # unable to fire on this one.
+        # Stop what the episode started before reading it. Sealing closed the tool surface and
+        # did not stop work an earlier call left running, so without this the filing and the
+        # snapshot beneath it can come from different moments and the evaluator scores a state no
+        # instant of the episode ever had.
+        try:
+            await asyncio.to_thread(session.worker.call, "quiesce")
+        except Exception:
+            # A worker too wedged to answer is about to be signalled anyway; the close below owns
+            # that, and a failure to quiesce politely must not cost the episode its grade.
+            pass
         read = await asyncio.to_thread(
             session.worker.call,
             "read",

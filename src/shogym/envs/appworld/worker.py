@@ -63,6 +63,15 @@ from http.server import BaseHTTPRequestHandler, HTTPServer
 from typing import Any, Dict, List, Optional
 
 #: The header every request must carry.
+#:
+#: **A gate on the socket, not a secret from the agent.** It is kept out of argv, the environment,
+#: the tool schemas and the results, so nothing hands it over; but it lives in this process's own
+#: handler state, and this is the process that runs agent-authored code. Code running here can
+#: reach it, and no arrangement inside one interpreter changes that.
+#:
+#: What it is for is the boundary it can actually hold: another process on this machine cannot
+#: drive this worker's world without it. Read it as a cross-process gate, and do not build
+#: anything on it being unknown to the episode.
 TOKEN_HEADER = "X-Shogym-Worker-Token"
 
 
@@ -167,6 +176,61 @@ class Episode:
         """Run one snippet of the agent's code against the world and return what it printed."""
         return {"output": self.world.execute(str(body["code"]))}
 
+    def quiesce(self, body: Dict[str, Any]) -> Dict[str, Any]:
+        """Stop everything this worker started, before the state below it is read.
+
+        Sealing closes the tool surface; it does not stop work an earlier `execute` left running.
+        A subprocess still writing while :meth:`read` takes its filing and saves the snapshot
+        leaves the two from different moments, and the evaluator then scores a state no single
+        instant of the episode ever had.
+
+        Descendants only. This process is the one being asked, and killing it here would take the
+        snapshot with it, so it stays until the host closes it. What cannot be stopped is a thread
+        inside this interpreter: threads are not signallable, and an episode that left one running
+        is bounded by the host closing this process rather than by anything here."""
+        import os
+        import signal
+        import subprocess
+        import time
+
+        mine = os.getpid()
+        try:
+            group = os.getpgid(mine)
+        except (OSError, AttributeError):
+            return {"stopped": 0}
+
+        def descendants() -> List[int]:
+            try:
+                listing = subprocess.run(
+                    ["ps", "-o", "pid=,pgid=", "-A"], capture_output=True, text=True, timeout=5
+                )
+            except (OSError, subprocess.SubprocessError):
+                return []
+            found: List[int] = []
+            for line in listing.stdout.splitlines():
+                fields = line.split()
+                if len(fields) == 2 and fields[1].isdigit() and fields[0].isdigit():
+                    pid, pgid = int(fields[0]), int(fields[1])
+                    if pgid == group and pid != mine:
+                        found.append(pid)
+            return found
+
+        stopped = 0
+        for how in (signal.SIGTERM, signal.SIGKILL):
+            live = descendants()
+            if not live:
+                break
+            for pid in live:
+                try:
+                    os.kill(pid, how)
+                    stopped += 1
+                except OSError:
+                    pass
+            deadline = time.monotonic() + 5
+            while descendants() and time.monotonic() < deadline:
+                time.sleep(0.02)
+        return {"stopped": stopped}
+
     def read(self, body: Dict[str, Any]) -> Dict[str, Any]:
         """What is in the named project, plus digests of what the world became.
 
@@ -175,7 +239,10 @@ class Episode:
         to see.
 
         The digests are what make "the same task twice is the same world" checkable, one over the
-        world's own end-state databases and one over the global generator's state."""
+        world's own end-state databases and one over the global generator's state.
+
+        Call :meth:`quiesce` first. What is read here has to be one instant of the episode, and it
+        is not one instant if something the episode started is still writing underneath it."""
         self.world.models.reset_db_home_path()
         filing = _read_filing(self.world.models, body)
         # Flush the end state so the grader, which is a different process, has something to read.
@@ -350,6 +417,7 @@ def build_handler(episode: Episode, token: str, server: List[Any]) -> type:
         "/seed": episode.seed,
         "/open": episode.open,
         "/execute": episode.execute,
+        "/quiesce": episode.quiesce,
         "/read": episode.read,
         "/close": episode.close,
     }

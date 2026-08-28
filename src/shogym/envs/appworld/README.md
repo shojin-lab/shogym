@@ -46,8 +46,20 @@ submission, the same size on the wire; `Never()` answers with no channel at all.
 ```python
 from shogym.serve.stream import Information, Placebo, TaskRef, TaskStream
 
-TaskStream(shogym.make, [TaskRef("appworld", 0)], prov_dir=..., feedback=Information())
+TaskStream(
+    shogym.make,
+    [TaskRef("appworld", 0)],
+    prov_dir=...,
+    feedback=Information(),
+    # Pass the fingerprint. It is what makes the rows of one record one measurement, and a resume
+    # under a changed draw, payload class, block budget or corpus is refused rather than appended.
+    identity=shogym.make("appworld").config_digest,
+)
 ```
+
+Passing `identity` is how a record defends itself. A directory that already names one refuses a
+resume that names a different one, and refuses a caller that names none: the record has said what
+produced its rows, and rows that decline to say make it unreadable as one run afterwards.
 
 ## Requirements
 

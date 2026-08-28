@@ -19,6 +19,7 @@ import datetime as dt
 import json
 import urllib.error
 import urllib.request
+import uuid
 import zlib
 from pathlib import Path
 from typing import Any, Dict, List
@@ -441,18 +442,29 @@ async def test_a_read_outside_the_served_tree_is_refused() -> None:
     as the run. A mount namespace is what makes this fail; nothing short of one does.
 
     Expected to fail today, and strictly: when it starts passing, the boundary exists and the
-    marker is what should go."""
-    probe = """
+    marker is what should go.
+
+    **The sentinel is a host-only file, deliberately.** This read `/etc/hosts`, which a correctly
+    isolated container has its own readable copy of, so the test would have gone green on a
+    container that was working exactly as intended and told us nothing about whether the boundary
+    held. The file below is written by this test on the host, outside every tree the worker is
+    given, so it can only be read by a process sharing the host's mount namespace."""
+    sentinel = adapter.cache_root().parent / f"host-only-{uuid.uuid4().hex}"
+    sentinel.write_text("readable only from the host namespace")
+    try:
+        probe = f"""
 _io = __import__("io")
 try:
-    _io.open("/etc/hosts").read()
-    print(json.dumps({"read": True}))
+    _io.open({str(sentinel)!r}).read()
+    print(json.dumps({{"read": True}}))
 except Exception as failure:
-    print(json.dumps({"read": False, "why": type(failure).__name__}))
+    print(json.dumps({{"read": False, "why": type(failure).__name__}}))
 """
-    played = await play([probe])
-    seen = json.loads(json.loads(played["outputs"][0]["content"])["output"])
-    assert seen["read"] is False
+        played = await play([probe])
+        seen = json.loads(json.loads(played["outputs"][0]["content"])["output"])
+        assert seen["read"] is False
+    finally:
+        sentinel.unlink(missing_ok=True)
 
 
 async def test_the_answers_are_not_in_the_process_that_runs_agent_code() -> None:
@@ -632,6 +644,10 @@ async def test_information_hands_back_the_receipt_and_placebo_the_digest(
             [TaskRef("appworld", TASK)],
             prov_dir=tmp_path / name,
             feedback=policy,
+            # The port's own fingerprint, which is what makes two of these runs one measurement:
+            # the draw, the payload class, the block budget, the corpus contents and the scoring
+            # version. A resume under a changed pulse or a repointed corpus is refused by it.
+            identity=shogym.make("appworld").config_digest,
         )
         async with stream:
             await stream.get_task()

@@ -614,12 +614,15 @@ async def test_an_abandoned_dispense_reconciles_under_its_own_regime(tmp_path: P
     # The row a crash produces is built from the dispense alone. Defaulting its regime would make
     # every abandoned task of a practice run read back as evaluation-grade — a row that looks
     # MORE trustworthy than the run that produced it, which is the direction that matters.
-    stream = _stream(tmp_path, [0], feedback=Immediate())
+    stream = _stream(tmp_path, [0], feedback=Immediate(), identity="fingerprint-a")
     dispensed = await stream.get_task()
     assert dispensed is not None  # dispensed, never sealed: the process "dies" here
     abandoned = reconcile(tmp_path / "prov")
-    assert [(row.closure, row.feedback_regime) for row in abandoned] == [
-        ("broker_abort", "immediate")
+    # The identity comes off the dispense for the same reason the regime does. A row that lost it
+    # belongs to no particular run, which is exactly the row a later resume under a different
+    # configuration would be allowed to append beside.
+    assert [(row.closure, row.feedback_regime, row.run_identity) for row in abandoned] == [
+        ("broker_abort", "immediate", "fingerprint-a")
     ]
     await stream.aclose()
 
@@ -738,9 +741,29 @@ async def test_a_resume_under_a_different_run_identity_is_refused(tmp_path: Path
 
     with pytest.raises(ValueError, match="run identity"):
         _stream(tmp_path, [0, 1], resume=True, identity="fingerprint-b")
-    # The same identity resumes, and so does a caller that names none.
+    # A caller that names none is refused too, and this is the direction that matters. The record
+    # has already said what produced its rows; appending rows that decline to say makes it
+    # unreadable as one run afterwards, and the caller could have named an identity and did not.
+    with pytest.raises(ValueError, match="run identity"):
+        _stream(tmp_path, [0, 1], resume=True)
+    # The same identity resumes.
     _stream(tmp_path, [0, 1], resume=True, identity="fingerprint-a")
-    _stream(tmp_path, [0, 1], resume=True)
+
+
+async def test_a_record_that_names_no_identity_is_resumable_by_anyone(tmp_path: Path) -> None:
+    """The wildcard that is kept, and the only one.
+
+    A directory recorded before identities existed cannot say what produced it, so refusing it
+    would punish the record rather than a mismatch. That is compatibility owed to old records; it
+    is not owed to a new caller who could name an identity and chose not to."""
+    stream = _stream(tmp_path, [0])
+    async with stream:
+        await stream.get_task()
+        await stream.dispatch(SUBMIT_TOOL, {"answer": "4"})
+    assert [row["run_identity"] for row in _rows(tmp_path)] == [""]
+    # Accepted, and the claim this leaves behind now names an identity, which is why the
+    # unidentified resume below is a separate directory rather than the next line here.
+    _stream(tmp_path, [0, 1], resume=True, identity="fingerprint-a")
 
 
 async def test_the_claim_carries_the_identity_before_any_row_exists(tmp_path: Path) -> None:

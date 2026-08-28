@@ -48,6 +48,14 @@ from shogym.envs.appworld.world import SLOTS
 PASS_COUNTS_FILE = Path(__file__).with_name("pass_counts.txt")
 
 GRADED = "graded"
+#: What the drawn arm's visible vector is keyed by, beside the task.
+#:
+#: A committed constant rather than the pulse. The pulse is the hidden parameter the real key is
+#: drawn from, so keying the visible vector by it too made the vector a sample of the key's own
+#: cause. Nothing that produces a key may appear here. Changing this value re-rolls every drawn
+#: payload, so it is frozen like the count table beside it.
+DRAWN_BASIS = "shogym/appworld/drawn/v1"
+
 DIGEST = "digest"
 DRAWN = "drawn"
 
@@ -117,7 +125,7 @@ def _marks(*, task_id: str, verdicts: Verdicts, cell: str, pulse: int) -> Tuple[
     if cell == DRAWN:
         return tuple(
             PASS if passed else FAIL
-            for passed in _drawn_verdicts(task_id=task_id, verdicts=verdicts, pulse=pulse)
+            for passed in _drawn_verdicts(task_id=task_id, verdicts=verdicts)
         )
     return tuple(PASS if item.passed else FAIL for item in verdicts.items)
 
@@ -132,7 +140,7 @@ def _digest(task_id: str, item: Item) -> str:
     return hashlib.sha256(material).hexdigest()[:4]
 
 
-def _drawn_verdicts(*, task_id: str, verdicts: Verdicts, pulse: int) -> Tuple[bool, ...]:
+def _drawn_verdicts(*, task_id: str, verdicts: Verdicts) -> Tuple[bool, ...]:
     """A verdict per row that carries nothing about the drawn key.
 
     The dated requests get a number of passes drawn from the roster's own distribution
@@ -141,11 +149,16 @@ def _drawn_verdicts(*, task_id: str, verdicts: Verdicts, pulse: int) -> Tuple[bo
     real receipt shows on them. The base task's own checks keep their real verdicts, because an
     assertion says something about the base task and nothing about the key.
 
-    Every draw comes from a stream keyed by the task, the class and the pulse, and by nothing
-    else. It never reads the real verdicts, so re-rendering this payload against a different
-    submission moves neither the count nor the pattern, which is the executable form of the claim
-    that the count carries nothing."""
-    draw = stream(f"{pulse}|{task_id}|drawn")
+    **Not keyed by the pulse, and that is the point.** This used to draw from
+    ``f"{pulse}|{task_id}|drawn"``. It never read the real verdicts, so it looked independent, but
+    the real convention is itself a deterministic function of that same pulse: the visible vector
+    was an agent-visible sample of the hidden parameter, and independence of the *verdicts* is not
+    independence of the *key*. Two things sharing a hidden cause is a leak whether or not either
+    reads the other. The stream is keyed by :data:`DRAWN_BASIS`, a committed constant that the key
+    never touches, so the only thing the visible vector varies with is the task. The pulse is not
+    a parameter of this function at all, which is the form of the fix that cannot quietly come
+    back."""
+    draw = stream(f"{DRAWN_BASIS}|{task_id}|drawn")
     dated = [position for position, item in enumerate(verdicts.items) if item.dated]
     passing = set(_choose(draw, dated, _draw_count(draw)))
     arities = {slot.check_id: len(slot.options) for slot in SLOTS}
@@ -202,6 +215,7 @@ def pass_counts() -> Tuple[int, ...]:
 
 __all__ = [
     "DIGEST",
+    "DRAWN_BASIS",
     "DRAWN",
     "FAIL",
     "GRADED",
