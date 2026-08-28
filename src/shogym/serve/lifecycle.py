@@ -357,7 +357,13 @@ class FinalizationStore:
         only in the page cache is no more durable than that entry."""
         _mkdir_durable(self._dir)
         target = self._path(record.finalization_id)
-        blob = json.dumps(asdict(record), sort_keys=True, allow_nan=False)
+        payload = asdict(record)
+        # Refused here, because the reader refuses it. A verdict nested past what a record may be
+        # wrote cleanly and then came back as a corrupt entry on the next read: durable evidence
+        # this process produced, quarantined by this process. One acceptance, both ways.
+        if _too_deep(payload):
+            raise ValueError("a finalization record is not nested this deep")
+        blob = json.dumps(payload, sort_keys=True, allow_nan=False)
         fd, tmp = tempfile.mkstemp(dir=str(self._dir), suffix=".tmp")
         try:
             with os.fdopen(fd, "w", encoding="utf-8") as f:
