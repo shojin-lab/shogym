@@ -145,7 +145,9 @@ class HleEnv(Env):
         """The injected judge, or a lazily-built default ``OpenAIJudge`` (no network yet).
 
         Preflighted at session start (not env construction), so ``shogym.make("hle")``, the tool
-        manifest, and ``describe()`` all stay offline and keyless. The default ``OpenAIJudge``
+        manifest, and ``describe()`` stay keyless and build no client. They are not otherwise
+        network-free: a default construction downloads the gated ``cais/hle`` split (pass
+        ``tasks`` to skip it). The default ``OpenAIJudge``
         needs ``OPENAI_API_KEY`` to grade the (almost always free-form) non-exact answers; with
         no key it would raise inside ``submit_answer`` and every non-exact answer would
         fail-closed to ``correct=False``, silently deflating the benchmark. Raise early and
@@ -237,10 +239,13 @@ class HleEnv(Env):
         Runs HLE's grading on the sealed submission: a normalized exact-match fast path first
         (offline, free) and, on a miss, the session's injectable LLM judge. The returned
         ``verdict`` is **public-safe** (``correct``, ``judge_error``, and, when the env built the
-        judge itself, which model graded: see :meth:`_judge_provenance`) and is the sole
-        thing the agent ever sees (the serve layer stamps provenance / finalization_id / source
-        and appends its own ``finalize_error`` flag). The judge's ``reasoning`` /
-        ``extracted_answer`` and any exception text are answer oracles: they go **only** in the
+        judge itself, which model graded: see :meth:`_judge_provenance`). It is what the serve
+        layer returns as the terminal result's JSON ``content`` (stamping provenance /
+        finalization_id / source and appending its own ``finalize_error``); the episode feedback
+        ``_verify`` builds rides separately in ``_meta["shogym/feedback"]`` and adds
+        ``confidence`` / ``calibration_error`` for an explicit submission. The judge's
+        ``reasoning`` / ``extracted_answer`` and any exception text are answer oracles: they go
+        **only** in the
         private ``diagnostic`` (durable store / server logs), never in the verdict. Only a
         model-graded episode names a judge: the exact-match fast path publishes none, since no
         model read that answer.
@@ -335,7 +340,8 @@ def score_evidence(
     Pure. Emits ``correct`` (bool) always on termination; when there was a submission it also
     emits ``confidence`` (0–1, from the validated submit args) and ``calibration_error`` — the
     absolute gap between the submitted confidence and the correctness indicator (a per-episode
-    Brier-style term). A terminal with no submission (``terminate``/abort or the
+    Brier-style term, and a local diagnostic rather than upstream's batch calibration error).
+    A terminal with no submission (``terminate``/abort or the
     ``zero_unsubmitted`` horizon) emits only ``correct = False`` — there is no confidence to
     calibrate.
 

@@ -127,8 +127,9 @@ def build_image(
 ) -> None:
     """Build ``tag`` from ``dockerfile`` with ``context_dir`` as the build context.
 
-    Pins ``--platform linux/amd64``: the vendored task images are amd64 (they digest-pin an
-    amd64 ``python:3.11-slim`` base), so an arm64 host must emulate rather than fail the pull.
+    Pins ``--platform linux/amd64`` so every host builds the architecture the tasks were
+    authored and validated on. The vendored bases are multi-arch image indexes, so an arm64 host
+    emulates rather than silently building a different architecture.
     """
     _run_docker(
         [
@@ -312,7 +313,7 @@ def run_separate_verifier(
 ) -> VerifierOutcome:
     """Run the task's verifier in SEPARATE mode and return the recorded 0/1 verdict.
 
-    Faithful to Harbor's ``environment_mode="separate"`` flow:
+    Matches Harbor's ``environment_mode="separate"`` flow:
 
       1. Build the ``tests/`` image (it ``COPY . /tests/``, so it owns ``/tests/test.sh`` and
          golden files — the tests upload is skipped, exactly like Harbor's

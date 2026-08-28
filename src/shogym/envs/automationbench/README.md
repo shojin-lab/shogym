@@ -1,16 +1,18 @@
 # `automationbench` — AutomationBench, an offline cross-app workflow env
 
-A faithful shogym port of [**AutomationBench**](https://github.com/zapier/AutomationBench)
-(MIT, © Zapier): an agent gets a natural-language instruction and carries out a realistic
-cross-application business workflow over a fully **simulated** world of ~47 SaaS apps; scoring
-checks — programmatically, **end-state only** — whether the right data landed in the right
-systems. No LLM judge, no live SaaS, no network at eval time — the whole port is deterministic
-and offline.
+[**AutomationBench**](https://github.com/zapier/AutomationBench) (MIT, © Zapier) served through
+shogym at upstream commit `a321764`: an agent gets a natural-language instruction and carries out
+a realistic cross-application business workflow over a fully **simulated** world of ~47 SaaS
+apps; scoring checks — programmatically, **end-state only** — whether the right data landed in
+the right systems. No LLM judge, no live SaaS, no network at eval time. The port is offline and
+keyless and the rubric is deterministic over a given end-state, but a run is not reproducible
+step for step: upstream mints `uuid4` ids (e.g. Google Drive create/copy) and reads
+`datetime.now()`, so the same tool sequence can land different ids and timestamps.
 
 Like every shogym env this **describes** a task, **serves** its tools over MCP, and **verifies**
 a recorded trajectory while an external harness drives the tools — see
 [`../README.md`](../README.md). Upstream ships its own loop (a Prime Intellect `verifiers`
-`StatefulToolEnv`); this port throws that away and reuses only the three deterministic,
+`StatefulToolEnv`); this port throws that away and reuses only the three offline,
 `verifiers`-free pieces (the simulated tools + `WorldState` engine, the typed task defs, and
 the pure rubric). The runnable demo is
 [`examples/`](../../../../examples/).
@@ -19,7 +21,8 @@ the pure rubric). The runnable demo is
 
 > Requires **Python 3.12 + the `automationbench` extra**; the upstream source is provisioned at
 > runtime on first construction (a one-time network fetch, or point at a local checkout). Fully
-> offline / deterministic at eval time — no API key. See [Requirements](#requirements).
+> offline at eval time, and the rubric is deterministic over the sealed end-state — no API key.
+> See [Requirements](#requirements).
 
 ### Construct + serve
 
@@ -47,10 +50,14 @@ reads the verdict off the trace via `shogym.result_from_trace(...)`.
 `marketing` / `operations` / `support` / `finance` / `hr` / `simple` — or the `public` alias,
 the default, expanding to the six public domains = the 600 distributed tasks), `tasks` (an
 explicit list of raw upstream task rows — bypasses the domain loaders, used by the offline
-tests), and `max_steps` (the tool-call budget; the shogym horizon is `max_steps + 2`, default
-`max_steps=50` — upstream's `--max-steps` default and the "~50 tool-using turns" budget the
-task prompts advertise; the `+2` keeps the horizon a hair above the budget so a run can still
-call `done` explicitly).
+tests), and `max_steps` (the *advertised* tool-call budget, default 50 — upstream's
+`--max-steps` default and the "~50 tool-using turns" the task prompts quote). It is not an
+enforced cap on ordinary calls: the shogym horizon is `max_steps + 2` and `Episode.call`
+dispatches the ordinary call that reaches the horizon before sealing it as the terminal step, so
+`max_steps + 2` ordinary calls can execute. A `done` issued while the episode is still open is
+handled before the horizon is consulted and so is never preempted; the `+2` reserve is what
+keeps it reachable after the advertised budget, since a `done` sent after the horizon has sealed
+is tombstoned.
 
 ### Quickstart
 
@@ -168,14 +175,18 @@ semantics (give each run its own trace file for a guaranteed 1:1 mapping).
 
 ## Fidelity & deviations
 
-- **One toolset variant.** Upstream scores differ across its toolset variants (`api`, `zapier`,
-  `limited_zapier`, meta-tools); this port pins the **`api`** variant and reproduces it (including
-  the BM25 top-5 `api_search`). Numbers are comparable to the `api`-toolset leaderboard, not the
-  meta-tool ones.
+- **One toolset variant.** Upstream offers three (`scripts/eval.py` `--toolset`): `api`,
+  `zapier` and `limited_zapier`, where `zapier` *is* the meta-tool discovery mode
+  (`runner.py` sets `use_meta_tools = toolset == "zapier"`). This port pins **`api`** and
+  reproduces it, including the BM25 top-5 `api_search`. Upstream publishes a single table and
+  scores its official leaderboard on a held-out private set, so treat a number from here as an
+  `api`-toolset result rather than as comparable to any published per-variant figure.
 - **Pinned upstream source.** The port provisions and imports the pinned upstream commit
   [`a321764`](https://github.com/zapier/AutomationBench/commit/a321764ace3cfbe42289e6a13abef2f0f4f56fad),
   reusing only the `verifiers`-free pieces (simulated tools + `WorldState`, typed task defs, the
-  pure rubric); upstream's `verifiers` / `anthropic` agent loop is discarded.
+  pure rubric); upstream's `verifiers` / `anthropic` agent loop is discarded. The pin is the
+  default runtime provisioner's; `AUTOMATIONBENCH_SRC` points at a local checkout whose revision
+  nothing checks, so that documented override is a trusted, unversioned path.
 - **End-state-only scoring, verbatim rubric.** Scoring is AutomationBench's own rubric run over
   the sealed end-state — no LLM judge, no live SaaS. The free/negative-assertion gate is preserved.
 - **Public set only.** The 600 public-domain tasks are distributed; the private leaderboard set
@@ -202,6 +213,4 @@ src/shogym/envs/automationbench/
   env_v1.py      # @register("automationbench"): describe / task-load / finalize (seal) + verify (evidence)
   mcp_server.py  # in-process MCP: api_search / api_fetch / base64_encode / done, per-session WorldState + score_session
   adapter.py     # the single seam: provisions + imports upstream, re-hosts setup_state helpers, reuses the rubric
-  README.md      # this file
 ```
-</content>

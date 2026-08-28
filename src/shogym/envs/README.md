@@ -13,15 +13,14 @@ harness (Claude Code, Codex, pi, Hermes, or a small in-process loop) drives the 
 env only describes, serves, and scores. Hold `(env, task)` fixed, swap the harness, and the
 delta in the trace is attributable to the harness.
 
-This README is the **single source** for the machinery every env shares — the terminal
-lifecycle vocabulary, how a score is read back off a trace, the requirements boilerplate, and
-the offline-vs-keyed test split. Each env's own README states only what is *specific* to that
-env and links back here for the rest.
+The machinery every env shares lives here — the terminal lifecycle vocabulary, how a score is
+read back off a trace, the requirements boilerplate, and the offline-vs-keyed test split. Each
+env's own README states only what is *specific* to that env and links back here for the rest.
 
 ## Terminal lifecycle: seal, terminal, score-terminal, abort
 
-Every env ends an episode through the same lifecycle. The vocabulary is defined once here and
-used verbatim in each env README:
+Every env ends an episode through the same lifecycle, and each env README uses this vocabulary
+verbatim:
 
 - **terminal** — a tool call that *ends* the episode. Each tool advertises a `terminal_kind`
   in the manifest: `none` (an ordinary step), `score`, or `abort`.
@@ -66,7 +65,7 @@ the same `EvalResult` this way.
 ## Requirements boilerplate
 
 Every env that needs an optional extra states its own data / keys, but the pin-and-install
-mechanics are identical and defined once here:
+mechanics are identical:
 
 - **Python 3.12.** The project is pinned to 3.12 (`requires-python = ">=3.12,<3.13"`, with a
   committed `.python-version`) — the tau2 port needs it.
@@ -109,12 +108,12 @@ extras and the network, so there is nothing left for it to legitimately skip.
 | Env | What it is | README |
 |---|---|---|
 | `wordle_v1` | The reference env-as-center environment — Wordle in the smallest honest form (`guess` + reserved `terminate`, a pure trajectory verifier). No extra deps; runs on core shogym. | [`wordle/README.md`](wordle/README.md) |
-| `tau2_mock`, `tau2_airline`, `tau2_retail`, `tau2_telecom`, `tau2_banking_knowledge` | A faithful shogym port of [τ²-bench](https://github.com/sierra-research/tau2-bench) — tool-using customer-service agents across domains, scored by tau2's own evaluator. Needs the `tau2` extra + tau2 data. | [`tau2/README.md`](tau2/README.md) |
-| `yc_bench` | A faithful shogym port of [YC-Bench](https://github.com/collinear-ai/yc-bench) — operate a simulated AI startup for one year via a single `run_command` tool, scored on survival, funds, and tasks completed. Needs the `yc_bench` extra (deterministic in-process sim — no data or key). | [`yc_bench/README.md`](yc_bench/README.md) |
-| `hle` | A faithful shogym port of [Humanity's Last Exam](https://huggingface.co/datasets/cais/hle) — a single-turn, expert-level question answered via one `submit_answer` tool, graded server-side (exact-match fast path, then an OpenAI model judge; shogym's first model-graded verifier). Needs the `hle` extra, `OPENAI_API_KEY`, and gated `cais/hle` access. | [`hle/README.md`](hle/README.md) |
-| `browsecomp_plus` | A faithful shogym port of [BrowseComp-Plus](https://github.com/texttron/BrowseComp-Plus) — answer reasoning-heavy queries against a fixed ~100K-doc corpus via `search` / `get_document` / `submit_answer`, graded by an LLM judge plus deterministic retrieval-recall / citation metrics. Needs the `browsecomp_plus` extra, `OPENAI_API_KEY`, Java 21, and gated dataset access. | [`browsecomp_plus/README.md`](browsecomp_plus/README.md) |
-| `automationbench` | A faithful shogym port of [AutomationBench](https://github.com/zapier/AutomationBench) — carry out a cross-application business workflow over a fully simulated world of ~47 SaaS apps via an `api` tool surface, scored end-state-only by a pure rubric. Needs the `automationbench` extra (offline / deterministic — no key). | [`automationbench/README.md`](automationbench/README.md) |
-| `frontier_bench` | A faithful shogym port of [Frontier-Bench](https://github.com/harbor-framework/frontier-bench) — operate a per-task Docker container through a shell (`exec` / `read_file` / `write_file` / `done`), scored by the task's own verifier over the container end-state. A CPU-only, single-container slice (5 tasks). Needs the `frontier_bench` extra + a local Docker daemon (no key or data download). | [`frontier_bench/README.md`](frontier_bench/README.md) |
+| `tau2_mock`, `tau2_airline`, `tau2_retail`, `tau2_telecom`, `tau2_banking_knowledge` | [τ²-bench](https://github.com/sierra-research/tau2-bench) served through shogym at upstream source commit `1d244f5`, with domain data from an unversioned caller-supplied checkout (`TAU2_DATA_DIR`, or upstream's source-relative fallback) — tool-using customer-service agents across domains, scored by tau2's own evaluator. Needs the `tau2` extra + tau2 data. | [`tau2/README.md`](tau2/README.md) |
+| `yc_bench` | [YC-Bench](https://github.com/collinear-ai/yc-bench) served through shogym at upstream commit `e7d6067` — operate a simulated AI startup for one year via a single `run_command` tool, scored on survival, funds, and tasks completed. Needs the `yc_bench` extra (in-process sim, no data or key; a seed reproduces the business attributes, not the `uuid4` row ids). | [`yc_bench/README.md`](yc_bench/README.md) |
+| `hle` | [Humanity's Last Exam](https://huggingface.co/datasets/cais/hle) served through shogym — a single-turn, expert-level question answered via one `submit_answer` tool, graded server-side with HLE's own judge prompt (exact-match fast path, then an OpenAI model judge; shogym's first model-graded verifier). Needs the `hle` extra, `OPENAI_API_KEY`, and gated `cais/hle` access. | [`hle/README.md`](hle/README.md) |
+| `browsecomp_plus` | [BrowseComp-Plus](https://github.com/texttron/BrowseComp-Plus) served through shogym at upstream commit `0469490` for the qrels and the copied evaluation code, with separately pinned Hugging Face revisions for the queries and the BM25 index — answer reasoning-heavy queries against a fixed ~100K-doc corpus via `search` / `get_document` / `submit_answer`, graded by an LLM judge plus deterministic retrieval-recall / citation metrics. Needs the `browsecomp_plus` extra, `OPENAI_API_KEY`, Java 21, and Hugging Face network access (the datasets are public). | [`browsecomp_plus/README.md`](browsecomp_plus/README.md) |
+| `automationbench` | [AutomationBench](https://github.com/zapier/AutomationBench) served through shogym at upstream commit `a321764` — carry out a cross-application business workflow over a fully simulated world of ~47 SaaS apps via an `api` tool surface, scored end-state-only by upstream's own rubric. Needs the `automationbench` extra (offline, no key; the rubric is deterministic over a given end-state, though upstream mints `uuid4` ids and reads `datetime.now()`). | [`automationbench/README.md`](automationbench/README.md) |
+| `frontier_bench` | [Frontier-Bench](https://github.com/harbor-framework/frontier-bench) served through shogym at upstream commit `eb4af26c` — operate a per-task Docker container through a shell (`exec` / `read_file` / `write_file` / `done`), scored by the task's own verifier over the container end-state. A CPU-only, single-container slice (5 tasks). Needs the `frontier_bench` extra + a local Docker daemon (no key or data download). | [`frontier_bench/README.md`](frontier_bench/README.md) |
 
 Runnable end-to-end demos (Claude Code drives a served env; shogym scores off the trace) live
 under [`examples/`](../../../examples/), one per harness. Each serves a
@@ -131,7 +130,8 @@ each env keeps a one-liner and links back to the matching section of this README
 
 ```
 # `<registered_env_id>` — <BenchmarkName>, <hook>
-A faithful shogym port of <upstream>. <one line: what the task is.>
+<upstream> served through shogym[ at <pinned commit or release>]. <one line: what the task is.>
+<one line: what the port reuses from upstream verbatim, and what it replaces.>
 <one-liner: env-as-center → link to this README; the runnable example link.>
 
 ## Running it       ← FIRST content section: construct → serve over MCP → drive it
@@ -154,15 +154,20 @@ A faithful shogym port of <upstream>. <one line: what the task is.>
 `Layout`. `Requirements`, `Gotchas`, and `Layout` are optional — include them when the env has
 extras / keys / data, sharp edges, or a source map worth drawing.
 
+- **The opener summarises the pin; `Fidelity & deviations` is authoritative.** Name the commit
+  or release in the opener when the port pins one, and give the exact pin and its limits below.
+  The clause is optional: `hle` loads the `cais/hle` split at whatever revision resolves, so its
+  opener drops it and the next line names what it loads instead. An opener never implies a pin
+  the code does not make.
 - **`How it works`** always carries `describe → TaskSpec` then `Tools (served over MCP)`, then
   a verifier subsection: **`finalize + verify`** for a seal env (the score terminal seals,
   `finalize` produces the verdict, `verify` reads it) or **`verify`** for a marker/trivial env
   (wordle — a pure verifier over the trajectory, no `finalize`). Use the heading bare: no
   parentheticals, no arrows.
-- **`Fidelity & deviations`** is the one place every deviation from upstream lives: the pinned
-  upstream commit / tag, the retriever / judge / variant / model choices, any deferred scope
-  (multimodal, dense retrieval, keyed variants), and any intentional delta from the original
-  benchmark. If a reader wants to know "how faithful is this and where does it differ", this
-  section answers it — nothing fidelity-related hides in `Gotchas` or `Requirements`.
-</content>
-</invoke>
+- **`Fidelity & deviations`** is the authoritative place for every *deviation* from upstream:
+  the exact pinned upstream commit / tag and what it does not cover, the retriever / judge /
+  variant / model choices, any deferred scope (multimodal, dense retrieval, keyed variants),
+  and any intentional delta from the original benchmark. Every question of the form "what
+  does this port change" is answered here. `Requirements` and `Gotchas` may repeat a
+  fidelity-adjacent fact a reader needs in order to run the env, but a deviation that appears
+  only there is a bug in the README.

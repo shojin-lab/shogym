@@ -2,10 +2,12 @@
 YC-Bench's sim state flows back into episode feedback through the seal-before-verdict path.
 
 Requires the ``yc_bench`` extra and the provisioned upstream source — skipped otherwise (naming
-the reason), so the offline core suite stays green. YC-Bench generates its whole world
-deterministically from the seed and runs its sim in process, so once the source is cached the
-entire path (seed → CLI commands → sealed finalize → verdict) runs offline, with no model calls
-or API keys.
+the reason), so the offline core suite stays green. YC-Bench generates its world from the seed
+and runs its sim in process, so once the source is cached the path (seed → CLI commands →
+sealed finalize → verdict) makes no model call and needs no API key. It is not strictly
+network-free: importing the adapter pulls in litellm, which reaches for a model-cost map unless
+``LITELLM_LOCAL_MODEL_COST_MAP=true``. Row ids are ``uuid4`` and differ per run, so what is
+reproducible is the seeded business state and the final funds, not the identifiers.
 """
 
 from __future__ import annotations
@@ -160,7 +162,7 @@ async def test_command_budget_is_max_commands_then_submit() -> None:
 
 
 async def test_sim_resume_requires_active_task() -> None:
-    # Faithful yc-bench behavior: `sim resume` refuses to advance with no active task.
+    # Matches yc-bench: `sim resume` refuses to advance with no active task.
     episode = await ServedEpisode.start("yc_bench", task=0)
     try:
         r = await episode.call("run_command", {"command": "yc-bench sim resume"})
@@ -196,9 +198,10 @@ async def test_run_command_rejects_agent_loop_and_interactive() -> None:
 
 
 async def test_seed_is_deterministic_across_episodes() -> None:
-    """Fidelity/reproducibility: the same task (seed) + the same commands yield the same final
-    funds — the deterministic sim is preserved by the wrap. Read off the sealed `submit`
-    verdict."""
+    """Fidelity/reproducibility, scoped: the same task (seed) + the same commands yield the same
+    final *funds*. That outcome is what the wrap preserves — not the trajectory, since row ids are
+    fresh ``uuid4``s that the agent sees and that break ties between simultaneous events. Read off
+    the sealed `submit` verdict."""
     funds = []
     for _ in range(2):
         episode = await ServedEpisode.start("yc_bench", task=3)

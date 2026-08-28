@@ -102,7 +102,8 @@ def test_exact_match_normalizes_case_space_and_punctuation() -> None:
 
 
 def test_exact_match_rejects_semantic_differences() -> None:
-    # The fast path must never grant credit an exact comparison wouldn't.
+    # Semantic differences the fast path does reject. It is not airtight: `_STRIP_CHARS`
+    # includes `!` and brackets, so exact_match("5", "5!") is True — see issue #139.
     assert not exact_match("The City of Light", "Paris")
     assert not exact_match("42 km", "42")
     assert not exact_match("berlin", "paris")

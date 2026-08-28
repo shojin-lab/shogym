@@ -1,4 +1,4 @@
-"""``automationbench`` on the env-as-center core (RFC 008): a faithful wrap of AutomationBench.
+"""``automationbench`` on the env-as-center core (RFC 008): a wrap of AutomationBench.
 
 AutomationBench (Zapier, MIT) drops an agent into a fully **simulated** world of ~47 SaaS apps
 and asks it to carry out a realistic cross-application business workflow described in natural
@@ -6,7 +6,7 @@ language; scoring checks — programmatically, **end-state only** — whether th
 in the right systems. No LLM judge, no live SaaS, no network.
 
 Upstream ships its own agent loop (a Prime Intellect ``verifiers`` ``StatefulToolEnv``). This
-port throws that away and keeps the three deterministic, offline pieces verbatim (see
+port throws that away and keeps the three offline, ``verifiers``-free pieces verbatim (see
 :mod:`shogym.envs.automationbench.adapter`): the simulated tools + ``WorldState`` engine, the typed
 task defs, and the pure rubric. shogym's harness *is* the agent loop:
 
@@ -88,7 +88,9 @@ class AutomationBenchEnv(Env):
       - ``tasks``: an explicit list of raw upstream task rows (each ``{"prompt", "info", ...}``,
         ``info`` a dict or JSON string). When given, the domain datasets are **not** loaded —
         this is how offline tests construct the env without ``datasets``.
-      - ``max_steps``: the shogym horizon (default 50, upstream's default).
+      - ``max_steps``: the *advertised* tool-call budget (default 50, upstream's default). The
+        shogym horizon is ``max_steps + 2``, and the ordinary call that reaches it is dispatched
+        before it seals, so this is a soft target: ``max_steps + 2`` ordinary calls can execute.
     """
 
     mcp_servers = (AUTOMATIONBENCH_SPEC,)

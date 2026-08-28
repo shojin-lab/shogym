@@ -1,14 +1,14 @@
 """The model-graded judge for the HLE env — shogym's first model-graded verifier (issue #33).
 
 The judge decides whether a submitted answer matches the gold answer for a Humanity's Last
-Exam question. It is used **server-side**, inside the ``submit_answer`` tool handler
-(``mcp_server``), so the env's ``_verify`` stays a pure function over the recorded
-trajectory: the handler runs the judge and records its verdict on the terminal step; the
-verifier only *parses* that verdict.
+Exam question. It runs **server-side, after the seal**: ``submit_answer`` seals the episode and
+the serve layer then runs the env's ``finalize`` hook, which grades the frozen submission and
+returns the verdict as core-owned terminal evidence. The tool handler never grades, and the
+env's ``_verify`` stays a pure function that only *reads* that verdict.
 
 Two pieces, on purpose:
 
-- ``exact_match`` — a deterministic, offline fast path (normalize + compare). The handler
+- ``exact_match`` — a deterministic, offline fast path (normalize + compare). ``finalize``
   tries this first; a match short-circuits the LLM judge entirely (no network, no cost).
 - :class:`Judge` — the injectable LLM-judge seam. The registered ``hle`` env defaults to
   :class:`OpenAIJudge`; offline tests inject a scripted judge (mirroring how the tau2 port
@@ -65,8 +65,9 @@ class Judge(Protocol):
     """A model-graded verifier: does ``response`` answer ``question`` as ``correct_answer``?
 
     Implementations must be side-effect-free apart from the model call and must not raise on
-    an ordinary bad response — return ``JudgeResult(correct=False)`` instead. The handler
-    guards against exceptions regardless, but a well-behaved judge keeps the episode clean.
+    an ordinary bad response — return ``JudgeResult(correct=False)`` instead. The finalizer
+    guards against exceptions regardless, but a well-behaved judge keeps the episode
+    clean.
     """
 
     def __call__(
@@ -77,10 +78,11 @@ class Judge(Protocol):
 def normalize_answer(text: Any) -> str:
     """Casefold, collapse internal whitespace, and strip surrounding punctuation.
 
-    Deliberately conservative: it only equates answers that differ by case, spacing, or
-    trailing punctuation. Anything semantic (unit conversions, paraphrase, numeric
-    tolerance) is left to the LLM judge — the fast path must never *grant* credit an exact
-    comparison wouldn't."""
+    Intended to equate answers differing only by case, spacing, or trailing punctuation,
+    leaving anything semantic (unit conversions, paraphrase, numeric tolerance) to the LLM
+    judge. It does not hold to that: ``_STRIP_CHARS`` includes ``!``, ``?`` and brackets, and
+    ``str.strip`` removes them repeatedly, so ``normalize_answer("5!") == "5"`` and a factorial
+    or a closing bracket can be erased along with the character beneath it. See issue #139."""
     if text is None:
         return ""
     s = re.sub(r"\s+", " ", str(text)).strip()
@@ -96,7 +98,7 @@ def exact_match(response: Any, correct_answer: Any) -> bool:
     return bool(gold) and normalize_answer(response) == gold
 
 
-# The official HLE judge prompt (Center for AI Safety, `cais/hle`), used verbatim so the
+# HLE's judge prompt (Center for AI Safety, `cais/hle`), lightly edited so the
 # judge's grading criteria match the benchmark's own.
 JUDGE_PROMPT = """Judge whether the following [response] to [question] is correct or not \
 based on the precise and unambiguous [correct_answer] below.

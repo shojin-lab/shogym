@@ -3,11 +3,13 @@
 These are the *non-judge* half of BrowseComp-Plus scoring: given the docids a run retrieved
 (off the recorded ``search`` steps), the docids it cited (off the submitted answer text), and
 the query's relevance judgements (``qrel_evidence`` / ``qrel_golds``), compute recall and
-citation precision/recall exactly as upstream ``scripts_evaluation/evaluate_run.py`` does.
+citation precision/recall as upstream ``scripts_evaluation/evaluate_run.py`` does.
 
 Everything here is **pure** and dependency-free (stdlib ``re`` only), so it runs in the offline
-core test suite and is called from the env's pure ``_verify``. The functions are ported
-verbatim from BrowseComp-Plus commit ``0469490`` to keep the metrics faithful.
+core test suite and is called from the env's pure ``_verify``. The functions are adapted from
+BrowseComp-Plus commit ``0469490``: :func:`compute_citation_metrics` divides by the
+deduplicated set sizes where upstream divides by the input list lengths, which is the same
+number for the distinct docids this env passes it.
 """
 
 from __future__ import annotations
@@ -50,7 +52,11 @@ def extract_citations_from_response(response_text: str) -> List[str]:
 def compute_citation_metrics(
     cited_docids: Iterable[str], relevant_docids: Iterable[str]
 ) -> Dict[str, float]:
-    """Citation precision/recall of ``cited_docids`` against ``relevant_docids`` (upstream verbatim).
+    """Citation precision/recall of ``cited_docids`` against ``relevant_docids``.
+
+    Adapted from upstream's ``compute_citation_metrics``: both inputs are deduplicated and the
+    denominators are the set sizes, where upstream divides by the input list lengths. The two
+    agree on the distinct docids this env passes (citations arrive already deduplicated).
 
     - ``precision`` — fraction of cited docids that are relevant;
     - ``recall`` — fraction of relevant docids that were cited.

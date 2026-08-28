@@ -10,9 +10,9 @@ contained to one file (per issue #32's fidelity caveat), *every* ``yc_bench`` im
 here, behind a small, stable surface the rest of the env calls:
 
   - :func:`build_db` — open a fresh per-session SQLite database.
-  - :func:`seed_session` — seed one deterministic company/world (reuses yc-bench's own
-    ``_init_simulation``, so seeding is bit-identical to ``yc-bench run`` for a given
-    seed/config/start-date).
+  - :func:`seed_session` — seed one company/world from the task seed (reuses yc-bench's own
+    ``_init_simulation``, so the seeded world matches ``yc-bench run``'s attributes for a given
+    seed/config/start-date; the row ids are fresh ``uuid4``s either way).
   - :func:`run_cli` — execute one ``yc-bench <cmd>`` against the session DB, reusing
     yc-bench's command-validation policy and its real CLI entry point.
   - :func:`read_final_state` — read the authoritative terminal metrics (funds, survival,
@@ -137,11 +137,13 @@ def seed_session(
     horizon_years: Optional[int],
     company_name: str,
 ) -> str:
-    """Seed one deterministic company/world into the session DB; return the company id.
+    """Seed one company/world into the session DB from the task seed; return the company id.
 
     Delegates to yc-bench's own ``_init_simulation`` (the exact function ``yc-bench run``
     calls), so for a fixed seed/config/start-date the seeded world — employees, clients,
-    market tasks, horizon event, and initial ``SimState`` — is identical to upstream."""
+    market tasks, horizon event, and initial ``SimState`` — carries the same *attributes* as
+    upstream's. The row **ids** are not reproducible: upstream's ``services/seed_world.py``
+    mints a ``uuid4()`` per company, employee, client and market task."""
     experiment_cfg = load_config(config_name)
     resolved_horizon = (
         horizon_years if horizon_years is not None else experiment_cfg.sim.horizon_years
