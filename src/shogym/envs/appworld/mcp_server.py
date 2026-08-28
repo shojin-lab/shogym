@@ -34,8 +34,13 @@ class Session:
     task_id: str
     supervisor_email: str
     experiment: str
-    #: This episode's own served corpus, removed when the session ends (see `world.derive_view`).
+    #: This episode's own served corpus on the host, removed when the session ends (see
+    #: `world.derive_view`). The world never sees this path: inside the container it is mounted
+    #: at a fixed name.
     view: str = ""
+    #: This episode's own output tree on the host, mounted alone into the world's container and
+    #: again into the grading one. Two containers, one directory, and no other episode's.
+    outputs: Any = None
     #: How many blocks of code this episode may run. The step budget the serve layer enforces has
     #: one slot more than this, so that `submit` always has somewhere to go; without a separate
     #: count the spare slot is just another `execute`, and a task's world can be changed after the

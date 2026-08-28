@@ -40,12 +40,11 @@ import asyncio
 import datetime as dt
 import hashlib
 import zlib
-from functools import partial
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, Dict, Optional
 
 from shogym.core import Env
-from shogym.envs.appworld import adapter, payload, world
+from shogym.envs.appworld import adapter, container, payload, world
 from shogym.envs.appworld.ledger import build_backlog
 from shogym.envs.appworld.scorer import Verdicts, draw_key, leg_of, score
 from shogym.envs.registration import register
@@ -153,52 +152,36 @@ class AppWorldEnv(Env):
                 f"report must be {payload.GRADED!r} or {payload.DRAWN!r}, got {report!r}; the "
                 "digest is the notice channel's and is never the report's"
             )
-        adapter.ensure_apps()
+        # Before anything else, and at construction rather than at the first `execute`. Every
+        # episode's world runs in a container; there is no host fallback, because a worker on the
+        # host runs agent-authored code as the user running the run. A machine without Docker
+        # cannot serve this env, and an hour into a run is the wrong time to find that out.
+        container.require_docker()
+        adapter.ensure_image()
+        # Anything this port left behind whose parent is gone. The case is a run that died while a
+        # world was wedged inside a command: the worker never gets back to the read that would
+        # tell it its parent had gone, so it never exits and `--rm` never fires.
+        container.reap()
         self._pulse = int(pulse)
         self._report = report
         self._original = adapter.ensure_corpus() / "data"
-        self._task_ids = adapter.task_ids()
         # Read once, from the corpus this run actually serves, and used for three things that all
         # have to agree: the name of the served cache, the name of the grader's cache, and the run
         # fingerprint a resumed record is checked against. They used to be able to disagree, so a
         # process pointed at a second corpus computed a fingerprint for that one and then reused
         # and served task material derived from the first.
-        #
-        # **The roster's authored text comes back from the same read, and is what this env serves
-        # for the rest of its life.** The digest and the cache names were fixed here while the
-        # instructions, the supervisors and the dates went on being reread from the live corpus
-        # every time a task was described, seeded or scored. So a corpus edited after construction
-        # served new authored text under the old fingerprint, out of caches named for the old
-        # bytes, and nothing in the record said so. An env that has stated what corpus it is
-        # serving has to go on serving that one (see `adapter.corpus_snapshot`).
-        snapshot = adapter.corpus_snapshot(self._original.parent, task_ids=self._task_ids)
-        self._corpus = snapshot.digest
-        self._specs = snapshot.specs
-        # What the interpreter turned out to hold, read once here and used for three things that
-        # have to agree: both cache names, both stamps, and the run fingerprint. It is the
-        # interpreter that writes a task's seeded database log, so a cache it did not write is a
-        # world this run did not make; and reading it twice is a second of construction for an
-        # answer that cannot have changed in between.
-        self._runtime = adapter.runtime_digest()
-        # Bound to the corpus this snapshot was taken of, and handed to both derivations. A task
-        # is materialised on its first use, which can be hours and two hundred episodes after the
-        # digest above was computed, and the bytes it copies are the world an agent is served and
-        # the baseline it is graded against. Pinning the authored text was never enough for those.
-        self._source_check = partial(snapshot.verify, self._original.parent)
+        self._corpus = adapter.corpus_digest(self._original.parent)
         served, graded = (
-            adapter.derived_root(self._corpus, runtime=self._runtime),
-            adapter.graded_root(self._corpus, runtime=self._runtime),
+            adapter.derived_root(self._corpus),
+            adapter.graded_root(self._corpus),
         )
-        adapter.stamp_cache(served, source=self._corpus, runtime=self._runtime)
-        adapter.stamp_cache(graded, source=self._corpus, runtime=self._runtime)
-        self._derived = world.derive_root(
-            original=self._original, derived=served / "data", verify=self._source_check
-        )
+        adapter.stamp_cache(served, source=self._corpus)
+        adapter.stamp_cache(graded, source=self._corpus)
+        self._derived = world.derive_root(original=self._original, derived=served / "data")
         # The grader's view of the same corpus, with the answers linked back in. Only the grading
         # process is ever given this root; the world an agent drives is given the other one.
-        self._graded = world.derive_root(
-            original=self._original, derived=graded / "data", verify=self._source_check
-        )
+        self._graded = world.derive_root(original=self._original, derived=graded / "data")
+        self._task_ids = adapter.task_ids()
         self._backlogs: Dict[str, Any] = {}
         self.function = FunctionConfig(example_system_template=_static_instructions())
         # The step budget the serve layer enforces is one past the configured block budget, so
@@ -212,7 +195,11 @@ class AppWorldEnv(Env):
             report=self._report,
             blocks=self._blocks,
             corpus=self._corpus,
-            runtime=self._runtime,
+            runtime=container.image_identity(container.image_name()),
+            # What machine an episode was given. Captured once for this process and passed to
+            # every launch, so an environment changed mid-run cannot move it and a run relaunched
+            # under a changed one does not pass for the earlier measurement.
+            resources="|".join(container.limits()),
         )
         super().__init__(horizon=self._blocks + 1, num_tasks=len(self._task_ids))
 
@@ -309,79 +296,71 @@ class AppWorldEnv(Env):
         from shogym.envs.appworld import mcp_server
 
         task_id = str(task["task_id"])
-        self._backlog(task_id, self._task_specs(task_id))
-        # An absolute path, which AppWorld joins onto its own output root and so replaces it
-        # outright. That is the whole of what keeps one episode's end state, logs and evaluator
-        # artifacts out of the tree every other episode is served from: a shared output tree is a
-        # place a later episode, including the other arm of a pair, can read an earlier grade.
-        experiment = str(adapter.episode_outputs(session_id))
-        # The shared, pristine seeded world, written once per task. It needs a worker of its own
-        # because only the runtime's interpreter can write a database log, and it gets one only on
-        # the cold path: a task already derived needs no worker to say so.
-        if not world.already_derived(
-            derived=self._derived, graded=self._graded, task_id=task_id
-        ):
-            seeder = adapter.Worker.spawn(self._derived.parent)
-            try:
-                self._derive(seeder, task_id)
-            finally:
-                seeder.close()
-        view = adapter.episode_view(session_id)
+        # One output tree per episode, outside every served corpus, mounted alone into this
+        # episode's container at a fixed name. The world is told its experiment *is* that
+        # directory: AppWorld joins an experiment name onto its own output root, so an absolute
+        # one replaces the root, and inside the container the absolute one is the mount point.
+        outputs = adapter.episode_outputs(session_id)
+        experiment = container.OUTPUTS_MOUNT
+        # Deriving comes first, and has to: the world's container mounts this one task's tree, so
+        # the tree has to exist before there is a container to mount it into. Seeding is a
+        # container of its own, which is also why it no longer needs this episode's worker.
+        self._derive(task_id)
+        # This episode's own view of the derived corpus. Under the container the served tree is
+        # mounted read-only, so the write this exists to contain cannot happen at all; it is kept
+        # because it is the property at the layer below, and a run of this env without the
+        # container is a run where it is the only thing holding it.
+        view = world.derive_view(
+            derived=self._derived, view=adapter.episode_view(session_id), task_id=task_id
+        )
+        # Everything made before the session exists is made under this guard. A spawn or an open
+        # that failed used to leave the view and the output tree behind with nothing holding them:
+        # the env's own close finds no session, so neither was ever removed and both grew for the
+        # life of the machine.
         worker: Optional[adapter.Worker] = None
-        published = False
         try:
-            # This episode's own view of the seeded world. Not the shared tree: see
-            # `world.derive_view` for why an episode that writes through its served inputs must
-            # not be writing through the next episode's, or the other arm of its own pair's.
-            # Inside the block, because a copy that fails part way through is a partial view under
-            # this session's name and nothing else will ever come back for it.
-            world.derive_view(derived=self._derived, view=view, task_id=task_id)
-            worker = adapter.Worker.spawn(view)
+            worker = adapter.Worker.spawn(view, task_id=task_id, outputs=outputs)
             worker.call(
                 "open", task_id=task_id, experiment=experiment, seed=_world_seed(task_id)
             )
-            mcp_server.begin_session(
-                session_id,
-                mcp_server.Session(
-                    worker=worker,
-                    task_id=task_id,
-                    supervisor_email=str(task["supervisor_email"]),
-                    experiment=experiment,
-                    view=str(view),
-                    budget=self._blocks,
-                ),
-            )
-            published = True
-        finally:
-            if not published:
-                if worker is not None:
-                    worker.close()
-                shutil.rmtree(view, ignore_errors=True)
-                # And whatever the world managed to write before it failed to open. It is named
-                # for this session, so nothing else will ever come back for it.
-                shutil.rmtree(experiment, ignore_errors=True)
+        except Exception:
+            if worker is not None:
+                worker.close()
+            _discard(view, outputs)
+            raise
+        mcp_server.begin_session(
+            session_id,
+            mcp_server.Session(
+                worker=worker,
+                task_id=task_id,
+                outputs=outputs,
+                view=str(view),
+                supervisor_email=str(task["supervisor_email"]),
+                experiment=experiment,
+                budget=self._blocks,
+            ),
+        )
 
     def _end_session(self, session_id: str) -> None:
-        import shutil
-
         from shogym.envs.appworld import mcp_server
 
-        session = mcp_server.end_session(session_id)
+        session = mcp_server.get_session(session_id)
         if session is None:
             return
-        session.worker.close()
-        # The episode's served view goes with it too, for the reason it existed: a view that
-        # outlived its episode is a directory the next one could be given by mistake.
-        shutil.rmtree(session.view, ignore_errors=True)
-        # The episode's output tree goes with the episode. It holds this episode's end state and
-        # its logs, and leaving it behind gives a later episode something of an earlier one's to
-        # find; a directory that only ever grows is retention by omission rather than by policy.
-        # After the worker is closed, so nothing is still writing into what is being removed.
-        shutil.rmtree(session.experiment, ignore_errors=True)
-        # And the copy the grader was given, which is the same tree under a second name.
-        shutil.rmtree(session.experiment + ".graded", ignore_errors=True)
+        try:
+            # Never raises here: teardown's close is best effort by contract, and a container it
+            # could not remove belongs to the reaper rather than to this call.
+            session.worker.close()
+        finally:
+            # The directories go whatever the container did. A view that outlived its episode is
+            # a directory the next one could be given by mistake, and an output tree that only
+            # ever grows is retention by omission rather than by policy. In a `finally` because
+            # the failure that stops the close is exactly the failure that would otherwise leave
+            # them, and the handle is dropped last, so nothing between here and there loses it.
+            _discard(Path(session.view), session.outputs, Path(str(session.outputs) + ".graded"))
+            mcp_server.end_session(session_id)
 
-    def _derive(self, worker: adapter.Worker, task_id: str) -> None:
+    def _derive(self, task_id: str) -> None:
         """Make sure the seeded copy of ``task_id``'s world exists, writing it if it does not.
 
         Checked before the backlog is drawn rather than after. Drawing one costs about a second,
@@ -403,8 +382,8 @@ class AppWorldEnv(Env):
             derived=self._derived,
             graded=self._graded,
             task_id=task_id,
-            write_log=lambda source, into: worker.call(
-                "seed", **rows, from_dbs=str(source), into=str(into)
+            write_log=lambda source, into: adapter.seed(
+                root=self._derived.parent, source_dbs=source, into=into, rows=rows
             ),
             verify=self._source_check,
         )
@@ -486,8 +465,8 @@ class AppWorldEnv(Env):
         # **Nothing here asks the world anything.** The world's process is the process that runs
         # agent-authored code, so a reply from it saying that it had stopped, or flushed, or that
         # a value was such-and-such, is a reply the episode could have written. There is no seal
-        # command, no quiesce command and no read command any more. The host stops the worker's
-        # process and waits for it, then grades what is on disk.
+        # command and no quiesce command any more. The host stops the container, confirms it with
+        # the daemon, and grades what is on disk.
         #
         # **What is on disk is the world at the end of the last block, because upstream puts it
         # there.** `AppWorld.execute` ends with its own save into the episode's output tree and
@@ -495,19 +474,15 @@ class AppWorldEnv(Env):
         # on the state after block N, and an episode that ran none is graded on its opening state.
         # Work an agent's thread does after its last block is lost rather than scored, which is
         # the same rule the block budget states.
-        #
-        await asyncio.to_thread(session.worker.close)
-        # A tree of regular files, or no grade. See `adapter.snapshot_outputs`: the grading
-        # process is pointed at the root that holds the answers, so a link left under the output
-        # tree would resolve there.
+        await asyncio.to_thread(session.worker.close, confirm=True)
+        # A tree of regular files, or no grade. See `adapter.snapshot_outputs`: the grader's
+        # namespace holds the answers, so a link left under the output tree would resolve there.
         snapshot = await asyncio.to_thread(
-            adapter.snapshot_outputs,
-            Path(session.experiment),
-            into=Path(session.experiment + ".graded"),
+            adapter.snapshot_outputs, session.outputs, into=Path(str(session.outputs) + ".graded")
         )
         graded = await asyncio.to_thread(
             adapter.grade,
-            root=self._graded.parent,
+            graded=self._graded.parent,
             task_id=session.task_id,
             outputs=snapshot,
             ignore=world.ADDED_MODELS,
@@ -589,7 +564,11 @@ class AppWorldEnv(Env):
             # stream files the row unscored on the core's own stamp rather than on this item.
             fb.episode.append(EpisodeFeedback(name="finalize_error", value=True))
             fb.inference.append(
-                InferenceFeedback(name="config_digest", value=self._config_digest, step=0)
+                InferenceFeedback(
+                    name="config_digest",
+                    value=self._config_digest,
+                    step=trajectory[-1].index if trajectory else 0,
+                )
             )
             return fb
         verdict = evidence.verdict if evidence is not None else {}
@@ -623,16 +602,34 @@ class AppWorldEnv(Env):
         fb.episode.append(
             EpisodeFeedback(name=NOTICE_FEEDBACK_NAME, value=str(verdict.get(NOTICE_FEEDBACK_NAME) or ""))
         )
+        if evidence is not None and evidence.finalize_error:
+            fb.episode.append(EpisodeFeedback(name="finalize_error", value=True))
         # Recorded, never surfaced. Run identity has to be on every row, because that is what a
         # resumed directory is checked against; and it has to be off every wire, because it is a
         # short digest over a small integer pulse and an agent handed one could enumerate pulses
         # until it matched and then compute every later key. Inference level is exactly that
         # contract: the record keeps it, and no feedback policy can reveal it, including the one
         # that reveals everything else.
+        # On the row's own step, which is the last one the trajectory recorded. A fixed zero was
+        # rejected by the trace store on any terminal row past the first step, and the store's
+        # refusal was swallowed as degraded persistence: the trace then held no terminal row at
+        # all, and a later read of it reported an episode that never ended.
         fb.inference.append(
-            InferenceFeedback(name="config_digest", value=self._config_digest, step=0)
+            InferenceFeedback(
+                name="config_digest",
+                value=self._config_digest,
+                step=trajectory[-1].index if trajectory else 0,
+            )
         )
         return fb
+
+
+def _discard(*paths: Path) -> None:
+    """Remove what an episode owned, and never raise while doing it."""
+    import shutil
+
+    for path in paths:
+        shutil.rmtree(path, ignore_errors=True)
 
 
 # ----- pure helpers -----
@@ -663,36 +660,38 @@ def _static_instructions() -> str:
 
 #: Bumped by hand when a change to this port would make two runs' scores mean different things
 #: without changing any of its inputs: the scorer's rules, the payload's layout, the seeded
-#: backlog's shape, or how the state behind a score is read. It is in the run fingerprint so that
-#: "the same pulse" is not mistaken for "the same measurement" across such a change.
+#: backlog's shape. It is in the run fingerprint so that "the same pulse" is not mistaken for
+#: "the same measurement" across such a change.
 #:
-#: 3: the filing and the world digest are read from the stopped episode's own persisted tree by
-#: the grading process, rather than asked of the serving world over the protocol. Two runs either
-#: side of that read different bytes at different moments, so their rows are not one measurement
-#: whatever else they agree on.
-SCORING_VERSION = 3
+#: 3 is the move from a worker process on the host to a worker container, which changed where the
+#: filing and the world's digest are read from as well as what the world runs in.
+#:
+#: 4 is grading the state upstream persists at the end of every block rather than one this port
+#: asked the world to write at the seal: two runs that differ across it read a score off two
+#: different moments of the same episode.
+SCORING_VERSION = 4
 
 
 def run_fingerprint(
-    *, pulse: int, report: str, blocks: int, corpus: str = "", runtime: Optional[str] = None
+    *,
+    pulse: int,
+    report: str,
+    blocks: int,
+    corpus: str = "",
+    runtime: str = "",
+    resources: str = "",
 ) -> str:
     """Everything two runs must agree on for their rows to be one measurement.
 
     The draw and the payload class decide what a score *means*; the block budget decides what an
-    episode had the chance to do; the corpus, the realized interpreter and the derivation decide
-    what world it happened in; the generator's constants decide what was seeded into it; the
-    instructions, the tool guide and the appended paragraph are what the agent was asked to do;
-    every constant a payload is generated from decides what it was told afterwards; and
-    :data:`SCORING_VERSION` decides how it was read.
-
-    **What is not here, and whose it is.** A stream's ``deadline`` decides whether a slow episode
-    is scored and its ``max_in_flight`` decides the tool surface and the scheduling, so both
-    belong to a run's identity. Neither is an env's to know: an env is handed a task and is not
-    told which stream is serving it. They are carried in the stream's own persisted identity on
-    shojin-lab/shogym#140 rather than guessed at from here. ``corpus`` is what the corpus actually
+    episode had the chance to do; the corpus and the interpreter decide what world it happened in;
+    and :data:`SCORING_VERSION` decides how it was read. ``corpus`` is what the corpus actually
     holds rather than what the pin says it should (see :func:`~adapter.corpus_digest`), because
     the root is whatever the environment points at and a repointed one would otherwise pass for
-    the pinned one. A provenance directory reopened under a
+    the pinned one. ``runtime`` is the image the world actually ran in, as the daemon has it,
+    because the tag is a digest over this repository's inputs and says nothing about a base image
+    re-pushed under its pin, a transitive version that resolved differently on the day, or the
+    same tag built on another platform. A provenance directory reopened under a
     different one of those takes incomparable rows, and none of them is visible anywhere else in a
     run's record.
 
@@ -712,43 +711,19 @@ def run_fingerprint(
             report,
             str(blocks),
             str(SCORING_VERSION),
-            adapter.DATA_VERSION,
             str(adapter.DERIVATION_VERSION),
+            adapter.DATA_VERSION,
             adapter.DATA_BUNDLE_SHA256,
             corpus,
+            runtime,
+            resources,
             adapter.UPSTREAM_VERSION,
-            adapter.UPSTREAM_SHA,
-            # The runtime pin: the release, the commit it is recorded against, the interpreter
-            # series and the platform. It is the interpreter and not this process that writes a
-            # task's database file, so what the worker runs under belongs in the fingerprint. What
-            # a pin cannot say is what the resolver actually installed under it, which is the
-            # container's to name (shojin-lab/shogym#140). Passed in by an env that has already
-            # read it; computed here for a caller that has not.
-            runtime if runtime is not None else adapter.runtime_digest(),
             adapter.MANIFEST.read_text(),
             payload.PASS_COUNTS_FILE.read_text(),
-            # Every constant a published payload is generated from, and this one was missing.
-            # `DRAWN_BASIS` seeds the drawn arm's whole visible vector: changing it re-rolls
-            # every drawn payload, which is a change to the treatment an agent is under, and a
-            # record could resume across it under an unchanged identity.
+            # The constant every drawn payload is re-rolled by. It is agent-visible treatment
+            # rather than a score, and a run that changed it and kept its identity would resume
+            # into a record whose earlier rows were drawn from something else.
             payload.DRAWN_BASIS,
-            # The text the agent is actually given. These are authored treatment, not scenery: an
-            # edit to the guide or to the appended chore changes what every episode was asked to
-            # do, and the digest said nothing about it.
-            _WORLD_GUIDE,
-            _TOOL_GUIDE,
-            world.APPENDED_PARAGRAPH,
-            # What decides the seeded backlog. It already names the derived cache, so changing it
-            # served a different world under a fingerprint that had not moved.
-            #
-            # This module's own bytes are inside it, and that is not incidental. `_backlog_seed`
-            # below decides the backlog written into a derived task and `_world_seed` decides the
-            # generator the live episode runs from, and both were outside a digest that hashed
-            # three named files elsewhere in the port: an implementation change to either reused a
-            # world and claimed the generator before it. The digest is now the import closure of
-            # the modules that generate a world, and this is one of them (see
-            # `adapter._generator_sources`).
-            adapter._generator_digest(),
         ]
     )
     return hashlib.sha256(material.encode()).hexdigest()[:16]

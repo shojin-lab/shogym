@@ -139,65 +139,39 @@ TaskStream(
     [TaskRef("appworld", 0)],
     prov_dir=...,
     feedback=Information(),
+    # Pass the fingerprint. It is what makes the rows of one record one measurement, and a resume
+    # under a changed draw, payload class, block budget, corpus or worker image is refused rather
+    # than appended.
+    identity=shogym.make("appworld").config_digest,
 )
 ```
 
-The env publishes `config_digest` on every terminal, at inference level. It is the fingerprint of
-everything the measurement rests on, so a runner that wants to prove two records are one
-measurement compares that value across their rows.
+Passing `identity` is how a record defends itself. A directory that already names one refuses a
+resume that names a different one, and refuses a caller that names none: the record has said what
+produced its rows, and rows that decline to say make it unreadable as one run afterwards.
 
-`config_digest` covers the draw, the payload class, the block budget, every constant a payload is
-generated from, the text the agent is given (the world guide, the tool guide and the appended
-paragraph), the generator that decides the seeded backlog (its constants, and the bytes of every
-module the world generators import, walked rather than listed), the corpus this run actually
-serves (all of it, including the 134 MB of shared base episodes read as input), the derivation
-layout, the runtime pin, and a hand-bumped scoring version that moves when how a score is read
-moves. The runtime is a *pin* and not a reading of what was installed: the release, the commit it
-is recorded against, the Python series and the platform. The pinned release's own dependencies are
-ranges, so two machines can resolve different transitive versions under one pin, and a module
-edited in place inside the runtime moves nothing. Reading the installed bytes is what would close
-that, and it belongs with the container the worker runs in
-([shojin-lab/shogym#140](https://github.com/shojin-lab/shogym/pull/140)), where the image digest
-names the whole tree at once. An env serves the corpus it
-read at construction for the whole of its life: the instructions, the supervisors and the dates
-come from that one reading, so a corpus edited underneath a running env cannot put new authored
-text behind an unchanged fingerprint. Pinning the text is not the whole of it, because a task's
-databases and its ground truth are read when that task is first served rather than at
-construction, so each unit of the corpus is checked against what the snapshot read before it is
-derived, and a unit that moved is an episode that does not happen. The derived and grader caches
-are named by the same source digest and carry a stamp inside them saying what they were built
-from, so a run pointed at a second corpus cannot serve material derived from the first.
-
-Each row's `feedback_regime` is the arm the task was **assigned**, not the arm it was told through.
-It has to be: the row is fsynced before the policy's answer is composed, because the answer is
-composed from the recorded row. So a cancelled terminal, a task the stream ended itself and a
-policy that could not answer all leave a scored row stamped `information` or `placebo` with nobody
-told. That is the field an intention-to-treat estimate wants, and every assigned task has one.
-Whether a given delivery reached the agent is the runner's to record, and the environment does
-not claim to answer it.
+The absence of a line is load-bearing, so two things fail closed on it. A delivery whose line
+cannot be written is not delivered: the terminating call is answered with the empty member every
+other silence uses, and the stream stops. And a terminal that outran its deadline delivers
+nothing even when the env's finalization eventually returns: the watchdog has already sealed that
+task into an unscored `timeout` row, which the design counts as a failed delivery to be scored at
+the floor and retried rather than as a dose, so the late answer carries the empty member and the
+log stays silent about it.
 
 ## Requirements
 
 Pin-and-install mechanics are shared; see [`../README.md`](../README.md). What is specific:
 
+- **Docker, and no fallback.** Every world runs in a container, because the code an agent writes
+  runs *as* the worker and a worker on the host runs it as the user running the run. A machine
+  with no reachable daemon is refused when an `appworld` env is **constructed**, with the reason.
 - **The `appworld` extra carries no packages, and cannot.** `appworld` 0.1.3.post1 pins
-  `pydantic>=1.9,<2`; shogym's MCP layer needs `pydantic>=2.7`. No environment satisfies both. The
-  port therefore builds an interpreter of its own (a virtual environment under
-  `~/.cache/shogym/appworld/runtime-<version>-<sha>/` holding the pinned release) and runs every
-  world in a subprocess under it. `SHOGYM_CACHE` relocates it; `uv` is used when it is on `PATH`
-  and `venv` + `pip` otherwise. This is provisioned when an `appworld` env is **constructed**, so
-  `import shogym` stays offline. Both pins are in that name and in a stamp inside it, and the
-  installed distribution is checked to be the pinned release before the tree is published, so a
-  build that resolved something else never gets served and a pin that moves builds a second
-  interpreter rather than reusing the first. What the wheel cannot say is which commit it was cut
-  from; that half of the pin names the runtime and is not verifiable against the artifact, and
-  what the realized code actually is is not read here at all: `config_digest` carries the pin,
-  and the container ([shojin-lab/shogym#140](https://github.com/shojin-lab/shogym/pull/140)) is
-  where an image digest names the realized tree. The app sources the wheel ships packed are
-  unpacked into that interpreter afterwards, and a second stamp written once the unpack has
-  exited zero is what says it is done: the runtime is already published by then, so an unpack
-  interrupted part way through would otherwise leave a complete runtime with an incomplete
-  package inside it.
+  `pydantic>=1.9,<2`; shogym's MCP layer needs `pydantic>=2.7`. No environment satisfies both, so
+  upstream is not installed beside shogym; it is not installed on the host at all. It lives in an
+  image (`worker.Dockerfile`), built on first use and tagged with a digest over the Dockerfile and
+  the worker together. The build takes about a minute cold and resolves natively on both
+  architectures this port has run on; `SHOGYM_APPWORLD_PLATFORM` forces one if a machine needs it.
+  This is provisioned when an env is **constructed**, so `import shogym` stays offline.
 - **The data bundle is fetched and checked.** ~33 MB, once, into
   `~/.cache/shogym/appworld/corpus-0.1.0/`. Upstream's own downloader verifies nothing; this one
   refuses a bundle whose size and sha256 are not the pinned pair. `APPWORLD_ROOT` pointing at a
@@ -239,9 +213,9 @@ The base task's answer is recorded the way AppWorld records it, with
 
 ### finalize + verify
 
-`submit` seals the episode. `finalize` then reads the world's end state, collects the base task's
-own checks, and scores the filing against the drawn key, in the **serving** process and never in
-the world's. The worker's protocol has no field for the key and no comparison in it, so a world an
+`submit` seals the episode. `finalize` then stops its container, reads the end state upstream had
+already written, collects the base task's own checks, and scores the filing against the drawn key
+in the **serving** process, never in the world's. The worker's protocol has no field for the key and no comparison in it, so a world an
 agent had complete control of still could not be made to say what the answer was.
 
 `_verify` publishes the numbers plus the matched pair: `report` carries the receipt, `notice`
@@ -420,15 +394,17 @@ bytes, sha256 `fd9f9608c2ec71ed0ac25c3633a738b9129a318a129e31230425b9188e508250`
   payload whose whole argument is a closed ASCII vocabulary. An assertion row's observed value is
   `not determined` in every payload class, and the outcome appears only in the graded receipt's
   verdict column. The diff-carrying variant is not built.
-- **The world runs in a subprocess under its own interpreter,** for the packaging conflict above
-  and because AppWorld freezes the process clock and holds each app's database engine on a class
-  attribute. That subprocess binds a loopback port and refuses every request without a token
-  minted at spawn. AppWorld's own environment server publishes `evaluate`, `save_state` and
-  `load_state` unauthenticated on every interface; this one does not.
+- **The world runs in a container of its own,** for the packaging conflict above, because
+  AppWorld freezes the process clock and holds each app's database engine on a class attribute,
+  and because the code an agent writes runs as that process. It has one task's tree read-only, its
+  own output directory writable, and no network; it talks to its parent over the pipe pair the
+  parent made and over nothing else. AppWorld's own environment server publishes `evaluate`,
+  `save_state` and `load_state` unauthenticated on every interface; there is no interface here.
 - **The base task is graded in a second process that never runs agent code.** The world an
   episode is served from is built with `load_ground_truth=False`, so the answers and the checks
   are not objects in the process an agent's code runs as and there is no evaluator there to call.
-  At the seal the end state is flushed to disk and a short-lived grading process reads it.
+  Upstream persists the world at the end of every block, so the seal has nothing to flush: the
+  host stops the container and a short-lived grading container reads what is there.
 - **The generator's global-RNG state is captured and restored around every episode,** and the seed
   it is started from names the task and nothing else: not the session, not the run, not the
   feedback regime. AppWorld saves databases and not generator state, and every `login` draws from
@@ -457,97 +433,154 @@ bytes, sha256 `fd9f9608c2ec71ed0ac25c3633a738b9129a318a129e31230425b9188e508250`
   machinery. This is the environment and its three payload classes; the experiment that uses them
   is not in this repository.
 
-### What the worker boundary is, and what it is not
+### What the worker boundary is
 
-The code an agent writes runs **as** the worker process, with that process's filesystem and
-network, as the same user as the run. AppWorld's own `SafetyGuard` is not a boundary either: it
-refuses `import sys` and lets `__import__("sys")` through, and it null-patches `os.walk` and
-`os.listdir` while `io.open` reads whatever the user can read. **This port does not claim a
-sandbox, and on one uid no filesystem arrangement is one.** What it claims is that the cheap
-routes are closed and the expensive one is visible, each tested by running the probe:
+The code an agent writes runs **as** the worker process, and until this revision that process was
+the run's own user: everything the user could read, agent-authored code could read. The port said
+so in those words, because on one uid no filesystem arrangement is a boundary. The worker runs in
+a container now, so the boundary is the machine's rather than the arrangement's.
 
-| what | how |
+**What one episode's world can see, and it is the whole list:**
+
+| mounted | how |
 |---|---|
-| the worker's token and corpus root | passed on stdin, read once and closed, so `sys.argv` carries only the script and the subcommand |
-| the serving process's environment | replaced with an allow-list, so an inherited provider key is not there to read |
-| the answers, as objects | the world is built without ground truth, and there is no evaluator in the process |
-| the answers, as files | the served tree contains no `ground_truth`, and **no path in it leads to a directory the answers are a sibling of**: the task's own files are copies, and the shared base is named by a link into the derived tree, which has no answers in it by construction |
-| the grader's tree | a directory with an unguessable name under a private parent, not a neighbour of the served root |
-| one episode's grade | upstream's evaluator report is disabled, and an episode's whole output tree is named absolutely and lives outside every served corpus, so no episode holds another's end state, logs or verdicts |
-| the corpus itself | served inputs are independent copies rather than hard links, so a write through the served pathname changes neither the corpus later episodes are derived from nor the baseline the grader diffs against |
-| the next episode's inputs, by accident | each episode is served its own view: its task's world is copied per episode and removed with the episode, so an ordinary write through one episode's served pathname is that episode's own. What it can still reach and write is the shared base and the shared task cache the views are copied out of, which the container binds read-only ([shojin-lab/shogym#140](https://github.com/shojin-lab/shogym/pull/140)) and this host worker does not |
-| the drawn key | never sent to either process: the protocol has no field for one |
+| the corpus's shared parts (`base_dbs`, `api_docs`, `datasets`, `version.txt`) | read-only |
+| **one** task's world, from this episode's own view of the corpus | read-only, mounted by name, so `data/tasks` inside the container holds exactly one directory |
+| **one** episode's output tree, at `/outputs` | the only writable mount there is, and bounded before it is graded |
 
-**There is no file-access audit, and a run must not be read as though there were one.** An earlier
-revision of this port installed an audit hook to journal files opened from outside the served tree.
-It recorded opens made by the worker process, and in isolation it recorded opens made inside an
-embedded IPython shell, but it did not record a file read through a served `execute` call in a live
-world. A control that works on some paths and not the one that matters is worse than none, because
-an empty journal reads as "file access was audited and nothing was found" when it means nothing of
-the kind. It has been removed rather than shipped with a caveat. Nothing here records what an
-agent's code opens.
+**What it cannot see, and the word is *absent* rather than refused:** the run's provenance
+directory, the grader's tree and its private parent, the downloaded corpus, this port's cache, the
+repository, every other task's derived tree, every other episode's output tree, and the user's
+home. None of them is a file the world may not open. None of them is a path.
+
+**And no network.** The container is started with `--network none`, which is what inverting the
+transport bought: the worker used to answer on a loopback port, and a container-loopback listener
+cannot be forwarded, a published port is not loopback-only, and `--network none` and `-p` are
+mutually exclusive. It speaks length-prefixed JSON frames on the pipe pair its parent made
+instead, so there is no port to find and no token to need: a pipe has one writer. Descriptors 0
+and 1 are duplicated and then pointed at `/dev/null` and standard error, so a library that prints
+on import cannot corrupt a frame and agent code reading `sys.stdin` cannot eat a command.
+
+The arrangement the boundary replaced is all still there, and is now belt to its braces rather
+than the whole defence. The answers are absent from the served tree and are not objects in the
+process; nothing in the served tree is a symlink; served inputs are independent copies, so a
+write through a served pathname changes neither the corpus later episodes are derived from nor
+the baseline the grader diffs against, and each episode is served a view of its own so a write
+through one is not in the next one's inputs (under the container there is no write to make: the
+served tree is mounted read-only); upstream's evaluator report is off and an episode's output tree
+is its own, so no episode holds another's end state, logs or verdicts; the grader's tree has
+an unguessable name; and the drawn key reaches neither process, because the protocol has no field
+for one.
 
 **Nothing the host needs to know comes from the process that runs the agent's code.** There is no
-seal command, no quiesce command and no read command: the writer on the protocol's own socket is
-reachable from inside the interpreter that executes agent-authored Python, so a reply saying "I
-have flushed", "I have stopped" or "the filing says X" is a reply the episode could have written.
-The host signals the worker's process, waits for it, and grades what is on disk.
+seal command and no quiesce command: the writer on the protocol's own pipe is reachable from
+inside the interpreter that executes agent-authored Python, so a reply saying "I have flushed" or
+"I have stopped" is a reply the episode could have written. The host stops the container, asks the
+daemon to confirm it, and grades what is on disk.
 
-**What is on disk is the world as upstream last persisted it.** `AppWorld.execute` ends with its
-own save into the episode's output tree and `initialize` writes one before any block runs. So an
-episode that ran N blocks is graded on the state after block N, and one that ran none is graded on
-its opening state. The generator digest is written to the same tree for the same reason a
-lifecycle fact is not asked for: a diagnostic read out of a reply is a diagnostic the episode can
-choose.
+**What is on disk is the world at the end of the last block, because upstream puts it there.**
+`AppWorld.execute` ends with its own save into the episode's output tree and `initialize` writes
+one before any block runs. So an episode that ran N blocks is graded on the state after block N,
+and one that ran none is graded on its opening state. Work an agent's thread does after its last
+block is lost rather than scored, which is the same rule the block budget already states, and the
+generator digest is written to the same tree for the same reason: a diagnostic read out of a reply
+is a diagnostic the episode can choose.
 
-**What a stopped worker proves, and what it does not.** It proves that the process this port
-started was signalled and reaped before the tree was copied, so the filing, the digests and the
-evaluator all read one state. It does not prove that nothing was written on the way down, and it
-does not prove that nothing of the episode's is still running. The stop is SIGTERM, a short grace,
-then SIGKILL, and SIGTERM is catchable, so a process that ran agent-authored code has that grace
-in which an exit path of its own could still write. And what is stopped is that process and not
-everything it started: agent code runs there and is free to spawn, and a descendant of it survives
-the stop, holds whatever it holds, and can go on writing into the tree about to be graded. So the
-honest reading of a graded tree on this worker is "the state upstream persisted, plus anything the
-episode's own shutdown or its descendants persisted", not "the state at the end of block N and
-nothing else".
+**A removal the daemon will not confirm ends the episode.** `docker inspect` exiting nonzero is
+not the same fact as the container being gone: every daemon outage, unreachable context and
+timeout exits nonzero too. Not-found is read from the daemon's own wording, presence is read from
+success, and anything else is unknown, which fails closed. Teardown's own removal is the other
+contract and never raises, because a teardown that raises abandons the handles it was there to
+release; what it could not remove belongs to the sweep.
 
-**A serving process that dies abruptly leaves a world running.** Teardown is the ordinary path and
-it needs a parent to run it, so the case it cannot reach is the parent dying with an episode open.
-Nothing here covers that: the worker is reparented and goes on serving a world nobody holds a
-handle on, holding a port and a scratch directory, and this port neither notices nor comes back
-for it.
+**Docker's own proxy profile is emptied rather than left alone.** The client adds
+`HTTP_PROXY` and its variants to every container it creates, from whatever profile is configured,
+and a proxy URL can carry credentials or an internal host name. This port never passed them, which
+is how they were missed; they are now passed empty, which is what overrides an injection.
 
-**Both of those are the same fact, and it is the reason for the container.** A signal aimed at one
-process cannot promise anything about a tree of them, and a handle held in one process's memory
-cannot outlive that process. A namespace can do both: it can be destroyed rather than asked, and
-destroying it takes every process inside it, whatever they are and whoever started them.
-[shojin-lab/shogym#140](https://github.com/shojin-lab/shogym/pull/140) runs the episode worker in a
-container for exactly that, and **the host worker in this file is for development.** Use it to
-build a port, watch an episode and run the suite. A run whose scores have to survive an adversary
-needs the container, and a run made on the host worker should be read knowing that nothing was
-watching.
+**Two boundaries are bounded because they are the host's, not the container's.** The reader's frame
+buffer is a host allocation that the container's memory limit does not reach, so a header that is
+not a length and a body larger than any block's output are refused before anything is read, and
+either is fatal to that worker. And `/outputs` is a host bind that Docker cannot put a quota on, so
+what an episode wrote there is bounded at the boundary instead: bytes, files, depth and the wall
+clock the snapshot may take, with a tree past any of them refusing the episode rather than being
+copied. An episode can still fill a disk while it runs; bounding that needs a filesystem quota this
+port does not have.
 
-**The grader is given a snapshot, not the tree the world wrote.** The grading process is pointed
-at the root that holds the answers, so a link left under the output tree would resolve there. The
-root itself is checked before it is resolved, and every entry under it must be a plain file or
-directory; anything else refuses the episode rather than being skipped, because a grade over a
-tree with an entry quietly dropped is a grade over a tree nobody submitted. It is an ordinary
-copy otherwise: an episode wrote this tree, so its size and its depth are the episode's to choose,
-and what bounds them is the container's disk rather than anything here. It reads the filing, the
-databases' digest, the generator digest and the base task's own evaluator, all from those same
-bytes, so what is scored and what is graded are one state by construction rather than two
-observations that happened to agree.
+**A container nobody could remove is written down.** The sweep skips containers whose parent is
+alive, which is right for the ordinary case and wrong for a long-lived process that failed to
+remove one and has no later chance to try. A removal that could not be confirmed records the name
+where the sweep also looks.
 
-**The residual, stated exactly.** The private tree is hard to guess and not hard to read: it is
-the same uid, so its 0700 mode stops other users and stops nothing else. The shared base and the
-shared task cache are writable by the process that runs agent code, because it owns those files,
-so cross-episode contamination is closed against upstream (which never writes there) and against
-accident, and not against an episode that goes looking. The stop is one process's, and its
-descendants are outside it. The port's own source is readable, and with it the draw's algorithm.
-The run's provenance directory retains true reports even under `Placebo`. Anything else the user
-running the port can read is readable. Every one of those is closed by the container and by
-nothing in this file.
+**The grader is given a snapshot, not the tree the world wrote.** The grading container mounts the
+answers, so a symlink left under the output tree would resolve inside *its* namespace. Every entry
+is checked to be a plain file or directory resolving inside the tree, and anything else refuses the
+episode rather than being skipped; what is copied is a tree of regular files with no link in it.
+
+**Two more containers, and neither runs a line an agent wrote.** Seeding writes one task's
+database log into a staging directory, and grading reads the snapshot: the filing, the databases'
+digest, the generator digest and the base task's own evaluator against the answers. Both are short-lived,
+both are the same image, and grading is the only place ground truth is loaded at all.
+
+**The transport carries an identifier on every frame.** An ordered pipe is not HTTP: a command
+that timed out is still running and its answer still arrives, into the stream the next caller is
+reading. An answer whose identifier is not the one a call sent is discarded, and a call that
+stopped waiting poisons its worker outright, because a world with a command still running in it
+is not a world worth reusing.
+
+**The image.** Digest-pinned base (`python:3.12-slim-bookworm`), `appworld` version-pinned to the
+release this port reproduces, the app sources the wheel ships packed unpacked at build time, and
+everything byte-compiled so a read-only container is not recompiling on every episode. Tagged with
+a digest over the Dockerfile and the worker together, so an edit to either builds a new image
+rather than reusing one built under the old text. **The corpus is deliberately not baked in**: it
+carries every task's `ground_truth` beside every task's `specs.json`, so an image holding it would
+put the answers inside the container that runs the agent's code.
+
+`appworld` is no longer installed on the host at all. There is no host fallback and no flag for
+one: a worker on the host runs agent-authored code as the user running the run, which is the
+arrangement this exists to end. A machine with no Docker daemon is refused when an env is
+**constructed**, with the reason, rather than at the first `execute`.
+
+**There is no file-access audit, and a run must not be read as though there were one.** An earlier
+revision installed an audit hook to journal files opened from outside the served tree. It recorded
+opens made by the worker process, and in isolation it recorded opens made inside an embedded
+IPython shell, but it did not record a file read through a served `execute` call in a live world.
+A control that works on some paths and not the one that matters is worse than none. It was removed
+rather than caveated, and the container makes the property it was proxying for something to
+enforce rather than something to observe.
+
+**What a run is filed under.** The fingerprint carries the draw, the payload class, the block
+budget, what the corpus actually holds (every file the world reads, not only the tasks), the image
+the world ran in as the daemon has it, the cpu and memory that image was given, and how a score is
+read. Both derived caches are named for the corpus they were built from, so a tree warmed under one
+`APPWORLD_ROOT` cannot be served under another.
+
+**What it costs.** Measured on darwin/arm64 against the host worker it replaces, same task and
+same corpus: per-episode startup 1.87s to 2.32s, one `execute` round trip 1.8ms to 6.1ms on an
+empty block and 3.9ms to 11.1ms on one that makes an API call, grading 1.43s to 1.80s, and a whole
+served episode 8.72s to 8.99s. The image builds in about half a minute and is 95 MB.
+
+**What the world can learn about the host is names, not contents.** `/proc/self/mountinfo` is
+readable from inside and names the host-side source of every bind: the cache root, the private
+home and its tag, and this episode's own output directory. None is openable from there, none is
+the Docker socket, and none is a key, a pulse or a grade; and none of them differs between two
+arms of a pair, so a world cannot read its treatment off its own filesystem. The container's short
+id is kept out of the environment by giving every container the same hostname. The claim is about
+contents, and the port does not claim its paths are secret.
+
+**A container whose parent died is swept, not hoped about.** Every container carries the pid that
+started it and this machine's boot, and construction removes the labelled ones whose parent is
+gone. The case is a run that dies while a world is wedged in a command: the worker learns its
+parent has gone only from end-of-file on its next read, which it never reaches, so it never exits
+and `--rm` never fires.
+
+**The residual, stated exactly.** The daemon is trusted: a container is a boundary against the
+code inside it and not against whoever can talk to Docker, and this port's own parent process can
+do both. Episodes are isolated from each other and from the run by the mount set, not by separate
+kernels. The port's own source is readable to anyone with the repository, and with it the draw's
+algorithm; what has changed is that the world's process is not one of them. And the run's
+provenance directory still retains true reports under `Placebo`, which is the runner's business
+rather than the env's, but it is no longer readable from inside an episode.
 
 ## Gotchas
 
@@ -602,7 +635,9 @@ nothing in this file.
 | `world.py` | the appended paragraph, the four stored slots, and the derived corpus |
 | `scorer.py` | the drawn key, the per-item verdicts, and the fractions |
 | `payload.py` | the receipt, the digest and the drawn receipt |
-| `worker.py` | one world, in its own interpreter, behind a token-gated loopback port |
+| `worker.py` | one world, in a container of its own, answering frames on stdin |
+| `container.py` | the image, the mount set, and the flags a world is run under |
+| `worker.Dockerfile` | the image: the pinned interpreter and release, and not the corpus |
 | `adapter.py` | the pins, the provisioning, the served roster, the worker client |
 | `task_manifest.txt` | the 318 served tasks, settled before any episode |
 | `pass_counts.txt` | the roster's own distribution of passing-request counts |
