@@ -1901,15 +1901,25 @@ class TaskStream:
             about the failure is swallowed — what could not be finished is attached to the
             error being raised.
 
-            **It is called on the serving loop, and a slow factory is felt by every live
-            sibling.** :meth:`get_task` builds the env before it reaches its first await, so for
-            as long as a constructor runs no other episode can dispatch and the watchdog cannot
-            enforce anyone's deadline: a factory that takes seconds delays a 50 ms heartbeat by
-            seconds. That is measurable with the AppWorld port, whose construction walks a corpus
-            and an installed interpreter. Keep a factory cheap, or run the run under the
-            ``off_loop_factory`` contract added by the stacked lifecycle branch, which moves the
-            call onto the episode's own thread and owns what a cancelled caller leaves behind.
-            This module does not offer a second mechanism for it.
+            **Called on the caller's thread, with the caller's running loop, unless
+            ``off_loop_factory`` says otherwise.** That is a contract and not an accident: an
+            env is allowed to bind loop-affine resources in its constructor, and one that calls
+            ``asyncio.get_running_loop()`` there is a supported env.
+        off_loop_factory: declare that ``env_for`` is safe to call in a worker thread: no
+            running loop, no thread-affine resources, nothing read out of a context variable
+            that the caller's context would have to supply (the context is copied, so a value
+            set before the call is still visible). Constructing an env is blocking work, and for
+            some envs it is real work (provisioning a corpus, walking and copying two views of
+            it, taking a file lock), so an env that can say this gets its **per-task**
+            construction moved off the serving loop, where a cold or contended one would
+            otherwise stop every other episode this stream is serving and every deadline
+            watching them. Default ``False``, which keeps the contract above exactly.
+
+            It does not, and cannot, move the **catalog** call in this constructor. That call is
+            synchronous by construction, so a caller that makes it from inside a running loop
+            blocks that loop for its duration whichever thread the work happens on. For AppWorld
+            that first call is the cold provisioning one, and the way to keep a loop free of it
+            is to build the stream off the loop: ``await asyncio.to_thread(TaskStream, ...)``.
         tasks: the materialised queue. Non-empty; may repeat a task index. An env key is a
             private label while the queue names one env — anything at all, ``__`` included,
             since the wire carries only the env's own tool names. Name a second env and every
@@ -1993,6 +2003,7 @@ class TaskStream:
         # because `Never` is frozen and holds nothing per-run; a policy that ever holds state
         # (a `Delayed` queue, a `Noisy` generator) may not be a default for exactly that reason.
         feedback: FeedbackPolicy = Never(),
+        off_loop_factory: bool = False,
     ) -> None:
         if not isinstance(max_in_flight, int):
             # A capacity is a count of slots, and everything downstream reads it as one: it
@@ -2125,6 +2136,10 @@ class TaskStream:
                     )
 
         self._env_for = env_for
+        # Whether the caller has said this factory may be called in a worker thread. Off by
+        # default: the documented contract is that an env may bind loop-affine resources in its
+        # constructor, and moving an arbitrary callback off the loop would break one silently.
+        self._off_loop_factory = bool(off_loop_factory)
         self._queue: List[TaskRef] = queue
         self._max_in_flight = max_in_flight
         self._deadline = deadline
@@ -3712,16 +3727,17 @@ class TaskStream:
             # yet: if a span refuses to open, the episode never starts and the position is
             # still owed. Spans first, so nothing needs cleaning up when one fails.
             spans, dispensed_extensions = await self._begin_spans(ref)
-            # Built off the loop. The factory is the caller's own code and constructing an env is
-            # ordinary blocking work (for some envs it provisions a corpus, walks and copies two
-            # views of it, and takes a file lock), so evaluating it here, in the argument list of
-            # the await, is a cold or contended construction stopping every other episode this
-            # stream is serving and every deadline watching them (see :func:`_built`).
-            episode = await ServedEpisode.open_env(
-                await _built(lambda: self._env_for(ref.env)),
-                env_name=ref.env,
-                task=ref.task_idx,
-            )
+            # Off the loop only if the caller said this factory may be (see `off_loop_factory`).
+            # Constructing an env is blocking work and a cold one stops every other episode this
+            # stream is serving, but the factory is the caller's own code and the contract is
+            # that it runs where the caller is: an env that binds a loop in its constructor is a
+            # supported env, and moving one to a worker thread would break it with a
+            # `RuntimeError` on the first dispense and nothing in the record saying why.
+            if self._off_loop_factory:
+                env = await _built(lambda: self._env_for(ref.env))
+            else:
+                env = self._env_for(ref.env)
+            episode = await ServedEpisode.open_env(env, env_name=ref.env, task=ref.task_idx)
             try:
                 # The episode's own snapshot, taken when it was opened and the same for every
                 # reader (see :meth:`ServedEpisode.describe`). That is what makes the check below
@@ -5523,6 +5539,7 @@ class EvalStream(TaskStream):
         # word about why — and a caller reading that has every reason to reach for `TaskStream`
         # and pass the policy there, which is exactly the move this class exists to make visible.
         feedback: Any = _REFUSED,
+        off_loop_factory: bool = False,
     ) -> None:
         if feedback is not _REFUSED:
             # `Never()` is refused too, and that is the point rather than an oversight. A value
@@ -5547,6 +5564,7 @@ class EvalStream(TaskStream):
             provenance=provenance,
             provenance_timeout=provenance_timeout,
             feedback=Never(),
+            off_loop_factory=off_loop_factory,
         )
 
 

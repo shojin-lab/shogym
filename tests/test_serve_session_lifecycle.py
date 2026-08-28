@@ -21,6 +21,8 @@ too, and a stream that builds one on the loop stops every other episode it is se
 from __future__ import annotations
 
 import asyncio
+import contextvars
+import os
 import threading
 import time
 from pathlib import Path
@@ -52,6 +54,7 @@ class _SlowSessionEnv(_FixtureScoreEnv):
         begin_seconds: float = 0.0,
         end_seconds: float = 0.0,
         begin_error: Optional[BaseException] = None,
+        describe_error: Optional[BaseException] = None,
         tasks: Optional[List[Dict[str, Any]]] = None,
     ) -> None:
         self._begin_seconds = begin_seconds
@@ -62,9 +65,25 @@ class _SlowSessionEnv(_FixtureScoreEnv):
         self.releases: List[Dict[str, Any]] = []
         self.releases_finished = 0
         self.peak_releases = 0
+        self.closed = threading.Event()
+        self.closed_during_release = False
+        self.describe_error = describe_error
         self._inside = 0
         self._counting = threading.Lock()
         super().__init__(tasks=tasks or list(TASKS))
+
+    def describe(self, task_id: Optional[str] = None) -> Any:
+        if self.describe_error is not None:
+            raise self.describe_error
+        return super().describe(task_id)
+
+    async def _close(self) -> None:
+        """The env-level half of cleanup, which releasing a session is not. A `close()` that runs
+        while a release is still inside `_end_session` is tearing down underneath it."""
+        with self._counting:
+            if self._inside:
+                self.closed_during_release = True
+        self.closed.set()
 
     def _begin_session(self, session_id: str, task: Dict[str, Any]) -> None:
         self.begins.append(time.perf_counter())
@@ -127,6 +146,11 @@ async def test_a_cancelled_setup_releases_the_session_exactly_once() -> None:
     # the right way this time.
     assert env.begin_returned is not None
     assert env.releases[0]["at"] >= env.begin_returned
+    # And the env itself was closed, which releasing its session is not: `open_env` promises that
+    # ownership transfers and a setup failure closes what it was given, and an env's `_close` is
+    # where a constructor's processes, clients and temp directories go.
+    assert _until(env.closed.is_set), "the env was released but never closed"
+    assert env.closed_during_release is False
 
 
 async def test_a_setup_that_raises_releases_the_session_exactly_once() -> None:
@@ -147,6 +171,8 @@ async def test_a_setup_that_raises_releases_the_session_exactly_once() -> None:
     await asyncio.sleep(0.3)
     assert len(env.releases) == 1, env.releases
     assert env.peak_releases == 1
+    assert _until(env.closed.is_set), "the env was released but never closed"
+    assert env.closed_during_release is False
 
 
 def test_a_cancelled_setups_rollback_outlives_the_loop_it_was_cancelled_on() -> None:
@@ -209,9 +235,14 @@ async def test_a_timed_out_teardown_is_abandoned_and_never_reissued(
     # `close()` is bounded too. The release is still inside the hook when it runs, and it neither
     # waits for it a second time nor enters it again.
     assert closed < 0.3, closed
-    # The release the bound abandoned still finishes, in its own thread, on its own time.
+    # The release the bound abandoned still finishes, in its own thread, on its own time, and the
+    # env close follows it rather than running beside it. `Env.close` states that order, and a
+    # `_close` that tears down what `_end_session` is still using is the same use-after-free by
+    # another route. Bounding the caller's latency is not the same as declaring cleanup done.
     assert _until(lambda: env.releases_finished == 1)
     assert len(env.releases) == 1, env.releases
+    assert _until(env.closed.is_set), "the env was never closed"
+    assert env.closed_during_release is False
 
 
 async def test_an_ordinary_episode_releases_its_session_exactly_once() -> None:
@@ -256,11 +287,13 @@ async def test_a_wedged_teardown_does_not_stop_another_episodes_clock(
 # ----- constructing an env is blocking work, and it is not the loop's -----
 
 
-async def test_a_slow_construction_does_not_stop_the_rest_of_the_loop(tmp_path: Path) -> None:
+async def test_a_declared_off_loop_factory_does_not_stop_the_rest_of_the_loop(
+    tmp_path: Path,
+) -> None:
     # `TaskStream.get_task` used to evaluate the env factory in the argument list of its await,
     # which is on the loop. For an env that provisions a corpus and walks two views of it, a cold
-    # first construction is seconds of it, and every other episode's deadline is held for all of
-    # them.
+    # per-task construction is a second of it, and every other episode's deadline is held for all
+    # of them. Moved only for a factory whose caller has said it may be.
     ticks = 0
 
     async def ticker() -> None:
@@ -273,7 +306,12 @@ async def test_a_slow_construction_does_not_stop_the_rest_of_the_loop(tmp_path: 
         time.sleep(0.3)
         return _FixtureScoreEnv(tasks=list(TASKS))
 
-    stream = TaskStream(slow_factory, [TaskRef(ENV_NAME, 0)], prov_dir=tmp_path / "prov")
+    stream = TaskStream(
+        slow_factory,
+        [TaskRef(ENV_NAME, 0)],
+        prov_dir=tmp_path / "prov",
+        off_loop_factory=True,
+    )
     beat = asyncio.ensure_future(ticker())
     try:
         async with stream:
@@ -284,9 +322,11 @@ async def test_a_slow_construction_does_not_stop_the_rest_of_the_loop(tmp_path: 
     assert ticks > 20, ticks
 
 
-async def test_start_builds_its_env_off_the_loop(monkeypatch: pytest.MonkeyPatch) -> None:
+async def test_start_builds_its_env_off_the_loop_when_told_it_may(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
     # The same for the single-episode entry point, whose `make()` was on the loop for the same
-    # reason and with the same effect.
+    # reason and with the same effect, and behind the same declaration.
     ticks = 0
 
     async def ticker() -> None:
@@ -302,7 +342,7 @@ async def test_start_builds_its_env_off_the_loop(monkeypatch: pytest.MonkeyPatch
     monkeypatch.setattr(episode_module, "make", slow_make)
     beat = asyncio.ensure_future(ticker())
     try:
-        ep = await ServedEpisode.start(ENV_NAME, task=0)
+        ep = await ServedEpisode.start(ENV_NAME, task=0, off_loop_factory=True)
         await ep.close()
     finally:
         beat.cancel()
@@ -360,13 +400,15 @@ async def test_opening_many_episodes_reads_the_store_once(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     reads = {"n": 0}
-    real = FinalizationStore.load_all
+    real = FinalizationStore._load_all
 
     def counting(self: FinalizationStore) -> Any:
         reads["n"] += 1
         return real(self)
 
-    monkeypatch.setattr(FinalizationStore, "load_all", counting)
+    # The primitive that walks the directory, which is what costs, rather than the public reader
+    # that calls it.
+    monkeypatch.setattr(FinalizationStore, "_load_all", counting)
     for _ in range(3):
         ep = await ServedEpisode.open_env(
             _FixtureScoreEnv(tasks=list(TASKS)),
@@ -375,3 +417,238 @@ async def test_opening_many_episodes_reads_the_store_once(
         )
         await ep.close()
     assert reads["n"] == 1, reads
+
+
+async def test_a_setup_error_after_begin_releases_off_the_loop() -> None:
+    # `describe()` raising, or the constructor's own score/finalize guard, is a supported failure
+    # and it happens after the session exists. The release used to go through `env.close()`, and
+    # `Env.close` runs the hook inline, so a slow release on this path froze the loop and every
+    # deadline on it: measured at one 5 ms tick while a 300 ms hook ran on the main thread.
+    ticks = 0
+
+    async def ticker() -> None:
+        nonlocal ticks
+        while True:
+            ticks += 1
+            await asyncio.sleep(0.005)
+
+    env = _SlowSessionEnv(end_seconds=0.3, describe_error=RuntimeError("no contract"))
+    beat = asyncio.ensure_future(ticker())
+    try:
+        with pytest.raises(RuntimeError, match="no contract"):
+            await ServedEpisode.open_env(env, task=0)
+    finally:
+        beat.cancel()
+    assert len(env.releases) == 1, env.releases
+    assert env.releases[0]["thread"] != "MainThread", env.releases
+    assert ticks > 20, ticks
+    assert _until(env.closed.is_set), "the env was released but never closed"
+    assert env.closed_during_release is False
+
+
+# ----- the factory runs where its caller said it may -----
+
+
+class _LoopBoundEnv(_FixtureScoreEnv):
+    """An env that binds the running loop in its constructor. The stream contract permits this
+    (`test_a_catalog_env_is_never_closed_on_a_foreign_loop` codifies it), so a serve layer that
+    quietly moves the factory to a worker thread breaks a supported env."""
+
+    def __init__(self, **kwargs: Any) -> None:
+        self.loop = asyncio.get_running_loop()
+        super().__init__(**kwargs)
+
+
+async def test_a_loop_affine_factory_still_gets_its_loop_on_every_dispense(
+    tmp_path: Path,
+) -> None:
+    # Not only at construction. The catalog instance is built on the caller's loop either way;
+    # this is about the *second* invocation, the per-task one, which is the one that moved.
+    stream = TaskStream(
+        lambda _name: _LoopBoundEnv(tasks=list(TASKS)),
+        [TaskRef(ENV_NAME, 0)],
+        prov_dir=tmp_path / "prov",
+    )
+    async with stream:
+        await stream.get_task()
+        await stream.dispatch(SUBMIT_TOOL, {"answer": "4"})
+
+
+async def test_an_off_loop_factory_is_called_in_a_thread_with_the_callers_context(
+    tmp_path: Path,
+) -> None:
+    # The opt-in, and what it means: no running loop where the factory runs, a thread that is not
+    # the caller's, and the caller's context variables still readable, because a factory that
+    # reads one is reading a value its caller set rather than a loop it is bound to.
+    marker: contextvars.ContextVar[str] = contextvars.ContextVar("marker", default="unset")
+    marker.set("the caller's")
+    seen: Dict[str, Any] = {}
+
+    def factory(_name: str) -> _FixtureScoreEnv:
+        try:
+            seen["loop"] = asyncio.get_running_loop()
+        except RuntimeError:
+            seen["loop"] = None
+        seen["thread"] = threading.current_thread().name
+        seen["marker"] = marker.get()
+        return _FixtureScoreEnv(tasks=list(TASKS))
+
+    stream = TaskStream(
+        factory, [TaskRef(ENV_NAME, 0)], prov_dir=tmp_path / "prov", off_loop_factory=True
+    )
+    # The catalog call was the caller's, on the caller's thread. That is not an oversight: this
+    # constructor is synchronous, so no thread it delegates to would give the caller its loop back
+    # (see below).
+    assert seen["thread"] == threading.main_thread().name
+    async with stream:
+        await stream.get_task()
+        await stream.dispatch(SUBMIT_TOOL, {"answer": "4"})
+    assert seen["loop"] is None
+    assert seen["thread"] != threading.main_thread().name
+    assert seen["marker"] == "the caller's"
+
+
+async def test_the_first_construction_is_the_callers_and_a_serving_caller_builds_off_the_loop(
+    tmp_path: Path,
+) -> None:
+    # The cold call for an env whose data is fetched lazily is this one, not the per-task one, and
+    # no flag on this constructor can move it: it is synchronous, so a caller that makes it from
+    # inside a running loop blocks that loop for its duration whichever thread does the work. The
+    # fix is the caller's, and it is one line, so it is tested as one.
+    ticks = 0
+
+    async def ticker() -> None:
+        nonlocal ticks
+        while True:
+            ticks += 1
+            await asyncio.sleep(0.005)
+
+    def slow_factory(_name: str) -> _FixtureScoreEnv:
+        time.sleep(0.3)
+        return _FixtureScoreEnv(tasks=list(TASKS))
+
+    beat = asyncio.ensure_future(ticker())
+    try:
+        on_the_loop = TaskStream(
+            slow_factory, [TaskRef(ENV_NAME, 0)], prov_dir=tmp_path / "on-loop"
+        )
+        held = ticks
+        off_the_loop = await asyncio.to_thread(
+            TaskStream,
+            slow_factory,
+            [TaskRef(ENV_NAME, 0)],
+            prov_dir=tmp_path / "off-loop",
+            off_loop_factory=True,
+        )
+        moved = ticks - held
+    finally:
+        beat.cancel()
+    await on_the_loop.aclose()
+    await off_the_loop.aclose()
+    # Built on the loop: the loop did not advance. Built off it: it did, through the same 300 ms.
+    assert held <= 2, held
+    assert moved > 20, moved
+
+
+def test_a_scan_that_did_not_finish_is_not_remembered_as_one(tmp_path: Path) -> None:
+    # Remembering the directory before the pass ran turned one transient write failure into a
+    # record that stays PENDING for the life of the process: the first call raised, and every
+    # call after it found the path already answered and read nothing. Only a pass that resolved
+    # what it found counts.
+    store = FinalizationStore(tmp_path / "finalizations")
+    store.write(
+        FinalizationRecord(
+            session_id="prior", finalization_id="f-crash", status="PENDING",
+            source="explicit_tool",
+        )
+    )
+    real = FinalizationStore.write
+    failures = {"left": 1}
+
+    def flaky(self: FinalizationStore, record: FinalizationRecord) -> None:
+        if failures["left"]:
+            failures["left"] -= 1
+            raise OSError("the store is read-only for one call")
+        return real(self, record)
+
+    FinalizationStore.write = flaky  # type: ignore[method-assign]
+    try:
+        with pytest.raises(OSError):
+            store.recover_once()
+    finally:
+        FinalizationStore.write = real  # type: ignore[method-assign]
+    assert store.read("f-crash").status == "PENDING"
+    # Writability is back, and the next caller is the one that has to notice.
+    assert [r.finalization_id for r in store.recover_once()] == ["f-crash"]
+    assert store.read("f-crash").status == "FAILED"
+
+
+def test_a_directory_holding_an_unreadable_record_is_scanned_again(tmp_path: Path) -> None:
+    # A file that cannot be read is skipped so the rest of the directory still loads, and that is
+    # right for a reader and wrong for a scan: the record it could not read is exactly the one
+    # recovery exists for, so the pass has not answered the question and may not be remembered.
+    directory = tmp_path / "finalizations"
+    store = FinalizationStore(directory)
+    store.write(
+        FinalizationRecord(
+            session_id="prior", finalization_id="f-crash", status="PENDING",
+            source="explicit_tool",
+        )
+    )
+    torn = directory / "finalization-f-torn.json"
+    torn.write_text("{not json", encoding="utf-8")
+    assert [r.finalization_id for r in store.recover_once()] == ["f-crash"]
+    # Unremembered, because one entry was never read. A second pass finds nothing left to resolve,
+    # which is the point: it looked rather than assuming its predecessor had.
+    torn.unlink()
+    store.write(
+        FinalizationRecord(
+            session_id="prior", finalization_id="f-later", status="PENDING",
+            source="explicit_tool",
+        )
+    )
+    assert [r.finalization_id for r in store.recover_once()] == ["f-later"]
+
+
+def test_a_forked_child_asks_the_recovery_question_for_itself(tmp_path: Path) -> None:
+    # "Once per process" means this process. The parent left a record alone because its owner was
+    # alive when the parent looked; a child that inherits that answer never looks again, and the
+    # record outlives the owner it was waiting on. Sync, and forking before any loop exists, for
+    # the reason the stream's fork test gives.
+    directory = tmp_path / "finalizations"
+    store = FinalizationStore(directory)
+    store.write(
+        FinalizationRecord(
+            session_id="prior", finalization_id="f-crash", status="PENDING",
+            source="explicit_tool", owner_pid=os.getpid(),
+        )
+    )
+    assert store.recover_once() == []  # the owner is alive: nothing to resolve, and remembered
+
+    held = store.read("f-crash")
+    held.owner_pid = _a_dead_pid()
+    store.write(held)
+
+    verdict = tmp_path / "child-said"
+    pid = os.fork()
+    if pid == 0:  # pragma: no cover - the child never returns to the test runner
+        try:
+            resolved = FinalizationStore(directory).recover_once()
+            verdict.write_text(
+                ",".join(r.finalization_id for r in resolved), encoding="utf-8"
+            )
+        finally:
+            os._exit(0)
+    os.waitpid(pid, 0)
+    assert verdict.read_text(encoding="utf-8") == "f-crash"
+    assert store.read("f-crash").status == "FAILED"
+
+
+def _a_dead_pid() -> int:
+    """A pid nothing is running under: spawn a child, reap it, and use its id. Made rather than
+    guessed, because a number picked out of the air is a number something may be using."""
+    pid = os.fork()
+    if pid == 0:  # pragma: no cover - the child never returns to the test runner
+        os._exit(0)
+    os.waitpid(pid, 0)
+    return pid
