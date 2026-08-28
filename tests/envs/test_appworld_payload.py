@@ -490,19 +490,30 @@ def test_the_drawn_verdicts_do_not_move_when_the_real_ones_do(
 
 
 def test_the_drawn_verdicts_do_not_move_when_the_key_does(backlog: ledger.Backlog) -> None:
-    first, second = draw_key(LEG, 0), draw_key(LEG, 3)
-    submission = filing(backlog, first, correct=11)
+    """Varying the pulse, which is what the key is actually drawn from.
+
+    Passing two `Key` objects while `render` keeps its own default pulse cannot detect the defect
+    this guards: the visible vector is keyed by the pulse too, so it would move with the hidden
+    parameter rather than with the key object. Two things sharing a hidden cause is a leak whether
+    or not either reads the other, and the only way to see it is to move the cause."""
+    submission = filing(backlog, draw_key(LEG, 0), correct=11)
     columns = {
         _last_column(
             payload.render(
                 task_id=TASK,
                 verdicts=score(
-                    backlog=backlog, key=key, filing=submission, assertions=CHECKS
+                    backlog=backlog,
+                    key=draw_key(LEG, pulse),
+                    filing=submission,
+                    assertions=CHECKS,
                 ),
                 cell=payload.DRAWN,
+                pulse=pulse,
             )
         )
-        for key in (first, second)
+        # Production pulses, not just two key objects: the real convention is a deterministic
+        # function of this number, so if the drawn vector still varies with it the arm leaks.
+        for pulse in (0, 3, 17, 4242)
     }
     assert len(columns) == 1
 

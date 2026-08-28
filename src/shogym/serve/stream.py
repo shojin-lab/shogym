@@ -1580,6 +1580,10 @@ def reconcile(prov_dir: Path) -> List[ResultRow]:
             # evaluation-grade — a row that is *more* trustworthy-looking than the run that
             # produced it, which is the one direction this record may never round in.
             feedback_regime=_recorded_regime(record),
+            # And the identity, for the same reason and from the same place. A row that lost it
+            # reads back as belonging to no particular run, which is precisely the row a later
+            # resume under a different configuration would be allowed to append beside.
+            run_identity=str(record.get("run_identity", "")),
         )
         for record in read_dispenses(prov_dir)
         if record["lease"] not in sealed
@@ -3036,12 +3040,20 @@ class TaskStream:
         and the harness rather than of the queue. A caller that names nothing gets the behaviour
         it had before, and so does a record written before this field existed: an empty identity
         matches anything, because refusing every directory recorded without one would punish the
-        record rather than the mismatch."""
-        if not recorded or not self._run_identity or recorded == self._run_identity:
+        record rather than the mismatch.
+
+        **The wildcard runs one way only.** An old record that names no identity is accepted by
+        any caller, because it cannot say what it was. A caller that names none is *not* accepted
+        by a record that does: the record has already said what produced its rows, and appending
+        rows that decline to say makes a directory nobody can read as one run afterwards. The
+        asymmetry is the whole point. Compatibility is owed to records written before this field
+        existed, not to a caller who could name an identity now and did not."""
+        if not recorded or recorded == self._run_identity:
             return
         raise ValueError(
             f"{self.prov_dir} holds {source} written under run identity {recorded!r}, but this "
-            f"stream serves under {self._run_identity!r}; the rows of one record are read together, "
+            f"stream serves under {self._run_identity or 'no identity'!r}; the rows of one record "
+            "are read together, "
             "so rows produced under two configurations have a mean that is about neither of "
             "them. Resume under the configuration the record was written with, or serve into a "
             "fresh provenance directory"

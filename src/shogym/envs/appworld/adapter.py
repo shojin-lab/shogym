@@ -35,6 +35,7 @@ import select
 import signal
 import shutil
 import subprocess
+import time
 import tempfile
 import sys
 import urllib.error
@@ -42,7 +43,7 @@ import urllib.request
 from dataclasses import dataclass
 from functools import lru_cache
 from pathlib import Path
-from typing import Any, Dict, Sequence, Tuple
+from typing import Any, Dict, List, Optional, Sequence, Tuple
 
 from shogym.envs._upstream import _locked
 
@@ -324,6 +325,15 @@ def graded_root() -> Path:
     return home / f"graded-{DATA_VERSION}-{_generator_digest()}-{_private_tag()}"
 
 
+def _read_tag(keyfile: Path) -> Optional[str]:
+    """The published tag, or ``None`` if there is not a complete one there yet."""
+    try:
+        tag = keyfile.read_text().strip()
+    except FileNotFoundError:
+        return None
+    return tag if len(tag) == 16 else None
+
+
 @lru_cache(maxsize=4)
 def corpus_digest(root: Path) -> str:
     """What the corpus at ``root`` actually holds, as sixteen hex characters.
@@ -333,10 +343,14 @@ def corpus_digest(root: Path) -> str:
     otherwise be served under a name that claims to be the pinned one, and would reuse a derived
     tree built from something else.
 
-    Read in full for the files that decide what a task is and what it is scored against, and by
-    name and size for the databases, which are 179 MB and would make this a minute of reading on
-    every construction. A database edited without changing its length is therefore not caught, and
-    that is the honest limit of this digest rather than a claim it does not make."""
+    **Every scoring-relevant file is read, not sized.** This once hashed `specs.json` in full and
+    took path and size for everything else, which left the ground truth and the evaluation
+    material identifiable only by length: a same-length edit to an answer key passed unnoticed
+    under a digest whose whole job is to say what the corpus holds. A size is not a summary of
+    contents, and a fingerprint that says it covers the scoring inputs has to have read them.
+
+    The task tree is the scoring input, so all of it is read. Reading it costs a second or so on
+    every fresh process, which is the price of the digest meaning what it says."""
     digest = hashlib.sha256()
     data = root / "data"
     version = data / "version.txt"
@@ -345,23 +359,36 @@ def corpus_digest(root: Path) -> str:
         if not path.is_file():
             continue
         digest.update(str(path.relative_to(data)).encode())
-        if path.name == "specs.json":
-            digest.update(path.read_bytes())
-        else:
-            digest.update(str(path.stat().st_size).encode())
+        digest.update(path.read_bytes())
     return digest.hexdigest()[:16]
 
 
 def episode_outputs(session_id: str) -> Path:
-    """One episode's own output tree, under the private home and named for the episode.
+    """One episode's own output tree, named for the episode and not under the private home.
 
     AppWorld joins its experiment name onto its own output root, so an absolute name replaces that
     root outright. That is what keeps an episode's end state, its logs and anything the evaluator
     leaves behind out of the corpus tree every other episode is served from. A shared output tree
-    is a place the other arm of a pair can read an earlier grade."""
-    home = private_home() / f"episodes-{DATA_VERSION}-{_private_tag()}"
+    is a place the other arm of a pair can read an earlier grade.
+
+    **Deliberately not a child of** :func:`private_home`. The runtime keeps this value on the live
+    AppWorld object, where agent-authored code can read it, so whatever directory it names is
+    named *to the agent*. Under the private home it named the grader's own parent, and the
+    unguessable tag that protects the grader stops protecting it once something hands the name
+    over. This tree is separate: reading it tells you where episode outputs go and nothing about
+    where the answers are.
+
+    The name is still absolute, so on the host this remains a path the worker's user could reach
+    if it went looking. Making it unreachable is the container's job (see the PR that runs the
+    worker in its own mount namespace); what belongs here is not handing over the address."""
+    home = episodes_home()
     home.mkdir(parents=True, exist_ok=True)
     return home / f"episode-{session_id}"
+
+
+def episodes_home() -> Path:
+    """Where per-episode output trees live: this port's ordinary cache, not the private one."""
+    return cache_root() / f"episodes-{DATA_VERSION}"
 
 
 @lru_cache(maxsize=1)
@@ -374,22 +401,34 @@ def _private_tag() -> str:
     home.mkdir(parents=True, exist_ok=True)
     os.chmod(home, 0o700)
     keyfile = home / ".tag"
-    # Created exclusively, and a loser reads the winner's value rather than keeping its own. Two
-    # processes that each kept their own would name two private trees, and a private tree is a
-    # copy of the corpus: the cost of getting this wrong is 134 MB and a rebuild, per loser.
+    existing = _read_tag(keyfile)
+    if existing is not None:
+        return existing
+    # Written whole, then published by rename. An exclusive create publishes the *name* before the
+    # bytes, so a concurrent reader could see a real file holding nothing, and a crash in the gap
+    # left that empty file behind for good. `os.replace` is atomic within a directory, so the name
+    # appears only once it already holds a complete tag.
+    tag = secrets.token_hex(8)
+    staged = home / f".tag.{os.getpid()}.{tag}"
+    handle = os.open(staged, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
     try:
-        handle = os.open(keyfile, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
-    except FileExistsError:
-        tag = keyfile.read_text().strip()
-        if len(tag) == 16:
-            return tag
-        raise RuntimeError(f"the private tag at {keyfile} is not a tag; remove it to rebuild")
-    try:
-        tag = secrets.token_hex(8)
         os.write(handle, tag.encode())
+        os.fsync(handle)
     finally:
         os.close(handle)
-    return tag
+    try:
+        # A loser takes the winner's tag rather than keeping its own: two processes that each kept
+        # theirs would name two private trees, and a private tree is a copy of the corpus, so the
+        # cost of getting this wrong is 134 MB and a rebuild for every loser.
+        os.link(staged, keyfile)
+    except FileExistsError:
+        pass
+    finally:
+        os.unlink(staged)
+    published = _read_tag(keyfile)
+    if published is None:
+        raise RuntimeError(f"the private tag at {keyfile} is not a tag; remove it to rebuild")
+    return published
 
 
 @lru_cache(maxsize=1)
@@ -523,7 +562,14 @@ class Worker:
         Signalled and reaped rather than asked over the socket. Teardown runs on the serving
         process's shared loop, so a close that waited on an HTTP round trip into a wedged world
         would hold every other episode with it; and there is nothing to ask for, because the end
-        state was flushed when the episode was read. A process that ignores the signal is killed."""
+        state was flushed when the episode was read. A process that ignores the signal is killed.
+
+        **The group, and not only its leader.** This used to signal only while the leader was
+        still alive and then wait only for that leader. A leader that had already exited left its
+        children unsignalled, and a child that outlived the leader was never noticed: the world
+        had been scored and something was still running in it. The group is signalled whatever the
+        leader is doing, and what is waited for is the group emptying."""
+        pgid = _group_of(self.process)
         if self.process.poll() is None:
             _stop(self.process, signal.SIGTERM)
             try:
@@ -534,6 +580,12 @@ class Worker:
                     self.process.wait(timeout=_CLOSE_SECONDS)
                 except subprocess.TimeoutExpired:
                     pass
+        elif pgid is not None:
+            # The leader is already gone, so nothing above signalled anything. Its children are
+            # still in its group.
+            _signal_group(pgid, signal.SIGTERM)
+        if pgid is not None:
+            _reap_group(pgid)
         for stream in (self.process.stdout, self.process.stderr):
             if stream is not None:
                 try:
@@ -589,6 +641,68 @@ def grade(
     return json.loads(out.strip().splitlines()[-1])["output"]
 
 
+def _group_of(process: subprocess.Popen) -> Optional[int]:
+    """The worker's process group, while it is still possible to ask."""
+    try:
+        return os.getpgid(process.pid)
+    except (OSError, AttributeError):
+        return None
+
+
+def _signal_group(pgid: int, how: int) -> None:
+    try:
+        os.killpg(pgid, how)
+    except (OSError, AttributeError):
+        pass
+
+
+def _group_members(pgid: int) -> Sequence[int]:
+    """Every live process still in ``pgid``, this process excluded.
+
+    Asked of `ps` rather than of `/proc`, which macOS does not have. An answer this cannot get is
+    reported as an empty group: the caller uses it to decide whether to escalate, and a reaper
+    that raised on an unreadable process table would turn a diagnostic into a failed teardown."""
+    try:
+        listing = subprocess.run(
+            ["ps", "-o", "pid=,pgid=", "-A"],
+            capture_output=True,
+            text=True,
+            timeout=_CLOSE_SECONDS,
+        )
+    except (OSError, subprocess.SubprocessError):
+        return ()
+    live: List[int] = []
+    for line in listing.stdout.splitlines():
+        fields = line.split()
+        if len(fields) != 2:
+            continue
+        try:
+            pid, group = int(fields[0]), int(fields[1])
+        except ValueError:
+            continue
+        if group == pgid and pid != os.getpid():
+            live.append(pid)
+    return live
+
+
+def _reap_group(pgid: int) -> None:
+    """Wait for the worker's group to empty, escalating once if it does not.
+
+    Waiting for the leader says nothing about what the leader started. Agent code runs in that
+    process and may have left something behind, and something still running after the world has
+    been scored is either changing what was scored or holding a port the next episode wants."""
+    deadline = time.monotonic() + _CLOSE_SECONDS
+    escalated = False
+    while _group_members(pgid):
+        if time.monotonic() >= deadline:
+            if escalated:
+                return
+            _signal_group(pgid, signal.SIGKILL)
+            escalated = True
+            deadline = time.monotonic() + _CLOSE_SECONDS
+        time.sleep(0.02)
+
+
 def _stop(process: subprocess.Popen, how: int) -> None:
     """Signal the worker's whole process group, or the worker alone if it has no group of its own.
 
@@ -633,6 +747,7 @@ __all__ = [
     "corpus_digest",
     "derived_root",
     "episode_outputs",
+    "episodes_home",
     "grade",
     "graded_root",
     "private_home",

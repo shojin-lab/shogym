@@ -260,9 +260,34 @@ def derive_root(*, original: Path, derived: Path) -> Path:
         for entry in sorted(original.iterdir()):
             if entry.name == "tasks":
                 continue
-            if not (derived / entry.name).exists():
+            if not _complete(derived / entry.name):
+                # Rebuilt rather than trusted. A directory left half copied by a crash exists, and
+                # existence was all this used to ask for, so the next process served a truncated
+                # corpus and called it ready. The marker below is written last and is what
+                # "finished" means here.
+                shutil.rmtree(derived / entry.name, ignore_errors=True)
                 _materialise(entry, derived / entry.name)
+                _mark_complete(derived / entry.name)
     return derived
+
+
+#: Written into a materialised directory once every file under it is there. A directory without it
+#: is a directory some process was interrupted in the middle of.
+_COMPLETE = ".shogym-complete"
+
+
+def _complete(target: Path) -> bool:
+    """Whether ``target`` was finished, rather than merely started."""
+    if not target.exists():
+        return False
+    if target.is_dir():
+        return (target / _COMPLETE).exists()
+    return True
+
+
+def _mark_complete(target: Path) -> None:
+    if target.is_dir():
+        (target / _COMPLETE).write_text("")
 
 
 def _materialise(source: Path, target: Path) -> None:
