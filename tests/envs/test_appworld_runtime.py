@@ -16,7 +16,7 @@ import os
 import threading
 import time
 from pathlib import Path
-from typing import Any, Dict, List, Tuple
+from typing import Any, Dict, List
 
 import pytest
 
@@ -1591,3 +1591,78 @@ def test_session_setup_draws_the_backlog_for_a_task_that_is_already_derived(
         assert "abc_1" in env._backlogs, "the warm path drew nothing and left it to finalize"
     finally:
         mcp_server.end_session("warm")
+
+
+def test_a_task_that_is_no_longer_what_was_derived_is_built_again(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Reuse was decided by two path existences, which is not a task.
+
+    The question asked was whether the served `dbs/todoist.jsonl` and the graded `ground_truth`
+    were there. That says yes to a tree with everything else missing, to one whose databases were
+    changed after derivation, and to one whose read-only seal has come off; and what is reused is
+    the world every episode of the task starts in and the baseline it is graded against. Each of
+    the three is built here on a real derivation and the answer read.
+
+    A rebuild rather than a refusal, because a task that is not what was derived is a task this
+    can make correctly: the seeder is called again and the tree afterwards is the tree that was
+    published the first time."""
+    root = _derivable_corpus(tmp_path / "corpus")
+    env = _stub_env(root, tmp_path, monkeypatch)
+    seeder = _StubSeeder()
+    # Seeding is a container of its own on this branch, so what is counted is the call that
+    # starts it rather than a worker handed in.
+    monkeypatch.setattr(adapter, "seed", seeder)
+    env._derive("abc_1")
+    assert seeder.calls == 1
+    served = env._derived / "tasks" / "abc_1"
+    graded = env._graded / "tasks" / "abc_1"
+    assert world.already_derived(derived=env._derived, graded=env._graded, task_id="abc_1")
+    intact = {
+        path: path.read_bytes()
+        for path in sorted(served.rglob("*"))
+        if path.is_file() and not path.is_symlink()
+    }
+
+    def _damage(how: Any) -> None:
+        world._unseal(served)
+        how()
+        world._seal(served)
+
+    # A file removed, a file's bytes changed, and a node whose write bit came back. The third is
+    # left unsealed on purpose: it is the state a partial chmod leaves, and a shared task an
+    # episode can write to is one it can leave changed for the next episode and for the other arm
+    # of its own pair.
+    for damage in (
+        lambda: _damage(lambda: (served / "dbs" / "gmail.jsonl").unlink()),
+        lambda: _damage(lambda: (served / "dbs" / "gmail.jsonl").write_text("nail")),
+        lambda: world._unseal(served / "dbs" / "gmail.jsonl"),
+    ):
+        damage()
+        assert not world.already_derived(
+            derived=env._derived, graded=env._graded, task_id="abc_1"
+        )
+        before = seeder.calls
+        env._derive("abc_1")
+        assert seeder.calls == before + 1, "rebuilt rather than trusted"
+        assert world.already_derived(derived=env._derived, graded=env._graded, task_id="abc_1")
+        assert {
+            path: path.read_bytes()
+            for path in sorted(served.rglob("*"))
+            if path.is_file() and not path.is_symlink()
+        } == intact
+
+    # And the grader's own view is held to the same standard: it is the baseline the evaluator
+    # diffs against, and half of it was never checked at all.
+    world._unseal(graded)
+    (graded / "ground_truth" / "answer.json").write_text('"moved"')
+    world._seal(graded)
+    assert not world.already_derived(derived=env._derived, graded=env._graded, task_id="abc_1")
+    env._derive("abc_1")
+    assert json.loads((graded / "ground_truth" / "answer.json").read_text()) == "the answer"
+
+    # A warm episode pays for that check once per task, and this is what it costs.
+    began = time.monotonic()
+    for _ in range(20):
+        assert world.already_derived(derived=env._derived, graded=env._graded, task_id="abc_1")
+    assert (time.monotonic() - began) / 20 < 0.05

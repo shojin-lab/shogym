@@ -147,8 +147,9 @@ TaskStream(
 
 `config_digest` covers the draw, the payload class, the block budget, every constant a payload is
 generated from, the text the agent is given (the world guide, the tool guide and the appended
-paragraph), the generator that decides the seeded backlog (its constants and the bytes of the
-three modules that implement it), the corpus this run actually serves (all of it, including the
+paragraph), the generator that decides the seeded backlog (its constants, and the bytes of every
+module the world generators import, walked rather than listed), the corpus this run actually
+serves (all of it, including the
 134 MB of shared base episodes read as input), the derivation layout, what the worker image turned
 out to be rather than the release it was asked for, the cpu and memory a container is given, and a
 hand-bumped scoring version that moves when how a score is read moves. An env serves the corpus it
@@ -738,10 +739,20 @@ the counters move. Split across machines, the constants differ as well, and a re
 identity would be covering two descriptions of two machines.
 
 **A container whose parent died is swept, not hoped about.** Every container carries the pid that
-started it and this machine's boot, and construction removes the labelled ones whose parent is
-gone. The case is a run that dies while a world is wedged in a command: the worker learns its
+started it and this machine's boot, and a housekeeping pass removes the labelled ones whose parent
+is gone. The case is a run that dies while a world is wedged in a command: the worker learns its
 parent has gone only from end-of-file on its next read, which it never reaches, so it never exits
 and `--rm` never fires.
+
+This is where the host-worker branch keeps a ledger of worker *processes*, with a pid, a start
+time, a token and a scratch directory, and a keep-alive pipe each worker watches so it kills its
+own group when its parent goes. None of that exists here and none of it is needed: a worker is a
+container, it holds no scratch directory of the host's and no token, `--rm` and the pipe cover the
+parent that exits cleanly, and what a later run reads to recognise an abandoned world is the
+container's own labels rather than anything a dead process wrote down. What the two branches share
+is the question, which is whether the process that started this thing is still the process that
+started it; this port answers it in one place, for containers and for the per-episode trees beside
+them.
 
 **The residual, stated exactly.** The daemon is trusted: a container is a boundary against the
 code inside it and not against whoever can talk to Docker, and this port's own parent process can

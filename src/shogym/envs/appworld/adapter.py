@@ -55,7 +55,7 @@ import urllib.request
 from dataclasses import dataclass, field
 from functools import lru_cache
 from pathlib import Path
-from typing import Any, Dict, List, Mapping, Optional, Sequence, Tuple
+from typing import Any, Dict, Iterator, List, Mapping, Optional, Sequence, Tuple
 
 from shogym.envs._upstream import _locked
 from shogym.envs.appworld import container, world
@@ -297,9 +297,12 @@ def task_specs(root: Path, task_id: str) -> Dict[str, Any]:
 #: sealed. It is in both cache names, so a tree built under an older layout is a different cache
 #: rather than a stale one wearing the same name.
 #:
-#: 2: the shared half of a derived root is the entries this port names rather than everything the
-#: corpus had beside ``tasks`` (see :data:`~world.SHARED_ENTRIES`), so a tree built under 1 holds
-#: entries a tree built under 2 does not.
+#: 2: two changes to the shape, both of which a tree built under 1 fails to have. A derived task
+#: carries a manifest of what was copied into it, which is what says the derivation finished
+#: rather than two paths existing; and the shared half of a derived root is the entries this port
+#: names rather than everything the corpus had beside ``tasks``
+#: (see :data:`~world.SHARED_ENTRIES`), so a tree built under 1 also holds entries a tree built
+#: under 2 does not.
 DERIVATION_VERSION = 2
 
 #: What a derived cache was built from, written inside it once it is complete.
@@ -1037,24 +1040,6 @@ class _Frames:
             )
         return answer
 
-#: What every worker's scratch directory is named for, so a directory this port left behind on a
-#: host is one an operator can recognise.
-_SCRATCH_PREFIX = "shogym-appworld-"
-
-#: A grader's scratch directory, which is a worker's with a word added.
-_GRADE_SCRATCH_PREFIX = _SCRATCH_PREFIX + "grade-"
-
-
-def _close_descriptor(descriptor: Optional[int]) -> None:
-    """Close a raw descriptor, and treat one that is already closed as closed."""
-    if descriptor is None:
-        return
-    try:
-        os.close(descriptor)
-    except OSError:
-        pass
-
-
 #: The two frames this protocol has. A spawn is answered by a startup frame and a command by an
 #: answer; nothing on this pipe is ever both, so neither is ever accepted where the other belongs.
 _READY_FRAME: Tuple[str, ...] = ("ready",)
@@ -1220,6 +1205,22 @@ def graded_mounts(*, graded: Path, task_id: str, outputs: Path) -> List[Mount]:
     mounts.append(Mount(graded / "data" / "tasks" / task_id, f"{GRADED_MOUNT}/data/tasks/{task_id}"))
     mounts.append(Mount(outputs, OUTPUTS_MOUNT, writable=True))
     return mounts
+
+
+# ----- workers whose parent is gone -----
+#
+# **This port has one reaper, and it is `container.reap`.** The host-worker branch keeps a ledger
+# of worker *processes* here: a pid, a birth stamp, a token and a scratch directory, swept by a
+# later run that finds the owner gone. None of that exists on this branch. A worker is a
+# container, it holds no scratch directory of the host's and no token, and what a later run reads
+# to find an abandoned one is the container's own labels plus the disowned ledger those labels
+# cannot cover (see `container.reap` and `container.disowned`). Carrying both would be two
+# ledgers with one set of names between them, and nothing would ever write to this one.
+#
+# What the two share is the question rather than the code: whether the process that started this
+# thing is still the process that started it. `container.process_birth` and
+# `container._process_is_alive` answer it once, for containers and for the per-episode trees
+# beside them.
 
 
 @dataclass
