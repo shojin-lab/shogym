@@ -720,55 +720,88 @@ bind onto any other path inside `/proc` is refused by the container runtime outr
 mounted because it is inside /proc`), which was checked against this daemon rather than assumed.
 Covering more would need a userspace filesystem in every container rather than a flag.
 
-**What remains readable, and the parity claim over it.** The seven masked entries are covered;
-everything else under `/proc` and `/sys` is a residual, and the list below is what a recursive walk
-of both trees inside a served container actually finds, in both arms, twice per arm. It is
-generated rather than remembered: the earlier version of this section named the top level of
-`/proc` and four nested paths, and a walk found `/proc/sys/fs/file-nr`, a fresh
-`/proc/sys/kernel/random/uuid` on every read, the kernel allocator's counters under
-`/sys/kernel/slab`, per-device statistics and this container's own cgroup accounting varying too.
+**What remains readable, and what the gate actually asserts.** The seven masked entries are
+covered; everything else under `/proc` and `/sys` is a residual. The guarantee this port makes
+about it is exact and is checked rather than described:
+`test_the_two_arms_read_the_same_proc_and_sys_outside_what_moves` walks both trees whole in both
+arms, twice per arm, and compares file contents, directory listings, link targets and the failure
+of anything that could not be read. Everything the two arms can see there is byte-identical
+between them, **except the paths that move on their own**, and the test measures that set on the
+host it is running on rather than reading it from a list.
 
-Two arms of a pair on one host read the same bytes for **every** readable path under `/proc` and
-`/sys` except these, which is about fourteen thousand files against twenty-nine patterns:
+**The moving set is host-specific, and this list is an observation rather than a boundary.** What
+moves is a property of the kernel, the base image and the machine's devices: this laptop
+(darwin/arm64, Docker Desktop) moves the families below, and the project's CI runner moves
+fifty-six sysfs paths that are not among them. The gate does not consult this list at all, which
+is why it is portable; the list is here so a reader knows what kind of thing the residual is.
+`_generate_proc_residual` regenerates it.
 
 ```text
+/proc/<n>/io
+/proc/<n>/maps
+/proc/<n>/net/softnet_stat
+/proc/<n>/oom_score
+/proc/<n>/schedstat
+/proc/<n>/smaps
+/proc/<n>/smaps_rollup
+/proc/<n>/stat
+/proc/<n>/statm
+/proc/<n>/status
+/proc/<n>/syscall
+/proc/<n>/task/<n>/io
+/proc/<n>/task/<n>/maps
+/proc/<n>/task/<n>/net/softnet_stat
+/proc/<n>/task/<n>/oom_score
+/proc/<n>/task/<n>/schedstat
+/proc/<n>/task/<n>/smaps
+/proc/<n>/task/<n>/smaps_rollup
+/proc/<n>/task/<n>/stat
+/proc/<n>/task/<n>/statm
+/proc/<n>/task/<n>/status
+/proc/<n>/task/<n>/syscall
 /proc/buddyinfo
 /proc/cgroups
 /proc/driver/rtc
-/proc/fs/**
-/proc/interrupts
-/proc/locks
-/proc/mounts
+/proc/fs/**/es_shrinker_info
+/proc/irq/<n>/spurious
 /proc/pagetypeinfo
-/proc/pressure/*
-/proc/sched_debug
-/proc/schedstat
+/proc/pressure/cpu
+/proc/pressure/io
+/proc/pressure/memory
 /proc/slabinfo
 /proc/softirqs
-/proc/sys/fs/*
-/proc/sys/kernel/random/*
-/proc/timer_list
+/proc/sys/fs/dentry-state
+/proc/sys/fs/inode-nr
+/proc/sys/fs/inode-state
+/proc/sys/kernel/random/uuid
 /proc/vmstat
 /proc/zoneinfo
+/sys/devices/**/max_bytes
+/sys/devices/**/since_epoch
 /sys/devices/**/stat
+/sys/devices/**/time
 /sys/devices/**/urbnum
-/sys/devices/**/rtc/*/since_epoch
-/sys/devices/**/rtc/*/time
-/sys/devices/virtual/bdi/*/max_bytes
-/sys/fs/cgroup/**
-/sys/fs/ext4/**
-/sys/kernel/irq/*/per_cpu_count
-/sys/kernel/mm/**
-/sys/kernel/slab/**
-/sys/kernel/uevent_seqnum
+/sys/fs/cgroup/**/cpu.pressure
+/sys/fs/cgroup/**/cpu.stat
+/sys/fs/cgroup/**/io.pressure
+/sys/fs/cgroup/**/memory.current
+/sys/fs/cgroup/**/memory.peak
+/sys/fs/cgroup/**/memory.stat
+/sys/fs/ext4/**/lifetime_write_kbytes
+/sys/fs/ext4/**/session_write_kbytes
+/sys/kernel/irq/**/per_cpu_count
+/sys/kernel/slab/**/cpu_slabs
+/sys/kernel/slab/**/objects
+/sys/kernel/slab/**/objects_partial
+/sys/kernel/slab/**/partial
+/sys/kernel/slab/**/slabs
+/sys/kernel/slab/**/slabs_cpu_partial
+/sys/kernel/slab/**/total_objects
 ```
 
-These are kernel counters, per-device statistics, this container's own cgroup accounting, and
-values that are new on every read. They move between two reads on one machine, so two arms run at
-two instants do not read them identically and cannot be made to.
-`test_the_documented_proc_residual_is_what_a_walk_finds` walks both trees in both arms and holds
-the difference to exactly this list, so a new entry is a test failure rather than a quiet
-widening, and `_generate_proc_residual` is how the list is regenerated when a kernel adds one.
+These are kernel counters, per-device and per-cgroup accounting, and values that are new on every
+read. They move between two reads on one machine, so two arms run at two instants do not read them
+identically and cannot be made to.
 
 What that means for a design: **place a pair on one host**, where everything but the counters is
 shared. Split across machines, the constants differ as well (the boot identifier, the kernel
