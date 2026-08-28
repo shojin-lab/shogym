@@ -1053,28 +1053,159 @@ def test_an_env_that_publishes_the_same_name_for_something_else_is_not_read(
 
     A stream reserved the first terminal item called that and compared it against the caller's
     identity, so an environment publishing it as an ordinary metric would have had a successful
-    terminal turned into an unscored failure by a module that had no business reading it. The env
-    declares which item is its identity now, and one that declares nothing is not checked."""
+    terminal turned into an unscored failure by a module that had no business reading it. Which
+    item is an identity is the env's declaration now, read off the registered class so that a row
+    being replayed on a resume can be checked without a live env, and an env that declares nothing
+    is not read at all."""
+    from shogym.envs.registration import _ENV_REGISTRY, identity_feedback_name
     from shogym.serve.stream import TaskStream
 
-    stream = TaskStream.__new__(TaskStream)
-    stream._named_identity = "the-caller-name"
-    stream.prov_dir = tmp_path
-
-    class _Env:
+    class _Quiet:
         pass
 
-    class _Episode:
-        _env = _Env()
+    class _Speaks:
+        identity_feedback_name = "config_digest"
 
-    observed = [{"name": "config_digest", "value": "something else entirely", "level": "episode"}]
-    # Declares nothing: not read, not compared, not refused.
-    stream._require_env_agrees(observed, _Episode())
-    # Declares it: compared, and this one disagrees.
-    _Env.identity_feedback_name = "config_digest"
-    with pytest.raises(ValueError, match="the environment says"):
-        stream._require_env_agrees(observed, _Episode())
-    # And a declared name the env did not publish is not a failure either.
-    _Env.identity_feedback_name = "some_other_channel"
-    stream._require_env_agrees(observed, _Episode())
+    _ENV_REGISTRY["a-quiet-env"] = _Quiet
+    _ENV_REGISTRY["a-speaking-env"] = _Speaks
+    try:
+        assert identity_feedback_name("a-quiet-env") == ""
+        assert identity_feedback_name("a-speaking-env") == "config_digest"
+        stream = TaskStream.__new__(TaskStream)
+        stream._run_identity = "the-caller-name"
+        stream._env_identity = ""
+        stream.prov_dir = tmp_path
+        observed = [{"name": "config_digest", "value": "something else", "level": "episode"}]
+        # Declares nothing: not read, not compared, not refused.
+        stream._require_env_agrees(observed, env_name="a-quiet-env")
+        # Declares it: compared, and this one disagrees with the identity it is filed under.
+        with pytest.raises(ValueError, match="run identity"):
+            stream._require_env_agrees(observed, env_name="a-speaking-env")
+    finally:
+        _ENV_REGISTRY.pop("a-quiet-env", None)
+        _ENV_REGISTRY.pop("a-speaking-env", None)
+
+def test_a_snapshot_missing_a_log_is_not_a_world_to_grade(tmp_path: Path) -> None:
+    """Half a save is stable, and stable is what made it dangerous.
+
+    Upstream's saver clears its destination and writes the app logs one after another, so a world
+    stopped in the middle of one leaves a tree that never changes again and is missing a file. The
+    reply that said the block finished cannot be trusted, so completeness is checked rather than
+    believed: every log the task's own inputs have, and none of them cut off mid-write."""
+    served = tmp_path / "served" / "dbs"
+    served.mkdir(parents=True)
+    for name in ("todoist.jsonl", "gmail.jsonl"):
+        (served / name).write_text('{"row": 1}\n')
+    snapshot = tmp_path / "snap"
+    dbs = snapshot / "tasks" / "abc_1" / "dbs"
+    dbs.mkdir(parents=True)
+    (dbs / "todoist.jsonl").write_text('{"row": 1}\n')
+    (dbs / "gmail.jsonl").write_text('{"row": 1}\n')
+    # A whole save passes, so the refusals below are about the damage.
+    adapter.verify_snapshot(snapshot, task_id="abc_1", expected=served)
+
+    (dbs / "gmail.jsonl").unlink()
+    with pytest.raises(adapter.SnapshotError, match="missing gmail.jsonl"):
+        adapter.verify_snapshot(snapshot, task_id="abc_1", expected=served)
+
+    # And a log the save was cut off in the middle of writing.
+    (dbs / "gmail.jsonl").write_text('{"row": 1}\n{"row": 2, "cut')
+    with pytest.raises(adapter.SnapshotError, match="mid-line"):
+        adapter.verify_snapshot(snapshot, task_id="abc_1", expected=served)
+
+
+def test_a_worker_with_a_call_in_flight_does_not_settle(monkeypatch: pytest.MonkeyPatch) -> None:
+    """What finalization asks before it stops a container.
+
+    A terminal may overtake an ordinary call, which the serve layer does on purpose. What must not
+    follow is removing the container while upstream is inside the save it ends every block with:
+    the lock is held for the length of a call, so acquiring it is the fact that none is running,
+    and failing to inside the bound is the fact that one is."""
+    import threading
+
+    worker = _stub_worker(_ECHO, monkeypatch)
+    try:
+        assert worker.settle(0.5) is True
+        held = threading.Event()
+        released = threading.Event()
+
+        def _hold() -> None:
+            with worker.lock:
+                held.set()
+                released.wait(5)
+
+        thread = threading.Thread(target=_hold, daemon=True)
+        thread.start()
+        assert held.wait(5)
+        assert worker.settle(0.2) is False
+        released.set()
+        thread.join(5)
+        assert worker.settle(0.5) is True
+    finally:
+        worker.close()
+
+
+def test_a_spawn_that_never_becomes_ready_releases_everything(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """Removal can raise, and everything after it used to be skipped.
+
+    A control timeout raises even with the status unchecked, and the local client and its pipes
+    were released after that call. Nothing was going to come back for them, because spawn returned
+    no worker; and the ordinary sweep skips the labelled container because its parent is alive."""
+    monkeypatch.setattr(container, "_ledger", lambda: tmp_path / "disowned.txt")
+    import subprocess as _sub
+
+    process = _sub.Popen(
+        [sys.executable, "-c", "import time; time.sleep(30)"],
+        stdin=_sub.PIPE,
+        stdout=_sub.PIPE,
+        stderr=_sub.DEVNULL,
+        bufsize=0,
+    )
+
+    def _refuses(name: str, *, confirm: bool = False) -> bool:
+        raise container.DockerError("`docker rm` did not finish within 10s")
+
+    monkeypatch.setattr(container, "remove", _refuses)
+    adapter._release(process, "stuck-container")
+    # The container went to the ledger, and this process's own handles went whatever the daemon
+    # said.
+    assert container.outstanding() == ["stuck-container"]
+    assert process.poll() is not None
+    assert process.stdout is None or process.stdout.closed
+
+
+def test_the_sweep_keeps_a_tree_whose_owner_is_still_running(tmp_path: Path) -> None:
+    """Age is not evidence that anybody left.
+
+    This removed any per-episode tree untouched for an hour, and an episode can legitimately run
+    longer: sixty blocks at five minutes each is the default budget, a view's root is static from
+    the moment it is built, and a database written three levels down does not touch the root above
+    it. A sibling arm constructing an env would then have deleted a live episode's mounted tree.
+    What is asked now is whether the process that wrote the owner file is still there."""
+    import os
+    import time
+
+    from shogym.envs.appworld import env_v1
+
+    home = tmp_path / "episodes"
+    live, dead, unmarked = home / "live", home / "dead", home / "unmarked"
+    for root in (live, dead, unmarked):
+        root.mkdir(parents=True)
+        (root / "something").write_text("state")
+    env_v1._claim_tree(live)
+    (dead / env_v1._OWNER_FILE).write_text("999999 1700000000\n")
+    # Older than any age threshold anybody would pick.
+    ancient = time.time() - 86_400
+    for root in (live, dead, unmarked):
+        os.utime(root, (ancient, ancient))
+
+    env_v1._sweep_leftovers(home)
+    # The live one is this process, which is alive, so it stays however old it looks.
+    assert live.exists()
+    # The dead one names a process that is gone.
+    assert not dead.exists()
+    # And a tree with no owner predates this and is left alone rather than guessed about.
+    assert unmarked.exists()
 

@@ -39,6 +39,7 @@ from __future__ import annotations
 import asyncio
 import datetime as dt
 import hashlib
+import os
 import threading
 import zlib
 from pathlib import Path
@@ -73,6 +74,11 @@ SUBMIT_TOOL_NAME = "submit"
 #: API calls, a median of 25 and a maximum of 649, and a block may make as many calls as it likes,
 #: so this is a budget on turns rather than on work.
 DEFAULT_HORIZON = 60
+
+#: How long finalization waits for an accepted call to come back before it gives up on grading
+#: this episode. Short, because it runs inside the serve layer's own release bound, and long
+#: enough that an ordinary block finishing its save is waited for rather than raced.
+_SETTLE_SECONDS = 30.0
 
 #: The draw. It fixes the convention and the four stored slots for every task, and nothing else in
 #: the port reads it. Two runs that share it are graded against the same rules; two that do not
@@ -310,29 +316,35 @@ class AppWorldEnv(Env):
         # directory: AppWorld joins an experiment name onto its own output root, so an absolute
         # one replaces the root, and inside the container the absolute one is the mount point.
         outputs = adapter.episode_outputs(session_id)
+        # Claimed before anything is written into them, so a sweep racing this construction sees
+        # an owner rather than an untouched directory.
+        _claim_tree(outputs)
         experiment = container.OUTPUTS_MOUNT
-        # Deriving comes first, and has to: the world's container mounts this one task's tree, so
-        # the tree has to exist before there is a container to mount it into. Seeding is a
-        # container of its own, which is also why it no longer needs this episode's worker.
-        self._derive(task_id)
-        # This episode's own view of the derived corpus. Under the container the served tree is
-        # mounted read-only, so the write this exists to contain cannot happen at all; it is kept
-        # because it is the property at the layer below, and a run of this env without the
-        # container is a run where it is the only thing holding it.
-        view = world.derive_view(
-            derived=self._derived, view=adapter.episode_view(session_id), task_id=task_id
-        )
-        # Everything made before the session exists is made under this guard. A spawn or an open
-        # that failed used to leave the view and the output tree behind with nothing holding them:
-        # the env's own close finds no session, so neither was ever removed and both grew for the
-        # life of the machine.
+        view = adapter.episode_view(session_id)
+        # **Everything made before the session exists is made under this guard**, and the guard
+        # starts here rather than at the spawn: deriving a task the corpus does not have fails
+        # too, and it failed after the output tree had been claimed, so the tree was left with
+        # nothing holding it. The env's own close finds no session, so nothing else was going to
+        # remove either of them.
         worker: Optional[adapter.Worker] = None
         try:
+            # Deriving comes first, and has to: the world's container mounts this one task's tree,
+            # so the tree has to exist before there is a container to mount it into. Seeding is a
+            # container of its own, which is also why it no longer needs this episode's worker.
+            self._derive(task_id)
+            # This episode's own view of the derived corpus. Under the container the served tree
+            # is mounted read-only, so the write this exists to contain cannot happen at all; it
+            # is kept because it is the property at the layer below, and a run of this env without
+            # the container is a run where it is the only thing holding it.
+            _claim_tree(view)
+            view = world.derive_view(
+                derived=self._derived, view=view, task_id=task_id
+            )
             worker = adapter.Worker.spawn(view, task_id=task_id, outputs=outputs)
             worker.call(
                 "open", task_id=task_id, experiment=experiment, seed=_world_seed(task_id)
             )
-        except Exception:
+        except BaseException:
             if worker is not None:
                 worker.close()
             _discard(view, outputs)
@@ -489,6 +501,16 @@ class AppWorldEnv(Env):
         # pieces in sequence, so a stop in the middle of it leaves a tree that is stable and
         # partial. Confirmed absence proves that writing has stopped, not that it finished, so the
         # episode is refused here rather than scored on whatever the interruption left.
+        # **A terminal may overtake an ordinary call, and stopping on top of one is not allowed.**
+        # The serve layer lets a terminal jump the queue on purpose, so a submit can arrive while
+        # an `execute` is inside the save upstream ends every block with. Removing the container
+        # then leaves a tree that is stable and partial. So the call is waited for, bounded, and a
+        # world that will not settle is poisoned rather than stopped underneath.
+        if not await asyncio.to_thread(session.worker.settle, _SETTLE_SECONDS):
+            session.worker.poisoned = (
+                f"a call was still running {_SETTLE_SECONDS:.0f}s after this episode was sealed, "
+                "so stopping the world now would interrupt whatever it was writing"
+            )
         if session.worker.poisoned:
             await asyncio.to_thread(session.worker.close, confirm=False)
             raise RuntimeError(
@@ -513,6 +535,15 @@ class AppWorldEnv(Env):
         except BaseException:
             abandon.set()
             raise
+        # A whole save, or no grade. The reply that said a block finished is not evidence, so
+        # what is on the stopped tree is checked instead: every log the task's own inputs have,
+        # and none of them cut off mid-write.
+        await asyncio.to_thread(
+            adapter.verify_snapshot,
+            snapshot,
+            task_id=session.task_id,
+            expected=self._derived / "tasks" / session.task_id / "dbs",
+        )
         graded = await asyncio.to_thread(
             adapter.grade,
             graded=self._graded.parent,
@@ -690,27 +721,73 @@ def _discard(*paths: Path) -> None:
         shutil.rmtree(path, ignore_errors=True)
 
 
-def _sweep_leftovers(*homes: Path) -> None:
-    """Remove episode trees whose owning process is gone, at construction rather than at teardown.
+#: Written inside every per-episode tree, naming the process that owns it. A tree is somebody's
+#: until that process is gone, and nothing else is evidence of anything.
+_OWNER_FILE = ".shogym-owner"
 
-    What teardown declined to walk lands here, where nothing is waiting on a bound. A tree is
-    somebody's until its process exits, so age is what says it is nobody's: an hour is far longer
-    than an episode and far shorter than a run."""
+#: How many trees one construction will remove, and how long it will spend. The sweep runs where
+#: an env is built, which a stream may do on its serving loop, so it is bounded like everything
+#: else that runs there.
+_SWEEP_MAX_TREES = 64
+_SWEEP_SECONDS = 5.0
+
+
+def _claim_tree(root: Path) -> None:
+    """Mark a per-episode tree as this process's, so a sweep can tell it is not abandoned."""
+    from shogym.envs.appworld import container as container_module
+
+    try:
+        root.mkdir(parents=True, exist_ok=True)
+        (root / _OWNER_FILE).write_text(
+            f"{os.getpid()} {container_module.process_birth(os.getpid())}\n"
+        )
+    except OSError:
+        pass
+
+
+def _sweep_leftovers(*homes: Path) -> None:
+    """Remove episode trees whose owner is gone, and never one whose owner is alive.
+
+    **Age is not evidence.** This removed anything whose directory had not been touched for an
+    hour, and an episode can legitimately run longer than that: sixty blocks at five minutes each
+    is the default budget, a view's root is static from the moment it is built, and a database
+    written three levels down does not touch the root above it. A sibling arm's construction would
+    then have deleted a live episode's mounted tree. What is asked instead is whether the process
+    that wrote the owner file is still there, which is the same question, and the same evidence,
+    the container sweep asks: a pid and the birth stamp that says it is the same process.
+
+    A tree with no owner file predates this and is left alone rather than guessed about.
+
+    Bounded in both directions, because this runs where an env is constructed and a stream may
+    construct one on its serving loop."""
     import shutil
     import time
 
-    cutoff = time.time() - 3600
+    from shogym.envs.appworld import container as container_module
+
+    began = time.monotonic()
+    removed = 0
     for home in homes:
         try:
             entries = sorted(home.iterdir())
         except OSError:
             continue
         for entry in entries:
+            if removed >= _SWEEP_MAX_TREES or time.monotonic() - began > _SWEEP_SECONDS:
+                return
             try:
-                if entry.stat().st_mtime < cutoff:
-                    shutil.rmtree(entry, ignore_errors=True)
+                owner = (entry / _OWNER_FILE).read_text().split()
             except OSError:
+                # No owner, or unreadable: not evidence that anybody left.
                 continue
+            if not owner or not owner[0].isdigit():
+                continue
+            if container_module._process_is_alive(
+                int(owner[0]), owner[1] if len(owner) > 1 else ""
+            ):
+                continue
+            shutil.rmtree(entry, ignore_errors=True)
+            removed += 1
 
 
 # ----- pure helpers -----

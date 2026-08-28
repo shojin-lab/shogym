@@ -1421,12 +1421,17 @@ async def test_a_resume_is_refused_under_a_changed_draw_and_under_a_changed_dead
 
     prov = tmp_path / "run"
     first = shogym.make("appworld")
+    # The opportunity is part of what the caller names, not something the stream appends: a
+    # deadline decides whether a slow episode is scored or timed out, and a capacity decides the
+    # tool surface, so two directories that differ in either hold rows about two different
+    # opportunities. Composing it here keeps `identity` a string the stream compares and never
+    # reads, which is what stops it inferring a format it cannot verify.
     stream = TaskStream(
         shogym.make,
         [TaskRef("appworld", TASK)],
         prov_dir=prov,
         feedback=Information(),
-        identity=first.config_digest,
+        identity=f"{first.config_digest}|deadline=600.0",
         deadline=600.0,
     )
     async with stream:
@@ -1443,7 +1448,7 @@ async def test_a_resume_is_refused_under_a_changed_draw_and_under_a_changed_dead
             [TaskRef("appworld", TASK)],
             prov_dir=prov,
             feedback=Information(),
-            identity=other.config_digest,
+            identity=f"{other.config_digest}|deadline=600.0",
             deadline=600.0,
             resume=True,
         )
@@ -1457,7 +1462,7 @@ async def test_a_resume_is_refused_under_a_changed_draw_and_under_a_changed_dead
             [TaskRef("appworld", TASK)],
             prov_dir=prov,
             feedback=Information(),
-            identity=first.config_digest,
+            identity=f"{first.config_digest}|deadline=30.0",
             deadline=30.0,
             resume=True,
         )
@@ -1470,7 +1475,7 @@ async def test_a_resume_is_refused_under_a_changed_draw_and_under_a_changed_dead
         [TaskRef("appworld", TASK)],
         prov_dir=prov,
         feedback=Information(),
-        identity=first.config_digest,
+        identity=f"{first.config_digest}|deadline=600.0",
         deadline=600.0,
         resume=True,
     )
@@ -1630,6 +1635,65 @@ async def test_an_interrupted_world_is_not_graded_even_when_it_stopped_cleanly(
         await episode.close()
 
 
+async def test_a_terminal_that_overtakes_a_block_does_not_grade_the_interrupted_save() -> None:
+    """The race the serve layer creates on purpose, and what finalization does about it.
+
+    A terminal may overtake an ordinary call: a deadline has to be able to end an episode whose
+    block is not coming back. What must not follow is removing the container while upstream is
+    inside the save it ends every block with, because that leaves a tree that is stable and
+    partial and a grade taken over it is a grade of half a save.
+
+    So finalization waits for the accepted call, bounded, and a world that will not settle is
+    refused rather than stopped underneath. This submits while a block is still running."""
+    import asyncio as _asyncio
+
+    from shogym.envs.appworld import env_v1
+    from shogym.envs.appworld import mcp_server
+
+    env = shogym.make("appworld")
+    episode = await ServedEpisode.open_env(env, env_name="appworld", task=TASK)
+    session = mcp_server.get_session(episode.session_id)
+    assert session is not None
+    original = env_v1._SETTLE_SECONDS
+    env_v1._SETTLE_SECONDS = 1.0
+    slow = "print(sum(i * i for i in range(400000000)))"
+    try:
+        block = _asyncio.create_task(episode.call("execute", {"code": slow}))
+        await _asyncio.sleep(1.0)
+        terminal = await episode.call("submit", {})
+        block.cancel()
+        with contextlib.suppress(BaseException):
+            await block
+        feedback = {
+            item["name"]: item["value"] for item in (terminal.meta.get("shogym/feedback") or [])
+        }
+    finally:
+        env_v1._SETTLE_SECONDS = original
+        await episode.close()
+    # The block was still running, so the episode is refused rather than scored over whatever the
+    # stop interrupted.
+    assert feedback.get("finalize_error") is True
+    assert "checks" not in feedback
+    assert "report" not in feedback and "notice" not in feedback
+
+
+async def test_the_resolver_a_world_reads_says_nothing_about_the_host() -> None:
+    """Docker writes one from the host's resolver configuration even with no network at all.
+
+    The file it wrote named a nameserver and said it was based on the host's. There is nothing to
+    resolve in a container with no network, so what that file holds is host metadata and nothing
+    else; a fixed one is mounted over it."""
+    probe = """
+_io = __import__("io")
+print(json.dumps({"resolv": _io.open("/etc/resolv.conf").read()}))
+"""
+    played = await play([probe])
+    seen = json.loads(json.loads(played["outputs"][0]["content"])["output"])
+    assert "no resolver" in seen["resolv"]
+    assert "nameserver" not in seen["resolv"]
+    assert "host" not in seen["resolv"].lower().replace("this container", "")
+
+
 async def test_the_proxy_profile_a_client_is_configured_with_reaches_no_world(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:
@@ -1759,59 +1823,3 @@ async def test_information_hands_back_the_receipt_and_placebo_the_digest(
     # And the two answers are the same size on the wire, not just the two values.
     assert len(json.dumps(answers["information"])) == len(json.dumps(answers["placebo"]))
 
-async def test_a_record_named_before_the_opportunity_was_in_the_identity_still_resumes(
-    tmp_path: Path,
-) -> None:
-    """A durable format grew, and every record written under the old one would have been refused.
-
-    Before this, a named record stored the caller's string verbatim. It stores the caller's string
-    and what the run let an episode do now, so a resume that is otherwise identical, same caller
-    identity, same deadline, same capacity, met a mismatch that was about the format rather than
-    about the run. Refusing an unknown opportunity is right; refusing a known one is a break.
-
-    So a record naming exactly what this caller names is adopted, and the run that adopts it
-    rewrites the claim once."""
-    import json as _json
-
-    from shogym.serve.stream import Information, TaskRef, TaskStream
-
-    prov = tmp_path / "legacy"
-    env = shogym.make("appworld")
-    stream = TaskStream(
-        shogym.make,
-        [TaskRef("appworld", TASK)],
-        prov_dir=prov,
-        feedback=Information(),
-        identity=env.config_digest,
-    )
-    async with stream:
-        await stream.get_task()
-        await stream.dispatch("submit", {})
-
-    # Rewrite the durable rows the way a pre-PR run would have left them: the caller's string
-    # alone, with nothing about what the run let an episode do.
-    composed = None
-    for name in ("results.jsonl", "dispenses.jsonl"):
-        path = prov / name
-        if not path.exists():
-            continue
-        rows = [_json.loads(line) for line in path.read_text().splitlines() if line.strip()]
-        for row in rows:
-            if row.get("run_identity"):
-                composed = composed or row["run_identity"]
-                row["run_identity"] = env.config_digest
-        path.write_text("".join(_json.dumps(row) + "\n" for row in rows))
-    assert composed and composed.startswith(env.config_digest) and composed != env.config_digest
-
-    # It resumes, rather than being refused for a format it could not have written.
-    resumed = TaskStream(
-        shogym.make,
-        [TaskRef("appworld", TASK)],
-        prov_dir=prov,
-        feedback=Information(),
-        identity=env.config_digest,
-        resume=True,
-    )
-    assert resumed is not None
-    # A record naming some other composed identity is still refused, which is what the field was
-    # added for; that half is `test_a_resume_is_refused_under_a_changed_draw_and_under_a_changed_deadline`.
