@@ -31,10 +31,11 @@ import math
 import os
 import tempfile
 import threading
+import time
 import warnings
 from dataclasses import asdict, dataclass
 from pathlib import Path
-from typing import Any, Dict, List, Literal, Optional, Sequence, Tuple, Union
+from typing import Any, Dict, List, Literal, Optional, Sequence, Set, Tuple, Union
 
 # The evidence-schema version. Stamped on every :class:`TerminalEvidence`, the durable
 # record, and the trace ``terminal`` event so a reader can tell which envelope it is parsing.
@@ -50,6 +51,10 @@ try:  # pragma: no cover - one branch per platform
     _MAX_PID = int(Path("/proc/sys/kernel/pid_max").read_text(encoding="utf-8").strip())
 except (OSError, ValueError):
     _MAX_PID = 2 ** 31 - 1
+
+#: Where the no-trace finalization store lives, when a caller says. Read by every process, so a
+#: test that opens an episode in a child interpreter can keep it out of the developer's own store.
+SESSIONS_ROOT_ENV_VAR = "SHOGYM_SESSIONS_ROOT"
 
 TerminalSource = Literal["explicit_tool", "horizon", "abort"]
 TerminalStatus = Literal["ok", "finalize_error"]
@@ -358,11 +363,6 @@ class FinalizationStore:
         _mkdir_durable(self._dir)
         target = self._path(record.finalization_id)
         payload = asdict(record)
-        # Refused here, because the reader refuses it. A verdict nested past what a record may be
-        # wrote cleanly and then came back as a corrupt entry on the next read: durable evidence
-        # this process produced, quarantined by this process. One acceptance, both ways.
-        if _too_deep(payload):
-            raise ValueError("a finalization record is not nested this deep")
         blob = json.dumps(payload, sort_keys=True, allow_nan=False)
         fd, tmp = tempfile.mkstemp(dir=str(self._dir), suffix=".tmp")
         try:
@@ -525,8 +525,20 @@ class FinalizationStore:
         not be now, so the child asks again. The cache is emptied in the child at fork, and keyed
         by pid as well, for a platform that cannot register a fork handler."""
         key = str(self._dir.resolve()) if self._dir.exists() else str(self._dir)
-        with _RECOVERED_LOCK:
-            quarantined = _recovered().get(key)
+        while True:
+            with _RECOVERED_LOCK:
+                quarantined = _recovered().get(key)
+                if quarantined is not None or key not in _SCANNING:
+                    if quarantined is None:
+                        # Claimed before the scan, not after it. Checked and released, every cold
+                        # caller for one directory scanned the whole shared store: "once per
+                        # process" held for the answer and not for the work, which is the entire
+                        # cost this exists to remove. Claiming serialises callers for *this*
+                        # directory only, so a different store is still scanned in parallel.
+                        _SCANNING.add(key)
+                    break
+            # Somebody is scanning this directory. Wait for them rather than doing it again.
+            time.sleep(0.005)
         if quarantined is not None:
             if not quarantined:
                 return []
@@ -538,9 +550,15 @@ class FinalizationStore:
         # written, and holding a process-wide lock across it would stop episodes opening against
         # every other store. Two callers racing the same directory both scan, which costs a
         # second read and nothing else, because resolving a record is idempotent.
-        resolved, unreadable = self._recover()
+        try:
+            resolved, unreadable = self._recover()
+        except BaseException:
+            with _RECOVERED_LOCK:
+                _SCANNING.discard(key)
+            raise
         with _RECOVERED_LOCK:
             _recovered()[key] = tuple(unreadable)
+            _SCANNING.discard(key)
         if unreadable:
             warnings.warn(
                 f"{len(unreadable)} entries in {self._dir} are not finalization records and were "
@@ -562,6 +580,9 @@ class FinalizationStore:
 #: concurrently.
 _RECOVERED: Dict[str, Tuple[Path, ...]] = {}
 _RECOVERED_PID: Optional[int] = None
+#: Directories a caller in this process is scanning right now, so a second caller for the same one
+#: waits for the answer instead of computing it again.
+_SCANNING: Set[str] = set()
 _RECOVERED_LOCK = threading.Lock()
 
 
@@ -576,6 +597,7 @@ def _recovered() -> Dict[str, Tuple[Path, ...]]:
     pid = os.getpid()
     if _RECOVERED_PID != pid:
         _RECOVERED = {}
+        _SCANNING.clear()
         _RECOVERED_PID = pid
     return _RECOVERED
 
@@ -585,6 +607,7 @@ def _forget_recovered() -> None:
     when the fork happened. Both are replaced."""
     global _RECOVERED, _RECOVERED_PID, _RECOVERED_LOCK
     _RECOVERED = {}
+    _SCANNING.clear()
     _RECOVERED_PID = os.getpid()
     _RECOVERED_LOCK = threading.Lock()
 
@@ -593,33 +616,30 @@ if hasattr(os, "register_at_fork"):
     os.register_at_fork(after_in_child=_forget_recovered)
 
 
-def _too_deep(value: Any, depth: int = 0) -> bool:
-    """Is this nested past what a record may be? Iterative in the sense that matters: it stops at
-    the bound rather than at the interpreter's stack."""
-    if depth > _MAX_RECORD_DEPTH:
-        return True
-    if isinstance(value, dict):
-        return any(_too_deep(item, depth + 1) for item in value.values())
-    if isinstance(value, (list, tuple)):
-        return any(_too_deep(item, depth + 1) for item in value)
-    return False
-
-
 def _has_unwritable_number(value: Any) -> bool:
     """Is there a ``NaN`` or an infinity anywhere in here?
 
-    Recursive, because :meth:`FinalizationStore.write` is: it serialises with
-    ``allow_nan=False``, which walks the whole structure, so a check that stops at the first level
-    passes records the writer will never accept."""
-    if isinstance(value, float):
-        return not math.isfinite(value)
-    if isinstance(value, dict):
-        return any(
-            _has_unwritable_number(key) or _has_unwritable_number(item)
-            for key, item in value.items()
-        )
-    if isinstance(value, (list, tuple)):
-        return any(_has_unwritable_number(item) for item in value)
+    Walks the whole structure, because :meth:`FinalizationStore.write` does: it serialises with
+    ``allow_nan=False``, so a check that stops at the first level passes records the writer will
+    never accept.
+
+    **Iteratively, and that is the whole point.** Recursively it raises ``RecursionError`` on a
+    file deeper than the interpreter's stack, which is an exception the reader refuses nothing
+    with: the pass raises, the directory is never cached, and every episode rescans the whole
+    store. A depth *limit* is the wrong repair for it: v1 records and
+    ``TerminalEvidence.verdict`` have no bound, so a limit puts one on records this project has
+    already written and on verdicts an env may legally return."""
+    stack: List[Any] = [value]
+    while stack:
+        item = stack.pop()
+        if isinstance(item, float):
+            if not math.isfinite(item):
+                return True
+        elif isinstance(item, dict):
+            stack.extend(item.keys())
+            stack.extend(item.values())
+        elif isinstance(item, (list, tuple)):
+            stack.extend(item)
     return False
 
 
@@ -651,6 +671,15 @@ def _sessions_cache_root() -> Path:
     That keeps the contract local: the root exists and its entry is on disk when this returns,
     with no appeal to a later write that a recovery-only startup never performs."""
     try:
+        # An explicit root, when one is named. This is the seam a test suite needs: a fixture
+        # that patches a function reaches only the interpreter it runs in, and this repository
+        # has tests that open episodes in fresh interpreters. An environment variable is what a
+        # child process inherits.
+        named = os.environ.get(SESSIONS_ROOT_ENV_VAR)
+        if named:
+            base = Path(named)
+            _mkdir_durable(base)
+            return base
         base = Path(os.path.expanduser("~")) / ".cache" / "shogym" / "sessions"
         _mkdir_durable(base)
         return base
@@ -728,11 +757,6 @@ _UNREADABLE = (
     RecursionError,
 )
 
-#: How deep a record may nest before this reader stops calling it a record. `json.loads` accepts
-#: far deeper than anything this store writes, and the difference is an untrusted file that loads
-#: and then raises inside the validator, which is the one exception that is not a refusal.
-_MAX_RECORD_DEPTH = 32
-
 
 def _record_from_dict(data: Dict[str, Any]) -> FinalizationRecord:
     """One record from one decoded file, refusing anything that is not the shape of a record.
@@ -743,12 +767,6 @@ def _record_from_dict(data: Dict[str, Any]) -> FinalizationRecord:
     an episode opening against a directory shared with every session the machine has ever run."""
     if not isinstance(data, dict):
         raise TypeError(f"a finalization record is a JSON object, not {type(data).__name__}")
-    # Checked before anything walks it. A valid-looking file five hundred objects deep loads
-    # through `json.loads` and then raises `RecursionError` inside the validator below, which is
-    # not an exception this reader was refusing anything with: the pass raised, nothing was
-    # cached, and every episode after it scanned the whole store again.
-    if _too_deep(data):
-        raise ValueError("a finalization record is not nested this deep")
     for name in ("session_id", "finalization_id", "status", "source"):
         if not isinstance(data.get(name), str):
             raise TypeError(f"a record's {name} is a string, not {type(data.get(name)).__name__}")

@@ -810,13 +810,26 @@ def _with_preemption(diagnostic: Optional[str], preempted: Optional[str]) -> Opt
     return note if not diagnostic else f"{diagnostic}; {note}"
 
 
-async def _disposed(sessions: "List[MCPSession]") -> None:
-    """Close every session this setup opened, whatever any one of them does."""
+async def _disposed(
+    sessions: "List[MCPSession]", carried: Optional[BaseException] = None
+) -> None:
+    """Close every session this setup opened, whatever any one of them does.
+
+    Failures are carried rather than dropped. Continuing past one is right, because the sessions
+    after it still have to be closed; losing it is not, because the caller is being handed a setup
+    error and "a session would not close" is part of what happened while answering."""
     for session in sessions:
         try:
             await session.close()
-        except BaseException:  # noqa: BLE001 - best effort; one may not stop the rest
-            pass
+        except BaseException as failed:  # noqa: BLE001 - noted; one may not stop the rest
+            if carried is not None:
+                _noted(carried, "an MCP session", failed)
+            else:
+                warnings.warn(
+                    f"an MCP session could not be closed: {type(failed).__name__}: {failed}",
+                    RuntimeWarning,
+                    stacklevel=2,
+                )
 
 
 def _noted(carried: BaseException, what: str, failure: BaseException) -> None:
@@ -967,7 +980,8 @@ def _discarded_env(
 
 def _close_and_stop(lifecycle: "_Lifecycle", env: Any) -> None:
     cleanup = _env_close(env, lifecycle, None, contextvars.copy_context())
-    lifecycle.stop_when(cleanup.close_env())
+    cleanup.close_env()
+    lifecycle.stop_when(cleanup.watching())
 
 
 @dataclass
@@ -1380,19 +1394,27 @@ class ServedEpisode:
             # the env close and the lifecycle's own shutdown.
             if began is not None:
                 rollback = rollback or _SetupRollback(lifecycle, env, began, cleanup)
-            disposing = asyncio.ensure_future(_disposed(opened))
+            disposing = asyncio.ensure_future(_disposed(opened, setup_failed))
             disposing.add_done_callback(_swallow)
+            if rollback is not None:
+                # Told by the *task*, not by whoever gets to the line after the await. A caller
+                # cancelled mid-disposal used to say the sessions were closed while one of them
+                # was still closing, and the rollback then ran `Env.close` underneath it.
+                disposing.add_done_callback(lambda _f: rollback.sessions_closed())
             try:
                 await asyncio.shield(disposing)
             except BaseException as closing_failed:  # noqa: BLE001 - noted, not raised
                 if isinstance(closing_failed, asyncio.CancelledError) and _caller_cancelled():
                     # Handed back, but only after everything above has an owner: the rollback is
-                    # queued on the lifecycle, the sessions are disposing in their own task, and
-                    # the shutdown below is arranged behind the cleanup.
-                    if rollback is not None:
-                        rollback.sessions_closed()
+                    # queued on the lifecycle and is told by the disposal task itself, and the
+                    # close and the shutdown are started here rather than left to a line this
+                    # cancellation is about to skip. Without a rollback there is no session to
+                    # release and nothing else would ever start the close, so the env stayed open
+                    # and its lifecycle stayed alive.
+                    if rollback is None and not handed_over:
+                        cleanup.close_env()
                     if not handed_over:
-                        lifecycle.stop_when(cleanup.outcome)
+                        lifecycle.stop_when(cleanup.watching())
                     raise
                 _noted(setup_failed, "an MCP session", closing_failed)
             if rollback is not None:
@@ -1402,7 +1424,7 @@ class ServedEpisode:
                 # decision, and a wait is the one thing a cancellation may take.
                 rollback.sessions_closed()
                 if not handed_over:
-                    lifecycle.stop_when(cleanup.outcome)
+                    lifecycle.stop_when(cleanup.watching())
                 # The sessions above are closed before the env is, because `Env.close` releases
                 # what the *constructor* made and those clients may still be using it. The
                 # rollback is told rather than raced: it waits for this line before it arranges
@@ -1445,8 +1467,10 @@ class ServedEpisode:
             if not handed_over:
                 # Behind the cleanup, not on top of it: a rollback whose release outran the wait
                 # above is still running, and stopping the loop under it would abandon the env
-                # close it is about to arrange.
-                lifecycle.stop_when(cleanup.outcome)
+                # close it is about to arrange. And behind the *lifecycle's* half of that close,
+                # because a caller-owned close completes its outcome while the loop-side watcher
+                # is still running.
+                lifecycle.stop_when(cleanup.watching())
             raise
 
     async def env_closed(self, timeout: Optional[float] = None) -> None:
@@ -2198,12 +2222,28 @@ class ServedEpisode:
                     )
 
                 # A verifier bug must not strand the episode: fail closed on a verify() raise.
+                #
+                # **Bounded, and for the same reason the evaluator is.** `verify` runs on the loop
+                # that owns the env, and on the deadline path that loop is still holding the
+                # evaluator this transaction just timed out: awaiting it there put the fail-closed
+                # answer *behind* the thing the deadline exists to stop waiting for, so the
+                # promised bound was not a bound at all. What is left of the budget is what it
+                # gets, and a verifier that cannot run inside it fails closed like one that
+                # raised.
                 try:
-                    feedback = await self._env_verify(
-                        terminated=True, evidence=evidence
+                    feedback = await asyncio.wait_for(
+                        self._env_verify(terminated=True, evidence=evidence),
+                        timeout=self._verify_budget(),
                     )
                     items = [*feedback.inference, *feedback.episode]
-                except Exception as exc:  # noqa: BLE001 (verifier failure => fail closed)
+                except BaseException as exc:  # noqa: BLE001 (verifier failure => fail closed)
+                    # `BaseException`, so a `CancelledError` the verifier itself raised is
+                    # contained like any other verifier failure. Let out, it cancelled this
+                    # transaction after the in-memory evidence was set and before the durable
+                    # record was replaced: an episode neither finalized nor recoverable. A
+                    # cancellation asked for against this task is a different thing and goes back.
+                    if isinstance(exc, asyncio.CancelledError) and _caller_cancelled():
+                        raise
                     evidence = TerminalEvidence(
                         source=source,  # type: ignore[arg-type]
                         status="finalize_error",
@@ -2219,6 +2259,12 @@ class ServedEpisode:
                     self._evidence = evidence
                     items = []
                 self._terminal_feedback = [dump_item(item) for item in items]
+                # `verify` is awaited now, so this transaction yields between appending the step
+                # and committing it, and the deadline's forced terminal can seal in that gap.
+                # Rechecked rather than assumed: two callers came back with the same abort payload
+                # and neither tombstoned, over a trajectory that had grown a second terminal.
+                if self._finalization_id is not None and finalization_id != self._finalization_id:
+                    return self._sealed_tombstone()
 
                 # Durable state leads the public trace. Persist the terminal record FIRST —
                 # FINALIZED (ok) or FAILED (fail-closed) — so a crash can never leave a public
@@ -2431,6 +2477,13 @@ class ServedEpisode:
             return fn(*args)
         return await asyncio.wrap_future(self._lifecycle.call(fn, *args))
 
+    def _verify_budget(self) -> Optional[float]:
+        """What a verifier gets, when this transaction is running against a clock at all.
+
+        The finalize deadline is the caller's promise about when an answer arrives, and the
+        verifier is inside that promise, not after it."""
+        return self._finalize_deadline
+
     def _teardown_budget(self) -> float:
         """What is left of the one bound this episode's teardown gets, in seconds.
 
@@ -2507,8 +2560,14 @@ class ServedEpisode:
                     )
                 if not inflight.done():
                     # It has outrun the bound. From here the episode ends against it, exactly as
-                    # the deadline does, and the call is tombstoned when it lands.
-                    self._preempted = self._inflight_tool
+                    # the deadline does, and the call is tombstoned when it lands. For a non-seal
+                    # env that gate is `_terminated` and nothing else sets it: without this the
+                    # close tore the session down, returned, and the call then committed step 1
+                    # and ran `verify` against an env that was gone.
+                    async with self._lock:
+                        self._preempted = self._inflight_tool
+                        if not self._seal_enabled:
+                            self._terminated = True
             finalization: Optional["asyncio.Future[CallResult]"] = None
             if self._seal_enabled:
                 async with self._lock:
@@ -2646,7 +2705,7 @@ class ServedEpisode:
 
     def _teardown_now(self) -> None:
         """The arrangement itself: one close, then the shutdown behind it."""
-        self._lifecycle.stop_when(self._cleanup.close_env())
+        self._lifecycle.stop_when(self._cleanup.watching())
 
     async def _close_env(self) -> None:
         """Close the env, after this session's release and never beside it.
