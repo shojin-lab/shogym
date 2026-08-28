@@ -753,7 +753,7 @@ def test_a_publish_that_fails_puts_the_displaced_tree_back(
 
 
 def test_a_failed_terminal_publishes_the_failure_and_neither_arm() -> None:
-    """The row an unconfirmed stop leaves, and what used to be on it.
+    """The row a finalize that failed leaves, and what used to be on it.
 
     A finalize that fails closed used to publish a row of zeroed fractions with an empty receipt
     and an empty notice beside them. That is a scored-looking row for an episode nothing scored:
@@ -1353,8 +1353,8 @@ async def test_a_warm_finalize_draws_its_backlog_off_the_event_loop(
     monkeypatch.setattr(env_v1, "build_backlog", _slow_draw)
 
     class _wedged:
-        def close(self, *, confirm: bool = False) -> None:
-            raise adapter.WorkerError("the group could not be confirmed stopped")
+        def close(self) -> None:
+            raise adapter.WorkerError("the worker could not be stopped")
 
     env = env_v1.AppWorldEnv.__new__(env_v1.AppWorldEnv)
     env._pulse = 0

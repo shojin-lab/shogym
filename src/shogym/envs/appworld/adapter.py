@@ -1379,7 +1379,14 @@ def snapshot_outputs(outputs: Path, *, into: Path) -> Path:
     root = outputs.resolve()
     if not root.is_dir():
         raise SnapshotError(f"the episode left no output tree at {outputs}")
-    shutil.rmtree(into, ignore_errors=True)
+    # Whatever is under the destination name goes, whatever it is. `rmtree` alone leaves a plain
+    # file or a symbolic link exactly where it is, and the destination is a sibling of the tree the
+    # episode wrote and so a name the episode can create: one left as a file turned the next
+    # `mkdir` into a bare `FileExistsError` rather than this module's own refusal.
+    if into.is_symlink() or into.is_file():
+        into.unlink()
+    else:
+        shutil.rmtree(into, ignore_errors=True)
     into.mkdir(parents=True)
     # One pass: what is checked is what is copied. A validate-then-`copytree` would walk the tree
     # twice, and `copytree` on its own resolves the links this refuses.
