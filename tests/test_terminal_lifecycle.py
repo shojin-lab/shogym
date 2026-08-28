@@ -368,15 +368,18 @@ async def test_finalize_deadline_fails_closed_and_drains_evaluator_before_teardo
         evaluator_done["flag"] = True
         return ev
 
-    real_end_session = ep._env.end_session
+    # The hook, not the public wrapper: the serve layer claims a session and then runs the hook
+    # it was handed, so `_end_session` is where the release actually happens (see
+    # `Env.claim_session`) and the only place an observer can stand.
+    real_end_session = ep._env._end_session
 
     def observing_end_session(session_id):
-        # end_session drops per-session state — the evaluator must have drained by now.
+        # _end_session drops per-session state, so the evaluator must have drained by now.
         evaluator_done["at_end_session"] = evaluator_done["flag"]
         return real_end_session(session_id)
 
     ep._finalize = slow  # type: ignore[assignment]
-    ep._env.end_session = observing_end_session  # type: ignore[method-assign]
+    ep._env._end_session = observing_end_session  # type: ignore[method-assign]
     try:
         # The DEADLINE bounds caller latency: the fail-closed result returns while the evaluator
         # is STILL RUNNING, rather than teardown blocking on it. Asserted as ordering (the
@@ -397,7 +400,7 @@ async def test_finalize_deadline_fails_closed_and_drains_evaluator_before_teardo
         assert _feedback(ep)["finalize_error"] is True
         # ...yet env state is not dropped until the evaluator has drained (no use-after-free):
         # the drain+teardown runs in the background; close() waits for it.
-        assert ep._env.end_session is observing_end_session
+        assert ep._env._end_session is observing_end_session
         release.set()
         await ep.close()
         assert evaluator_done["at_end_session"] is True

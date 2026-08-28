@@ -552,20 +552,17 @@ nothing in this file.
 ## Gotchas
 
 - **`env.num_tasks` is 318, not 417.** Task indices address the manifest, not the split.
-- **Construction is slow, online, and blocking, and it happens on the serving loop.** Building the
-  runtime, fetching the corpus and copying it into the two derived views is a one-time cost;
-  deriving a task's seeded world costs about a second the first time it is served and nothing
-  after that. A warm construction is still about four seconds, and `TaskStream.get_task()` calls
-  the env factory synchronously, on the loop it serves on. So while one task is being constructed
-  nothing else on that loop runs: a live sibling episode cannot dispatch a call and its deadline
-  cannot fire, and a 50 ms heartbeat was measured arriving 4.689 s late behind one construction.
-  At `max_in_flight=1` that is dead time and nothing worse; above it, the capacity is not what it
-  says. The mechanism that fixes it is the `off_loop_factory=True` keyword on
-  `TaskStream` / `ServedEpisode` from
-  [shojin-lab/shogym#141](https://github.com/shojin-lab/shogym/pull/141), which this port depends
-  on and which is not on this branch, so nothing here passes it yet. A caller constructing an env
-  directly on a loop it is also serving on has the same problem for the same reason and should
-  build it in a thread. Set `APPWORLD_ROOT` to skip the download.
+- **Construction is slow, online, and blocking, and it no longer happens on the serving loop.**
+  Building the runtime, fetching the corpus and copying it into the two derived views is a
+  one-time cost; deriving a task's seeded world costs about a second the first time it is served
+  and nothing after that, and a warm construction is still about four seconds. On the serving loop
+  that is time nothing else on it runs: a live sibling episode cannot dispatch a call and its
+  deadline cannot fire, and a 50 ms heartbeat was measured arriving 4.689 s late behind one
+  construction. `TaskStream` and `ServedEpisode.start` take `off_loop_factory=True`, which builds
+  each task's env off the loop that is serving the others; this env declares no loop affinity, so
+  it passes it. A caller that calls `make()` itself on a loop it is also serving on has the same
+  problem for the same reason and should build it in a thread. Set `APPWORLD_ROOT` to skip the
+  download.
 - **A different `pulse` is a different experiment.** It fixes the convention and the four stored
   slots for every leg. Scores drawn under two pulses are not comparable, and neither the pulse nor
   the payload class appears anywhere else in a run's record, so every row carries a

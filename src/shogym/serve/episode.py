@@ -27,11 +27,13 @@ An env that marks nothing ``score`` never enters this path: ``_seal_enabled`` is
 from __future__ import annotations
 
 import asyncio
+import concurrent.futures
 import json
 import os
+import threading
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, Dict, List, Optional, Union
+from typing import Any, Callable, Dict, List, Optional, Union
 
 import jsonschema
 
@@ -137,38 +139,176 @@ def _wire_form(spec: TaskSpec) -> TaskSpec:
     return spec.model_copy(update={"tools": tools}) if changed else spec
 
 
-def _release_when_begun(env: Any, session_id: str, beginning: "asyncio.Future[None]") -> None:
-    """Release a session whose setup was abandoned, once that setup finishes.
+#: How long a failed or cancelled ``open_env`` waits for the rollback of a setup hook it
+#: abandoned. The release does not need this wait to happen (the hook thread performs it either
+#: way), so this only decides how long the caller is held before its own error reaches it.
+_ROLLBACK_SECONDS = 60.0
 
-    Setup runs in a thread and a thread cannot be told to stop, so a cancelled ``open_env`` cannot
-    undo what its hook is in the middle of doing. What it can do is leave a note: when the hook
-    lands, end the session it opened. An env whose hook failed has nothing to release and its
-    ``end_session`` is a no-op, which is why this does not distinguish the two cases."""
 
-    def release(finished: "asyncio.Future[None]") -> None:
-        if finished.cancelled():
-            return
+def _session_hooks() -> "concurrent.futures.ThreadPoolExecutor":
+    """The one thread an episode runs its env's session hooks on.
+
+    One per episode, one thread in it, built at the moment the first hook is submitted and shut
+    down when the episode closes. Three properties come out of that shape and every one of them
+    is load-bearing:
+
+    * **It outlives the caller and the loop.** What a submit hands back is a plain
+      :class:`concurrent.futures.Future` whose completion callbacks run *in the worker thread*.
+      So a rollback arranged for an abandoned setup finishes in the thread that ran the setup,
+      whether or not the caller's task still exists and whether or not the event loop it was
+      running on is still open.
+    * **One thread means the hooks cannot overlap.** A release submitted while the setup hook is
+      still running waits in the queue rather than beside it.
+    * **Nothing is created at import.** A pool built at import gives every process that imports
+      this module threads it never asked for, and a fork inherits the pool's locks without the
+      threads that would release them, so the first submit in the child waits forever. This
+      module is imported by a stream that has a test which forks, so that is not hypothetical.
+    """
+    return concurrent.futures.ThreadPoolExecutor(
+        max_workers=1, thread_name_prefix="shogym-session"
+    )
+
+
+class _SetupRollback:
+    """The single owner of the rollback for a setup hook that was abandoned mid-flight.
+
+    A thread cannot be cancelled, so a caller that gives up on ``begin_session`` leaves the hook
+    running and whatever it goes on to create, a process or a port or a directory, with nobody
+    left to release it. This queues the release behind the hook on the episode's own hook thread:
+    the hook lands, and the release runs next, in that same thread. No loop is consulted and none
+    has to still exist.
+
+    **One owner, and no second caller beside it.** ``Env.begin_session`` records the session id
+    before entering the hook, so an ``env.close()`` on the failure path would end a session the
+    hook is still inside. The failure path therefore waits on :meth:`settled` instead of closing
+    the env itself, and :meth:`shogym.core.Env.claim_session` makes any later attempt a no-op."""
+
+    def __init__(
+        self,
+        hooks: "concurrent.futures.ThreadPoolExecutor",
+        env: Any,
+        session_id: str,
+    ) -> None:
+        self._done = threading.Event()
+
+        def release() -> None:
+            try:
+                env.end_session(session_id)
+            except Exception:
+                pass
+            finally:
+                self._done.set()
+
         try:
-            loop = asyncio.get_running_loop()
+            hooks.submit(release)
         except RuntimeError:
+            # The executor is already shutting down, which leaves this caller as the only one
+            # who can still run the release. Here rather than nowhere.
+            release()
+
+    async def settled(self, timeout: Optional[float] = None) -> None:
+        """Wait for the rollback, if there is still a loop to wait on.
+
+        A bound rather than a promise: the caller is already carrying an error and must not be
+        held by a hook that is not coming back. What is guaranteed without any waiting at all is
+        that the release happens, because it is the hook thread that performs it.
+
+        The default is read here rather than bound as a default argument, so the module constant
+        is one value a caller can see and a test can move."""
+        bound = _ROLLBACK_SECONDS if timeout is None else timeout
+        try:
+            await asyncio.wait_for(
+                asyncio.to_thread(self._done.wait, bound), timeout=bound + 1.0
+            )
+        except BaseException:
+            # Including a `CancelledError`: this runs inside a handler that re-raises the failure
+            # it was called for, so the wait giving way never loses it. The release itself does
+            # not depend on this wait.
+            pass
+
+
+def _settled() -> "concurrent.futures.Future[None]":
+    """A future that is already done: the release for a session somebody else has claimed."""
+    done: "concurrent.futures.Future[None]" = concurrent.futures.Future()
+    done.set_result(None)
+    return done
+
+
+def _discard(env: Any) -> None:
+    """Close an env nobody took ownership of, on a loop of its own in a thread of its own.
+
+    A constructed env holds whatever its constructor made (for an out-of-process world, another
+    process), and the caller that asked for it has gone. ``Env.close`` is a coroutine, so closing
+    it needs *a* loop, and the one this was built for is the loop the caller just abandoned.
+    :func:`asyncio.run` in a fresh thread gives it one that belongs to nobody else."""
+
+    def close() -> None:
+        try:
+            asyncio.run(env.close())
+        except BaseException:
+            pass
+
+    # Not a daemon: this thread is the only thing that will ever close this env, and a process
+    # that exits before it runs leaks whatever the constructor made. It has no session to release,
+    # because setup never started, so what it runs is the env's own `_close` and nothing else.
+    threading.Thread(target=close, name="shogym-discard", daemon=False).start()
+
+
+def _discard_when_built(building: "concurrent.futures.Future[Any]") -> None:
+    """Arrange for :func:`_discard` on an env whose caller stopped waiting for it to be built."""
+
+    def discard(finished: "concurrent.futures.Future[Any]") -> None:
+        if finished.cancelled() or finished.exception() is not None:
             return
-        loop.create_task(_ended(env, session_id))
+        _discard(finished.result())
 
-    beginning.add_done_callback(release)
+    building.add_done_callback(discard)
 
 
-async def _ended(env: Any, session_id: str) -> None:
-    """End one session off the loop, swallowing whatever it says: this is cleanup after a failure
-    that is already on its way to the caller, and a second error here would replace the first."""
+def _swallow(finished: "asyncio.Future[Any]") -> None:
+    """Read an abandoned wrapper's outcome so asyncio does not report it as never retrieved.
+
+    The failure it carries is the one already on its way to the caller through the shield, and
+    the work it describes has an owner of its own."""
+    if not finished.cancelled():
+        finished.exception()
+
+
+async def _built(factory: "Callable[[], Any]") -> Any:
+    """Construct one env off the event loop, and let go of it cleanly if the caller stops waiting.
+
+    Constructing an env is ordinary blocking work, and for some envs it is real work: provisioning
+    a corpus, walking and copying two views of it, taking a file lock. Run on the shared loop it
+    stops every other episode the process is serving, along with their watchdogs and deadlines,
+    which is the whole reason the session hooks are off the loop too.
+
+    Offloading introduces one thing the synchronous call did not have: a moment where the env
+    exists and its caller no longer does. A thread cannot be cancelled, so a caller that gives up
+    on this await still gets an env built, holding whatever its constructor made. The wait is
+    therefore shielded and an abandoned build is closed by :func:`_discard`, arranged on the
+    builder's own thread so it does not depend on the loop the caller just left."""
+    builder = concurrent.futures.ThreadPoolExecutor(
+        max_workers=1, thread_name_prefix="shogym-build"
+    )
     try:
-        await asyncio.to_thread(env.end_session, session_id)
-    except Exception:
-        pass
+        building = builder.submit(factory)
+    finally:
+        # Immediately: the thread runs the job it already has and then exits. One construction,
+        # one thread, no pool left behind and none created at import.
+        builder.shutdown(wait=False)
+    waiter = asyncio.wrap_future(building)
+    try:
+        return await asyncio.shield(waiter)
+    except BaseException:
+        waiter.add_done_callback(_swallow)
+        _discard_when_built(building)
+        raise
 
 
 #: How long teardown waits for an env to release one episode's resources before going on without
 #: it. Teardown runs on the shared loop, so this is a bound on the wait rather than a kill: an env
-#: whose release has to be certain makes its own hook bounded.
+#: whose release has to be certain makes its own hook bounded. Spent once per session: whichever
+#: of teardown and close reaches the release first waits, and the other observes.
 _END_SESSION_SECONDS = 60.0
 
 
@@ -209,6 +349,7 @@ class ServedEpisode:
         trace_path: Optional[Union[str, Path]],
         spec: TaskSpec,
         finalize_deadline: Optional[float] = None,
+        hooks: Optional["concurrent.futures.ThreadPoolExecutor"] = None,
     ) -> None:
         self._env = env
         self._env_name = env_name
@@ -315,6 +456,14 @@ class ServedEpisode:
         # evidence; close() routes through the same guard). `_teardown_runs` is a test hook.
         self._torn_down = False
         self._teardown_runs = 0
+        # The thread this episode's env session hooks run on, and the ONE release future for its
+        # session. Both are per-episode: `_hooks` is shut down by `close()`, and `_released` is
+        # issued by whichever of teardown and close reaches it first and then only observed
+        # (see `_release`). `_release_waited` records that the bound has been spent, so the two
+        # paths cannot wait for one operation twice.
+        self._hooks = hooks if hooks is not None else _session_hooks()
+        self._released: Optional["concurrent.futures.Future[None]"] = None
+        self._release_waited = False
         # Set if a durable-record write ever failed (best-effort persistence — never fatal).
         self._persist_degraded = False
         # The in-flight evaluator task (retained so teardown drains it — see `_run_finalize`).
@@ -350,8 +499,15 @@ class ServedEpisode:
             # This episode has not sealed yet, so it owns no record here; only prior/other
             # sessions' dangling records are resolved. Best-effort: a read-only-store I/O error
             # never blocks startup.
+            #
+            # Once per store directory per process, not once per episode. The no-trace store is
+            # one directory shared by every session ever run on the machine, so reading it is
+            # O(the machine's whole history), and the answer, "what did a process that is gone
+            # leave behind", is the same for every episode this process opens. Asked per episode
+            # it turned a suite that opens eighty of them into minutes of reading JSON (see
+            # :meth:`FinalizationStore.recover_once`).
             try:
-                self._store.recover()
+                self._store.recover_once()
             except OSError:
                 pass
 
@@ -366,9 +522,16 @@ class ServedEpisode:
         finalize_deadline: Optional[float] = None,
     ) -> "ServedEpisode":
         """Build the env, load the task instance, open the essential MCP sessions, and push
-        per-episode state into the (in-process) tool servers."""
+        per-episode state into the (in-process) tool servers.
+
+        The env is built **off the loop**, for the reason its session hooks are: constructing one
+        is ordinary blocking work and some envs make it real work (provisioning a corpus,
+        walking and copying a cache, taking a file lock), so a cold or contended construction on
+        the shared loop stops every other episode this process is serving, and their watchdogs
+        and deadlines with them."""
+        env = await _built(lambda: make(env_name, config=env_config))
         return await cls.open_env(
-            make(env_name, config=env_config),
+            env,
             env_name=env_name,
             task=task,
             trace_path=trace_path,
@@ -395,6 +558,12 @@ class ServedEpisode:
         would tear down any sibling episode sharing the instance).
         """
         opened: List[MCPSession] = []
+        # The episode's own hook thread, built here so the setup hook and its rollback are the
+        # same thread's work, and handed to the episode below. On every path out of this method
+        # it belongs to exactly one owner: the episode that was returned, or the failure handler.
+        hooks = _session_hooks()
+        rollback: Optional[_SetupRollback] = None
+        handed_over = False
         env_name = env_name if env_name is not None else env.name
         try:
             task_idx = int(task) if task is not None else None
@@ -425,14 +594,15 @@ class ServedEpisode:
             # A thread cannot be cancelled, so a caller that gives up on this await leaves the
             # hook running, and whatever it goes on to create (a process, a port, a directory)
             # has nobody left to release it. The wait is therefore shielded and, if it is
-            # abandoned, the release is arranged for the moment the hook lands.
-            beginning = asyncio.ensure_future(
-                asyncio.to_thread(env.begin_session, session_id, task_data)
-            )
+            # abandoned, the rollback is queued behind the hook on this same thread: one owner,
+            # running whether or not the caller's task or its loop still exist.
+            beginning = hooks.submit(env.begin_session, session_id, task_data)
+            waiter = asyncio.wrap_future(beginning)
             try:
-                await asyncio.shield(beginning)
+                await asyncio.shield(waiter)
             except BaseException:
-                _release_when_begun(env, session_id, beginning)
+                waiter.add_done_callback(_swallow)
+                rollback = _SetupRollback(hooks, env, session_id)
                 raise
             # The one description this episode ever asks for. Everything published about the task
             # and everything enforced on it comes off this single answer — see the snapshot the
@@ -441,7 +611,7 @@ class ServedEpisode:
             # Construct inside the try so the cleanup below also covers the constructor's own
             # fail-loud guard (a `score` manifest with no callable finalize): the sessions
             # opened above are released before the error propagates.
-            return cls(
+            episode = cls(
                 env,
                 env_name,
                 resolved_task,
@@ -452,21 +622,34 @@ class ServedEpisode:
                 trace_path,
                 spec=spec,
                 finalize_deadline=finalize_deadline,
+                hooks=hooks,
             )
+            handed_over = True
+            return episode
         except BaseException:
-            # Setup failed, so no ServedEpisode is returned for the caller to close:
-            # release everything here. Close any opened MCP sessions, then close the
-            # env (drops per-episode state begin_session may have pushed before
-            # raising). Both are best-effort so the original setup error propagates.
+            # Setup failed, so no ServedEpisode is returned for the caller to close: release
+            # everything here. Every step is best-effort so the original setup error propagates.
             for session in opened:
                 try:
                     await session.close()
                 except Exception:
                     pass
-            try:
-                await env.close()
-            except Exception:
-                pass
+            if rollback is not None:
+                # The setup hook is still running and its rollback is already queued behind it on
+                # the hook thread. Closing the env here would be a second release on one
+                # episode's resources, because `Env.begin_session` records the session id before
+                # entering the hook, so `Env.close` would find it and enter `_end_session` while
+                # `_begin_session` is still inside. Wait for the one owner instead, for as long
+                # as there is a loop to wait on; a caller that is tearing the loop down gets a
+                # thread that finishes the release without it.
+                await rollback.settled()
+            else:
+                try:
+                    await env.close()
+                except Exception:
+                    pass
+            if not handed_over:
+                hooks.shutdown(wait=False)
             raise
 
     @property
@@ -1246,26 +1429,61 @@ class ServedEpisode:
             self._torn_down = True
             self._teardown_runs += 1
             self._state = LifecycleState.TEARING_DOWN
+        await self._release_session()
+        self._state = LifecycleState.CLOSED
+
+    def _release(self) -> "concurrent.futures.Future[None]":
+        """This session's **one** release, issued here and never issued again.
+
+        The session is claimed on the loop and the hook runs off it. Claiming first is what makes
+        the later ``env.close()`` in :meth:`close` safe: the id is gone from the env the instant
+        this returns, so a close that arrives while the hook is still running finds nothing of
+        this session left and cannot enter the hook a second time. That is the whole failure a
+        bounded teardown used to create: abandoning the wait left the first hook running, and
+        `close` went straight into the second.
+
+        A session somebody else has already claimed (a rollback that ran, an earlier close) gets
+        an already-finished future, because the release it names has an owner."""
+        if self._released is None:
+            release = self._env.claim_session(self._session_id)
+            if release is None:
+                self._released = _settled()
+            else:
+                try:
+                    self._released = self._hooks.submit(release)
+                except RuntimeError:
+                    # The hook thread is gone (a second close), so this caller runs the release.
+                    release()
+                    self._released = _settled()
+        return self._released
+
+    async def _release_session(self) -> None:
+        """Issue the session's one release and wait for it, once, up to the bound.
+
+        Off the loop and bounded, for the reason `begin_session` is: this runs on the shared loop
+        and an env that waits on a wedged child would hold every other episode with it. At the
+        bound the wait is abandoned, never the release: an env that needs its own release to be
+        certain has to make its hook bounded too, which is why the appworld worker's close signals
+        and reaps rather than asking politely over a socket.
+
+        The bound is spent once per session. Whichever of teardown and close reaches this first
+        does the waiting; the other returns immediately, because waiting a second time for one
+        operation is how a 60-second bound becomes a 120-second one."""
+        release = self._release()
+        if self._release_waited:
+            return
+        self._release_waited = True
         try:
-            # Off the loop and bounded, for the reason `begin_session` is: teardown runs on the
-            # shared loop and an env that waits on a wedged child would hold every other episode
-            # with it. At the bound the wait is abandoned; an env that needs its own release to be
-            # certain has to make its hook bounded too, which is why the appworld worker's close
-            # signals and reaps rather than asking politely over a socket.
-            #
-            # Abandoned, not repeated. The thread is still inside the hook when the bound expires,
-            # so re-issuing the release would put two of them on one episode's resources; an env
-            # whose hook is not safe to call twice would then be raced by this module rather than
-            # by anything a caller did.
+            # Shielded so the timeout cancels this wait and not the release: cancelling the
+            # wrapper would try to cancel the underlying job, and a job still queued behind a
+            # slow hook would be cancelled outright, abandoning the release rather than the
+            # wait.
             await asyncio.wait_for(
-                asyncio.shield(
-                    asyncio.to_thread(self._env.end_session, self._session_id)
-                ),
+                asyncio.shield(asyncio.wrap_future(release)),
                 timeout=_END_SESSION_SECONDS,
             )
         except Exception:
             pass
-        self._state = LifecycleState.CLOSED
 
     async def close(self) -> None:
         # close() participates in the lifecycle for a seal env. If a finalization is in flight,
@@ -1299,11 +1517,24 @@ class ServedEpisode:
             await self._teardown()  # idempotent: a no-op if the finalizer already ran it
 
         # Close every MCP session opened for this episode, then let the env tear down its own
-        # per-session state. `env.close()` drops in-process server state via `end_session`;
-        # out-of-process sessions are reaped by their `close()` above (one subprocess/session).
+        # per-session state. Out-of-process sessions are reaped by their `close()` above (one
+        # subprocess/session).
         for session in self._opened:
             try:
                 await session.close()
             except Exception:
                 pass
-        await self._env.close()
+        # This episode's session is released here, through the one owned release, and bounded.
+        # For a non-seal env this is where it happens at all, since nothing above tears down. The
+        # `env.close()` below is then a close over what is left of the env, not a second entry
+        # into this session's hook: the session was claimed the moment the release was issued, so
+        # even a release still running in its thread leaves `Env.close` with nothing of this
+        # episode's to do.
+        await self._release_session()
+        try:
+            await self._env.close()
+        finally:
+            # The hook thread has no work left that anything is waiting for. `wait=False`: a
+            # release still inside a wedged hook finishes in its own time and this close is not
+            # held by it, which is the same bound the wait above already declared.
+            self._hooks.shutdown(wait=False)
