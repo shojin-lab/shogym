@@ -16,8 +16,10 @@ from __future__ import annotations
 import json
 import os
 import sys
+import threading
+import time
 from pathlib import Path
-from typing import Any, Dict, List
+from typing import Any, Dict, List, Sequence
 
 import pytest
 
@@ -1237,6 +1239,171 @@ def test_a_frame_of_the_wrong_shape_is_fatal(monkeypatch: pytest.MonkeyPatch) ->
             monkeypatch.undo()
 
 
+def test_a_startup_frame_is_not_an_answer_to_a_command(monkeypatch: pytest.MonkeyPatch) -> None:
+    """"One of three keys" is not a shape, and the gap was a whole frame wide.
+
+    A spawn is answered by `ready` and a command by `output` or `error`, and the check accepted any
+    of the three whichever was being read. So a `ready` arriving in answer to an `execute` passed
+    framing, matched the identifier, left the protected read loop, and raised `KeyError('output')`
+    outside every handler here — after the lock had been released, with the worker neither poisoned
+    nor stopped, while the command it belonged to might still have been running. Each read now says
+    which of the two frames it is waiting for."""
+    emit = (
+        "body = json.dumps({'id': request['id'], 'ready': True}).encode()\n"
+        "    w.write(str(len(body)).encode() + b'\\n')\n"
+        "    w.write(body)\n"
+        "    w.flush()"
+    )
+    stub = _ECHO.replace(
+        'send({"id": request["id"], "output": {"saw": request["command"]}})', emit
+    )
+    stopped: List[str] = []
+    worker = _stub_worker(stub, monkeypatch)
+    monkeypatch.setattr(container, "remove", lambda name, confirm=False: stopped.append(name))
+    with pytest.raises(adapter.WorkerError) as refused:
+        worker.call("execute")
+    # Fatal, poisoned and removed, which is what a broken frame gets and what this used to escape.
+    assert "protocol was broken" in str(refused.value)
+    assert worker.poisoned
+    assert stopped == [worker.container]
+
+
+def test_a_worker_that_stops_reading_its_pipe_still_times_the_call_out(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """The deadline covered the answer and not the request.
+
+    `stdin.write` and `flush` are blocking calls into a pipe with one reader, and the deadline was
+    not consulted until the first read after them. A worker that stopped reading — wedged in a
+    native call, or running agent code that never returns — therefore held the host inside `write`
+    for ever once a request outgrew the pipe's remaining capacity, and the timeout that poisons and
+    removes never arrived. The stub here reads nothing at all, and the request is made larger than
+    any pipe buffer."""
+    monkeypatch.setattr(adapter, "_CALL_TIMEOUT_SECONDS", 0.5)
+    monkeypatch.setattr(container, "_ledger", lambda: tmp_path / "disowned.txt")
+    stopped: List[str] = []
+    # Reads nothing, ever. It holds the descriptors open so the write blocks rather than breaking.
+    worker = _stub_worker("import time\ntime.sleep(30)\n", monkeypatch)
+    monkeypatch.setattr(container, "remove", lambda name, confirm=False: stopped.append(name))
+    began = time.monotonic()
+    try:
+        with pytest.raises(adapter.WorkerError) as refused:
+            worker.call("execute", code="x" * (4 << 20))
+        assert "did not read its request" in str(refused.value)
+        assert time.monotonic() - began < 10.0, "the write waited on the reader, not the deadline"
+        # A half-written frame leaves the stream out of position, so this is the poisoning kind.
+        assert worker.poisoned
+        assert stopped == [worker.container]
+    finally:
+        worker.process.kill()
+        adapter._close_pipes(worker.process)
+
+
+def test_a_request_larger_than_the_protocol_writes_is_refused_before_anything_is_written(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The other half of the same bound. Nothing is written, so the worker is still usable: this is
+    a request this process declined to make rather than a protocol that broke."""
+    monkeypatch.setattr(adapter, "_MAX_REQUEST_BYTES", 1024)
+    worker = _stub_worker(_ECHO, monkeypatch)
+    try:
+        with pytest.raises(adapter.WorkerError, match="more than the 1024"):
+            worker.call("execute", code="x" * 4096)
+        assert not worker.poisoned
+        # And the pipe is still in position: the next ordinary call is answered.
+        assert worker.call("execute", code="print(1)") == {"saw": "execute"}
+    finally:
+        worker.process.kill()
+        adapter._close_pipes(worker.process)
+
+
+# ----- the save record is untrusted input -----
+
+
+def _snapshot_with_a_save(root: Path, *, manifest: Any) -> Path:
+    """A stopped snapshot holding one database log, with the save record a test wants beside it."""
+    dbs = root / "snapshot" / "tasks" / "abc_1" / "dbs"
+    dbs.mkdir(parents=True)
+    (dbs / "todoist.jsonl").write_text('{"row": 1}\n')
+    (dbs.parent / "save.manifest").write_text(
+        manifest if isinstance(manifest, str) else json.dumps(manifest)
+    )
+    expected = root / "expected"
+    expected.mkdir()
+    (expected / "todoist.jsonl").write_text("")
+    return root / "snapshot"
+
+
+def test_a_save_record_naming_a_path_outside_the_snapshot_opens_nothing(tmp_path: Path) -> None:
+    """The record is written inside the tree the episode can write, so its keys are its text.
+
+    Every key was joined to the snapshot's `dbs` directory and the result was `stat`-ed and
+    streamed, with nothing proving the key was one path component. A `..` walked out of the
+    snapshot and out of the episode's tree entirely, into a host path the serving process could
+    read after the container had stopped; an absolute key replaced the join outright. Neither is a
+    save record with an extra field in it, so both refuse the episode, and the walk itself is over
+    the *served* tree's names rather than over anything the manifest supplies."""
+    for key in ("../../../../etc/hosts", "/etc/hosts", "dbs/todoist.jsonl", ".."):
+        root = tmp_path / f"case-{abs(hash(key))}"
+        root.mkdir()
+        snapshot = _snapshot_with_a_save(
+            root, manifest={"block": 1, "files": {"todoist.jsonl": 11, key: 1}}
+        )
+        with pytest.raises(adapter.SnapshotError, match="not the name of a database log"):
+            adapter.verify_snapshot(
+                snapshot, task_id="abc_1", expected=root / "expected", blocks=1
+            )
+
+
+def test_the_save_record_is_read_under_a_bound_of_its_own(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """`read_text()[:cap]` reads the file and then takes the slice.
+
+    So a record an episode grew towards the tree's own gibibyte was allocated and decoded in the
+    serving process before a single bound was consulted: the container's memory limit does not
+    reach a host allocation, and cancelling the await the copy runs under does not interrupt one.
+    The read is through a handle now, of at most a cap and one byte, with the clock and the abandon
+    flag read between chunks."""
+    monkeypatch.setattr(adapter, "_MANIFEST_MAX_BYTES", 512)
+    root = tmp_path / "big"
+    root.mkdir()
+    snapshot = _snapshot_with_a_save(root, manifest={"block": 1, "files": {"todoist.jsonl": 11}})
+    (snapshot / "tasks" / "abc_1" / "save.manifest").write_text(
+        '{"block": 1, "padding": "' + "x" * 4096 + '"}'
+    )
+    with pytest.raises(adapter.SnapshotError, match="more than 512 bytes"):
+        adapter.verify_snapshot(snapshot, task_id="abc_1", expected=root / "expected", blocks=1)
+
+    # And the read is abandonable, which the whole-file read was not.
+    root = tmp_path / "abandoned"
+    root.mkdir()
+    snapshot = _snapshot_with_a_save(root, manifest={"block": 1, "files": {"todoist.jsonl": 11}})
+    stop = threading.Event()
+    stop.set()
+    with pytest.raises(adapter.SnapshotError, match="abandoned"):
+        adapter.verify_snapshot(
+            snapshot, task_id="abc_1", expected=root / "expected", blocks=1, stop=stop
+        )
+
+
+def test_a_save_record_with_more_entries_than_a_world_has_logs_is_refused(
+    tmp_path: Path,
+) -> None:
+    """An entry cap as well as a byte cap, because the loop that reads them is work too."""
+    root = tmp_path / "many"
+    root.mkdir()
+    snapshot = _snapshot_with_a_save(
+        root,
+        manifest={
+            "block": 1,
+            "files": {f"app{index}.jsonl": 0 for index in range(400)} | {"todoist.jsonl": 11},
+        },
+    )
+    with pytest.raises(adapter.SnapshotError, match="database logs"):
+        adapter.verify_snapshot(snapshot, task_id="abc_1", expected=root / "expected", blocks=1)
+
+
 def test_ownership_lives_beside_the_tree_and_not_inside_it(tmp_path: Path) -> None:
     """Cleanup authority was kept in the tree it governs, which the episode can write.
 
@@ -1293,3 +1460,194 @@ def test_a_tree_teardown_declined_to_walk_is_reclaimed_while_the_server_lives(
     assert not root.exists()
     # And its control-plane records go with it.
     assert not adapter.control_file(root, "ended").exists()
+
+
+# ----- every generated tree is somebody's, and stays somebody's until it is gone -----
+
+
+def test_the_tree_handed_to_the_grader_is_claimed_before_it_is_created(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """A crash between the copy and the teardown left a tree nobody could ever reclaim.
+
+    Finalization copies the stopped output tree into a sibling directory to hand the grader, and
+    that directory was created without a claim. `_reclaimable` deliberately refuses to guess about
+    a tree the control plane says nothing about, so the leftover was not a tree waiting to be
+    swept: it was a tree no sweep would ever look at again. It is claimed when the session begins,
+    long before the copy exists, which is the rule for every tree this port generates."""
+    import inspect
+
+    from shogym.envs.appworld import env_v1
+
+    source = inspect.getsource(env_v1.AppWorldEnv._begin_session)
+    claim = source.index("_claim_tree(_snapshot_of(outputs))")
+    assert claim < source.index("Worker.spawn"), "claimed before anything could crash after it"
+
+    home = tmp_path / "episodes"
+    outputs = home / "episode-abc"
+    snapshot = env_v1._snapshot_of(outputs)
+    env_v1._claim_tree(outputs)
+    env_v1._claim_tree(snapshot)
+    # The claim is on file before the copy has put anything there, which is what a crash between
+    # the two would leave: a tree with an owner rather than a tree nobody has ever heard of.
+    assert adapter.control_file(snapshot, "owner").exists()
+    assert not list(snapshot.iterdir())
+
+    (snapshot / "dbs").mkdir()
+    # A dead owner, which is what a crash leaves: the sweep takes it, where before it could not.
+    adapter.control_file(snapshot, "owner").write_text("999999 1700000000\n")
+    assert env_v1._reclaimable(snapshot) is True
+    env_v1._sweep_leftovers(home)
+    assert not snapshot.exists()
+
+
+def test_a_teardown_that_cannot_walk_a_tree_still_says_the_episode_ended(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """The prewalk can fail, and its failure was the one way out of teardown that recorded nothing.
+
+    An oversized tree is left behind and marked ended, so a sweep takes it while the server runs.
+    A walk that raised took the other branch, which left the tree still naming the live serving
+    process: an ended episode that read as a running one, kept until the run exited."""
+    from shogym.envs.appworld import env_v1
+
+    home = tmp_path / "episodes"
+    root = home / "episode-unwalkable"
+    root.mkdir(parents=True)
+    env_v1._claim_tree(root)
+
+    def _raises(self: Path, pattern: str) -> Any:
+        raise OSError("the tree cannot be walked")
+
+    monkeypatch.setattr(Path, "rglob", _raises)
+    env_v1._discard(root)
+    monkeypatch.undo()
+
+    assert root.exists()
+    assert adapter.control_file(root, "ended").exists()
+    monkeypatch.setattr(env_v1, "_ENDED_GRACE_SECONDS", -1.0)
+    assert env_v1._reclaimable(root) is True
+
+
+def test_a_removal_that_left_something_behind_keeps_the_record_of_it(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """`rmtree(ignore_errors=True)` says nothing about what it removed.
+
+    Both the teardown and the sweep erased a tree's ownership records straight afterwards, so a
+    removal that got half way left a partial tree the control plane had just forgotten about —
+    unknown, and therefore never retried. The records go only once the root is confirmed absent."""
+    import shutil
+
+    from shogym.envs.appworld import env_v1
+
+    home = tmp_path / "episodes"
+    root = home / "episode-stubborn"
+    (root / "kept").mkdir(parents=True)
+    (root / "kept" / "state").write_text("x")
+    env_v1._claim_tree(root)
+
+    real = shutil.rmtree
+    removing = [False]
+
+    def _partial(path: Any, ignore_errors: bool = False) -> None:
+        # What a real failure looks like from the outside: it returns, and some of the tree is
+        # still there. `ignore_errors=True` has already swallowed whatever stopped it.
+        if removing[0]:
+            real(path, ignore_errors=ignore_errors)
+
+    monkeypatch.setattr(shutil, "rmtree", _partial)
+    env_v1._discard(root)
+    # Still there, still known, and now marked ended so a sweep may take it.
+    assert root.exists()
+    assert adapter.control_file(root, "owner").exists()
+    assert adapter.control_file(root, "ended").exists()
+
+    # The sweep's own half of the same rule.
+    monkeypatch.setattr(env_v1, "_ENDED_GRACE_SECONDS", -1.0)
+    env_v1._sweep_leftovers(home)
+    assert root.exists()
+    assert adapter.control_file(root, "ended").exists(), "the leftover is still somebody's"
+    # And once it really goes, the records go with it.
+    removing[0] = True
+    env_v1._sweep_leftovers(home)
+    assert not root.exists()
+    assert not adapter.control_file(root, "ended").exists()
+
+
+def test_a_large_backlog_of_leftovers_does_not_hold_up_the_next_episode(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """Every construction processed the whole ledger and every labelled candidate.
+
+    Each removal is its own pair of Docker control calls of up to ten seconds, and nothing bounded
+    the number of them, so a machine holding a hundred abandoned containers spent minutes here —
+    in a constructor a serve layer calls on the loop it is dispensing from, before the `await` that
+    opens the episode. One pass spends a deadline and a count and leaves the rest written down."""
+    monkeypatch.setattr(container, "_ledger", lambda: tmp_path / "disowned.txt")
+    for index in range(200):
+        container.disowned(f"stale-{index}")
+
+    calls: List[str] = []
+
+    def _slow(args: Sequence[str], *, timeout: float, check: bool = True) -> Any:
+        calls.append(args[0])
+        time.sleep(0.01)
+        if args[0] == "inspect":
+            return _Finished(1, "", "No such object")
+        if args[0] == "ps":
+            return _Finished(0, "")
+        return _Finished(0, "")
+
+    monkeypatch.setattr(container, "_run", _slow)
+    monkeypatch.setattr(container, "_REAP_MAX_CONTAINERS", 8)
+    removed = container.reap()
+    # It stopped at the cap rather than working through the backlog.
+    assert len(removed) == 8
+    # And what it did not reach is still written down for the next pass, which starts where this
+    # one left off.
+    assert len(container.outstanding()) == 192
+    assert container.reap() == [f"stale-{index}" for index in range(8, 16)]
+
+
+def test_reaping_a_backlog_happens_off_the_thread_that_built_the_env() -> None:
+    """A bounded stall on the dispensing loop is still a stall on it.
+
+    `TaskStream` evaluates its env factory before the `await` that opens an episode, so whatever a
+    construction does synchronously is done with every sibling episode's deadline running. Nothing
+    waits on housekeeping: what one pass does not finish is still there for the next to find."""
+    import inspect
+
+    from shogym.envs.appworld import env_v1
+
+    source = inspect.getsource(env_v1.AppWorldEnv.__init__)
+    assert "container.reap()" not in source, "reaping is not on the caller's thread"
+    assert "_housekeep()" in source
+    assert "threading.Thread" in inspect.getsource(env_v1._housekeep)
+
+
+def test_the_disowned_ledger_is_compacted_without_losing_a_live_name(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """It is append-only, and a rewrite is the one operation on it that can drop a name.
+
+    Two lines per container that had to be disowned and later went, so every later sweep reads all
+    of them. The rewrite keeps what is still outstanding and takes the file's own lock, which every
+    writer takes: an append that arrives while this is running waits rather than landing in the
+    middle of it, and it lands at the end of what the rewrite left."""
+    ledger = tmp_path / "disowned.txt"
+    monkeypatch.setattr(container, "_ledger", lambda: ledger)
+    monkeypatch.setattr(container, "_LEDGER_MAX_LINES", 32)
+    for index in range(40):
+        container.disowned(f"gone-{index}")
+        container._append(f"-gone-{index}")
+    container.disowned("still-here")
+    assert container.outstanding() == ["still-here"]
+
+    container._compact()
+    # Every settled event is gone from the file and the one live name is not.
+    assert ledger.read_text() == "+still-here\n"
+    assert container.outstanding() == ["still-here"]
+    # And an append after the rewrite still lands where a reader finds it.
+    container.disowned("arrived-later")
+    assert container.outstanding() == ["still-here", "arrived-later"]

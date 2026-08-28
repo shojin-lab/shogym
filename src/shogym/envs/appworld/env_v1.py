@@ -26,12 +26,14 @@ serve two worlds that agreed on their contents and disagreed on their next draw.
 
 **One world, one process.** AppWorld freezes the clock for the whole interpreter and holds every
 app's database engine on a class attribute, so two worlds in one process are one world being
-unfrozen by the other. Each episode gets a worker process on its own loopback port, gated by a
-token the agent never sees (:mod:`shogym.envs.appworld.worker`).
+unfrozen by the other. Each episode gets a worker in a container of its own, reached over the pipe
+pair its parent made and by nothing else: there is no network in there and so no port to find and
+no token to need (:mod:`shogym.envs.appworld.worker`).
 
 This module imports **nothing** from upstream at load time, so ``import shogym`` (which imports it
-to register the env) stays offline. The corpus and the app sources are provisioned when an
-``appworld`` env is *constructed*; see :mod:`shogym.envs.appworld.adapter`.
+to register the env) stays offline. Upstream is not installed on this machine at all; the image
+and the corpus are provisioned when an ``appworld`` env is *constructed*; see
+:mod:`shogym.envs.appworld.adapter`.
 """
 
 from __future__ import annotations
@@ -176,13 +178,8 @@ class AppWorldEnv(Env):
         # cannot serve this env, and an hour into a run is the wrong time to find that out.
         container.require_docker()
         adapter.ensure_image()
-        # Anything this port left behind whose parent is gone. The case is a run that died while a
-        # world was wedged inside a command: the worker never gets back to the read that would
-        # tell it its parent had gone, so it never exits and `--rm` never fires.
-        container.reap()
-        # And the trees teardown declined to walk, plus anything a crash left behind. Nothing is
-        # waiting on this, which is why it is here rather than in teardown.
-        _sweep_leftovers(adapter.episodes_home(), adapter.cache_root() / f"views-{adapter.DATA_VERSION}")
+        # What the last run left behind, on a thread of its own. See `_housekeep`.
+        _housekeep()
         self._pulse = int(pulse)
         self._report = report
         self._original = adapter.ensure_corpus() / "data"
@@ -333,7 +330,16 @@ class AppWorldEnv(Env):
         outputs = adapter.episode_outputs(session_id)
         # Claimed before anything is written into them, so a sweep racing this construction sees
         # an owner rather than an untouched directory.
+        #
+        # **Both trees, and the second one is claimed long before it exists.** Finalization copies
+        # the stopped output tree into a sibling directory to hand the grader, and that one was
+        # created without a claim: a process that died between the copy and its teardown left a
+        # tree the control plane said nothing about, which `_reclaimable` treats as unknown
+        # for ever rather than guessing about. Claim first and create later is the rule for every
+        # generated tree here, and a claim on a directory that never gets made costs one small
+        # file that teardown drops.
         _claim_tree(outputs)
+        _claim_tree(_snapshot_of(outputs))
         experiment = container.OUTPUTS_MOUNT
         view = adapter.episode_view(session_id)
         # **Everything made before the session exists is made under this guard**, and the guard
@@ -362,7 +368,7 @@ class AppWorldEnv(Env):
         except BaseException:
             if worker is not None:
                 worker.close()
-            _discard(view, outputs)
+            _discard(view, outputs, _snapshot_of(outputs))
             raise
         mcp_server.begin_session(
             session_id,
@@ -393,7 +399,7 @@ class AppWorldEnv(Env):
             # ever grows is retention by omission rather than by policy. In a `finally` because
             # the failure that stops the close is exactly the failure that would otherwise leave
             # them, and the handle is dropped last, so nothing between here and there loses it.
-            _discard(Path(session.view), session.outputs, Path(str(session.outputs) + ".graded"))
+            _discard(Path(session.view), session.outputs, _snapshot_of(session.outputs))
             mcp_server.end_session(session_id)
 
     def _derive(self, task_id: str) -> None:
@@ -544,7 +550,7 @@ class AppWorldEnv(Env):
             snapshot = await asyncio.to_thread(
                 adapter.snapshot_outputs,
                 session.outputs,
-                into=Path(str(session.outputs) + ".graded"),
+                into=_snapshot_of(session.outputs),
                 stop=abandon,
             )
         except BaseException:
@@ -726,7 +732,15 @@ def _discard(*paths: Path) -> None:
     nobody is reading rather than a deletion nobody can bound.
 
     The snapshot copy is always small, because :func:`adapter.snapshot_outputs` refused anything
-    that was not; the original is the one that can be large, and it is the one this may leave."""
+    that was not; the original is the one that can be large, and it is the one this may leave.
+
+    **Every way out of here leaves the tree owned by somebody.** A tree this declines to walk, a
+    walk that raised, and a removal that did not remove are three different failures and were two
+    different bugs: the first two left an ended episode's tree still naming the live serving
+    process, so the sweep could not take it until that process exited, and the third erased the
+    ownership records after a removal that had ignored its own errors, which left whatever
+    remained unknown to the control plane and therefore never retried. The records are dropped
+    only once the root is confirmed absent."""
     import shutil
 
     for path in paths:
@@ -736,15 +750,25 @@ def _discard(*paths: Path) -> None:
                 nodes += 1
                 if nodes > _DISCARD_MAX_NODES:
                     break
-            if nodes > _DISCARD_MAX_NODES:
-                # Left where it is, and *said to be over*: without that it still named the serving
-                # process, which is alive, so the sweep meant to reclaim it could not until that
-                # process exited.
-                _mark_ended(path)
-                continue
+            over = nodes > _DISCARD_MAX_NODES
         except OSError:
+            # The walk itself failed, so this teardown is not going to remove the tree either. It
+            # is still an episode that ended, and saying so is what lets a later sweep take it.
+            _mark_ended(path)
+            continue
+        if over:
+            # Left where it is, and *said to be over*: without that it still named the serving
+            # process, which is alive, so the sweep meant to reclaim it could not until that
+            # process exited.
+            _mark_ended(path)
             continue
         shutil.rmtree(path, ignore_errors=True)
+        if os.path.lexists(path):
+            # `ignore_errors` means this call has already swallowed whatever stopped it. What is
+            # left is a partial tree, and the honest record of it is an ended episode a sweep
+            # will come back to rather than no record at all.
+            _mark_ended(path)
+            continue
         _forget_tree(path)
 
 
@@ -767,6 +791,61 @@ _ENDED_GRACE_SECONDS = 60.0
 #: else that runs there.
 _SWEEP_MAX_TREES = 64
 _SWEEP_SECONDS = 5.0
+
+
+#: Whether a housekeeping pass is already running. One at a time, because a stream that builds an
+#: env per task would otherwise start one per construction, and they would all be sweeping the same
+#: two directories and the same ledger.
+_HOUSEKEEPING = threading.Lock()
+
+
+def _housekeep() -> None:
+    """Clear what the last run left behind, on a thread, and never make a caller wait for it.
+
+    Two jobs. Containers whose parent process is gone, which is the case teardown cannot reach: a
+    run that died while a world was wedged inside a command leaves a worker that never gets back
+    to the read that would tell it its parent had gone, so it never exits and ``--rm`` never
+    fires. And the per-episode trees teardown declined to walk, plus whatever a crash left behind.
+
+    **On a thread, because the caller may be an event loop.** Both are Docker control calls and
+    filesystem walks over what a previous run left, and this runs in a constructor a serve layer
+    calls while it is dispensing — before the ``await`` that opens the episode, so every sibling
+    episode, every deadline and the other arm of a pair waited out the whole of it. Each pass is
+    bounded now as well (see :func:`container.reap` and :func:`_sweep_leftovers`), and a bounded
+    stall on the loop that dispenses tasks is still a stall on it. Nothing waits on the result:
+    what this does not finish is still there for the next construction to find.
+
+    One pass at a time, and failures are swallowed: this is housekeeping, and an env that could
+    not tidy up after a previous run is an env that can still serve."""
+    if not _HOUSEKEEPING.acquire(blocking=False):
+        return
+
+    def _pass() -> None:
+        try:
+            container.reap()
+            _sweep_leftovers(
+                adapter.episodes_home(),
+                adapter.cache_root() / f"views-{adapter.DATA_VERSION}",
+            )
+        except Exception:  # noqa: BLE001 — housekeeping never fails a construction
+            pass
+        finally:
+            _HOUSEKEEPING.release()
+
+    try:
+        threading.Thread(target=_pass, name="shogym-appworld-housekeeping", daemon=True).start()
+    except RuntimeError:
+        # A process that cannot start a thread is one shutting down, and there is nothing here
+        # worth failing a construction over.
+        _HOUSEKEEPING.release()
+
+
+def _snapshot_of(outputs: Path) -> Path:
+    """Where the copy handed to the grader goes for the episode whose output tree is ``outputs``.
+
+    One definition, because three places name this directory and one of them claims it before it
+    exists: a name spelled out at each use is a name that can disagree with the claim."""
+    return Path(str(outputs) + ".graded")
 
 
 def _claim_tree(root: Path) -> None:
@@ -867,8 +946,13 @@ def _sweep_leftovers(*homes: Path) -> None:
             if not entry.is_dir() or not _reclaimable(entry):
                 continue
             shutil.rmtree(entry, ignore_errors=True)
-            _forget_tree(entry)
             removed += 1
+            if os.path.lexists(entry):
+                # Removed as much as it could and no more. The records stay, so the next sweep
+                # still knows this tree is nobody's and comes back to it; erasing them here made
+                # the leftover unknown to the control plane and therefore permanent.
+                continue
+            _forget_tree(entry)
 
 
 # ----- pure helpers -----

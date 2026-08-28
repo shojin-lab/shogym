@@ -32,6 +32,7 @@ edit to either builds a new image rather than reusing one built under the old te
 from __future__ import annotations
 
 import calendar
+import fcntl
 import hashlib
 import json
 import os
@@ -42,7 +43,7 @@ import uuid
 from dataclasses import dataclass
 from functools import lru_cache
 from pathlib import Path
-from typing import Callable, Dict, List, Optional, Sequence, Tuple
+from typing import IO, Callable, Dict, List, Optional, Sequence, Tuple
 
 from shogym.envs._upstream import _locked
 
@@ -479,6 +480,15 @@ def remove(container: str, *, confirm: bool = False) -> bool:
     return True
 
 
+#: What one sweep will spend before it leaves the rest for the next one. Both halves of a reap are
+#: Docker control calls of up to :data:`_CONTROL_TIMEOUT_SECONDS` each, and a removal is several of
+#: them, so a backlog of a hundred abandoned containers is minutes of work: unbounded, that is a
+#: construction that stalls whatever thread it is on for as long as the backlog says. The work is
+#: idempotent and the leftovers do not spoil, so stopping early costs nothing but a second pass.
+_REAP_SECONDS = 20.0
+_REAP_MAX_CONTAINERS = 16
+
+
 def reap(*, alive: Optional[Callable[..., bool]] = None) -> List[str]:
     """Remove this port's containers whose parent process is gone, and say which.
 
@@ -491,17 +501,29 @@ def reap(*, alive: Optional[Callable[..., bool]] = None) -> List[str]:
     at construction: a labelled container whose parent is not running is one nobody is coming back
     for. The boot time is in the label because pids are reused across a reboot, and removing a
     live episode's world because an unrelated process now holds its parent's number would be a
-    worse failure than the one this fixes."""
+    worse failure than the one this fixes.
+
+    **Bounded in aggregate, which it was not.** Each removal is its own bounded pair of control
+    calls, and nothing bounded the number of them: a machine holding a large backlog spent the
+    whole of it here, in a constructor a serve layer may call while it is dispensing. So one call
+    spends a deadline and a count and leaves the remainder written down. Nothing is lost by
+    stopping: what is left is either still in the ledger or still labelled, and the next
+    construction starts again from the front of it."""
+    began = time.monotonic()
+    running = alive if alive is not None else _process_is_alive
+    # The ones nobody could remove, whoever is alive. See `disowned`.
+    removed: List[str] = _sweep_disowned(began=began)
+    if _spent(began, removed):
+        return removed
     listed = _run(
         ["ps", "--all", "--quiet", "--filter", f"label={LABEL_OWNER}=1",
          "--filter", f"label={LABEL_BOOT}={_boot_id()}"],
         timeout=_CONTROL_TIMEOUT_SECONDS,
         check=False,
     )
-    running = alive if alive is not None else _process_is_alive
-    # The ones nobody could remove, whoever is alive. See `disowned`.
-    removed: List[str] = _sweep_disowned()
     for identifier in listed.stdout.split():
+        if _spent(began, removed):
+            break
         # Read as structure rather than as words. Two labels printed side by side and split on
         # whitespace is a value rebuilt rather than read, and a value rebuilt is a value whose
         # spacing can change: that is how a live parent came to look like a different process.
@@ -605,8 +627,14 @@ def disowned(container: str) -> None:
 
 
 def _append(line: str) -> None:
+    """Add one event, under the lock the rewrite takes, and never raise.
+
+    One ``O_APPEND`` write of one short line, which the kernel does not interleave with another
+    process's. The lock is not what makes that atomic; it is what keeps this out of the middle of
+    a compaction, which is a read and a write with a gap in it (see :func:`_compact`)."""
     try:
         with open(_ledger(), "a") as handle:
+            _exclusive(handle)
             handle.write(line + "\n")
     except OSError:
         pass
@@ -618,6 +646,11 @@ def outstanding() -> List[str]:
         lines = _ledger().read_text().splitlines()
     except OSError:
         return []
+    return _live(lines)
+
+
+def _live(lines: Sequence[str]) -> List[str]:
+    """The names a ledger's events leave outstanding, in the order they were first written."""
     live: List[str] = []
     gone = set()
     for line in lines:
@@ -629,21 +662,89 @@ def outstanding() -> List[str]:
     return [name for name in live if name not in gone]
 
 
-def _sweep_disowned() -> List[str]:
+def _spent(began: float, removed: Sequence[str]) -> bool:
+    """Whether this sweep has used the budget one call gets."""
+    return len(removed) >= _REAP_MAX_CONTAINERS or time.monotonic() - began > _REAP_SECONDS
+
+
+def _sweep_disowned(*, began: Optional[float] = None) -> List[str]:
     """Remove every container the ledger still names, and tombstone the ones that went.
 
     Nothing here consults the parent, because the ledger's whole point is a container whose parent
     is alive and out of ways to remove it. A name that cannot be removed is left with no tombstone,
-    so the next sweep tries it again."""
-    removed = []
-    for name in outstanding():
+    so the next sweep tries it again.
+
+    Bounded with :func:`reap`, and by the same budget when it is called from there: the ledger is
+    append-only and a machine that lost a run holds every name that run could not remove."""
+    began = time.monotonic() if began is None else began
+    removed: List[str] = []
+    names = outstanding()
+    for name in names:
+        if _spent(began, removed):
+            break
         try:
             remove(name, confirm=True)
         except DockerError:
             continue
         _append(f"-{name}")
         removed.append(name)
+    _compact()
     return removed
+
+
+#: When the ledger is rewritten rather than appended to. It is a log of events, two lines per
+#: container that had to be disowned and later went, so a file only ever appended to is a file
+#: every later sweep reads in full. Rare, because the rewrite is the only operation on this file
+#: that is not one atomic append.
+_LEDGER_MAX_LINES = 4096
+
+
+def _compact() -> None:
+    """Rewrite the ledger as just the names still outstanding, when it has grown enough to matter.
+
+    **In place and under the file's own lock, because a rewrite is the one operation here that can
+    lose a name.** Everything else is a single ``O_APPEND`` write, which the kernel will not
+    interleave; a rewrite is a read and a write with a gap in the middle, and the case this file
+    exists for is a name appended by a live sibling. Publishing a new file from what this had read
+    would drop anything appended in that gap, and what it would drop is a container nobody else is
+    coming back for.
+
+    So the exclusion is a lock on the ledger itself, taken by every writer including this one
+    (see :func:`_append`): a rename would swap the inode the lock is on, so the file is truncated
+    and rewritten rather than replaced. An appender blocked on the lock writes to the end of
+    whatever this leaves, which is the same place it was always going to write.
+
+    Never raises, and does nothing at all where the filesystem cannot lock: a ledger that is
+    merely long is a file this port reads a little more of, and losing a name from it is a
+    container nobody removes."""
+    try:
+        with open(_ledger(), "r+") as handle:
+            if not _exclusive(handle):
+                return
+            lines = handle.read().splitlines()
+            if len(lines) <= _LEDGER_MAX_LINES:
+                return
+            keeping = _live(lines)
+            handle.seek(0)
+            handle.write("".join(f"+{name}\n" for name in keeping))
+            handle.truncate()
+    except OSError:
+        pass
+
+
+def _exclusive(handle: "IO[str]") -> bool:
+    """Take the ledger's own lock, or say that this filesystem does not have one.
+
+    Blocking, because everyone who takes it holds it for one small write and the honest reading of
+    "somebody else has it" is that they are a line ahead of this one."""
+    try:
+        fcntl.flock(handle.fileno(), fcntl.LOCK_EX)
+    except OSError:
+        # Including the errnos that mean "this mount has no locks". The appends stay correct
+        # without it, because each is one `O_APPEND` write; what is not attempted without it is
+        # the rewrite, which is the operation that needs the exclusion.
+        return False
+    return True
 
 
 def _process_is_alive(pid: int, birth: str = "") -> bool:
