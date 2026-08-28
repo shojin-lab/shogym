@@ -640,7 +640,18 @@ def test_a_grader_that_outruns_its_bound_leaves_no_container_behind(
             pass
 
     monkeypatch.setattr(container_module, "run", lambda **kw: (_Never(), "grader-1"))
-    monkeypatch.setattr(container_module, "remove", lambda name, confirm=False: released.append(name))
+    # **Reports the removal it performed, and writes its ledger somewhere of its own.** A mock
+    # returning `None` is a mock saying the daemon would not confirm the removal, which is a
+    # different path: `_release` then disowns the name, and the disowned ledger is a real file
+    # under the real cache. A selected run of this test left `+grader-1` in it, where a later
+    # sweep would trust the name and issue a removal for whatever holds it.
+    monkeypatch.setattr(container_module, "_ledger", lambda: tmp_path / "disowned.txt")
+
+    def _removed(name: str, confirm: bool = False) -> bool:
+        released.append(name)
+        return True
+
+    monkeypatch.setattr(container_module, "remove", _removed)
     monkeypatch.setattr(adapter, "_GRADE_TIMEOUT_SECONDS", 0.1)
     with pytest.raises(adapter.WorkerError, match="did not finish"):
         adapter.grade(
@@ -652,6 +663,9 @@ def test_a_grader_that_outruns_its_bound_leaves_no_container_behind(
             timeout=0.1,
         )
     assert released == ["grader-1"], "the grading container outlived its own bound"
+    # And nothing was handed to the sweep, because the removal was confirmed. The ledger this
+    # asserts on is this test's own, which is the other half of the point.
+    assert container_module.outstanding() == []
     for descriptor in (to_worker_read, to_worker_write, from_worker_read, from_worker_write):
         os.close(descriptor)
 
