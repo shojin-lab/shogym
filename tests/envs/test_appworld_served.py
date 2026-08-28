@@ -18,6 +18,7 @@ from __future__ import annotations
 import asyncio
 import contextlib
 import datetime as dt
+import hashlib
 import json
 import re
 import uuid
@@ -1051,6 +1052,18 @@ async def test_the_two_arms_read_the_same_proc_and_sys_outside_what_moves(
     for name in ours:
         head = name.split(":", 1)[1]
         assert head.startswith(("/proc/self", "/proc/thread-self")) or head.split("/")[2].isdigit()
+
+    # **The masked seven are the port's own constants, read from inside the served container.**
+    # The classification below is about what may differ; this is the other half, and it is the
+    # only half that says the binds landed at all. Compared by the same digest the walk took, so
+    # what is checked is the bytes a block of agent code would read rather than a flag on a
+    # command line.
+    from shogym.envs.appworld import container as container_module
+
+    for source, target in container_module.neutral_procfs():
+        expected = hashlib.sha256(source.read_bytes()[:_WALK_FILE_CAP]).hexdigest()[:12]
+        for arm in (first, second):
+            assert arm["seen"].get("f:" + target) == expected, target
 
     # What moves on its own: what changed inside a container between two sweeps, and what two
     # episodes of the *same* arm differ in. Both are measured here rather than read from a list,
