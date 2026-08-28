@@ -28,13 +28,13 @@ from typing import Any, Dict, List
 REPO = Path(__file__).resolve().parents[2]
 README = REPO / "src" / "shogym" / "envs" / "appworld" / "README.md"
 
-#: The members of the identity and the treatment the paired configuration is made of. Every one of
-#: them belongs to the server, and none of them may appear in the agent's own process.
+#: What the paired configuration is made of: the treatment, the queue, and everything that decides
+#: what an episode was allowed to do. Every one of them belongs to the server, and none of them may
+#: appear in the agent's own process.
 CONFIGURED = (
     "SHOGYM_ENV",
     "SHOGYM_TASKS",
     "SHOGYM_FEEDBACK",
-    "SHOGYM_IDENTITY",
     "SHOGYM_DEADLINE",
     "SHOGYM_IN_FLIGHT",
     "SHOGYM_RUNS",
@@ -151,9 +151,8 @@ def documented_arms(tmp_path: Path) -> Dict[str, Dict[str, str]]:
 def test_the_two_arms_launch_the_agent_as_the_same_process(tmp_path: Path) -> None:
     """The treatment and the control have to be one process apart, and they used to be two.
 
-    The commands set `SHOGYM_FEEDBACK`, the task list and the identity on the outer `claude`
-    process, which put the assignment, the run's fingerprint and the pulse in the agent's own
-    environment. The quickstart says in as many words that Claude Code keeps its built-in tools
+    The commands set `SHOGYM_FEEDBACK` and the task list on the outer `claude` process, which put
+    the assignment and the queue in the agent's own environment. The quickstart says in as many words that Claude Code keeps its built-in tools
     unless a deny list is added, and the paired commands added none, so the agent could read its
     arm before it was treated and could reach the record, which holds both payloads on every row
     whichever arm answered the terminal.
@@ -183,9 +182,9 @@ def test_the_two_arms_launch_the_agent_as_the_same_process(tmp_path: Path) -> No
 def test_the_arm_and_the_record_reach_the_server_and_nothing_else(tmp_path: Path) -> None:
     """The other side of the same line: what the two arms are allowed to differ in.
 
-    The regime, the queue, the identity, the deadline and the capacity travel in the MCP config's
-    `env` block, which is the child's environment and nobody else's, and the two arms' blocks
-    differ in the regime alone, because every other member is what makes two runs one measurement.
+    The regime, the queue, the deadline and the capacity travel in the MCP config's `env` block,
+    which is the child's environment and nobody else's, and the two arms' blocks differ in the
+    regime alone, because everything beside it is what makes two runs one measurement.
     The provenance directory goes outside the directory the agent is launched into, since it names
     the regime in `claim.json` before the first dispense and keeps every payload the env published
     afterwards."""

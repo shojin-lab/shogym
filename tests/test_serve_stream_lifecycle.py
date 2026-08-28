@@ -2264,15 +2264,9 @@ async def test_a_recorded_provenance_directory_is_refused_unless_it_is_resumed(
     # them: the file records a one-task queue as two outcomes while `results` shows one. Both
     # readings are faithful and they disagree, so the call that produced them is refused.
     built: List[_FixtureScoreEnv] = []
-    closed: List[_FixtureScoreEnv] = []
 
     def factory(_name: str) -> _FixtureScoreEnv:
         env = _FixtureScoreEnv(tasks=TASKS)
-
-        async def _close(inner: _FixtureScoreEnv = env) -> None:
-            closed.append(inner)
-
-        env.close = _close  # type: ignore[method-assign]
         built.append(env)
         return env
 
@@ -2283,12 +2277,9 @@ async def test_a_recorded_provenance_directory_is_refused_unless_it_is_resumed(
 
     with pytest.raises(ValueError, match="already holds records"):
         _stream(tmp_path, [0], factory=factory)
-    # The record it protected is untouched: not appended to, and not truncated either. The envs
-    # this refusal built on its way to the refusal are closed again on the way out — the catalog
-    # is built before the directory is claimed now, so that a resume that refuses has displaced
-    # nobody, and this is what that costs a construction that was going to be refused anyway.
-    await asyncio.sleep(0.05)  # the close is scheduled on this loop, not awaited by a constructor
-    assert built and closed == built
+    # Refused before a single env is built, so there is nothing to clean up after it — and the
+    # record it protected is untouched: not appended to, and not truncated either.
+    assert built == []
     assert [row.position for row in read_results(tmp_path / "prov")] == [0]
 
     # `resume` is the way to say the continuation was meant, and it still works.
