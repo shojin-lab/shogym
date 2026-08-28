@@ -802,16 +802,23 @@ rather than the env's, but it is no longer readable from inside an episode.
 ## Gotchas
 
 - **`env.num_tasks` is 318, not 417.** Task indices address the manifest, not the split.
-- **Construction is slow, online, and blocking, and it happens on the caller's own thread.**
-  Building the image, fetching the corpus and copying it into the two derived views is a one-time
-  cost; deriving a task's seeded world costs about a second the first time it is served and
-  nothing after that. What every construction pays is the Docker check and one reading of the
-  corpus, which is about two seconds. `TaskStream` calls its env factory on the loop it dispenses
-  from, so that cost lands on the loop: clearing up after a previous run is kept off it (a thread
-  of its own, bounded, and nothing waits on it), and the rest is not something an env can move.
-  A queue served with `shogym.make` as its factory builds one env per dispensed task, so a runner
-  serving many tasks should hand it a factory that keeps the env it built. Set `APPWORLD_ROOT` to
-  skip the download.
+- **Construction is slow, online, and blocking, and it happens on the serving loop.** Building the
+  image, fetching the corpus and copying it into the two derived views is a one-time cost;
+  deriving a task's seeded world costs about a second the first time it is served and nothing
+  after that. A warm construction is still a Docker check and one reading of the corpus, and
+  `TaskStream.get_task()` calls the env factory synchronously, on the loop it serves on. So while
+  one task is being constructed nothing else on that loop runs: a live sibling episode cannot
+  dispatch a call and its deadline cannot fire. At `max_in_flight=1` that is dead time and nothing
+  worse; above it, the capacity is not what it says. The mechanism that fixes it is the
+  `off_loop_factory=True` keyword on `TaskStream` / `ServedEpisode` from
+  [shojin-lab/shogym#141](https://github.com/shojin-lab/shogym/pull/141), which this port depends
+  on and which is not on this branch, so nothing here passes it yet. What this port does keep off
+  that loop is clearing up after a previous run: reaping containers and sweeping per-episode trees
+  runs on a thread of its own, bounded, and nothing waits on it. A caller constructing an env
+  directly on a loop it is also serving on has the same problem for the same reason and should
+  build it in a thread. A queue served with `shogym.make` as its factory builds one env per
+  dispensed task, so a runner serving many tasks should hand it a factory that keeps the env it
+  built. Set `APPWORLD_ROOT` to skip the download.
 - **A different `pulse` is a different experiment.** It fixes the convention and the four stored
   slots for every leg. Scores drawn under two pulses are not comparable, and neither the pulse nor
   the payload class appears anywhere else in a run's record, so every row carries a
