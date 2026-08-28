@@ -342,7 +342,13 @@ print(json.dumps({
     # The allow-list, what the worker sets for itself, and the handful the platform and the
     # interpreter inject into every process no matter what they were handed.
     platform = {"__CF_USER_TEXT_ENCODING", "__PYVENV_LAUNCHER__", "PYTHONHASHSEED"}
-    allowed = set(adapter._ENV_ALLOW_LIST) | {"HOME", "APPWORLD_CACHE", "APPWORLD_ROOT"} | platform
+    allowed = (
+        set(adapter._ENV_ALLOW_LIST)
+        # `PYTHONDONTWRITEBYTECODE` is what keeps every cache in the runtime a hash-based one, so
+        # the runtime digest can leave `__pycache__` out and still say what executes.
+        | {"HOME", "APPWORLD_CACHE", "APPWORLD_ROOT", "PYTHONDONTWRITEBYTECODE"}
+        | platform
+    )
     assert set(environment) <= allowed, sorted(set(environment) - allowed)
     assert not [
         name

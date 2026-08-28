@@ -59,13 +59,23 @@ TaskStream(
 
 `config_digest` covers the draw, the payload class, the block budget, every constant a payload is
 generated from, the text the agent is given (the world guide, the tool guide and the appended
-paragraph), the generator constants that decide the seeded backlog, the corpus this run actually
-serves (all of it, including the 134 MB of shared base episodes read as input), the derivation
-layout, every installed byte of the interpreter the worker turned out to be built with, and a
-hand-bumped scoring version that moves when how a score is read moves. An env serves the corpus it
+paragraph), the generator that decides the seeded backlog (its constants and the bytes of the
+three modules that implement it), the corpus this run actually serves (all of it, including the
+134 MB of shared base episodes read as input), the derivation layout, what the worker's
+interpreter turned out to hold, and a hand-bumped scoring version that moves when how a score is
+read moves. "What the interpreter holds" is a stated scope rather than a slogan: it is every
+installed source and data byte under `site-packages` plus the base executable `bin/python`
+resolves to. It is not the base interpreter's standard library, which belongs to the host rather
+than to anything this port installs, and it is not the bytecode caches, which are left out because
+the whole interpreter is compiled at provisioning with hash-based caches the import system checks
+against each source's own hash, and workers write none back: every `.pyc` that can be consulted
+therefore stands for a source the digest did read. An env serves the corpus it
 read at construction for the whole of its life: the instructions, the supervisors and the dates
 come from that one reading, so a corpus edited underneath a running env cannot put new authored
-text behind an unchanged fingerprint. A stream's `deadline` and
+text behind an unchanged fingerprint. Pinning the text is not the whole of it, because a task's
+databases and its ground truth are read when that task is first served rather than at
+construction, so each unit of the corpus is checked against what the snapshot read before it is
+derived, and a unit that moved is an episode that does not happen. A stream's `deadline` and
 `max_in_flight` belong to a run's identity too and are not an env's to know, so the stream folds
 them in itself: what a record is filed under is a structured identity whose members are the name
 passed here, the digest each env in the queue published about itself, the deadline and the
@@ -126,7 +136,11 @@ Pin-and-install mechanics are shared; see [`../README.md`](../README.md). What i
   build that resolved something else never gets served and a pin that moves builds a second
   interpreter rather than reusing the first. What the wheel cannot say is which commit it was cut
   from; that half of the pin names the runtime and is not verifiable against the artifact, and
-  what the realized code actually is comes from hashing the installed bytes instead.
+  what the realized code actually is comes from hashing the installed bytes instead. The app
+  sources the wheel ships packed are unpacked into that interpreter afterwards, its bytecode
+  caches are rewritten as hash-based ones, and a second stamp written once both have exited zero
+  is what says it is done: the runtime is already published by then, so an unpack interrupted part
+  way through would otherwise leave a complete runtime with an incomplete package inside it.
 - **The data bundle is fetched and checked.** ~33 MB, once, into
   `~/.cache/shogym/appworld/corpus-0.1.0/`. Upstream's own downloader verifies nothing; this one
   refuses a bundle whose size and sha256 are not the pinned pair. `APPWORLD_ROOT` pointing at a
@@ -348,13 +362,14 @@ bytes, sha256 `fd9f9608c2ec71ed0ac25c3633a738b9129a318a129e31230425b9188e508250`
   feedback regime. AppWorld saves databases and not generator state, and every `login` draws from
   the global generator, so a port that replayed only the databases would serve two worlds that
   agreed on their contents and disagreed on their next draw.
-- **Deferred: the derived cache's identity does not fingerprint its source.** The cache name
-  carries a digest of the backlog generator's constants, so changing a cut value or an option set
-  derives a fresh corpus. It does not carry the source corpus's own identity or the derivation
-  code's version, so pointing `APPWORLD_ROOT` at a different corpus, or changing how a task is
-  derived without changing a ledger constant, would reuse the existing tree. The pinned bundle
-  makes the first unlikely and neither is a silent wrong answer within one pinned run, so it is
-  recorded here rather than fixed.
+- **The derived cache's name says everything that filled it.** Four things: the corpus it was
+  derived from, the derivation layout, the generator (its constants and the bytes of `ledger.py`,
+  `world.py` and `worker.py`), and the realized interpreter, which is the process that writes a
+  task's seeded database log through upstream's own model layer. Each of them is also inside a
+  stamp written into the cache, because a name cannot cover a tree that was edited, moved or
+  restored under it. So pointing `APPWORLD_ROOT` at a second corpus, editing how a task is derived
+  without touching a ledger constant, or reinstalling the runtime, all derive a fresh tree rather
+  than reusing one an older combination seeded.
 - **Not built:** the yoked payload (a donor's submission and the receipt computed on it), the
   foreign rendering of a verdict vector as prose and the parser that round-trips it, the fixed-size
   envelope that would pad those to one predeclared size, and any assignment, forking or analysis

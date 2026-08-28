@@ -404,7 +404,14 @@ def test_a_worker_environment_carries_nothing_it_was_not_given(
     assert "OPENAI_API_KEY" not in scrubbed
     assert "SHOGYM_APPWORLD_PROV" not in scrubbed
     assert scrubbed["HOME"] == str(tmp_path)
-    assert set(scrubbed) <= set(adapter._ENV_ALLOW_LIST) | {"HOME", "APPWORLD_CACHE"}
+    # No cache is written back, which is what keeps every `.pyc` a worker can consult a hash-based
+    # one and lets the runtime digest leave `__pycache__` out and still be true about what runs.
+    assert scrubbed["PYTHONDONTWRITEBYTECODE"] == "1"
+    assert set(scrubbed) <= set(adapter._ENV_ALLOW_LIST) | {
+        "HOME",
+        "APPWORLD_CACHE",
+        "PYTHONDONTWRITEBYTECODE",
+    }
 
 
 def test_two_episodes_of_one_task_do_not_share_their_served_inputs(tmp_path: Path) -> None:
@@ -740,22 +747,77 @@ def test_two_corpora_under_one_cache_root_are_two_caches(
     first = adapter.corpus_digest(_corpus(tmp_path / "a", "one"))
     second = adapter.corpus_digest(_corpus(tmp_path / "b", "two"))
     assert first != second
-    assert adapter.derived_root(first) != adapter.derived_root(second)
-    assert adapter.graded_root(first) != adapter.graded_root(second)
+    held = "0123456789abcdef"
+    assert adapter.derived_root(first, runtime=held) != adapter.derived_root(second, runtime=held)
+    assert adapter.graded_root(first, runtime=held) != adapter.graded_root(second, runtime=held)
     # And the shared base is inside the digest, which it was not: only `version.txt` and the task
     # tree were, so 134 MB of starting state every episode reads could change invisibly.
     (tmp_path / "a" / "data" / "base_dbs" / "big.jsonl").write_text("edited")
     assert adapter.corpus_digest(tmp_path / "a") != first
 
 
+def test_a_cache_is_named_by_the_code_and_the_interpreter_that_filled_it(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The name said which corpus a cache came from and nothing about what produced it.
+
+    Two things fill a seeded cache besides the corpus. One is this port's own generator: the
+    constants were in the name, the code that reads them was not, so an edit to how a backlog is
+    drawn or how a task is materialised left the key alone and compared it against rows an older
+    implementation had seeded. The other is the provisioned interpreter, which is the process that
+    writes a task's database log through upstream's model layer: the run fingerprint moved when it
+    changed and the cache did not, so a run could hold a name saying one runtime over a world
+    another had built."""
+    monkeypatch.setenv("SHOGYM_CACHE", str(tmp_path / "cache"))
+    corpus = "0f0f0f0f0f0f0f0f"
+
+    served = adapter.derived_root(corpus, runtime="aaaaaaaaaaaaaaaa")
+    graded = adapter.graded_root(corpus, runtime="aaaaaaaaaaaaaaaa")
+    assert served == adapter.derived_root(corpus, runtime="aaaaaaaaaaaaaaaa")
+    # A different realized interpreter is a different cache, on both roots.
+    assert served != adapter.derived_root(corpus, runtime="bbbbbbbbbbbbbbbb")
+    assert graded != adapter.graded_root(corpus, runtime="bbbbbbbbbbbbbbbb")
+
+    # And so is a generator whose constants did not move but whose code did. The three files whose
+    # bytes are read are the ones that decide what a derived tree holds, and they are read as
+    # bytes rather than named, so an edit that touches no constant still moves the key.
+    named = {path.name for path in adapter._generator_sources()}
+    assert named == {"ledger.py", "world.py", "worker.py"}
+    assert all(path.is_file() for path in adapter._generator_sources())
+
+    copies = tmp_path / "generator"
+    copies.mkdir()
+    for path in adapter._generator_sources():
+        (copies / path.name).write_bytes(path.read_bytes())
+    order = tuple(copies / path.name for path in adapter._generator_sources())
+    monkeypatch.setattr(adapter, "_generator_sources", lambda: order)
+    try:
+        adapter._generator_digest.cache_clear()
+        copied = adapter.derived_root(corpus, runtime="aaaaaaaaaaaaaaaa")
+        assert copied == served, "the same bytes under another directory are the same generator"
+        (copies / "ledger.py").write_bytes(
+            (copies / "ledger.py").read_bytes() + b"\n# an edit that changes no constant\n"
+        )
+        adapter._generator_digest.cache_clear()
+        assert copied != adapter.derived_root(corpus, runtime="aaaaaaaaaaaaaaaa")
+    finally:
+        # The digest is memoized for the process, so a test that patched what it reads has to
+        # leave the cache empty or every later test reads this one's answer.
+        adapter._generator_digest.cache_clear()
+
+
 def test_a_cache_that_was_built_from_something_else_is_refused(tmp_path: Path) -> None:
     """The name cannot cover a tree edited, moved or restored in place under the old name, and a
     cache is the material a run is scored against, so the stamp inside it is checked too."""
     root = tmp_path / "seeded"
-    adapter.stamp_cache(root, source="aaaa")
-    adapter.stamp_cache(root, source="aaaa")  # idempotent
+    adapter.stamp_cache(root, source="aaaa", runtime="rrrr")
+    adapter.stamp_cache(root, source="aaaa", runtime="rrrr")  # idempotent
     with pytest.raises(adapter.ProvisioningError, match="was built from"):
-        adapter.stamp_cache(root, source="bbbb")
+        adapter.stamp_cache(root, source="bbbb", runtime="rrrr")
+    # The interpreter that filled it is in the stamp too, so a cache reused under a runtime that
+    # did not write it is refused rather than served.
+    with pytest.raises(adapter.ProvisioningError, match="was built from"):
+        adapter.stamp_cache(root, source="aaaa", runtime="ssss")
 
 
 # ----- the seal is verified, not inferred -----
@@ -1138,7 +1200,9 @@ def test_a_bytecode_cache_is_not_part_of_the_runtime_identity(
 
     A `.pyc` is written lazily by whichever process imported the module first, so hashing one
     would make the interpreter's identity depend on what ran before rather than on what is
-    installed. Nothing hides in one either: Python discards a cache whose source is newer."""
+    installed. What keeps that from being a hole is not this function: it is that provisioning
+    leaves the runtime holding hash-based caches and workers write none back, which is
+    `test_a_stale_bytecode_cache_is_not_what_the_worker_executes`."""
     home = tmp_path / "runtime"
     python = _fake_runtime(home)
     monkeypatch.setattr(adapter, "runtime", lambda: python)
@@ -1532,3 +1596,498 @@ def test_a_provisioning_subprocess_that_never_finishes_is_not_waited_on_forever(
     with pytest.raises(adapter.ProvisioningError, match="timed out after"):
         adapter._run([sys.executable, "-c", "import time; time.sleep(30)"], timeout=0.5)
     assert time.monotonic() - began < 10.0
+
+
+# ----- the bytes a derivation reads are the bytes the run was built against -----
+
+
+def _derivable_corpus(root: Path, *, answer: str = "the answer", shared: str = "shared") -> Path:
+    """A corpus holding one whole task: text, databases and ground truth, plus a shared base."""
+    task = root / "data" / "tasks" / "abc_1"
+    (task / "dbs").mkdir(parents=True)
+    (task / "dbs" / "gmail.jsonl").write_text("mail")
+    (task / "dbs" / "todoist.jsonl").write_text("[]")
+    (task / "ground_truth").mkdir()
+    (task / "ground_truth" / "answer.json").write_text(json.dumps(answer))
+    (task / "specs.json").write_text(
+        json.dumps(
+            {
+                "instruction": "do the thing",
+                "datetime": "2023-05-18T12:00:00",
+                "supervisor": {
+                    "first_name": "Ada",
+                    "last_name": "Lovelace",
+                    "email": "ada@example.com",
+                    "phone_number": "555",
+                },
+            }
+        )
+    )
+    (root / "data" / "version.txt").write_text("0.1.0")
+    (root / "data" / "base_dbs").mkdir()
+    (root / "data" / "base_dbs" / "big.jsonl").write_text(shared)
+    return root
+
+
+class _StubBacklog:
+    """Enough of a backlog for `world.seeding` to describe, and nothing that costs a second."""
+
+    description = "a project description"
+    requests: List[Any] = []
+
+
+class _StubSeeder:
+    """A seeding worker that writes the one file the derivation asks it to write."""
+
+    def __init__(self) -> None:
+        self.calls = 0
+
+    def call(self, command: str, **body: Any) -> Any:
+        self.calls += 1
+        Path(body["into"]).write_text("[]")
+        return {}
+
+    def close(self, *, confirm: bool = False) -> None:
+        pass
+
+
+def _stub_env(root: Path, tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Any:
+    """An env holding one corpus's snapshot, without the provisioning a constructor does."""
+    from functools import partial
+
+    from shogym.envs.appworld import env_v1
+
+    snapshot = adapter.corpus_snapshot(root, task_ids=("abc_1",))
+    env = env_v1.AppWorldEnv.__new__(env_v1.AppWorldEnv)
+    env._original = root / "data"
+    env._task_ids = ("abc_1",)
+    env._specs = snapshot.specs
+    env._corpus = snapshot.digest
+    env._backlogs = {}
+    env._blocks = 60
+    env._source_check = partial(snapshot.verify, root)
+    env._derived = tmp_path / "served" / "data"
+    env._graded = tmp_path / "graded" / "data"
+    monkeypatch.setattr(env_v1, "build_backlog", lambda seed, reference: _StubBacklog())
+    return env
+
+
+def test_a_task_edited_after_the_snapshot_is_not_derived_into_a_world(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Pinning a task's authored text pinned the text and nothing else it is made of.
+
+    The snapshot fixed the instruction, the supervisor and the date at construction; the
+    databases, and the ground truth the grader diffs against, went on being read out of the live
+    corpus at the moment a task was first served, which can be hours and two hundred episodes
+    later. So an in-place edit in that window built a world and a grading baseline out of bytes the
+    run's own identity had never seen, under an unchanged `config_digest`. The unit is checked
+    before it is read, and a mismatch is an episode that does not happen rather than one that is
+    scored against something else."""
+    root = _derivable_corpus(tmp_path / "corpus")
+    env = _stub_env(root, tmp_path, monkeypatch)
+    (root / "data" / "tasks" / "abc_1" / "ground_truth" / "answer.json").write_text('"moved"')
+
+    seeder = _StubSeeder()
+    with pytest.raises(adapter.ProvisioningError, match="no longer holds"):
+        env._derive(seeder, "abc_1")
+    assert seeder.calls == 0, "nothing was written out of the changed corpus"
+    assert not (env._derived / "tasks" / "abc_1").exists()
+
+    # And the same env derives the task it was built against, so what is refused is the change.
+    (root / "data" / "tasks" / "abc_1" / "ground_truth" / "answer.json").write_text(
+        json.dumps("the answer")
+    )
+    env._derive(seeder, "abc_1")
+    assert (env._derived / "tasks" / "abc_1" / "dbs" / "todoist.jsonl").exists()
+    assert (env._graded / "tasks" / "abc_1" / "ground_truth").exists()
+
+
+def test_a_shared_entry_edited_after_the_snapshot_is_not_derived_into_a_root(
+    tmp_path: Path,
+) -> None:
+    """The other derivation path, and the larger one.
+
+    `derive_root` copies the base databases and the documentation, which is 134 MB of starting
+    state every episode of the run reads as input. It read them from the live corpus with nothing
+    saying they were still what the digest had been computed over."""
+    from functools import partial
+
+    root = _derivable_corpus(tmp_path / "corpus")
+    snapshot = adapter.corpus_snapshot(root, task_ids=("abc_1",))
+    check = partial(snapshot.verify, root)
+    derived = tmp_path / "served" / "data"
+
+    (root / "data" / "base_dbs" / "big.jsonl").write_text("a different starting state")
+    with pytest.raises(adapter.ProvisioningError, match="no longer holds"):
+        world.derive_root(original=root / "data", derived=derived, verify=check)
+    assert not (derived / "base_dbs").exists()
+
+    (root / "data" / "base_dbs" / "big.jsonl").write_text("shared")
+    world.derive_root(original=root / "data", derived=derived, verify=check)
+    assert (derived / "base_dbs" / "big.jsonl").read_text() == "shared"
+
+
+# ----- what a finalizer may do before it yields -----
+
+
+async def test_a_warm_finalize_draws_its_backlog_off_the_event_loop(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The production path the synthetic loop test could not reach.
+
+    A task served for the first time draws its backlog while it is being seeded. A task already on
+    disk skips that, so the first draw happened at the top of `finalize`, synchronously, before
+    that coroutine had yielded once: between a tenth of a second and three seconds of auditing
+    depending on the task, during which every other episode on this loop is stopped and the
+    `wait_for` that is supposed to be able to time this one out cannot fire."""
+    from shogym.envs.appworld import env_v1, mcp_server
+    from shogym.serve.lifecycle import FinalizeRequest
+
+    ticks = 0
+
+    async def ticker() -> None:
+        nonlocal ticks
+        while True:
+            ticks += 1
+            await asyncio.sleep(0.005)
+
+    def _slow_draw(seed: int, reference: Any) -> Any:
+        time.sleep(0.4)
+        return _StubBacklog()
+
+    monkeypatch.setattr(env_v1, "build_backlog", _slow_draw)
+
+    class _wedged:
+        def close(self, *, confirm: bool = False) -> None:
+            raise adapter.WorkerError("the group could not be confirmed stopped")
+
+    env = env_v1.AppWorldEnv.__new__(env_v1.AppWorldEnv)
+    env._pulse = 0
+    env._backlogs = {}
+    env._specs = {"abc_1": {"datetime": "2023-05-18T12:00:00"}}
+    mcp_server.begin_session(
+        "warm",
+        mcp_server.Session(
+            worker=_wedged(),
+            task_id="abc_1",
+            supervisor_email="ada@example.com",
+            experiment="/nowhere",
+        ),
+    )
+    beat = asyncio.create_task(ticker())
+    try:
+        with pytest.raises(adapter.WorkerError):
+            await env.finalize(
+                FinalizeRequest(
+                    source="explicit_tool", finalization_id="f", session_id="warm"
+                )
+            )
+    finally:
+        beat.cancel()
+        mcp_server.end_session("warm")
+    # A draw made from the coroutine itself would leave this at one or two.
+    assert ticks > 20, ticks
+
+
+def test_session_setup_draws_the_backlog_for_a_task_that_is_already_derived(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """And the reason the finalizer normally finds one waiting.
+
+    The draw used to happen only on the branch that seeds a cold task, so every later episode of
+    that task reached the terminal without one. The serve layer runs this hook in a thread, which
+    is where an audit that can take three seconds belongs."""
+    from shogym.envs.appworld import mcp_server
+
+    monkeypatch.setenv("SHOGYM_CACHE", str(tmp_path / "cache"))
+    root = _derivable_corpus(tmp_path / "corpus")
+    env = _stub_env(root, tmp_path, monkeypatch)
+
+    class _opened:
+        def call(self, command: str, **body: Any) -> Any:
+            return {}
+
+        def close(self, *, confirm: bool = False) -> None:
+            pass
+
+    monkeypatch.setattr(world, "already_derived", lambda **kw: True)
+    monkeypatch.setattr(world, "derive_view", lambda **kw: tmp_path / "view")
+    monkeypatch.setattr(adapter.Worker, "spawn", classmethod(lambda cls, root: _opened()))
+
+    try:
+        env._begin_session("warm", {"task_id": "abc_1", "supervisor_email": "ada@example.com"})
+        assert "abc_1" in env._backlogs, "the warm path drew nothing and left it to finalize"
+    finally:
+        mcp_server.end_session("warm")
+
+
+# ----- construction is bounded, and owns what it starts -----
+
+
+def test_locating_the_installed_package_is_not_waited_on_forever(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The one provisioning subprocess that had no deadline at all.
+
+    It starts a provisioned interpreter and waits for it to import a large package. An import that
+    wedges on a broken shared library or a filesystem that stopped answering held construction
+    open for the life of the run, and construction runs before there is a task to file a timeout
+    row against."""
+    monkeypatch.setattr(adapter, "_IMPORT_TIMEOUT_SECONDS", 0.5)
+    wedged = tmp_path / "python"
+    wedged.write_text("#!/bin/sh\nsleep 30\n")
+    wedged.chmod(0o755)
+
+    began = time.monotonic()
+    with pytest.raises(adapter.ProvisioningError, match="did not finish importing"):
+        adapter._installed_package(wedged)
+    assert time.monotonic() - began < 10.0
+
+
+def test_a_handshake_that_stops_halfway_through_a_line_is_not_waited_on_forever() -> None:
+    """Readability is not a line.
+
+    The descriptor was waited on once and then read with `readline`, which has no deadline of its
+    own: a worker that wrote half a line and then wedged made the wait bounded and the read
+    unbounded, so the spawn timeout it was supposed to be under never applied to it."""
+    half = subprocess.Popen(
+        [sys.executable, "-c", "import sys, time; sys.stdout.write('{\"po'); "
+         "sys.stdout.flush(); time.sleep(30)"],
+        stdout=subprocess.PIPE,
+        text=True,
+    )
+    try:
+        began = time.monotonic()
+        assert adapter._first_line(half, 0.5) == ""
+        assert time.monotonic() - began < 10.0
+    finally:
+        half.kill()
+        half.wait()
+
+    whole = subprocess.Popen(
+        [sys.executable, "-c", "import sys, time; sys.stdout.write('{\"port\": 1}\\n'); "
+         "sys.stdout.flush(); time.sleep(30)"],
+        stdout=subprocess.PIPE,
+        text=True,
+    )
+    try:
+        assert json.loads(adapter._first_line(whole, 5.0))["port"] == 1
+    finally:
+        whole.kill()
+        whole.wait()
+
+
+def _stub_worker_script(tmp_path: Path) -> Path:
+    """A worker that records its pid, says whatever it is told to say, and then never stops."""
+    script = tmp_path / "stub_worker.py"
+    script.write_text(
+        "import os, sys, time\n"
+        "sys.stdin.readline()\n"
+        "open(sys.argv[0] + '.pid', 'w').write(str(os.getpid()))\n"
+        "sys.stdout.write(open(sys.argv[0] + '.line').read())\n"
+        "sys.stdout.flush()\n"
+        "time.sleep(60)\n"
+    )
+    return script
+
+
+def test_a_handshake_that_fails_leaves_no_process_and_no_scratch_behind(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Only one of the ways this fails used to clean up after itself.
+
+    The empty-line branch killed the worker, reaped it and removed its scratch. Everything else
+    walked out of the constructor with the process still running, its whole group with it, and a
+    temporary home directory on disk that nothing held a reference to: a first line that is not
+    JSON, an object with no port in it, a port that is not a number. All of them happen before
+    there is an episode to record a failure against, so nothing else would have said so either."""
+    script = _stub_worker_script(tmp_path)
+    monkeypatch.setattr(adapter, "runtime", lambda: Path(sys.executable))
+    monkeypatch.setattr(adapter, "WORKER", script)
+    monkeypatch.setattr(adapter.tempfile, "tempdir", str(tmp_path))
+    said = Path(str(script) + ".line")
+    recorded = Path(str(script) + ".pid")
+
+    for line, failure in (
+        ("not json at all\n", json.JSONDecodeError),
+        ("{}\n", KeyError),
+        ('{"port": "not a number"}\n', ValueError),
+    ):
+        said.write_text(line)
+        recorded.unlink(missing_ok=True)
+        with pytest.raises(failure):
+            adapter.Worker.spawn(tmp_path / "root")
+        pid = int(recorded.read_text())
+        with pytest.raises(ProcessLookupError):
+            os.kill(pid, 0)
+        assert not list(tmp_path.glob("shogym-appworld-*")), line
+
+
+def test_a_session_that_never_opens_leaves_no_served_view_behind(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The episode's own copy of the task is written before there is a worker to hold it.
+
+    `_end_session` removes what a *published* session names, and a session that never got
+    published names nothing: a copy that failed part way through, a spawn that failed or a world
+    that would not open left the copied task directory and the episode's output tree behind, and
+    left the worker running."""
+    monkeypatch.setenv("SHOGYM_CACHE", str(tmp_path / "cache"))
+    root = _derivable_corpus(tmp_path / "corpus")
+    env = _stub_env(root, tmp_path, monkeypatch)
+    view = tmp_path / "view"
+
+    closed: List[bool] = []
+
+    class _unopenable:
+        def call(self, command: str, **body: Any) -> Any:
+            raise adapter.WorkerError("the world would not open")
+
+        def close(self, *, confirm: bool = False) -> None:
+            closed.append(True)
+
+    monkeypatch.setattr(world, "already_derived", lambda **kw: True)
+    monkeypatch.setattr(adapter, "episode_view", lambda session_id: view)
+    monkeypatch.setattr(world, "derive_view", lambda **kw: kw["view"].mkdir(exist_ok=True))
+    monkeypatch.setattr(adapter.Worker, "spawn", classmethod(lambda cls, root: _unopenable()))
+
+    with pytest.raises(adapter.WorkerError):
+        env._begin_session("orphan", {"task_id": "abc_1", "supervisor_email": "ada@example.com"})
+    assert closed == [True]
+    assert not view.exists()
+    assert not adapter.episode_outputs("orphan").exists()
+
+
+# ----- what the runtime digest leaves out, and why that is safe -----
+
+
+def test_a_stale_bytecode_cache_is_not_what_the_worker_executes(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The digest skips `__pycache__`, and the usual defence of that is not quite true.
+
+    Python discards a cache whose recorded source mtime and size have changed, which is weaker
+    than "whose source has changed": an ordinary `.pyc` carrying the right two numbers is executed
+    whatever is in it. This builds exactly that and proves the interpreter runs it, rather than
+    asserting that it would not; then it rebuilds the same cache the way provisioning does, as a
+    hash-based one the import system checks against the source's own hash, and proves the source
+    is what runs. That is what makes leaving those bytes out of the identity honest."""
+    import py_compile
+
+    site = tmp_path / "site"
+    package = site / "widget"
+    package.mkdir(parents=True)
+    source = package / "__init__.py"
+
+    def _plant(mode: "py_compile.PycInvalidationMode") -> None:
+        source.write_text("VALUE = 'cached'\n")
+        py_compile.compile(str(source), doraise=True, invalidation_mode=mode)
+        stamped = source.stat()
+        # The same length, so the cache's recorded size still matches, and the same modification
+        # time, so its recorded timestamp does too. The cache and the source now disagree, and a
+        # timestamp cache has nothing that could say so.
+        source.write_text("VALUE = 'source'\n")
+        os.utime(source, (stamped.st_atime, stamped.st_mtime))
+
+    def _value() -> str:
+        finished = subprocess.run(
+            [sys.executable, "-c", "import widget; print(widget.VALUE)"],
+            capture_output=True,
+            text=True,
+            env={
+                "PATH": os.environ.get("PATH", ""),
+                "PYTHONPATH": str(site),
+                "PYTHONDONTWRITEBYTECODE": "1",
+            },
+            timeout=60,
+        )
+        assert finished.returncode == 0, finished.stderr
+        return finished.stdout.strip()
+
+    _plant(py_compile.PycInvalidationMode.TIMESTAMP)
+    assert _value() == "cached", "a metadata-valid timestamp cache is executable code"
+
+    _plant(py_compile.PycInvalidationMode.CHECKED_HASH)
+    assert _value() == "source", "a hash-based cache is checked against the source it claims"
+
+    # And both halves of what puts the runtime in that state: every cache in it is rewritten as a
+    # hash-based one at provisioning, and a worker writes none back.
+    scratch = tmp_path / "scratch"
+    assert adapter._worker_environment(scratch)["PYTHONDONTWRITEBYTECODE"] == "1"
+
+
+def test_the_runtime_digest_covers_the_interpreter_the_venv_borrows(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """`bin/python` is a link out of the tree, and nothing read what it points at.
+
+    The digest walked `site-packages` and read `pyvenv.cfg`, which names the base interpreter's
+    *directory*. A directory is a label. The executable every world actually runs under was
+    outside the identity, so a base interpreter replaced or repointed under the same
+    configuration was one identity with the one before it."""
+    home = tmp_path / "runtime"
+    python = _fake_runtime(home)
+    base = tmp_path / "base" / "python3.12"
+    base.parent.mkdir()
+    base.write_bytes(b"an interpreter\n")
+    python.unlink()
+    python.symlink_to(base)
+    monkeypatch.setattr(adapter, "runtime", lambda: python)
+
+    before = adapter.runtime_digest()
+    assert adapter.runtime_digest() == before
+    # The same length, because a digest that only noticed lengths would pass a weaker test.
+    base.write_bytes(b"another one!!!\n")
+    assert adapter.runtime_digest() != before
+
+
+# ----- an unpack is finished or it is not -----
+
+
+def test_a_half_unpacked_runtime_is_unpacked_again_rather_than_trusted(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The runtime is published and stamped before its app sources are unpacked at all.
+
+    Reuse was decided by whether one file, `apps/todoist/models.py`, existed. Upstream's installer
+    goes on doing in-place work after the individual app files are there, so an unpack interrupted
+    anywhere past that point left a runtime under a name and a stamp that both say it is finished,
+    and every later construction skipped it. What says the unpack is done is now a stamp written
+    after the unpacking process exited zero."""
+    home = tmp_path / "runtime"
+    python = _fake_runtime(home)
+    installed = home / "lib" / "python3.12" / "site-packages" / "appworld"
+    monkeypatch.setattr(adapter, "runtime", lambda: python)
+
+    located: List[int] = []
+    monkeypatch.setattr(
+        adapter, "_installed_package", lambda _: (located.append(1), installed)[1]
+    )
+    ran: List[List[str]] = []
+
+    def _unpack(command: List[str], **kw: Any) -> None:
+        ran.append(command)
+        (installed / "apps" / "todoist").mkdir(parents=True, exist_ok=True)
+        (installed / "apps" / "todoist" / "models.py").write_text("")
+
+    monkeypatch.setattr(adapter, "_run", _unpack)
+
+    # Exactly what an interruption leaves behind: the file the old test read, and no more.
+    (installed / "apps" / "todoist").mkdir(parents=True)
+    (installed / "apps" / "todoist" / "models.py").write_text("")
+    adapter.ensure_apps()
+    assert [command[-1] for command in ran][:1] == ["install"], (
+        "the sentinel file alone is not proof the unpack finished"
+    )
+    # And the interpreter is left with hash-based bytecode caches, which is what makes the runtime
+    # digest's silence about `__pycache__` a true statement rather than a hopeful one.
+    compiled = ran[-1]
+    assert "compileall" in compiled and "checked-hash" in compiled and "-f" in compiled
+    unpacked = len(ran)
+
+    adapter.ensure_apps()
+    assert len(ran) == unpacked, "and an unpack that got to the end is not repeated"
+    # The warm path does not start the interpreter to find out where the package lives, which is
+    # most of a second on every env construction.
+    assert len(located) == 1

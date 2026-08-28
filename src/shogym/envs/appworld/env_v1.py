@@ -41,6 +41,7 @@ import datetime as dt
 import hashlib
 import threading
 import zlib
+from functools import partial
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, Dict, Optional
 
@@ -178,16 +179,31 @@ class AppWorldEnv(Env):
         snapshot = adapter.corpus_snapshot(self._original.parent, task_ids=self._task_ids)
         self._corpus = snapshot.digest
         self._specs = snapshot.specs
+        # What the interpreter turned out to hold, read once here and used for three things that
+        # have to agree: both cache names, both stamps, and the run fingerprint. It is the
+        # interpreter that writes a task's seeded database log, so a cache it did not write is a
+        # world this run did not make; and reading it twice is a second of construction for an
+        # answer that cannot have changed in between.
+        self._runtime = adapter.runtime_digest()
+        # Bound to the corpus this snapshot was taken of, and handed to both derivations. A task
+        # is materialised on its first use, which can be hours and two hundred episodes after the
+        # digest above was computed, and the bytes it copies are the world an agent is served and
+        # the baseline it is graded against. Pinning the authored text was never enough for those.
+        self._source_check = partial(snapshot.verify, self._original.parent)
         served, graded = (
-            adapter.derived_root(self._corpus),
-            adapter.graded_root(self._corpus),
+            adapter.derived_root(self._corpus, runtime=self._runtime),
+            adapter.graded_root(self._corpus, runtime=self._runtime),
         )
-        adapter.stamp_cache(served, source=self._corpus)
-        adapter.stamp_cache(graded, source=self._corpus)
-        self._derived = world.derive_root(original=self._original, derived=served / "data")
+        adapter.stamp_cache(served, source=self._corpus, runtime=self._runtime)
+        adapter.stamp_cache(graded, source=self._corpus, runtime=self._runtime)
+        self._derived = world.derive_root(
+            original=self._original, derived=served / "data", verify=self._source_check
+        )
         # The grader's view of the same corpus, with the answers linked back in. Only the grading
         # process is ever given this root; the world an agent drives is given the other one.
-        self._graded = world.derive_root(original=self._original, derived=graded / "data")
+        self._graded = world.derive_root(
+            original=self._original, derived=graded / "data", verify=self._source_check
+        )
         self._backlogs: Dict[str, Any] = {}
         self.function = FunctionConfig(example_system_template=_static_instructions())
         # The step budget the serve layer enforces is one past the configured block budget, so
@@ -201,6 +217,7 @@ class AppWorldEnv(Env):
             report=self._report,
             blocks=self._blocks,
             corpus=self._corpus,
+            runtime=self._runtime,
         )
         super().__init__(horizon=self._blocks + 1, num_tasks=len(self._task_ids))
 
@@ -277,10 +294,27 @@ class AppWorldEnv(Env):
         Seeding runs here rather than at load time because the rows are written by the worker's
         interpreter: AppWorld cannot be imported beside shogym, so the only process that can write
         a database log is the one that owns the worlds. It is idempotent, so the second time a
-        task is served the derived world is already on disk and nothing is written."""
+        task is served the derived world is already on disk and nothing is written.
+
+        **The backlog is drawn here too, and unconditionally.** It used to be drawn only where a
+        task had to be seeded, so a task served a second time reached ``finalize`` without one and
+        drew it there: at the top of a coroutine, on the loop every other episode of the run is
+        running on, for between a tenth of a second and three seconds of auditing depending on the
+        task. The serve layer runs this hook in a thread, which is where work of that shape
+        belongs, and drawing a backlog twice is free because it is kept.
+
+        **Nothing is left behind by a session that does not open.** The episode's own served view
+        is written before the worker exists and the worker exists before the session is published,
+        so a spawn that fails, a world that will not open, or anything else that raises in between
+        used to leave a copied task directory, and sometimes a live worker, with nothing holding a
+        reference to either: ``_end_session`` cleans up what a *published* session names, and there
+        is no published session on this path. This is the same teardown, owed by whoever failed."""
+        import shutil
+
         from shogym.envs.appworld import mcp_server
 
         task_id = str(task["task_id"])
+        self._backlog(task_id, self._task_specs(task_id))
         # An absolute path, which AppWorld joins onto its own output root and so replaces it
         # outright. That is the whole of what keeps one episode's end state, logs and evaluator
         # artifacts out of the tree every other episode is served from: a shared output tree is a
@@ -297,33 +331,40 @@ class AppWorldEnv(Env):
                 self._derive(seeder, task_id)
             finally:
                 seeder.close()
-        # This episode's own view of it. Not the shared tree: see `world.derive_view` for why an
-        # episode that writes through its served inputs must not be writing through the next
-        # episode's, or the other arm of its own pair's.
-        view = world.derive_view(
-            derived=self._derived,
-            view=adapter.episode_view(session_id),
-            task_id=task_id,
-        )
-        worker = adapter.Worker.spawn(view)
+        view = adapter.episode_view(session_id)
+        worker: Optional[adapter.Worker] = None
+        published = False
         try:
+            # This episode's own view of the seeded world. Not the shared tree: see
+            # `world.derive_view` for why an episode that writes through its served inputs must
+            # not be writing through the next episode's, or the other arm of its own pair's.
+            # Inside the block, because a copy that fails part way through is a partial view under
+            # this session's name and nothing else will ever come back for it.
+            world.derive_view(derived=self._derived, view=view, task_id=task_id)
+            worker = adapter.Worker.spawn(view)
             worker.call(
                 "open", task_id=task_id, experiment=experiment, seed=_world_seed(task_id)
             )
-        except Exception:
-            worker.close()
-            raise
-        mcp_server.begin_session(
-            session_id,
-            mcp_server.Session(
-                worker=worker,
-                task_id=task_id,
-                supervisor_email=str(task["supervisor_email"]),
-                experiment=experiment,
-                view=str(view),
-                budget=self._blocks,
-            ),
-        )
+            mcp_server.begin_session(
+                session_id,
+                mcp_server.Session(
+                    worker=worker,
+                    task_id=task_id,
+                    supervisor_email=str(task["supervisor_email"]),
+                    experiment=experiment,
+                    view=str(view),
+                    budget=self._blocks,
+                ),
+            )
+            published = True
+        finally:
+            if not published:
+                if worker is not None:
+                    worker.close()
+                shutil.rmtree(view, ignore_errors=True)
+                # And whatever the world managed to write before it failed to open. It is named
+                # for this session, so nothing else will ever come back for it.
+                shutil.rmtree(experiment, ignore_errors=True)
 
     def _end_session(self, session_id: str) -> None:
         import shutil
@@ -370,6 +411,7 @@ class AppWorldEnv(Env):
             write_log=lambda source, into: worker.call(
                 "seed", **rows, from_dbs=str(source), into=str(into)
             ),
+            verify=self._source_check,
         )
 
     # ----- describe -----
@@ -432,7 +474,13 @@ class AppWorldEnv(Env):
         if session is None:
             raise RuntimeError(f"no open world for session {req.session_id}")
         specs = self._task_specs(session.task_id)
-        backlog = self._backlog(session.task_id, specs)
+        # Off the loop, and it is the first thing this coroutine does that is not a dictionary
+        # lookup. `_begin_session` has normally drawn this already, in the thread the serve layer
+        # runs session setup in, and then this costs nothing; what it must not be is the coroutine
+        # itself running an audit that takes up to three seconds on a task whose world was already
+        # on disk, before it has yielded once. Every other episode of the run is on this loop, and
+        # so is the `wait_for` that is supposed to be able to time this one out.
+        backlog = await asyncio.to_thread(self._backlog, session.task_id, specs)
         key = draw_key(leg_of(session.task_id), self._pulse)
 
         # Off the event loop. Each of these blocks on another process, one of them the world's
@@ -633,7 +681,9 @@ def _static_instructions() -> str:
 SCORING_VERSION = 3
 
 
-def run_fingerprint(*, pulse: int, report: str, blocks: int, corpus: str = "") -> str:
+def run_fingerprint(
+    *, pulse: int, report: str, blocks: int, corpus: str = "", runtime: Optional[str] = None
+) -> str:
     """Everything two runs must agree on for their rows to be one measurement.
 
     The draw and the payload class decide what a score *means*; the block budget decides what an
@@ -681,8 +731,10 @@ def run_fingerprint(*, pulse: int, report: str, blocks: int, corpus: str = "") -
             # release's ranges against whatever the host and the index offer on the day, so two
             # runs could sit under one name and one identity with different worlds underneath
             # them. This reads the installed bytes, so an artifact republished under the pinned
-            # version and a module edited in place both move it.
-            adapter.runtime_digest(),
+            # version and a module edited in place both move it. Passed in by an env that has
+            # already read it, because reading it is most of a second and the answer cannot have
+            # changed between the two reads; computed here for a caller that has not.
+            runtime if runtime is not None else adapter.runtime_digest(),
             adapter.MANIFEST.read_text(),
             payload.PASS_COUNTS_FILE.read_text(),
             # Every constant a published payload is generated from, and this one was missing.
