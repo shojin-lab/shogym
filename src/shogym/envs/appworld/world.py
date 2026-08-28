@@ -726,28 +726,64 @@ def _materialise(source: Path, target: Path) -> None:
 def _publish(building: Path, target: Path, *, replacing: bool = False) -> None:
     """Give a staging tree its final name, or drop it if someone else got there first.
 
-    ``replacing`` is for the one caller that has to displace an existing target: a shared base
-    entry left incomplete or partly sealed by a crash. It is still not a build in place. The
-    finished tree is renamed *aside* first and the staged one renamed in, so the name is never
-    absent and never holds a half-made tree; the displaced one is then removed at leisure."""
+    ``replacing`` is for the callers that have to displace an existing target: a served task, a
+    grading view, or a shared base entry left incomplete or partly sealed by a crash. It is still
+    not a build in place. The finished tree is renamed *aside* and the staged one renamed in, and
+    the displaced one is removed afterwards.
+
+    **Two renames are two operations, so the name is briefly absent even when this succeeds.**
+    That used to be written here as "the name is never absent", which is not something two
+    sequential renames can promise: between them the target does not exist, and the builders' lock
+    excludes other builders rather than the live workers resolving paths through this tree. The
+    window is a syscall wide and it is real. What this does promise is that the name never holds a
+    half-made tree, because what is renamed in was complete and sealed before it had this name.
+
+    **A publish that fails puts the incumbent back.** The displaced tree used to be removed
+    unconditionally, so a failure at the second rename deleted the only remaining copy and left
+    the name absent: a probe that injected one found neither tree afterwards. For a shared base
+    entry that is worse than a failed build, because an episode already running resolves absolute
+    names through it. So the incumbent is restored, and if the restore itself fails the displaced
+    copy is *retained* under its own name rather than removed, because it is then the only copy
+    there is."""
     if target.exists() and not replacing:
         _unseal(building)
         shutil.rmtree(building, ignore_errors=True)
         return
     target.parent.mkdir(parents=True, exist_ok=True)
     displaced = target.with_name(f".{target.name}.{os.getpid()}.{secrets.token_hex(8)}.displaced")
+    published = False
+    # Whether the incumbent is sitting under `displaced` and is the only copy of it there is.
+    aside = False
     try:
         if target.exists():
             os.replace(target, displaced)
+            aside = True
         os.replace(building, target)
+        published = True
     except OSError:
         _unseal(building)
         shutil.rmtree(building, ignore_errors=True)
+        if aside:
+            try:
+                os.replace(displaced, target)
+                aside = False
+            except OSError:
+                # Left where it is. The `finally` below removes a displaced tree only after a
+                # publish that worked, so this one survives this call and can be found by name.
+                pass
+            # The publish did not happen, whatever the restore did. Raised rather than swallowed,
+            # because what holds the name now is the tree this call was asked to replace: for a
+            # task or a view that is the entry `already_derived` had already refused, and a caller
+            # told nothing would go on to serve an episode out of it.
+            raise
         if not target.exists():
             raise
+        # Somebody else published while this build was staging. Their tree is under the name and
+        # this one has been dropped, which is what this branch has always meant.
     finally:
-        _unseal(displaced)
-        shutil.rmtree(displaced, ignore_errors=True)
+        if published and aside:
+            _unseal(displaced)
+            shutil.rmtree(displaced, ignore_errors=True)
 
 
 def _link(source: Path, target: Path) -> None:

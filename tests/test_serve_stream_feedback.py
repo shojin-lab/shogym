@@ -801,13 +801,14 @@ async def test_a_resume_under_a_different_run_identity_is_refused(tmp_path: Path
 async def test_a_record_written_before_the_identity_was_a_record_still_resumes(
     tmp_path: Path,
 ) -> None:
-    """A durable format that grew is not a run that changed.
+    """A durable format that grew, migrated once rather than assumed away.
 
-    A record used to store one opaque name where it now stores a record of members. Refusing an
-    unknown opportunity is right; refusing a *known* one because the shape around it grew would be
-    a format break dressed up as a safety property. So a stored name is compared against the name
-    this caller supplies and against nothing else, because what the record does not carry it never
-    had."""
+    A record used to store one opaque name where it now stores a record of members, and the name
+    used to be compared against the caller's and nothing else. That reads absence as equality: the
+    old shape carries no deadline, no capacity and no env digests, so a record made at one
+    opportunity was resumed under the same name at another and scored a row into it. What an old
+    shape earns is the same one-time adoption an unidentified record earns, written into the
+    directory and refused to every other identity afterwards."""
     async with _stream(tmp_path, [0], identity="fingerprint-a") as first:
         await first.get_task()
         await first.dispatch(SUBMIT_TOOL, {"answer": "4"})
@@ -824,7 +825,14 @@ async def test_a_record_written_before_the_identity_was_a_record_still_resumes(
             rewritten.append(json.dumps(record))
         path.write_text("\n".join(rewritten) + "\n")
 
-    async with _stream(tmp_path, [0, 1], resume=True, identity="fingerprint-a") as resumed:
+    # The name matches, and that is not enough: what the old shape does not carry it cannot
+    # vouch for, so the caller has to say once that it knows what those rows were.
+    with pytest.raises(ValueError, match="names only a caller"):
+        _stream(tmp_path, [0, 1], resume=True, identity="fingerprint-a")
+
+    async with _stream(
+        tmp_path, [0, 1], resume=True, identity="fingerprint-a", adopt_unidentified=True
+    ) as resumed:
         await resumed.get_task()
         await resumed.dispatch(SUBMIT_TOOL, {"answer": "6"})
     assert [_named(row["run_identity"]) for row in _rows(tmp_path)] == [
@@ -832,8 +840,8 @@ async def test_a_record_written_before_the_identity_was_a_record_still_resumes(
         "fingerprint-a",
     ]
     # ...and a name that is not the record's is still two runs, whichever shape it is stored in.
-    with pytest.raises(ValueError, match="run identity"):
-        _stream(tmp_path, [0, 1], resume=True, identity="fingerprint-b")
+    with pytest.raises(ValueError, match="already been adopted"):
+        _stream(tmp_path, [0, 1], resume=True, identity="fingerprint-b", adopt_unidentified=True)
 
 
 async def test_a_record_that_names_no_identity_is_not_silently_adopted(tmp_path: Path) -> None:
@@ -857,12 +865,22 @@ async def test_a_record_that_names_no_identity_is_not_silently_adopted(tmp_path:
     _stream(tmp_path, [0, 1], resume=True, identity="fingerprint-a", adopt_unidentified=True)
 
 
-async def test_a_record_that_names_no_identity_is_continued_as_itself(tmp_path: Path) -> None:
-    """The compatibility that is owed, and the whole of it: a directory recorded before identities
-    existed is resumed by a caller that also names none. Nothing about that run changed, and
-    nothing about it is being claimed."""
+async def test_a_record_that_names_no_identity_is_adopted_even_by_a_caller_that_names_none(
+    tmp_path: Path,
+) -> None:
+    """Blank beside blank was never a comparison.
+
+    A caller that names nothing used to continue a pre-identity directory with no assertion at
+    all, on the grounds that nothing about the run was being claimed. But "names nothing" is a
+    predicate over the caller and the env digests only: the deadline and the capacity are true of
+    that run too, and the old record cannot say what they were. So the same directory was resumed
+    at a different deadline and a different capacity and scored a row into it, which is the mixed
+    opportunity the identity exists to refuse, reached through the one door left open."""
     await _unidentified_record(tmp_path)
-    resumed = _stream(tmp_path, [0, 1], resume=True)
+    with pytest.raises(ValueError, match="names no run identity"):
+        _stream(tmp_path, [0, 1], resume=True)
+
+    resumed = _stream(tmp_path, [0, 1], resume=True, adopt_unidentified=True)
     async with resumed:
         await resumed.get_task()
         await resumed.dispatch(SUBMIT_TOOL, {"answer": "6"})
@@ -871,6 +889,13 @@ async def test_a_record_that_names_no_identity_is_continued_as_itself(tmp_path: 
     stored = [row["run_identity"] for row in _rows(tmp_path)]
     assert stored[0] == ""
     assert stored[1] == {"caller": "", "envs": {}, "deadline": None, "max_in_flight": 1}
+    # And the assertion was written down, so the next ordinary resume of this shape needs no flag
+    # and every other opportunity is refused.
+    assert len(read_adoptions(tmp_path / "prov")) == 1
+    async with _stream(tmp_path, [0, 1], resume=True):
+        pass
+    with pytest.raises(ValueError, match="already been adopted"):
+        _stream(tmp_path, [0, 1], resume=True, deadline=30.0, adopt_unidentified=True)
 
 
 async def test_an_adoption_is_recorded_and_the_next_resume_is_ordinary(tmp_path: Path) -> None:
@@ -1160,6 +1185,29 @@ async def test_a_construction_that_refuses_leaves_the_record_unadopted(tmp_path:
     # So the migration did not happen, and the flagless resume is refused exactly as before.
     with pytest.raises(ValueError, match="names no run identity"):
         _stream(tmp_path, [0, 1], resume=True, identity="fingerprint-a")
+
+
+@pytest.mark.parametrize("bad", ["false", "true", 1, 0])
+async def test_resume_must_be_an_exact_boolean(tmp_path: Path, bad: Any) -> None:
+    """The stronger of the two assertions, and it had no check at all.
+
+    ``adopt_unidentified`` is refused unless it is an exact bool because ``bool("false")`` is
+    true. ``resume`` was read by ordinary truthiness, and it is the argument that deliberately
+    breaks a *live* claim: a config file or an environment variable holding the word "false"
+    therefore dispossessed a stream that was serving correctly, which then stopped for good at
+    its next owned append."""
+    incumbent = _stream(tmp_path, [0, 1])
+    await incumbent.get_task()
+    held = json.loads(_claim(tmp_path).read_text(encoding="utf-8"))
+
+    with pytest.raises(TypeError, match="resume must be True or False"):
+        _stream(tmp_path, [0, 1], resume=bad)
+    # The refusal is before anything is spent, so the incumbent still owns its directory: same
+    # claim, its append lands, and it closes cleanly.
+    assert json.loads(_claim(tmp_path).read_text(encoding="utf-8")) == held
+    async with incumbent:
+        await incumbent.dispatch(SUBMIT_TOOL, {"answer": "4"})
+    assert not incumbent.stopped
 
 
 @pytest.mark.parametrize("bad", ["false", "true", 1, 0, None])
@@ -2475,6 +2523,152 @@ async def test_a_takeover_that_cannot_publish_puts_the_incumbent_back(
         await incumbent.dispatch(SUBMIT_TOOL, {"answer": "6"})
     assert [row["position"] for row in _rows(tmp_path)] == [0, 1]
     assert not _claim(tmp_path).exists()
+
+
+@pytest.mark.parametrize("stored", ["", "fingerprint-a"])
+async def test_an_old_shape_cannot_vouch_for_the_members_it_does_not_carry(
+    tmp_path: Path, stored: str
+) -> None:
+    """Absence is not equality, in either old shape.
+
+    A bare name carries a caller and nothing else; the empty string carries not even that. Both
+    used to be accepted whenever the halves they *do* carry matched, which reads a missing member
+    as an unchanged one: a record made at ``deadline=30, max_in_flight=1`` was resumed under the
+    same caller at ``deadline=None, max_in_flight=2``, mixing two opportunity definitions inside
+    the field whose whole job is telling them apart."""
+    caller = stored or ""
+    async with _stream(
+        tmp_path, [0, 1], identity=caller, deadline=30.0, max_in_flight=1
+    ) as first:
+        await first.get_task()
+        await first.dispatch(SUBMIT_TOOL, {"answer": "4"})
+    _restamp_identity(tmp_path, stored)
+
+    # The changed opportunity is refused, and so is the unchanged one: an old shape earns an
+    # adoption either way, because it cannot testify to what it never recorded.
+    with pytest.raises(ValueError, match="adopt_unidentified=True"):
+        _stream(tmp_path, [0, 1], resume=True, identity=caller, deadline=None, max_in_flight=2)
+    with pytest.raises(ValueError, match="adopt_unidentified=True"):
+        _stream(tmp_path, [0, 1], resume=True, identity=caller, deadline=30.0, max_in_flight=1)
+
+    # Adopted once, by one opportunity, and every other one is refused from then on.
+    async with _stream(
+        tmp_path,
+        [0, 1],
+        resume=True,
+        identity=caller,
+        deadline=30.0,
+        max_in_flight=1,
+        adopt_unidentified=True,
+    ):
+        pass
+    with pytest.raises(ValueError, match="already been adopted"):
+        _stream(
+            tmp_path,
+            [0, 1],
+            resume=True,
+            identity=caller,
+            deadline=None,
+            max_in_flight=2,
+            adopt_unidentified=True,
+        )
+
+
+async def test_a_result_row_that_answers_no_dispense_is_refused(tmp_path: Path) -> None:
+    """The two logs are not two records.
+
+    A dispense is the durable half a crash leaves behind and a result is the answer to it, and
+    `reconcile` pairs them by lease alone. Each was checked against the queue and neither against
+    the other, so a result whose lease named no dispense retired its position and was skipped
+    while `reconcile` went on reporting a `broker_abort` for the dispense nothing now answered:
+    one queue position holding a score and a crash at once, in a record a resume called
+    complete."""
+    async with _stream(tmp_path, [0, 1]) as first:
+        await first.get_task()
+        await first.dispatch(SUBMIT_TOOL, {"answer": "4"})
+
+    path = tmp_path / "prov" / "results.jsonl"
+    rewritten = []
+    for line in path.read_text().splitlines():
+        if not line.strip():
+            continue
+        record = json.loads(line)
+        record["lease"] = "z" * 32
+        rewritten.append(json.dumps(record))
+    path.write_text("\n".join(rewritten) + "\n")
+
+    with pytest.raises(ValueError, match="which no dispense") as refused:
+        _stream(tmp_path, [0, 1], resume=True)
+    assert "broker abort" in str(refused.value)
+
+
+@pytest.mark.parametrize("field", ["position", "seq"])
+async def test_a_result_row_that_disagrees_with_its_dispense_is_refused(
+    tmp_path: Path, field: str
+) -> None:
+    """One call wrote both halves, so a record whose halves disagree cannot say which
+    opportunity the outcome belongs to.
+
+    The queue holds one task twice, so both records stay consistent with the queue whichever way
+    the pairing is broken: what is under test is the cross-check and not the position check that
+    runs before it. ``env`` and ``task_idx`` cannot be isolated that way, because moving either
+    makes a record disagree with the queue first and earns that refusal instead."""
+    async with _stream(tmp_path, [0, 0]) as first:
+        for _ in range(2):
+            await first.get_task()
+            await first.dispatch(SUBMIT_TOOL, {"answer": "4"})
+
+    path = tmp_path / "prov" / "dispenses.jsonl"
+    records = [json.loads(line) for line in path.read_text().splitlines() if line.strip()]
+    # Broken on the dispense side, so every row still matches the queue it was recorded against.
+    if field == "position":
+        records[0]["position"], records[1]["position"] = (
+            records[1]["position"],
+            records[0]["position"],
+        )
+    else:
+        records[1]["seq"] = records[0]["seq"]
+    path.write_text("\n".join(json.dumps(record) for record in records) + "\n")
+
+    with pytest.raises(ValueError, match="the dispense it answers records"):
+        _stream(tmp_path, [0, 0], resume=True)
+
+
+async def test_two_result_rows_for_one_opportunity_are_refused(tmp_path: Path) -> None:
+    """A position is one opportunity, so two outcomes for it cannot both be the one a mean
+    averages."""
+    async with _stream(tmp_path, [0, 0]) as first:
+        for _ in range(2):
+            await first.get_task()
+            await first.dispatch(SUBMIT_TOOL, {"answer": "4"})
+
+    for name in ("results.jsonl", "dispenses.jsonl"):
+        path = tmp_path / "prov" / name
+        records = [json.loads(line) for line in path.read_text().splitlines() if line.strip()]
+        records[1]["position"] = 0
+        path.write_text("\n".join(json.dumps(record) for record in records) + "\n")
+
+    with pytest.raises(ValueError, match="two result rows for queue position 0"):
+        _stream(tmp_path, [0, 0], resume=True)
+
+
+async def test_a_dispense_with_no_result_is_still_the_row_a_resume_replays(
+    tmp_path: Path,
+) -> None:
+    """The cross-check may not turn the crash it exists to describe into a refusal: an abandoned
+    dispense is exactly what a resume replays and what `reconcile` reports."""
+    crashed = _stream(tmp_path, [0, 1])
+    await crashed.get_task()  # dispensed, never sealed
+    assert read_results(tmp_path / "prov") == []
+    async with _stream(tmp_path, [0, 1], resume=True) as resumed:
+        await resumed.get_task()
+        await resumed.dispatch(SUBMIT_TOOL, {"answer": "4"})
+    assert [row["position"] for row in _rows(tmp_path)] == [0]
+    assert [row.closure for row in reconcile(tmp_path / "prov")] == ["broker_abort"]
+    # The crashed stream lost its directory to the resume that continued it, which is the whole
+    # assertion `resume=True` makes, so its own close reports the row it can no longer write.
+    with pytest.raises(RuntimeError, match="record is incomplete"):
+        await crashed.aclose()
 
 
 @pytest.mark.parametrize(

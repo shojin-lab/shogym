@@ -267,7 +267,16 @@ async def test_the_world_process_answers_nothing_without_its_token() -> None:
         worker.close()
 
 
-async def test_the_port_and_the_token_reach_no_agent_visible_surface() -> None:
+async def test_the_port_and_the_token_are_absent_from_every_standard_surface() -> None:
+    """What the port and the token are kept off, which is every surface this env answers on: the
+    instructions, a tool's schema, a tool's result and the terminal's own metadata. Argv and the
+    environment are checked beside these, in the probe test below.
+
+    That is the whole of the claim, and the name says so now because the old one ("no
+    agent-visible surface") claimed more than any test here can. Agent-authored code runs *as* the
+    worker process and the token is that process's own handler state, so it is a gate against
+    another process on this machine and never a secret from the code running in this one (see
+    `worker.TOKEN_HEADER`)."""
     env = shogym.make("appworld")
     episode = await ServedEpisode.open_env(env, env_name="appworld", task=TASK)
     try:
@@ -876,3 +885,81 @@ async def test_information_hands_back_the_receipt_and_placebo_the_digest(
     assert len(receipt.encode()) == len(digest.encode())
     # And the two answers are the same size on the wire, not just the two values.
     assert len(json.dumps(answers["information"])) == len(json.dumps(answers["placebo"]))
+
+
+async def test_the_documented_launch_serves_each_arm_of_the_pair(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The command in this port's README, run, both arms of it.
+
+    The test above builds a `TaskStream` by hand, which is not what anybody launches. What the
+    README documents is the Claude Code quickstart: an MCP config that spawns `serve.py`, and an
+    environment that says which env, which tasks and which regime. That path served
+    `Immediate()` and nothing else, so the documented way to run this env handed one agent the
+    receipt, its placebo and every numeric grade at once. It was neither arm of the pair it was
+    documented as running, and no test noticed because none of them ran it.
+
+    So this drives the quickstart's own module the way its own MCP server does, once per arm, and
+    asks the three questions the launch has to answer: does the regime reach the stream, does each
+    arm reveal only its own channel, and does each arm land a row of its own that says which arm
+    it was. The rows are read back with the quickstart's reader, which is also what makes this a
+    check on the summary the reader prints."""
+    import importlib
+
+    from fastmcp import Client
+
+    from examples.claude_code import results as results_mod
+    from examples.claude_code import serve as serve_mod
+    from shogym.feedback.wire import CHANNEL_FEEDBACK_NAME
+    from shogym.serve.stream import build_stream_server
+
+    quickstart = Path(serve_mod.__file__).resolve().parent
+    config = json.loads((quickstart / ".mcp.json").read_text())
+    # The launch is only this file's if this is still what the documented config spawns.
+    assert config["mcpServers"]["shogym"]["args"] == ["run", "python", "serve.py"]
+
+    directories: List[Path] = []
+    try:
+        for arm in ("information", "placebo"):
+            monkeypatch.setenv("SHOGYM_ENV", "appworld")
+            monkeypatch.setenv("SHOGYM_TASKS", str(TASK))
+            monkeypatch.setenv("SHOGYM_FEEDBACK", arm)
+            monkeypatch.setenv("SHOGYM_IDENTITY", "the-pair")
+            monkeypatch.setenv("SHOGYM_DEADLINE", "1800")
+            monkeypatch.setenv("SHOGYM_IN_FLIGHT", "1")
+            # The constants are read from the environment at import, which is what a launch does.
+            importlib.reload(serve_mod)
+            assert (serve_mod.ENV, serve_mod.TASKS, serve_mod.FEEDBACK) == (
+                "appworld",
+                [TASK],
+                arm,
+            )
+            # Each arm names its own directory, without being told to.
+            directories.append(serve_mod.new_run_dir(runs=tmp_path))
+
+            stream = serve_mod.build_stream(prov_dir=tmp_path / arm)
+            assert stream.feedback.regime == arm
+            async with stream:
+                async with Client(build_stream_server(stream, name="shogym")) as client:
+                    dispensed = json.loads(
+                        (await client.call_tool("get_task", {})).content[0].text
+                    )
+                    assert set(dispensed) == {"env", "instructions", "budget", "tools"}
+                    terminal = json.loads((await client.call_tool("submit", {})).content[0].text)
+
+            revealed = {item["name"]: item["value"] for item in terminal["feedback"]}
+            # One item, under the one public name, and never the numbers.
+            assert set(revealed) == {CHANNEL_FEEDBACK_NAME}
+            assert "SUBMISSION RECEIPT" in revealed[CHANNEL_FEEDBACK_NAME]
+
+            rows = results_mod.rows(tmp_path / arm)
+            assert [row.feedback_regime for row in rows] == [arm]
+            assert rows[0].score is not None
+            # And the row is summarisable, which is what the reader counts and prints.
+            assert rows[0].score.reward is not None
+    finally:
+        # The module's constants are process-wide, so they go back to what the environment says.
+        monkeypatch.undo()
+        importlib.reload(serve_mod)
+
+    assert directories[0] != directories[1], "the two arms would have shared one record"

@@ -55,7 +55,7 @@ inside it.
 Usage::
 
     python worker.py serve            # {"root": ..., "token": ..., "keepalive": ...} on stdin
-    python worker.py grade            # {"root", "task_id", "experiment", "filing"} on stdin
+    python worker.py grade            # {"root", "task_id", "experiment", "filing", "keepalive"}
     python worker.py install
     python worker.py unpack --bundle <bundle> --into <directory>
 """
@@ -641,7 +641,12 @@ def main(argv: Optional[List[str]] = None) -> int:
         opening = _handshake()
         return serve(opening["root"], opening["token"], opening.get("keepalive"))
     if args.command == "grade":
-        print(json.dumps({"output": grade(_handshake())}), flush=True)
+        opening = _handshake()
+        # Armed before the evaluator is loaded, for the reason `serve` arms it before it builds a
+        # world: this process is short-lived but it is not instant, and a host that dies inside
+        # its ten minutes would otherwise leave it running under init with nothing naming it.
+        watch_parent(opening.get("keepalive"))
+        print(json.dumps({"output": grade(opening)}), flush=True)
         return 0
     if args.command == "install":
         return install()

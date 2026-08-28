@@ -1326,6 +1326,12 @@ _ENV_ALLOW_LIST: Tuple[str, ...] = ("PATH", "LANG", "LC_ALL", "LC_CTYPE", "SYSTE
 #: removing one whose name it read out of a file: the ledger is a file, and a file can be edited.
 _SCRATCH_PREFIX = "shogym-appworld-"
 
+#: A grader's scratch directory, which is a worker's with a word added. It carries the prefix
+#: above because a grader is written into the same ledger as a serving worker and is reclaimed by
+#: the same sweep, which will only remove a directory whose name it recognises (see
+#: :func:`_clear_scratch`).
+_GRADE_SCRATCH_PREFIX = _SCRATCH_PREFIX + "grade-"
+
 
 def _close_descriptor(descriptor: Optional[int]) -> None:
     """Close a raw descriptor, and treat one that is already closed as closed."""
@@ -1534,7 +1540,14 @@ def reap(*, alive: Optional[Any] = None) -> List[str]:
         # be the one where nothing happens.
         if not owner.isdigit() or running(int(owner), str(record.get("birth", ""))):
             continue
-        _stop_orphan(record)
+        if not _stop_orphan(record):
+            # Nothing was stopped and nothing was seen to be gone, so this record is still the
+            # only durable trace of a worker that may be running. It used to be tombstoned here
+            # anyway, along with its scratch directory: an entry with a live worker pid and an
+            # unreadable birth was reported reclaimed by a sweep that had signalled nothing, which
+            # leaves a world serving with nothing left naming it: exactly the failure this whole
+            # file exists to close. Left where it is, for the next construction to try again.
+            continue
         _clear_scratch(record)
         forget_worker(name)
         reclaimed.append(name)
@@ -1542,8 +1555,8 @@ def reap(*, alive: Optional[Any] = None) -> List[str]:
     return reclaimed
 
 
-def _stop_orphan(record: Dict[str, Any]) -> None:
-    """Signal an abandoned worker's group, but only while the group is provably still its own.
+def _stop_orphan(record: Dict[str, Any]) -> bool:
+    """Stop an abandoned worker's group, and say whether the worker was positively dealt with.
 
     The same rule :meth:`Worker.close` follows, for the same reason and with less to go on: a pgid
     is a number, and a number is that worker's only while the process holding it exists. The
@@ -1555,14 +1568,55 @@ def _stop_orphan(record: Dict[str, Any]) -> None:
     A birth that was never readable is treated the same way. Elsewhere an unknown birth reads as
     "says nothing" and the pid is believed, which is the safe direction for a question about
     whether to *leave something alone*; here the answer decides whether to send a signal, so
-    unknown has to mean no."""
+    unknown has to mean no.
+
+    **The answer is what the caller tombstones on, and that is the change.** This used to return
+    nothing whatever it had done, so every one of the silent paths below reported the same thing
+    to :func:`reap` as a delivered kill: an entry with a live worker pid and a birth the process
+    table would not answer for had its scratch removed and its ledger line tombstoned without a
+    signal being sent, which is a running world with no durable record of itself left. Only two
+    outcomes are true here now, and both of them are positive:
+
+    * the group was addressed. The signal went out, or there was no group left to take it, which
+      is the same fact about this worker's execution domain.
+    * the worker was observed gone. Its pid names nothing at all, or it names a process born at
+      some other time, and in either case the process this record was written for has exited.
+
+    Everything else is ambiguity: a record this cannot read, a birth nobody wrote down, a process
+    table that will not answer, a pid this uid may not query. Ambiguity keeps the record and the
+    scratch rather than spending them."""
     pid, pgid = record.get("pid"), record.get("pgid")
     birth = str(record.get("pid_birth") or "")
     if not isinstance(pid, int) or not isinstance(pgid, int) or pid != pgid:
-        return
-    if not birth or process_birth(pid) != birth:
-        return
-    _signal_group(pgid, signal.SIGKILL)
+        return False
+    if not birth:
+        return False
+    now = process_birth(pid)
+    if now == birth:
+        return _signal_group(pgid, signal.SIGKILL)
+    if now:
+        # A different process is wearing this number, so the worker that was written down here has
+        # exited. Nothing of its own is left to signal, and the number is not this port's to aim
+        # at.
+        return True
+    # The table said nothing, which is not the same as saying the process is gone. One question
+    # left that does not need it: whether the number names anything at all.
+    return _pid_is_absent(pid)
+
+
+def _pid_is_absent(pid: int) -> bool:
+    """Whether ``pid`` names no process at all, as far as this process is allowed to tell.
+
+    The narrow half of :func:`_process_is_alive`, and it answers the opposite way where it cannot
+    tell. A number this uid may not signal belongs to somebody else and is certainly not absent,
+    and an error that is neither is not an observation of anything."""
+    try:
+        os.kill(pid, 0)
+    except ProcessLookupError:
+        return True
+    except OSError:
+        return False
+    return False
 
 
 def _clear_scratch(record: Dict[str, Any]) -> None:
@@ -1713,9 +1767,16 @@ def _boot_id() -> str:
 class Worker:
     """A handle on one episode's world, running in a process of its own.
 
-    The port is the process's, the token is this object's, and neither is ever put anywhere an
-    agent can read: not on the worker's command line, not in the instructions the env publishes,
-    not in a tool's schema, and not in a tool's result.
+    The port is the process's and the token is this object's, and neither is handed over on any of
+    the standard surfaces: not on the worker's command line, not in its environment, not in the
+    instructions the env publishes, not in a tool's schema, and not in a tool's result. That is
+    the whole of the claim, and it is what the tests exercise.
+
+    **It is not a secret from the code the agent writes**, and nothing here should be built as
+    though it were. That code runs as the worker process, and the token is that process's own
+    handler state; no arrangement inside one interpreter puts a value beyond the code running in
+    it. What the token holds is the boundary it can hold: another process on this machine cannot
+    drive this world without it (see :data:`~worker.TOKEN_HEADER`).
 
     What this is and is not: it keeps the world's own grading routes and the serving process's
     environment out of the agent's reach, and it is not a sandbox. The code an agent writes runs
@@ -1821,6 +1882,14 @@ class Worker:
             assert process.stdout is not None
             line = _first_line(process, _SPAWN_TIMEOUT_SECONDS)
             if not line:
+                # The group is stopped first and the status read after it, because ``poll`` reaps
+                # an exited child and a reaped leader's group number is the kernel's to hand on.
+                # Read for the diagnostic before anything had stopped the group, it left the
+                # cleanup below signalling a number that might already have been somebody else's,
+                # which is the stale-group ordering :meth:`_stop_the_group` refuses. A worker that
+                # closed its pipe without printing is also a worker that may have started
+                # something first, and this is what stops that too.
+                _stop(process, signal.SIGKILL, pgid)
                 raise WorkerError(
                     "the appworld worker never bound a port "
                     f"(status {process.poll()}, waited {_SPAWN_TIMEOUT_SECONDS:.0f}s)"
@@ -2235,39 +2304,82 @@ def grade(
     world over the protocol, which made the process that runs agent-authored code the process
     reporting what the episode had done. One process now reads one stopped tree, so the filing,
     the databases' digest and the evaluator's verdicts are one state by construction rather than
-    two observations that happened to agree."""
-    opening = json.dumps(
-        {
-            "root": str(root),
-            "task_id": task_id,
-            "experiment": str(outputs),
-            "ignore": list(ignore),
-            "filing": dict(filing),
-        }
-    )
-    scratch = Path(tempfile.mkdtemp(prefix="shogym-appworld-grade-"))
-    process = subprocess.Popen(
-        [str(runtime()), str(WORKER), "grade"],
-        stdin=subprocess.PIPE,
-        stdout=subprocess.PIPE,
-        stderr=subprocess.PIPE,
-        text=True,
-        cwd=str(scratch),
-        env=_worker_environment(scratch),
-    )
+    two observations that happened to agree.
+
+    **A session of its own, and the same two lifelines the serving worker has.** This used to be
+    an ordinary child with captured pipes, which made the advertised bound a bound on nothing: the
+    timeout killed the leader alone and then read the pipes again with no deadline, so a
+    descendant holding either of them kept a sealed episode's terminal open indefinitely. It ran
+    for twenty seconds under a one-second bound in a probe, with the descendant still running
+    afterwards. The group is what is signalled now, its emptying is what is waited for, and every
+    wait on the way down has a bound of its own (see :func:`_end_grader`).
+
+    The other half is the crash: this process is short-lived but it is not instant, and a serving
+    parent that dies inside those ten minutes would have left it running under init with nothing
+    naming it. So it holds the reading end of a pipe from here and stops its own group when that
+    reaches end of file (see :func:`~worker.watch_parent`), and it is written into the same
+    durable ledger the serving workers are, so a later construction reclaims it (see
+    :func:`reap`)."""
+    scratch = Path(tempfile.mkdtemp(prefix=_GRADE_SCRATCH_PREFIX))
+    process: Optional[subprocess.Popen] = None
+    pgid: Optional[int] = None
+    record: Optional[str] = None
+    # Non-inheritable by default, so no other child of this process holds the writing end open and
+    # keeps the grader reporting this one alive after it has gone.
+    listening, holding = os.pipe()
     try:
-        # Bounded, killed and reaped. An evaluator that hangs would otherwise hold a sealed
-        # episode's terminal open forever: `to_thread` does not make a child process cancellable,
-        # so a deadline on the coroutine stops the waiting and leaves the child running.
-        out, err = process.communicate(input=opening + "\n", timeout=timeout)
-    except subprocess.TimeoutExpired:
-        process.kill()
-        process.communicate()
-        raise WorkerError(
-            f"grading {task_id} did not finish within {timeout:.0f}s; the grader was killed"
-        ) from None
+        process = subprocess.Popen(
+            [str(runtime()), str(WORKER), "grade"],
+            stdin=subprocess.PIPE,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+            cwd=str(scratch),
+            env=_worker_environment(scratch),
+            # Its own process group, for the reason the serving worker has one: what is stopped on
+            # a timeout has to be everything this process started, and the evaluator is upstream
+            # code this port does not get to promise is childless.
+            start_new_session=True,
+            pass_fds=(listening,),
+        )
+        # Read once, while the answer is certainly about this process (see `Worker.pgid`).
+        pgid = _group_of(process)
+        record = record_worker(
+            pid=process.pid,
+            pid_birth=process_birth(process.pid),
+            pgid=pgid,
+            scratch=str(scratch),
+        )
+        opening = json.dumps(
+            {
+                "root": str(root),
+                "task_id": task_id,
+                "experiment": str(outputs),
+                "ignore": list(ignore),
+                "filing": dict(filing),
+                "keepalive": listening,
+            }
+        )
+        try:
+            # Bounded, killed and reaped. An evaluator that hangs would otherwise hold a sealed
+            # episode's terminal open forever: `to_thread` does not make a child process
+            # cancellable, so a deadline on the coroutine stops the waiting and leaves the child
+            # running.
+            out, err = process.communicate(input=opening + "\n", timeout=timeout)
+        except subprocess.TimeoutExpired:
+            _end_grader(process, pgid)
+            raise WorkerError(
+                f"grading {task_id} did not finish within {timeout:.0f}s; the grader's process "
+                "group was stopped"
+            ) from None
     finally:
+        # The child has its own copy; a reading end still open here would be a pipe that never
+        # reaches end-of-file for the grader either.
+        _close_descriptor(listening)
+        _close_descriptor(holding)
         shutil.rmtree(scratch, ignore_errors=True)
+        if record is not None:
+            forget_worker(record)
     if process.returncode != 0:
         raise WorkerError(
             f"grading {task_id} failed (status {process.returncode}): {err.strip()[-2000:]}"
@@ -2286,11 +2398,24 @@ def _group_of(process: subprocess.Popen) -> Optional[int]:
         return None
 
 
-def _signal_group(pgid: int, how: int) -> None:
+def _signal_group(pgid: int, how: int) -> bool:
+    """Signal every process in ``pgid``, and say whether the group was addressed at all.
+
+    True is "the signal was delivered, or there was no member left to deliver it to": both are
+    answers about this group, and the second is the one a stop is aiming at. False is this process
+    being unable to address it at all (a platform with no ``killpg``, or a group this uid may not
+    signal), which is not an outcome anything may be concluded from.
+
+    :meth:`Worker._stop_the_group` ignores the answer because it reads the process table
+    afterwards, which is the stronger evidence. :func:`_stop_orphan` has no such reader and
+    tombstones a durable record on the strength of this, so it needs the difference."""
     try:
         os.killpg(pgid, how)
+    except ProcessLookupError:
+        return True
     except (OSError, AttributeError):
-        pass
+        return False
+    return True
 
 
 def _group_members(pgid: int) -> Optional[List[int]]:
@@ -2387,6 +2512,40 @@ def _stop(process: subprocess.Popen, how: int, pgid: Optional[int]) -> None:
         pass
 
 
+def _end_grader(process: subprocess.Popen, pgid: Optional[int]) -> None:
+    """Stop a grader that outran its bound, and do not return until its group is gone.
+
+    Every step here is one the plain ``kill``-then-``communicate`` pair got wrong. The group is
+    signalled rather than the leader, because the evaluator is upstream code that may have started
+    something and a descendant of it holds the captured pipes; the signal goes out *before*
+    anything reaps the leader, which is the window in which the number is certainly this grader's
+    (the ordering :meth:`Worker._stop_the_group` exists for); the group's emptying is read from the
+    process table rather than inferred; and the final read of the pipes carries a deadline, because
+    an unbounded ``communicate`` on a descendant's pipe is exactly how a 600-second bound became no
+    bound at all.
+
+    Every wait is bounded, including this one: a teardown that cannot finish is reported by the
+    caller as a grading failure, and an episode is better left unscored than left waiting on a
+    process nothing can account for."""
+    _stop(process, signal.SIGKILL, pgid)
+    if pgid is not None:
+        # Enumerated while the leader is still unreaped, so this asks about descendants and about
+        # nothing else (see `_group_members`).
+        _group_emptied(pgid, within=_CLOSE_SECONDS)
+    try:
+        process.communicate(timeout=_CLOSE_SECONDS)
+    except (subprocess.TimeoutExpired, ValueError, OSError):
+        # A pipe something still holds, or one already closed underneath this. The group has been
+        # killed and confirmed above; what is left here is a read this call will not wait on.
+        pass
+    for stream in (process.stdin, process.stdout, process.stderr):
+        if stream is not None:
+            try:
+                stream.close()
+            except Exception:
+                pass
+
+
 def _abandon(process: Optional[subprocess.Popen], pgid: Optional[int], scratch: Path) -> None:
     """Take back everything a worker that never got published was given.
 
@@ -2395,9 +2554,20 @@ def _abandon(process: Optional[subprocess.Popen], pgid: Optional[int], scratch: 
     group, because the leader may already have started something. Reaped, because an unreaped
     child holds its pid and this is the one moment at which nobody else will ever wait on it. And
     the scratch directory last, which is this worker's ``HOME``, its working directory and its
-    bytecode cache."""
+    bytecode cache.
+
+    **A leader something already reaped is not signalled**, which is the rule
+    :meth:`Worker._stop_the_group` follows and which this used to break. A pid is reserved until
+    its parent reaps it and a group exists while any member holds it, so an unreaped leader makes
+    the stored number unambiguously this worker's; once the leader has been waited on, the kernel
+    is free to hand both numbers to somebody else, and a ``killpg`` after that is a signal into a
+    stranger's group. The reap can happen before this call as easily as inside it: the failed
+    handshake's own diagnostic used to call ``poll()``, which reaps an exited child, and then this
+    function signalled the released number. There is then nothing of this worker's left to stop,
+    and the scratch directory is still cleared."""
     if process is not None:
-        _stop(process, signal.SIGKILL, pgid)
+        if process.returncode is None:
+            _stop(process, signal.SIGKILL, pgid)
         try:
             process.wait(timeout=_CLOSE_SECONDS)
         except subprocess.TimeoutExpired:
