@@ -785,13 +785,12 @@ async def test_one_episodes_write_is_not_in_the_next_episodes_world() -> None:
 
 
 async def test_the_world_stops_before_it_is_graded() -> None:
-    """Sealing closes the tool surface and does not stop work an earlier call left running, so the
-    worker's whole group is stopped and *confirmed gone* before anything reads what it left.
+    """Sealing closes the tool surface, so the worker is stopped and reaped before anything reads
+    what it left: the filing, the digests and the evaluator all read one state.
 
-    The leader's exit used to be the whole of this assertion, and a leader says nothing about what
-    it started. What is checked now is the value the finalizer grades on: the group was signalled
-    while it was still this worker's, the leader was reaped, and the process table was read and
-    held nothing of the group. An episode whose stop cannot be confirmed is not scored at all."""
+    What that does *not* prove is that nothing of the episode's is still running. Agent code runs
+    in the worker and is free to spawn, and a descendant of it survives this stop. Closing that
+    needs a namespace rather than a signal, which is shojin-lab/shogym#140."""
     from shogym.envs.appworld import mcp_server
 
     env = shogym.make("appworld")
@@ -801,43 +800,14 @@ async def test_the_world_stops_before_it_is_graded() -> None:
         assert session is not None
         worker = session.worker
         assert worker.process.poll() is None
-        assert worker.stopped is False
         await episode.call("submit", {})
-        # Graded, and the process that could have changed the world is not merely dead: its whole
-        # group was observed empty before a byte of what it wrote was read.
+        # Graded, and the process that could have changed the world was reaped before a byte of
+        # what it wrote was read.
         assert worker.process.poll() is not None
-        assert worker.stopped is True
     finally:
         await episode.close()
     # The copy the grader was given goes with the episode too.
     assert not Path(str(adapter.episode_outputs(episode.session_id)) + ".graded").exists()
-
-
-async def test_a_stop_that_cannot_be_confirmed_scores_nothing_and_reveals_nothing(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    """The fail-closed path, driven through a real world.
-
-    An unconfirmed stop leaves a tree something may still be writing to, and a number computed
-    over it is a number about no instant of the episode. This used to be scored anyway: the
-    quiescence failure was noted on the row and the fractions, the receipt and the notice were
-    published beside it. Now the episode ends as an infrastructure closure, and there is no
-    receipt and no notice for a feedback policy to select, rename and reveal."""
-    env = shogym.make("appworld")
-    episode = await ServedEpisode.open_env(env, env_name="appworld", task=TASK)
-    try:
-        # Exactly the shape of the failure: `ps` cannot be read, so nothing can say the group is
-        # empty. The worker is still signalled and reaped; what is missing is the evidence.
-        monkeypatch.setattr(adapter, "_group_members", lambda pgid: None)
-        await episode.call("submit", {})
-        payload = episode.terminal_payload or {}
-        assert payload.get("finalize_error") is True
-        # Nothing that could be read as a score, and neither arm's dose.
-        published = {item["name"] for item in (episode.terminal_feedback or [])}
-        assert "report" not in published and "notice" not in published
-        assert "ledger_fraction" not in published
-    finally:
-        await episode.close()
 
 
 # ----- the matched pair, through a stream -----
