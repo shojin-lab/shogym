@@ -381,10 +381,15 @@ class FinalizationStore:
         _fsync_dir(self._dir)
 
     def read(self, finalization_id: str) -> Optional[FinalizationRecord]:
+        """One record by id, through the same reader a scan uses.
+
+        Parsed directly, this returned another episode's evidence out of a file whose contents
+        named a different id, while `load_all` correctly refused the same file. One reader, one
+        answer: a direct read and a recovery scan may not disagree about what a record is."""
         path = self._path(finalization_id)
         if not path.exists():
             return None
-        return _record_from_dict(json.loads(path.read_text(encoding="utf-8")))
+        return self._read_path(path)
 
     def load_all(self) -> List[FinalizationRecord]:
         return self._load_all()[0]

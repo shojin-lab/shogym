@@ -3649,7 +3649,7 @@ class TaskStream:
         if replacing.done():
             self._replacing.pop(position, None)
 
-    def _builder(self, position: int, ref: TaskRef) -> "_Builder":
+    async def _builder(self, position: int, ref: TaskRef) -> "_Builder":
         """The build owed to one queue position: the one already running, or a new one.
 
         **Adopted here, under the dispense lock, and that is what makes shutdown safe.** An entry
@@ -3676,6 +3676,12 @@ class TaskStream:
             # of them inside `max_in_flight`, which is the unbounded construction the registry
             # exists to prevent.
             self._replacing[position] = discarded
+            # Waited for *here*, before the replacement exists. Registered and then returned to a
+            # caller that only checked `_replacing` on its way in, the call that detected the
+            # mismatch was the one call that never waited: it started B while A was still
+            # constructing, two constructors for one position and outside the capacity that is
+            # supposed to bound them.
+            await self._await_replaced(position)
             held = None
         if held is None:
             lifecycle = _Lifecycle(ref.env)
@@ -3692,7 +3698,6 @@ class TaskStream:
             held = self._builders[position] = _Builder(
                 lifecycle, building, context, close_context
             )
-        held.adopted = True
         return held
 
     def _drop_builders(self) -> None:
@@ -3910,8 +3915,12 @@ class TaskStream:
             # whether or not it had settled, so a slow one restored the overlap on the next pull.
             # It stays registered until it is done.
             await self._await_replaced(position)
-            held = self._builder(position, ref)
-            await self._await_replaced(position)
+            held = await self._builder(position, ref)
+            # Adoption is the last step, after every wait. Set inside the builder, a cancellation
+            # in the wait that followed left an adopted entry nobody was waiting for, and
+            # `_drop_builders` skips adopted entries on purpose, so shutdown walked past it and
+            # its env and lifecycle stayed alive for good.
+            held.adopted = True
             lifecycle, building = held.lifecycle, held.building
             try:
                 if building is not None:
