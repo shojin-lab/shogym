@@ -137,16 +137,6 @@ class AppWorldEnv(Env):
     function_name = "agent"
     score_terminal_tool = SUBMIT_TOOL_NAME
 
-    #: The item a runner may compare against the identity it is filing rows under. Declared here
-    #: rather than assumed there: `config_digest` is an ordinary name any env may publish as a
-    #: metric, and a module that decided what its number meant would turn another env's successful
-    #: terminal into an unscored failure. An env that declares nothing is not checked.
-    #:
-    #: The value is readable off the env itself (`config_digest` below), so a serve layer can fold
-    #: it into the identity a run is filed under before the first task is dispensed, rather than
-    #: waiting for the first row to publish one.
-    identity_feedback_name = "config_digest"
-
     def __init__(
         self,
         pulse: int = DEFAULT_PULSE,

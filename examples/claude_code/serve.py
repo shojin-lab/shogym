@@ -61,24 +61,17 @@ TASKS = [int(t) for t in os.environ["SHOGYM_TASKS"].split(",")] if os.environ.ge
 #     SHOGYM_FEEDBACK=information <your harness command>
 FEEDBACK = os.environ.get("SHOGYM_FEEDBACK") or "immediate"
 
-# What this run is called, in the record. The stream folds the deadline, the capacity and what
-# each env said about itself into the same identity, so this is the human-readable half; a
-# directory that already names one refuses a resume naming another, which is what keeps two arms
-# of a pair from being appended into one record.
-#     SHOGYM_IDENTITY=appworld-pulse-0-pilot <your harness command>
-IDENTITY = os.environ.get("SHOGYM_IDENTITY") or ""
-
-# Seconds per task, and how many tasks may be in flight at once. Both are members of the identity
-# above, because a deadline decides whether a slow episode is scored or timed out and a capacity
-# decides what an agent may work on next, so two arms compared against each other have to agree
-# on them. Unset is no deadline and one task at a time.
+# Seconds per task, and how many tasks may be in flight at once. A deadline decides whether a slow
+# episode is scored or timed out and a capacity decides what an agent may work on next, so two
+# arms compared against each other have to agree on them. Unset is no deadline and one task at a
+# time.
 DEADLINE = float(os.environ["SHOGYM_DEADLINE"]) if os.environ.get("SHOGYM_DEADLINE") else None
 IN_FLIGHT = int(os.environ.get("SHOGYM_IN_FLIGHT") or 1)
 # --------------------------------------------------------------------------------------------
 
 # Where the records go. Beside this file by default, which is what a quickstart wants. A run whose
 # scores you intend to defend puts them somewhere the agent is not working: the directory holds
-# `claim.json`, which names the regime and the identity before the first task is dispensed, and
+# `claim.json`, which names the regime before the first task is dispensed, and
 # `results.jsonl`, which keeps every payload the env published on every row whatever the arm was
 # told. An agent that can read either can read its own assignment and the receipt a control arm
 # withholds, so a paired run names a directory of its own here and takes the file-reading built-ins
@@ -134,7 +127,6 @@ def build_stream(
     tasks: Sequence[int] = TASKS,
     prov_dir: Optional[Path] = None,
     regime: str = FEEDBACK,
-    identity: str = IDENTITY,
     deadline: Optional[float] = DEADLINE,
     max_in_flight: int = IN_FLIGHT,
 ) -> TaskStream:
@@ -150,9 +142,6 @@ def build_stream(
         # What a terminating call reveals (see `FEEDBACK`). For evaluation-grade scores use
         # EvalStream, which is `Never` made structural and refuses any policy at construction.
         feedback=policy(regime),
-        # The caller's half of what this record is filed under. The env's own answer and the two
-        # numbers above are folded in by the stream itself.
-        identity=identity,
     )
 
 

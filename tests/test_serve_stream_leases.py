@@ -452,15 +452,7 @@ class _ScriptedTokens:
         return value
 
 
-def _dispense_record(
-    lease: str, *, seq: int, position: int, task_idx: int, max_in_flight: int = 1
-) -> Dict[str, Any]:
-    """A dispense record in the shape this module writes one.
-
-    The identity is carried because a record that names none is a record from before the member
-    existed, and continuing one is a migration a caller has to ask for. This record is standing in
-    for one *this* module wrote, so it says what such a record says: the run facts, blank where
-    nobody named anything."""
+def _dispense_record(lease: str, *, seq: int, position: int, task_idx: int) -> Dict[str, Any]:
     return {
         "lease": lease,
         "seq": seq,
@@ -469,12 +461,6 @@ def _dispense_record(
         "task_idx": task_idx,
         "dispensed_at": 1.0,
         "extensions": {},
-        "run_identity": {
-            "caller": "",
-            "envs": {},
-            "deadline": None,
-            "max_in_flight": max_in_flight,
-        },
     }
 
 
@@ -522,8 +508,8 @@ async def test_a_record_that_holds_one_lease_twice_is_refused_at_resume(
         "".join(
             json.dumps(record) + "\n"
             for record in (
-                _dispense_record("c" * 32, seq=1, position=0, task_idx=0, max_in_flight=2),
-                _dispense_record("c" * 32, seq=2, position=1, task_idx=1, max_in_flight=2),
+                _dispense_record("c" * 32, seq=1, position=0, task_idx=0),
+                _dispense_record("c" * 32, seq=2, position=1, task_idx=1),
             )
         )
     )
