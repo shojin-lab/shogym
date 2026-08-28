@@ -24,6 +24,7 @@ date. No AppWorld import, no world state, no clock.
 from __future__ import annotations
 
 import datetime as dt
+import math
 import random
 from dataclasses import dataclass
 from typing import Dict, Iterable, List, NamedTuple, Optional, Sequence, Tuple
@@ -63,7 +64,12 @@ BANDS: Tuple[str, ...] = ("Routine", "Standard", "Priority", "Urgent", "Critical
 SPAN = 46
 
 #: How many times a backlog is redrawn before the reference date is given up on.
-ATTEMPTS = 140
+#:
+#: Raising this is additive and nothing else: attempts are tried in order and the first admissible
+#: draw wins, so a task that already had a backlog keeps exactly the backlog it had. What a higher
+#: cap changes is only the tasks that had none. At 140 two of the served roster ran out, and a
+#: manifest that lists a task the generator gives up on is a task that raises when it is served.
+ATTEMPTS = 500
 
 #: How many requests a shipped backlog holds. Four options on two of the axes need this many to
 #: separate all 64 conventions; shorter backlogs collide.
@@ -349,20 +355,41 @@ def _draw(
     order = list(range(len(candidates)))
     rng.shuffle(order)
     order = order[:2500]
-    pool = np.array([hits[i] for i in order], dtype=np.float64) if order else np.zeros((0, len(settings)))
+    pool = (
+        np.array([hits[i] for i in order], dtype=np.int64)
+        if order
+        else np.zeros((0, len(settings)), dtype=np.int64)
+    )
 
     designed = max(3, (dated * 2) // 3)
-    cover = np.zeros(len(settings), dtype=np.float64)
+    # Integers, and that is the point of this block rather than a preference.
+    #
+    # This greedy cover used to score candidates with a float64 dot product and take `np.argmax`
+    # of it. A float dot product is not the same number on every machine: BLAS sums in whatever
+    # order its kernel picks, so one candidate's gain differs in the last bit between one
+    # architecture's kernel and another's, and two gains that are equal in arithmetic can compare
+    # either way. The pick changes, and with it the draw, whether the draw is admissible, which
+    # attempt first succeeds, and the frozen pass-count table built out of all of it. A backlog is
+    # meant to be the same on every machine; with floats here it was not, and one task's backlog
+    # existed on arm64 and did not exist on x86_64.
+    #
+    # Every weight is `3 / (1 + cover)` for an integer cover bounded by the number of picks, so a
+    # common denominator makes the comparison exact. Integer addition is associative, so the sum
+    # is the same whatever order numpy adds it in, which is what floats could not promise.
+    scale = math.lcm(*range(1, designed + 2))
+    cover = np.zeros(len(settings), dtype=np.int64)
     taken = np.zeros(len(order), dtype=bool)
     chosen: List[Tuple[dt.date, ...]] = []
     for _ in range(min(designed, dated)):
         if not len(order) or taken.all():
             break
-        gains = pool @ (3.0 / (1.0 + cover))
-        gains[taken] = -np.inf
+        gains = pool @ (3 * scale // (1 + cover))
+        # Gains are non-negative, so -1 is below every real candidate. `argmax` takes the first
+        # maximum, which is the rule this had before and is well defined on exact integers.
+        gains[taken] = -1
         pick = int(np.argmax(gains))
         taken[pick] = True
-        cover += pool[pick]
+        cover = cover + pool[pick]
         chosen.append(candidates[order[pick]])
 
     requests: List[Request] = [Request(reference="", dates=dict(zip(ROLES, d))) for d in chosen]
