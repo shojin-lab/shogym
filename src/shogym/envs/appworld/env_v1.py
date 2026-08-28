@@ -1268,6 +1268,14 @@ def run_fingerprint(
             world.APPENDED_PARAGRAPH,
             # What decides the seeded backlog. It already names the derived cache, so changing it
             # served a different world under a fingerprint that had not moved.
+            #
+            # This module's own bytes are inside it, and that is not incidental. `_backlog_seed`
+            # below decides the backlog written into a derived task and `_world_seed` decides the
+            # generator the live episode runs from, and both were outside a digest that hashed
+            # three named files elsewhere in the port: an implementation change to either reused a
+            # world and claimed the generator before it. The digest is the import closure of the
+            # modules that generate a world now, and this is one of them (see
+            # `adapter._generator_sources`).
             adapter._generator_digest(),
             # What machine an episode was given. Captured once for this process and passed to
             # every launch, so an environment changed mid-run cannot move it and a run relaunched

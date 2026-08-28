@@ -10,8 +10,8 @@ one packaging forces, so it costs nothing extra.
 
 **And the container is the isolation, not an arrangement of paths.** The code an agent writes runs
 as the worker, so a worker on the host runs it as the user running the run, and everything that
-user can read it can read. The worker has no host path any more. It gets one task's served tree,
-its own output directory, and no network; the run's provenance, the grader's tree, the corpus, the
+user can read it can read. The worker has no host path. It gets one task's served tree, its own
+output directory, and no network; the run's provenance, the grader's tree, the corpus, the
 repository and every other episode's world are not hidden from it, they are absent.
 
 Two things are provisioned, and both are pinned here:
@@ -55,7 +55,7 @@ import urllib.request
 from dataclasses import dataclass, field
 from functools import lru_cache
 from pathlib import Path
-from typing import Any, Dict, List, Mapping, Optional, Sequence, Tuple
+from typing import Any, Dict, Iterator, List, Mapping, Optional, Sequence, Tuple
 
 from shogym.envs._upstream import _locked
 from shogym.envs.appworld import container, world
@@ -146,10 +146,6 @@ WORKER = container.WORKER
 def ensure_image() -> str:
     """The image every world runs in, building it if this machine does not have it.
 
-    Not a virtual environment any more. ``appworld`` pins ``pydantic<2`` and shogym needs
-    ``pydantic>=2.7``, which used to force an interpreter of its own; it now forces an image of its
-    own, which is the same separation with a boundary around it.
-
     A machine with no Docker daemon fails here as a :class:`ProvisioningError`, which is the type
     the test gate reads as "not provisioned on this machine" and skips on, and which
     ``SHOGYM_REQUIRE_UPSTREAM=1`` turns back into a failure. An env constructed on such a machine
@@ -199,7 +195,7 @@ def _fetch_corpus(root: Path) -> None:
     front of it. The image is built by the caller, outside this function's lock (see
     :func:`ensure_corpus`)."""
     # Named for the process that owns it rather than fixed, and never cleared before use. The
-    # caller's lock is required now, so this is belt and braces rather than the only exclusion:
+    # caller's lock is required, so this is belt and braces rather than the only exclusion:
     # what it buys is that an abandoned staging tree is one process's residue under its own name
     # rather than a directory the next cold start believes is its own.
     staging = root.with_name(f"{root.name}.{os.getpid()}.{secrets.token_hex(4)}.building")
@@ -277,12 +273,11 @@ def task_ids() -> Tuple[str, ...]:
 def task_specs(root: Path, task_id: str) -> Dict[str, Any]:
     """One task's shipped specification: its instruction, its supervisor and its datetime.
 
-    **Read every time, not memoized.** This was cached on ``(root, task_id)``, which is a key that
-    says where a spec was rather than what it said: a corpus edited in place produced a new
-    ``corpus_digest`` and a new cache name, and the same process went on serving the instruction,
-    the supervisor and the datetime it had read the first time. The identity moved and the task
-    did not. It is a few kilobytes of JSON, and the cache was also unbounded across a roster of
-    318.
+    **Read every time, not memoized.** A cache on ``(root, task_id)`` is keyed by where a spec was
+    rather than by what it said: a corpus edited in place gets a new ``corpus_digest`` and a new
+    cache name, while the process goes on serving the instruction, the supervisor and the datetime
+    it read the first time. The identity moves and the task does not. It is a few kilobytes of
+    JSON, and such a cache is also unbounded across a roster of 318.
 
     **A served env does not call this.** It reads its whole roster's specs once, out of the same
     walk that computes its corpus digest (:func:`corpus_snapshot`), and serves those for its life:
@@ -296,10 +291,6 @@ def task_specs(root: Path, task_id: str) -> Dict[str, Any]:
 #: Bumped when the shape of a derived tree changes: what is copied, what is linked, what is
 #: sealed. It is in both cache names, so a tree built under an older layout is a different cache
 #: rather than a stale one wearing the same name.
-#:
-#: 2: the shared half of a derived root is the entries this port names rather than everything the
-#: corpus had beside ``tasks`` (see :data:`~world.SHARED_ENTRIES`), so a tree built under 1 holds
-#: entries a tree built under 2 does not.
 DERIVATION_VERSION = 2
 
 #: What a derived cache was built from, written inside it once it is complete.
@@ -317,10 +308,10 @@ def derived_root(source: Optional[str] = None, *, runtime: Optional[str] = None)
     seeded rows, because it is the interpreter and not this process that writes them: a task's
     database file is a replayable statement log written through upstream's own model layer, so a
     resolved dependency that changed how a row is serialized changed the world under a name that
-    had not moved. And the source digest covers the corpus this was derived from, which used to be
-    missing entirely: ``APPWORLD_ROOT`` takes any directory with a ``data/tasks`` in it, so a
-    process pointed at a second corpus computed a fingerprint for that one and then reused and
-    served task material derived from the first.
+    had not moved. And the source digest covers the corpus this was derived from: ``APPWORLD_ROOT``
+    takes any directory with a ``data/tasks`` in it, so without it a process pointed at a second
+    corpus would compute a fingerprint for that one and then reuse and serve task material derived
+    from the first.
 
     ``runtime`` is passed in rather than read, for the reason ``source`` is: an env reads it once
     at construction and hands the same value to both roots and to its own fingerprint, so the
@@ -344,8 +335,8 @@ def graded_root(source: Optional[str] = None, *, runtime: Optional[str] = None) 
     same user as the process that built this, so no directory mode keeps it out: 0700 stops other
     users and stops nothing else. What closes it is a namespace in which the directory is not
     mounted at all, which is a container and is not built here (see the port's README). What this
-    does is stop the tree being derivable from what the worker is given, which the previous
-    layout, a fixed name beside the served root, was."""
+    does is stop the tree being derivable from what the worker is given, which a fixed name beside
+    the served root is not."""
     home = private_home()
     return (
         home
@@ -440,15 +431,15 @@ class CorpusSnapshot:
     holds it.
 
     The first two travel together because they have to be one observation. A digest and a later
-    ``specs.json`` read are two, and the gap between them is a corpus that can change: the env
-    fixed its fingerprint and its cache names from the first and then went on serving instructions
-    and dates read from the second, so an in-place edit served authored text under an identity
-    that had never seen it. Here the spec is parsed from the very bytes the digest was computed
-    over, so ``digest`` states what ``specs`` came from and there is no window between them to
-    edit.
+    ``specs.json`` read are two, and the gap between them is a corpus that can change: an env that
+    fixed its fingerprint and its cache names from the first and then served instructions and
+    dates read from the second would serve authored text an in-place edit had put under an
+    identity that never saw it. Here the spec is parsed from the very bytes the digest was
+    computed over, so ``digest`` states what ``specs`` came from and there is no window between
+    them to edit.
 
     **``units`` is what closes the same gap for everything the digest is not made of.** Holding a
-    task's *text* was never enough: derivation copies a task's databases and its ground truth out
+    task's *text* is not enough: derivation copies a task's databases and its ground truth out
     of the live corpus, and it copies the shared base out of it too, so a corpus edited after
     construction could still put changed bytes into a served world and into the tree it is graded
     against, under the unchanged ``config_digest`` computed before the edit. Rehashing all 183 MB
@@ -503,22 +494,21 @@ def corpus_digest(root: Path) -> str:
     otherwise be served under a name that claims to be the pinned one, and would reuse a derived
     tree built from something else.
 
-    **Every scoring-relevant file is read, not sized.** This once hashed `specs.json` in full and
-    took path and size for everything else, which left the ground truth and the evaluation
-    material identifiable only by length: a same-length edit to an answer key passed unnoticed
-    under a digest whose whole job is to say what the corpus holds. A size is not a summary of
-    contents, and a fingerprint that says it covers the scoring inputs has to have read them.
+    **Every scoring-relevant file is read, not sized.** Taking path and size for the ground truth
+    and the evaluation material leaves them identifiable only by length: a same-length edit to an
+    answer key passes unnoticed under a digest whose whole job is to say what the corpus holds. A
+    size is not a summary of contents, and a fingerprint that says it covers the scoring inputs
+    has to have read them.
 
-    **Everything under ``data`` is read, not only the tasks.** This once covered ``version.txt``
-    and the task tree, which left out ``base_dbs``, ``datasets`` and ``api_docs`` entirely. Those
-    are 134 MB of starting state and documentation that every episode reads as input: a world
-    built on different base databases is a different world, and a digest whose job is to say what
-    the corpus holds cannot leave out the largest thing in it.
+    **Everything under ``data`` is read, not only the tasks.** ``base_dbs``, ``datasets`` and
+    ``api_docs`` are 134 MB of starting state and documentation that every episode reads as input:
+    a world built on different base databases is a different world, and a digest whose job is to
+    say what the corpus holds cannot leave out the largest thing in it.
 
-    **Not memoized, deliberately.** It was cached on the root path, so a corpus that changed under
-    one path during a process kept the digest it had when the process first looked, which is the
-    one case the cache would have had to answer. The env computes this once in its constructor and
-    keeps the value; the cost is about two seconds on a fresh corpus, dominated by the fourteen
+    **Not memoized, deliberately.** A cache on the root path keeps the digest a process first
+    read, so a corpus that changed under that path during the process would go unnoticed, which is
+    the one case the cache would have had to answer. The env computes this once in its constructor
+    and keeps the value; the cost is about two seconds on a fresh corpus, dominated by the fourteen
     thousand small files in the task tree, and it is the price of the digest meaning what it
     says."""
     return corpus_snapshot(root, task_ids=()).digest
@@ -529,8 +519,7 @@ def corpus_snapshot(root: Path, *, task_ids: Sequence[str]) -> CorpusSnapshot:
 
     One walk rather than two, and that is the point rather than an optimization. The specs are
     parsed out of the same bytes the digest is computed from, as they are read, so a caller that
-    holds both holds one statement about one corpus at one instant. See :class:`CorpusSnapshot`
-    for what the two-observation version let through.
+    holds both holds one statement about one corpus at one instant.
 
     A named task whose spec the walk never reached is a manifest and a corpus that disagree, which
     is refused here rather than at the two-hundredth episode of a run.
@@ -548,11 +537,11 @@ def corpus_snapshot(root: Path, *, task_ids: Sequence[str]) -> CorpusSnapshot:
     for path in sorted(data.rglob("*")):
         if path.is_symlink():
             # **Refused rather than skipped.** A skipped link is a file the digest does not cover
-            # and derivation copies anyway: `_materialise` follows links, so the served world held
-            # bytes the identity had never read, and changing what a link pointed at changed the
-            # world without changing the digest that claims to say what the world is. The pinned
-            # bundle contains none, so this refuses a corpus rather than growing a rule about how
-            # to hash one.
+            # and derivation copies anyway: `_materialise` follows links, so the served world would
+            # hold bytes the identity had never read, and changing what a link pointed at would
+            # change the world without changing the digest that claims to say what the world is.
+            # The pinned bundle contains none, so this refuses a corpus rather than growing a rule
+            # about how to hash one.
             raise ProvisioningError(
                 f"the corpus at {root} contains a symbolic link ({path.relative_to(data)}), and "
                 "this port cannot state the identity of a tree whose contents are somewhere else"
@@ -686,7 +675,7 @@ def episode_outputs(session_id: str) -> Path:
     output tree is a place the other arm of a pair can read an earlier grade; a per-episode tree
     that no other episode's container mounts is a place nothing else can read at all.
 
-    **Deliberately not a child of** :func:`private_home`. Under the private home it named the
+    **Deliberately not a child of** :func:`private_home`. Under the private home it would name the
     grader's own parent, and the unguessable name that protects the grader stops protecting it
     the moment something hands an address inside it over. Nothing hands this one to the world,
     which sees it at a fixed mount point, but the host path is in the container's own mount table
@@ -699,13 +688,10 @@ def episode_outputs(session_id: str) -> Path:
 def runtime_digest() -> str:
     """What the worker's interpreter actually is, as sixteen hex characters.
 
-    The branch below reads a virtual environment's realized distribution set, because there the
-    runtime cache is named for the direct AppWorld release while it is built by resolving that
-    release's ranges against whatever the host offers on the day. Here there is no virtual
-    environment: the interpreter is an image, and the daemon holds one answer for what that image
-    is. The image id is that answer, and it moves for every reason the distribution set would
-    have, including the ones a tag cannot see (a re-pushed base, a transitive version that
-    resolved differently, the same tag built on another architecture).
+    The interpreter is an image, and the daemon holds one answer for what that image is. The image
+    id is that answer, and it moves for every reason a realized distribution set would have,
+    including the ones a tag cannot see (a re-pushed base, a transitive version that resolved
+    differently, the same tag built on another architecture).
 
     Not memoized, for the reason :func:`corpus_digest` is not: the value has to be able to move
     when the thing it names does."""
@@ -788,12 +774,10 @@ _PACKAGE_ROOT = Path(__file__).resolve().parent.parent.parent
 def _generator_sources() -> Tuple[Tuple[str, Path], ...]:
     """Every module whose bytes decide what a derived corpus holds, as (name, file) pairs.
 
-    **Walked from the entry points rather than listed by hand, because a hand-kept list is what
-    failed.** This was three names in a tuple: ``ledger.py``, ``world.py`` and ``worker.py``. The
-    two helpers that decide a task's seeded backlog and the seed its live world is started from
-    live in ``env_v1``, which was not one of them, so an edit to either produced the same cache
-    name and the same run fingerprint over a different world. A list somebody has to remember to
-    extend is a list that is right until the next helper is written somewhere else.
+    **Walked from the entry points rather than listed by hand.** A list somebody has to remember
+    to extend is a list that is right until the next helper is written somewhere else: a module
+    that decides a task's seeded backlog and is missing from it produces the same cache name and
+    the same run fingerprint over a different world.
 
     So the closure is computed: parse each entry point, take every module it imports that falls
     inside :data:`_GENERATOR_ROOTS`, and repeat. ``ast.walk`` rather than the module's top level,
@@ -803,12 +787,9 @@ def _generator_sources() -> Tuple[Tuple[str, Path], ...]:
     names the code actually writes, whether or not this process has imported it, and there is no
     ordering in which a module can be missed for having been imported later.
 
-    **What the boundary costs.** The closure is wider than the three files it replaces, so an edit
-    anywhere in this port derives the corpus again, a comment edit included. That is a few minutes
-    once, in the direction that cannot be wrong, and it is a real cost to
-    shojin-lab/shogym#140, which rewrites four of these modules and will re-derive on the first
-    construction after it lands. The alternative on offer was the hand-kept list, which is cheap
-    right up to the edit it does not notice.
+    **What the boundary costs.** An edit anywhere in this port derives the corpus again, a comment
+    edit included. That is a few minutes once, in the direction that cannot be wrong, and the
+    alternative is a hand-kept list, which is cheap right up to the edit it does not notice.
 
     Memoized, because it parses ten files and none of them can change inside a process."""
     found: Dict[str, Path] = {}
@@ -873,26 +854,22 @@ def _generator_digest() -> str:
     """Eight hex characters over everything that decides what a backlog looks like: the constants
     it is drawn from, and the code that draws it.
 
-    **The implementation as well as its constants, which it was not.** This hashed eleven values
-    out of :mod:`~shogym.envs.appworld.ledger` and nothing else, so an edit to *how* a backlog is
-    drawn, how a task is materialised or how a seeded row is written left every one of them alone
-    and left this digest alone with them. The cache the digest names is the world every episode of
-    a task starts in and the baseline it is graded against, so an unchanged key meant a new
-    generator comparing itself against rows an old one had seeded, silently and for the life of
-    the cache.
+    **The implementation as well as its constants.** Hashing the values out of
+    :mod:`~shogym.envs.appworld.ledger` and nothing else leaves an edit to *how* a backlog is
+    drawn, how a task is materialised or how a seeded row is written outside the key. The cache
+    the digest names is the world every episode of a task starts in and the baseline it is graded
+    against, so an unchanged key means a new generator comparing itself against rows an old one
+    seeded, silently and for the life of the cache.
 
-    Read off the files rather than declared in a constant somebody has to remember to bump, which
-    is the failure this is fixing rather than a variant of it. The constants are still hashed on
-    their own, so that moving one out of ``ledger.py`` cannot quietly take it out of the key.
+    Read off the files rather than declared in a constant somebody has to remember to bump. The
+    constants are still hashed on their own, so that moving one out of ``ledger.py`` cannot
+    quietly take it out of the key.
 
-    **And off every file the generator reaches, rather than three named ones.** The three were
-    ``ledger``, ``world`` and ``worker``, and the helpers that decide a task's seeded backlog and
-    the seed its world is started from are in ``env_v1``, which was not among them: an
-    implementation change to either reused a cache and a run identity claiming the generator
-    before it. What is hashed is now the import closure of the modules that generate a world (see
-    :func:`_generator_sources`), by dotted name and by source bytes, in one order on every
-    machine. The price is that an edit anywhere in this port, a comment included, derives the
-    corpus again: a few minutes once, in the direction that cannot be wrong.
+    **And off every file the generator reaches, rather than a few named ones.** What is hashed is
+    the import closure of the modules that generate a world (see :func:`_generator_sources`), by
+    dotted name and by source bytes, in one order on every machine. The price is that an edit
+    anywhere in this port, a comment included, derives the corpus again: a few minutes once, in
+    the direction that cannot be wrong.
 
     Memoized, because it reads ten files and none of them can change inside a process."""
     from shogym.envs.appworld import ledger
@@ -1013,19 +990,17 @@ class _Frames:
         except ValueError as exc:
             raise FramingError(f"the appworld worker sent a frame that is not JSON: {exc}") from exc
         # **Shape is part of framing, and the shape is this command's.** Valid JSON of the wrong
-        # kind used to travel straight into the caller, which then did `.get` on a list or indexed
-        # `output` on an object that had none: an `AttributeError` or a `KeyError` out of the
-        # transport, with the worker neither poisoned nor stopped and the spawn path skipping its
-        # own release.
+        # kind travelling straight into the caller is a `.get` on a list or an `output` indexed on
+        # an object that has none: an `AttributeError` or a `KeyError` out of the transport, with
+        # the worker neither poisoned nor stopped.
         #
         # **Per command, because "one of three keys" is not a shape.** A startup frame carrying
-        # only `ready` satisfied that test, so a `ready` arriving in answer to an `execute` left
-        # the protected read loop and raised `KeyError('output')` outside every handler here,
-        # after the worker's lock had been released and while the command it belonged to might
-        # still have been running. What a spawn expects and what a call expects are two different
-        # frames, so each one says which it is waiting for. The writer is reachable from inside
-        # the interpreter that runs agent code, so an answer that is not an answer to what was
-        # asked is exactly the thing this boundary is for.
+        # only `ready` satisfies that test, so a `ready` arriving in answer to an `execute` would
+        # leave the protected read loop and raise `KeyError('output')` outside every handler here.
+        # What a spawn expects and what a call expects are two different frames, so each one says
+        # which it is waiting for. The writer is reachable from inside the interpreter that runs
+        # agent code, so an answer that is not an answer to what was asked is exactly the thing
+        # this boundary is for.
         if not isinstance(answer, dict):
             raise FramingError(
                 f"the appworld worker sent a {type(answer).__name__} where a frame belongs"
@@ -1036,24 +1011,6 @@ class _Frames:
                 f"{', '.join(expect)}: {sorted(answer)[:8]}"
             )
         return answer
-
-#: What every worker's scratch directory is named for, so a directory this port left behind on a
-#: host is one an operator can recognise.
-_SCRATCH_PREFIX = "shogym-appworld-"
-
-#: A grader's scratch directory, which is a worker's with a word added.
-_GRADE_SCRATCH_PREFIX = _SCRATCH_PREFIX + "grade-"
-
-
-def _close_descriptor(descriptor: Optional[int]) -> None:
-    """Close a raw descriptor, and treat one that is already closed as closed."""
-    if descriptor is None:
-        return
-    try:
-        os.close(descriptor)
-    except OSError:
-        pass
-
 
 #: The two frames this protocol has. A spawn is answered by a startup frame and a command by an
 #: answer; nothing on this pipe is ever both, so neither is ever accepted where the other belongs.
@@ -1071,13 +1028,13 @@ _MAX_REQUEST_BYTES = 16 * 1024 * 1024
 def _send(process: subprocess.Popen, payload: Dict[str, Any], *, deadline: float) -> None:
     """Write one frame, under the same deadline the answer is read under.
 
-    **The write is inside the bound, and it was not.** ``stdin.write`` and ``flush`` are blocking
-    calls into a pipe with a finite buffer, and the worker is the only reader. A worker that has
-    stopped reading — wedged in a native call, stopped by a signal, running agent code that never
-    returns — leaves a request bigger than the remaining pipe capacity blocking in the host's
-    ``write`` for ever, and the deadline was not consulted until the first read afterwards. So a
-    call that promised to time out did not, and neither the poison nor the removal that follows a
-    timeout ever ran.
+    **The write is inside the bound.** ``stdin.write`` and ``flush`` are blocking calls into a
+    pipe with a finite buffer, and the worker is the only reader. A worker that has stopped
+    reading (wedged in a native call, stopped by a signal, running agent code that never returns)
+    leaves a request bigger than the remaining pipe capacity blocking in the host's ``write`` for
+    ever, so a deadline consulted no earlier than the first read afterwards bounds nothing: a call
+    that promised to time out does not, and neither the poison nor the removal that follows a
+    timeout runs.
 
     The descriptor is put in non-blocking mode and written through ``select``, so the wait is on
     the deadline rather than on the reader. Every write to this pipe goes through here, so nothing
@@ -1146,9 +1103,8 @@ def _worker_environment(root: str) -> Dict[str, str]:
 
     Nothing is inherited: ``docker run`` passes the image's own environment and what is named
     here, so the serving process's provider keys and run paths are not absent because they were
-    removed, they are absent because they were never offered. This used to be an allow-list over
-    ``os.environ``, which is the same list with a different failure mode: a name nobody thought of
-    still got through."""
+    removed, they are absent because they were never offered. An allow-list over ``os.environ`` is
+    the same list with a different failure mode: a name nobody thought of still gets through."""
     return {
         "APPWORLD_ROOT": root,
         "HOME": container.SCRATCH_MOUNT,
@@ -1162,16 +1118,16 @@ def _worker_environment(root: str) -> Dict[str, str]:
 def _shared_mounts(data: Path, at: str) -> List[Mount]:
     """The shared half of a corpus, named rather than enumerated, and only what is there.
 
-    **An allowlist, where this was a denylist.** Every top-level entry except ``tasks`` was
-    mounted, which puts whatever a corpus happens to carry inside the container that runs
-    agent-authored code: the pinned bundle ships a `LICENSE` and a `README_BEFORE_SHARING.md`
-    beside the four this port serves, and ``APPWORLD_ROOT`` takes any directory with a
-    ``data/tasks`` in it. None of that was ground truth and none of it was a grade; what it was is
-    a list this port described as exhaustive and did not build that way.
+    **An allowlist rather than a denylist.** Mounting every top-level entry except ``tasks`` puts
+    whatever a corpus happens to carry inside the container that runs agent-authored code: the
+    pinned bundle ships a `LICENSE` and a `README_BEFORE_SHARING.md` beside the four this port
+    serves, and ``APPWORLD_ROOT`` takes any directory with a ``data/tasks`` in it. None of that is
+    ground truth and none of it is a grade; what it is is a list described as exhaustive and not
+    built that way.
 
     Only what exists, because a bind whose source is missing is a directory the daemon creates and
     root owns, and a corpus without one of these fails where the world opens it, with upstream's
-    own words, which is where it failed before this list existed."""
+    own words."""
     return [
         Mount(data / name, f"{at}/data/{name}")
         for name in world.SHARED_ENTRIES
@@ -1192,15 +1148,12 @@ def served_mounts(*, root: Path, task_id: str, outputs: Path) -> List[Mount]:
     own output root, so an absolute one replaces the root, which is what keeps an episode's end
     state and its evaluator artifacts out of the tree the next episode is served.
 
-    **The shared half is an allowlist, and was a denylist.** It used to be every top-level entry
-    of the derived root except ``tasks``, which puts anything the corpus happens to carry inside
-    the boundary by default: the pinned bundle already ships a `LICENSE` and a
-    `README_BEFORE_SHARING.md`, and ``APPWORLD_ROOT`` takes any directory with a ``data/tasks`` in
-    it, so a custom corpus's own files were mounted because nothing had said they should not be.
-    None of that was ground truth and none of it was a grade; what it was is a list this port
-    described as exhaustive and did not build that way. The named entries are the ones a world
-    reads (:data:`~world.SHARED_ENTRIES`), and an entry not on the list is not mounted, whoever
-    put it in the corpus.
+    **The shared half is an allowlist.** Every top-level entry of the derived root except ``tasks``
+    would put anything the corpus happens to carry inside the boundary by default: the pinned
+    bundle already ships a `LICENSE` and a `README_BEFORE_SHARING.md`, and ``APPWORLD_ROOT`` takes
+    any directory with a ``data/tasks`` in it. The named entries are the ones a world reads
+    (:data:`~world.SHARED_ENTRIES`), and an entry not on the list is not mounted, whoever put it
+    in the corpus.
 
     ``root`` is the derived root, the parent of ``data``."""
     mounts = _shared_mounts(root / "data", CORPUS_MOUNT)
@@ -1220,6 +1173,19 @@ def graded_mounts(*, graded: Path, task_id: str, outputs: Path) -> List[Mount]:
     mounts.append(Mount(graded / "data" / "tasks" / task_id, f"{GRADED_MOUNT}/data/tasks/{task_id}"))
     mounts.append(Mount(outputs, OUTPUTS_MOUNT, writable=True))
     return mounts
+
+
+# ----- workers whose parent is gone -----
+#
+# **This port has one reaper, and it is `container.reap`.** A worker is a container, it holds no
+# scratch directory of the host's and no token, and what a later run reads to find an abandoned
+# one is the container's own labels plus the disowned ledger those labels cannot cover (see
+# `container.reap` and `container.disowned`). A ledger of worker *processes* here would be a
+# second set of names for the same question, and nothing would ever write to it.
+#
+# The question is whether the process that started this thing is still the process that started
+# it. `container.process_birth` and `container._process_is_alive` answer it once, for containers
+# and for the per-episode trees beside them.
 
 
 @dataclass
@@ -1271,9 +1237,9 @@ class Worker:
             opening = frames.frame(_SPAWN_TIMEOUT_SECONDS, expect=_READY_FRAME)
         except (TimeoutError, EOFError, ValueError, FramingError) as exc:
             # The container first, the local process and its pipes whatever that did. Removal can
-            # raise on a control timeout, and everything after it used to be skipped: no worker
-            # was returned, so nothing else was going to release the pipes, and the ordinary sweep
-            # skips a labelled container whose parent is alive.
+            # raise on a control timeout, and nothing after it may be skipped: no worker is
+            # returned, so nothing else would release the pipes, and the ordinary sweep skips a
+            # labelled container whose parent is alive.
             _release(process, name)
             raise WorkerError(
                 f"the appworld worker container never became ready ({type(exc).__name__}: {exc}); "
@@ -1304,18 +1270,16 @@ class Worker:
     def _stop_after_failure(self) -> None:
         """Remove the container, and say nothing untrue about whether it went.
 
-        ``closed`` means one thing: the daemon has confirmed this container is gone. A failure
-        path that set it on a best-effort removal marked the container absent without asking, and
-        finalization's own gate then returned early and graded a tree the container might still
-        have been writing to. So this asks, and hands the container to the sweep when the answer
-        does not come.
+        ``closed`` means one thing: the daemon has confirmed this container is gone. Setting it on
+        a best-effort removal would mark the container absent without asking, and finalization's
+        own gate would then return early and grade a tree the container might still be writing to.
+        So this asks, and hands the container to the sweep when the answer does not come.
 
-        **And it drops this process's own half either way.** It did not, and `close` returns at
-        once on a worker already marked closed, so the only wait and the only descriptor close in
-        this class were skipped for the whole life of a worker that failed: every timeout and every
-        broken frame left an attached `docker run` client and a pipe pair behind, for a run that
-        may serve hundreds of episodes. The container is somebody else's to worry about when the
-        daemon will not answer; the client and the pipes are nobody's but this one's."""
+        **And it drops this process's own half either way.** `close` returns at once on a worker
+        already marked closed, so a failure path that left this out would leave an attached
+        `docker run` client and a pipe pair behind for every timeout and every broken frame, in a
+        run that may serve hundreds of episodes. The container is somebody else's to worry about
+        when the daemon will not answer; the client and the pipes are nobody's but this one's."""
         try:
             container.remove(self.container, confirm=True)
             self.closed = True
@@ -1329,8 +1293,8 @@ class Worker:
 
         This process's own half of a worker, which is separate from the container's removal
         because the two fail independently and only one of them is anybody else's business.
-        Killing the client does not stop a container and never did; what it does is stop this
-        process holding a child and two descriptors for a world that is over.
+        Killing the client does not stop a container; what it does is stop this process holding a
+        child and two descriptors for a world that is over.
 
         Idempotent, because every path out of a worker ends here and some of them arrive twice."""
         if self.process.poll() is None:
@@ -1356,9 +1320,9 @@ class Worker:
         Under a lock, because the frames on one pipe are one sequence: two callers interleaving
         writes would produce a frame neither of them sent.
 
-        **Every frame carries an identifier and the answer echoes it.** The transport before this
-        was HTTP, where a response belonged to its own request by construction. An ordered pipe
-        has no such property: a command that timed out is a command still running, and its answer
+        **Every frame carries an identifier and the answer echoes it.** An ordered pipe gives no
+        property that ties an answer to its own request: a command that timed out is a command
+        still running, and its answer
         arrives later, into a stream the next caller is reading. Without an identifier that answer
         is read as the next command's, which is an earlier block's output returned under a later
         step, or a finalizer handed the wrong shape entirely. So an answer whose identifier is not
@@ -1412,11 +1376,8 @@ class Worker:
                 # so a runaway left running is a difference the treatment did not make.
                 #
                 # **And it does not claim the removal worked.** `closed` means one thing: the
-                # daemon has confirmed this container is gone. A timeout that set it marked the
-                # container absent on a best-effort removal that ignores an ordinary nonzero
-                # status, and finalization's own gate then returned early and graded a tree the
-                # timed-out command might still have been writing to. Unusable and absent are two
-                # facts; this sets the first and attempts the second.
+                # daemon has confirmed this container is gone. Unusable and absent are two facts;
+                # this sets the first and attempts the second.
                 self._stop_after_failure()
                 raise WorkerError(f"the appworld worker: {self.poisoned}") from exc
             if "error" in answer:
@@ -1425,15 +1386,14 @@ class Worker:
                 # own handling going wrong, and every command ends with a save this cannot say
                 # happened.
                 #
-                # **Under the lock that read the answer, which it was not.** The lock is the whole
-                # of what `settle` asks: acquiring it is the fact that no call is in flight. This
-                # branch ran after the `with` had released it, so between the release and the
-                # assignment there was an interval in which the worker was neither busy nor
-                # poisoned. A terminal is deliberately allowed to overtake an ordinary call, so
-                # finalization could land exactly there: `settle` returned true, the poison read
-                # empty, and the container was removed and its tree graded on the strength of a
-                # command that had just failed inside the world. Both facts are published while
-                # the lock still holds, so nothing observes one without the other.
+                # **Under the lock that read the answer.** The lock is the whole of what `settle`
+                # asks: acquiring it is the fact that no call is in flight. Outside it, between
+                # the release and this assignment, there would be an interval in which the worker
+                # was neither busy nor poisoned. A terminal is deliberately allowed to overtake an
+                # ordinary call, so finalization could land exactly there: `settle` returns true,
+                # the poison reads empty, and the container is removed and its tree graded on the
+                # strength of a command that has just failed inside the world. Both facts are
+                # published while the lock still holds, so nothing observes one without the other.
                 self.poisoned = f"{command!r} failed inside the world: {answer['error']}"
                 raise WorkerError(f"appworld worker refused {command!r}: {answer['error']}")
             return answer["output"]
@@ -1470,11 +1430,9 @@ class Worker:
             # nobody could confirm is still somebody's, even while this parent is alive.
             self.disown()
         else:
-            # **Only what the daemon confirmed.** A nonzero stop or removal used to reach this
-            # branch and be recorded as a removal, after which nothing tried again and the ordinary
-            # sweep skipped the container because its parent was alive. `remove` says whether the
-            # container is known to be gone, and when it is not it has already written the name
-            # where the sweep will find it.
+            # **Only what the daemon confirmed.** `remove` says whether the container is known to
+            # be gone, and when it is not it has already written the name where the sweep will
+            # find it.
             self.closed = bool(gone)
         self._release_local()
 
@@ -1580,7 +1538,7 @@ _SNAPSHOT_CHUNK_BYTES = 1 << 20
 class _Bound:
     """The four bounds one snapshot runs under, and the only place any of them is read.
 
-    A class rather than four locals threaded through the walk, because the walk is no longer one
+    A class rather than four locals threaded through the walk, because the walk is not one
     loop: enumerating a directory, removing the previous copy and moving one file's bytes are
     three operations that each have to be able to say "the budget is gone" from inside themselves.
     The limits are read off the module once, at construction, so a caller that shrinks them for a
@@ -1643,15 +1601,15 @@ class _Bound:
 def _names(source: Path, bound: _Bound) -> List[str]:
     """One directory's entry names, counted against the bound as they arrive, then sorted.
 
-    ``sorted(source.iterdir())`` read and sorted the whole directory before a single bound was
-    consulted, so a directory holding a million names spent all of that time and memory *after*
-    the deadline had passed and after the finalization had been cancelled. ``os.scandir`` hands
-    them over one at a time, so the bound is spent per entry and the enumeration stops inside the
-    directory rather than at the end of it.
+    ``sorted(source.iterdir())`` would read and sort the whole directory before a single bound was
+    consulted, so a directory holding a million names would spend all of that time and memory
+    *after* the deadline had passed and after the finalization had been cancelled. ``os.scandir``
+    hands them over one at a time, so the bound is spent per entry and the enumeration stops
+    inside the directory rather than at the end of it.
 
-    The order is still the sorted one, and the sort still happens: it runs on the names that got
-    past the bound, which is the difference. A deterministic order is worth keeping, because it
-    decides which of several refusals an episode gets told about."""
+    The order is the sorted one, and the sort runs on the names that got past the bound. A
+    deterministic order is worth keeping, because it decides which of several refusals an episode
+    gets told about."""
     names: List[str] = []
     with os.scandir(source) as entries:
         for entry in entries:
@@ -1663,10 +1621,10 @@ def _names(source: Path, bound: _Bound) -> List[str]:
 def _clear(target: Path, bound: _Bound, depth: int = 0) -> None:
     """Remove ``target`` and everything under it, under the same bound as the copy that follows.
 
-    ``shutil.rmtree`` was outside every bound, and what it removes is the previous snapshot, which
+    ``shutil.rmtree`` is outside every bound, and what is removed is the previous snapshot, which
     lives at a name one character away from the output root the world is handed: the process that
-    ran the agent's code could work out the name and fill the tree. So a cancelled finalization
-    waited out a deletion the episode had sized, before it reached the copy the bounds cover.
+    ran the agent's code can work out the name and fill the tree, and a cancelled finalization
+    would wait out a deletion the episode had sized before it reached the copy the bounds cover.
 
     Depth is bounded here as well as in the copy, and for a second reason: this recurses, so a
     tree nested ten thousand deep would otherwise be an interpreter stack rather than a refusal."""
@@ -1688,8 +1646,8 @@ def _clear(target: Path, bound: _Bound, depth: int = 0) -> None:
 def _copy(source: Path, target: Path, bound: _Bound) -> None:
     """Move one file's bytes, reading the clock and the stop flag between chunks.
 
-    ``shutil.copyfile`` was one call with no way in: a single large or slow file ran to completion
-    however long the copy had already taken and however long ago the finalization it belongs to
+    ``shutil.copyfile`` is one call with no way in: a single large or slow file runs to completion
+    however long the copy has already taken and however long ago the finalization it belongs to
     was abandoned. Checking once per file bounds a tree of small files and bounds nothing about a
     tree with one big one in it.
 
@@ -1720,9 +1678,9 @@ def snapshot_outputs(
     open.
 
     **The root is checked before it is resolved.** ``resolve()`` erases the question: a root that
-    was itself a symlink came back as whatever it pointed at, and only its descendants were then
-    inspected, so substituting the episode's own output directory substituted the whole tree. It
-    is ``lstat``-ed first, and a link there refuses the episode like a link anywhere else.
+    is itself a symlink comes back as whatever it points at, and inspecting only its descendants
+    would let a substituted output directory substitute the whole tree. It is ``lstat``-ed first,
+    and a link there refuses the episode like a link anywhere else.
 
     **Bounded in four ways, because this walks a tree an episode wrote.** Nodes, bytes, depth and
     elapsed time. Without them a large or deep tree holds finalization open for as long as it
@@ -1731,13 +1689,12 @@ def snapshot_outputs(
     not stop for that. Which is what ``stop`` is for: the caller sets it when its await is
     cancelled, and it is read from inside the work rather than between pieces of it.
 
-    **Every operation that can consume the bound is inside it, which three of them were not.** The
-    previous snapshot was removed by an unbounded ``rmtree`` before the clock was ever consulted;
-    each directory was read and sorted in full before the first check of the entries it produced;
-    and one file was copied by a single call that could not be interrupted however large it was.
-    So a tree an episode had sized could hold finalization open through any of the three while
-    every stated bound stood unbroken. The removal, the enumeration and the copy now each spend
-    the same budget as they go (see :class:`_Bound`).
+    **Every operation that can consume the bound is inside it.** An unbounded ``rmtree`` of the
+    previous snapshot, a directory read and sorted in full before the first check of the entries
+    it produced, or a file copied by a single call that cannot be interrupted however large it is
+    would each let a tree an episode had sized hold finalization open while every stated bound
+    stood unbroken. The removal, the enumeration and the copy each spend the same budget as they
+    go (see :class:`_Bound`).
 
     Every refusal is an episode refused outright rather than an entry skipped, because a grade
     computed over a tree with something quietly dropped is a grade over a tree nobody submitted.
@@ -1830,8 +1787,8 @@ def verify_snapshot(
 
     That manifest comes from the process that runs agent-authored code, so what it establishes is
     completeness against an *interruption* rather than against an adversary. Against an adversary
-    the guarantee is the one that was always there: the tree is what is graded, an episode already
-    controls its own tree, and nothing it can write there improves its grade.
+    the guarantee is a different one: the tree is what is graded, an episode already controls its
+    own tree, and nothing it can write there improves its grade.
 
     **Bounded and cancellable, like the copy before it.** A permitted tree may approach a
     gibibyte, so nothing here reads a file whole: the manifest is read through a handle under a
@@ -1840,8 +1797,8 @@ def verify_snapshot(
 
     **The manifest names nothing; it only answers about names the host already had.** It is
     written inside the tree the episode could write, so every key in it is text an episode chose.
-    What is walked is the trusted set — the basenames of the served task's own input logs, read
-    off a tree no episode can reach — and the manifest is consulted by those names and never
+    What is walked is the trusted set, the basenames of the served task's own input logs read off
+    a tree no episode can reach, and the manifest is consulted by those names and never
     iterated. A key that is not a plain ``.jsonl`` basename refuses the episode rather than being
     skipped, because a manifest naming ``../`` or an absolute path is not a save record with an
     extra field in it; and a name the trusted set lacks is never joined to a path, so no path
@@ -1903,9 +1860,9 @@ def _save_record(
 ) -> Dict[str, Any]:
     """Read the save record, under a cap of its own and with the same clock as everything else.
 
-    ``read_text()[:cap]`` reads the file and *then* takes the slice, so an episode that left a
-    manifest approaching the tree's own gibibyte had that gibibyte allocated and decoded in the
-    serving process before a single bound was consulted. The container's memory limit does not
+    ``read_text()[:cap]`` reads the file and *then* takes the slice, so an episode that leaves a
+    manifest approaching the tree's own gibibyte would have that gibibyte allocated and decoded in
+    the serving process before a single bound was consulted. The container's memory limit does not
     reach a host allocation, and cancelling the ``to_thread`` await does not interrupt one. So the
     handle is opened and at most a cap and one byte are read, in chunks, with the deadline and the
     abandon flag read between them; the extra byte is what tells an oversized manifest from one
@@ -1953,8 +1910,8 @@ def _save_lengths(files: Mapping[str, Any]) -> Dict[str, int]:
     """The lengths a save record claims, keyed by name, or a refusal.
 
     Every key is proved to be one plain ``.jsonl`` basename here, and that is the whole of what
-    this port will accept in it. Nothing downstream joins one of these names to a path — the walk
-    uses the served tree's own names — so this is not what stops the escape; what it stops is the
+    this port will accept in it. Nothing downstream joins one of these names to a path (the walk
+    uses the served tree's own names), so this is not what stops the escape; what it stops is the
     quieter thing, which is a save record that says something this port's saver would never write
     being read as a save record with an extra entry."""
     if len(files) > _MANIFEST_MAX_FILES:
