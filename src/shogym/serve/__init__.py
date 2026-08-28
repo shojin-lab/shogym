@@ -34,7 +34,9 @@ from shogym.serve.stream import (
     TaskRef,
     TaskStream,
     build_stream_server,
+    read_adoptions,
     read_dispenses,
+    read_exposures,
     read_results,
     reconcile,
 )
@@ -65,7 +67,9 @@ __all__ = [
     "TaskStream",
     "TerminalEvidence",
     "build_stream_server",
+    "read_adoptions",
     "read_dispenses",
+    "read_exposures",
     "read_results",
     "reconcile",
 ]

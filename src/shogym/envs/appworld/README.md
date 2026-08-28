@@ -74,7 +74,24 @@ resume that names a different one, and refuses a caller that names none: the rec
 produced its rows, and rows that decline to say make it unreadable as one run afterwards. A
 directory recorded before identities existed is refused too, in the other direction: it cannot say
 what produced its rows, so a named caller has to state that it knows
-(`adopt_unidentified=True`) rather than have the silence read as consent.
+(`adopt_unidentified=True`) rather than have the silence read as consent. That assertion is
+performed once and written into the directory, so the next ordinary resume under the same identity
+needs no flag.
+
+The assertion is also checked against the env, which is the one party that knows. Every terminal
+this env produces publishes its `config_digest` at inference level, the stream compares it with the
+name the record is being filed under, and the first row that publishes one binds the directory: a
+later row whose env says something else is refused before it can be scored, whether or not a caller
+named an identity at all.
+
+Each row's `feedback_regime` is the arm the task was **assigned**, not the arm it was told through.
+It has to be: the row is fsynced before the policy's answer is composed, because the answer is
+composed from the recorded row. So a cancelled terminal, a task the stream ended itself and a
+policy that could not answer all leave a scored row stamped `information` or `placebo` with nobody
+told. That is the field an intention-to-treat estimate wants, and every assigned task has one. What
+was actually delivered is a separate state in `exposures.jsonl` beside the results, joined by
+lease: a revealing run writes one line per terminating call it answered, and a row with no line
+there was never told. A run under `Never` writes no such log, because it opens no channel.
 
 ## Requirements
 
@@ -340,6 +357,7 @@ routes are closed and the expensive one is visible, each tested by running the p
 | one episode's grade | upstream's evaluator report is disabled, and an episode's whole output tree is named absolutely and lives outside every served corpus, so no episode holds another's end state, logs or verdicts |
 | the corpus itself | served inputs are independent copies rather than hard links, so a write through the served pathname changes neither the corpus later episodes are derived from nor the baseline the grader diffs against |
 | the next episode's inputs | each episode is served its own view: its task's world is copied per episode and removed with the episode, and everything else it can reach (the 134 MB of shared base, and the shared task cache the views are copied out of) is sealed read-only, so a write through one episode's served pathname is not in the next one's starting inputs, or the other arm of its pair's |
+| the *names* the next episode resolves | a view names the shared entries by absolute path, so the directory holding those names is sealed read-only too and opened only under the derivation lock; without it, `base_dbs` could be renamed aside and something else put there under the same name, which every current and later view would follow |
 | the drawn key | never sent to either process: the protocol has no field for one |
 
 **There is no file-access audit, and a run must not be read as though there were one.** An earlier
@@ -401,9 +419,11 @@ state by construction rather than two observations that happened to agree.
 
 **The residual, stated exactly.** The private tree is hard to guess and not hard to read: it is the
 same uid, so its 0700 mode stops other users and stops nothing else. The read-only seal on the
-shared base and the shared task cache is the same kind of thing: it refuses an ordinary write,
+shared base, the shared task cache and the directory holding their names is the same kind of thing: it refuses an ordinary write,
 upstream never writes there, and the process that runs agent code owns those files and could put
-the write bits back. The confirmed stop is likewise the process table's word rather than a
+the write bits back. Two ancestors above that directory stay writable as well, because the port
+writes its cache stamp in one and provisions in the other, so the shared root's own name is
+movable by a process willing to work a level up. The confirmed stop is likewise the process table's word rather than a
 namespace: a process that left this group is outside what it can see. The
 port's own source is readable, and with it the draw's algorithm. The run's provenance directory
 retains true reports even under `Placebo`. Anything else the user running the port can read is

@@ -451,6 +451,60 @@ def test_two_episodes_of_one_task_do_not_share_their_served_inputs(tmp_path: Pat
     world._unseal(derived)
 
 
+def test_the_shared_parent_cannot_be_renamed_around(tmp_path: Path) -> None:
+    """The other half of the same invariant, and the half sealing each entry does not give.
+
+    A view names the shared entries by absolute path, so what an episode resolves is the entry's
+    bytes *and* the name that reaches them — and a name lives in its parent. The previous head
+    sealed every entry and left their parent owner-writable, so `base_dbs` could be renamed aside
+    and a directory of the episode's own choosing put there under the same name; every view that
+    resolved it afterwards, this episode's and the other arm of its pair's, would follow.
+    """
+    original = tmp_path / "corpus" / "data"
+    (original / "tasks").mkdir(parents=True)
+    (original / "base_dbs").mkdir()
+    (original / "base_dbs" / "big.jsonl").write_text("shared base")
+    (original / "version.txt").write_text("1.0")
+
+    derived = world.derive_root(original=original, derived=tmp_path / "derived" / "data")
+    (derived / "tasks" / "abc_1" / "dbs").mkdir(parents=True)
+    (derived / "tasks" / "abc_1" / "dbs" / "gmail.jsonl").write_text("pristine")
+    view = world.derive_view(derived=derived, view=tmp_path / "a", task_id="abc_1")
+
+    # The links really are absolute paths into the shared parent, which is what makes the parent
+    # part of what an episode resolves rather than an implementation detail above it.
+    link = view / "data" / "base_dbs"
+    assert link.is_symlink()
+    assert os.readlink(link) == str(derived / "base_dbs")
+
+    assert not (derived.lstat().st_mode & 0o222), oct(derived.lstat().st_mode)
+    # A name cannot be moved aside, replaced, added or taken away. Each of these needs write
+    # permission on the parent and none of them touches the entry's own mode, which is exactly why
+    # the entry seal did not cover them.
+    with pytest.raises(PermissionError):
+        os.rename(derived / "base_dbs", derived / "moved_aside")
+    with pytest.raises(PermissionError):
+        (derived / "planted").mkdir()
+    with pytest.raises(PermissionError):
+        (derived / "version.txt").unlink()
+    with pytest.raises(PermissionError):
+        (derived / "swapped").symlink_to(tmp_path / "elsewhere")
+    # And what the episode resolves is still what it was built from.
+    assert (view / "data" / "base_dbs" / "big.jsonl").read_text() == "shared base"
+
+    # The residual, stated by exercising it: the worker runs as the user that owns these files, so
+    # a process that means to defeat the mode can put it back. This is a boundary against a rename
+    # and not against an adversary; shojin-lab/shogym#140 mounts the shared base into the worker's
+    # container read-only, which is a boundary rather than a convention. Two ancestors above this
+    # one stay writable as well — the seeded root holds the port's cache stamp and the cache root
+    # is where it provisions — so the name `data` itself is movable by a process willing to work a
+    # level up, and the container mount is what closes that too.
+    os.chmod(derived, 0o755)
+    os.rename(derived / "base_dbs", derived / "moved_aside")
+    assert (derived / "moved_aside" / "big.jsonl").read_text() == "shared base"
+    world._unseal(derived)
+
+
 # ----- stopping a worker, and stopping what it started -----
 
 

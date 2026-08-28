@@ -53,6 +53,7 @@ from shogym.serve.stream import (
     TaskRef,
     TaskStream,
     build_stream_server,
+    read_adoptions,
     read_dispenses,
     read_results,
     reconcile,
@@ -787,6 +788,238 @@ async def test_a_record_that_names_no_identity_is_continued_as_itself(tmp_path: 
         await resumed.get_task()
         await resumed.dispatch(SUBMIT_TOOL, {"answer": "6"})
     assert [row["run_identity"] for row in _rows(tmp_path)] == ["", ""]
+
+
+async def test_an_adoption_is_recorded_and_the_next_resume_is_ordinary(tmp_path: Path) -> None:
+    """A migration that changes nothing on disk is not one.
+
+    ``adopt_unidentified`` used to relax the check and leave the record saying exactly what it
+    said before, so this sequence was refused at the last step: adopt, append, close cleanly, and
+    then an ordinary resume under the very identity that had adopted those rows was turned away
+    by a directory that had already been told the answer. The alternative was to pass the flag
+    forever, which suspends the check for configurations nobody ever adopted."""
+    stream = _stream(tmp_path, [0])
+    async with stream:
+        await stream.get_task()
+        await stream.dispatch(SUBMIT_TOOL, {"answer": "4"})
+    assert [row["run_identity"] for row in _rows(tmp_path)] == [""]
+
+    adopting = _stream(
+        tmp_path, [0, 1], resume=True, identity="fingerprint-a", adopt_unidentified=True
+    )
+    async with adopting:
+        await adopting.get_task()
+        await adopting.dispatch(SUBMIT_TOOL, {"answer": "6"})
+    assert [row["run_identity"] for row in _rows(tmp_path)] == ["", "fingerprint-a"]
+
+    # The adoption is auditable: who took the rows on, under which regime, how many of each kind
+    # were there, and how far the record's own numbering had reached.
+    (adoption,) = read_adoptions(tmp_path / "prov")
+    assert adoption["run_identity"] == "fingerprint-a"
+    assert adoption["feedback_regime"] == "never"
+    assert adoption["results"] == 1 and adoption["dispenses"] == 1
+    assert adoption["through_seq"] == 1
+    # The blank rows are left blank: that they *were* blank is the one fact a reader of a migrated
+    # directory needs, and rewriting them would destroy it.
+    assert _rows(tmp_path)[0]["run_identity"] == ""
+
+    # The whole point. No flag, and the resume is ordinary.
+    async with _stream(tmp_path, [0, 1], resume=True, identity="fingerprint-a"):
+        pass
+    # And it wrote no second adoption: the assertion was performed once.
+    assert len(read_adoptions(tmp_path / "prov")) == 1
+
+    # A configuration nobody adopted is still refused, and told whose those rows are.
+    with pytest.raises(ValueError, match="already adopted by 'fingerprint-a'"):
+        _stream(tmp_path, [0, 1], resume=True, identity="fingerprint-b")
+
+
+async def test_a_construction_that_refuses_leaves_the_record_unadopted(tmp_path: Path) -> None:
+    """A call that refuses has served nothing and recorded nothing, and it may not be the reason
+    a later resume looks reasonable. The adoption is the only write this constructor makes to a
+    record, so it is the one mark a refusal could otherwise leave behind."""
+    stream = _stream(tmp_path, [0])
+    async with stream:
+        await stream.get_task()
+        await stream.dispatch(SUBMIT_TOOL, {"answer": "4"})
+
+    # A queue the record was not written against, asserted with the migration flag on.
+    with pytest.raises(ValueError, match="queue position"):
+        _stream(
+            tmp_path, [1, 0], resume=True, identity="fingerprint-a", adopt_unidentified=True
+        )
+    assert read_adoptions(tmp_path / "prov") == []
+    # So the migration did not happen, and the flagless resume is refused exactly as before.
+    with pytest.raises(ValueError, match="names no run identity"):
+        _stream(tmp_path, [0, 1], resume=True, identity="fingerprint-a")
+
+
+@pytest.mark.parametrize("bad", ["false", "true", 1, 0, None])
+def test_adopt_unidentified_must_be_an_exact_boolean(tmp_path: Path, bad: Any) -> None:
+    # It is the single argument that suspends the identity check, and `bool()` on what a config
+    # file or an environment variable produces makes the *string* `"false"` a yes. A run that
+    # suspended the check by accident is a record whose rows were averaged across configurations
+    # because someone wrote the word "false" down.
+    with pytest.raises(TypeError, match="adopt_unidentified must be True or False"):
+        _stream(tmp_path, [0], adopt_unidentified=bad)
+    # Refused before anything is spent: no directory, nothing claimed.
+    assert not (tmp_path / "prov").exists()
+
+
+# ----- the identity is checked against the one party that knows -----
+
+
+class _DigestedEnv(_FixtureScoreEnv):
+    """The score fixture, publishing what an env says about its own configuration.
+
+    AppWorld publishes a ``config_digest`` at inference level on every terminal, which is the env
+    saying which configuration produced this row. This is that shape with a value a test can
+    move: the stream reads it off the terminal evidence, never reveals it (no policy reaches
+    inference level), and compares it with the name the record is being filed under."""
+
+    def __init__(self, tasks: Any = None, digest: str = "") -> None:
+        super().__init__(tasks=tasks)
+        self._digest = digest
+
+    def _verify(
+        self, trajectory: Any, task: Dict[str, Any], *, terminated: bool, evidence: Any = None
+    ) -> FeedbackCollection:
+        fb = super()._verify(trajectory, task, terminated=terminated, evidence=evidence)
+        if terminated and self._digest:
+            fb.inference.append(
+                InferenceFeedback(name="config_digest", value=self._digest, step=0)
+            )
+        return fb
+
+
+def _digested_stream(
+    tmp_path: Path, indices: List[int], said: Dict[str, str], **kwargs: Any
+) -> TaskStream:
+    return TaskStream(
+        lambda _name: _DigestedEnv(tasks=TASKS, digest=said["digest"]),
+        [TaskRef(ENV_NAME, i) for i in indices],
+        prov_dir=tmp_path / "prov",
+        **kwargs,
+    )
+
+
+async def test_a_row_the_env_disowns_is_refused_before_it_is_scored(tmp_path: Path) -> None:
+    """The caller supplies a string and the module compares it with other strings on disk, which
+    is safe against a *changed caller* and says nothing about a caller whose string stopped
+    describing its env. A catalog and an episode factory can be handed configuration B while one
+    remembered name is stamped on every row, and the env is the only party that notices."""
+    stream = _digested_stream(tmp_path, [0], {"digest": "digest-b"}, identity="digest-a")
+    with pytest.raises(RuntimeError):
+        async with stream:
+            await stream.get_task()
+            await stream.dispatch(SUBMIT_TOOL, {"answer": "4"})
+
+    (row,) = _rows(tmp_path)
+    # Fail-closed: the disagreeing row is unscored and says why, rather than landing scored under
+    # a name its own env disowns.
+    assert row["closure"] == "finalize_error" and row["score"] is None
+    assert "digest-a" in row["diagnostic"] and "digest-b" in row["diagnostic"]
+
+
+async def test_a_record_is_bound_to_what_its_env_said(tmp_path: Path) -> None:
+    """The half a caller's assertion cannot carry, and the half that works for the wildcard.
+
+    Nobody named anything here, so there is no assertion to check. What the second row is refused
+    by is the *first* row: the env described itself, that description is what this directory
+    holds, and comparing what the env said with what the env said before is not an assertion
+    anybody made."""
+    said = {"digest": "digest-one"}
+    stream = _digested_stream(tmp_path, [0, 1], said)
+    with pytest.raises(RuntimeError):
+        async with stream:
+            await stream.get_task()
+            await stream.dispatch(SUBMIT_TOOL, {"answer": "4"})
+            said["digest"] = "digest-two"
+            await stream.get_task()
+            await stream.dispatch(SUBMIT_TOOL, {"answer": "6"})
+
+    rows = _rows(tmp_path)
+    assert [row["closure"] for row in rows] == ["sealed", "finalize_error"]
+    assert rows[0]["score"] is not None and rows[1]["score"] is None
+    assert "digest-one" in rows[1]["diagnostic"] and "digest-two" in rows[1]["diagnostic"]
+
+
+async def test_a_resume_is_held_to_the_digest_the_record_already_holds(tmp_path: Path) -> None:
+    # The binding is durable, because what carries it is already durable: the env's own item is
+    # on every row under `observed`, so a resume reads the configuration this directory holds out
+    # of the record rather than out of a caller.
+    said = {"digest": "digest-one"}
+    async with _digested_stream(tmp_path, [0], said) as first:
+        await first.get_task()
+        await first.dispatch(SUBMIT_TOOL, {"answer": "4"})
+
+    said["digest"] = "digest-two"
+    resumed = _digested_stream(tmp_path, [0, 1], said, resume=True)
+    with pytest.raises(RuntimeError):
+        async with resumed:
+            await resumed.get_task()
+            await resumed.dispatch(SUBMIT_TOOL, {"answer": "6"})
+
+    rows = _rows(tmp_path)
+    assert [row["closure"] for row in rows] == ["sealed", "finalize_error"]
+    assert "digest-one" in rows[1]["diagnostic"] and "digest-two" in rows[1]["diagnostic"]
+
+
+async def test_an_env_whose_names_cannot_be_compared_still_lands_its_row(
+    tmp_path: Path,
+) -> None:
+    """Finding the digest runs the env's own ``__eq__``, because a published name is an object
+    the env supplied. An env whose names raise would take the whole seal down at the identity
+    read — no row at all, and `reconcile` answering a task the agent played with a broker crash.
+    So the read is contained and an env that cannot be asked did not say; the score is refused by
+    the summary funnel for the same defect, one step further on, and the run stops there."""
+
+    class _ExplodingName(str):
+        def __eq__(self, other: Any) -> bool:
+            raise RuntimeError("names in this env cannot be compared")
+
+        def __ne__(self, other: Any) -> bool:
+            raise RuntimeError("names in this env cannot be compared")
+
+        __hash__ = str.__hash__
+
+    class _NamesExplode(_DigestedEnv):
+        def _verify(
+            self, trajectory: Any, task: Dict[str, Any], *, terminated: bool, evidence: Any = None
+        ) -> FeedbackCollection:
+            fb = super()._verify(trajectory, task, terminated=terminated, evidence=evidence)
+            # The digest's own name too, which is the one this check has to compare.
+            for item in [*fb.inference, *fb.episode]:
+                item.name = _ExplodingName(item.name)
+            return fb
+
+    stream = TaskStream(
+        lambda _name: _NamesExplode(tasks=TASKS, digest="digest-a"),
+        [TaskRef(ENV_NAME, 0)],
+        prov_dir=tmp_path / "prov",
+        identity="fingerprint-a",
+    )
+    with pytest.raises(RuntimeError):
+        async with stream:
+            await stream.get_task()
+            await stream.dispatch(SUBMIT_TOOL, {"answer": "4"})
+
+    # The row landed, unscored, saying which defect it was — rather than the seal escaping and
+    # the task reconciling as an evaluator that fell over.
+    (row,) = _rows(tmp_path)
+    assert row["score"] is None
+    assert "cannot headline" in (row["diagnostic"] or "")
+
+
+async def test_an_env_that_does_not_describe_itself_binds_nothing(tmp_path: Path) -> None:
+    # The state every env was in before this existed, and the one a reconciled crash row is in:
+    # no digest is published, so nothing is bound and nothing is refused.
+    async with _digested_stream(tmp_path, [0, 1], {"digest": ""}, identity="fingerprint-a") as s:
+        await s.get_task()
+        await s.dispatch(SUBMIT_TOOL, {"answer": "4"})
+        await s.get_task()
+        await s.dispatch(SUBMIT_TOOL, {"answer": "6"})
+    assert [row["closure"] for row in _rows(tmp_path)] == ["sealed", "sealed"]
 
 
 async def test_the_claim_carries_the_identity_before_any_row_exists(tmp_path: Path) -> None:
