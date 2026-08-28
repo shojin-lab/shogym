@@ -31,3 +31,8 @@ def _sessions_store(
     ``HOME`` itself, and that only works if this patch was made on the same object."""
     root = tmp_path_factory.mktemp("sessions")
     monkeypatch.setattr(lifecycle, "_sessions_cache_root", lambda: root)
+    # And in the environment, because a patched function reaches only this interpreter. Several
+    # tests here open an episode in a *fresh* one (a killed-stream reconciliation, the fork
+    # refusals), and those children inherited nothing: they scanned, recovered and wrote into the
+    # developer's real store while this fixture claimed they could not.
+    monkeypatch.setenv(lifecycle.SESSIONS_ROOT_ENV_VAR, str(root))

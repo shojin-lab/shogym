@@ -653,6 +653,64 @@ async def _normal_close_while_finalizing(_tmp: Path) -> None:
     _holds(env, sessions=ep)
 
 
+
+async def _cancel_cleanup_before_begin(_tmp: Path) -> None:
+    """Pass 9 finding 1, the pre-begin half: with no rollback there is no session to release, and
+    nothing else was starting the env close, so the env stayed open and its lifecycle alive."""
+    env = _Watched(bind_loop=False)
+    real_open = episode_module._open_session_for_spec
+
+    async def opening(spec: Any, **kwargs: Any) -> Any:
+        session = await real_open(spec, **kwargs)
+        closing = session.close
+
+        async def slow() -> None:
+            await asyncio.sleep(0.3)
+            await closing()
+
+        session.close = slow  # type: ignore[method-assign]
+        return session
+
+    def refuse(_idx: Any) -> Any:
+        raise ValueError("setup boom")
+
+    env.load_task = refuse  # type: ignore[method-assign]
+    episode_module._open_session_for_spec = opening  # type: ignore[assignment]
+    try:
+        opening_task = asyncio.ensure_future(ServedEpisode.open_env(env, task=0))
+        await asyncio.sleep(0.1)
+        opening_task.cancel()
+        with contextlib.suppress(BaseException):
+            await opening_task
+    finally:
+        episode_module._open_session_for_spec = real_open  # type: ignore[assignment]
+    assert await _awaited(env.closed.is_set), "a cancelled pre-begin cleanup left the env open"
+    _holds(env)
+
+
+async def _normal_close_while_dispatching_legacy(_tmp: Path) -> None:
+    """Pass 9 finding 5: a non-seal close that could not wait had no gate, so the call it gave up
+    on committed a step and ran `verify` against an env that was already gone."""
+    score_mcp.reset_block()
+    ep = await ServedEpisode.start(score_env.ENV_NAME, task=0)
+    ep._seal_enabled = False
+    original = episode_module._END_SESSION_SECONDS
+    episode_module._END_SESSION_SECONDS = 0.05
+    try:
+        running = asyncio.ensure_future(ep.call("block", {}))
+        await asyncio.sleep(0.1)
+        await ep.close()
+        score_mcp.released.set()
+        late = await running
+        assert late.tombstoned is True, "the call the close gave up on committed anyway"
+        assert [e.tool for e in ep._trajectory] == []
+    finally:
+        episode_module._END_SESSION_SECONDS = original
+        score_mcp.released.set()
+        with contextlib.suppress(BaseException):
+            await ep.close()
+
+
 #: state -> event -> a cell that runs, or the reason the pair cannot arise.
 _MATRIX: Dict[str, Dict[str, Any]] = {
     "building": {
@@ -680,11 +738,11 @@ _MATRIX: Dict[str, Dict[str, Any]] = {
         "cancel_close": "covered under `releasing`: a close here has no session state to race",
         "deadline_fires": "a task is not dispensed until setup returns, so no clock is running",
         "second_close": "no first close exists",
-        "env_raises": "covered under `releasing`",
         "session_slow": "sessions are opened before the hook; a slow one delays setup, not a race",
         "factory_fails_late": "the factory has already returned",
         "normal_close": "no episode is returned to close",
         "cancel_cleanup": _cancel_cleanup_while_begun,
+        "env_raises": _cancel_cleanup_before_begin,
         "deadline_mid_finalize": "nothing is finalizing",
     },
     "dispatching": {
@@ -697,7 +755,7 @@ _MATRIX: Dict[str, Dict[str, Any]] = {
         "loop_closes": "an episode whose loop closes mid-dispatch is `begun`'s loop-loss shape",
         "env_raises": "a tool that raises is an ordinary call result, not a lifecycle event",
         "env_cancels": "covered under `releasing`: the hook boundary is where it matters",
-        "session_slow": "a slow tool is what `cancel_call` blocks on",
+        "session_slow": _normal_close_while_dispatching_legacy,
         "span_fails": "spans are open by now",
         "factory_fails_late": "the factory has already returned",
         "cancel_cleanup": "there is no cleanup path here; teardown is `releasing` and `closing`",

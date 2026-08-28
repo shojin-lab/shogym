@@ -3626,6 +3626,29 @@ class TaskStream:
             releasing = self._releasing = asyncio.ensure_future(self._release_stream())
         await asyncio.shield(releasing)
 
+    async def _await_replaced(self, position: int) -> None:
+        """Wait for a build this position is replacing, and leave it registered until it settles.
+
+        Cancellation is the caller's and goes back to them: swallowed here it consumed a
+        `get_task` cancellation whole and carried on into construction and adoption, so a pull
+        that had been cancelled went on to consume a queue position and hand out a task nobody
+        was waiting for."""
+        replacing = self._replacing.get(position)
+        if replacing is None:
+            return
+        if not replacing.done():
+            try:
+                await asyncio.wait_for(
+                    asyncio.shield(asyncio.wrap_future(replacing)), timeout=_BUILD_SECONDS
+                )
+            except (asyncio.TimeoutError, TimeoutError):
+                # The bound is on the wait. The discard keeps running and stays registered, so
+                # the next pull for this position waits for the same one rather than starting a
+                # third.
+                return
+        if replacing.done():
+            self._replacing.pop(position, None)
+
     def _builder(self, position: int, ref: TaskRef) -> "_Builder":
         """The build owed to one queue position: the one already running, or a new one.
 
@@ -3880,15 +3903,15 @@ class TaskStream:
             # inside `max_in_flight`, and a wedged one leaves a thread behind each time. So the
             # build is the *position's*, not the pull's: a pull that is cancelled leaves it here
             # and the next pull for that position joins it instead of starting another.
-            replacing = self._replacing.pop(position, None)
-            if replacing is not None and not replacing.done():
-                # One constructor per position, even across a context change: the build being
-                # replaced is still running and this position may not have two.
-                with contextlib.suppress(BaseException):
-                    await asyncio.wait_for(
-                        asyncio.shield(asyncio.wrap_future(replacing)), timeout=_BUILD_SECONDS
-                    )
+            # One constructor per position, even across a context change, and the wait happens
+            # *before* the replacement is made. Popped first and waited on after, the very call
+            # that detected the mismatch started its own build and then found nothing to wait
+            # for, so two constructors ran for one position; and the predecessor was forgotten
+            # whether or not it had settled, so a slow one restored the overlap on the next pull.
+            # It stays registered until it is done.
+            await self._await_replaced(position)
             held = self._builder(position, ref)
+            await self._await_replaced(position)
             lifecycle, building = held.lifecycle, held.building
             try:
                 if building is not None:
