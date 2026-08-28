@@ -28,10 +28,12 @@ from __future__ import annotations
 
 import asyncio
 import concurrent.futures
+import contextlib
 import contextvars
 import json
 import os
 import threading
+import time
 import warnings
 from dataclasses import dataclass
 from pathlib import Path
@@ -184,6 +186,11 @@ def _running_loop() -> "Optional[asyncio.AbstractEventLoop]":
 #: not coming back.
 _ENV_CLOSE_SECONDS = 60.0
 
+#: How long a loop that is neither running nor closed is given before it counts as gone. That is
+#: what a loop looks like between two ``run_until_complete`` calls and what one looks like after
+#: its last, and only waiting tells them apart.
+_LOOP_QUIET_SECONDS = 0.25
+
 #: Env closes scheduled onto an owning loop from another thread. A task nothing holds may be
 #: collected before it runs, so each one is kept until it is done.
 _PENDING_CLOSES: "set[asyncio.Task[None]]" = set()
@@ -217,6 +224,8 @@ class _EnvClose:
         self._owner = owner
         self._lock = threading.Lock()
         self._taken = False
+        self._running = False
+        self._ticket = 0
         self._arranged = False
         self._done = threading.Event()
         #: What the close raised, if it raised. Read by tests and by the warning below.
@@ -228,25 +237,67 @@ class _EnvClose:
     def done(self) -> bool:
         return self._done.is_set()
 
-    def _take(self) -> bool:
+    def _take(self) -> Optional[int]:
+        """Take the close, and get the ticket that says which taking this was.
+
+        A ticket rather than a flag, because a take can be given back: a loop that accepted the
+        work and then stopped without running it has to be relieved of it, and the task it may
+        still be holding must not run afterwards. The ticket is what tells the two apart, so a
+        late task from an abandoned loop finds its ticket stale and does nothing."""
         with self._lock:
             if self._taken:
-                return False
+                return None
             self._taken = True
+            return self._ticket
+
+    def _reclaim(self, ticket: int) -> bool:
+        """Give the close back, if the holder never started it. ``True`` when it is free again."""
+        with self._lock:
+            if self._done.is_set() or self._running or self._ticket != ticket:
+                return False
+            self._ticket += 1
+            self._taken = False
+            return True
+
+    def _begin(self, ticket: int) -> bool:
+        """Claim the *running* of the close, once. ``False`` for a holder that has been relieved."""
+        with self._lock:
+            if self._ticket != ticket or self._done.is_set() or self._running:
+                return False
+            self._running = True
             return True
 
     async def here(self) -> None:
-        """Close on the caller's loop, and join whoever is already closing if that is not this."""
+        """Close on the caller's loop, and join whoever is already closing if that is not this.
+
+        **This one raises.** A caller that awaited a close is the one place there is somebody to
+        tell, and ``ServedEpisode.close`` propagated an env's failure before this owner existed;
+        containing it here would have made every caller's close silently best-effort, including
+        the ones that are not a stream with its own containment boundary.
+
+        **And it finishes even when the caller does not.** A cancellation arriving mid-close is
+        the caller going away, not an instruction to leave an env half torn down, so the close is
+        shielded to completion and the cancellation is handed back afterwards."""
         if self._owner is not None and _running_loop() is not self._owner:
             # Somebody else's loop. Hand it to the one that owns the env rather than closing an
             # env's constructor state from a loop it never met.
             self.from_thread()
             await self._joined()
             return
-        if not self._take():
+        ticket = self._take()
+        if ticket is None or not self._begin(ticket):
             await self._joined()
             return
-        await self._run()
+        closing = asyncio.ensure_future(self._run(raising=True))
+        # Read whatever it ends with, so a cancellation that stops us reading it ourselves does
+        # not leave asyncio reporting an exception nobody retrieved.
+        closing.add_done_callback(_swallow)
+        try:
+            await asyncio.shield(closing)
+        except asyncio.CancelledError:
+            with contextlib.suppress(BaseException):
+                await asyncio.shield(closing)
+            raise
 
     def arrange(self, hooks: "concurrent.futures.ThreadPoolExecutor") -> None:
         """Queue the close behind whatever this episode's hook thread is already doing.
@@ -267,24 +318,71 @@ class _EnvClose:
             self.from_thread()
 
     def from_thread(self) -> None:
-        """Run the close from a thread, on the owning loop while that loop can still take work."""
-        if not self._take():
-            return
+        """Run the close from a thread, on the owning loop while that loop will still run it.
+
+        **Ownership follows execution, not acceptance.** A loop accepting a callback is not a
+        loop running it, and a loop that runs the callback is not a loop that runs the task the
+        callback created: one that stops in between discards what it was holding, and an owner
+        taken at either point would have been taken by a close that never happened, with
+        ``_done`` never set and every retry finding it owned. So this thread watches for the
+        close to *finish*, and takes the work back when the loop stops without finishing it. The
+        ticket the loop was given goes stale at that moment, so a task it somehow still runs
+        afterwards does nothing."""
         loop = self._owner
-        if loop is not None and not loop.is_closed() and loop.is_running():
+        if loop is not None and not loop.is_closed():
+            def on_owner() -> None:
+                ticket = self._take()
+                if ticket is not None:
+                    self._spawn(ticket)
+
             try:
-                loop.call_soon_threadsafe(self._spawn)
-                return
+                loop.call_soon_threadsafe(on_owner)
             except RuntimeError:
                 pass
-        self._on_a_loop_of_its_own()
+            else:
+                if self._finished_on_owner(loop):
+                    return
+                self._reclaim(self._current_ticket())
+        ticket = self._take()
+        if ticket is not None and self._begin(ticket):
+            self._on_a_loop_of_its_own()
 
-    def _spawn(self) -> None:
-        """On the owning loop: start the close and keep the task alive until it finishes."""
+    def _current_ticket(self) -> int:
+        with self._lock:
+            return self._ticket
+
+    def _finished_on_owner(self, loop: "asyncio.AbstractEventLoop") -> bool:
+        """Wait for the owning loop to actually *finish* the close.
+
+        Polled rather than waited on outright, because what has to be noticed is the loop going
+        quiet: a close accepted by a loop that never turns again is a close that never happens,
+        and nothing about the accept says so. A loop that is merely busy is waited for. One that
+        has closed is done deciding. One that is stopped but not closed is given a moment, since
+        that is also what a loop looks like between two ``run_until_complete`` calls, and then
+        treated as gone."""
+        deadline = time.monotonic() + _ENV_CLOSE_SECONDS
+        quiet_until: Optional[float] = None
+        while not self._done.wait(0.005):
+            if loop.is_closed():
+                return False
+            if loop.is_running():
+                quiet_until = None
+            else:
+                now = time.monotonic()
+                if quiet_until is None:
+                    quiet_until = now + _LOOP_QUIET_SECONDS
+                elif now >= quiet_until:
+                    return False
+            if time.monotonic() > deadline:
+                return False
+        return True
+
+    def _spawn(self, ticket: int) -> None:
+        """On the owning loop, already taken: start the close and keep the task alive."""
         loop = self._owner
         try:
             assert loop is not None
-            task = loop.create_task(self._run())
+            task = loop.create_task(self._run_owned(ticket))
         except BaseException as exc:  # noqa: BLE001 - reported, never raised into the loop
             self.failure = exc
             self._done.set()
@@ -293,6 +391,12 @@ class _EnvClose:
         _PENDING_CLOSES.add(task)
         task.add_done_callback(_PENDING_CLOSES.discard)
 
+    async def _run_owned(self, ticket: int) -> None:
+        """The close as the owning loop runs it, and nothing at all if it has been relieved."""
+        if not self._begin(ticket):
+            return
+        await self._run()
+
     def _on_a_loop_of_its_own(self) -> None:
         self.orphaned = True
         try:
@@ -300,40 +404,55 @@ class _EnvClose:
         except BaseException as exc:  # noqa: BLE001 - reported, never raised into a worker thread
             self.failure = exc
             self._done.set()
-        self._warn()
+            self._warn()
 
-    async def _run(self) -> None:
+    async def _run(self, raising: bool = False) -> None:
         try:
             await self._env.close()
-        except BaseException as exc:  # noqa: BLE001 - recorded; there is no caller to raise to
+        except BaseException as exc:  # noqa: BLE001 - see below; a detached close has no caller
             self.failure = exc
-        finally:
             self._done.set()
+            if raising:
+                raise
+            # Nobody is awaiting this one, so the only way it can be observed is if it says so.
+            self._warn()
+            return
+        self._done.set()
 
     def _warn(self) -> None:
         if self.failure is None:
             return
+        where = (
+            "its loop was gone by the time the session release finished, so the close was "
+            "attempted on a temporary one; an env whose resources belong to the loop that built "
+            "it cannot be closed this way and "
+            if self.orphaned
+            else "no caller was waiting for it, so this is where it is reported, and "
+        )
         warnings.warn(
-            f"an env could not be closed after its episode failed: "
-            f"{type(self.failure).__name__}: {self.failure}. Its loop was gone by the time the "
-            "session release finished, so the close was attempted on a temporary one; an env "
-            "whose resources belong to the loop that built it cannot be closed this way and "
-            "whatever its constructor made is still held.",
+            f"an env could not be closed: {type(self.failure).__name__}: {self.failure}. "
+            f"{where}whatever its constructor made is still held.",
             RuntimeWarning,
             stacklevel=2,
         )
 
-    async def _joined(self) -> None:
+    async def _joined(self, timeout: Optional[float] = None) -> bool:
         """Wait for the owner, off the loop, so a close scheduled onto this loop can run."""
         if self._done.is_set():
-            return
+            return True
+        bound = _ENV_CLOSE_SECONDS if timeout is None else timeout
         try:
             await asyncio.wait_for(
-                asyncio.to_thread(self._done.wait, _ENV_CLOSE_SECONDS),
-                timeout=_ENV_CLOSE_SECONDS + 1.0,
+                asyncio.to_thread(self._done.wait, bound), timeout=bound + 1.0
             )
-        except BaseException:
+        except Exception:
             pass
+        return self._done.is_set()
+
+    async def settled(self, timeout: Optional[float] = None) -> bool:
+        """Public join: has this env actually been closed? Used by a caller that owns the slot
+        the env occupies and may not free it while the env is still closing."""
+        return await self._joined(timeout)
 
 
 class _SetupRollback:
@@ -369,12 +488,23 @@ class _SetupRollback:
         def rollback() -> None:
             try:
                 env.end_session(session_id)
-            except Exception:
+            except BaseException:  # noqa: BLE001 - see below
+                # `BaseException`, and the one that matters is `CancelledError`. An env's hook
+                # can raise it like any other code, and this thread is not cancellable, so one
+                # arriving here is the env's rather than anyone's instruction. Caught with
+                # `Exception` it went straight past the env close below and left the env open.
                 pass
             finally:
                 self._released.set()
-            # Then the env, on the loop that built it if that loop is still there to take it.
-            cleanup.from_thread()
+                # A true `finally`, and both of these belong in it. The env close is the other
+                # half of the cleanup this rollback exists to perform, and the executor is this
+                # episode's alone: shutting it down here rather than in the caller's
+                # continuation is what stops a caller that never resumes, because its loop went
+                # away, from leaving a live thread behind for every abandoned setup.
+                try:
+                    cleanup.from_thread()
+                finally:
+                    hooks.shutdown(wait=False)
 
         try:
             hooks.submit(contextvars.copy_context().run, rollback)
@@ -444,6 +574,16 @@ def _discard_when_built(
         ).start()
 
     building.add_done_callback(discard)
+
+
+def _caller_cancelled() -> bool:
+    """Is the task running this the one somebody asked to cancel?
+
+    ``CancelledError`` is two unrelated things wearing one type: a caller withdrawing, and
+    third-party code raising it. The count of cancellations requested on this task and not yet
+    withdrawn tells them apart, and no exception can, which is why this module asks the task."""
+    task = asyncio.current_task()
+    return task is not None and task.cancelling() > 0
 
 
 def _swallow(finished: "asyncio.Future[Any]") -> None:
@@ -883,6 +1023,18 @@ class ServedEpisode:
             if not handed_over:
                 hooks.shutdown(wait=False)
             raise
+
+    async def env_closed(self, timeout: Optional[float] = None) -> bool:
+        """Wait for this episode's env to be **actually** closed, and say whether it is.
+
+        :meth:`close` is bounded on purpose: a release still inside a wedged hook may not hold
+        the caller past the bound it was promised, so a close arranged behind that release is
+        left to finish on its own and ``close`` returns. That is right for latency and wrong for
+        ownership, and they are different questions. A caller holding the slot this episode
+        occupies (a stream deciding whether the next task may be dispensed) has to ask the second
+        one, because an env still closing is still holding a worker, a port and a directory, and
+        a slot freed on the first answer lets those accumulate past the configured capacity."""
+        return await self._cleanup.settled(timeout)
 
     @property
     def terminated(self) -> bool:
@@ -1716,6 +1868,15 @@ class ServedEpisode:
                 asyncio.shield(asyncio.wrap_future(release)),
                 timeout=_END_SESSION_SECONDS,
             )
+        except asyncio.CancelledError:
+            # Two unrelated things arrive here as the same exception. One is this caller being
+            # cancelled, which is theirs and goes back to them. The other is the env's hook
+            # raising `CancelledError` from a thread, which is ordinary third-party code failing
+            # and is contained like any other hook failure: let out, it would leave the MCP
+            # sessions and the env unclosed, and answer a terminating call with a traceback
+            # instead of the constant, since teardown runs inside it.
+            if _caller_cancelled():
+                raise
         except Exception:
             pass
 
@@ -1765,12 +1926,15 @@ class ServedEpisode:
         # even a release still running in its thread leaves `Env.close` with nothing of this
         # episode's to do.
         await self._release_session()
-        await self._close_env()
-        # The hook thread has no work left that anything is waiting for. `wait=False`: a release
-        # still inside a wedged hook, and the env close queued behind it, finish in their own
-        # time and this close is not held by them, which is the same bound the wait above
-        # already declared.
-        self._hooks.shutdown(wait=False)
+        try:
+            await self._close_env()
+        finally:
+            # In a `finally`, because the close above raises now: an env's close failure is the
+            # caller's to see, and a thread this episode owns is not something to leak over it.
+            # `wait=False`: a release still inside a wedged hook, and the env close queued behind
+            # it, finish in their own time and this close is not held by them, which is the same
+            # bound the wait above already declared.
+            self._hooks.shutdown(wait=False)
 
     async def _close_env(self) -> None:
         """Close the env, after this session's release and never beside it.
