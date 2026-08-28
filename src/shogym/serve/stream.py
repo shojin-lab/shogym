@@ -723,6 +723,11 @@ class ResultRow:
     # before the policy existed was written by a stream that revealed nothing, and a row built
     # without saying otherwise — `reconcile`'s, a caller's — may not read as one that did.
     feedback_regime: str = _NEVER_REGIME
+    #: What the run was configured with, as its caller chose to summarise it. Opaque here: this
+    #: module compares it and never reads it. Empty for a run whose caller named no identity, and
+    #: for every record written before this field existed, which is why an empty one matches
+    #: anything.
+    run_identity: str = ""
 
     def to_wire(self) -> Dict[str, Any]:
         return {
@@ -739,6 +744,7 @@ class ResultRow:
             # Appended, never inserted: every member above is one an existing reader already
             # keys on, and this one is additive so a `Never` row stays a row those readers parse.
             "feedback_regime": self.feedback_regime,
+            "run_identity": self.run_identity,
         }
 
     @classmethod
@@ -764,6 +770,7 @@ class ResultRow:
             diagnostic=row.get("diagnostic"),
             extensions=dict(row.get("extensions") or {}),
             feedback_regime=_recorded_regime(row),
+            run_identity=str(row.get("run_identity", "")),
         )
 
 
@@ -1960,6 +1967,7 @@ class TaskStream:
         # because `Never` is frozen and holds nothing per-run; a policy that ever holds state
         # (a `Delayed` queue, a `Noisy` generator) may not be a default for exactly that reason.
         feedback: FeedbackPolicy = Never(),
+        identity: str = "",
     ) -> None:
         if not isinstance(max_in_flight, int):
             # A capacity is a count of slots, and everything downstream reads it as one: it
@@ -2101,6 +2109,10 @@ class TaskStream:
         # no attribute of it is ever read.
         self._feedback = feedback
         self._regime = regime
+        # What the caller says makes two runs one measurement. Opaque to this module: it is
+        # written into the claim before the first dispense, stamped on every durable record, and
+        # compared before a takeover, and never read (see `_require_identity_matches`).
+        self._run_identity = str(identity)
         self._reveals = reveals
         self._reveal = reveal
         # The validated names, bound to the extensions they were validated for. Uniqueness and
@@ -2311,6 +2323,9 @@ class TaskStream:
                     self._require_regime_matches(
                         _recorded_regime(record), source="a dispense record"
                     )
+                    self._require_identity_matches(
+                        str(record.get("run_identity", "")), source="a dispense record"
+                    )
                     lease = str(record["lease"])
                     if lease in self._issued:
                         # Already ambiguous on disk, before this run adds anything: the pairing
@@ -2330,6 +2345,7 @@ class TaskStream:
                         row.position, TaskRef(row.env, row.task_idx), source="a result row"
                     )
                     self._require_regime_matches(row.feedback_regime, source="a result row")
+                    self._require_identity_matches(row.run_identity, source="a result row")
                     # A row's lease is the dispense's, so this adds nothing to a record whose two
                     # files agree — and it is what keeps the guarantee if they ever do not.
                     self._issued.add(row.lease)
@@ -2649,6 +2665,9 @@ class TaskStream:
                         str(held.get("feedback_regime", _NEVER_REGIME)),
                         source="an ownership claim",
                     )
+                    self._require_identity_matches(
+                        str(held.get("run_identity", "")), source="an ownership claim"
+                    )
                     # The assertion `resume=True` makes, carried out. Nothing can come between this
                     # and the create below, so a claim that is gone here was gone before this
                     # stream arrived.
@@ -2673,6 +2692,7 @@ class TaskStream:
                     {
                         "owner": self._owner,
                         "feedback_regime": self._regime,
+                        "run_identity": self._run_identity,
                         # Read back by every append and every release, as identity: this is the
                         # process the claim was taken in, and no other may write under it (see
                         # :meth:`_require_claim`). The wall clock is for the human alone.
@@ -3000,6 +3020,31 @@ class TaskStream:
             )
             + "; resuming needs the queue the provenance was recorded against, or a fresh "
             "provenance directory"
+        )
+
+    def _require_identity_matches(self, recorded: str, *, source: str) -> None:
+        """A stored record must have been written under the same run configuration as this stream.
+
+        The regime check beside this one asks whether the agent was told its verdicts. This asks
+        the other half: whether the rows were produced by the same thing at all. A record's rows
+        are read together and averaged, so a directory holding rows scored under two draws, two
+        payload classes, two corpora or two versions of a scorer is a record whose parts are
+        individually honest and whose mean is about neither of them.
+
+        What goes in the string is the caller's to decide and opaque here: this module compares it
+        and never reads it, because what makes two runs one measurement is a property of the env
+        and the harness rather than of the queue. A caller that names nothing gets the behaviour
+        it had before, and so does a record written before this field existed: an empty identity
+        matches anything, because refusing every directory recorded without one would punish the
+        record rather than the mismatch."""
+        if not recorded or not self._run_identity or recorded == self._run_identity:
+            return
+        raise ValueError(
+            f"{self.prov_dir} holds {source} written under run identity {recorded!r}, but this "
+            f"stream serves under {self._run_identity!r}; the rows of one record are read together, "
+            "so rows produced under two configurations have a mean that is about neither of "
+            "them. Resume under the configuration the record was written with, or serve into a "
+            "fresh provenance directory"
         )
 
     def _require_regime_matches(self, recorded: str, *, source: str) -> None:
@@ -3675,8 +3720,14 @@ class TaskStream:
             # yet: if a span refuses to open, the episode never starts and the position is
             # still owed. Spans first, so nothing needs cleaning up when one fails.
             spans, dispensed_extensions = await self._begin_spans(ref)
+            # Built off the loop. `env_for` is the caller's function and some envs make it do
+            # real work in it: one that provisions an interpreter, walks a corpus and takes file
+            # locks would otherwise hold every other episode this server is running, before the
+            # episode it is building has even opened.
             episode = await ServedEpisode.open_env(
-                self._env_for(ref.env), env_name=ref.env, task=ref.task_idx
+                await asyncio.to_thread(self._env_for, ref.env),
+                env_name=ref.env,
+                task=ref.task_idx,
             )
             try:
                 # The episode's own snapshot, taken when it was opened and the same for every
@@ -4780,6 +4831,7 @@ class TaskStream:
             extensions=self._unclosed_spans(live, cause),
             # The regime this stream serves, exactly as a composed row records it.
             feedback_regime=self._regime,
+            run_identity=self._run_identity,
         )
 
     def _unclosed_spans(self, live: _Live, cause: BaseException) -> Dict[str, Any]:
@@ -5000,6 +5052,7 @@ class TaskStream:
             # policy object — the row says what the run was, not what the policy happens to
             # answer at the moment the row is built.
             feedback_regime=self._regime,
+            run_identity=self._run_identity,
         )
         if unfinished is not None:
             # The seal's answer is already reached, so what is left is the failure. The row goes
@@ -5355,6 +5408,7 @@ class TaskStream:
                 # this run to write, the `broker_abort` :func:`reconcile` builds, can say which
                 # posture it was dispensed under instead of defaulting to the safe-looking one.
                 "feedback_regime": self._regime,
+                "run_identity": self._run_identity,
                 # namespace -> what that extension observed at dispense. The `{"dispensed": ...}`
                 # wrapper the row carries is deliberately *not* here: it exists to sit beside
                 # `sealed`/`error`, which are outcomes, and a dispense record has no outcome.
@@ -5479,6 +5533,7 @@ class EvalStream(TaskStream):
         # word about why — and a caller reading that has every reason to reach for `TaskStream`
         # and pass the policy there, which is exactly the move this class exists to make visible.
         feedback: Any = _REFUSED,
+        identity: str = "",
     ) -> None:
         if feedback is not _REFUSED:
             # `Never()` is refused too, and that is the point rather than an oversight. A value
@@ -5503,6 +5558,7 @@ class EvalStream(TaskStream):
             provenance=provenance,
             provenance_timeout=provenance_timeout,
             feedback=Never(),
+            identity=identity,
         )
 
 

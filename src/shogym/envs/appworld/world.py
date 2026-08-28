@@ -265,35 +265,17 @@ def derive_root(*, original: Path, derived: Path) -> Path:
     return derived
 
 
-def share_outputs(*, derived: Path, graded: Path) -> None:
-    """Give the grader a view of the episode's own output tree.
-
-    An episode writes its end state under the root its world was served from, and the grader reads
-    it under the root it was given. Those are two roots on purpose. This publishes the second name
-    for the first tree under the same lock the roots are built under, because every environment
-    constructed against a cold cache runs this and two of them racing on one ``symlink`` is an
-    ``FileExistsError`` out of a constructor.
-
-    A symlink here rather than a hard link, because a directory cannot be hard-linked and this
-    one has to stay the same directory as it fills up. It points from the grader's private tree
-    into the served tree, which is a direction an agent's process has no way to follow: it is the
-    private tree that is hard to find, and this link lives in it."""
-    outputs = derived / "experiments"
-    (outputs / "outputs").mkdir(parents=True, exist_ok=True)
-    graded.mkdir(parents=True, exist_ok=True)
-    with _locked(graded):
-        link = graded / "experiments"
-        if link.is_symlink() and os.readlink(link) == str(outputs):
-            return
-        _link(outputs, link)
-
-
 def _materialise(source: Path, target: Path) -> None:
     """Put ``source``'s content at ``target`` without leaving a path back to where it came from.
 
-    A hard link where the filesystem allows one, a copy otherwise. Never a symlink: a symlink
-    names its target's directory, and in this corpus every task directory has the answers as a
-    sibling."""
+    An independent copy. Never a symlink, because a symlink names its target's directory and in
+    this corpus every task directory has the answers as a sibling; and never a hard link either,
+    because a hard link is the same file under a second name. The worker runs as the same user
+    that built this and the file is writable, so a write through the served pathname would change
+    the corpus it was copied from and the baseline the grader diffs against, which is a served
+    episode editing the thing it is scored on.
+
+    The corpus is 134 MB and this is paid once per derived root, not per episode."""
     if target.exists():
         return
     if source.is_dir():
@@ -301,12 +283,7 @@ def _materialise(source: Path, target: Path) -> None:
         for entry in sorted(source.iterdir()):
             _materialise(entry, target / entry.name)
         return
-    try:
-        os.link(source, target)
-    except OSError:
-        # A different filesystem, or one with no hard links. A copy costs space and says nothing
-        # about where it came from, which is the property that matters.
-        shutil.copy2(source, target)
+    shutil.copy2(source, target)
 
 
 def _publish(building: Path, target: Path) -> None:
@@ -348,7 +325,6 @@ __all__ = [
     "Slot",
     "already_derived",
     "derive_root",
-    "share_outputs",
     "derive_task",
     "request_description",
     "seeding",

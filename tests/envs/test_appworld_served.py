@@ -557,6 +557,91 @@ async def test_the_same_block_inside_the_budget_does_file_the_log() -> None:
         await episode.close()
 
 
+async def test_one_episodes_grade_is_not_readable_by_the_next(tmp_path: Path) -> None:
+    """The failure this closes is the one the paired design cannot survive: the placebo member of
+    a pair reading the receipt of its twin.
+
+    Upstream's evaluator writes a report beside the episode's output by default, quoting the
+    requirement prose and the values behind it, and every worker used to be handed the same root
+    to find it under. Report writing is off, and an episode's output tree is now named absolutely
+    and lives outside any served corpus, so there is nothing of one episode inside another's
+    world."""
+    first = await play([filing_block()])
+    assert first["feedback"]["assertion_fraction"] >= 0.0  # the grader really ran
+
+    probe = """
+_io, _os = __import__("io"), __import__("os")
+root = _os.environ["APPWORLD_ROOT"]
+
+
+def _read(path):
+    try:
+        return _io.open(path).read()[:60]
+    except Exception as failure:
+        return type(failure).__name__
+
+
+print(json.dumps({
+    "root": root,
+    "experiments": _read(root + "/experiments/outputs"),
+    "report": _read(root + "/experiments/outputs/report.md"),
+}))
+"""
+    second = await play([probe])
+    seen = json.loads(json.loads(second["outputs"][0]["content"])["output"])
+    # Nothing of any episode's output is inside the tree a world is served from.
+    assert seen["experiments"] in ("FileNotFoundError", "IsADirectoryError", "NotADirectoryError")
+    assert seen["report"] == "FileNotFoundError"
+    # And no evaluator report exists anywhere under the served corpus.
+    served = adapter.derived_root()
+    assert list(served.rglob("report.md")) == []
+
+
+async def test_the_world_stops_before_it_is_graded() -> None:
+    """Sealing closes the tool surface and does not stop work an earlier call left running. The
+    worker is terminated before the read is scored, so the evaluator reads a snapshot nothing can
+    still be writing to."""
+    from shogym.envs.appworld import mcp_server
+
+    env = shogym.make("appworld")
+    episode = await ServedEpisode.open_env(env, env_name="appworld", task=TASK)
+    try:
+        session = mcp_server.get_session(episode.session_id)
+        assert session is not None
+        worker = session.worker
+        assert worker.process.poll() is None
+        await episode.call("submit", {})
+        # Graded, and the process that could have changed the world is already gone.
+        assert worker.process.poll() is not None
+    finally:
+        await episode.close()
+
+
+async def test_the_frozen_table_is_the_one_this_roster_produces() -> None:
+    """The distribution a drawn receipt's count comes from, checked against the generator over
+    every served task at its own reference date.
+
+    The cheap versions of this check pass while being wrong: a length and a sum survive a permuted
+    table, and a fixture built at one hard-coded date is not what production builds. This is the
+    whole roster, each task at the date its own specification carries, compared exactly."""
+    root = adapter.ensure_corpus()
+    built = ledger.pass_count_marginal(
+        _backlog_at(task_id, root) for task_id in adapter.task_ids()
+    )
+    assert built == payload.pass_counts()
+    assert sum(built) == len(adapter.task_ids()) * len(ledger.CONVENTIONS)
+
+
+def _backlog_at(task_id: str, root) -> ledger.Backlog:
+    specs = adapter.task_specs(root, task_id)
+    built = ledger.build_backlog(
+        zlib.crc32(task_id.encode()),
+        dt.datetime.fromisoformat(specs["datetime"]).date(),
+    )
+    assert built is not None, task_id
+    return built
+
+
 # ----- the matched pair, through a stream -----
 
 
