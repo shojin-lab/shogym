@@ -10,6 +10,8 @@ a tree of links resolving to nothing.
 from __future__ import annotations
 
 import asyncio
+import errno
+import json
 import os
 import threading
 import time
@@ -1044,3 +1046,310 @@ def test_a_corpus_with_a_link_in_it_is_refused_rather_than_half_digested(
     (data / "tasks" / "abc_1" / "linked.json").symlink_to(elsewhere)
     with pytest.raises(adapter.ProvisioningError, match="symbolic link"):
         adapter.corpus_digest(tmp_path)
+
+
+# ----- one reading of one corpus -----
+
+
+def _one_task_corpus(root: Path, *, instruction: str, moment: str) -> Path:
+    """A corpus holding one task, shaped like the pinned one."""
+    task = root / "data" / "tasks" / "abc_1"
+    task.mkdir(parents=True)
+    (root / "data" / "version.txt").write_text("0.1.0")
+    (task / "specs.json").write_text(
+        json.dumps(
+            {
+                "instruction": instruction,
+                "datetime": moment,
+                "supervisor": {
+                    "first_name": "Ada",
+                    "last_name": "Lovelace",
+                    "email": "ada@example.com",
+                    "phone_number": "555",
+                },
+            }
+        )
+    )
+    return root
+
+
+def test_a_corpus_is_read_once_for_its_digest_and_for_its_authored_text(tmp_path: Path) -> None:
+    """The digest and the specs are one observation, not two.
+
+    A digest computed in the constructor and a `specs.json` read later are two readings of a tree
+    that can change between them, and the gap is exactly where a corpus edited in place served new
+    authored text under the old identity. They come out of one walk now, and a manifest task the
+    walk never reached is a manifest and a corpus that are not describing the same split."""
+    root = _one_task_corpus(tmp_path / "corpus", instruction="do the thing", moment="2023-05-18T12:00:00")
+    snapshot = adapter.corpus_snapshot(root, task_ids=("abc_1",))
+    assert snapshot.digest == adapter.corpus_digest(root)
+    assert snapshot.specs["abc_1"]["instruction"] == "do the thing"
+
+    with pytest.raises(adapter.ProvisioningError, match="no specification for"):
+        adapter.corpus_snapshot(root, task_ids=("abc_1", "not_in_this_corpus_1"))
+
+
+def test_an_env_serves_the_corpus_it_was_constructed_against(tmp_path: Path) -> None:
+    """The env's own time-of-check gap, which the spec reread left open.
+
+    The corpus digest, the served cache's name and the grader's cache name were fixed in the
+    constructor, and the instruction, the supervisor and the datetime went on being reread from
+    the live corpus every time a task was described, seeded or scored. So a corpus edited after
+    construction served new authored text out of caches named for the old bytes, under a
+    fingerprint that had never seen it, and nothing in the record said so.
+
+    Refusing would need the corpus rehashed on every read, which is two seconds a time; serving
+    what was read costs nothing and is a contract that can be stated. This is the contract."""
+    from shogym.envs.appworld import env_v1
+
+    root = _one_task_corpus(tmp_path / "corpus", instruction="the first", moment="2023-05-18T12:00:00")
+    snapshot = adapter.corpus_snapshot(root, task_ids=("abc_1",))
+
+    env = env_v1.AppWorldEnv.__new__(env_v1.AppWorldEnv)
+    env._original = root / "data"
+    env._task_ids = ("abc_1",)
+    env._specs = snapshot.specs
+    env._corpus = snapshot.digest
+
+    # The corpus changes under the env, in place, after it has stated what it is serving.
+    (root / "data" / "tasks" / "abc_1" / "specs.json").write_text(
+        json.dumps(
+            {
+                "instruction": "the second",
+                "datetime": "2024-01-01T12:00:00",
+                "supervisor": {
+                    "first_name": "Mallory",
+                    "last_name": "Elsewhere",
+                    "email": "mallory@example.com",
+                    "phone_number": "999",
+                },
+            }
+        )
+    )
+    assert adapter.corpus_digest(root) != snapshot.digest, "the edit really did move the corpus"
+
+    specs = env._task_specs("abc_1")
+    assert specs["instruction"] == "the first"
+    assert specs["datetime"] == "2023-05-18T12:00:00"
+    # And every place the env hands that text on: the instructions an agent is given, and the
+    # supervisor whose accounts its world is driven with.
+    assert "the first" in env._instructions(0)
+    assert "the second" not in env._instructions(0)
+    assert env._load_task(0)["supervisor_email"] == "ada@example.com"
+
+
+# ----- the snapshot's bounds cover the operations that spend them -----
+
+
+def test_the_walk_stops_inside_a_directory_rather_than_after_reading_all_of_it(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The enumeration was the one part of the walk no bound could reach.
+
+    `sorted(source.iterdir())` read and sorted a whole directory before the first check of the
+    node count, the deadline or the stop flag, so an episode that left a million names in one
+    directory spent all of that time and memory after the budget was gone and after the
+    finalization it belonged to had been cancelled. The entries arrive one at a time now, and the
+    bound is spent as they arrive.
+
+    Counted at the seam rather than timed, because "it stopped early" is the claim and a
+    stopwatch is not how to say it."""
+    outputs = tmp_path / "outputs"
+    outputs.mkdir()
+    for index in range(400):
+        (outputs / f"{index}.jsonl").write_text("x")
+
+    consumed = 0
+    real_scandir = os.scandir
+
+    class _counting:
+        def __init__(self, inner: Any) -> None:
+            self._inner = inner
+
+        def __enter__(self) -> "_counting":
+            return self
+
+        def __exit__(self, *exc: Any) -> None:
+            self._inner.__exit__(*exc)
+
+        def __iter__(self) -> "_counting":
+            return self
+
+        def __next__(self) -> Any:
+            nonlocal consumed
+            entry = next(self._inner)
+            consumed += 1
+            return entry
+
+    monkeypatch.setattr(os, "scandir", lambda path: _counting(real_scandir(path)))
+
+    monkeypatch.setattr(adapter, "_SNAPSHOT_MAX_NODES", 5)
+    with pytest.raises(adapter.SnapshotError, match="more than 5 entries"):
+        adapter.snapshot_outputs(outputs, into=tmp_path / "a")
+    assert 0 < consumed <= 6, "the walk read the whole directory before it refused it"
+
+    # The deadline is read inside the enumeration too, not only between directories.
+    consumed = 0
+    monkeypatch.setattr(adapter, "_SNAPSHOT_MAX_NODES", 20_000)
+    monkeypatch.setattr(adapter, "_SNAPSHOT_SECONDS", -1.0)
+    with pytest.raises(adapter.SnapshotError, match="longer than"):
+        adapter.snapshot_outputs(outputs, into=tmp_path / "b")
+    assert consumed <= 1
+
+
+def test_a_cancelled_snapshot_stops_partway_through_a_file(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Once per file is not a bound on a tree with one big file in it.
+
+    `shutil.copyfile` is one call with no way in, so a finalization that was cancelled while the
+    copy was inside a large file waited out the whole of it. The bytes move in chunks now and the
+    flag is read between them, which is what makes cancellation a bound on the work rather than on
+    the gaps between pieces of it."""
+    outputs = tmp_path / "outputs"
+    outputs.mkdir()
+    (outputs / "one.jsonl").write_bytes(b"x" * (1 << 16))
+    # Sixty-four chunks for one file, so a flag raised on the tenth reading is raised well inside
+    # it however the checks before the copy are arranged.
+    monkeypatch.setattr(adapter, "_SNAPSHOT_CHUNK_BYTES", 1024)
+
+    class _after:
+        """A stop flag that is not set when the copy starts and is set once it is under way."""
+
+        def __init__(self, checks: int) -> None:
+            self.checks = checks
+            self.seen = 0
+
+        def is_set(self) -> bool:
+            self.seen += 1
+            return self.seen > self.checks
+
+    stop = _after(checks=10)
+    with pytest.raises(adapter.SnapshotError, match="abandoned"):
+        adapter.snapshot_outputs(
+            outputs,
+            into=tmp_path / "into",
+            stop=stop,  # pyright: ignore[reportArgumentType]
+        )
+    # It stopped with the file part copied, which is the whole claim: the refusal came from inside
+    # one copy rather than from the gap after it.
+    partial = tmp_path / "into" / "one.jsonl"
+    assert partial.exists()
+    assert 0 < partial.stat().st_size < (1 << 16)
+
+
+def test_the_deadline_is_read_while_one_file_is_still_being_copied(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The same gap, told by the clock instead of by the flag.
+
+    A copy that crosses the sixty-second budget used to run to the end of the file and only then
+    be noticed, so an episode with one enormous file decided how long finalization took. The
+    bounds are shrunk here rather than the file grown: a chunk of one byte over a megabyte is work
+    that certainly outlasts a fiftieth of a second, and the assertion is that it was stopped in
+    the middle of it."""
+    outputs = tmp_path / "outputs"
+    outputs.mkdir()
+    (outputs / "one.jsonl").write_bytes(b"x" * (1 << 20))
+
+    monkeypatch.setattr(adapter, "_SNAPSHOT_CHUNK_BYTES", 1)
+    monkeypatch.setattr(adapter, "_SNAPSHOT_SECONDS", 0.05)
+    with pytest.raises(adapter.SnapshotError, match="longer than"):
+        adapter.snapshot_outputs(outputs, into=tmp_path / "into")
+    partial = tmp_path / "into" / "one.jsonl"
+    assert partial.exists()
+    assert 0 < partial.stat().st_size < (1 << 20)
+
+
+def test_the_previous_snapshot_is_removed_under_the_same_bound(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The destination is one character away from a name the world is handed.
+
+    AppWorld is given the episode's output root by absolute path, and the snapshot goes to that
+    name with `.graded` on the end, in a process running as the same user. So the tree removed
+    before the copy is a tree the episode can size, and it was removed by an `rmtree` outside
+    every bound: the deadline had not started, the stop flag was not read, and nothing counted the
+    entries."""
+    outputs = tmp_path / "outputs"
+    outputs.mkdir()
+    (outputs / "one.jsonl").write_text("what the episode submitted")
+
+    into = tmp_path / "outputs.graded"
+    (into / "planted").mkdir(parents=True)
+    for index in range(400):
+        (into / "planted" / f"{index}.jsonl").write_text("x")
+
+    monkeypatch.setattr(adapter, "_SNAPSHOT_MAX_NODES", 5)
+    with pytest.raises(adapter.SnapshotError, match="more than 5 entries"):
+        adapter.snapshot_outputs(outputs, into=into)
+
+    # And a cancelled finalization does not wait out the removal either.
+    stop = threading.Event()
+    stop.set()
+    monkeypatch.setattr(adapter, "_SNAPSHOT_MAX_NODES", 20_000)
+    with pytest.raises(adapter.SnapshotError, match="abandoned"):
+        adapter.snapshot_outputs(outputs, into=into, stop=stop)
+    assert (into / "planted").exists(), "nothing was removed after the flag was seen"
+
+
+# ----- exclusion the filesystem cannot give -----
+
+
+def test_a_mount_that_cannot_lock_refuses_the_builders_and_still_serves_the_download(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The fallback the concurrency test above never exercises, on both sides of the fork.
+
+    `_locked` yielded with no exclusion at all when the filesystem could not provide `flock`,
+    which is right for the upstream-source download it was written for: that publishes by one
+    atomic rename and a loser validates the winner, so the loss is redundant work. It is wrong for
+    the builders here. The corpus is the material every score is computed against, and the
+    permission windows open a published directory and seal it again, which a second process inside
+    them closes under the first's feet.
+
+    The runtime builder this test also covered upstream is gone: there is no virtual environment
+    on the host any more, and the image is built by a daemon that serializes its own tags.
+
+    Simulated at the errno, because a filesystem that cannot lock is not a thing a test suite
+    has."""
+    from shogym.envs import _upstream
+
+    def _cannot_lock(descriptor: int, operation: int) -> None:
+        raise OSError(errno.ENOLCK, "no locks available")
+
+    monkeypatch.setattr(_upstream.fcntl, "flock", _cannot_lock)
+    monkeypatch.setattr(_upstream, "_warned_unlocked", False)
+
+    # The download path is unchanged: it says so once and gets on with it.
+    with pytest.warns(RuntimeWarning, match="cannot provide flock"):
+        with _upstream._locked(tmp_path):
+            pass
+    with pytest.raises(_upstream.ExclusionUnavailable, match="needs real exclusion"):
+        with _upstream._locked(tmp_path, required=True):
+            pass
+
+    monkeypatch.setenv("SHOGYM_CACHE", str(tmp_path / "cache"))
+    monkeypatch.delenv(adapter.ROOT_ENV_VAR, raising=False)
+    # The corpus builder, past the image it makes sure of first.
+    monkeypatch.setattr(adapter, "ensure_image", lambda: "an-image")
+    with pytest.raises(_upstream.ExclusionUnavailable):
+        adapter.ensure_corpus()
+
+    original = tmp_path / "corpus" / "data"
+    (original / "tasks" / "abc_1" / "dbs").mkdir(parents=True)
+    (original / "tasks" / "abc_1" / "ground_truth").mkdir()
+    (original / "tasks" / "abc_1" / "dbs" / "todoist.jsonl").write_text("")
+    (original / "shared").write_text("base databases")
+    # The permission window over the shared entries.
+    with pytest.raises(_upstream.ExclusionUnavailable):
+        world.derive_root(original=original, derived=tmp_path / "derived" / "data")
+    # And the one over the published tasks directory.
+    with pytest.raises(_upstream.ExclusionUnavailable):
+        world.derive_task(
+            original=original,
+            derived=tmp_path / "derived2" / "data",
+            graded=tmp_path / "graded2" / "data",
+            task_id="abc_1",
+            write_log=lambda source, into: into.write_text("seeded"),
+        )

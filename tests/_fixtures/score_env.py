@@ -42,14 +42,7 @@ class _FixtureScoreEnv(Env):
 
     Config: ``tasks`` (list of ``{"id","question","answer"}``); optional ``finalize_hook`` — a
     callable ``(FinalizeRequest, correct: bool) -> None`` a test can use to count invocations
-    or block/raise inside ``finalize`` (to exercise the cancellation/close/deadline rules).
-
-    Declares an identity channel, because a stream reads one only where an env says it has one:
-    which item says what produced a row is the env's to name, and a replay finds the name on the
-    registered class rather than on a live object it does not have. Publishing nothing under it is
-    the ordinary case and reads as nothing."""
-
-    identity_feedback_name = "config_digest"
+    or block/raise inside ``finalize`` (to exercise the cancellation/close/deadline rules)."""
 
     mcp_servers = (_SPEC,)
     function_name = "solver"

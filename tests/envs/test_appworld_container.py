@@ -1046,45 +1046,6 @@ def test_a_name_appended_during_a_sweep_is_not_lost(
     assert container.outstanding() == ["second"]
 
 
-def test_an_env_that_publishes_the_same_name_for_something_else_is_not_read(
-    tmp_path: Path,
-) -> None:
-    """`config_digest` is an ordinary name, and this module used to decide what it meant.
-
-    A stream reserved the first terminal item called that and compared it against the caller's
-    identity, so an environment publishing it as an ordinary metric would have had a successful
-    terminal turned into an unscored failure by a module that had no business reading it. Which
-    item is an identity is the env's declaration now, read off the registered class so that a row
-    being replayed on a resume can be checked without a live env, and an env that declares nothing
-    is not read at all."""
-    from shogym.envs.registration import _ENV_REGISTRY, identity_feedback_name
-    from shogym.serve.stream import TaskStream
-
-    class _Quiet:
-        pass
-
-    class _Speaks:
-        identity_feedback_name = "config_digest"
-
-    _ENV_REGISTRY["a-quiet-env"] = _Quiet
-    _ENV_REGISTRY["a-speaking-env"] = _Speaks
-    try:
-        assert identity_feedback_name("a-quiet-env") == ""
-        assert identity_feedback_name("a-speaking-env") == "config_digest"
-        stream = TaskStream.__new__(TaskStream)
-        stream._run_identity = "the-caller-name"
-        stream._env_identity = ""
-        stream.prov_dir = tmp_path
-        observed = [{"name": "config_digest", "value": "something else", "level": "episode"}]
-        # Declares nothing: not read, not compared, not refused.
-        stream._require_env_agrees(observed, env_name="a-quiet-env")
-        # Declares it: compared, and this one disagrees with the identity it is filed under.
-        with pytest.raises(ValueError, match="run identity"):
-            stream._require_env_agrees(observed, env_name="a-speaking-env")
-    finally:
-        _ENV_REGISTRY.pop("a-quiet-env", None)
-        _ENV_REGISTRY.pop("a-speaking-env", None)
-
 def test_a_worker_with_a_call_in_flight_does_not_settle(monkeypatch: pytest.MonkeyPatch) -> None:
     """What finalization asks before it stops a container.
 

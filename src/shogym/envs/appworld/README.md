@@ -139,18 +139,58 @@ TaskStream(
     [TaskRef("appworld", 0)],
     prov_dir=...,
     feedback=Information(),
-    # Pass the fingerprint, and whatever else about this run makes its rows one measurement. The
-    # env's digest covers the draw, the payload class, the block budget, the corpus, the worker
-    # image and the machine it was given; the deadline and the capacity are the stream's, and a
-    # record whose rows ran under two of them is a record about two different opportunities. The
-    # string is compared and never read, so what goes in it is the runner's to decide.
-    identity=f"{shogym.make('appworld').config_digest}|deadline=600.0|flight=1",
+    # Pass the fingerprint. It is what makes the rows of one record one measurement, and a resume
+    # under a changed draw, payload class, block budget or corpus is refused rather than appended.
+    identity=shogym.make("appworld").config_digest,
 )
 ```
 
+`config_digest` covers the draw, the payload class, the block budget, every constant a payload is
+generated from, the text the agent is given (the world guide, the tool guide and the appended
+paragraph), the generator constants that decide the seeded backlog, the corpus this run actually
+serves (all of it, including the 134 MB of shared base episodes read as input), the derivation
+layout, what the worker image turned out to be rather than the release it was asked for, the cpu
+and memory a container is given, and a
+hand-bumped scoring version that moves when how a score is read moves. An env serves the corpus it
+read at construction for the whole of its life: the instructions, the supervisors and the dates
+come from that one reading, so a corpus edited underneath a running env cannot put new authored
+text behind an unchanged fingerprint. A stream's `deadline` and
+`max_in_flight` belong to a run's identity too and are not an env's to know, so the stream folds
+them in itself: what a record is filed under is a structured identity whose members are the name
+passed here, the digest each env in the queue published about itself, the deadline and the
+capacity, compared member by member on every resume. The derived and grader caches are named by
+the same source digest and carry a stamp inside them saying what they were built from, so a run
+pointed at a second corpus cannot serve material derived from the first.
+
 Passing `identity` is how a record defends itself. A directory that already names one refuses a
 resume that names a different one, and refuses a caller that names none: the record has said what
-produced its rows, and rows that decline to say make it unreadable as one run afterwards.
+produced its rows, and rows that decline to say make it unreadable as one run afterwards. A
+directory recorded before identities existed is refused too, in the other direction: it cannot say
+what produced its rows, so a named caller has to state that it knows
+(`adopt_unidentified=True`) rather than have the silence read as consent. That assertion is
+performed once and written into the directory, so the next ordinary resume under the same identity
+needs no flag.
+
+The name is also checked against the env, which is the one party that knows, and the env's own
+answer is a member of the identity rather than something searched for inside that name. This env
+declares the item it describes itself with (`identity_feedback_name = "config_digest"`) and
+answers to it before any episode runs, so the stream reads the digest off the env at construction
+and writes it into the ownership claim: a run killed between its claim and its first row still
+leaves behind what its env said it was, and a resume against a changed corpus, draw or runtime is
+refused before a task is spent. Every terminal this env produces publishes the same
+`config_digest` at inference level, and a row whose env says something else than the identity
+holds for it is refused before it can be scored. The first row of an env that publishes a digest
+also binds the directory for that env, which is what covers an env that publishes one without
+answering to it, and it works whether or not a caller named an identity at all.
+
+Each row's `feedback_regime` is the arm the task was **assigned**, not the arm it was told through.
+It has to be: the row is fsynced before the policy's answer is composed, because the answer is
+composed from the recorded row. So a cancelled terminal, a task the stream ended itself and a
+policy that could not answer all leave a scored row stamped `information` or `placebo` with nobody
+told. That is the field an intention-to-treat estimate wants, and every assigned task has one. What
+was actually delivered is a separate state in `exposures.jsonl` beside the results, joined by
+lease: a revealing run writes one line per terminating call it answered, and a row with no line
+there was never told. A run under `Never` writes no such log, because it opens no channel.
 
 The absence of a line is load-bearing, so two things fail closed on it. A delivery whose line
 cannot be written is not delivered: the terminating call is answered with the empty member every
@@ -656,7 +696,7 @@ rather than the env's, but it is no longer readable from inside an episode.
   slots for every leg. Scores drawn under two pulses are not comparable, and neither the pulse nor
   the payload class appears anywhere else in a run's record, so every row carries a
   `config_digest`, which covers the draw, the payload class, the block budget, the pinned bundle,
-  what the interpreter actually holds rather than what version it was asked for, the served
+  what the worker image actually is rather than what version it was asked for, the served
   roster, the frozen count table, a scoring version, and what the corpus at `APPWORLD_ROOT`
   actually holds rather than what the pin says it should. Published at
   inference level: the record keeps it and no feedback policy

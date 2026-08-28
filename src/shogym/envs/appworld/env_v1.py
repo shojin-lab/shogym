@@ -145,8 +145,12 @@ class AppWorldEnv(Env):
 
     #: The item a runner may compare against the identity it is filing rows under. Declared here
     #: rather than assumed there: `config_digest` is an ordinary name any env may publish as a
-    #: metric, and a module that decided what it meant would turn another env's successful
+    #: metric, and a module that decided what its number meant would turn another env's successful
     #: terminal into an unscored failure. An env that declares nothing is not checked.
+    #:
+    #: The value is readable off the env itself (`config_digest` below), so a serve layer can fold
+    #: it into the identity a run is filed under before the first task is dispensed, rather than
+    #: waiting for the first row to publish one.
     identity_feedback_name = "config_digest"
 
     def __init__(
@@ -182,12 +186,23 @@ class AppWorldEnv(Env):
         self._pulse = int(pulse)
         self._report = report
         self._original = adapter.ensure_corpus() / "data"
+        self._task_ids = adapter.task_ids()
         # Read once, from the corpus this run actually serves, and used for three things that all
         # have to agree: the name of the served cache, the name of the grader's cache, and the run
         # fingerprint a resumed record is checked against. They used to be able to disagree, so a
         # process pointed at a second corpus computed a fingerprint for that one and then reused
         # and served task material derived from the first.
-        self._corpus = adapter.corpus_digest(self._original.parent)
+        #
+        # **The roster's authored text comes back from the same read, and is what this env serves
+        # for the rest of its life.** The digest and the cache names were fixed here while the
+        # instructions, the supervisors and the dates went on being reread from the live corpus
+        # every time a task was described, seeded or scored. So a corpus edited after construction
+        # served new authored text under the old fingerprint, out of caches named for the old
+        # bytes, and nothing in the record said so. An env that has stated what corpus it is
+        # serving has to go on serving that one (see `adapter.corpus_snapshot`).
+        snapshot = adapter.corpus_snapshot(self._original.parent, task_ids=self._task_ids)
+        self._corpus = snapshot.digest
+        self._specs = snapshot.specs
         served, graded = (
             adapter.derived_root(self._corpus),
             adapter.graded_root(self._corpus),
@@ -198,7 +213,6 @@ class AppWorldEnv(Env):
         # The grader's view of the same corpus, with the answers linked back in. Only the grading
         # process is ever given this root; the world an agent drives is given the other one.
         self._graded = world.derive_root(original=self._original, derived=graded / "data")
-        self._task_ids = adapter.task_ids()
         self._backlogs: Dict[str, Any] = {}
         self.function = FunctionConfig(example_system_template=_static_instructions())
         # The step budget the serve layer enforces is one past the configured block budget, so
@@ -935,11 +949,15 @@ def run_fingerprint(
             adapter.DATA_BUNDLE_SHA256,
             corpus,
             adapter.UPSTREAM_VERSION,
-            # What the interpreter and its dependency set turned out to be, rather than the one
-            # version that was asked for. The runtime cache is named for the direct AppWorld
-            # release while it is built by resolving that release's ranges against whatever the
-            # host and the index offer on the day, so two runs could sit under one name and one
-            # identity with different worlds underneath them.
+            # The commit the pinned release claims to be cut from. Nothing on this machine can
+            # check that claim against the wheel, so this is the only thing it is load-bearing
+            # for: a run under a changed pin is a different measurement, whether or not the
+            # artifact behind the version moved with it.
+            adapter.UPSTREAM_SHA,
+            # What the image turned out to hold, rather than the one version that was asked for.
+            # The Dockerfile asks for a release and the resolver answers with a transitive set
+            # that depends on the day and on the architecture, so two runs could sit under one
+            # tag and one identity with different worlds underneath them.
             adapter.runtime_digest(),
             adapter.MANIFEST.read_text(),
             payload.PASS_COUNTS_FILE.read_text(),

@@ -21,19 +21,6 @@ def make(env_name: str, config: Optional[Dict[str, Any]] = None) -> Env:
     return env
 
 
-def identity_feedback_name(env_name: str) -> str:
-    """The feedback item ``env_name`` declares as the identity of what produced a row.
-
-    Read off the class rather than off an instance, because a record is checked when it is
-    replayed as well as when it is written, and a replay has no live env. An env that declares
-    nothing gets the empty string, which means nothing about its rows is read as an identity:
-    the name is an ordinary one that any environment may publish as a metric, and a module that
-    decided what it meant would turn another env's successful terminal into an unscored failure.
-    """
-    cls = _ENV_REGISTRY.get(env_name)
-    return str(getattr(cls, "identity_feedback_name", "") or "") if cls is not None else ""
-
-
 def registered_envs() -> list:
     """Return the names of all registered environments."""
     return list(_ENV_REGISTRY.keys())
