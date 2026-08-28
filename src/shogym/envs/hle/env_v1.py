@@ -239,10 +239,13 @@ class HleEnv(Env):
         Runs HLE's grading on the sealed submission: a normalized exact-match fast path first
         (offline, free) and, on a miss, the session's injectable LLM judge. The returned
         ``verdict`` is **public-safe** (``correct``, ``judge_error``, and, when the env built the
-        judge itself, which model graded: see :meth:`_judge_provenance`) and is the sole
-        thing the agent ever sees (the serve layer stamps provenance / finalization_id / source
-        and appends its own ``finalize_error`` flag). The judge's ``reasoning`` /
-        ``extracted_answer`` and any exception text are answer oracles: they go **only** in the
+        judge itself, which model graded: see :meth:`_judge_provenance`). It is what the serve
+        layer returns as the terminal result's JSON ``content`` (stamping provenance /
+        finalization_id / source and appending its own ``finalize_error``); the episode feedback
+        ``_verify`` builds rides separately in ``_meta["shogym/feedback"]`` and adds
+        ``confidence`` / ``calibration_error`` for an explicit submission. The judge's
+        ``reasoning`` / ``extracted_answer`` and any exception text are answer oracles: they go
+        **only** in the
         private ``diagnostic`` (durable store / server logs), never in the verdict. Only a
         model-graded episode names a judge: the exact-match fast path publishes none, since no
         model read that answer.

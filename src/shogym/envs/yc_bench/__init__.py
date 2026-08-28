@@ -5,7 +5,7 @@ nothing from ``yc_bench`` at module load, so ``import shogym`` (which registers 
 env) stays offline. yc-bench is imported lazily — only when the env is actually *constructed*
 (its in-process MCP server is probed) or served.
 
-The port reuses YC-Bench's deterministic sim engine, CLI entry point and command validation,
+The port reuses YC-Bench's seeded sim engine, CLI entry point and command validation,
 SQLite state/ORM, and ``_init_simulation`` world seeding verbatim (funnelled through
 :mod:`shogym.envs.yc_bench.adapter`). It replaces upstream's own LLM agent loop
 (``agent/loop.py``, driven by ``runner/main.py``) and supplies the command, terminal and

@@ -46,7 +46,12 @@ reads the verdict off the trace via `shogym.result_from_trace(...)`.
 **Config** (via `shogym.make(name, config)` / `env_config`): `task_split` (`"train"`/`"test"`),
 `max_steps` (default 100, matching upstream), `user_llm` / `user_llm_args` (non-solo user
 simulator — pass `user_llm_args={"mock_response": "…"}` for a deterministic **offline** user),
-and `evaluation_type` (default `"all"`; use `"env"` for an offline run of an NL-basis domain).
+and `evaluation_type` (default `"all"`; `"env"` makes *evaluation* keyless by scoring the DB
+component only). The two are complementary and a keyless non-solo episode needs **both**:
+`evaluation_type` only reaches `_evaluate()`, so the live `UserSimulator` is still constructed
+unless `mock_response` is set, and a scripted user alone leaves `evaluation_type="all"`, where
+an NL assertion still calls the judge (a missing key then fails closed to reward 0 with
+`eval_error`).
 
 ### Quickstart
 
@@ -91,8 +96,10 @@ default `dev` group, so `uv sync` includes it. On top of that:
 - **`OPENAI_API_KEY`** — required for the **default/live user simulator** on non-solo domains
   (it's an OpenAI LLM), and for evaluator paths that call a judge (NL assertions, mostly
   `retail`) or dense retrieval (`banking_knowledge` only; `retail` ships no retrieval code). It is
-  *not* needed to run a non-solo domain with a scripted offline user
-  (`user_llm_args={"mock_response": "…"}`), nor for the solo `mock` domain.
+  *not* needed for the solo `mock` domain, nor for a non-solo domain run with **both** a
+  scripted user (`user_llm_args={"mock_response": "…"}`) and `evaluation_type="env"`. Either
+  setting alone still reaches a model: the scripted user leaves NL assertions to the judge, and
+  `evaluation_type` does not stop the live user simulator from being built.
 
 ## How it works
 

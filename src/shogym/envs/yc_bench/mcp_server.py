@@ -5,7 +5,7 @@
 """In-process MCP server for the ``yc_bench`` env — yc-bench's command surface, wrapped.
 
 yc-bench ships its own LLM agent loop (``agent/loop.py``), but its sim is built to take an
-external driver: something has to issue CLI commands against the deterministic sim, feed the
+external driver: something has to issue CLI commands against the seeded sim, feed the
 JSON results back, and collect the next commands. shogym *is* that driver, in place of that
 loop. This server exposes the command surface as two MCP tools:
 
@@ -46,8 +46,8 @@ from shogym.envs.yc_bench import adapter
 RUN_COMMAND_TOOL_NAME = "run_command"
 SUBMIT_TOOL_NAME = "submit"
 
-# Default per-command wall-clock budget for a yc-bench CLI subprocess. The deterministic sim
-# commands are fast; this only guards against a pathological hang.
+# Default per-command wall-clock budget for a yc-bench CLI subprocess. The sim commands are
+# fast; this only guards against a pathological hang.
 DEFAULT_COMMAND_TIMEOUT_SECONDS = 60.0
 
 server: FastMCP = FastMCP(name="yc_bench")

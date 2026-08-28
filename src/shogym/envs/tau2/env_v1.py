@@ -387,8 +387,10 @@ class Tau2AirlineEnv(Tau2Env):
 @register("tau2_retail")
 class Tau2RetailEnv(Tau2Env):
     """tau2's ``retail`` domain (non-solo). reward_basis includes NL_ASSERTION, so the *full*
-    reward needs a judge LLM (keyed). The DB component is scored offline — pass
-    ``evaluation_type="env"`` for an offline served run."""
+    reward needs a judge LLM (keyed). ``evaluation_type="env"`` scores the DB component only and
+    makes *evaluation* keyless; a keyless episode also needs a scripted user
+    (``user_llm_args={"mock_response": "…"}``), since this domain otherwise builds a live
+    ``UserSimulator``."""
 
     domain = "retail"
     solo_mode = False

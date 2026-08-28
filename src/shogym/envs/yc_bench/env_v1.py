@@ -1,7 +1,7 @@
 """``yc_bench`` on the env-as-center core (RFC 008): a wrap of YC-Bench.
 
 YC-Bench puts an agent in charge of a simulated AI startup for one year. Starting with
-$200,000, the agent issues ``yc-bench`` CLI commands against a deterministic, SQLite-backed
+$200,000, the agent issues ``yc-bench`` CLI commands against a seeded, SQLite-backed
 discrete-event simulation — accepting tasks from a marketplace, assigning employees,
 advancing the clock with ``sim resume``, and managing cash flow — until bankruptcy (funds < 0)
 or the one-year horizon. The score is how the company ends up.

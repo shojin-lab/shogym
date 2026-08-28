@@ -114,9 +114,12 @@ observation stream and no other tool.
   the verdict is flagged `judge_error` — rather than crashing the episode. The **result
   returned to the agent is sanitized** by exclusion: the judge's reasoning, its extracted answer
   and any exception text are answer oracles and never reach the agent, living only in the
-  private, off-trace diagnostic. What the agent does see is the public-safe set — `correct` and
-  `judge_error`, plus `judge_model` (and `judge_effort` when `judge_kwargs` set a
-  `reasoning_effort`) on a model-judged episode, and core's `finalize_error`.
+  private, off-trace diagnostic. What does reach it arrives on **two channels**. The terminal
+  result's JSON `content` is the sanitized verdict: `correct`, `judge_error`, plus `judge_model`
+  (and `judge_effort` when `judge_kwargs` set a `reasoning_effort`) on a model-judged episode,
+  and core's `finalize_error`. The `_meta["shogym/feedback"]` sidecar separately carries the
+  episode feedback, which for an explicit submission adds `confidence` and `calibration_error`
+  (see [Scoring](#scoring)).
 - **`terminate()`** — the reserved abort tool every env serves (`terminal_kind: abort`). Since
   `submit_answer` already ends the episode, a harness does **not** call `terminate` after
   submitting (it would be tombstoned); `terminate` before submitting ends the episode with no

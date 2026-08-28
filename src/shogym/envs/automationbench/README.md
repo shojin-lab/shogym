@@ -52,10 +52,12 @@ the default, expanding to the six public domains = the 600 distributed tasks), `
 explicit list of raw upstream task rows — bypasses the domain loaders, used by the offline
 tests), and `max_steps` (the *advertised* tool-call budget, default 50 — upstream's
 `--max-steps` default and the "~50 tool-using turns" the task prompts quote). It is not an
-enforced cap on ordinary calls: the shogym horizon is `max_steps + 2`, `Episode.call` dispatches
-the ordinary call that reaches the horizon before sealing it as the terminal step, and a score
-terminal is handled before the horizon is consulted at all. So `max_steps + 2` ordinary calls
-can execute, and `done` is never preempted.
+enforced cap on ordinary calls: the shogym horizon is `max_steps + 2` and `Episode.call`
+dispatches the ordinary call that reaches the horizon before sealing it as the terminal step, so
+`max_steps + 2` ordinary calls can execute. A `done` issued while the episode is still open is
+handled before the horizon is consulted and so is never preempted; the `+2` reserve is what
+keeps it reachable after the advertised budget, since a `done` sent after the horizon has sealed
+is tombstoned.
 
 ### Quickstart
 

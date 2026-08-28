@@ -90,7 +90,9 @@ class FrontierBenchEnv(Env):
         omits the task selector (default ``"fin-saccr-rwa"``, index 0).
       - ``max_steps``: the *advertised* tool-call budget per episode. The shogym horizon is
         ``max_steps + 2`` and the ordinary call that reaches it is dispatched before it seals, so
-        ``max_steps + 2`` ordinary calls can execute; ``done`` is never preempted by the horizon.
+        ``max_steps + 2`` ordinary calls can execute. A ``done`` issued while the episode is open
+        is never preempted; the ``+2`` reserve is what keeps it reachable after the budget, since
+        a ``done`` after the horizon seals is tombstoned.
       - ``command_timeout_seconds``: per-``exec`` wall-clock budget inside the container.
       - ``keep_container``: leave the container + images up after the episode (debugging).
     """

@@ -1,7 +1,11 @@
 """Lazy data provisioning for the ``browsecomp_plus`` env (issue #43).
 
-The three Hugging Face repos are **public and ungated** at the pinned revisions (unlike the HLE
-port's ``cais/hle``); what they need is network access, not accepted terms or a token.
+Every Hugging Face repo this module touches is **public and ungated** (unlike the HLE port's
+``cais/hle``); what they need is network access, not accepted terms or a token. Two of them are
+pinned to an immutable revision — the queries (:data:`HF_QUERIES_REVISION`) and the prebuilt BM25
+index (:data:`INDEX_REVISION`). :data:`HF_CORPUS_DATASET` carries no revision and is never
+auto-downloaded; the qrels are pinned to a GitHub commit (:data:`UPSTREAM_COMMIT`), not an HF
+revision.
 
 Three pieces, all kept out of ``import shogym`` (imported only when the *registered* env is
 constructed, never at module import — so registering the env stays offline):

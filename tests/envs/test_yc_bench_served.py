@@ -198,9 +198,10 @@ async def test_run_command_rejects_agent_loop_and_interactive() -> None:
 
 
 async def test_seed_is_deterministic_across_episodes() -> None:
-    """Fidelity/reproducibility: the same task (seed) + the same commands yield the same final
-    funds — the deterministic sim is preserved by the wrap. Read off the sealed `submit`
-    verdict."""
+    """Fidelity/reproducibility, scoped: the same task (seed) + the same commands yield the same
+    final *funds*. That outcome is what the wrap preserves — not the trajectory, since row ids are
+    fresh ``uuid4``s that the agent sees and that break ties between simultaneous events. Read off
+    the sealed `submit` verdict."""
     funds = []
     for _ in range(2):
         episode = await ServedEpisode.start("yc_bench", task=3)

@@ -71,7 +71,8 @@ bail-out.) shogym reads the verdict off the trace via `shogym.result_from_trace(
 index, used when a serve/describe call omits the selector; default `"fin-saccr-rwa"` / index 0),
 `max_steps` (the *advertised* tool-call budget, default 400; the shogym horizon is
 `max_steps + 2` and the call that reaches it still runs, so `max_steps + 2` ordinary calls can
-execute and `done` is never preempted),
+execute. A `done` issued while the episode is open is never preempted, and the `+2` reserve is
+what keeps it reachable after the budget — a `done` after the horizon seals is tombstoned),
 `command_timeout_seconds`
 (per-`exec` budget), and `keep_container` (leave the container + images up after the episode, for
 debugging).
@@ -329,10 +330,13 @@ follow-up issues:
   cross from the agent container into it (at their original paths). Artifacts the agent never
   produced simply don't land, so the pytest check fails naturally → reward 0. This is Harbor's
   anti-reward-hacking design, replicated.
-- **amd64 builds.** Builds pass `--platform linux/amd64` so every host builds the architecture
-  the tasks were authored and validated on. The vendored bases are multi-arch (the one
-  digest-pinned base is an OCI image index covering amd64, arm64 and more), so an arm64 host
-  emulates rather than silently building a different architecture.
+- **amd64 builds, and what that needs.** Builds pass `--platform linux/amd64` so every host
+  builds the architecture the tasks were authored and validated on. That selects an architecture;
+  it does not supply one. An amd64 host runs it natively, and an arm64 host needs amd64
+  emulation configured (binfmt/QEMU, which Docker Desktop ships and a bare arm64 daemon may not);
+  without it a Dockerfile `RUN` step fails with an exec-format error. The vendored bases are
+  multi-arch (the one digest-pinned base is an OCI image index covering amd64, arm64 and more),
+  so the flag is what keeps a build from silently producing a different architecture.
 - **One container per episode.** Each episode gets its own container (content-addressed image tag
   → cached build); sessions never share filesystem state and are torn down on `end_session`.
 

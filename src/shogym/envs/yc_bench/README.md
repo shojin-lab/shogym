@@ -1,9 +1,9 @@
 # `yc_bench` — YC-Bench, CEO of a simulated AI startup
 
-[**YC-Bench**](https://github.com/collinear-ai/yc-bench) (Collinear AI's long-horizon
-deterministic benchmark) served through shogym at upstream commit `e7d6067`. YC-Bench puts an
+[**YC-Bench**](https://github.com/collinear-ai/yc-bench) (Collinear AI's long-horizon,
+seeded benchmark) served through shogym at upstream commit `e7d6067`. YC-Bench puts an
 agent in charge of a simulated AI startup for one year: starting with **$200,000**, it issues
-`yc-bench` CLI commands against a deterministic, SQLite-backed discrete-event simulation —
+`yc-bench` CLI commands against a seeded, SQLite-backed discrete-event simulation —
 accepting tasks from a marketplace, assigning employees, advancing the clock, and managing cash
 flow — until **bankruptcy** (funds < 0) or the **one-year horizon**. The score is how the
 company ends up.
@@ -253,7 +253,7 @@ semantics (give each run its own trace file for a guaranteed 1:1 mapping).
 - **Offline vs keyed tests.** Follows the shared
   [offline-vs-keyed split](../README.md#tests-offline-vs-keyed): the pure-`verify` unit tests run
   in the core suite with no extra; the served + determinism tests need the `yc_bench` extra but
-  no API key (the sim is deterministic and in-process), and are `importorskip`-gated so the core
+  no API key (the sim runs in-process), and are `importorskip`-gated so the core
   3.12 suite stays green without it.
 
 ## Layout
