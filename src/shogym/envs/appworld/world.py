@@ -20,12 +20,14 @@ wrong. Everything else in the derived copy is a link.
 
 from __future__ import annotations
 
+import hashlib
+import json
 import os
 import secrets
 import shutil
 from contextlib import contextmanager
 from pathlib import Path
-from typing import Any, Callable, Dict, Iterator, NamedTuple, Optional, Tuple
+from typing import Any, Callable, Dict, Iterator, List, NamedTuple, Optional, Tuple
 
 from shogym.envs._upstream import _locked
 from shogym.envs.appworld.ledger import ROLES, SECTIONS, Backlog, Request
@@ -241,19 +243,39 @@ def derive_task(
         # of here, so a served worker able to write to it could change what a later episode, or
         # the other arm of its own pair, starts from. See `derive_view` for the invariant.
         _seal(building)
-        _publish(building, target)
+        # After the seal, because the modes are part of what a warm episode checks; and the last
+        # thing written into the staging tree, so it reaches the task's real name in the same
+        # rename that publishes the tree. See `_write_manifest`.
+        _write_manifest(building)
+        # `replacing`, because what got past the check above is either nothing at all or a task
+        # that is on disk and is not the task it claims to be. A publish that dropped its build
+        # on finding the name taken would leave the broken tree exactly where it was and rebuild
+        # it again on the next episode, forever.
+        _publish(building, target, replacing=True)
         _grading_view(target, graded / "tasks" / task_id, source / "ground_truth")
     return target
 
 
 def already_derived(*, derived: Path, graded: Path, task_id: str) -> bool:
-    """Whether both views of a task are already on disk and complete.
+    """Whether both views of a task are on disk, whole, and still the bytes that were derived.
 
     Both, not either: the world an agent drives and the grader's view of it are built together and
-    a run that found only the first would serve an episode nothing could grade."""
-    return (derived / "tasks" / task_id / "dbs" / "todoist.jsonl").exists() and (
-        graded / "tasks" / task_id / "ground_truth"
-    ).exists()
+    a run that found only the first would serve an episode nothing could grade.
+
+    **Two path existences were not a task.** This asked whether the served ``dbs/todoist.jsonl``
+    and the graded ``ground_truth`` were there, and answered yes for a tree with everything else
+    missing, for one whose databases had been changed after derivation, and for one whose seal had
+    come off. Every one of those is reused rather than rebuilt, and what is reused is the world an
+    episode starts in and the baseline it is graded against. So the question is now asked of a
+    manifest written when the task was derived: every path, its mode, its size and its digest (see
+    :func:`_write_manifest`).
+
+    It costs about two milliseconds for the pair, which is a task's 28 KB and a grading view's
+    52 KB across some thirty files, once per episode against a construction of about four
+    seconds."""
+    return _manifest_holds(derived / "tasks" / task_id) and _manifest_holds(
+        graded / "tasks" / task_id
+    )
 
 
 def _grading_view(target: Path, view: Path, answers: Path) -> None:
@@ -266,7 +288,9 @@ def _grading_view(target: Path, view: Path, answers: Path) -> None:
     building = _staging(view.parent, view.name)
     (building / "dbs").mkdir(parents=True)
     for entry in sorted(target.iterdir()):
-        if entry.name != "dbs":
+        # The served task's manifest is not this tree's: this one holds the answers as well, so
+        # it is a different set of files and gets a record of its own below.
+        if entry.name not in ("dbs", _MANIFEST):
             _materialise(entry, building / entry.name)
     for entry in sorted((target / "dbs").iterdir()):
         _materialise(entry, building / "dbs" / entry.name)
@@ -274,7 +298,8 @@ def _grading_view(target: Path, view: Path, answers: Path) -> None:
     # Sealed for the same reason the served copy is: this is the baseline the evaluator diffs
     # against, and a baseline that anything can edit is not one.
     _seal(building)
-    _publish(building, view)
+    _write_manifest(building)
+    _publish(building, view, replacing=True)
 
 
 def derive_view(*, derived: Path, view: Path, task_id: str) -> Path:
@@ -572,6 +597,109 @@ def _complete(target: Path) -> bool:
 def _mark_complete(target: Path) -> None:
     if target.is_dir():
         (target / _COMPLETE).write_text("")
+
+
+#: Written into a derived task once every file of it is there, and read before that task is
+#: reused. A task without one is a task some process was interrupted in the middle of, so this is
+#: the completion marker for a derived task as well as its contents.
+_MANIFEST = ".shogym-manifest"
+
+
+def _write_manifest(target: Path) -> None:
+    """Record every node of a derived task: its path, its kind, its mode, its size and its bytes.
+
+    **Written last, inside the staging directory, which is what makes it atomic.** A manifest is
+    only a completion marker if it cannot appear before the thing it completes, and this one
+    appears under the task's real name in the same ``rename`` that publishes the tree. There is no
+    ordering in which a reader sees a manifest over a half-built task.
+
+    Modes are in it because the seal is one of the properties being reused: a node whose write bit
+    came back is a shared task an episode could edit, and every episode of that task and the other
+    arm of its pair start from what it holds. Sizes are in it beside the digests because a size
+    mismatch is a rebuild decided without reading the file, and because a digest that is only ever
+    compared to itself is one nobody would notice going missing.
+
+    The manifest does not describe itself. Its own bytes are what is being trusted, so signing
+    them with a digest they contain would prove nothing; what it rests on is the publish, which
+    gives the whole tree one name at one instant. Its mode is still checked, because a manifest
+    anything can rewrite is a claim about a tree rather than a record of one.
+
+    Called after :func:`_seal` and on a staging tree, so the directory is opened for one write and
+    closed again. Nothing else knows that name yet."""
+    entries: List[List[Any]] = []
+    for path in sorted(_nodes(target)):
+        relative = str(path.relative_to(target))
+        mode = path.lstat().st_mode & 0o7777
+        if path.is_symlink():
+            entries.append([relative, "l", mode, 0, os.readlink(path)])
+        elif path.is_dir():
+            entries.append([relative, "d", mode, 0, ""])
+        else:
+            data = path.read_bytes()
+            entries.append([relative, "f", mode, len(data), hashlib.sha256(data).hexdigest()])
+    manifest = target / _MANIFEST
+    _chmod(target, 0o755)
+    # Whatever was there is not this tree's record. A staging directory built by copying another
+    # sealed tree can arrive holding that tree's manifest, read-only.
+    manifest.unlink(missing_ok=True)
+    manifest.write_text(json.dumps(entries, sort_keys=True))
+    _chmod(manifest, 0o444)
+    _chmod(target, 0o555)
+
+
+def _manifest_holds(target: Path) -> bool:
+    """Whether ``target`` is exactly the tree its manifest says was derived there.
+
+    Every entry, and nothing besides: a file that is gone, a file whose bytes changed, a node whose
+    write bit came back and a path nobody derived are all answered the same way, by saying this is
+    not a derived task and letting the caller build one. The manifest itself is the one path
+    excluded from the comparison, for the reason :func:`_write_manifest` gives.
+
+    Anything unreadable is a no rather than an error, and so is a manifest whose shape this code
+    does not recognise. This is asked on the ordinary warm path, before any lock, and the honest
+    answer to "I could not tell" is the one that rebuilds; a manifest written by a version of this
+    that recorded something else is a tree to build again rather than a crash at construction."""
+    try:
+        entries = json.loads((target / _MANIFEST).read_text())
+        if _writable(target / _MANIFEST):
+            return False
+        if {str(path.relative_to(target)) for path in _nodes(target)} != {
+            str(entry[0]) for entry in entries
+        }:
+            return False
+        for relative, kind, mode, size, content in entries:
+            path = target / relative
+            stamp = path.lstat()
+            if stamp.st_mode & 0o7777 != mode:
+                return False
+            if kind == "l":
+                if not path.is_symlink() or os.readlink(path) != content:
+                    return False
+            elif kind == "d":
+                if path.is_symlink() or not path.is_dir():
+                    return False
+            else:
+                if path.is_symlink() or not path.is_file() or stamp.st_size != size:
+                    return False
+                if hashlib.sha256(path.read_bytes()).hexdigest() != content:
+                    return False
+    except (LookupError, OSError, TypeError, ValueError):
+        return False
+    return True
+
+
+def _nodes(target: Path) -> "Iterator[Path]":
+    """Every path under ``target`` but the manifest, directories included, links never followed."""
+    for directory, children, names in os.walk(target, followlinks=False):
+        here = Path(directory)
+        linked = [child for child in children if (here / child).is_symlink()]
+        children[:] = sorted(child for child in children if child not in linked)
+        for child in children:
+            yield here / child
+        for name in sorted([*names, *linked]):
+            if here == target and name == _MANIFEST:
+                continue
+            yield here / name
 
 
 def _materialise(source: Path, target: Path) -> None:

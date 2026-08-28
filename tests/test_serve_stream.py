@@ -468,9 +468,17 @@ async def test_an_env_that_raises_while_ending_a_task_is_redacted_and_stops_the_
 
     # A task was still dispensed, so exactly one row is owed and lands — unscored, with the
     # feedback that never serialized absent from it, which is what makes the loss legible.
+    #
+    # Unscored *structurally*, which is the part that used to be missing. The failure is kept on
+    # the entry the way the stream-driven one is, so the classifier files this as the
+    # infrastructure failure it is rather than as the closure the agent had earned. It used to
+    # land `sealed`, with no diagnostic and a `Score` object beside it, saying the outcome was
+    # earned in the durable record while the stream stopped loudly beside it.
     (row,) = _rows(tmp_path / "right")
     assert row["observed"] == [], "feedback that never serialized cannot be on the row"
-    assert row["score"] == {"reward": None, "success": None, "feedback": []}
+    assert row["closure"] == "finalize_error"
+    assert row["score"] is None, "a task whose env raised on the way out earned no outcome"
+    assert "raised after the agent ended the task" in (row["diagnostic"] or "")
     assert right.stopped, "a run that lost an outcome reported itself complete"
     with pytest.raises(RuntimeError, match="raised while ending a task.*must be finite") as end:
         await right.aclose()

@@ -5,9 +5,15 @@
   of which choice an item involves. The verdicts are the only place reference information appears,
   and they are per item rather than per axis, so a reader has to work out which conventions
   account for the pattern rather than read the answer off a label.
-- **The digest** is a deterministic function of the task identity and the agent's own submission.
-  Both are already in the agent's own transcript, so it carries no information about the drawn
-  key by construction, and no inspection of its wording is needed to establish that.
+- **The digest** is computed here, on the server, as a deterministic function of two things: the
+  identity of the task this episode was served, and the agent's own submission. The identity is
+  the env's own material for the task the agent is working, and it is the same value in both arms
+  of a pair, so nothing about the drawn key can reach the wire through it. The claim is
+  independent of what the serve layer showed the agent: a `DispensedTask` deliberately carries
+  nothing that identifies the task, and this does not need it to, because the identity is an input
+  the env already holds rather than something read back out of the agent's transcript. What the
+  claim does **not** say is that the identifier is secret. It is printed in the header of all
+  three classes, which is a constant of the episode and not a function of the key.
 - **The drawn receipt** looks exactly like the receipt and states verdicts that were sampled
   rather than computed. Its number of passing requests comes from the roster's own distribution
   of passing counts, so it is not separable from a real receipt by that number either, and the
@@ -131,11 +137,21 @@ def _marks(*, task_id: str, verdicts: Verdicts, cell: str, pulse: int) -> Tuple[
 
 
 def _digest(task_id: str, item: Item) -> str:
-    """Four hex characters over the task identity, the item and what the agent put there.
+    """Four hex characters over the served task's identity, the item and what the agent put there.
 
     Deterministic rather than random: a random column is a channel nobody controls and nobody can
-    audit, and the point of this payload is that its content is recomputable from things the
-    agent already holds."""
+    audit, and what makes this payload a placebo is that every input to it is fixed before the key
+    is drawn or is written by the agent itself.
+
+    **Both inputs are the env's, and neither varies with the arm.** ``task_id`` is the identity of
+    the task this episode was served, which the env chose and holds; ``item`` is the check and the
+    value the agent left in the world. Two arms of one task are the same task, so the identity is
+    byte-identical across them and cannot tell one from the other. The key is not a parameter of
+    this function, which is the form of that claim that cannot quietly stop being true.
+
+    Nothing here rests on the agent having *seen* the identity. The serve layer redacts it, and it
+    does not have to publish it for this to be a control: the material is the env's own, and the
+    agent is working that task whether or not it can name it."""
     material = (task_id + item.check_id + item.observed).encode()
     return hashlib.sha256(material).hexdigest()[:4]
 

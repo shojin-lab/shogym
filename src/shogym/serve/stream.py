@@ -518,10 +518,11 @@ Closure = Literal[
 _SCORED_CLOSURES = frozenset({"sealed", "aborted", "drained"})
 
 # Where a task's `terminal_error` came from: a terminal the *stream* drove and the env failed on,
-# or a call the *agent* made that never reached a result and was promoted because the stream then
-# had to end the task itself (see `_Live.call_error`). Both leave the same unscored row and say
-# different things about the run — only the first is a reason to stop serving the queue.
-_TerminalErrorSource = Literal["terminal", "promoted_call"]
+# a terminal the *agent* drove and the env then raised on its way out of, or a call the agent made
+# that never reached a result and was promoted because the stream then had to end the task itself
+# (see `_Live.call_error`). All three leave the same unscored row and say different things about
+# the run to whoever has to act on it.
+_TerminalErrorSource = Literal["terminal", "agent_terminal", "promoted_call"]
 
 
 class _MalformedSummary(ValueError):
@@ -905,6 +906,42 @@ def _identity_disagreement(
     return None
 
 
+def _wire_int(record: Mapping[str, Any], key: str, *, source: str) -> int:
+    """One stored whole number, exactly as the writer emitted it.
+
+    **Read and never coerced, for the reason the identity members are not.** ``int()`` around a
+    persisted queue field turns a value this module never wrote into one that looks like a queue
+    position, a task index or a ``seq``: the string ``"0"`` becomes position 0 and is then trusted
+    as a task this run already played, and ``1.0`` becomes a ``seq`` the next row numbers past. A
+    record holding something else is a record this module did not write, and the honest answer to
+    it is a refusal rather than a reading. ``bool`` is refused with everything else, because
+    ``True`` is an ``int`` in Python and would pass as position 1.
+
+    The scope is corruption, a mixed writer, or a hand-edited recovery rather than anything an
+    agent can reach: the provenance directory is the harness's own. That is what makes failing
+    closed cheap here, not what makes it unnecessary."""
+    value = record.get(key)
+    if isinstance(value, bool) or not isinstance(value, int):
+        raise ValueError(
+            f"{source} stores {key}={value!r}, which is not the whole number this module writes "
+            f"there; a provenance record that is not the shape it was written in cannot be "
+            "replayed, because every position, lease and seq a resume trusts comes out of it"
+        )
+    return value
+
+
+def _wire_str(record: Mapping[str, Any], key: str, *, source: str) -> str:
+    """One stored text field, exactly as the writer emitted it (see :func:`_wire_int`)."""
+    value = record.get(key)
+    if not isinstance(value, str):
+        raise ValueError(
+            f"{source} stores {key}={value!r}, which is not the text this module writes there; a "
+            "provenance record that is not the shape it was written in cannot be replayed, "
+            "because every position, lease and seq a resume trusts comes out of it"
+        )
+    return value
+
+
 def _recorded_identity(record: Mapping[str, Any]) -> RunIdentity:
     """The run identity a stored dispense record or result row was written under, in wire form.
 
@@ -945,7 +982,16 @@ class DispensedTask:
     """What the agent receives: enough to act, and nothing that identifies the task.
 
     Redaction is structural — there is no field the task index, the target, or the queue
-    position could be written into."""
+    position could be written into.
+
+    **What this withholds is the queue's identification of the task, and only that.** The index,
+    the position and the target are the *stream's* facts about where a task sits in a run, and
+    knowing them would let an agent read its own progress and its neighbours' off its own
+    envelope. An env's own material is a different thing and is not redacted here: instructions
+    are published verbatim above, and an env is free to name the task it is serving inside them
+    or inside a value it publishes, because that name is what the agent is working on rather than
+    a fact about the run. An env that composes a terminal payload out of the task's identity and
+    the agent's own submission is therefore consistent with this class, not in tension with it."""
 
     env: str
     # The env's own prose, exactly as the env published it. The stream never edits it — see
@@ -1116,13 +1162,21 @@ class ResultRow:
 
     @classmethod
     def from_wire(cls, row: Dict[str, Any]) -> "ResultRow":
+        """Read one stored row back.
+
+        **Raises rather than coerces.** The queue fields a resume trusts — the position it skips,
+        the lease it may never mint again, the ``seq`` it numbers past — are read at exactly the
+        types this module writes them at (see :func:`_wire_int`), so a record that is not the
+        shape it was written in fails closed here instead of arriving downstream as a plausible
+        position or a plausible lease."""
         score = row.get("score")
+        where = "a result row"
         return cls(
-            seq=int(row["seq"]),
-            lease=str(row["lease"]),
-            position=int(row["position"]),
-            env=str(row["env"]),
-            task_idx=int(row["task_idx"]),
+            seq=_wire_int(row, "seq", source=where),
+            lease=_wire_str(row, "lease", source=where),
+            position=_wire_int(row, "position", source=where),
+            env=_wire_str(row, "env", source=where),
+            task_idx=_wire_int(row, "task_idx", source=where),
             closure=row["closure"],
             score=(
                 Score(
@@ -3294,14 +3348,18 @@ class TaskStream:
         for record in read_dispenses(self.prov_dir):
             stored = _recorded_identity(record)
             self._blank_dispenses += not stored
+            where = f"{self.dispenses_path}: a dispense record"
             self._require_position_matches(
-                int(record["position"]),
-                TaskRef(str(record["env"]), int(record["task_idx"])),
+                _wire_int(record, "position", source=where),
+                TaskRef(
+                    _wire_str(record, "env", source=where),
+                    _wire_int(record, "task_idx", source=where),
+                ),
                 source="a dispense record",
             )
             self._require_regime_matches(_recorded_regime(record), source="a dispense record")
             self._require_identity_matches(stored, source="a dispense record")
-            lease = str(record["lease"])
+            lease = _wire_str(record, "lease", source=where)
             if lease in self._issued:
                 # Already ambiguous on disk, before this run adds anything: the pairing
                 # `reconcile` does cannot answer two dispenses with one result, so whichever of
@@ -3314,7 +3372,7 @@ class TaskStream:
                     "invisible to reconciliation"
                 )
             self._issued.add(lease)
-            self._seq = max(self._seq, int(record["seq"]))
+            self._seq = max(self._seq, _wire_int(record, "seq", source=where))
         for row in read_results(self.prov_dir):
             self._blank_results += not row.run_identity
             self._require_position_matches(
@@ -3326,7 +3384,7 @@ class TaskStream:
             # resume inherits. The first recorded row of an env that describes itself fixes what
             # this directory holds for that env, and every row this run goes on to write for it is
             # held to the same one (see :meth:`_require_env_agrees`).
-            self._require_env_agrees(row.env, row.observed)
+            self._require_env_agrees(row.env, row.observed, scored=False)
             # A row's lease is the dispense's, so this adds nothing to a record whose two files
             # agree — and it is what keeps the guarantee if they ever do not.
             self._issued.add(row.lease)
@@ -3566,6 +3624,14 @@ class TaskStream:
         release is a write like any other: the claim it removes has to be the claim it read, or a
         takeover arriving between them is undone by a stream that no longer owns anything.
 
+        **A takeover that never published its replacement still has to put the incumbent back.**
+        This used to return at the first line whenever ``_claimed`` was false, which is exactly
+        the state a failed publication leaves: the incumbent's claim had already been unlinked,
+        the replacement raised on the way to disk, and the constructor's cleanup then walked away
+        from a directory owned by nobody. The incumbent went on serving until its next owned
+        append, and stopped there permanently. What decides whether a restore is owed is whether
+        this call took something away, not whether it managed to own anything.
+
         ``restoring`` is for the one caller that is undoing a takeover rather than ending a run:
         a constructor that took a directory over and then refused. Everything that can reject a
         queue, a record or an env runs after the claim is taken, and a call that refuses may not
@@ -3578,16 +3644,25 @@ class TaskStream:
         :meth:`_release_stream`). A claim that cannot be removed leaves a directory that
         ``resume=True`` reopens, which is a worse morning than a clean one and a much better one
         than a lost error."""
-        if not self._claimed:
-            return
-        self._claimed = False
         displaced, self._displaced = self._displaced, None
+        mine, self._claimed = self._claimed, False
+        if not mine and displaced is None:
+            return
         try:
             with _locked(self.prov_dir):
-                if not self._holds_claim(self._read_claim() or {}):
-                    return
-                self.claim_path.unlink()
-                if restoring and displaced is not None:
+                if mine:
+                    if not self._holds_claim(self._read_claim() or {}):
+                        return
+                    self.claim_path.unlink()
+                # A takeover that displaced a claim and never managed to publish its own leaves
+                # the directory owned by nobody, and the stream it displaced is still serving
+                # into it: the next append that stream makes finds a foreign claim, or none, and
+                # stops it for good. So the restore does not depend on this constructor having
+                # got as far as owning anything — it depends only on having taken something away.
+                # Guarded on the file, because the gap is a gap: whoever claimed the directory in
+                # the meantime owns it, and putting the incumbent back over them would dispossess
+                # the one party that is entitled to be there.
+                if restoring and displaced is not None and not self.claim_path.exists():
                     self._write_claim(displaced)
         except (OSError, ValueError):
             # `ValueError` for the restore alone: what goes back is a claim this run read off the
@@ -3687,7 +3762,9 @@ class TaskStream:
             "provenance directory"
         )
 
-    def _require_env_agrees(self, env: str, observed: Sequence[Dict[str, Any]]) -> None:
+    def _require_env_agrees(
+        self, env: str, observed: Sequence[Dict[str, Any]], *, scored: bool
+    ) -> None:
         """A row's env must say the same thing about itself that this record already holds, and
         the same thing the identity this run is filed under says it said.
 
@@ -3720,10 +3797,25 @@ class TaskStream:
         for a caller that named nothing too, because it compares what the env said with what the
         env said before, and neither of those is an assertion anybody made.
 
-        A row whose env declares nothing, or that publishes no digest, binds nothing and is
-        refused by nothing: an env that does not describe itself is the state every env was in
-        before this existed, and a reconciled crash row cannot carry a digest no env ever produced
-        for it.
+        **Silence is not agreement, on a row that is about to be scored.** The catalog digest is
+        read off the env this stream was built with and stamped into the identity every row is
+        filed under, and this used to return the moment an episode published nothing: a factory
+        that handed back a *different* env, one that declared the item and never published it, got
+        a sealed row with a real score filed under a digest its own episode had never said. That
+        is precisely the drift the assertion exists to detect, passing silently. So an episode
+        that publishes nothing where the catalog asserted something is a mismatch, and the row is
+        refused before it can be scored.
+
+        ``scored`` is what makes that requirement land only where it belongs, and it is the
+        closure rather than a guess about the env. An unearned closure already has its own finding
+        to report and the env published no verdict behind it, so demanding an identity item there
+        would replace a precise diagnostic (the transaction failed closed, the deadline elapsed)
+        with a vaguer one about a digest, for a row nobody can aggregate either way. A replayed
+        row is not required to attest at all: a record may have been written before this was
+        asked, and a reconciled crash row cannot carry a digest no env ever produced for it.
+
+        A row whose env declares nothing binds nothing and is refused by nothing, which is the
+        state every env was in before this existed.
 
         **Finding the item is contained; disagreeing about it is not.** A published name is an
         object the env supplied, so the comparison that finds this one runs the env's own
@@ -3743,8 +3835,19 @@ class TaskStream:
             # observed here was raised where it was observed (see :func:`_must_propagate`).
             if _must_propagate(exc, None):
                 raise
-            return
+            said = ""
+        asserted = self._run_identity.get("envs", {}).get(env, "")
         if not said:
+            if scored and asserted:
+                # The whole point of the assertion, in the case it exists to catch. See the
+                # docstring: silence is not agreement.
+                raise ValueError(
+                    f"{self.prov_dir} is being served under a run identity that has env {env!r} "
+                    f"at {asserted!r}, which was read off the env this stream was built with, but "
+                    f"the episode that produced this row published no {declared!r} to say so; a "
+                    "row scored under a configuration its own episode never attested is the "
+                    "factory drift this check exists to find"
+                )
             return
         bound = self._env_identity.get(env, "")
         if bound and said != bound:
@@ -3754,7 +3857,6 @@ class TaskStream:
                 "record are read together, so a record holding both has a mean that is about "
                 "neither of them. Serve the second configuration into a fresh provenance directory"
             )
-        asserted = self._run_identity.get("envs", {}).get(env, "")
         if asserted and said != asserted:
             raise ValueError(
                 f"{self.prov_dir} is being served under a run identity that has env {env!r} at "
@@ -4916,6 +5018,14 @@ class TaskStream:
             # and letting that escape here would take the stop, the seal and the redacted answer
             # with it — see :func:`_rendered_failure`.
             rendered = _rendered_failure(exc)
+            # Kept on the entry *before* the seal, so the row this failure produces says what
+            # happened rather than what the agent's terminal was about to say. Without it the
+            # classifier saw no terminal error at all and filed the task under the closure the
+            # agent had earned — `sealed` or `aborted`, with a `Score` object beside it — for a
+            # task whose env raised on its way out and published no verdict anybody can stand
+            # behind. The stream stopped loudly and the durable row still said the outcome was
+            # earned, which is the one thing this module's closures exist to keep apart.
+            live.failed_to_end(exc, "agent_terminal")
             self._stop(
                 exc,
                 dispensing=(
@@ -6039,8 +6149,12 @@ class TaskStream:
         # silently keeps one of them — losing the evidence and, for a summary name, deciding the
         # headline by list order (see `_pick_summary`).
         observed = [dict(item) for item in episode.terminal_feedback]
-        self._require_env_agrees(live.ref.env, observed)
         closure, diagnostic = self._classify(live, forced)
+        # After the closure and not before it, because whether an env had to describe itself
+        # depends on whether this row is about to carry a score. An unearned closure has its own
+        # finding to report and the env published no verdict behind it; a scored one is the row
+        # the assertion is for (see `_require_env_agrees`).
+        self._require_env_agrees(live.ref.env, observed, scored=closure in _SCORED_CLOSURES)
         # The summary is read as a unit and strictly (see `_pick_summary`): a wrong-typed
         # `success`/`reward` leaves the row unscored rather than coerced or quietly emptied.
         # `closure` is untouched — how the task *ended* is a different question from whether
@@ -6372,6 +6486,17 @@ class TaskStream:
                     f"env {live.ref.env!r} failed on a call the agent made "
                     f"({_rendered_failure(exc)}) and the stream then ended the task; the agent "
                     "never played it out",
+                )
+            if live.terminal_error_source == "agent_terminal":
+                # The agent ended the task and the env raised on its way out, so the terminal is
+                # committed and the verdict behind it is not. Said separately from the
+                # stream-driven case below because the two are different findings for whoever
+                # has to act on them: one is an env that could not finish what the agent asked
+                # for, the other an env that could not finish what the harness asked for.
+                return (
+                    "finalize_error",
+                    f"env {live.ref.env!r} raised after the agent ended the task "
+                    f"({_rendered_failure(exc)}); it published no verdict behind that ending",
                 )
             return (
                 "finalize_error",

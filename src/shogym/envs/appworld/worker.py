@@ -54,7 +54,7 @@ inside it.
 
 Usage::
 
-    python worker.py serve            # {"root": ..., "token": ...} on stdin
+    python worker.py serve            # {"root": ..., "token": ..., "keepalive": ...} on stdin
     python worker.py grade            # {"root", "task_id", "experiment", "filing"} on stdin
     python worker.py install
     python worker.py unpack --bundle <bundle> --into <directory>
@@ -68,7 +68,9 @@ import json
 import os
 import random
 import shutil
+import signal
 import sys
+import threading
 from http.server import BaseHTTPRequestHandler, HTTPServer
 from typing import Any, Dict, List, Optional
 
@@ -515,7 +517,70 @@ def _handshake() -> Dict[str, Any]:
     return json.loads(line)
 
 
-def serve(root: str, token: str) -> int:
+def watch_parent(descriptor: Optional[int]) -> None:
+    """Stop this process, and everything it started, when the host that owns it goes away.
+
+    **The loop below is ended from outside, and a host that died abruptly can no longer end it.**
+    This process is started in a session of its own so that stopping the episode stops everything
+    the episode spawned, which also means nothing reaps it when its parent dies: it is handed to
+    init and goes on serving a world nobody is coming back for, holding a port and a scratch
+    directory, while a resumed harness starts a second one. Neither the token nor the port nor the
+    group number survives the parent, so there is nothing left that names it.
+
+    So the parent holds one end of a pipe and this process holds the other. A read on it never
+    returns anything, because nothing is ever written; what it returns is end-of-file, at the
+    instant the last copy of the writing end is closed, which is the instant the parent exits
+    however it exits. That is a fact from the kernel rather than a message from a process, which
+    is the same standard everything else in this protocol is held to.
+
+    The whole group is signalled and not just this process, for the reason the host signals a
+    group: agent code runs here and is free to spawn, and a worker that exited politely on its own
+    while leaving descendants behind would be the same orphan under a different name. Only when
+    this process really leads that group, because a platform without ``setsid`` would otherwise
+    have this signalling the host's own group.
+
+    ``PR_SET_PDEATHSIG`` is asked for as well, and is not what this rests on: it is Linux only, and
+    it fires on the death of the parent *thread* rather than the parent process. The pipe is what
+    works on both platforms this port runs on, and the two together cover the window between the
+    fork and this call.
+
+    A daemon thread, because the read blocks forever in the ordinary case and the process must be
+    free to exit around it."""
+    _pdeathsig()
+    if descriptor is None:
+        return
+
+    def _wait() -> None:
+        try:
+            while os.read(descriptor, 1):
+                pass
+        except OSError:
+            pass
+        if os.getpgrp() == os.getpid():
+            os.killpg(os.getpgrp(), signal.SIGKILL)
+        os._exit(1)
+
+    threading.Thread(target=_wait, daemon=True).start()
+
+
+def _pdeathsig() -> None:
+    """Ask Linux to kill this process when its parent thread exits, and shrug where it cannot.
+
+    Belt to the pipe's braces, and never the mechanism: it does not exist on macOS, and on Linux
+    it is armed against the parent thread rather than the parent process. Failure is silence,
+    because everything this covers the pipe covers too."""
+    if not sys.platform.startswith("linux"):
+        return
+    try:
+        import ctypes
+
+        # PR_SET_PDEATHSIG
+        ctypes.CDLL("libc.so.6", use_errno=True).prctl(1, signal.SIGKILL, 0, 0, 0)
+    except Exception:
+        pass
+
+
+def serve(root: str, token: str, keepalive: Optional[int] = None) -> int:
     """Bind a loopback port, say which one, and serve until the host stops this process.
 
     One request at a time, and every one of them on the main thread. AppWorld runs an agent's code
@@ -527,7 +592,12 @@ def serve(root: str, token: str) -> int:
     **This loop is ended from outside and never from inside.** There is no close command to ask
     for; the host signals this process's group and confirms it is gone. A shutdown the protocol
     could request would be a shutdown agent-authored code could request, and the fact the host
-    needs is that this process stopped rather than that it said so."""
+    needs is that this process stopped rather than that it said so.
+
+    ``keepalive`` is the one thing outside that is not a signal: a descriptor whose end-of-file
+    means the host is gone (see :func:`watch_parent`). It is armed before the world is built,
+    because building one is seconds in which the parent can die."""
+    watch_parent(keepalive)
     os.environ["APPWORLD_ROOT"] = root
     episode = Episode()
     holder: List[Any] = []
@@ -569,7 +639,7 @@ def main(argv: Optional[List[str]] = None) -> int:
     args = parser.parse_args(argv)
     if args.command == "serve":
         opening = _handshake()
-        return serve(opening["root"], opening["token"])
+        return serve(opening["root"], opening["token"], opening.get("keepalive"))
     if args.command == "grade":
         print(json.dumps({"output": grade(_handshake())}), flush=True)
         return 0

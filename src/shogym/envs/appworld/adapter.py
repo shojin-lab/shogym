@@ -27,10 +27,14 @@ Importing this module imports nothing from upstream. Provisioning happens when a
 
 from __future__ import annotations
 
+import ast
+import calendar
+import fcntl
 import hashlib
 import json
 import os
 import platform
+import re
 import secrets
 import select
 import signal
@@ -367,13 +371,17 @@ def ensure_apps() -> None:
 def _compile_runtime(python: Path) -> None:
     """Rewrite every bytecode cache in the interpreter as a hash-based one.
 
-    **This is what lets :func:`runtime_digest` leave ``__pycache__`` out and still be true.** A
-    default ``.pyc`` records the source's modification time and size and is honoured whenever those
-    two numbers still match, whatever bytes the cache itself holds, so a cache under the installed
-    tree is executable code that no digest over the sources has read. A hash-based cache records a
-    hash of the source and the import system checks it on every import, so a cache that disagrees
-    with the source beside it is discarded and the source is what runs. Every ``.pyc`` a worker can
-    consult then stands for a source :func:`runtime_digest` did read.
+    **Two things, and neither of them is the identity.** A default ``.pyc`` records the source's
+    modification time and size and is honoured whenever those two numbers still match, whatever
+    bytes the cache itself holds; a hash-based one records a hash of the source and the import
+    system checks it, so a cache whose source was edited beside it is discarded and the source is
+    what runs. That closes the stale-cache case and not the changed-payload one, because the
+    recorded hash covers the source and not the marshalled code, which is why
+    :func:`runtime_digest` reads these bytes rather than reasoning about them.
+
+    What this buys is the other half: the whole tree is compiled once, here, so no later import
+    has a cache to write, and the identity computed after this call is the identity every worker
+    afterwards runs under.
 
     Forced, because ``compileall`` decides whether a cache is current by comparing a *timestamp*
     header, so an existing timestamp cache that is up to date is skipped and left in the form this
@@ -589,30 +597,35 @@ def runtime_digest() -> str:
     exists to catch. A ``.dist-info`` name is a label, and a label is not a fingerprint of the code
     behind it.
 
-    **What is hashed, exactly: the installed source and data bytes of ``site-packages``, plus the
-    base interpreter's own binary.** Every regular file under every ``site-packages`` of the
-    virtual environment, by relative path and by content; every symbolic link there by its target
-    text, by where that text resolves to and by the resolved file's bytes; ``pyvenv.cfg``; the
-    platform; the pins; and the executable ``bin/python`` resolves to, which is the real
-    interpreter the venv borrows and which nothing else here would have covered.
+    **What is hashed, exactly: every byte of ``site-packages`` an import can reach, plus the base
+    interpreter's own binary.** Every regular file under every ``site-packages`` of the virtual
+    environment, by relative path and by content, ``__pycache__`` included; every symbolic link
+    there by its target text, by where that text resolves to and by the resolved file's bytes;
+    ``pyvenv.cfg``; the platform; the pins; and the executable ``bin/python`` resolves to, which is
+    the real interpreter the venv borrows and which nothing else here would have covered.
 
-    **What is not hashed, and why each is out of scope.** The base interpreter's *standard
-    library* is not read: it is thousands of files belonging to the host's Python rather than to
-    anything this port installs, and the base binary's own bytes already move with a reinstalled
-    or repointed interpreter. Bytecode caches are not read: see below. A digest that named those
-    would be a longer walk and a claim this code cannot keep, so the claim is the narrower one and
-    it is true.
+    **The bytecode caches are in, and used not to be.** The argument for leaving them out was that
+    provisioning rewrites every cache as a hash-based one, which the import system validates
+    against the source's own hash, so a ``.pyc`` stood for a source this function had read. That
+    validation compares the *source hash recorded in the cache header* with the source; it does
+    not bind the marshalled payload to those bytes. So a cache whose header still matched and
+    whose payload had been changed was executable code this digest had never read, and the
+    identity said nothing. Reading the caches costs a quarter of a second on this runtime, against
+    the second and a half per worker start that deleting them and re-parsing every import would
+    cost instead, so they are read.
 
-    **``__pycache__`` is skipped, and the runtime is built so that skipping it is not a hole.**
-    Bytecode caches are written lazily by whatever process imported a module first, so hashing
-    them would make the interpreter's identity depend on which worker ran before rather than on
-    what is installed. What makes leaving them out honest is not that a stale cache is unlikely to
-    be executed: an ordinary ``.pyc`` whose recorded source mtime and size match the source beside
-    it is executed whatever its contents say. It is that every cache in this interpreter is
-    rewritten at provisioning as a hash-based one, which the import system checks against the
-    source's own hash, and that a worker writes none back (see :func:`_compile_runtime` and
-    :func:`_worker_environment`). Every ``.pyc`` that can be consulted therefore stands for a
-    source this function read.
+    That is stable rather than lucky, because nothing writes one after provisioning:
+    :func:`_compile_runtime` compiles the whole tree once with ``-f``, every process this port
+    starts under that interpreter afterwards carries ``PYTHONDONTWRITEBYTECODE`` (see
+    :func:`_worker_environment`), and a valid checked-hash cache is not rewritten by the import
+    that reads it. A cache appearing or changing under this tree is therefore a change to the code
+    the worker runs, which is exactly what this digest is for.
+
+    **What is not hashed, and why it is out of scope.** The base interpreter's *standard library*
+    is not read: it is thousands of files belonging to the host's Python rather than to anything
+    this port installs, and the base binary's own bytes already move with a reinstalled or
+    repointed interpreter. A digest that named that would be a longer walk and a claim this code
+    cannot keep, so the claim is the narrower one and it is true.
 
     Read off the filesystem rather than by running the interpreter, so a broken install still gets
     an answer. It costs about a second warm over the roughly fifteen thousand installed files of
@@ -682,7 +695,7 @@ def _absorb_target(material: Any, label: bytes, path: Path) -> None:
 
 
 def _installed_files(packages: Path) -> "Iterator[Tuple[str, Path]]":
-    """Every file under ``packages`` bar the bytecode caches, in one order on every machine.
+    """Every file under ``packages``, bytecode caches included, in one order on every machine.
 
     Sorted at each level rather than by collecting and sorting the whole tree, so a digest over a
     hundred thousand files still holds one directory's names at a time.
@@ -693,9 +706,7 @@ def _installed_files(packages: Path) -> "Iterator[Tuple[str, Path]]":
     for directory, children, names in os.walk(packages, followlinks=False):
         here = Path(directory)
         linked = [child for child in children if (here / child).is_symlink()]
-        children[:] = sorted(
-            child for child in children if child != "__pycache__" and child not in linked
-        )
+        children[:] = sorted(child for child in children if child not in linked)
         for name in sorted([*names, *linked]):
             path = here / name
             yield str(path.relative_to(packages)), path
@@ -705,9 +716,12 @@ def _installed_files(packages: Path) -> "Iterator[Tuple[str, Path]]":
 
 
 #: Bumped when the shape of a derived tree changes: what is copied, what is linked, what is
-#: sealed. It is part of a cache's name and of its stamp, so a tree built under an older layout is
-#: a different cache rather than one this code will read as its own.
-DERIVATION_VERSION = 1
+#: sealed, and what a task carries to say it is whole. It is part of a cache's name and of its
+#: stamp, so a tree built under an older layout is a different cache rather than one this code
+#: will read as its own. At 2 because a derived task now carries a manifest of everything in it
+#: (see :func:`~world._write_manifest`), and a tree from before it has nothing to be checked
+#: against.
+DERIVATION_VERSION = 2
 
 #: What a derived cache was built from, written inside it once it is complete.
 _SOURCE_FILE = ".shogym-source"
@@ -1131,14 +1145,113 @@ def _private_tag() -> str:
     return published
 
 
-def _generator_sources() -> Tuple[Path, ...]:
-    """The files whose bytes decide what a derived corpus holds.
+#: The modules that generate a world, from which the rest of the generator is reached. Between
+#: them they hold every decision a derived corpus is made of: ``env_v1`` draws the backlog and
+#: names the seeds it and the episode's world are started from, ``world`` decides what a derived
+#: tree is made of and what the seeded rows say, and ``worker`` writes those rows into a task's
+#: database log through upstream's own model layer.
+_GENERATOR_ENTRY_POINTS: Tuple[str, ...] = (
+    "shogym.envs.appworld.env_v1",
+    "shogym.envs.appworld.world",
+    "shogym.envs.appworld.worker",
+)
 
-    What a backlog is drawn as (``ledger``), what a derived tree is made of and what the seeded
-    rows say (``world``), and how those rows are actually written into a task's database log
-    (``worker``)."""
-    here = Path(__file__).parent
-    return tuple(here / name for name in ("ledger.py", "world.py", "worker.py"))
+#: How far the walk from those entry points goes. This port's own package, and the one module
+#: outside it that derivation calls into. The boundary is deliberate rather than incidental: past
+#: it is shogym's own machinery (the serve layer, the core env, the MCP transport), which decides
+#: how an episode is dispensed and recorded and decides nothing about what bytes end up in a
+#: derived tree. Naming the whole distribution here would put the entire package's source in the
+#: name of a 134 MB cache, so an unrelated edit to the serve layer would re-derive the corpus.
+_GENERATOR_ROOTS: Tuple[str, ...] = ("shogym.envs.appworld", "shogym.envs._upstream")
+
+#: The installed root of the ``shogym`` package, which is what a dotted module name is resolved
+#: against. Read off this module's own location rather than off ``sys.modules``, so the walk is a
+#: file operation and needs nothing imported.
+_PACKAGE_ROOT = Path(__file__).resolve().parent.parent.parent
+
+
+@lru_cache(maxsize=1)
+def _generator_sources() -> Tuple[Tuple[str, Path], ...]:
+    """Every module whose bytes decide what a derived corpus holds, as (name, file) pairs.
+
+    **Walked from the entry points rather than listed by hand, because a hand-kept list is what
+    failed.** This was three names in a tuple: ``ledger.py``, ``world.py`` and ``worker.py``. The
+    two helpers that decide a task's seeded backlog and the seed its live world is started from
+    live in ``env_v1``, which was not one of them, so an edit to either produced the same cache
+    name and the same run fingerprint over a different world. A list somebody has to remember to
+    extend is a list that is right until the next helper is written somewhere else.
+
+    So the closure is computed: parse each entry point, take every module it imports that falls
+    inside :data:`_GENERATOR_ROOTS`, and repeat. ``ast.walk`` rather than the module's top level,
+    because the imports this port defers into function bodies (the ledger inside
+    :func:`_generator_digest`, ``mcp_server`` inside a session's setup) are imports all the same.
+    Static rather than through ``sys.modules``: what is hashed then is what is on disk under the
+    names the code actually writes, whether or not this process has imported it, and there is no
+    ordering in which a module can be missed for having been imported later.
+
+    **What the boundary costs.** The closure is wider than the three files it replaces, so an edit
+    anywhere in this port derives the corpus again, a comment edit included. That is a few minutes
+    once, in the direction that cannot be wrong, and it is a real cost to
+    shojin-lab/shogym#140, which rewrites four of these modules and will re-derive on the first
+    construction after it lands. The alternative on offer was the hand-kept list, which is cheap
+    right up to the edit it does not notice.
+
+    Memoized, because it parses ten files and none of them can change inside a process."""
+    found: Dict[str, Path] = {}
+    pending = list(_GENERATOR_ENTRY_POINTS)
+    while pending:
+        name = pending.pop()
+        if name in found:
+            continue
+        source = _module_file(name)
+        if source is None:
+            continue
+        found[name] = source
+        pending.extend(_imported_modules(name, source))
+    return tuple(sorted(found.items()))
+
+
+def _module_file(name: str) -> Optional[Path]:
+    """Where a dotted module inside :data:`_GENERATOR_ROOTS` lives, or ``None`` for anything else.
+
+    A package contributes its ``__init__`` and nothing else; its submodules arrive on their own
+    names, through the imports that actually reach them, so importing a package does not drag in
+    every file beside it."""
+    if not any(name == root or name.startswith(root + ".") for root in _GENERATOR_ROOTS):
+        return None
+    within = _PACKAGE_ROOT.joinpath(*name.split(".")[1:])
+    module = within.with_suffix(".py")
+    if module.is_file():
+        return module
+    package = within / "__init__.py"
+    return package if package.is_file() else None
+
+
+def _imported_modules(name: str, source: Path) -> "Iterator[str]":
+    """Every dotted name ``source`` imports, whether or not it resolves to anything.
+
+    ``from x import y`` yields both ``x`` and ``x.y``: the name after ``import`` is a submodule or
+    an attribute and the syntax does not say which, so both are offered and :func:`_module_file`
+    keeps whichever is a file. Relative imports are resolved against the module's own package;
+    this port writes none today, and a walk that silently skipped them would be the hand-kept
+    list's failure wearing a different hat."""
+    tree = ast.parse(source.read_bytes(), filename=str(source))
+    package = name if source.name == "__init__.py" else name.rpartition(".")[0]
+    for node in ast.walk(tree):
+        if isinstance(node, ast.Import):
+            for alias in node.names:
+                yield alias.name
+        elif isinstance(node, ast.ImportFrom):
+            base = node.module or ""
+            if node.level:
+                parts = package.split(".")
+                anchor = ".".join(parts[: len(parts) - node.level + 1])
+                base = f"{anchor}.{base}" if base else anchor
+            if not base:
+                continue
+            yield base
+            for alias in node.names:
+                yield f"{base}.{alias.name}"
 
 
 @lru_cache(maxsize=1)
@@ -1155,12 +1268,19 @@ def _generator_digest() -> str:
     the cache.
 
     Read off the files rather than declared in a constant somebody has to remember to bump, which
-    is the failure this is fixing rather than a variant of it. The price is that an edit anywhere
-    in those three files, a comment included, derives the corpus again: a few minutes once, in the
-    direction that cannot be wrong. The constants are still hashed on their own, so that moving
-    one out of ``ledger.py`` cannot quietly take it out of the key.
+    is the failure this is fixing rather than a variant of it. The constants are still hashed on
+    their own, so that moving one out of ``ledger.py`` cannot quietly take it out of the key.
 
-    Memoized, because it reads three files and nothing under it can change inside a process."""
+    **And off every file the generator reaches, rather than three named ones.** The three were
+    ``ledger``, ``world`` and ``worker``, and the helpers that decide a task's seeded backlog and
+    the seed its world is started from are in ``env_v1``, which was not among them: an
+    implementation change to either reused a cache and a run identity claiming the generator
+    before it. What is hashed is now the import closure of the modules that generate a world (see
+    :func:`_generator_sources`), by dotted name and by source bytes, in one order on every
+    machine. The price is that an edit anywhere in this port, a comment included, derives the
+    corpus again: a few minutes once, in the direction that cannot be wrong.
+
+    Memoized, because it reads ten files and none of them can change inside a process."""
     from shogym.envs.appworld import ledger
 
     material = hashlib.sha256()
@@ -1181,8 +1301,8 @@ def _generator_digest() -> str:
             )
         ).encode()
     )
-    for source in _generator_sources():
-        material.update(source.name.encode())
+    for name, source in _generator_sources():
+        material.update(name.encode())
         material.update(b"\0")
         material.update(source.read_bytes())
     return material.hexdigest()[:8]
@@ -1202,21 +1322,32 @@ class WorkerError(RuntimeError):
 #: the episode's own.
 _ENV_ALLOW_LIST: Tuple[str, ...] = ("PATH", "LANG", "LC_ALL", "LC_CTYPE", "SYSTEMROOT", "TMPDIR")
 
+#: What every worker's scratch directory is named for. It is also what a sweep checks before
+#: removing one whose name it read out of a file: the ledger is a file, and a file can be edited.
+_SCRATCH_PREFIX = "shogym-appworld-"
+
+
+def _close_descriptor(descriptor: Optional[int]) -> None:
+    """Close a raw descriptor, and treat one that is already closed as closed."""
+    if descriptor is None:
+        return
+    try:
+        os.close(descriptor)
+    except OSError:
+        pass
+
 
 def _worker_environment(scratch: Path) -> Dict[str, str]:
     """A scrubbed environment for one worker.
 
-    **``PYTHONDONTWRITEBYTECODE`` is half of what makes the runtime digest's claim true**, and
-    :func:`ensure_apps` is the other half. :func:`runtime_digest` skips ``__pycache__``, and the
-    usual defence of that is that Python discards a cache whose source has changed. It discards
-    one whose recorded source *mtime and size* have changed, which is weaker than it sounds: a
-    ``.pyc`` carrying the right two numbers is executed whatever bytes are in it, so a cache
-    written or edited under the installed tree would be executable code the run's identity has
-    never read. Provisioning therefore compiles the whole interpreter with hash-based caches,
-    which the import system validates against the source's own hash rather than against its
-    timestamp; this is what stops a *new* cache being written in the default timestamp form
-    afterwards, by a worker or by anything else. Between them, every ``.pyc`` that can be
-    consulted is one whose source hash still matches a source the digest did read.
+    **``PYTHONDONTWRITEBYTECODE`` is what keeps the runtime's identity a constant of the run.**
+    :func:`runtime_digest` reads every ``.pyc`` under the installed tree, because a cache is
+    executable input and a checked-hash header binds the source and not the payload. That digest
+    names the derived cache, so a cache file appearing or changing mid-run would rename the world
+    every later episode is served from. Nothing this port starts under that interpreter writes
+    one: provisioning compiles the tree once (:func:`_compile_runtime`) and every process after it
+    carries this variable, so the only way those bytes move is somebody changing what the worker
+    executes, which is the fact the digest exists to carry.
 
     Not the same thing as ``PYTHONPYCACHEPREFIX``, which was the first attempt and which sends
     each worker to a cache directory of its own. That is also correct and costs about three
@@ -1228,6 +1359,354 @@ def _worker_environment(scratch: Path) -> Dict[str, str]:
     scrubbed["APPWORLD_CACHE"] = str(scratch / "appworld-cache")
     scrubbed["PYTHONDONTWRITEBYTECODE"] = "1"
     return scrubbed
+
+
+# ----- workers whose parent is gone -----
+
+#: Where the workers this port has started are written down, one event per line. A file rather
+#: than anything held in memory, because the case it exists for is a serving process that is no
+#: longer there to hold anything: what a later construction reads has to have outlived the process
+#: that wrote it.
+_WORKER_LEDGER = "workers.txt"
+
+#: When the ledger is rewritten rather than appended to. Two lines per worker that started and
+#: stopped, so a file only ever appended to is a file every later construction reads in full.
+_LEDGER_MAX_LINES = 4096
+
+#: What one sweep spends before it leaves the rest for the next one. Deciding whether an owner is
+#: still alive can cost a ``ps`` per record, and this runs inside a constructor a serve layer may
+#: call while it is dispensing. The work is idempotent and the leftovers do not spoil, so stopping
+#: early costs nothing but a second pass.
+_REAP_SECONDS = 10.0
+_REAP_MAX_WORKERS = 16
+
+
+def _ledger() -> Path:
+    """The ledger's path, made if this is the first worker on this machine."""
+    home = cache_root()
+    home.mkdir(parents=True, exist_ok=True)
+    return home / _WORKER_LEDGER
+
+
+def _append(line: str) -> None:
+    """Add one event, under the lock a rewrite takes, and never raise.
+
+    One ``O_APPEND`` write of one short line, which the kernel does not interleave with another
+    process's. The lock is not what makes that atomic; it is what keeps this out of the middle of
+    a compaction, which is a read and a write with a gap in it (see :func:`_compact`)."""
+    try:
+        with open(_ledger(), "a") as handle:
+            _exclusive(handle)
+            handle.write(line + "\n")
+    except OSError:
+        pass
+
+
+def _exclusive(handle: Any) -> bool:
+    """Take the ledger's own lock, or say that this filesystem does not have one.
+
+    Blocking, because everyone who takes it holds it for one small write and the honest reading of
+    "somebody else has it" is that they are a line ahead of this one."""
+    try:
+        fcntl.flock(handle.fileno(), fcntl.LOCK_EX)
+    except OSError:
+        # Including the errnos that mean "this mount has no locks". The appends stay correct
+        # without it, because each is one `O_APPEND` write; what is not attempted without it is
+        # the rewrite, which is the operation that needs the exclusion.
+        return False
+    return True
+
+
+def record_worker(**fields: Any) -> str:
+    """Write down one worker this process has started, and return the name it was written under.
+
+    Appended before the handshake rather than after it, so a parent that dies during a spawn has
+    still said what it started. The record is what a later construction has instead of the
+    ``Worker`` object: who owns it (:func:`process_birth` beside the owner's pid, so a recycled
+    number is not read as a live owner), which boot it belongs to, what to signal, and what to
+    remove.
+
+    Never raises. A worker that could not be written down is a worker whose parent-death pipe
+    still stops it; the ledger is what lets a later run *find* it, not what stops it."""
+    name = f"{os.getpid()}-{secrets.token_hex(8)}"
+    _append(
+        "+"
+        + json.dumps(
+            {
+                "name": name,
+                "parent": os.getpid(),
+                "birth": _own_birth(),
+                "boot": _boot_id(),
+                **fields,
+            },
+            sort_keys=True,
+        )
+    )
+    return name
+
+
+def forget_worker(name: str) -> None:
+    """Tombstone a worker this process has stopped."""
+    _append(f"-{name}")
+
+
+def outstanding() -> List[Dict[str, Any]]:
+    """The workers written down and not yet tombstoned, in the order they were first written."""
+    try:
+        lines = _ledger().read_text().splitlines()
+    except OSError:
+        return []
+    return _live(lines)
+
+
+def _live(lines: Sequence[str]) -> List[Dict[str, Any]]:
+    """The records a ledger's events leave outstanding, in the order they were first written.
+
+    Every line is an event, ``+`` for a worker to account for and ``-`` for one confirmed stopped,
+    and what is live is what the events say rather than what any writer last decided. A line that
+    will not parse is a line from a version of this code or a torn write, and is skipped rather
+    than treated as a worker."""
+    live: Dict[str, Dict[str, Any]] = {}
+    gone: set = set()
+    for line in lines:
+        line = line.strip()
+        if line.startswith("-"):
+            gone.add(line[1:])
+        elif line.startswith("+"):
+            try:
+                record = json.loads(line[1:])
+            except ValueError:
+                continue
+            name = str(record.get("name", ""))
+            if name and name not in live:
+                live[name] = record
+    return [record for name, record in live.items() if name not in gone]
+
+
+def _spent(began: float, reclaimed: Sequence[str]) -> bool:
+    """Whether this sweep has used the budget one call gets."""
+    return len(reclaimed) >= _REAP_MAX_WORKERS or time.monotonic() - began > _REAP_SECONDS
+
+
+def reap(*, alive: Optional[Any] = None) -> List[str]:
+    """Stop and clear away this port's workers whose owner is gone, and say which.
+
+    **The case teardown cannot reach.** A worker is started in a session of its own so that
+    stopping an episode stops everything the episode spawned, and only the parent's own ``Worker``
+    object held its port, its token, its process handle and its group. A serving process that died
+    abruptly took all four with it: the worker was reparented and went on running, and a resumed
+    harness could neither adopt it nor name it for teardown and simply started another. What is
+    left is a process nobody is going to stop and nothing names.
+
+    So every worker is written down with the pid and the birth of the process that started it, and
+    this runs at construction: a record whose owner is not running is a worker nobody is coming
+    back for. The birth is beside the pid because pids are reused, and the boot id is beside both
+    because they are reused across a restart; stopping a live episode's world because an unrelated
+    process now holds its owner's number would be worse than the failure this fixes.
+
+    **Bounded in aggregate**, because deciding an owner is dead can cost a ``ps`` per record and
+    this is called from a constructor a serve layer may run while it is dispensing. Nothing is lost
+    by stopping early: what is left is still in the ledger, and the next construction starts again
+    from the front of it.
+
+    This is the second defence and not the first. The worker holds the read end of a pipe from its
+    parent and stops itself when that closes (see :func:`~worker.watch_parent`), so in the ordinary
+    crash the process is already gone by the time anything reads this file and what is reclaimed
+    here is the scratch directory and the record. This is what covers a worker that was stopped
+    before it armed the pipe, or one whose group outlived it."""
+    began = time.monotonic()
+    running = alive if alive is not None else _process_is_alive
+    reclaimed: List[str] = []
+    for record in outstanding():
+        if _spent(began, reclaimed):
+            break
+        name = str(record.get("name", ""))
+        if record.get("boot") != _boot_id():
+            # From before this machine last restarted. Every number in it belongs to somebody
+            # else now, so nothing is signalled; the record goes, and so does whatever scratch
+            # directory survived the reboot.
+            _clear_scratch(record)
+            forget_worker(name)
+            reclaimed.append(name)
+            continue
+        owner = str(record.get("parent", ""))
+        # An unreadable record is left alone. This stops processes, so the ambiguous case has to
+        # be the one where nothing happens.
+        if not owner.isdigit() or running(int(owner), str(record.get("birth", ""))):
+            continue
+        _stop_orphan(record)
+        _clear_scratch(record)
+        forget_worker(name)
+        reclaimed.append(name)
+    _compact()
+    return reclaimed
+
+
+def _stop_orphan(record: Dict[str, Any]) -> None:
+    """Signal an abandoned worker's group, but only while the group is provably still its own.
+
+    The same rule :meth:`Worker.close` follows, for the same reason and with less to go on: a pgid
+    is a number, and a number is that worker's only while the process holding it exists. The
+    leader's own birth was read at spawn and written down beside its pid, so this can ask whether
+    the number still names the process it was written for. A leader that is gone leaves a number
+    nothing here may signal, and its descendants are then beyond reach: that is the honest
+    boundary rather than a signal aimed at whoever holds the number now.
+
+    A birth that was never readable is treated the same way. Elsewhere an unknown birth reads as
+    "says nothing" and the pid is believed, which is the safe direction for a question about
+    whether to *leave something alone*; here the answer decides whether to send a signal, so
+    unknown has to mean no."""
+    pid, pgid = record.get("pid"), record.get("pgid")
+    birth = str(record.get("pid_birth") or "")
+    if not isinstance(pid, int) or not isinstance(pgid, int) or pid != pgid:
+        return
+    if not birth or process_birth(pid) != birth:
+        return
+    _signal_group(pgid, signal.SIGKILL)
+
+
+def _clear_scratch(record: Dict[str, Any]) -> None:
+    """Remove an abandoned worker's scratch directory, which was its ``HOME``.
+
+    Only one this port made. The name is read out of a file, and a file is a thing that can be
+    edited, so what is removed has to carry the prefix :func:`Worker.spawn` gives every scratch
+    directory. That is not a boundary against somebody who writes this file on purpose, and it is
+    not meant to be: it is what keeps a mangled or truncated line from naming a directory this
+    would then delete."""
+    scratch = record.get("scratch")
+    if not isinstance(scratch, str) or not scratch:
+        return
+    path = Path(scratch)
+    if not path.name.startswith(_SCRATCH_PREFIX):
+        return
+    shutil.rmtree(path, ignore_errors=True)
+
+
+def _compact() -> None:
+    """Rewrite the ledger as just the records still outstanding, once it has grown enough to matter.
+
+    **In place and under the file's own lock, because a rewrite is the one operation here that can
+    lose a record.** Everything else is a single ``O_APPEND`` write, which the kernel will not
+    interleave; a rewrite is a read and a write with a gap in the middle, and a record appended by
+    a live sibling in that gap is a worker nobody would ever come back for. A rename would swap the
+    inode the lock is on, so the file is truncated and rewritten rather than replaced.
+
+    Never raises, and does nothing at all where the filesystem cannot lock: a ledger that is merely
+    long is a file this port reads a little more of."""
+    try:
+        with open(_ledger(), "r+") as handle:
+            if not _exclusive(handle):
+                return
+            lines = handle.read().splitlines()
+            if len(lines) <= _LEDGER_MAX_LINES:
+                return
+            keeping = _live(lines)
+            handle.seek(0)
+            handle.write("".join("+" + json.dumps(r, sort_keys=True) + "\n" for r in keeping))
+            handle.truncate()
+    except OSError:
+        pass
+
+
+def _process_is_alive(pid: int, birth: str = "") -> bool:
+    """Whether ``pid`` is the same live process that was born at ``birth``."""
+    if pid == os.getpid():
+        return True
+    try:
+        os.kill(pid, 0)
+    except ProcessLookupError:
+        return False
+    except PermissionError:
+        # Somebody else's process, which is somebody else's business and certainly alive.
+        return True
+    except OSError:
+        return True
+    if not birth:
+        return True
+    now = process_birth(pid)
+    # A recorded birth that no longer matches is a recycled number, and the process that owned
+    # this worker is gone. An unreadable birth now says nothing, so it says nothing.
+    return not now or now == birth
+
+
+@lru_cache(maxsize=1)
+def _own_birth() -> str:
+    """When this process started. Memoized: it is one ``ps`` and it cannot change."""
+    return process_birth(os.getpid())
+
+
+def process_birth(pid: int) -> str:
+    """When ``pid`` started, as the process table reports it, or the empty string if unknown.
+
+    A pid is reused, and within one boot it is reused quickly. ``kill(pid, 0)`` answers "is
+    something running under that number", and the question a sweep is asking is "is the process
+    that started this worker still running". The start time is what separates them: a number that
+    came back with a different birth is a different process wearing the same badge.
+
+    **A number, not a rendering.** ``ps`` blank-pads a single-digit day and renders the time in the
+    caller's zone, so the same live process read under two locales or two ``TZ`` values prints two
+    different strings, and an owner would then read as replaced. The environment is pinned and the
+    result converted to epoch seconds, which has no spacing to lose and compares exactly.
+
+    One second of precision is what ``ps`` offers, so a pid reused inside the same second is still
+    indistinguishable. That is the residual, and it is narrower than the pid alone was.
+
+    Unknown is the empty string rather than an error, and two empty strings compare equal, which
+    keeps a sweep on the safe side of its own rule: it stops only what it can positively tell is
+    abandoned."""
+    try:
+        finished = subprocess.run(
+            ["ps", "-o", "lstart=", "-p", str(pid)],
+            capture_output=True,
+            text=True,
+            timeout=_CLOSE_SECONDS,
+            env={**os.environ, "TZ": "UTC", "LC_ALL": "C", "LANG": "C"},
+        )
+    except (OSError, subprocess.SubprocessError):
+        return ""
+    if finished.returncode != 0:
+        return ""
+    rendered = " ".join(finished.stdout.split())
+    if not rendered:
+        return ""
+    try:
+        # Normalised first, so the padded day the platform writes and the single space a reader
+        # might rebuild parse to the same instant. The zone is pinned above, so this is UTC.
+        return str(calendar.timegm(time.strptime(rendered, "%a %b %d %H:%M:%S %Y")))
+    except ValueError:
+        # A format this does not know is not a birth this can compare. Unknown is the empty
+        # string, which keeps a sweep on the safe side of its own rule.
+        return ""
+
+
+@lru_cache(maxsize=1)
+def _boot_id() -> str:
+    """Something that changes when the machine restarts, so a reused pid is not a live owner.
+
+    **The number, not the rendering.** ``sysctl -n kern.boottime`` prints a struct and then a human
+    date, and the date is rendered in the caller's zone: hashing the whole line gives two boot
+    identities for one boot under two ``TZ`` values, which would hide an orphan from a sweep run in
+    another zone. The seconds field inside the struct is the kernel's own value and does not move,
+    so that is what is taken. Linux's boot id is already a value rather than a rendering."""
+    try:
+        stamp = subprocess.run(
+            ["sysctl", "-n", "kern.boottime"],
+            capture_output=True,
+            text=True,
+            timeout=_CLOSE_SECONDS,
+            env={**os.environ, "TZ": "UTC", "LC_ALL": "C", "LANG": "C"},
+        )
+        if stamp.returncode == 0 and stamp.stdout.strip():
+            seconds = re.search(r"sec\s*=\s*(\d+)", stamp.stdout)
+            if seconds:
+                return seconds.group(1)
+            return hashlib.sha256(stamp.stdout.strip().encode()).hexdigest()[:12]
+    except (OSError, subprocess.SubprocessError):
+        pass
+    try:
+        return hashlib.sha256(Path("/proc/sys/kernel/random/boot_id").read_bytes()).hexdigest()[:12]
+    except OSError:
+        return "unknown"
 
 
 @dataclass
@@ -1257,6 +1736,13 @@ class Worker:
     #: second close signals a group this port never started. Read at spawn, the answer is about
     #: this worker or it is nothing.
     pgid: Optional[int] = None
+    #: The writing end of the pipe whose end-of-file tells the worker this process is gone. Held
+    #: open for the worker's whole life and closed by nothing but :meth:`close` and the death of
+    #: this process, which is the event it exists to signal (see :func:`~worker.watch_parent`).
+    keepalive: Optional[int] = None
+    #: What this worker is written down as in the durable ledger, so a later construction can tell
+    #: an abandoned worker from a live one (see :func:`reap`).
+    record: Optional[str] = None
     #: Whether :meth:`close` has begun. Set before the first signal, so a close interrupted part
     #: way through is still a worker no later call will signal for.
     closed: bool = False
@@ -1283,11 +1769,24 @@ class Worker:
         reaped and removed on every other exit.
 
         The whole handshake is under :data:`_SPAWN_TIMEOUT_SECONDS`. The write is not, and does not
-        need to be: it is a couple of hundred bytes into an empty pipe, which cannot block."""
+        need to be: it is a couple of hundred bytes into an empty pipe, which cannot block.
+
+        **The worker is given a way to notice this process dying, and is written down so a later
+        one can find it.** Stdin is closed after the handshake, so nothing on it says anything
+        afterwards; the keep-alive pipe is a second descriptor, held open for the worker's whole
+        life and closed by the kernel when this process exits however it exits. Its number is sent
+        in the handshake rather than fixed by convention, because ``pass_fds`` does not renumber.
+        The ledger record beside it is what a construction after a crash reads (see :func:`reap`),
+        and it is written before the handshake so that a parent which dies inside a spawn has still
+        said what it started."""
         token = secrets.token_urlsafe(32)
-        scratch = Path(tempfile.mkdtemp(prefix="shogym-appworld-"))
+        scratch = Path(tempfile.mkdtemp(prefix=_SCRATCH_PREFIX))
         process: Optional[subprocess.Popen] = None
         pgid: Optional[int] = None
+        record: Optional[str] = None
+        # Non-inheritable by default, so no other child of this process holds the writing end open
+        # and reports this one alive after it has gone.
+        listening, holding = os.pipe()
         published = False
         try:
             process = subprocess.Popen(
@@ -1303,11 +1802,20 @@ class Worker:
                 # child alone would leave those descendants running against the world after it
                 # was scored.
                 start_new_session=True,
+                pass_fds=(listening,),
             )
             # Read here and kept, rather than resolved from the pid later: see `pgid`.
             pgid = _group_of(process)
+            record = record_worker(
+                pid=process.pid,
+                pid_birth=process_birth(process.pid),
+                pgid=pgid,
+                scratch=str(scratch),
+            )
             assert process.stdin is not None
-            process.stdin.write(json.dumps({"root": str(root), "token": token}) + "\n")
+            process.stdin.write(
+                json.dumps({"root": str(root), "token": token, "keepalive": listening}) + "\n"
+            )
             process.stdin.flush()
             process.stdin.close()
             assert process.stdout is not None
@@ -1324,12 +1832,20 @@ class Worker:
                 token=token,
                 scratch=scratch,
                 pgid=pgid,
+                keepalive=holding,
+                record=record,
             )
             published = True
             return worker
         finally:
+            # The child has its own copy; a reading end still open here would be a pipe that never
+            # reaches end-of-file for the worker either.
+            _close_descriptor(listening)
             if not published:
+                _close_descriptor(holding)
                 _abandon(process, pgid, scratch)
+                if record is not None:
+                    forget_worker(record)
 
     def call(self, command: str, **body: Any) -> Any:
         """Send one command and return what the world answered."""
@@ -1378,6 +1894,11 @@ class Worker:
         if not self.closed:
             self.closed = True
             self.stopped = self._stop_the_group()
+            # After the stop, not before it. The ordinary teardown is the signal and the process
+            # table; the pipe is the crash path, and closing it first would put a second killer
+            # in the middle of the one that reports.
+            _close_descriptor(self.keepalive)
+            self.keepalive = None
             for stream in (self.process.stdout, self.process.stderr):
                 if stream is not None:
                     try:
@@ -1385,6 +1906,9 @@ class Worker:
                     except Exception:
                         pass
             shutil.rmtree(self.scratch, ignore_errors=True)
+            if self.record is not None:
+                forget_worker(self.record)
+                self.record = None
         if confirm and not self.stopped:
             raise WorkerError(
                 "the appworld worker's execution domain could not be confirmed stopped, so there "
