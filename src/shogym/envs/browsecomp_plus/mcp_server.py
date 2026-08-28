@@ -93,9 +93,12 @@ def _state_for(session_id: Optional[str]) -> Optional[Dict[str, Any]]:
 def _snippet(text: str, max_tokens: int) -> str:
     """Truncate ``text`` to ``max_tokens`` whitespace tokens (``-1`` disables truncation).
 
-    Upstream snippets by the Qwen3-0.6B subword tokenizer; shogym approximates with whitespace
-    tokens to stay dependency-light (transformers is not a required dep). Snippet length is
-    cosmetic for the agent — it never affects scoring (recall uses returned docids)."""
+    Upstream snippets by the ``Qwen/Qwen3-0.6B`` subword tokenizer
+    (``searcher/tools.py``); shogym approximates with whitespace tokens to stay dependency-light
+    (transformers is not a required dep). This is **agent-visible**: at the same nominal 512 a
+    whitespace token is usually longer than a subword one, so the evidence window generally
+    differs from upstream's and can change the answer and its citations. Retrieval recall is
+    unaffected (it reads returned docids), but the episode score is not insulated."""
     if max_tokens is None or max_tokens < 0:
         return text
     tokens = text.split()

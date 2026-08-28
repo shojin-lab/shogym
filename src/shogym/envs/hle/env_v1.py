@@ -337,7 +337,8 @@ def score_evidence(
     Pure. Emits ``correct`` (bool) always on termination; when there was a submission it also
     emits ``confidence`` (0–1, from the validated submit args) and ``calibration_error`` — the
     absolute gap between the submitted confidence and the correctness indicator (a per-episode
-    Brier-style term). A terminal with no submission (``terminate``/abort or the
+    Brier-style term, and a local diagnostic rather than upstream's batch calibration error).
+    A terminal with no submission (``terminate``/abort or the
     ``zero_unsubmitted`` horizon) emits only ``correct = False`` — there is no confidence to
     calibrate.
 

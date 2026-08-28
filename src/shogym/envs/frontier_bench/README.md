@@ -231,12 +231,18 @@ core-owned terminal evidence, so the transcript cannot influence it.
   **`eb4af26c`** and the per-task `sha256` digest recorded in upstream `tasks/dataset.toml`, and
   vendors the runtime files under [`tasks/`](tasks/) (upstream's `maintainer/` tooling is not
   carried). The five recorded digests match that file exactly.
-- **`v0.1.0` is this port's own label.** `manifest.UPSTREAM_TAG` records it, and nothing at the
-  pinned commit corroborates it: the repository has moved to `harbor-framework/terminal-bench`,
-  no `v0.1.0` tag or release resolves there, and upstream's `tasks/dataset.toml` at `eb4af26c`
-  names the dataset `terminal-bench/terminal-bench-3` with no version field, while the string
-  `0.1.0` appears in none of the vendored task files. Treat it as a legacy local label; the
-  commit is the only anchor that resolves. `describe()` still stamps the recorded label in
+- **`0.1.0` is upstream's Harbor Hub dataset version, not a Git tag.** Upstream published these
+  74 tasks to Harbor Hub as `frontier-bench/frontier-bench@0.1.0`. The merge immediately before
+  the pinned commit ([PR #1417](https://github.com/harbor-framework/terminal-bench/pull/1417),
+  merged as `81c5ff3e`) added exactly that string to its READMEs ("The published dataset is
+  `frontier-bench/frontier-bench@0.1.0` (74 tasks)"), and later commits in the same PR
+  deliberately unpinned it so the docs would not need a bump each release. The version is
+  upstream's, not this port's invention. What does not exist is a **Git** tag: no `v0.1.0` ref
+  or release resolves in `harbor-framework/terminal-bench` (where the old `frontier-bench` URL
+  redirects), `tasks/dataset.toml` at `eb4af26c` names the in-repo dataset
+  `terminal-bench/terminal-bench-3` with no version field, and `0.1.0` appears in none of the
+  vendored task files. `manifest.UPSTREAM_TAG` records it with a `v` prefix this port added.
+  The commit `eb4af26c` is the source anchor. `describe()` still stamps the recorded label in
   each TaskSpec's provenance footer (`pinned: frontier-bench v0.1.0 · <digest>`); moving that
   footer onto the commit changes a served string, so it is
   [issue #136](https://github.com/shojin-lab/shogym/issues/136) rather than part of this pass.

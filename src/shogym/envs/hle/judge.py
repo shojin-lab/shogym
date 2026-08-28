@@ -65,8 +65,8 @@ class Judge(Protocol):
     """A model-graded verifier: does ``response`` answer ``question`` as ``correct_answer``?
 
     Implementations must be side-effect-free apart from the model call and must not raise on
-    an ordinary bad response — return ``JudgeResult(correct=False)`` instead. The handler
-    finalizer guards against exceptions regardless, but a well-behaved judge keeps the episode
+    an ordinary bad response — return ``JudgeResult(correct=False)`` instead. The finalizer
+    guards against exceptions regardless, but a well-behaved judge keeps the episode
     clean.
     """
 

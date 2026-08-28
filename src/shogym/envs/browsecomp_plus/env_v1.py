@@ -13,8 +13,10 @@ against the query's relevance judgements (qrels).
 the env's ``finalize`` hook runs the LLM judge on the frozen submission (seal-before-verdict),
 so a graded verdict only ever exists for an already-sealed, un-continuable episode — the agent
 can never grade, read the verdict, then edit and re-grade. ``finalize`` returns core-owned,
-**sanitized** :class:`~shogym.serve.lifecycle.TerminalEvidence` (a public ``correct`` verdict
-only — never the judge's reasoning, extracted answer, or exception text); the pure ``_verify``
+**sanitized** :class:`~shogym.serve.lifecycle.TerminalEvidence` — sanitized by *exclusion*: never
+the judge's reasoning, extracted answer, or exception text. The public verdict carries
+``correct`` and ``confidence``, ``judge_error`` when grading failed, and core's
+``finalize_error``; the pure ``_verify``
 scores from that evidence, plus retrieval recall off the recorded ``search`` steps and citation
 metrics off the submitted answer the same terminal evidence carries.
 
@@ -367,7 +369,8 @@ def score_trajectory(
     Emits, on termination:
       - ``correct`` (bool) — the judge's verdict (False if the episode ended with no evidence).
       - ``confidence`` (0–1) + ``calibration_error`` (``|confidence − correct|``) — only when a
-        submission was graded (HLE-style calibration; omitted on a horizon/abort end).
+        submission was graded (HLE-style, a local per-episode diagnostic rather than upstream's
+        batch ``calib_err``; omitted on a horizon/abort end).
       - ``judge_error`` (True) — only when the grade was a fail-closed judge failure, or the
         finalize transaction itself failed closed.
       - ``retrieval_recall`` — fraction of the query's evidence docids retrieved across all

@@ -112,9 +112,11 @@ observation stream and no other tool.
   `OpenAIJudge`; offline tests inject a scripted judge, mirroring how the tau2 port injects a
   scripted user simulator. A judge failure **fails closed** — the answer scores incorrect and
   the verdict is flagged `judge_error` — rather than crashing the episode. The **result
-  returned to the agent is sanitized**: only the public-safe `correct` (bool) and `judge_error`
-  (bool). The judge's reasoning / extracted answer and any exception text are answer oracles —
-  they never reach the agent; they live only in the private, off-trace diagnostic.
+  returned to the agent is sanitized** by exclusion: the judge's reasoning, its extracted answer
+  and any exception text are answer oracles and never reach the agent, living only in the
+  private, off-trace diagnostic. What the agent does see is the public-safe set — `correct` and
+  `judge_error`, plus `judge_model` (and `judge_effort` when `judge_kwargs` set a
+  `reasoning_effort`) on a model-judged episode, and core's `finalize_error`.
 - **`terminate()`** — the reserved abort tool every env serves (`terminal_kind: abort`). Since
   `submit_answer` already ends the episode, a harness does **not** call `terminate` after
   submitting (it would be tombstoned); `terminate` before submitting ends the episode with no
@@ -138,8 +140,10 @@ Feedback emitted on termination (episode-level):
 - **`correct`** — did the judge (or the exact-match fast path) accept the answer.
 - **`confidence`** — the submitted 0–100 confidence as a 0–1 fraction.
 - **`calibration_error`** — `|confidence − correct|`, the per-episode Brier-style gap between
-  the stated confidence and the outcome (0 is perfectly calibrated). A terminal with no graded
-  submission emits only `correct = False` (there is no confidence to calibrate).
+  the stated confidence and the outcome (0 is perfectly calibrated). A local diagnostic, not
+  upstream's batch Calibration Error (see [Fidelity & deviations](#fidelity--deviations)).
+  A terminal with no graded submission emits only `correct = False` (there is no confidence to
+  calibrate).
 - **`judge_error`** — set (`True`) only when the grade fail-closed on a grading-infra failure
   (a judge exception, or a serve-layer finalize deadline/crash), so an analyst can filter those
   out of the genuine zeros.
@@ -206,6 +210,13 @@ semantics (give each run its own trace file for a guaranteed 1:1 mapping).
   now records the model that graded it.
 - **Text-only for now.** Questions carrying an image are filtered out; multimodal is a
   follow-up.
+- **`calibration_error` is a local diagnostic, not upstream's metric.** This env emits a
+  per-episode `|confidence − correct|` from the `confidence` argument the agent passes to
+  `submit_answer`. Upstream has the judge extract a confidence from the response and reports an
+  adaptive **batch** calibration error over the run. The two are not comparable.
+- **The 80/20 split is this port's.** Upstream evaluates the 2,500-question set whole. This env
+  slices it positionally into `train` / `test` and defaults to the 80% `train` subset, so a
+  default run is not scored on the published benchmark population.
 - **Judge fail-closed.** A grading-infra failure scores `correct = False` with `judge_error =
   True` rather than crashing — so an infra failure is distinguishable from a genuine wrong
   answer, not silently counted as one.

@@ -239,11 +239,14 @@ semantics (give each run its own trace file for a guaranteed 1:1 mapping).
   reads the sim's final state, scores it, and ends the run in one call. No separate `terminate`
   is needed (that stays available only as the *abort* terminal, which scores nothing).
 - **Long horizon.** A full year is many `run_command` / `sim resume` turns; the shogym horizon is
-  `max_commands + 1` (default 4001 steps). The reserved slot is not what protects `submit`:
-  `Episode.call` handles a score terminal before it consults the horizon at all, so `submit` is
-  never preempted either way. What the extra slot buys is one more ordinary command, since the
-  call that reaches the horizon is dispatched before it seals. Raise `max_commands`
-  for verbose policies.
+  `max_commands + 1` (default 4001 steps), and the `+ 1` is what keeps `submit` reachable.
+  `Episode.call` seals on the ordinary call that *reaches* the horizon, so with a horizon of
+  exactly `max_commands` the last budgeted command would itself end the episode and a following
+  `submit` would be tombstoned and scored as a horizon zero. The extra slot leaves the episode
+  open after the full budget. A `submit` issued while the episode is still open is handled
+  before the horizon check, so the horizon never preempts it — but that priority only helps
+  because the `+ 1` leaves an open episode to submit into. Raise `max_commands` for verbose
+  policies.
 - **One company per DB.** YC-Bench stores a single simulation per database, so each episode gets
   its own private SQLite file (seeded on `begin_session`, deleted on `end_session`). Sessions
   never share state.

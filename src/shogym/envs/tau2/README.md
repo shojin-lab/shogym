@@ -204,8 +204,10 @@ semantics (give each run its own trace file for a guaranteed 1:1 mapping).
   benchmark content.
 - **Python 3.12 pin rationale.** The pinned tau2 revision imports the stdlib `audioop` module,
   removed in 3.13 — this is why the shared project pin is `>=3.12,<3.13`.
-- **banking uses `bm25_grep`.** `tau2_banking_knowledge` is pinned to the offline `bm25_grep`
-  retrieval variant (rank-bm25, no embeddings) so it constructs/serves offline. The benchmark
+- **banking uses `bm25_grep`.** `tau2_banking_knowledge` is pinned to the `bm25_grep` retrieval
+  variant (rank-bm25, no embeddings) so it constructs and serves without a *retrieval* key. It is
+  a non-solo domain, so the default served user simulator is still an LLM and does make model
+  calls. The benchmark
   default (`alltools`, dense OpenAI embeddings) needs a key at construction time and is a keyed
   follow-up.
 - **NL-assertion reward is keyed.** `retail` carries `NL_ASSERTION` in nearly every task's

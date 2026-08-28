@@ -364,7 +364,8 @@ def _find_verdict(trajectory: Trajectory) -> Optional[Dict[str, Any]]:
 
 @register("tau2_mock")
 class Tau2MockEnv(Tau2Env):
-    """tau2's ``mock`` domain (solo mode) — the smallest fully-offline slice."""
+    """tau2's ``mock`` domain (solo mode) — the smallest keyless slice (no user-simulator
+    model call; see the README on litellm's cost-map fetch at import)."""
 
     domain = "mock"
     solo_mode = True

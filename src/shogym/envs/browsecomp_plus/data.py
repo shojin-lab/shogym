@@ -1,4 +1,7 @@
-"""Lazy, gated data provisioning for the ``browsecomp_plus`` env (issue #43).
+"""Lazy data provisioning for the ``browsecomp_plus`` env (issue #43).
+
+The three Hugging Face repos are **public and ungated** at the pinned revisions (unlike the HLE
+port's ``cais/hle``); what they need is network access, not accepted terms or a token.
 
 Three pieces, all kept out of ``import shogym`` (imported only when the *registered* env is
 constructed, never at module import — so registering the env stays offline):

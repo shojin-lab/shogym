@@ -3,8 +3,10 @@
 Frontier-Bench is *continuously versioned* — the upstream repo is re-tagged as tasks land and
 verifiers are corrected. A port is therefore a **snapshot**: this module pins commit
 ``eb4af26c`` and records, per vendored task, the ``sha256`` digest exactly as it appears in
-upstream ``tasks/dataset.toml``. ``UPSTREAM_TAG = "v0.1.0"`` is a label this port records and
-serves; nothing at the pinned commit corroborates it (see the env README). Each task's files are
+upstream ``tasks/dataset.toml``. ``UPSTREAM_TAG = "v0.1.0"`` records upstream's **Harbor Hub
+dataset version** for these 74 tasks (published as ``frontier-bench/frontier-bench@0.1.0``; the
+leading ``v`` is this port's). It is not a Git tag — no such ref resolves upstream — so the
+commit above is the source anchor. See the env README. Each task's files are
 *vendored* under ``tasks/<name>/`` (they are tiny — a handful of CSVs/scripts, two Dockerfiles,
 an oracle, and a pytest verifier), so ``describe`` / verdict parsing / the tool schema all work
 fully offline; only *serving* an episode needs Docker.

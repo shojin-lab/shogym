@@ -141,8 +141,10 @@ frontier_bench = []
 automationbench = [
     "datasets>=2.19",
 ]
-# The BrowseComp-Plus port (src/shogym/envs/browsecomp_plus), pinned to upstream
-# commit 0469490. `datasets` lazy-loads the XOR-encrypted `Tevatron/browsecomp-plus` queries
+# The BrowseComp-Plus port (src/shogym/envs/browsecomp_plus). Upstream commit 0469490 covers the
+# qrels and the evaluation/judge code this port copies; the encrypted queries and the prebuilt
+# BM25 index carry their own Hugging Face revisions (HF_QUERIES_REVISION / INDEX_REVISION in
+# data.py). `datasets` lazy-loads the XOR-encrypted `Tevatron/browsecomp-plus` queries
 # (decrypted in memory only — never persisted), `openai` backs the default model-graded judge,
 # and `pyserini` (which also needs a Java 21 runtime) is the BM25/Lucene retriever over the
 # prebuilt corpus index. Optional so `pip install shogym` (and the core offline test suite) stay

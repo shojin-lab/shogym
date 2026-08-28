@@ -48,7 +48,10 @@ DEFAULT_COMPANY_NAME = "BenchCo"
 
 # Deterministic, disjoint train/test seed banks. A task *is* a seed: it selects the market
 # tasks generated for the world (employees/clients are fixed across seeds upstream), so a seed
-# fully reproduces an instance. Seeds are small positive ints (upstream uses 1, 2, 3, …); the
+# reproduces an instance's *business attributes*. It does not reproduce the row ids: those are
+# fresh ``uuid4``s, they reach the agent in ``sim resume`` wake events, and they break ties
+# between simultaneous events (see the env README). Seeds are small positive ints (upstream
+# uses 1, 2, 3, …); the
 # test bank is offset far away so the two never overlap.
 _TRAIN_SEEDS: List[int] = list(range(1, 17))  # 16 tasks
 _TEST_SEEDS: List[int] = list(range(9001, 9017))  # 16 held-out tasks
@@ -104,10 +107,10 @@ class YcBenchEnv(Env):
     Config (all optional, via ``shogym.make("yc_bench", config=...)`` / ``env_config``):
       - ``task_split``: ``"train"`` (default) or ``"test"`` — selects the seed bank.
       - ``config_name``: YC-Bench preset name or ``.toml`` path (default ``"default"``).
-      - ``max_commands``: the *advertised* command budget per episode. The shogym horizon is
-        ``max_commands + 1`` and the command that reaches it is dispatched before it seals, so
-        ``max_commands + 1`` ordinary commands can execute; ``submit`` is handled before the
-        horizon is consulted and is never preempted.
+      - ``max_commands``: the command budget per episode. The shogym horizon is
+        ``max_commands + 1``: the first ``max_commands`` ordinary commands leave the episode
+        open, and a further one both executes and seals. The ``+ 1`` is what keeps ``submit``
+        reachable after the full budget (see the README's *Long horizon* note).
       - ``horizon_years``: sim horizon (default: the preset's ``sim.horizon_years``).
       - ``start_date`` / ``company_name``: seeding parameters (defaults match ``yc-bench run``).
       - ``command_timeout_seconds``: per-command wall-clock budget.

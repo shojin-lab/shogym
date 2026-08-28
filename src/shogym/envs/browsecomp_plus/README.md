@@ -26,7 +26,8 @@ recorded trajectory while an external harness drives the tools — see
 ## Running it
 
 > Requires **Python 3.12 + the `browsecomp_plus` extra**, an OpenAI key for the judge, Hugging
-> Face access to the (encrypted) query dataset, and a **Java 21** runtime (pyserini/Lucene) — the
+> Face network access for the (encrypted, but public and ungated) query dataset, and a **Java 21**
+> runtime (pyserini/Lucene) — the
 > prebuilt **BM25 index auto-downloads once** on first served use. See
 > [Requirements](#requirements). Offline tests need none of it.
 
@@ -149,7 +150,9 @@ qrels. `score_trajectory` reads:
 - **`correct`** — the judge's verdict, off the core-owned `evidence.verdict` (never a marker in a
   tool result the agent can forge). A judge / finalize failure is flagged `judge_error=True`.
 - **`confidence`** (0–1) + **`calibration_error`** (`|confidence − correct|`) — HLE-style, read
-  from the validated submission (`evidence.args`); omitted on a horizon/abort end.
+  from the validated submission (`evidence.args`); omitted on a horizon/abort end. A local
+  per-episode diagnostic, not upstream's batch `calib_err` (see
+  [Fidelity & deviations](#fidelity--deviations)).
 - **`retrieval_recall`** — fraction of the query's evidence docids (`qrel_evidence`) retrieved
   across all `search` steps (BrowseComp-Plus's retrieval recall).
 - **`citation_recall` / `citation_precision` / `num_citations`** — cited-docid metrics vs
@@ -207,6 +210,21 @@ semantics (give each run its own trace file for a guaranteed 1:1 mapping).
   failure fails closed to `correct=False` with `judge_error=True`.
 - **Queries stay encrypted at rest.** The XOR/canary decryption happens only in memory at load;
   shogym never writes or commits decrypted queries/answers. The canary constant is preserved.
+- **Snippets are cut on whitespace, not subwords.** Upstream truncates a `search` snippet with
+  the `Qwen/Qwen3-0.6B` tokenizer (`searcher/tools.py`); this port splits on whitespace to stay
+  dependency-light. At the same nominal `snippet_max_tokens=512` a whitespace token is usually
+  longer than a subword one, so the agent generally sees a different, longer evidence window
+  than upstream would show it. That can change the submitted answer and its citations, so it is
+  a scoring-relevant deviation even though retrieval recall (docid-based) is unaffected.
+- **`calibration_error` is a local diagnostic, not upstream's metric.** This env emits a
+  per-episode `|confidence − correct|` from the `confidence` argument the agent passes to
+  `submit_answer`. Upstream has the *judge* extract a confidence from the response and computes
+  an adaptive **batch** calibration error (`calib_err`, `p=2`, `beta=100`, over at least 100
+  replies) in `scripts_evaluation/evaluate_run.py`. The two are not comparable; do not report
+  this number against the published Calibration Error.
+- **The 80/20 split is this port's.** Upstream evaluates its supplied query population whole.
+  This env slices it positionally into `train` / `test` and defaults to the 80% `train`
+  subset, so a default run is not scored on the published benchmark population.
 
 ## Gotchas
 

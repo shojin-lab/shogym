@@ -83,7 +83,8 @@ README covers the model and the shared env-README template.
   [BrowseComp-Plus](https://github.com/texttron/BrowseComp-Plus). Answer reasoning-heavy queries
   against a fixed ~100K-doc corpus via `search` / `get_document` / `submit_answer`, graded by an
   LLM judge plus deterministic retrieval-recall and citation metrics. Needs the
-  `browsecomp_plus` extra, `OPENAI_API_KEY`, Java 21, and gated dataset access.
+  `browsecomp_plus` extra, `OPENAI_API_KEY`, Java 21, and Hugging Face network access (the
+  datasets are public).
 - **[`automationbench`](src/shogym/envs/automationbench/README.md)**: a port of
   [AutomationBench](https://github.com/zapier/AutomationBench). Carry out a cross-application
   business workflow over a fully simulated world of ~47 SaaS apps via an `api` tool surface,
