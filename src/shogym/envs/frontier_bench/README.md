@@ -69,7 +69,9 @@ bail-out.) shogym reads the verdict off the trace via `shogym.result_from_trace(
 
 **Config** (via `shogym.make(name, config)` / `env_config`): `task` (the *default* task by name or
 index, used when a serve/describe call omits the selector; default `"fin-saccr-rwa"` / index 0),
-`max_steps` (tool-call budget, default 400; the shogym horizon is `max_steps + 2`),
+`max_steps` (the *advertised* tool-call budget, default 400; the shogym horizon is
+`max_steps + 2` and the call that reaches it still runs, so `max_steps + 2` ordinary calls can
+execute and `done` is never preempted),
 `command_timeout_seconds`
 (per-`exec` budget), and `keep_container` (leave the container + images up after the episode, for
 debugging).

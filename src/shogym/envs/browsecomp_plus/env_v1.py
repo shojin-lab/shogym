@@ -2,7 +2,8 @@
 
 A Deep-Research **retrieval** benchmark: answer OpenAI BrowseComp's reasoning-heavy queries
 against a **fixed, human-verified corpus** (served ``search`` / ``get_document`` tools) instead
-of the live web — isolating search+reasoning from web noise and making runs reproducible. This
+of the live web — isolating search+reasoning from web noise and stabilising retrieval (not the
+whole run: cached inputs bypass the pins and the judge is sampled). This
 is "HLE with a fixed retrieval corpus": the answer is graded by an LLM judge (as in the HLE
 port), and the env adds deterministic **retrieval recall** (off the recorded ``search`` steps)
 and **citation** metrics (off the submitted answer the terminal evidence carries), both scored
@@ -175,10 +176,12 @@ class BrowseCompPlusEnv(Env):
     def _searcher_for_session(self) -> Searcher:
         """The injected searcher, or a lazily-built default ``BM25Searcher`` (built once, shared).
 
-        Deferred to session start (not env construction), so ``shogym.make(...)``, the tool
-        manifest, and ``describe()`` stay offline: building the BM25 searcher opens the prebuilt
-        Lucene index (Java 21 + pyserini) and provisions the corpus, which must not happen just to
-        read the contract. The searcher is read-only, so one instance safely backs every episode."""
+        Deferred to session start (not env construction): building the BM25 searcher opens the
+        prebuilt Lucene index (Java 21 + pyserini) and provisions the corpus, which must not
+        happen just to read the contract. That deferral is about the index alone — a default
+        ``shogym.make(...)`` still loads the query dataset and both qrel files (see the module
+        docstring); only an injected ``tasks=`` avoids those downloads. The searcher is
+        read-only, so one instance safely backs every episode."""
         if self._searcher is not None:
             return self._searcher
         from shogym.envs.browsecomp_plus.data import bm25_index_path
@@ -191,7 +194,9 @@ class BrowseCompPlusEnv(Env):
         """The injected judge, or a lazily-built default ``OpenAIJudge`` (no network yet).
 
         Preflighted at session start (not env construction), so making the env, probing the tool
-        manifest, and ``describe()`` stay offline and keyless. The default ``OpenAIJudge`` needs
+        manifest, and ``describe()`` stay keyless and build no client. (They are not otherwise
+        network-free: a default construction downloads the queries and qrels.) The default
+        ``OpenAIJudge`` needs
         ``OPENAI_API_KEY`` to grade answers; with no key it would fail-close every answer to
         incorrect, silently deflating the benchmark. Raise early and clearly instead — but only in
         the "forgot the key" case: an injected ``judge=`` or a ``judge_base_url`` override (a
@@ -336,7 +341,8 @@ class BrowseCompPlusEnv(Env):
         evidence: Optional[TerminalEvidence] = None,
     ) -> FeedbackCollection:
         """Score the episode: correctness from the core-owned ``evidence`` (never marker JSON),
-        plus deterministic retrieval/citation metrics off the recorded trajectory + the task's
+        plus retrieval recall off the recorded trajectory and citation metrics off the submitted
+        answer the same evidence carries, both against the task's
         qrels. Pure over its inputs."""
         return score_trajectory(trajectory, task, terminated=terminated, evidence=evidence)
 
@@ -355,7 +361,8 @@ def score_trajectory(
 
     Correctness comes from the core-owned :class:`TerminalEvidence` the seal transaction
     produced (the judge's verdict) — not from any tool result the agent can forge. The
-    retrieval/citation metrics are deterministic over the trajectory + the task's qrels.
+    retrieval recall is deterministic over the trajectory and the citation metrics over the
+    submitted answer carried on the terminal evidence, both against the task's qrels.
 
     Emits, on termination:
       - ``correct`` (bool) — the judge's verdict (False if the episode ended with no evidence).

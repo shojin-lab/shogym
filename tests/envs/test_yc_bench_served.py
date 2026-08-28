@@ -2,10 +2,12 @@
 YC-Bench's sim state flows back into episode feedback through the seal-before-verdict path.
 
 Requires the ``yc_bench`` extra and the provisioned upstream source — skipped otherwise (naming
-the reason), so the offline core suite stays green. YC-Bench generates its whole world
-deterministically from the seed and runs its sim in process, so once the source is cached the
-entire path (seed → CLI commands → sealed finalize → verdict) runs offline, with no model calls
-or API keys.
+the reason), so the offline core suite stays green. YC-Bench generates its world from the seed
+and runs its sim in process, so once the source is cached the path (seed → CLI commands →
+sealed finalize → verdict) makes no model call and needs no API key. It is not strictly
+network-free: importing the adapter pulls in litellm, which reaches for a model-cost map unless
+``LITELLM_LOCAL_MODEL_COST_MAP=true``. Row ids are ``uuid4`` and differ per run, so what is
+reproducible is the seeded business state and the final funds, not the identifiers.
 """
 
 from __future__ import annotations

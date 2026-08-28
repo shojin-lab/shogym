@@ -10,9 +10,9 @@ contained to one file (per issue #32's fidelity caveat), *every* ``yc_bench`` im
 here, behind a small, stable surface the rest of the env calls:
 
   - :func:`build_db` — open a fresh per-session SQLite database.
-  - :func:`seed_session` — seed one deterministic company/world (reuses yc-bench's own
+  - :func:`seed_session` — seed one company/world from the task seed (reuses yc-bench's own
     ``_init_simulation``, so the seeded world matches ``yc-bench run``'s attributes for a given
-    seed/config/start-date).
+    seed/config/start-date; the row ids are fresh ``uuid4``s either way).
   - :func:`run_cli` — execute one ``yc-bench <cmd>`` against the session DB, reusing
     yc-bench's command-validation policy and its real CLI entry point.
   - :func:`read_final_state` — read the authoritative terminal metrics (funds, survival,

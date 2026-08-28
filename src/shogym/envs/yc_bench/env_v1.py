@@ -104,8 +104,10 @@ class YcBenchEnv(Env):
     Config (all optional, via ``shogym.make("yc_bench", config=...)`` / ``env_config``):
       - ``task_split``: ``"train"`` (default) or ``"test"`` — selects the seed bank.
       - ``config_name``: YC-Bench preset name or ``.toml`` path (default ``"default"``).
-      - ``max_commands``: the command budget per episode (the shogym horizon is
-        ``max_commands + 1``, reserving a slot for the terminal ``submit``).
+      - ``max_commands``: the *advertised* command budget per episode. The shogym horizon is
+        ``max_commands + 1`` and the command that reaches it is dispatched before it seals, so
+        ``max_commands + 1`` ordinary commands can execute; ``submit`` is handled before the
+        horizon is consulted and is never preempted.
       - ``horizon_years``: sim horizon (default: the preset's ``sim.horizon_years``).
       - ``start_date`` / ``company_name``: seeding parameters (defaults match ``yc-bench run``).
       - ``command_timeout_seconds``: per-command wall-clock budget.
@@ -238,9 +240,11 @@ class YcBenchEnv(Env):
         session (``engine.dispose()`` / DB teardown) only *after* this returns, so the read here
         always sees an open DB. The verdict is the sim's own end-state — the agent's company
         metrics, public-safe with no oracle; ``verify`` applies the terminal-state gate when it
-        scores it, and core stamps the provenance. Offline and keyless, and the sim advances
-        deterministically in-process from the seed and the commands issued — though upstream's
-        world seeding mints ``uuid4`` row ids, so the identifiers differ run to run.
+        scores it, and core stamps the provenance. Keyless and in-process. Determinism is
+        narrower than it looks: the seeded *business attributes* follow the seed, and the tested
+        property is that one seed and one command sequence end on the same funds. Row ids are
+        ``uuid4``, they reach the agent through ``sim resume`` wake events, and they break ties
+        between simultaneous events, so the trajectory itself is not fixed by the seed.
         """
         from shogym.envs.yc_bench import mcp_server  # lazy: pulls in yc_bench
         from shogym.serve.lifecycle import TerminalEvidence

@@ -375,7 +375,8 @@ class Tau2MockEnv(Tau2Env):
 @register("tau2_airline")
 class Tau2AirlineEnv(Tau2Env):
     """tau2's ``airline`` domain (non-solo; user simulator). reward_basis = DB + COMMUNICATE,
-    both scored offline — so a ``mock_response`` user makes the whole slice offline."""
+    both scored without a model call — so a ``mock_response`` user keeps the whole slice
+    keyless (see the README on litellm's cost-map fetch at import)."""
 
     domain = "airline"
     solo_mode = False

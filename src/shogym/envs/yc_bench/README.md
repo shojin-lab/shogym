@@ -68,7 +68,8 @@ variable at the top of its `serve.py`:
 ENV = "yc_bench"
 ```
 
-The sim itself is fully offline and needs no OpenAI or YC-Bench key; the harness still
+The sim itself needs no OpenAI or YC-Bench key and makes no model call of its own (importing the
+adapter still reaches for litellm's cost map, see [Requirements](#requirements)); the harness
 makes its own model calls.
 
 ## Requirements
@@ -238,8 +239,10 @@ semantics (give each run its own trace file for a guaranteed 1:1 mapping).
   reads the sim's final state, scores it, and ends the run in one call. No separate `terminate`
   is needed (that stays available only as the *abort* terminal, which scores nothing).
 - **Long horizon.** A full year is many `run_command` / `sim resume` turns; the shogym horizon is
-  `max_commands + 1` (default 4001 steps) — `max_commands` non-terminal commands plus one
-  reserved slot so the terminal `submit` is never preempted by the horizon. Raise `max_commands`
+  `max_commands + 1` (default 4001 steps). The reserved slot is not what protects `submit`:
+  `Episode.call` handles a score terminal before it consults the horizon at all, so `submit` is
+  never preempted either way. What the extra slot buys is one more ordinary command, since the
+  call that reaches the horizon is dispatched before it seals. Raise `max_commands`
   for verbose policies.
 - **One company per DB.** YC-Bench stores a single simulation per database, so each episode gets
   its own private SQLite file (seeded on `begin_session`, deleted on `end_session`). Sessions

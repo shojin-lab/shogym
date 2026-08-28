@@ -145,7 +145,9 @@ class HleEnv(Env):
         """The injected judge, or a lazily-built default ``OpenAIJudge`` (no network yet).
 
         Preflighted at session start (not env construction), so ``shogym.make("hle")``, the tool
-        manifest, and ``describe()`` all stay offline and keyless. The default ``OpenAIJudge``
+        manifest, and ``describe()`` stay keyless and build no client. They are not otherwise
+        network-free: a default construction downloads the gated ``cais/hle`` split (pass
+        ``tasks`` to skip it). The default ``OpenAIJudge``
         needs ``OPENAI_API_KEY`` to grade the (almost always free-form) non-exact answers; with
         no key it would raise inside ``submit_answer`` and every non-exact answer would
         fail-closed to ``correct=False``, silently deflating the benchmark. Raise early and

@@ -2,7 +2,9 @@
 
 Thin per-domain module exposing the ``server`` attribute the in-process transport resolves.
 Pinned to the ``bm25_grep`` retrieval variant (rank-bm25, no OpenAI embeddings) so the tool
-manifest builds — and the env constructs/serves — fully offline. The benchmark-default
+manifest builds — and the env constructs/serves — without a retrieval key. Only *retrieval* is
+keyless: this is a non-solo domain, so the default served user simulator is an LLM and does make
+model calls (see the env README). The benchmark-default
 ``alltools`` variant (dense embeddings) requires an OpenAI key at construction time and is a
 keyed follow-up; switching variants would also change the published tool manifest, so it is
 fixed here to match. Requires the ``tau2`` extra (with ``rank-bm25``).

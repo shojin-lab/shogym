@@ -659,8 +659,9 @@ async def test_injected_judge_and_the_fast_path_claim_no_judge_model() -> None:
 
 
 async def test_make_and_describe_are_keyless(monkeypatch) -> None:
-    # Constructing the env, reading describe(), and probing the tool manifest must stay offline
-    # and keyless with the default judge — only session-begin preflights the key.
+    # Constructing the env, reading describe(), and probing the tool manifest must stay keyless
+    # with the default judge — only session-begin preflights the key. Tasks are injected here, so
+    # this also avoids the dataset download a default construction would make.
     import shogym
 
     monkeypatch.delenv("OPENAI_API_KEY", raising=False)

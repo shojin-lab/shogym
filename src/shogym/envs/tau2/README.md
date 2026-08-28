@@ -144,14 +144,14 @@ selected by `task_split`.
 
 | Env | Domain | Mode | Notes |
 |---|---|---|---|
-| `tau2_mock` | mock | **solo** (tau2 `DummyUser`) | tiny, fully offline — no user-sim LLM |
+| `tau2_mock` | mock | **solo** (tau2 `DummyUser`) | tiny, keyless — no user-sim LLM |
 | `tau2_airline` | airline | non-solo | user simulator (LLM) |
 | `tau2_retail` | retail | non-solo | user simulator; NL-assertion reward |
 | `tau2_telecom` | telecom | non-solo | user operates device tools; user simulator |
 | `tau2_banking_knowledge` | banking_knowledge | non-solo | pinned to the offline `bm25_grep` retrieval variant |
 
 **Solo vs non-solo:** in solo mode the agent works autonomously (tau2's `DummyUser`, no
-user-simulator LLM), so the episode runs offline. Non-solo domains drive tau2's LLM user
+user-simulator LLM), so the episode makes no model call. Non-solo domains drive tau2's LLM user
 simulator, so an episode makes model calls (see [Requirements](#requirements)).
 
 **Splits:** `airline` / `retail` / `telecom` expose tau2's declared `train`/`test` splits
@@ -251,6 +251,6 @@ semantics (give each run its own trace file for a guaranteed 1:1 mapping).
 |---|---|
 | `env_v1.py` | The registered `tau2_*` envs (one per domain): `describe` (policy + ticket + manifest), the `finalize` hook (tau2 agent-stop → `evaluate_simulation` once, on the sealed episode), and the pure `_verify` scorer (verdict from evidence). |
 | `mcp_server.py` | The bridge: hosts tau2's `Orchestrator` + `GymAgent` on a per-episode background thread, turning each MCP tool call into the agent's next action; `done` is the score terminal. |
-| `mock_server.py` | The solo `mock` domain server (tau2 `DummyUser`, fully offline). |
+| `mock_server.py` | The solo `mock` domain server (tau2 `DummyUser`, no user-simulator model call). |
 | `airline_server.py` / `retail_server.py` / `telecom_server.py` | The non-solo domain servers (domain tools + `send_message` to the LLM user simulator). |
 | `banking_knowledge_server.py` | The `banking_knowledge` domain server, pinned to the offline `bm25_grep` retrieval variant. |

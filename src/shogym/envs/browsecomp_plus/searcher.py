@@ -53,7 +53,7 @@ class InMemorySearcher:
     For fixtures and offline tests only — **not** BM25. Scores each document by the
     number of distinct query terms it contains (ties broken by total term frequency, then docid
     for stability), which is enough to exercise the served ``search`` / ``get_document`` tools and
-    the retrieval/citation metrics without Java, pyserini, or the 2.78 GB corpus.
+    the retrieval/citation metrics without Java, pyserini, or the ~2.17 GB prebuilt BM25 index.
 
     ``corpus`` is a mapping of ``docid -> text`` (docids are compared as strings).
     """

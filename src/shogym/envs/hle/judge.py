@@ -66,7 +66,8 @@ class Judge(Protocol):
 
     Implementations must be side-effect-free apart from the model call and must not raise on
     an ordinary bad response — return ``JudgeResult(correct=False)`` instead. The handler
-    guards against exceptions regardless, but a well-behaved judge keeps the episode clean.
+    finalizer guards against exceptions regardless, but a well-behaved judge keeps the episode
+    clean.
     """
 
     def __call__(

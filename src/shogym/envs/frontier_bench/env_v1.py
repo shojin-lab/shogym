@@ -88,7 +88,9 @@ class FrontierBenchEnv(Env):
     Config (all optional, via ``shogym.make("frontier_bench", config=...)`` / ``env_config``):
       - ``task``: the *default* vendored task, by name or index — used when a serve/describe call
         omits the task selector (default ``"fin-saccr-rwa"``, index 0).
-      - ``max_steps``: the tool-call budget per episode (the shogym horizon is ``max_steps + 2``).
+      - ``max_steps``: the *advertised* tool-call budget per episode. The shogym horizon is
+        ``max_steps + 2`` and the ordinary call that reaches it is dispatched before it seals, so
+        ``max_steps + 2`` ordinary calls can execute; ``done`` is never preempted by the horizon.
       - ``command_timeout_seconds``: per-``exec`` wall-clock budget inside the container.
       - ``keep_container``: leave the container + images up after the episode (debugging).
     """

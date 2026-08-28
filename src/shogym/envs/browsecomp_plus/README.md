@@ -7,7 +7,10 @@ port copies; the encrypted queries and the BM25 index carry their own Hugging Fa
 (see [Fidelity & deviations](#fidelity--deviations)). The task: answer OpenAI BrowseComp's
 reasoning-heavy queries against a **fixed, human-verified ~100K-doc corpus** served as
 `search` / `get_document` tools, instead of the live web. Freezing the corpus isolates search +
-reasoning from web noise and makes runs reproducible. `submit_answer` is the **score terminal**:
+reasoning from web noise, and the pinned cold-cache inputs keep retrieval stable. That is not
+end-to-end reproducibility: a cached or overridden index or qrel file bypasses the pins, and the
+judge is lower variance rather than deterministic (see
+[Fidelity & deviations](#fidelity--deviations)). `submit_answer` is the **score terminal**:
 submitting seals the episode and the env's `finalize` hook grades the sealed answer with an LLM
 judge (as in the [HLE](../hle/README.md) port), and the env adds deterministic
 **retrieval-recall** and **citation** metrics scored against the query's relevance judgements

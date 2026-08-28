@@ -21,7 +21,8 @@ loop. This server exposes the command surface as two MCP tools:
 
 Each episode gets its own throwaway SQLite database (one company per DB, matching yc-bench's
 single-simulation-per-DB model), seeded from the task's seed on ``begin_session`` (same
-business attributes every run; upstream mints fresh ``uuid4`` row ids) and torn down on
+business attributes every run; upstream mints fresh ``uuid4`` row ids, which reach the agent in
+``sim resume`` wake events and break ties between simultaneous events) and torn down on
 ``end_session``. State is keyed by ``_session_id`` (shogym
 injects it), so concurrent episodes are isolated. All ``yc_bench`` imports are funnelled
 through :mod:`shogym.envs.yc_bench.adapter`, so importing this module requires the ``yc_bench``

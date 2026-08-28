@@ -50,10 +50,12 @@ reads the verdict off the trace via `shogym.result_from_trace(...)`.
 `marketing` / `operations` / `support` / `finance` / `hr` / `simple` — or the `public` alias,
 the default, expanding to the six public domains = the 600 distributed tasks), `tasks` (an
 explicit list of raw upstream task rows — bypasses the domain loaders, used by the offline
-tests), and `max_steps` (the tool-call budget; the shogym horizon is `max_steps + 2`, default
-`max_steps=50` — upstream's `--max-steps` default and the "~50 tool-using turns" budget the
-task prompts advertise; the `+2` keeps the horizon a hair above the budget so a run can still
-call `done` explicitly).
+tests), and `max_steps` (the *advertised* tool-call budget, default 50 — upstream's
+`--max-steps` default and the "~50 tool-using turns" the task prompts quote). It is not an
+enforced cap on ordinary calls: the shogym horizon is `max_steps + 2`, `Episode.call` dispatches
+the ordinary call that reaches the horizon before sealing it as the terminal step, and a score
+terminal is handled before the horizon is consulted at all. So `max_steps + 2` ordinary calls
+can execute, and `done` is never preempted.
 
 ### Quickstart
 
