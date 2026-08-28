@@ -35,9 +35,9 @@ to either: there is no field in the protocol for one and no comparison in this f
 **And no lifecycle fact comes from this process either.** There is no seal, quiesce, read or close
 command. The writer on this process's own socket is reachable from inside the interpreter that
 executes agent-authored Python, so a reply saying "I have stopped", "nothing else is running" or
-"the filing says X" is a reply the episode could have written. The host stops this process's group,
-confirms it is gone by reading the process table itself, and grades the tree on disk. Nothing here
-has to flush a final state, because upstream already did: ``AppWorld.execute`` ends with its own
+"the filing says X" is a reply the episode could have written. The host stops this process, waits
+for it, and grades the tree on disk. Nothing here has to flush a final state, because upstream
+already did: ``AppWorld.execute`` ends with its own
 save into the episode's output tree and ``initialize`` writes one before any block runs, so an
 episode that ran N blocks is graded on the state after block N and one that ran none is graded on
 its opening state. Work an agent's thread does after its last block is lost rather than scored,
@@ -371,10 +371,9 @@ def build_handler(episode: Episode, token: str, server: List[Any]) -> type:
     **There are no lifecycle commands, and that is the point.** ``seal``, ``quiesce``, ``read``
     and ``close`` are gone: this is the process that runs agent-authored Python, so a reply from
     it saying "I have stopped", "nothing else is running" or "the filing says X" is a reply the
-    episode could have written. The host stops this process's group, confirms it is gone by
-    reading the process table itself, and grades the tree upstream already wrote (see
-    :meth:`Episode.execute`). What is left here is the two commands that have to come from the
-    world because only the world can answer them."""
+    episode could have written. The host stops this process, waits for it, and grades the tree
+    upstream already wrote (see :meth:`Episode.execute`). What is left here is the two commands
+    that have to come from the world because only the world can answer them."""
     commands = {
         "/seed": episode.seed,
         "/open": episode.open,
