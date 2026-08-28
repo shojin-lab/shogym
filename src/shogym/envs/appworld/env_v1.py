@@ -39,6 +39,7 @@ from __future__ import annotations
 import asyncio
 import datetime as dt
 import hashlib
+import threading
 import zlib
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, Dict, Optional
@@ -421,11 +422,21 @@ class AppWorldEnv(Env):
         # A tree of regular files, or no grade. See `adapter.snapshot_outputs`: the grading
         # process is pointed at the root that holds the answers, so a link left under the output
         # tree would resolve there.
-        snapshot = await asyncio.to_thread(
-            adapter.snapshot_outputs,
-            Path(session.experiment),
-            into=Path(session.experiment + ".graded"),
-        )
+        # The copy runs in a thread, and cancelling an `await` does not stop a thread: a
+        # finalization the deadline gave up on would otherwise leave one walking an episode's
+        # tree, holding the file handles and the disk it needs. The flag is what the thread stops
+        # for, checked once per file.
+        abandon = threading.Event()
+        try:
+            snapshot = await asyncio.to_thread(
+                adapter.snapshot_outputs,
+                Path(session.experiment),
+                into=Path(session.experiment + ".graded"),
+                stop=abandon,
+            )
+        except BaseException:
+            abandon.set()
+            raise
         graded = await asyncio.to_thread(
             adapter.grade,
             root=self._graded.parent,
@@ -584,9 +595,17 @@ def run_fingerprint(*, pulse: int, report: str, blocks: int, corpus: str = "") -
     """Everything two runs must agree on for their rows to be one measurement.
 
     The draw and the payload class decide what a score *means*; the block budget decides what an
-    episode had the chance to do; the corpus, the interpreter and the derivation decide what world
-    it happened in; every constant a payload is generated from decides what the agent was told;
-    and :data:`SCORING_VERSION` decides how it was read. ``corpus`` is what the corpus actually
+    episode had the chance to do; the corpus, the realized interpreter and the derivation decide
+    what world it happened in; the generator's constants decide what was seeded into it; the
+    instructions, the tool guide and the appended paragraph are what the agent was asked to do;
+    every constant a payload is generated from decides what it was told afterwards; and
+    :data:`SCORING_VERSION` decides how it was read.
+
+    **What is not here, and whose it is.** A stream's ``deadline`` decides whether a slow episode
+    is scored and its ``max_in_flight`` decides the tool surface and the scheduling, so both
+    belong to a run's identity. Neither is an env's to know: an env is handed a task and is not
+    told which stream is serving it. They are carried in the stream's own persisted identity on
+    shojin-lab/shogym#140 rather than guessed at from here. ``corpus`` is what the corpus actually
     holds rather than what the pin says it should (see :func:`~adapter.corpus_digest`), because
     the root is whatever the environment points at and a repointed one would otherwise pass for
     the pinned one. A provenance directory reopened under a
@@ -614,6 +633,12 @@ def run_fingerprint(*, pulse: int, report: str, blocks: int, corpus: str = "") -
             adapter.DATA_BUNDLE_SHA256,
             corpus,
             adapter.UPSTREAM_VERSION,
+            # What the interpreter and its dependency set turned out to be, rather than the one
+            # version that was asked for. The runtime cache is named for the direct AppWorld
+            # release while it is built by resolving that release's ranges against whatever the
+            # host and the index offer on the day, so two runs could sit under one name and one
+            # identity with different worlds underneath them.
+            adapter.runtime_digest(),
             adapter.MANIFEST.read_text(),
             payload.PASS_COUNTS_FILE.read_text(),
             # Every constant a published payload is generated from, and this one was missing.
@@ -621,6 +646,15 @@ def run_fingerprint(*, pulse: int, report: str, blocks: int, corpus: str = "") -
             # every drawn payload, which is a change to the treatment an agent is under, and a
             # record could resume across it under an unchanged identity.
             payload.DRAWN_BASIS,
+            # The text the agent is actually given. These are authored treatment, not scenery: an
+            # edit to the guide or to the appended chore changes what every episode was asked to
+            # do, and the digest said nothing about it.
+            _WORLD_GUIDE,
+            _TOOL_GUIDE,
+            world.APPENDED_PARAGRAPH,
+            # What decides the seeded backlog. It already names the derived cache, so changing it
+            # served a different world under a fingerprint that had not moved.
+            adapter._generator_digest(),
         ]
     )
     return hashlib.sha256(material.encode()).hexdigest()[:16]

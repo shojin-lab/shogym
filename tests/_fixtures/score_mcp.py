@@ -53,3 +53,31 @@ def submit(answer: str, _session_id: str, confidence: int = 100) -> Dict[str, An
 def noop(_session_id: str) -> Dict[str, Any]:
     """An ordinary mid-episode tool that changes nothing."""
     return {"ok": True}
+
+
+#: Released by a test to let `block` return. A real blocking worker rather than a cancellable
+#: async substitute: FastMCP runs a synchronous tool in a worker thread, which is the shape of
+#: AppWorld's own `execute` (a blocking HTTP call into another process). Cancelling the coroutine
+#: that awaits it abandons the await and not the operation, and that difference is the whole of
+#: what the cancellation and deadline regressions are about.
+released = threading.Event()
+#: Set by `block` once it has actually returned, so a test can tell "still running" from "landed".
+landed = threading.Event()
+#: What `block` did to the world before it returned, which stands in for a world mutation an
+#: abandoned call makes after its caller has gone.
+mutations: list = []
+
+
+@server.tool
+def block(_session_id: str) -> Dict[str, Any]:
+    """An ordinary tool that does not return until a test lets it, and then mutates."""
+    released.wait(timeout=30)
+    mutations.append(_session_id)
+    landed.set()
+    return {"ok": True, "mutations": len(mutations)}
+
+
+def reset_block() -> None:
+    released.clear()
+    landed.clear()
+    mutations.clear()
