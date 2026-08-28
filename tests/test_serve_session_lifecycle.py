@@ -81,6 +81,8 @@ class _SlowSessionEnv(_FixtureScoreEnv):
         self.peak_releases = 0
         self.closed = threading.Event()
         self.closed_during_release = False
+        self.closed_after_sessions: Optional[bool] = None
+        self.sessions_closed = threading.Event()
         self.close_entries = 0
         self.peak_closes = 0
         self.closed_on_a_foreign_loop = False
@@ -105,6 +107,8 @@ class _SlowSessionEnv(_FixtureScoreEnv):
         with self._counting:
             if self._inside:
                 self.closed_during_release = True
+            if self.closed_after_sessions is None:
+                self.closed_after_sessions = self.sessions_closed.is_set()
             self._inside_close += 1
             self.close_entries += 1
             self.peak_closes = max(self.peak_closes, self._inside_close)
@@ -425,12 +429,16 @@ async def test_an_abandoned_construction_is_closed_rather_than_left_running() ->
         time.sleep(0.3)
         return _NoticingEnv(tasks=list(TASKS))
 
-    building = asyncio.ensure_future(episode_module._built(slow_factory))
+    lifecycle = episode_module._Lifecycle("probe")
+    building = asyncio.ensure_future(episode_module._built(slow_factory, lifecycle))
     await asyncio.sleep(0.02)
     building.cancel()
     with pytest.raises(asyncio.CancelledError):
         await building
-    assert await _awaited(closed.is_set), "the env nobody took was never closed"
+    # Closed on the loop it was built on, which is the lifecycle's, so there is no loop to find
+    # and none to give up on. This caller's loop is not involved at all.
+    assert _until(closed.is_set), "the env nobody took was never closed"
+    assert _until(lambda: not lifecycle.running)
 
 
 # ----- restart recovery is a startup question, asked once -----
@@ -562,10 +570,16 @@ async def test_an_off_loop_factory_is_called_in_a_thread_with_the_callers_contex
     # constructor is synchronous, so no thread it delegates to would give the caller its loop back
     # (see below).
     assert seen["thread"] == threading.main_thread().name
+    caller = asyncio.get_running_loop()
     async with stream:
         await stream.get_task()
         await stream.dispatch(SUBMIT_TOOL, {"answer": "4"})
-    assert seen["loop"] is None
+    # On a loop, and on the right one: the episode's own. An env that binds
+    # `asyncio.get_running_loop()` in its constructor binds the loop that will also close it, and
+    # that loop outlives every caller, so `off_loop_factory` moves construction off the *caller's*
+    # loop rather than off every loop.
+    assert seen["loop"] is not None
+    assert seen["loop"] is not caller
     assert seen["thread"] != threading.main_thread().name
     assert seen["marker"] == "the caller's"
 
@@ -730,28 +744,36 @@ def _a_dead_pid() -> int:
     return pid
 
 
-async def test_a_timed_out_release_closes_a_loop_affine_env_on_its_own_loop(
-    monkeypatch: pytest.MonkeyPatch,
+async def test_a_declared_off_loop_env_is_built_and_closed_on_the_same_loop(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    # `TaskStream` promises its envs are closed on the loop that built them and on no other, and
-    # a factory is allowed to bind loop-affine resources, so a close handed to a worker thread's
-    # throwaway loop is not a safe generalisation: the env refuses it, and the refusal used to be
-    # swallowed. The deferred close is scheduled back onto the owning loop while that loop can
-    # still take work.
+    # `TaskStream` promises its envs are closed on the loop that built them. An env whose factory
+    # the caller has declared safe off their loop is built on the episode's own lifecycle loop,
+    # which is also where it is closed, so the promise holds by construction: there is no second
+    # loop to find and nothing to decide when the release runs late. The bound is short and the
+    # hook is long here, so the close is arranged behind a release that has outrun it, which is
+    # the case that used to reach for a throwaway loop.
     monkeypatch.setattr(episode_module, "_END_SESSION_SECONDS", 0.02)
-    env = _SlowSessionEnv(end_seconds=0.4, bind_loop=True)
-    ep = await ServedEpisode.open_env(env, task=0)
-    await ep.call(SUBMIT_TOOL, {"answer": "4"})
-    await ep.close()
-    # Serving continues, which is the condition under which the owning loop is available: the
-    # close lands on it when the release finally comes out of the hook.
-    for _ in range(80):
-        if env.closed.is_set():
-            break
-        await asyncio.sleep(0.02)
-    assert env.closed.is_set(), "the deferred close never ran"
-    assert env.closed_on_a_foreign_loop is False
-    assert env.close_entries == 1, env.close_entries
+    built: List[_SlowSessionEnv] = []
+
+    def factory(_name: str) -> _SlowSessionEnv:
+        env = _SlowSessionEnv(end_seconds=0.3, bind_loop=True)
+        built.append(env)
+        return env
+
+    stream = TaskStream(
+        factory,
+        [TaskRef(ENV_NAME, 0)],
+        prov_dir=tmp_path / "prov",
+        off_loop_factory=True,
+    )
+    async with stream:
+        await stream.get_task()
+        await stream.dispatch(SUBMIT_TOOL, {"answer": "4"})
+    served = built[1]  # built[0] is the catalog instance, built on the caller's thread
+    assert served.closed.is_set(), "the env was never closed"
+    assert served.closed_on_a_foreign_loop is False
+    assert served.close_entries == 1, served.close_entries
 
 
 async def test_a_second_close_joins_the_deferred_one_rather_than_starting_another(
@@ -913,37 +935,34 @@ async def test_a_cancelled_close_finishes_the_close_and_hands_the_cancellation_b
     assert env.close_entries == 1
 
 
-def test_a_close_a_loop_accepted_but_never_ran_is_not_lost() -> None:
-    # A loop accepting a callback is not a loop running it. Ownership taken at the post would be
-    # taken by a close that never happens, with every retry finding it owned and nothing left to
-    # set it: the env is released and never closed. The take happens on the loop, inside the
-    # callback, and a loop that stops first leaves it for the thread.
-    env = _SlowSessionEnv()
+def test_a_lifecycle_owned_close_does_not_need_the_callers_loop_at_all() -> None:
+    # What replaces four rounds of "will that loop ever run this?". The env is built on the
+    # episode's own loop and closed there, so a caller's loop closing, pausing, or never turning
+    # again is not a question anyone has to answer: no work is ever posted to it. Driven by hand,
+    # with the caller's loop closed before the close is asked for.
+    env: Dict[str, Any] = {}
+    lifecycle = episode_module._Lifecycle("probe")
     loop = asyncio.new_event_loop()
     loop.set_exception_handler(lambda _loop, _context: None)
-    cleanup = episode_module._EnvClose(env, loop)
-    posted = threading.Event()
 
-    def from_a_worker() -> None:
-        posted.set()
-        cleanup.from_thread()
-
-    worker = threading.Thread(target=from_a_worker, name="probe-worker")
-
-    async def block_then_stop() -> None:
-        # The loop's last turn: the worker posts while this is running, and the loop stops
-        # before it can take another.
-        worker.start()
-        posted.wait(5.0)
-        time.sleep(0.1)
+    async def build() -> None:
+        env["it"] = await episode_module._built(
+            lambda: _SlowSessionEnv(), lifecycle
+        )
 
     try:
-        loop.run_until_complete(block_then_stop())
+        loop.run_until_complete(build())
     finally:
         loop.close()
-    worker.join(10.0)
-    assert env.closed.is_set(), "the close the loop accepted was never run by anyone"
-    assert env.close_entries == 1
+    built = env["it"]
+    assert built.owner is None  # `bind_loop` is off; what matters is the close below
+
+    cleanup = episode_module._EnvClose(built, lifecycle, None)
+    outcome = cleanup.close_env()
+    outcome.result(timeout=10.0)
+    assert built.closed.is_set()
+    assert built.close_entries == 1
+    lifecycle.stop(5.0)
 
 
 # ----- a CancelledError an env raised is the env's, not the caller's -----
@@ -1081,3 +1100,291 @@ def test_a_quarantined_entry_is_re_read_and_resolved_once_it_becomes_a_record(
     assert store.read("f-crash").status == "FAILED"
     # And it stops being quarantined once it is readable.
     assert store.recover_once() == []
+
+
+# ----- the slot waits for the close itself, and nothing shorter -----
+
+
+async def test_a_slot_is_not_freed_by_a_join_that_gave_up(tmp_path: Path) -> None:
+    # The join the slot owner makes used to be bounded, and a bound that expires reads exactly
+    # like a close that finished: the release task completed, `_Live.released` said the env was
+    # gone, and the next task was dispensed over an env that still held its worker and its port.
+    # With both lifecycle bounds at 10 ms and a 200 ms release there is no bound left to expire.
+    built: List[_SlowSessionEnv] = []
+
+    def factory(_name: str) -> _SlowSessionEnv:
+        env = _SlowSessionEnv(end_seconds=0.2)
+        built.append(env)
+        return env
+
+    stream = TaskStream(
+        factory,
+        [TaskRef(ENV_NAME, 0), TaskRef(ENV_NAME, 0)],
+        prov_dir=tmp_path / "prov",
+        max_in_flight=1,
+    )
+    original = (episode_module._END_SESSION_SECONDS, episode_module._ROLLBACK_SECONDS)
+    episode_module._END_SESSION_SECONDS = 0.01
+    episode_module._ROLLBACK_SECONDS = 0.01
+    try:
+        async with stream:
+            await stream.get_task()
+            await stream.dispatch(SUBMIT_TOOL, {"answer": "4"})
+            first = built[1]
+            await stream.get_task()
+            assert first.closed.is_set(), "a join that gave up freed the slot"
+            assert first.releases_finished == 1
+            await stream.dispatch(SUBMIT_TOOL, {"answer": "4"})
+    finally:
+        (
+            episode_module._END_SESSION_SECONDS,
+            episode_module._ROLLBACK_SECONDS,
+        ) = original
+
+
+# ----- a live owner is never taken over, however long it stays quiet -----
+
+
+def test_a_paused_but_open_owner_loop_is_never_taken_over() -> None:
+    # No elapsed time proves an open loop is dead. A loop between two `run_until_complete` calls
+    # looks exactly like a loop nobody will ever turn again, so a takeover on a timer reclaims a
+    # live owner and closes a loop-affine env somewhere it does not belong. Only the owner itself
+    # can say, and `is_closed` is the one thing that says it.
+    lifecycle = episode_module._Lifecycle("probe")
+    owner = asyncio.new_event_loop()
+    try:
+        env = owner.run_until_complete(_made_on(owner))
+        cleanup = episode_module._EnvClose(env, lifecycle, owner)
+        cleanup.close_env()
+        # The owner is open and idle, which is what a pause looks like. Nothing may happen.
+        time.sleep(0.6)
+        assert not env.closed.is_set(), "an idle owner was treated as a dead one"
+        assert env.closed_on_a_foreign_loop is False
+        # It comes back, and closes its own env on its own loop, exactly as it always could.
+        owner.run_until_complete(cleanup.here())
+        assert env.closed.is_set()
+        assert env.close_entries == 1
+        assert env.closed_on_a_foreign_loop is False
+    finally:
+        owner.close()
+        lifecycle.stop(5.0)
+
+
+async def _made_on(_owner: "asyncio.AbstractEventLoop") -> "_SlowSessionEnv":
+    return _SlowSessionEnv(bind_loop=True)
+
+
+async def test_a_close_asked_for_from_a_foreign_loop_hands_off_and_waits() -> None:
+    # Asking a foreign running loop to run `asyncio.run` is a nested-run `RuntimeError`, and
+    # asking it to block while something is polled is a serving loop held for a minute. It does
+    # neither: the close belongs to the loop that built the env, and a caller elsewhere waits on
+    # the outcome.
+    lifecycle = episode_module._Lifecycle("probe")
+    env = await _built_on(lifecycle)
+    cleanup = episode_module._EnvClose(env, lifecycle, None)
+    started = time.perf_counter()
+    cleanup.close_env()
+    await cleanup.joined()
+    assert time.perf_counter() - started < 1.0
+    assert env.closed.is_set()
+    assert cleanup.failure is None
+    lifecycle.stop(5.0)
+
+
+async def _built_on(lifecycle: Any) -> "_SlowSessionEnv":
+    return await episode_module._built(lambda: _SlowSessionEnv(bind_loop=True), lifecycle)
+
+
+# ----- the rollback closes the sessions before the env -----
+
+
+async def test_a_rollback_closes_the_mcp_sessions_before_the_env(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # `Env.close` releases what the *constructor* made, and the sessions opened for this episode
+    # are clients that may still be using it. The ordinary close path has always closed them
+    # first; the rollback used to arrange the env close the moment the release landed, beside a
+    # caller that was only then awaiting the sessions.
+    # The release lands at once and the sessions take a while, which is the order that exposes
+    # it: a rollback that arranges the env close the moment the release is out is arranging it
+    # while the caller is still closing the clients that use what the env is about to release.
+    env = _SlowSessionEnv(begin_seconds=0.1)
+    real_open = episode_module._open_session_for_spec
+
+    async def opening_session(spec: Any, **kwargs: Any) -> Any:
+        session = await real_open(spec, **kwargs)
+        closing = session.close
+
+        async def close() -> None:
+            # A close that yields for a while, so an env close scheduled beside it runs first
+            # rather than merely happening to run second.
+            await asyncio.sleep(0.3)
+            await closing()
+            env.sessions_closed.set()
+
+        session.close = close  # type: ignore[method-assign]
+        return session
+
+    monkeypatch.setattr(episode_module, "_open_session_for_spec", opening_session)
+    opening = asyncio.ensure_future(ServedEpisode.open_env(env, task=0))
+    await asyncio.sleep(0.02)
+    opening.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await opening
+    assert env.closed.is_set()
+    assert env.closed_after_sessions is True
+
+
+# ----- one builder per queue position -----
+
+
+async def test_a_cancelled_pull_hands_its_builder_to_the_next_one(tmp_path: Path) -> None:
+    # A thread cannot be told to stop, so a pull that gives up mid-build leaves a constructor
+    # running. If the next pull for the same still-owed position starts its own, a client that
+    # cancels repeatedly runs as many constructors at once as it likes, none of them inside
+    # `max_in_flight`, and each wedged one leaves a thread behind.
+    started = threading.Semaphore(0)
+    release = threading.Event()
+    builds = {"n": 0}
+
+    def factory(_name: str) -> _SlowSessionEnv:
+        builds["n"] += 1
+        started.release()
+        release.wait(10.0)
+        return _SlowSessionEnv()
+
+    stream = TaskStream(
+        factory,
+        [TaskRef(ENV_NAME, 0)],
+        prov_dir=tmp_path / "prov",
+        off_loop_factory=True,
+    )
+    catalog_builds = builds["n"]
+    try:
+        for _ in range(3):
+            pull = asyncio.ensure_future(stream.get_task())
+            assert started.acquire(timeout=5.0) or True
+            await asyncio.sleep(0.05)
+            pull.cancel()
+            with pytest.raises(asyncio.CancelledError):
+                await pull
+        assert builds["n"] - catalog_builds == 1, builds
+    finally:
+        release.set()
+        await stream.aclose()
+
+
+# ----- a cleanup failure is a note on the setup failure, not a replacement -----
+
+
+async def test_a_close_that_fails_during_setup_does_not_replace_the_setup_failure() -> None:
+    # The caller asked why setup failed. "The env would not close" is not that answer: it is
+    # something that happened while answering, and a caller handed it instead has been given the
+    # wrong problem to debug.
+    env = _SlowSessionEnv(close_error=RuntimeError("close boom"))
+
+    def refuse(_idx: Any) -> Any:
+        raise ValueError("setup boom")
+
+    env.load_task = refuse  # type: ignore[method-assign]
+    with pytest.raises(ValueError, match="setup boom") as raised:
+        await ServedEpisode.open_env(env, task=0)
+    assert any("close boom" in note for note in getattr(raised.value, "__notes__", []))
+
+
+# ----- every joiner is told what the close did -----
+
+
+async def test_every_close_caller_is_told_the_same_failure() -> None:
+    # A single-owner operation needs a retained outcome and not only a completion event: the
+    # loser of the claim used to wait for the event and return as though the close had gone well.
+    env = _SlowSessionEnv(close_error=RuntimeError("close boom"), close_seconds=0.15)
+    ep = await ServedEpisode.open_env(env, task=0)
+    await ep.call(SUBMIT_TOOL, {"answer": "4"})
+    outcomes = await asyncio.gather(ep.close(), ep.close(), return_exceptions=True)
+    assert [type(outcome).__name__ for outcome in outcomes] == ["RuntimeError", "RuntimeError"]
+    assert all("close boom" in str(outcome) for outcome in outcomes)
+    # And a caller arriving after the fact is told too, rather than finding a quiet success.
+    with pytest.raises(RuntimeError, match="close boom"):
+        await ep.close()
+
+
+# ----- the abandoned build closes under the context it was built in -----
+
+
+async def test_an_abandoned_build_is_closed_under_the_callers_context() -> None:
+    # `_built` copies the caller's context into the factory; the discard callback fires later, in
+    # whichever thread finished the build, after that context has been left behind. An env whose
+    # constructor took a tenant-scoped resource releases one, and the abandoned path is not where
+    # that should quietly become the wrong tenant.
+    _TENANT.set("tenant-a")
+    seen: Dict[str, Any] = {}
+    closed = threading.Event()
+
+    class _Noticing(_FixtureScoreEnv):
+        async def _close(self) -> None:
+            seen["tenant"] = _TENANT.get()
+            closed.set()
+
+    def slow_factory() -> _Noticing:
+        time.sleep(0.3)
+        return _Noticing(tasks=list(TASKS))
+
+    lifecycle = episode_module._Lifecycle("probe")
+    building = asyncio.ensure_future(episode_module._built(slow_factory, lifecycle))
+    await asyncio.sleep(0.02)
+    building.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await building
+    assert _until(closed.is_set), "the env nobody took was never closed"
+    assert seen["tenant"] == "tenant-a"
+
+
+# ----- the decoder refuses values that are not what they claim to be -----
+
+
+@pytest.mark.parametrize(
+    "field, value",
+    [
+        pytest.param("owner_pid", 0, id="pid zero is every process in a group"),
+        pytest.param("owner_pid", -1, id="a negative pid is a process group"),
+        pytest.param("owner_pid", 2**63, id="a pid past what the platform can hold"),
+        pytest.param("schema_version", 2, id="a schema this reader does not have"),
+    ],
+)
+def test_a_value_that_is_not_what_it_claims_is_not_a_record(
+    tmp_path: Path, field: str, value: Any
+) -> None:
+    directory = tmp_path / "finalizations"
+    directory.mkdir(parents=True)
+    record = {
+        "session_id": "s", "finalization_id": "f-bad", "status": "PENDING",
+        "source": "explicit_tool",
+    }
+    record[field] = value
+    (directory / "finalization-bad.json").write_text(json.dumps(record), encoding="utf-8")
+    store = FinalizationStore(directory)
+    assert store.load_all() == []
+    with pytest.warns(RuntimeWarning, match="are not finalization records"):
+        assert store.recover_once() == []
+
+
+def test_a_record_carrying_nan_is_quarantined_rather_than_rewritten_forever(
+    tmp_path: Path,
+) -> None:
+    # `json.loads` reads `NaN` and the writer refuses it, so a record carrying one can be read
+    # and never written back: recovery rewrote it, the write raised, and the same failure came
+    # round again on every pass, with the directory never cached and every episode rescanning.
+    directory = tmp_path / "finalizations"
+    directory.mkdir(parents=True)
+    (directory / "finalization-nan.json").write_text(
+        '{"session_id": "s", "finalization_id": "f-nan", "status": "PENDING", '
+        '"source": "explicit_tool", "verdict": {"confidence": NaN}}',
+        encoding="utf-8",
+    )
+    store = FinalizationStore(directory)
+    with pytest.warns(RuntimeWarning, match="are not finalization records"):
+        assert store.recover_once() == []
+    with _reads_counted(store) as reads:
+        assert store.recover_once() == []
+    assert reads["full"] == 0
