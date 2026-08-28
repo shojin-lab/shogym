@@ -668,14 +668,17 @@ def test_the_record_type_and_the_wire_agree_about_an_unstamped_row() -> None:
 
 
 async def test_the_regime_is_additive_on_the_wire(tmp_path: Path) -> None:
-    # Wire compatibility: a `Never` row is still the row an existing reader parses, plus one
-    # member. Anything renamed or dropped here breaks a consumer that never asked for feedback.
+    # Wire compatibility: a `Never` row is still the row an existing reader parses, plus the two
+    # members added since. Anything renamed or dropped here breaks a consumer that never asked
+    # for either. `run_identity` is empty for a run whose caller named none, so an existing
+    # reader sees a field it can ignore rather than a value it has to understand.
     async with _stream(tmp_path, [0]) as stream:
         await stream.get_task()
         await stream.dispatch(SUBMIT_TOOL, {"answer": "4"})
     wire = stream.results[0].to_wire()
-    assert set(wire) == _ROW_MEMBERS_BEFORE_THE_REGIME | {"feedback_regime"}
+    assert set(wire) == _ROW_MEMBERS_BEFORE_THE_REGIME | {"feedback_regime", "run_identity"}
     assert wire["feedback_regime"] == "never"
+    assert wire["run_identity"] == ""
     assert _rows(tmp_path) == [wire]
 
 
