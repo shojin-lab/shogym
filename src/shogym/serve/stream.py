@@ -313,7 +313,7 @@ from shogym.feedback.wire import (
     NOTICE_FEEDBACK_NAME,
     REPORT_FEEDBACK_NAME,
 )
-from shogym.serve.episode import ServedEpisode
+from shogym.serve.episode import ServedEpisode, _built
 from shogym.serve.server import build_tool
 from shogym.shared.terminate_mcp import TERMINATE_TOOL_NAME
 from shogym.task import TaskSpec, ToolManifest
@@ -3712,8 +3712,15 @@ class TaskStream:
             # yet: if a span refuses to open, the episode never starts and the position is
             # still owed. Spans first, so nothing needs cleaning up when one fails.
             spans, dispensed_extensions = await self._begin_spans(ref)
+            # Built off the loop. The factory is the caller's own code and constructing an env is
+            # ordinary blocking work (for some envs it provisions a corpus, walks and copies two
+            # views of it, and takes a file lock), so evaluating it here, in the argument list of
+            # the await, is a cold or contended construction stopping every other episode this
+            # stream is serving and every deadline watching them (see :func:`_built`).
             episode = await ServedEpisode.open_env(
-                self._env_for(ref.env), env_name=ref.env, task=ref.task_idx
+                await _built(lambda: self._env_for(ref.env)),
+                env_name=ref.env,
+                task=ref.task_idx,
             )
             try:
                 # The episode's own snapshot, taken when it was opened and the same for every

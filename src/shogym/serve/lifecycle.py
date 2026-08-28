@@ -29,9 +29,10 @@ import hashlib
 import json
 import os
 import tempfile
+import threading
 from dataclasses import asdict, dataclass
 from pathlib import Path
-from typing import Any, Dict, List, Literal, Optional, Union
+from typing import Any, Dict, List, Literal, Optional, Set, Union
 
 # The evidence-schema version. Stamped on every :class:`TerminalEvidence`, the durable
 # record, and the trace ``terminal`` event so a reader can tell which envelope it is parsing.
@@ -407,6 +408,40 @@ class FinalizationStore:
                 self.write(record)
                 resolved.append(record)
         return resolved
+
+    def recover_once(self) -> List[FinalizationRecord]:
+        """:meth:`recover` for the first caller in this process to ask about this directory, and
+        nothing at all for every caller after it.
+
+        Recovery is a **startup** question: which records did a process that is no longer here
+        leave mid-finalize? The answer cannot change because this process opened another episode,
+        so asking it again per episode buys nothing and costs a full read of the directory,
+        which is shared across every session that runs without a trace path and therefore holds
+        every record the machine has ever written. On a developer machine that is tens of
+        thousands of files, so an episode that should open in milliseconds spends seconds reading
+        JSON, and a suite that opens eighty episodes spends minutes of it. Asked once, the cost
+        is paid once.
+
+        What this gives up is small and named: a record another process abandons *while this one
+        runs* is resolved by the next process to start rather than by this one's next episode.
+        Recovery has always been for the run before this one, and a live owner's record was
+        already left alone.
+
+        Not reset after a fork. A child shares the directory its parent has already recovered,
+        so the answer it would compute is the answer its parent already wrote."""
+        key = str(self._dir.resolve()) if self._dir.exists() else str(self._dir)
+        with _RECOVERED_LOCK:
+            if key in _RECOVERED:
+                return []
+            _RECOVERED.add(key)
+        return self.recover()
+
+
+#: The store directories already recovered in this process, keyed by resolved path. Recovery is a
+#: startup question asked once per directory (see :meth:`FinalizationStore.recover_once`); the
+#: lock is here because episodes are opened concurrently.
+_RECOVERED: Set[str] = set()
+_RECOVERED_LOCK = threading.Lock()
 
 
 def _pid_alive(pid: Optional[int]) -> bool:

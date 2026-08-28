@@ -193,15 +193,42 @@ class Env(ABC):
         self._open_session_ids.add(session_id)
         self._begin_session(session_id, task)
 
+    def claim_session(self, session_id: str) -> Optional[Callable[[], None]]:
+        """Take sole responsibility for releasing one session, and get the release to run.
+
+        Returns a zero-argument callable that runs ``_end_session`` for ``session_id``, or
+        ``None`` if some other caller has already claimed it. Exactly one caller is ever handed
+        the callable, because the claim is a ``set.remove`` and only one remover can win.
+
+        **Claiming and releasing are separate so a caller can claim on its event loop and run the
+        hook off it.** ``_end_session`` is an env hook and some envs make it do real work (an env
+        whose episode is a world in another process signals and reaps it there), so the serve
+        layer runs it in a thread and bounds its wait. Between the two, something else may try to
+        release the same session: the completion callback of an abandoned setup, or the
+        ``env.close()`` at the end of an episode whose teardown gave up waiting. A session that
+        has been claimed is no longer open, so those callers get ``None`` here and
+        :meth:`close` finds nothing of it left. One hook per session, whatever the timing, rather
+        than two of them on one episode's resources, which is the failure an env's
+        ``_end_session`` is under no obligation to survive.
+
+        A hook that raises does not put the session back: it was entered once, and a second entry
+        is the thing this exists to prevent."""
+        try:
+            self._open_session_ids.remove(session_id)
+        except KeyError:
+            return None
+        return lambda: self._end_session(session_id)
+
     def end_session(self, session_id: str) -> None:
         """Drop the per-episode state ``begin_session`` created, via ``_end_session``.
 
-        Symmetric with :meth:`begin_session`. ``close()`` invokes it for any
-        session still open, so a stateful in-process tool server does not leak an
-        entry per episode.
+        Symmetric with :meth:`begin_session`, and idempotent: the claim and the hook together
+        (see :meth:`claim_session`). ``close()`` invokes it for any session still open, so a
+        stateful in-process tool server does not leak an entry per episode.
         """
-        self._end_session(session_id)
-        self._open_session_ids.discard(session_id)
+        release = self.claim_session(session_id)
+        if release is not None:
+            release()
 
     def verify(
         self,
