@@ -54,8 +54,8 @@ inside it.
 
 Usage::
 
-    python worker.py serve            # {"root": ..., "token": ..., "keepalive": ...} on stdin
-    python worker.py grade            # {"root", "task_id", "experiment", "filing", "keepalive"}
+    python worker.py serve            # {"root": ..., "token": ...} on stdin
+    python worker.py grade            # {"root", "task_id", "experiment", "filing"} on stdin
     python worker.py install
     python worker.py unpack --bundle <bundle> --into <directory>
 """

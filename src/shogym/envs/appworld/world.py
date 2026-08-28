@@ -425,8 +425,8 @@ def _publish(building: Path, target: Path, *, replacing: bool = False) -> None:
     """Give a staging tree its final name, or drop it if someone else got there first.
 
     ``replacing`` is for the callers that have to displace an existing target: a served task, a
-    grading view, or a shared base entry left incomplete or partly sealed by a crash. It is still
-    not a build in place. The finished tree is renamed *aside* and the staged one renamed in, and
+    grading view, or a shared base entry left incomplete by a crash. It is still not a build in
+    place. The finished tree is renamed *aside* and the staged one renamed in, and
     the displaced one is removed afterwards.
 
     **Two renames are two operations, so the name is briefly absent even when this succeeds.**
@@ -434,7 +434,7 @@ def _publish(building: Path, target: Path, *, replacing: bool = False) -> None:
     sequential renames can promise: between them the target does not exist, and the builders' lock
     excludes other builders rather than the live workers resolving paths through this tree. The
     window is a syscall wide and it is real. What this does promise is that the name never holds a
-    half-made tree, because what is renamed in was complete and sealed before it had this name.
+    half-made tree, because what is renamed in was complete before it had this name.
 
     **A publish that fails puts the incumbent back.** The displaced tree used to be removed
     unconditionally, so a failure at the second rename deleted the only remaining copy and left

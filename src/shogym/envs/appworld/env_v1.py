@@ -718,14 +718,12 @@ def run_fingerprint(
             corpus,
             adapter.UPSTREAM_VERSION,
             adapter.UPSTREAM_SHA,
-            # What the interpreter turned out to hold, rather than the one version that was asked
-            # for. The runtime cache is named for the pins while it is built by resolving that
-            # release's ranges against whatever the host and the index offer on the day, so two
-            # runs could sit under one name and one identity with different worlds underneath
-            # them. This reads the installed bytes, so an artifact republished under the pinned
-            # version and a module edited in place both move it. Passed in by an env that has
-            # already read it, because reading it is most of a second and the answer cannot have
-            # changed between the two reads; computed here for a caller that has not.
+            # The runtime pin: the release, the commit it is recorded against, the interpreter
+            # series and the platform. It is the interpreter and not this process that writes a
+            # task's database file, so what the worker runs under belongs in the fingerprint. What
+            # a pin cannot say is what the resolver actually installed under it, which is the
+            # container's to name (shojin-lab/shogym#140). Passed in by an env that has already
+            # read it; computed here for a caller that has not.
             runtime if runtime is not None else adapter.runtime_digest(),
             adapter.MANIFEST.read_text(),
             payload.PASS_COUNTS_FILE.read_text(),

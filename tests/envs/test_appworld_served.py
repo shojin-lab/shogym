@@ -383,10 +383,13 @@ async def test_the_served_tree_has_no_path_that_leads_to_the_answers() -> None:
     derived base rather than copying 134 MB per episode. A symlink is not the defect; a symlink
     whose *target* has the answers as a sibling is. So what is asserted here is the target
     contract, walked the way the reviewer walked it: step through each link, ask the directory it
-    landed in for this task, and find the task there and no `ground_truth` beside it. The
-    read-only half of the same invariant, which is what keeps one arm of a pair out of the
-    other's inputs, is asserted below and at
-    `test_appworld_runtime.py::test_two_episodes_of_one_task_do_not_share_their_served_inputs`."""
+    landed in for this task, and find the task there and no `ground_truth` beside it.
+
+    What an episode can *write* through those links is a different question and is not asserted
+    here: the shared base and the shared task cache belong to the user the worker runs as, so what
+    keeps one arm of a pair out of the other's inputs on this host worker is the per-episode view
+    (`test_appworld_runtime.py::test_two_episodes_of_one_task_do_not_share_their_served_inputs`)
+    rather than a permission. shojin-lab/shogym#140 binds them read-only, which is the boundary."""
     probe = """
 _io, _os = __import__("io"), __import__("os")
 root = _os.environ["APPWORLD_ROOT"]
@@ -405,8 +408,6 @@ def _mode(path):
     # cannot be measured from in here: upstream's guard replaces `io.open` with one that refuses
     # every write mode whatever the path, and null-patches `os.open`, which then reports success
     # and creates nothing. Both would answer about the guard rather than about the filesystem.
-    # What a 0o555 directory does to a write is proved on the host, in
-    # `test_appworld_runtime.py::test_two_episodes_of_one_task_do_not_share_their_served_inputs`.
     try:
         return oct(_os.stat(path).st_mode & 0o777)
     except Exception as failure:
@@ -429,16 +430,10 @@ shared = ["base_dbs", "datasets", "api_docs"]
 neighbours = []
 answers = []
 writable = []
-parents = []
 for name in shared:
     if not _os.path.islink(root + "/data/" + name):
         continue
     here = _os.path.dirname(_os.path.realpath(root + "/data/" + name))
-    # The directory the link lands *in*, not the entry it lands on. These links are absolute, so
-    # what this episode resolves is the name as much as the bytes, and a name lives in its parent:
-    # a writable parent is a rename away from putting something else under `base_dbs` for this
-    # episode and for the other arm of its pair.
-    parents.append(_mode(here))
     if _os.path.exists(here + "/tasks/%(task)s/specs.json"):
         neighbours.append(name)
     if _os.path.exists(here + "/tasks/%(task)s/ground_truth"):
@@ -466,10 +461,6 @@ print(json.dumps({
     "neighbours": sorted(set(neighbours)),
     "answers_beyond_a_link": sorted(set(answers)),
     "writable_shared_inputs": sorted(set(writable)),
-    "shared_parent_modes": sorted(set(parents)),
-    # The base every episode shares. A write through it would be in the next episode's inputs.
-    "shared_mode": _mode(root + "/data/api_docs"),
-    "shared_file_mode": _mode(root + "/data/base_dbs/admin.db"),
     "own_mode": _mode(task),
 }))
 """ % {"task": task_id()}
@@ -489,23 +480,13 @@ print(json.dumps({
     # keeps every task's answers in the folder beside its specs.
     assert seen["neighbours"] == ["api_docs", "base_dbs", "datasets"]
     assert seen["answers_beyond_a_link"] == []
-    # And nothing the walk reaches is writable, which is the other half of the invariant: the
-    # shared base was sealed and the shared task cache beside it was not, so a served worker could
-    # edit the pristine copy the next episode is built from.
-    assert seen["writable_shared_inputs"] == []
-    # And the directory those names live in is read-only too, which sealing each entry did not
-    # do. The links are absolute, so what this episode resolves is the name as much as the bytes:
-    # under an owner-writable parent, `base_dbs` could be renamed aside and a directory of the
-    # episode's own choosing put there under the same name, and every view resolving it afterwards
-    # would follow — including the other arm of this one's pair. What a 0o555 directory does to a
-    # rename is proved on the host, in
-    # `test_appworld_runtime.py::test_the_shared_parent_cannot_be_renamed_around`.
-    assert seen["shared_parent_modes"] == ["0o555"]
-    # The episode owns its task and nothing else. The shared base an episode links to is sealed
-    # read-only, so a write through it cannot reach the next episode's starting inputs or the
-    # other arm of its own pair's; its own task copy is writable and goes with the episode.
-    assert seen["shared_mode"] == "0o555"
-    assert seen["shared_file_mode"] == "0o444"
+    # What the walk reaches *is* writable, and this asserts it rather than leaving it implied.
+    # The shared base and the shared task cache belong to the user the worker runs as, so an
+    # episode that goes looking can leave something in what the next one, or the other arm of its
+    # own pair, starts from. That is the host worker's boundary and the reason for the container
+    # (shojin-lab/shogym#140), and a test that quietly stopped checking it would let the claim
+    # drift back into the README. Its own task copy is writable too, and is the episode's own.
+    assert seen["writable_shared_inputs"] != []
     assert int(seen["own_mode"], 8) & 0o200
 
 
@@ -825,10 +806,6 @@ async def test_information_hands_back_the_receipt_and_placebo_the_digest(
             [TaskRef("appworld", TASK)],
             prov_dir=tmp_path / name,
             feedback=policy,
-            # The port's own fingerprint, which is what makes two of these runs one measurement:
-            # the draw, the payload class, the block budget, the corpus contents and the scoring
-            # version. A resume under a changed pulse or a repointed corpus is refused by it.
-            identity=shogym.make("appworld").config_digest,
         )
         async with stream:
             await stream.get_task()
