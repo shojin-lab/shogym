@@ -2097,8 +2097,67 @@ def test_the_readme_names_exactly_the_procfs_entries_that_are_masked() -> None:
     sentence = sentence[: sentence.index("\n\n")]
     named = {word.strip("`,.") for word in sentence.split() if word.startswith("`")}
     assert named == set(container._NEUTRAL_PROC), sorted(named ^ set(container._NEUTRAL_PROC))
-    # And the residual the README lists is not silently a subset of it.
-    residual = readme[readme.index("**What remains readable, in two kinds.**") :]
-    residual = residual[: residual.index("\n\nWhat that means for a design")]
+    # And what the README lists as residual does not quietly include one of them: a masked entry
+    # named as free to vary would be the claim collapsing into a description of whatever happens.
+    residual = readme.split("```text\n", 1)[1].split("\n```", 1)[0].splitlines()
     for masked in container._NEUTRAL_PROC:
-        assert f"/proc/{masked}`" not in residual, masked
+        assert f"/proc/{masked}" not in residual, masked
+
+
+def test_an_inventory_the_daemon_would_not_answer_is_not_an_empty_one(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """A `ps` that failed is not a `ps` that found nothing, and it was read as one.
+
+    The status was ignored, so a transient failure's empty stdout said "no orphans". That is the
+    one direction this must never fail in: a crash orphan is known by its labels and by nothing
+    else, so it is in neither the disowned ledger nor the ended sidecars, and the recurrence
+    consults only those two. The pass therefore concluded there was nothing left to do and
+    stopped, with a container still holding a cpu quota and a writable mount beside a live paired
+    sibling.
+
+    Driven as the review drove it: the first inventory fails, and the next one would have found
+    the orphan."""
+    from shogym.envs.appworld import env_v1
+
+    monkeypatch.setattr(container, "_ledger", lambda: tmp_path / "disowned.txt")
+    monkeypatch.setenv("SHOGYM_CACHE", str(tmp_path / "cache"))
+    monkeypatch.setattr(container, "_INVENTORY_UNKNOWN", False)
+
+    inventories: List[int] = []
+    labels = '{"shogym.appworld.parent": "4242", "shogym.appworld.birth": "1700000000"}'
+    gone: List[str] = []
+
+    def _run(args, **_):
+        if args[0] == "ps":
+            inventories.append(1)
+            if len(inventories) == 1:
+                return _Finished(1, "", "Cannot connect to the Docker daemon")
+            return _Finished(0, "orphan")
+        if args[0] == "inspect":
+            if args[-1] in gone:
+                return _Finished(1, "", "Error: No such object")
+            return _Finished(0, labels)
+        if args[0] in ("rm", "stop"):
+            gone.append(args[-1])
+            return _Finished(0, "")
+        raise AssertionError(args)
+
+    monkeypatch.setattr(container, "_run", _run)
+
+    # The failing pass: nothing found, nothing removed, and nothing in the ledger to go back for.
+    assert container.reap(alive=lambda pid, birth="": False) == []
+    assert container.outstanding() == []
+    # What is recorded is that this port does not know, which is what brings the next pass back.
+    assert container.inventory_pending() is True
+    assert env_v1._deferred_work() is True
+
+    # And the next pass finds it. Run through the recurrence rather than by hand, which is the
+    # half that used to stop after one.
+    monkeypatch.setattr(env_v1, "_HOUSEKEEPING_INTERVAL_SECONDS", 0.0)
+    monkeypatch.setattr(env_v1, "_HOUSEKEEPING_MAX_PASSES", 4)
+    monkeypatch.setattr(env_v1, "_sweep_leftovers", lambda *homes: None)
+    env_v1._housekeeping_passes()
+    assert len(inventories) >= 2, "the recurrence stopped on an inventory it never took"
+    assert "orphan" in gone
+    assert container.inventory_pending() is False

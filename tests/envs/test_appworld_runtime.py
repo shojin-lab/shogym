@@ -1666,3 +1666,49 @@ def test_a_task_that_is_no_longer_what_was_derived_is_built_again(
     for _ in range(20):
         assert world.already_derived(derived=env._derived, graded=env._graded, task_id="abc_1")
     assert (time.monotonic() - began) / 20 < 0.05
+
+
+def test_a_task_member_this_port_does_not_name_is_not_derived_or_served(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The boundary inside a task was the same denylist the shared half used to be.
+
+    A derived task is mounted whole at `/corpus/data/tasks/<id>`, and what was copied into it was
+    every member of the source task except `dbs` and the exact name `ground_truth`. Since
+    `APPWORLD_ROOT` takes any directory with a `data/tasks` in it, an artifact somebody's own
+    corpus carried beside the three the pinned bundle ships was derived and mounted because it was
+    neither of the two names that had been thought of. The answers stay out by not being on the
+    list now rather than by being remembered, which is the difference between a boundary and a
+    habit."""
+    root = _derivable_corpus(tmp_path / "corpus")
+    source = root / "data" / "tasks" / "abc_1"
+    # What a custom corpus might carry beside the three, and what the pinned one does not.
+    (source / "notes.md").write_text("somebody's own working notes")
+    (source / "solution").mkdir()
+    (source / "solution" / "walkthrough.txt").write_text("how this task is solved")
+
+    env = _stub_env(root, tmp_path, monkeypatch)
+    monkeypatch.setattr(adapter, "seed", _StubSeeder())
+    env._derive("abc_1")
+
+    def _corpus_members(tree: Path) -> List[str]:
+        """What came out of the corpus, which is everything but this port's own bookkeeping."""
+        return sorted(
+            entry.name for entry in tree.iterdir() if not entry.name.startswith(".shogym")
+        )
+
+    served = env._derived / "tasks" / "abc_1"
+    assert _corpus_members(served) == ["dbs", "specs.json"]
+    assert not (served / "notes.md").exists()
+    assert not (served / "solution").exists()
+    # The answers are absent for the same reason rather than a different one.
+    assert not (served / "ground_truth").exists()
+
+    # And the per-episode view an episode is actually given carries only what the task holds.
+    view = world.derive_view(derived=env._derived, view=tmp_path / "view", task_id="abc_1")
+    assert _corpus_members(view / "data" / "tasks" / "abc_1") == ["dbs", "specs.json"]
+
+    # The grader's own view is built from the derived task, so it inherits the same list, plus the
+    # answers it exists to hold.
+    graded = env._graded / "tasks" / "abc_1"
+    assert _corpus_members(graded) == ["dbs", "ground_truth", "specs.json"]

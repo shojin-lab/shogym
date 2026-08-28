@@ -45,6 +45,19 @@ from shogym.envs.appworld.ledger import ROLES, SECTIONS, Backlog, Request
 #: mounting it, and calling the result an exhaustive list.
 SHARED_ENTRIES: Tuple[str, ...] = ("api_docs", "base_dbs", "datasets", "version.txt")
 
+#: What a task directory holds that a served world is given, beside the ``dbs`` this port seeds
+#: itself. The same rule as :data:`SHARED_ENTRIES`, one level down and for the same reason: the
+#: derived task is mounted whole at ``/corpus/data/tasks/<id>``, so what is copied into it is what
+#: an episode can read.
+#:
+#: **A list, where this was "everything except `dbs` and `ground_truth`".** Every task in the
+#: pinned corpus holds exactly `dbs`, `ground_truth` and `specs.json`, and the exclusion of the
+#: answers was the whole of the rule: an unrecognised member of somebody's own corpus was copied
+#: and mounted because it was neither of the two names that had been thought of. ``ground_truth``
+#: stays out by not being on the list rather than by being named, which is the difference between
+#: a boundary and a habit of remembering.
+TASK_ENTRIES: Tuple[str, ...] = ("specs.json",)
+
 # ----- the appended paragraph -----
 
 #: Appended to every task instruction, byte-identical on every task. It points at world data and
@@ -237,10 +250,11 @@ def derive_task(
         source = original / "tasks" / task_id
         building = _staging(derived / "tasks", task_id)
         (building / "dbs").mkdir(parents=True)
-        for entry in sorted(source.iterdir()):
-            # `ground_truth` is deliberately absent: see the docstring.
-            if entry.name not in ("dbs", "ground_truth"):
-                _materialise(entry, building / entry.name)
+        # Named rather than excluded, and only what this task has: `ground_truth` is absent
+        # because it is not on the list, not because it was remembered (see `TASK_ENTRIES`).
+        for name in TASK_ENTRIES:
+            if (source / name).exists():
+                _materialise(source / name, building / name)
         for entry in sorted((source / "dbs").iterdir()):
             if entry.name != "todoist.jsonl":
                 _materialise(entry, building / "dbs" / entry.name)
@@ -509,6 +523,7 @@ def _publish(building: Path, target: Path, *, replacing: bool = False) -> None:
 
 __all__ = [
     "SHARED_ENTRIES",
+    "TASK_ENTRIES",
     "ADDED_MODELS",
     "APPENDED_PARAGRAPH",
     "EMPTY_FILING",
