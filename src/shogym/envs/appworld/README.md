@@ -58,9 +58,14 @@ TaskStream(
 ```
 
 `config_digest` covers the draw, the payload class, the block budget, every constant a payload is
-generated from, the corpus this run actually serves (all of it, including the 134 MB of shared base
-episodes read as input), the derivation layout, and a hand-bumped scoring version that moves when
-how a score is read moves. The derived and grader caches are named by the same source digest and
+generated from, the text the agent is given (the world guide, the tool guide and the appended
+paragraph), the generator constants that decide the seeded backlog, the corpus this run actually
+serves (all of it, including the 134 MB of shared base episodes read as input), the derivation
+layout, the interpreter and distribution set the worker turned out to be built with, and a
+hand-bumped scoring version that moves when how a score is read moves. A stream's `deadline` and
+`max_in_flight` belong to a run's identity too and are not an env's to know; they are carried in
+the stream's own persisted identity on
+[shojin-lab/shogym#140](https://github.com/shojin-lab/shogym/pull/140). The derived and grader caches are named by the same source digest and
 carry a stamp inside them saying what they were built from, so a run pointed at a second corpus
 cannot serve material derived from the first.
 
@@ -353,13 +358,24 @@ have flushed", "I have stopped" or "the filing says X" is a reply the episode co
 The host signals the worker's process group, confirms from the process table that the group is
 empty, and grades what is on disk.
 
-**What is on disk is the world at the end of the last block, because upstream puts it there.**
-`AppWorld.execute` ends with its own save into the episode's output tree and `initialize` writes
-one before any block runs. So an episode that ran N blocks is graded on the state after block N,
-and one that ran none is graded on its opening state. Work an agent's thread does after its last
-block is lost rather than scored, which is the same rule the block budget already states, and the
-generator digest is written to the same tree for the same reason: a diagnostic read out of a reply
-is a diagnostic the episode can choose.
+**What is on disk is the world as upstream last persisted it.** `AppWorld.execute` ends with its
+own save into the episode's output tree and `initialize` writes one before any block runs. So an
+episode that ran N blocks is graded on the state after block N, and one that ran none is graded on
+its opening state. The generator digest is written to the same tree for the same reason a
+lifecycle fact is not asked for: a diagnostic read out of a reply is a diagnostic the episode can
+choose.
+
+**What an empty process group proves, and what it does not.** It proves quiescence *at the moment
+the snapshot is taken*: nothing of the episode's was running when the tree was copied, so the
+filing, the digests and the evaluator all read one state. It does not prove that nothing was
+written on the way down. The stop is SIGTERM, a short grace, then SIGKILL, and SIGTERM is
+catchable, so a process that ran agent-authored code has that grace in which an exit path of its
+own could still write. The grace is short for exactly this reason and it is not zero, so the
+honest reading of a graded tree is "the state upstream persisted, plus anything the episode's own
+shutdown persisted inside the grace", not "the state at the end of block N and nothing else".
+Making the two the same needs a namespace that can be destroyed rather than a signal that can be
+handled, which is
+[shojin-lab/shogym#140](https://github.com/shojin-lab/shogym/pull/140).
 
 **A stop the process table will not confirm ends the episode unscored.** Not reaped inside the
 bound, or a process table that would not answer: each of those leaves a tree something may still
@@ -373,10 +389,13 @@ with a `finalize_error` closure and nothing in `observed` at all, which means ne
 has a payload to reveal. The same is true of an output tree the grader refuses.
 
 **The grader is given a snapshot, not the tree the world wrote.** The grading process is pointed
-at the root that holds the answers, so a link left under the output tree would resolve there.
-Every entry is checked to be a plain file or directory resolving inside the tree, and anything
-else refuses the episode rather than being skipped; what is copied is a tree of regular files with
-no link in it. It reads the filing, the databases' digest, the generator digest and the base
+at the root that holds the answers, so a link left under the output tree would resolve there. The
+root itself is checked before it is resolved, and every entry under it must be a plain file or
+directory; anything else refuses the episode rather than being skipped, because a grade over a
+tree with an entry quietly dropped is a grade over a tree nobody submitted. The walk is bounded in
+nodes, bytes, depth and elapsed time, and it stops on a flag the finalizer sets if its own await
+is abandoned, because an episode wrote this tree and nothing else here would stop it deciding how
+long finalization takes. It reads the filing, the databases' digest, the generator digest and the base
 task's own evaluator, all from those same bytes, so what is scored and what is graded are one
 state by construction rather than two observations that happened to agree.
 

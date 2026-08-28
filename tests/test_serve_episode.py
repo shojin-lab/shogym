@@ -14,6 +14,7 @@ import shogym
 from shogym.feedback import parse_meta
 from shogym.serve import ServedEpisode
 from shogym.trace import load_traces
+from tests._fixtures import score_env, score_mcp
 
 
 def _answer(task_idx: int) -> str:
@@ -63,15 +64,16 @@ async def test_solve_then_terminate_surfaces_episode_feedback_only_at_end(
     assert any(f["name"] == "check_answer" for f in rows[-1]["feedback"])
 
 
-async def test_cancelled_call_does_not_advance_step(tmp_path: Path) -> None:
-    # A cancelled/timed-out in-flight call must not leave the step counter advanced
-    # with no trajectory entry: the next call has to be step 1, not 2 (contiguous,
-    # one Step per completed call).
+async def test_a_cancelled_call_is_adopted_rather_than_forgotten(tmp_path: Path) -> None:
+    # A cancelled/timed-out call must not leave the step counter advanced with no trajectory
+    # entry, and it must not leave the *operation* unaccounted for either. The operation is the
+    # episode's, not the caller's: an abandoned await does not stop a call that is already in the
+    # env, so what lands is recorded, and the next call follows it rather than taking its number.
     ep = await ServedEpisode.start("wordle_v1", task=0)
     try:
         session = ep._sessions["guess"]
         real_call = session.call_tool
-        blocker = asyncio.Event()  # never set → the call blocks until cancelled
+        blocker = asyncio.Event()
 
         async def blocking(*a, **k):
             await blocker.wait()
@@ -81,14 +83,55 @@ async def test_cancelled_call_does_not_advance_step(tmp_path: Path) -> None:
         with pytest.raises(asyncio.TimeoutError):
             await asyncio.wait_for(ep.call("guess", {"word": _answer(0)}), timeout=0.05)
 
-        assert ep._step == 0  # not advanced by the cancelled call
+        # Nothing is committed while it is still running: the step and the trajectory entry are
+        # written when the operation lands, not when it is issued.
+        assert ep._step == 0
         assert ep._trajectory == []
 
+        # And it lands. The caller is gone; the episode is not.
+        blocker.set()
         session.call_tool = real_call  # type: ignore[method-assign]
         res = await ep.call("guess", {"word": _answer(0)})
-        assert ep._step == 1 and ep._trajectory[0].index == 1  # step 1, not 2
+        # Two contiguous steps, one per completed call: the adopted one and this one.
+        assert ep._step == 2
+        assert [entry.index for entry in ep._trajectory] == [1, 2]
         assert json.loads(res.content)["solved"] is True
     finally:
+        await ep.close()
+
+
+async def test_a_second_call_waits_for_an_abandoned_one_to_land() -> None:
+    """The gate a lock could not hold.
+
+    ``asyncio.Lock`` is released as a cancellation unwinds, so a caller that went away left the
+    episode open to the next call while its own operation was still in the env.
+
+    The handler here is a synchronous FastMCP tool, so it runs in a worker thread: cancelling the
+    coroutine that awaits it abandons the await and not the operation, which is the shape of
+    AppWorld's own ``execute`` and the reason a cancellable async substitute cannot show this."""
+    score_mcp.reset_block()
+    ep = await ServedEpisode.start(score_env.ENV_NAME, task=0)
+    try:
+        first = asyncio.ensure_future(ep.call("block", {}))
+        await asyncio.sleep(0.1)
+        first.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await first
+        assert not score_mcp.landed.is_set()
+
+        second = asyncio.ensure_future(ep.call("noop", {}))
+        await asyncio.sleep(0.1)
+        # Held out, and by the operation rather than by the lock the cancellation dropped.
+        assert not second.done()
+        assert not ep._lock.locked()
+
+        score_mcp.released.set()
+        await second
+        # Both are in the trajectory, in the order they ran.
+        assert [entry.tool for entry in ep._trajectory] == ["block", "noop"]
+        assert ep._step == 2
+    finally:
+        score_mcp.released.set()
         await ep.close()
 
 

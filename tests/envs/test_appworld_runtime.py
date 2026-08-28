@@ -828,3 +828,186 @@ def test_an_ordinary_terminal_still_publishes_both_arms() -> None:
     assert published["report"] == "a receipt"
     assert published["notice"] == "a digest"
     assert "finalize_error" not in published
+
+
+# ----- what a stop is signalled with, and in what order -----
+
+
+def test_the_group_is_killed_after_a_short_grace_and_reaped_last(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Two orderings, both of which the docs claimed and the code did not do.
+
+    SIGTERM used to be followed by up to ten seconds of waiting, and SIGTERM is catchable: every
+    one of those seconds is a second in which the process that ran agent-authored code can still
+    write into the tree about to be graded. It gets a short grace and then a signal it cannot
+    decline.
+
+    And the leader was reaped *before* the group was enumerated. Reaping releases the pid, and a
+    group exists only while it has a member, so the enumeration and the escalation after it were
+    about whatever held the number by then. The group is read while the leader is still a zombie
+    holding it, and the reap is last."""
+    order: List[str] = []
+    real_members = adapter._group_members
+
+    def _watch_signal(pgid: int, how: int) -> None:
+        order.append("SIGKILL" if how == signal.SIGKILL else "SIGTERM")
+        try:
+            os.killpg(pgid, how)
+        except OSError:
+            # A group that has already emptied, which is what the real helper tolerates too: the
+            # kill after the grace is sent whatever the group did, and a no-op is one of the
+            # things it can be.
+            pass
+
+    def _watch_members(pgid: int) -> Any:
+        order.append("enumerate")
+        return real_members(pgid)
+
+    process = _sleeper(30)
+    worker = _worker(tmp_path, process)
+    monkeypatch.setattr(adapter, "_signal_group", _watch_signal)
+    monkeypatch.setattr(adapter, "_group_members", _watch_members)
+    monkeypatch.setattr(adapter, "_TERM_GRACE_SECONDS", 0.05)
+
+    began = time.monotonic()
+    worker.close(confirm=True)
+    elapsed = time.monotonic() - began
+
+    assert worker.stopped is True
+    # A kill follows the grace whatever the group did, and every enumeration happened before the
+    # reap, which is the last thing that runs.
+    assert order[0] == "SIGTERM"
+    assert "SIGKILL" in order
+    assert order.index("SIGKILL") < order.index("enumerate", order.index("SIGKILL"))
+    assert process.returncode is not None
+    # The grace is the bound, not ten seconds of a signal the process may ignore.
+    assert elapsed < 5.0
+
+
+# ----- what the grader may be handed -----
+
+
+def test_a_symlinked_output_root_is_refused(tmp_path: Path) -> None:
+    """`resolve()` erases the question: a root that is itself a link comes back as whatever it
+    names, and inspecting only its descendants afterwards lets a substituted output directory
+    substitute the whole tree the grade is computed over."""
+    real = tmp_path / "real"
+    (real / "tasks").mkdir(parents=True)
+    (real / "tasks" / "a.jsonl").write_text("[]")
+    link = tmp_path / "outputs"
+    link.symlink_to(real)
+    with pytest.raises(adapter.SnapshotError, match="output root .* is a symbolic link"):
+        adapter.snapshot_outputs(link, into=tmp_path / "into")
+    # And the ordinary root is still accepted, so the refusal is about the link.
+    assert adapter.snapshot_outputs(real, into=tmp_path / "into").is_dir()
+
+
+def test_a_snapshot_is_bounded_in_every_direction(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """An episode wrote this tree, so walking and copying it without a bound lets the episode
+    decide how long finalization takes and how much of the host's disk it uses. None of the
+    deadlines above cover it: a deadline cancels an await, and the thread doing the copying does
+    not stop for that."""
+    outputs = tmp_path / "outputs"
+    (outputs / "dbs").mkdir(parents=True)
+    for index in range(6):
+        (outputs / "dbs" / f"{index}.jsonl").write_text("x" * 64)
+
+    monkeypatch.setattr(adapter, "_SNAPSHOT_MAX_NODES", 3)
+    with pytest.raises(adapter.SnapshotError, match="more than 3 entries"):
+        adapter.snapshot_outputs(outputs, into=tmp_path / "a")
+
+    monkeypatch.setattr(adapter, "_SNAPSHOT_MAX_NODES", 20_000)
+    monkeypatch.setattr(adapter, "_SNAPSHOT_MAX_BYTES", 100)
+    with pytest.raises(adapter.SnapshotError, match="larger than 100 bytes"):
+        adapter.snapshot_outputs(outputs, into=tmp_path / "b")
+
+    monkeypatch.setattr(adapter, "_SNAPSHOT_MAX_BYTES", 1 << 30)
+    monkeypatch.setattr(adapter, "_SNAPSHOT_MAX_DEPTH", 0)
+    with pytest.raises(adapter.SnapshotError, match="deeper than 0 directories"):
+        adapter.snapshot_outputs(outputs, into=tmp_path / "c")
+
+    monkeypatch.setattr(adapter, "_SNAPSHOT_MAX_DEPTH", 24)
+    monkeypatch.setattr(adapter, "_SNAPSHOT_SECONDS", -1.0)
+    with pytest.raises(adapter.SnapshotError, match="longer than"):
+        adapter.snapshot_outputs(outputs, into=tmp_path / "d")
+
+
+def test_an_abandoned_snapshot_stops_at_the_next_file(tmp_path: Path) -> None:
+    """Cancelling the await does not stop the thread, so the thread is given something to stop
+    for, and it is checked once per file rather than once per tree."""
+    outputs = tmp_path / "outputs"
+    outputs.mkdir()
+    for index in range(4):
+        (outputs / f"{index}.jsonl").write_text("x")
+    stop = threading.Event()
+    stop.set()
+    with pytest.raises(adapter.SnapshotError, match="abandoned"):
+        adapter.snapshot_outputs(outputs, into=tmp_path / "into", stop=stop)
+
+
+# ----- what the identity covers -----
+
+
+def test_the_fingerprint_covers_the_realized_runtime_and_the_authored_text(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The inputs the digest has to cover.
+
+    The runtime cache is named for the direct AppWorld release while it is built by resolving
+    that release's ranges against whatever the host offers, so the realized interpreter and
+    distribution set were outside the identity entirely. The guide, the tool guide and the
+    appended paragraph are the text every episode is given, which is authored treatment rather
+    than scenery. And the generator digest already decided which derived cache was served."""
+    from shogym.envs.appworld import adapter, env_v1, world
+    from shogym.envs.appworld.env_v1 import run_fingerprint
+
+    base = run_fingerprint(pulse=0, report="graded", blocks=60)
+    for module, name, moved in (
+        (adapter, "runtime_digest", lambda: "a different runtime"),
+        (env_v1, "_WORLD_GUIDE", "a different guide"),
+        (env_v1, "_TOOL_GUIDE", "a different tool guide"),
+        (world, "APPENDED_PARAGRAPH", "a different chore"),
+        (adapter, "_generator_digest", lambda: "a different generator"),
+    ):
+        original = getattr(module, name)
+        try:
+            monkeypatch.setattr(module, name, moved)
+            assert base != run_fingerprint(pulse=0, report="graded", blocks=60), name
+        finally:
+            monkeypatch.setattr(module, name, original)
+
+
+def test_a_spec_edited_in_place_is_not_served_from_a_cache(tmp_path: Path) -> None:
+    """The identity moves and the task does not.
+
+    Memoizing `task_specs` on `(root, task id)` says where a spec was rather than what it said, so
+    editing a corpus in place produces a new `corpus_digest` and a new cache name while the same
+    process goes on serving the instruction it read the first time."""
+    task = tmp_path / "data" / "tasks" / "abc_1"
+    task.mkdir(parents=True)
+    (task / "specs.json").write_text('{"instruction": "first"}')
+    assert adapter.task_specs(tmp_path, "abc_1")["instruction"] == "first"
+    (task / "specs.json").write_text('{"instruction": "second"}')
+    assert adapter.task_specs(tmp_path, "abc_1")["instruction"] == "second"
+
+
+def test_a_corpus_with_a_link_in_it_is_refused_rather_than_half_digested(
+    tmp_path: Path,
+) -> None:
+    """A digest that skips links leaves a served world holding bytes the identity never read,
+    because derivation follows them: changing what a link points at changes the world without
+    moving the digest that claims to say what the world is."""
+    data = tmp_path / "data"
+    (data / "tasks" / "abc_1").mkdir(parents=True)
+    (data / "version.txt").write_text("0.1.0")
+    (data / "tasks" / "abc_1" / "specs.json").write_text("{}")
+    assert len(adapter.corpus_digest(tmp_path)) == 16
+
+    elsewhere = tmp_path / "elsewhere.json"
+    elsewhere.write_text('{"answer": 1}')
+    (data / "tasks" / "abc_1" / "linked.json").symlink_to(elsewhere)
+    with pytest.raises(adapter.ProvisioningError, match="symbolic link"):
+        adapter.corpus_digest(tmp_path)

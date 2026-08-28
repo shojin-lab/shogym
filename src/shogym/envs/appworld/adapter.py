@@ -30,6 +30,7 @@ from __future__ import annotations
 import hashlib
 import json
 import os
+import platform
 import secrets
 import select
 import signal
@@ -37,6 +38,7 @@ import shutil
 import subprocess
 import time
 import tempfile
+import threading
 import sys
 import urllib.error
 import urllib.request
@@ -75,6 +77,13 @@ _DOWNLOAD_TIMEOUT_SECONDS = 300.0
 #: How long a worker gets to stop after it is signalled, before it is killed. Short: teardown
 #: runs on the shared loop and a wedged world may not hold the others.
 _CLOSE_SECONDS = 10.0
+
+#: How long SIGTERM is given before SIGKILL follows it, whatever happened.
+#:
+#: Short on purpose. SIGTERM is catchable, so every second of it is a second in which the process
+#: that ran agent-authored code can still write into the tree that is about to be graded. What the
+#: grace buys is an ordinary exit for a process that wants one; what it must not buy is time.
+_TERM_GRACE_SECONDS = 0.5
 
 #: How long the grader gets. Generous, because the base task's evaluator replays a whole task's
 #: database changes, and bounded, because a grader that never finishes would hold a sealed
@@ -285,10 +294,42 @@ def task_ids() -> Tuple[str, ...]:
     return tuple(line.strip() for line in MANIFEST.read_text().splitlines() if line.strip())
 
 
-@lru_cache(maxsize=None)
 def task_specs(root: Path, task_id: str) -> Dict[str, Any]:
-    """One task's shipped specification: its instruction, its supervisor and its datetime."""
+    """One task's shipped specification: its instruction, its supervisor and its datetime.
+
+    **Read every time, not memoized.** This was cached on ``(root, task_id)``, which is a key that
+    says where a spec was rather than what it said: a corpus edited in place produced a new
+    ``corpus_digest`` and a new cache name, and the same process went on serving the instruction,
+    the supervisor and the datetime it had read the first time. The identity moved and the task
+    did not. It is a few kilobytes of JSON, and the cache was also unbounded across a roster of
+    318."""
     return json.loads((root / "data" / "tasks" / task_id / "specs.json").read_text())
+
+
+def runtime_digest() -> str:
+    """What the worker's interpreter actually is, as sixteen hex characters.
+
+    The runtime cache is named for the *direct* AppWorld version alone, while it is built by
+    resolving that release's ranged dependencies against whatever the host's Python and the index
+    offer on the day. Two machines, or one machine a month apart, therefore run a world under
+    different transitive versions under a name that says they are the same. This reads what was
+    realized rather than what was asked for: the interpreter the environment records for itself,
+    and the distribution set on its path, by name and version.
+
+    Read off the filesystem rather than by running the interpreter, so it costs a directory
+    listing. Not memoized, for the reason :func:`corpus_digest` is not."""
+    home = runtime().parent.parent
+    material = hashlib.sha256()
+    material.update(f"{platform.system()}|{platform.machine()}".encode())
+    config = home / "pyvenv.cfg"
+    material.update(config.read_bytes() if config.exists() else b"")
+    for packages in sorted(home.glob("lib/python*/site-packages")):
+        for entry in sorted(packages.iterdir()):
+            # `name-version.dist-info` is the realized distribution set, which is the thing the
+            # cache name does not carry.
+            if entry.name.endswith(".dist-info"):
+                material.update(entry.name.encode())
+    return material.hexdigest()[:16]
 
 
 # ----- the derived corpus -----
@@ -434,7 +475,18 @@ def corpus_digest(root: Path) -> str:
     digest = hashlib.sha256()
     data = root / "data"
     for path in sorted(data.rglob("*")):
-        if not path.is_file() or path.is_symlink():
+        if path.is_symlink():
+            # **Refused rather than skipped.** A skipped link is a file the digest does not cover
+            # and derivation copies anyway: `_materialise` follows links, so the served world held
+            # bytes the identity had never read, and changing what a link pointed at changed the
+            # world without changing the digest that claims to say what the world is. The pinned
+            # bundle contains none, so this refuses a corpus rather than growing a rule about how
+            # to hash one.
+            raise ProvisioningError(
+                f"the corpus at {root} contains a symbolic link ({path.relative_to(data)}), and "
+                "this port cannot state the identity of a tree whose contents are somewhere else"
+            )
+        if not path.is_file():
             continue
         digest.update(str(path.relative_to(data)).encode())
         with path.open("rb") as handle:
@@ -740,20 +792,34 @@ class Worker:
             # stop and there is nothing that could say what it started.
             _stop(self.process, signal.SIGTERM, pgid)
             try:
-                self.process.wait(timeout=_CLOSE_SECONDS)
+                self.process.wait(timeout=_TERM_GRACE_SECONDS)
             except subprocess.TimeoutExpired:
                 _stop(self.process, signal.SIGKILL, pgid)
             return False
+        # SIGTERM, a short grace, then SIGKILL whatever happened. The grace used to be ten
+        # seconds of a signal any process may catch, ignore or take its time over, and every one
+        # of those seconds is time in which the process that ran agent-authored code is still
+        # able to write into the tree about to be graded. It is short because it buys only an
+        # ordinary exit, and it ends in a signal nothing can decline.
         _signal_group(pgid, signal.SIGTERM)
+        # The grace, watched through the process table rather than through `wait`: `wait` reaps,
+        # and a group is enumerable only while its number is still held. A leader that exits
+        # tidily becomes a zombie, which the enumeration steps over, so this returns as soon as
+        # the group is really empty and otherwise costs the grace.
+        _group_emptied(pgid, within=_TERM_GRACE_SECONDS)
+        _signal_group(pgid, signal.SIGKILL)
+        # Enumerated while the leader is still unreaped, and that ordering is the point. Reaping
+        # releases the pid, and a process group exists only while it has a member: reap first and
+        # the number is free, so an enumeration or an escalation after it is about whatever holds
+        # it now. An unreaped leader is a zombie, which holds the number and is excluded from the
+        # count (see `_group_members`), so this asks about descendants and about nothing else.
+        empty = _group_emptied(pgid, within=_CLOSE_SECONDS) is True
+        # Reaped last.
         try:
             self.process.wait(timeout=_CLOSE_SECONDS)
         except subprocess.TimeoutExpired:
-            _signal_group(pgid, signal.SIGKILL)
-            try:
-                self.process.wait(timeout=_CLOSE_SECONDS)
-            except subprocess.TimeoutExpired:
-                return False
-        return _group_emptied(pgid) is True
+            return False
+        return empty
 
 
 class SnapshotError(RuntimeError):
@@ -764,39 +830,100 @@ class SnapshotError(RuntimeError):
     be resolving a path the agent chose in a process that also holds the answers."""
 
 
-def snapshot_outputs(outputs: Path, *, into: Path) -> Path:
+#: What a snapshot may hold before it is refused. An episode's real output tree is tens of
+#: kilobytes across a few dozen files at a depth of four, so these bound a pathological case and
+#: not an ordinary one: the tree was writable by the process that ran agent-authored code, and an
+#: unbounded walk of it holds finalization open and fills the host's disk.
+_SNAPSHOT_MAX_NODES = 20_000
+_SNAPSHOT_MAX_BYTES = 1 << 30
+_SNAPSHOT_MAX_DEPTH = 24
+_SNAPSHOT_SECONDS = 60.0
+
+
+def snapshot_outputs(
+    outputs: Path, *, into: Path, stop: "Optional[threading.Event]" = None
+) -> Path:
     """Copy a stopped episode's output tree into one the grader can be given, or refuse.
 
     **Why a copy and not the tree itself.** The grading process is pointed at the root that holds
     the answers, and it also has to read the state to grade, which was writable by the process
-    that ran the agent's code. A symlink left in there resolves in the grader's process, so a link
-    planted under the output tree could make the digest, the filing and the evaluator read bytes
-    from the graded tree instead of from what the episode submitted. Nothing here returns those
-    bytes to the agent, so this is score integrity rather than a leak, and it is still not a thing
-    to leave open.
+    that ran the agent's code. A symlink left in there resolves in the grader, so a link planted
+    under the output tree could make the digest, the filing and the evaluator read bytes from the
+    graded tree instead of from what the episode submitted. Nothing here returns those bytes to
+    the agent, so this is score integrity rather than a leak, and it is still not a thing to leave
+    open.
 
-    So: every entry is checked to be a plain file or a plain directory whose real path is inside
-    the tree, and anything else refuses the episode outright rather than being skipped, because a
-    skipped entry is a grade computed over a tree that is not the one submitted. What is copied is
-    then a tree of regular files with no link in it, and that is what the grader is given.
+    **The root is checked before it is resolved.** ``resolve()`` erases the question: a root that
+    was itself a symlink came back as whatever it pointed at, and only its descendants were then
+    inspected, so substituting the episode's own output directory substituted the whole tree. It
+    is ``lstat``-ed first, and a link there refuses the episode like a link anywhere else.
+
+    **Bounded in four ways, because this walks a tree an episode wrote.** Nodes, bytes, depth and
+    elapsed time. Without them a large or deep tree holds finalization open for as long as it
+    likes and fills the host's disk on the way, and neither the finalize deadline nor the grader's
+    own timeout covers it: a deadline cancels the *await*, and the thread doing the copying does
+    not stop for that. Which is what ``stop`` is for: the caller sets it when its await is
+    cancelled and this checks it once per file, so a cancelled finalization stops the copy at the
+    next file rather than at the end of the tree.
+
+    Every refusal is an episode refused outright rather than an entry skipped, because a grade
+    computed over a tree with something quietly dropped is a grade over a tree nobody submitted.
 
     Safe to walk because the worker is already gone: this runs after a confirmed stop, so nothing
     can add a link between the check and the copy."""
+    if outputs.is_symlink():
+        raise SnapshotError(
+            f"the episode's output root {outputs} is a symbolic link, so what would be graded is "
+            "whatever it names rather than what the episode wrote"
+        )
     root = outputs.resolve()
     if not root.is_dir():
         raise SnapshotError(f"the episode left no output tree at {outputs}")
-    for path in sorted(root.rglob("*")):
-        if path.is_symlink():
-            raise SnapshotError(
-                f"the episode left a symbolic link in its output tree ({path.name} -> "
-                f"{os.readlink(path)}), which a grader must not resolve"
-            )
-        if not (path.is_file() or path.is_dir()):
-            raise SnapshotError(f"the episode left {path.name}, which is not a file or directory")
-        if not path.resolve().is_relative_to(root):
-            raise SnapshotError(f"the episode left {path.name}, which resolves outside its tree")
+    began = time.monotonic()
+    nodes = 0
+    total = 0
     shutil.rmtree(into, ignore_errors=True)
-    shutil.copytree(root, into, symlinks=False)
+    into.mkdir(parents=True)
+    # One pass: what is checked is what is copied. A validate-then-`copytree` would walk the tree
+    # twice and bound neither walk.
+    pending: List[Tuple[Path, Path, int]] = [(root, into, 0)]
+    while pending:
+        source, target, depth = pending.pop()
+        if depth > _SNAPSHOT_MAX_DEPTH:
+            raise SnapshotError(
+                f"the episode's output tree is deeper than {_SNAPSHOT_MAX_DEPTH} directories"
+            )
+        for entry in sorted(source.iterdir()):
+            if stop is not None and stop.is_set():
+                raise SnapshotError("the snapshot was abandoned before it finished")
+            if time.monotonic() - began > _SNAPSHOT_SECONDS:
+                raise SnapshotError(
+                    f"the episode's output tree took longer than {_SNAPSHOT_SECONDS:.0f}s to copy"
+                )
+            nodes += 1
+            if nodes > _SNAPSHOT_MAX_NODES:
+                raise SnapshotError(
+                    f"the episode's output tree holds more than {_SNAPSHOT_MAX_NODES} entries"
+                )
+            if entry.is_symlink():
+                raise SnapshotError(
+                    f"the episode left a symbolic link in its output tree ({entry.name} -> "
+                    f"{os.readlink(entry)}), which a grader must not resolve"
+                )
+            if entry.is_dir():
+                (target / entry.name).mkdir()
+                pending.append((entry, target / entry.name, depth + 1))
+                continue
+            if not entry.is_file():
+                raise SnapshotError(
+                    f"the episode left {entry.name}, which is not a file or directory"
+                )
+            total += entry.stat().st_size
+            if total > _SNAPSHOT_MAX_BYTES:
+                raise SnapshotError(
+                    f"the episode's output tree is larger than {_SNAPSHOT_MAX_BYTES} bytes"
+                )
+            shutil.copyfile(entry, target / entry.name, follow_symlinks=False)
     return into
 
 
@@ -918,8 +1045,8 @@ def _group_members(pgid: int) -> Optional[List[int]]:
     return live
 
 
-def _group_emptied(pgid: int) -> Optional[bool]:
-    """Whether ``pgid`` is provably empty, escalating once if it is not, or ``None`` if unknown.
+def _group_emptied(pgid: int, *, within: float) -> Optional[bool]:
+    """Whether ``pgid`` emptied inside ``within`` seconds, or ``None`` if that cannot be read.
 
     Waiting for the leader says nothing about what the leader started. Agent code runs in that
     process and may have left something behind, and something still running after the world has
@@ -927,9 +1054,13 @@ def _group_emptied(pgid: int) -> Optional[bool]:
 
     Three answers rather than two, because the caller grades on the strength of this: ``True`` is
     a process table that was read and held nothing of this group, ``False`` is one that still did
-    after a SIGKILL, and ``None`` is a table that could not be read at all."""
-    deadline = time.monotonic() + _CLOSE_SECONDS
-    escalated = False
+    when the time ran out, and ``None`` is a table that could not be read at all.
+
+    Escalation belongs to the caller. This used to send its own SIGKILL when its first deadline
+    passed, which made "how long a tidy exit gets" and "how long a killed group gets to disappear"
+    one number and put the signal in the helper that reports rather than in the one that stops
+    (see :meth:`Worker._stop_the_group`)."""
+    deadline = time.monotonic() + within
     while True:
         members = _group_members(pgid)
         if members is None:
@@ -937,11 +1068,7 @@ def _group_emptied(pgid: int) -> Optional[bool]:
         if not members:
             return True
         if time.monotonic() >= deadline:
-            if escalated:
-                return False
-            _signal_group(pgid, signal.SIGKILL)
-            escalated = True
-            deadline = time.monotonic() + _CLOSE_SECONDS
+            return False
         time.sleep(0.02)
 
 
@@ -1013,6 +1140,7 @@ __all__ = [
     "ensure_apps",
     "ensure_corpus",
     "runtime",
+    "runtime_digest",
     "snapshot_outputs",
     "stamp_cache",
     "task_ids",
