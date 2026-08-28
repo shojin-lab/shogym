@@ -883,6 +883,12 @@ _SWEEP_SECONDS = 5.0
 #: two directories and the same ledger.
 _HOUSEKEEPING = threading.Lock()
 
+#: A wake that arrived while a pass was already running, and that the pass may not have seen.
+#: Deferred work is written down before the wake is sent, so a thread that finds this set after a
+#: pass has work to go back for, whatever that pass concluded. Set before the lock is tried and
+#: read after it is released, which is what makes a rejected wake impossible to lose.
+_HOUSEKEEPING_AGAIN = threading.Event()
+
 
 #: How long a housekeeping thread waits between passes, and how many it will make. Deferred work
 #: is written down when it is deferred, so a pass that leaves some is followed by another rather
@@ -918,14 +924,32 @@ def _housekeep() -> None:
 
     One pass at a time, and failures are swallowed: this is housekeeping, and an env that could
     not tidy up after a previous run is an env that can still serve."""
+    # **Recorded before the lock is tried, which is what makes a rejected wake survive.** A caller
+    # that found the flag held used to simply return, so a teardown that recorded a disowned
+    # container or an ended tree in the window between the running pass reading "no work left" and
+    # releasing the lock had its wake dropped, and the thread then exited on a conclusion that was
+    # already out of date. On a run's last episode nothing came after it.
+    _HOUSEKEEPING_AGAIN.set()
     if not _HOUSEKEEPING.acquire(blocking=False):
         return
 
     def _held() -> None:
         try:
-            _housekeeping_passes()
+            while True:
+                # Cleared before the pass rather than after it, so work recorded *during* the pass
+                # sets it again and is seen below rather than being cleared away unlooked at.
+                _HOUSEKEEPING_AGAIN.clear()
+                _housekeeping_passes()
+                if not _HOUSEKEEPING_AGAIN.is_set():
+                    break
         finally:
             _HOUSEKEEPING.release()
+        # The one window the loop above cannot close is between its last read of the flag and the
+        # release: a wake arriving there finds the lock still held and gives up. Read again once
+        # the lock is gone, where whoever takes it next can act on it, and this call is the one
+        # that has just seen it.
+        if _HOUSEKEEPING_AGAIN.is_set():
+            _housekeep()
 
     try:
         threading.Thread(target=_held, name="shogym-appworld-housekeeping", daemon=True).start()

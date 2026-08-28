@@ -858,41 +858,82 @@ print(json.dumps({
     assert seen["hostname"] in ("", "worker")
 
 
+#: What two arms of a pair may read differently out of `/proc` on one host, and the whole of it.
+#:
+#: Kernel counters keep counting, and the mount table names each episode's own output directory,
+#: so these move between two reads on one machine and cannot be made not to. Everything else there
+#: is either masked by a neutral file or constant for the host, and the test below holds the
+#: difference between the arms to exactly this set: a new name in it is a failure rather than a
+#: quiet widening of what a pair is allowed to differ in.
+_PROC_TIME_VARYING = frozenset(
+    {
+        "buddyinfo",
+        "cgroups",
+        "interrupts",
+        "locks",
+        "mounts",
+        "pagetypeinfo",
+        "pressure/cpu",
+        "pressure/io",
+        "pressure/memory",
+        "sched_debug",
+        "schedstat",
+        "slabinfo",
+        "softirqs",
+        "timer_list",
+        "vmstat",
+        "zoneinfo",
+    }
+)
+
+#: Read but never opened: one blocks until the kernel logs something, and the other two are the
+#: whole of memory.
+_PROC_UNREAD = ("kmsg", "kcore", "self", "thread-self", "sysrq-trigger")
+
+
 async def test_the_machine_a_world_reads_about_is_not_the_host(tmp_path: Path) -> None:
     """A container's `/proc` is mostly the machine's, and this is where that stopped being true.
 
     The kernel virtualizes the process tree per namespace and virtualizes almost nothing else, so
-    `/proc/cpuinfo`, `/proc/meminfo`, `/proc/uptime`, `/proc/stat` and `/proc/loadavg` were the
-    host's own, readable from ordinary `execute` output. None of that is ground truth, a grade, a
-    pulse or an arm label, and both arms on one host read the same numbers; what it is, is a
-    description of the machine rather than of the world, and a pair split across two machines
-    would read two descriptions of two machines under one identity.
+    the host's processor inventory, its memory, how long it has been up and what it had been doing
+    were the host's own, readable from ordinary `execute` output. None of that is ground truth, a
+    grade, a pulse or an arm label; what it is, is a description of the machine rather than of the
+    world, and a pair split across two machines would read two descriptions under one identity.
 
-    Fixed files are mounted over the ones the runtime will let a bind cover. What it will not cover
-    is documented in the port's README rather than implied to be covered: an arbitrary path inside
-    `/proc` is refused (`cannot be mounted because it is inside /proc`), so the boot identifier,
-    the kernel version string and the processor count as `sched_getaffinity` reports it are still
-    the machine's.
-
-    Both arms are read and compared rather than the values being asserted, because what the pair
-    needs is that they are the same, and the constants are the port's to change."""
+    Fixed files are mounted over the seven entries the runtime will let a bind cover. What it will
+    not cover is refused outright, so the rest is a residual rather than an oversight, and this
+    reads the *whole* of `/proc` rather than the seven overlays: both arms are compared name by
+    name and byte by byte, the constants have to match exactly, and what may differ is held to the
+    documented counter set. A new name in that difference fails here."""
     from shogym.serve.stream import Information, Placebo, TaskRef, TaskStream
 
     probe = """
-_io = __import__("io")
-def _read(path):
+_io, _json, _os = __import__("io"), __import__("json"), __import__("os")
+skip = %r
+names, read = [], {}
+with _os.scandir("/proc") as _entries:
+    _found = sorted(entry.name for entry in _entries)
+for name in _found:
+    if name.isdigit() or name in skip:
+        continue
+    names.append(name)
+    path = "/proc/" + name
     try:
-        return _io.open(path).read()
+        if not _os.path.isfile(path):
+            continue
+        with _io.open(path, "rb") as handle:
+            read[name] = handle.read(4096).decode("utf-8", "replace")
     except Exception as exc:
-        return "unreadable: %s" % type(exc).__name__
-print(json.dumps({
-    "cpuinfo": _read("/proc/cpuinfo"),
-    "meminfo": _read("/proc/meminfo"),
-    "uptime": _read("/proc/uptime"),
-    "stat": _read("/proc/stat").splitlines()[:1],
-    "loadavg": _read("/proc/loadavg"),
-}))
-"""
+        read[name] = "unreadable: %%s" %% type(exc).__name__
+for nested in ("pressure/cpu", "pressure/io", "pressure/memory", "sys/kernel/random/boot_id"):
+    try:
+        with _io.open("/proc/" + nested, "rb") as handle:
+            read[nested] = handle.read(4096).decode("utf-8", "replace")
+    except Exception as exc:
+        read[nested] = "unreadable: %%s" %% type(exc).__name__
+print(_json.dumps({"names": names, "read": read}))
+""" % (_PROC_UNREAD,)
+
     seen = {}
     identity = shogym.make("appworld").config_digest
     for name, policy in (("information", Information()), ("placebo", Placebo())):
@@ -910,17 +951,33 @@ print(json.dumps({
             seen[name] = json.loads(answer["output"])
             await stream.dispatch("submit", {})
 
-    # Byte for byte the same in both arms, which is the paired claim, and none of it is this
-    # machine's, which is the boundary one.
-    assert seen["information"] == seen["placebo"]
-    read = seen["information"]
+    first, second = seen["information"], seen["placebo"]
+    # The same filesystem, entry for entry: an arm cannot tell which it is from what is there.
+    assert first["names"] == second["names"]
+
+    read = first["read"]
+    # None of it is this machine's. These are the seven the runtime lets a bind cover, and the
+    # values are the port's own constants.
     assert "model name\t: neutral" in read["cpuinfo"]
     assert read["meminfo"].startswith("MemTotal:        1048576 kB")
     assert read["uptime"].split() == ["0.00", "0.00"]
     assert read["loadavg"].split() == ["0.00", "0.00", "0.00", "1/1", "1"]
-    assert read["stat"] == ["cpu  0 0 0 0 0 0 0 0 0 0"]
-    # Well formed rather than blank, because the world's own dependencies parse them: a truncated
-    # one would be an exception on import rather than a masked fact.
+    assert read["stat"].splitlines()[0] == "cpu  0 0 0 0 0 0 0 0 0 0"
+    assert read["swaps"].startswith("Filename")
+    assert read["diskstats"] == ""
+
+    # And what the two arms differ in is the documented residual and nothing else. The constants
+    # in it (the boot id, the kernel version and its command line) are not in this set at all,
+    # which is the paired guarantee for a pair placed on one host.
+    differing = {
+        name
+        for name in set(read) | set(second["read"])
+        if read.get(name) != second["read"].get(name)
+    }
+    assert differing <= _PROC_TIME_VARYING, sorted(differing - _PROC_TIME_VARYING)
+    for constant in ("version", "cmdline", "sys/kernel/random/boot_id"):
+        assert read[constant] == second["read"][constant], constant
+        assert not read[constant].startswith("unreadable"), constant
 
 
 async def test_the_two_arms_see_the_same_surface_from_inside_execute(tmp_path: Path) -> None:

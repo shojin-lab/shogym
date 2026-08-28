@@ -83,10 +83,13 @@ def test_a_relative_cache_root_still_produces_links_that_resolve(
 
     original = tmp_path / "corpus" / "data"
     (original / "tasks").mkdir(parents=True)
-    (original / "shared").write_text("base databases")
+    # A shared entry this port names: the derived root holds what `world.SHARED_ENTRIES` says
+    # and nothing else, so a fixture inventing a name would be testing a tree production
+    # never builds.
+    (original / "version.txt").write_text("base databases")
     derived = adapter.cache_root() / "derived" / "data"
     world.derive_root(original=original, derived=derived)
-    materialised = derived / "shared"
+    materialised = derived / "version.txt"
     # No symlink to resolve at all now, which is the stronger form of the same guarantee.
     assert not materialised.is_symlink()
     assert materialised.exists() and materialised.read_text() == "base databases"
@@ -1340,7 +1343,7 @@ def test_a_mount_that_cannot_lock_refuses_the_builders_and_still_serves_the_down
     (original / "tasks" / "abc_1" / "dbs").mkdir(parents=True)
     (original / "tasks" / "abc_1" / "ground_truth").mkdir()
     (original / "tasks" / "abc_1" / "dbs" / "todoist.jsonl").write_text("")
-    (original / "shared").write_text("base databases")
+    (original / "version.txt").write_text("base databases")
     # The permission window over the shared entries.
     with pytest.raises(_upstream.ExclusionUnavailable):
         world.derive_root(original=original, derived=tmp_path / "derived" / "data")

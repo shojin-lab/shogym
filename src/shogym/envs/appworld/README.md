@@ -494,6 +494,15 @@ a container now, so the boundary is the machine's rather than the arrangement's.
 | **one** task's world, from this episode's own view of the corpus | read-only, mounted by name, so `data/tasks` inside the container holds exactly one directory |
 | **one** episode's output tree, at `/outputs` | the only writable mount there is, and bounded before it is graded |
 
+That table is the code's own list rather than a description of it. The shared row used to be
+"every top-level entry of the corpus except `tasks`", which is a denylist wearing an allowlist's
+words: the pinned bundle ships a `LICENSE` and a `README_BEFORE_SHARING.md` beside the four, and
+`APPWORLD_ROOT` takes any directory with a `data/tasks` in it, so whatever a corpus happened to
+carry was derived and mounted because nothing had said it should not be. The four are named now
+(`world.SHARED_ENTRIES`), a corpus entry this port does not name is neither derived nor mounted,
+and it is left where it is rather than refused: a file this port does not use is not a defect in
+somebody else's corpus.
+
 **What it cannot see, and the word is *absent* rather than refused:** the run's provenance
 directory, the grader's tree and its private parent, the downloaded corpus, this port's cache, the
 repository, every other task's derived tree, every other episode's output tree, and the user's
@@ -705,12 +714,28 @@ under one identity. So fixed files are mounted over `cpuinfo`, `meminfo`, `uptim
 `loadavg`, `swaps` and `diskstats`, which is the set the container runtime will let a bind cover,
 and they are well formed rather than blank because the world's own dependencies parse them.
 
-**What remains readable, and is not covered by anything above:** `/proc/sys/kernel/random/boot_id`,
-`/proc/version`, the processor count as `sched_getaffinity` reports it (the port limits cpu by
-quota, not by affinity), and `/sys`. A bind onto an arbitrary path inside `/proc` is refused by
-the runtime, so covering those would need a userspace filesystem in every container rather than a
-flag. Two arms on one host read the same values for all of them; two arms on two hosts do not, and
-a paired design that splits across machines should say so.
+The seven are the whole of what a bind can cover, and they are the whole of what is covered: a
+bind onto any other path inside `/proc` is refused by the container runtime outright (`cannot be
+mounted because it is inside /proc`), which was checked against this daemon rather than assumed.
+Covering more would need a userspace filesystem in every container rather than a flag.
+
+**What remains readable, in two kinds.** The first is *constant* on one host: the boot identifier
+(`/proc/sys/kernel/random/boot_id`), the kernel version string (`/proc/version` and
+`/proc/cmdline`), the processor count as `sched_getaffinity` reports it (the port limits cpu by
+quota, not by affinity), and `/sys`. Two arms of a pair on one host read exactly the same bytes
+for all of these, and a test asserts it.
+
+The second kind is *time-varying*, and it is where the paired guarantee is narrower than "the two
+arms see the same surface". Kernel counters keep counting: `/proc/vmstat`, `/proc/pressure/{cpu,
+io,memory}`, `/proc/buddyinfo`, `/proc/pagetypeinfo`, `/proc/zoneinfo`, `/proc/slabinfo`,
+`/proc/softirqs`, `/proc/cgroups` and the mount table's per-episode source names all move between
+two reads on one machine, so two arms run at two instants do not read them identically and cannot be made to.
+`test_the_machine_a_world_reads_about_is_not_the_host` holds the difference between the arms to
+exactly this set, so a new entry in it is a test failure rather than a quiet widening.
+
+What that means for a design: **place a pair on one host**, where every constant is shared and only
+the counters move. Split across machines, the constants differ as well, and a record that says one
+identity would be covering two descriptions of two machines.
 
 **A container whose parent died is swept, not hoped about.** Every container carries the pid that
 started it and this machine's boot, and construction removes the labelled ones whose parent is

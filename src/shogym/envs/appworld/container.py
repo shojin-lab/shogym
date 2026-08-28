@@ -640,7 +640,20 @@ def reap(*, alive: Optional[Callable[..., bool]] = None) -> List[str]:
         # ambiguous case has to be the one where nothing happens.
         if not parent.isdigit() or running(int(parent), birth):
             continue
-        _run(["rm", "-f", identifier], timeout=_CONTROL_TIMEOUT_SECONDS, check=False)
+        # **What the daemon did, not what it was asked.** A refusing daemon that produced a reap
+        # reporting a container gone would leave no record anywhere: the ledger is the only thing
+        # `_deferred_work` consults, so housekeeping would conclude there was nothing left to do
+        # and stop. A container that is still there still holds a writable mount.
+        try:
+            gone = remove(identifier, confirm=True)
+        except DockerError:
+            # The daemon would not confirm it. Written down where the sweep looks, so a later pass
+            # tries it again rather than this being the last anyone hears of it.
+            disowned(identifier)
+            continue
+        if not gone:
+            disowned(identifier)
+            continue
         removed.append(identifier)
     return removed
 
