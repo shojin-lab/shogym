@@ -19,7 +19,7 @@ import sys
 import threading
 import time
 from pathlib import Path
-from typing import Any, Dict, List
+from typing import Any, Dict, List, Tuple
 
 import pytest
 
@@ -591,6 +591,167 @@ def test_a_worker_is_stopped_through_the_group_it_was_spawned_in() -> None:
 
 
 
+# ----- a worker whose parent is gone -----
+
+
+def _keepalive_worker_script(tmp_path: Path) -> Path:
+    """A worker that arms the real parent-death watch and then never stops on its own.
+
+    It calls `worker.watch_parent`, which is the code under test, rather than a copy of it. That
+    module imports nothing but the standard library at its top level, so it can be loaded by an
+    interpreter that has never heard of `appworld` or of shogym."""
+    script = tmp_path / "keepalive_worker.py"
+    script.write_text(
+        "import json, sys, time\n"
+        f"sys.path.insert(0, {str(adapter.WORKER.parent)!r})\n"
+        "import worker\n"
+        "opening = json.loads(sys.stdin.readline())\n"
+        "sys.stdin.close()\n"
+        "worker.watch_parent(opening.get('keepalive'))\n"
+        "sys.stdout.write(json.dumps({'port': 1}) + '\\n')\n"
+        "sys.stdout.flush()\n"
+        "while True:\n"
+        "    time.sleep(1)\n"
+    )
+    return script
+
+
+def _supervisor_script(tmp_path: Path) -> Path:
+    """A serving process that spawns one worker, says which pid it got, and then waits."""
+    script = tmp_path / "supervisor.py"
+    script.write_text(
+        "import sys, time\n"
+        "from pathlib import Path\n"
+        "from shogym.envs.appworld import adapter\n"
+        "adapter.runtime = lambda: Path(sys.executable)\n"
+        "adapter.WORKER = Path(sys.argv[1])\n"
+        "worker = adapter.Worker.spawn(Path(sys.argv[2]))\n"
+        "Path(sys.argv[3]).write_text(str(worker.process.pid))\n"
+        "time.sleep(300)\n"
+    )
+    return script
+
+
+def test_a_worker_stops_itself_when_the_process_that_started_it_dies(tmp_path: Path) -> None:
+    """Teardown needs a parent, and the case it cannot reach is the parent dying with an episode
+    open.
+
+    A worker is started in a session of its own, so nothing reaps it when its owner goes: it was
+    handed to init and went on serving a world, holding a port and a scratch directory, while the
+    only handle on it, the port, the token, the process and the group number, died with the
+    process that held them. Every other close test keeps the owning parent alive, so none of them
+    could have seen this.
+
+    The supervisor here is a real process running the real spawn, and it is killed with a signal
+    it cannot handle rather than asked to tidy up. What the worker is left with is the reading end
+    of a pipe, which reaches end of file because the kernel closed the writing end, and that is a
+    fact about the parent rather than a message from one."""
+    root = tmp_path / "root"
+    root.mkdir()
+    told = tmp_path / "worker.pid"
+    supervisor = subprocess.Popen(
+        [
+            sys.executable,
+            str(_supervisor_script(tmp_path)),
+            str(_keepalive_worker_script(tmp_path)),
+            str(root),
+            str(told),
+        ],
+        env={**os.environ, "SHOGYM_CACHE": str(tmp_path / "cache")},
+    )
+    try:
+        deadline = time.monotonic() + 60
+        while not told.exists() and time.monotonic() < deadline:
+            assert supervisor.poll() is None, "the supervisor exited instead of spawning"
+            time.sleep(0.05)
+        worker_pid = int(told.read_text())
+        os.kill(worker_pid, 0)
+        # And it was written down, which is the other half of what a later run has to work from.
+        written = (tmp_path / "cache" / "appworld" / "workers.txt").read_text()
+        assert f'"pid": {worker_pid}' in written
+
+        supervisor.kill()
+        supervisor.wait(timeout=30)
+        deadline = time.monotonic() + 30
+        while time.monotonic() < deadline:
+            try:
+                os.kill(worker_pid, 0)
+            except ProcessLookupError:
+                break
+            time.sleep(0.05)
+        else:
+            raise AssertionError("the worker outlived the process that started it")
+    finally:
+        supervisor.kill()
+        supervisor.wait(timeout=30)
+
+
+def test_a_worker_whose_owner_is_gone_is_reclaimed_and_a_live_one_is_not(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The durable half: what a construction after a crash has instead of a `Worker` object.
+
+    Nothing outlived the serving process. A resumed harness could neither adopt a worker nor name
+    one for teardown, so it started another beside it. Every worker is written down now with the
+    pid and the start time of the process that started it, and a construction reads that file.
+
+    The start time is the load-bearing half. A pid alone answers "is something running under that
+    number", and pids are handed out again, so an owner's number can belong to a stranger by the
+    time anybody asks: reclaiming a live episode's world is worse than the failure this fixes. So
+    the owner below is a real process that really exited, and the live one is a real process
+    running under its own recorded birth."""
+    monkeypatch.setenv("SHOGYM_CACHE", str(tmp_path / "cache"))
+    running: List[subprocess.Popen] = []
+
+    def _worker_of(
+        name: str, owner: subprocess.Popen, birth: str
+    ) -> Tuple[subprocess.Popen, Path]:
+        """One sleeper standing in for a worker, written down as ``owner``'s."""
+        held = _sleeper(120)
+        running.append(held)
+        scratch = tmp_path / f"shogym-appworld-{name}"
+        scratch.mkdir()
+        adapter._append(
+            "+"
+            + json.dumps(
+                {
+                    "name": name,
+                    "parent": owner.pid,
+                    "birth": birth,
+                    "boot": adapter._boot_id(),
+                    "pid": held.pid,
+                    "pid_birth": adapter.process_birth(held.pid),
+                    "pgid": adapter._group_of(held),
+                    "scratch": str(scratch),
+                }
+            )
+        )
+        return held, scratch
+
+    gone = _sleeper(120)
+    gone_birth = adapter.process_birth(gone.pid)
+    assert gone_birth, "the process table has to answer for this test to mean anything"
+    gone.kill()
+    gone.wait(timeout=30)
+    living = _sleeper(120)
+    running.append(living)
+
+    try:
+        abandoned, abandoned_scratch = _worker_of("orphan", gone, gone_birth)
+        kept, kept_scratch = _worker_of("live", living, adapter.process_birth(living.pid))
+
+        assert adapter.reap() == ["orphan"]
+        assert abandoned.wait(timeout=30) is not None, "the abandoned world was stopped"
+        assert not abandoned_scratch.exists(), "and its scratch directory went with it"
+        assert kept.poll() is None and kept_scratch.exists(), "the live one is untouched"
+        assert [record["name"] for record in adapter.outstanding()] == ["live"]
+        assert adapter.reap() == [], "and a second sweep has nothing left to do"
+    finally:
+        for process in running:
+            process.kill()
+            process.wait(timeout=30)
+
+
 # ----- a stop that cannot be confirmed is not a stop -----
 
 
@@ -778,31 +939,103 @@ def test_a_cache_is_named_by_the_code_and_the_interpreter_that_filled_it(
     assert served != adapter.derived_root(corpus, runtime="bbbbbbbbbbbbbbbb")
     assert graded != adapter.graded_root(corpus, runtime="bbbbbbbbbbbbbbbb")
 
-    # And so is a generator whose constants did not move but whose code did. The three files whose
-    # bytes are read are the ones that decide what a derived tree holds, and they are read as
-    # bytes rather than named, so an edit that touches no constant still moves the key.
-    named = {path.name for path in adapter._generator_sources()}
-    assert named == {"ledger.py", "world.py", "worker.py"}
-    assert all(path.is_file() for path in adapter._generator_sources())
+    # And so is a generator whose constants did not move but whose code did. The modules whose
+    # bytes are read are the ones a world is generated from, and they are read as bytes rather
+    # than named, so an edit that touches no constant still moves the key.
+    named = dict(adapter._generator_sources())
+    assert {
+        "shogym.envs.appworld.env_v1",
+        "shogym.envs.appworld.ledger",
+        "shogym.envs.appworld.world",
+        "shogym.envs.appworld.worker",
+    } <= set(named)
+    assert all(path.is_file() for path in named.values())
+    # `env_v1` above is the one the hand-kept list did not have. `_backlog_seed` decides the
+    # backlog written into a derived task and `_world_seed` decides the episode's own generator,
+    # and both live there, so an implementation change to either reused a world and a run identity
+    # naming the generator before it.
+    assert "_backlog_seed" in named["shogym.envs.appworld.env_v1"].read_text()
 
     copies = tmp_path / "generator"
     copies.mkdir()
-    for path in adapter._generator_sources():
-        (copies / path.name).write_bytes(path.read_bytes())
-    order = tuple(copies / path.name for path in adapter._generator_sources())
+    for name, path in adapter._generator_sources():
+        (copies / name).write_bytes(path.read_bytes())
+    order = tuple((name, copies / name) for name, _ in adapter._generator_sources())
     monkeypatch.setattr(adapter, "_generator_sources", lambda: order)
     try:
         adapter._generator_digest.cache_clear()
         copied = adapter.derived_root(corpus, runtime="aaaaaaaaaaaaaaaa")
         assert copied == served, "the same bytes under another directory are the same generator"
-        (copies / "ledger.py").write_bytes(
-            (copies / "ledger.py").read_bytes() + b"\n# an edit that changes no constant\n"
-        )
-        adapter._generator_digest.cache_clear()
-        assert copied != adapter.derived_root(corpus, runtime="aaaaaaaaaaaaaaaa")
+        # Every one of them, not a representative: a module in the closure that did not move the
+        # name would be a module the identity does not cover.
+        for name, path in order:
+            before = path.read_bytes()
+            path.write_bytes(before + b"\n# an edit that changes no constant\n")
+            adapter._generator_digest.cache_clear()
+            assert copied != adapter.derived_root(corpus, runtime="aaaaaaaaaaaaaaaa"), name
+            path.write_bytes(before)
+            adapter._generator_digest.cache_clear()
+            assert copied == adapter.derived_root(corpus, runtime="aaaaaaaaaaaaaaaa"), name
     finally:
         # The digest is memoized for the process, so a test that patched what it reads has to
         # leave the cache empty or every later test reads this one's answer.
+        adapter._generator_digest.cache_clear()
+
+
+def test_the_generator_names_itself_by_what_it_imports_rather_than_by_a_list(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The closure is walked, so a module that joins the generator joins the identity by itself.
+
+    The failure this is against is not an edit to a listed file; it is a helper written into a
+    file nobody thought to list. So the walk is exercised on a package of its own, where a module
+    can be added to an entry point's imports and the answer checked, which is the operation the
+    real closure cannot demonstrate without editing the port.
+
+    Three things are established. Imports are followed transitively, and through a body rather
+    than only at the top level, because this port defers several of its own. A module reached only
+    from outside the port's own roots is not pulled in, which is what keeps the name of a 134 MB
+    cache off the serve layer's source. And a new import moves the name."""
+    root = tmp_path / "src" / "shogym"
+    package = root / "envs" / "appworld"
+    package.mkdir(parents=True)
+    (root / "envs" / "_upstream.py").write_text("HELD = 1\n")
+    (root / "serve").mkdir()
+    (root / "serve" / "stream.py").write_text("UNRELATED = 1\n")
+    (package / "entry.py").write_text(
+        "from shogym.envs.appworld import middle\n"
+        "from shogym.serve.stream import UNRELATED\n"
+        "def later():\n"
+        "    from shogym.envs._upstream import HELD\n"
+        "    return HELD\n"
+    )
+    (package / "middle.py").write_text("VALUE = 1\n")
+    (package / "spare.py").write_text("VALUE = 2\n")
+    monkeypatch.setattr(adapter, "_PACKAGE_ROOT", root)
+    monkeypatch.setattr(adapter, "_GENERATOR_ENTRY_POINTS", ("shogym.envs.appworld.entry",))
+
+    adapter._generator_sources.cache_clear()
+    adapter._generator_digest.cache_clear()
+    try:
+        walked = dict(adapter._generator_sources())
+        assert set(walked) == {
+            "shogym.envs.appworld.entry",
+            "shogym.envs.appworld.middle",
+            "shogym.envs._upstream",
+        }, "transitively, through a function body, and no further than this port's own roots"
+        assert "shogym.serve.stream" not in walked
+        assert "shogym.envs.appworld.spare" not in walked, "a file beside them is not an import"
+
+        before = adapter._generator_digest()
+        (package / "entry.py").write_text(
+            (package / "entry.py").read_text() + "from shogym.envs.appworld import spare\n"
+        )
+        adapter._generator_sources.cache_clear()
+        adapter._generator_digest.cache_clear()
+        assert "shogym.envs.appworld.spare" in dict(adapter._generator_sources())
+        assert adapter._generator_digest() != before, "a module that joined the generator moved it"
+    finally:
+        adapter._generator_sources.cache_clear()
         adapter._generator_digest.cache_clear()
 
 
@@ -1193,25 +1426,43 @@ def test_the_runtime_digest_moves_when_the_installed_code_does(
     assert run_fingerprint(pulse=0, report="graded", blocks=60) != stamped
 
 
-def test_a_bytecode_cache_is_not_part_of_the_runtime_identity(
+def test_a_bytecode_cache_is_part_of_the_runtime_identity(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """The digest reads installed bytes, and `__pycache__` is not one of them.
+    """A `.pyc` is executable input, and the digest used to skip every one of them.
 
-    A `.pyc` is written lazily by whichever process imported the module first, so hashing one
-    would make the interpreter's identity depend on what ran before rather than on what is
-    installed. What keeps that from being a hole is not this function: it is that provisioning
-    leaves the runtime holding hash-based caches and workers write none back, which is
-    `test_a_stale_bytecode_cache_is_not_what_the_worker_executes`."""
+    The defence of skipping them was that provisioning leaves the runtime holding hash-based
+    caches, which the import system validates against the source's own hash. That validation
+    binds the *source hash written in the cache's header* to the source, and binds nothing to the
+    marshalled code after it. So a cache whose header still matched its source and whose payload
+    had been changed was executable code the run's identity had never read, and the identity did
+    not move.
+
+    This builds precisely that: a real checked-hash cache, then one byte of its payload changed
+    with the sixteen-byte header left exactly as it was."""
+    import py_compile
+
     home = tmp_path / "runtime"
     python = _fake_runtime(home)
     monkeypatch.setattr(adapter, "runtime", lambda: python)
-    cache = home / "lib" / "python3.12" / "site-packages" / "appworld" / "__pycache__"
+    installed = home / "lib" / "python3.12" / "site-packages" / "appworld" / "__init__.py"
 
+    compiled = Path(
+        py_compile.compile(
+            str(installed),
+            doraise=True,
+            invalidation_mode=py_compile.PycInvalidationMode.CHECKED_HASH,
+        )
+    )
     before = adapter.runtime_digest()
-    cache.mkdir()
-    (cache / "__init__.cpython-312.pyc").write_bytes(b"\x00compiled")
-    assert adapter.runtime_digest() == before
+    source, original = installed.read_bytes(), compiled.read_bytes()
+    edited = bytearray(original)
+    edited[-1] ^= 0xFF
+    compiled.write_bytes(bytes(edited))
+
+    assert compiled.read_bytes()[:16] == original[:16], "the source hash it records is untouched"
+    assert installed.read_bytes() == source, "and so is the source it claims to stand for"
+    assert adapter.runtime_digest() != before
 
 
 def test_a_runtime_is_reused_only_when_it_is_the_one_the_pins_name(
@@ -1728,6 +1979,81 @@ def test_a_shared_entry_edited_after_the_snapshot_is_not_derived_into_a_root(
     assert (derived / "base_dbs" / "big.jsonl").read_text() == "shared"
 
 
+# ----- a task is reused only when it is still the task that was derived -----
+
+
+def test_a_task_that_is_no_longer_what_was_derived_is_built_again(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Reuse was decided by two path existences, which is not a task.
+
+    The question asked was whether the served `dbs/todoist.jsonl` and the graded `ground_truth`
+    were there. That says yes to a tree with everything else missing, to one whose databases were
+    changed after derivation, and to one whose read-only seal has come off; and what is reused is
+    the world every episode of the task starts in and the baseline it is graded against. Each of
+    the three is built here on a real derivation and the answer read.
+
+    A rebuild rather than a refusal, because a task that is not what was derived is a task this
+    can make correctly: the seeder is called again and the tree afterwards is the tree that was
+    published the first time."""
+    root = _derivable_corpus(tmp_path / "corpus")
+    env = _stub_env(root, tmp_path, monkeypatch)
+    seeder = _StubSeeder()
+    env._derive(seeder, "abc_1")
+    assert seeder.calls == 1
+    served = env._derived / "tasks" / "abc_1"
+    graded = env._graded / "tasks" / "abc_1"
+    assert world.already_derived(derived=env._derived, graded=env._graded, task_id="abc_1")
+    intact = {
+        path: path.read_bytes()
+        for path in sorted(served.rglob("*"))
+        if path.is_file() and not path.is_symlink()
+    }
+
+    def _damage(how: Any) -> None:
+        world._unseal(served)
+        how()
+        world._seal(served)
+
+    # A file removed, a file's bytes changed, and a node whose write bit came back. The third is
+    # left unsealed on purpose: it is the state a partial chmod leaves, and a shared task an
+    # episode can write to is one it can leave changed for the next episode and for the other arm
+    # of its own pair.
+    for damage in (
+        lambda: _damage(lambda: (served / "dbs" / "gmail.jsonl").unlink()),
+        lambda: _damage(lambda: (served / "dbs" / "gmail.jsonl").write_text("nail")),
+        lambda: world._unseal(served / "dbs" / "gmail.jsonl"),
+    ):
+        damage()
+        assert not world.already_derived(
+            derived=env._derived, graded=env._graded, task_id="abc_1"
+        )
+        before = seeder.calls
+        env._derive(seeder, "abc_1")
+        assert seeder.calls == before + 1, "rebuilt rather than trusted"
+        assert world.already_derived(derived=env._derived, graded=env._graded, task_id="abc_1")
+        assert {
+            path: path.read_bytes()
+            for path in sorted(served.rglob("*"))
+            if path.is_file() and not path.is_symlink()
+        } == intact
+
+    # And the grader's own view is held to the same standard: it is the baseline the evaluator
+    # diffs against, and half of it was never checked at all.
+    world._unseal(graded)
+    (graded / "ground_truth" / "answer.json").write_text('"moved"')
+    world._seal(graded)
+    assert not world.already_derived(derived=env._derived, graded=env._graded, task_id="abc_1")
+    env._derive(seeder, "abc_1")
+    assert json.loads((graded / "ground_truth" / "answer.json").read_text()) == "the answer"
+
+    # A warm episode pays for that check once per task, and this is what it costs.
+    began = time.monotonic()
+    for _ in range(20):
+        assert world.already_derived(derived=env._derived, graded=env._graded, task_id="abc_1")
+    assert (time.monotonic() - began) / 20 < 0.05
+
+
 # ----- what a finalizer may do before it yields -----
 
 
@@ -1972,7 +2298,12 @@ def test_a_stale_bytecode_cache_is_not_what_the_worker_executes(
     whatever is in it. This builds exactly that and proves the interpreter runs it, rather than
     asserting that it would not; then it rebuilds the same cache the way provisioning does, as a
     hash-based one the import system checks against the source's own hash, and proves the source
-    is what runs. That is what makes leaving those bytes out of the identity honest."""
+    is what runs.
+
+    That is what an edited *source* costs, and it is only half the question. An edited *payload*
+    under a matching header is executed by either kind, which is why the digest reads these bytes
+    rather than reasoning about them: see
+    `test_a_bytecode_cache_is_part_of_the_runtime_identity`."""
     import py_compile
 
     site = tmp_path / "site"

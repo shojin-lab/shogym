@@ -59,17 +59,17 @@ TaskStream(
 
 `config_digest` covers the draw, the payload class, the block budget, every constant a payload is
 generated from, the text the agent is given (the world guide, the tool guide and the appended
-paragraph), the generator that decides the seeded backlog (its constants and the bytes of the
-three modules that implement it), the corpus this run actually serves (all of it, including the
-134 MB of shared base episodes read as input), the derivation layout, what the worker's
-interpreter turned out to hold, and a hand-bumped scoring version that moves when how a score is
-read moves. "What the interpreter holds" is a stated scope rather than a slogan: it is every
-installed source and data byte under `site-packages` plus the base executable `bin/python`
-resolves to. It is not the base interpreter's standard library, which belongs to the host rather
-than to anything this port installs, and it is not the bytecode caches, which are left out because
-the whole interpreter is compiled at provisioning with hash-based caches the import system checks
-against each source's own hash, and workers write none back: every `.pyc` that can be consulted
-therefore stands for a source the digest did read. An env serves the corpus it
+paragraph), the generator that decides the seeded backlog (its constants, and the bytes of every
+module the world generators import, walked rather than listed), the corpus this run actually
+serves (all of it, including the 134 MB of shared base episodes read as input), the derivation
+layout, what the worker's interpreter turned out to hold, and a hand-bumped scoring version that
+moves when how a score is read moves. "What the interpreter holds" is a stated scope rather than a
+slogan: it is every installed byte under `site-packages`, bytecode caches included, plus the base
+executable `bin/python` resolves to. The caches are in it because a checked-hash `.pyc` binds the
+*source* hash recorded in its header and not the marshalled payload beside it, so a payload edited
+under a matching header is executable code no digest over the sources would have read. It is not
+the base interpreter's standard library, which belongs to the host rather than to anything this
+port installs. An env serves the corpus it
 read at construction for the whole of its life: the instructions, the supervisors and the dates
 come from that one reading, so a corpus edited underneath a running env cannot put new authored
 text behind an unchanged fingerprint. Pinning the text is not the whole of it, because a task's
@@ -311,13 +311,19 @@ cannot change the byte count.
 - **the receipt** (`report`, under `Information`): `PASS` or `FAIL` per item and nothing else. No
   expected value, no rule statement, no per-item error count, and no naming of which choice an
   item turns on.
-- **the digest** (`notice`, under `Placebo`): `sha256(task || check || observed)[:4]` per item. A
-  function of the task identity and the agent's own submission, both of which are already in the
-  agent's transcript, so it carries nothing about the key by construction. The base task's own
-  checks render their observed value as `not determined`, always: a check asserts over models the
-  agent touched through nine apps and has no value the agent wrote anywhere, and naming its
-  outcome in the one column both classes share would make the inert payload move with the base
-  task's result. A test flips every check and asserts no byte of the digest moves.
+- **the digest** (`notice`, under `Placebo`): `sha256(task || check || observed)[:4]` per item.
+  Computed on the server, from the identity of the task the agent is working and from the agent's
+  own submission. The identity is the env's own material, not something the serve layer showed the
+  agent (a dispensed task deliberately carries nothing that names it), and it is the same value in
+  both arms of a pair, so it cannot tell one arm from the other. The key is not an input to it at
+  all. That is the whole of the claim: the identifier is not secret, and it is printed in the
+  header of all three classes, which is a constant of the episode rather than a function of the
+  key. The base task's own checks render their observed value as `not determined`, always. A check
+  asserts over models the agent touched through nine apps and has no value the agent wrote
+  anywhere, and naming its outcome in the one column both classes share would make the inert
+  payload move with the base task's result. A test flips every check and asserts no byte of the
+  digest moves, and a second renders two tasks from one submission and reads what moves: the
+  header cell that prints the task, the digest column, and nothing else.
 - **the drawn receipt** (`report`, with `report="drawn"`): the receipt's shape with verdicts that
   were sampled rather than computed. The number of passing dated requests is drawn from
   [`pass_counts.txt`](pass_counts.txt), the roster's own distribution enumerated over every served
@@ -363,13 +369,25 @@ bytes, sha256 `fd9f9608c2ec71ed0ac25c3633a738b9129a318a129e31230425b9188e508250`
   the global generator, so a port that replayed only the databases would serve two worlds that
   agreed on their contents and disagreed on their next draw.
 - **The derived cache's name says everything that filled it.** Four things: the corpus it was
-  derived from, the derivation layout, the generator (its constants and the bytes of `ledger.py`,
-  `world.py` and `worker.py`), and the realized interpreter, which is the process that writes a
-  task's seeded database log through upstream's own model layer. Each of them is also inside a
-  stamp written into the cache, because a name cannot cover a tree that was edited, moved or
-  restored under it. So pointing `APPWORLD_ROOT` at a second corpus, editing how a task is derived
-  without touching a ledger constant, or reinstalling the runtime, all derive a fresh tree rather
-  than reusing one an older combination seeded.
+  derived from, the derivation layout, the generator, and the realized interpreter, which is the
+  process that writes a task's seeded database log through upstream's own model layer. "The
+  generator" is its constants plus the source bytes of every module reachable from the three that
+  generate a world (`env_v1`, `world`, `worker`), walked through the imports rather than kept as a
+  list somebody has to remember to extend: the list version missed the helpers that pick a task's
+  backlog seed and its world seed, both of which live in `env_v1`. The price of the walk is that
+  an edit anywhere in the port, a comment included, derives the corpus again. Each of the four is
+  also inside a stamp written into the cache, because a name cannot cover a tree that was edited,
+  moved or restored under it. So pointing `APPWORLD_ROOT` at a second corpus, editing how a task
+  is derived without touching a ledger constant, or reinstalling the runtime, all derive a fresh
+  tree rather than reusing one an older combination seeded.
+- **A derived task is reused only when it is still the task that was derived.** Every path in it,
+  with its mode, its size and its digest, is written into a manifest as the last act of its
+  derivation, and that manifest arrives under the task's name in the same rename that publishes
+  the tree, so it is the completion marker as well as the contents. A warm episode checks the
+  whole of it before reusing anything. The check used to be that two paths existed, which said
+  yes to a tree with everything else missing, to one whose databases had been changed since, and
+  to one whose read-only seal had come off. Verifying the pair costs about two milliseconds
+  against a construction of about four seconds.
 - **Not built:** the yoked payload (a donor's submission and the receipt computed on it), the
   foreign rendering of a verdict vector as prose and the parser that round-trips it, the fixed-size
   envelope that would pad those to one predeclared size, and any assignment, forking or analysis
@@ -443,6 +461,21 @@ A leader something else reaped first leaves a number nothing may signal or enume
 episode is closed as an infrastructure failure rather than scored on it, so the row is `unscored`
 with a `finalize_error` closure and nothing in `observed` at all, which means neither feedback arm
 has a payload to reveal. The same is true of an output tree the grader refuses.
+
+**A serving process that dies abruptly does not leave a world running.** Teardown is the ordinary
+path and it needs a parent to run it, so the case it cannot reach is the parent dying with an
+episode open. The worker is started in a session of its own, which is what makes stopping an
+episode stop everything the episode spawned and also what stops anything reaping it when its
+owner goes: it would be handed to init and go on serving a world nobody holds a handle on, since
+the port, the token, the process handle and the group number lived only in the parent's memory.
+Two things close that. The worker holds the read end of a pipe from its parent and kills its own
+group when that reaches end of file, which is the kernel reporting the parent's exit rather than
+any process saying so, and which happens however the parent exits (`PR_SET_PDEATHSIG` is asked
+for too on Linux, and is not what this rests on). And every worker is written down in a file under
+the cache root with the pid and the start time of the process that started it, so a later
+construction can tell an abandoned worker from a live one and clear it away: the start time is
+there beside the pid because pids are reused, and reclaiming a live episode's world because an
+unrelated process now holds its owner's number would be worse than the failure this fixes.
 
 **The grader is given a snapshot, not the tree the world wrote.** The grading process is pointed
 at the root that holds the answers, so a link left under the output tree would resolve there. The

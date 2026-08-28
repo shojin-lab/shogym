@@ -25,6 +25,7 @@ construction site, and these tests are the adversary that goes looking for the w
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import copy
 import json
 import os
@@ -1449,6 +1450,102 @@ async def test_an_env_whose_names_cannot_be_compared_still_lands_its_row(
     assert "cannot headline" in (row["diagnostic"] or "")
 
 
+class _SilentDigestEnv(_DeclaredDigestEnv):
+    """Answers to the name it declares, and publishes nothing under it on the row.
+
+    The drift this pair exists to catch, in the shape it actually takes: a factory that hands the
+    catalog one env and every episode another. The catalog's answer is what the run is filed
+    under, and an episode that says nothing is an episode that never confirmed it."""
+
+    def _verify(
+        self, trajectory: Any, task: Dict[str, Any], *, terminated: bool, evidence: Any = None
+    ) -> FeedbackCollection:
+        return _FixtureScoreEnv._verify(
+            self, trajectory, task, terminated=terminated, evidence=evidence
+        )
+
+
+async def test_a_row_the_env_never_attested_is_refused_before_it_is_scored(
+    tmp_path: Path,
+) -> None:
+    """Silence is not agreement.
+
+    The catalog's digest is stamped into the identity every row is filed under, and the check used
+    to return the moment an episode published nothing under the declared name. So a factory that
+    handed the catalog one env and the episode another, one that declared the item and never
+    published it, produced a ``sealed`` row with a real score filed under a digest its own episode
+    had never said: the drift the assertion exists to detect, passing silently."""
+    built: List[Any] = []
+
+    def _factory(_name: str) -> _DeclaredDigestEnv:
+        # The first env built is the catalog's, and it is the one that asserts.
+        env = (
+            _DeclaredDigestEnv(tasks=TASKS, digest="digest-a")
+            if not built
+            else _SilentDigestEnv(tasks=TASKS, digest="digest-a")
+        )
+        built.append(env)
+        return env
+
+    stream = TaskStream(
+        _factory,
+        [TaskRef(ENV_NAME, 0)],
+        prov_dir=tmp_path / "prov",
+        identity="fingerprint-a",
+    )
+    with pytest.raises(RuntimeError):
+        async with stream:
+            await stream.get_task()
+            await stream.dispatch(SUBMIT_TOOL, {"answer": "4"})
+
+    (row,) = _rows(tmp_path)
+    assert row["closure"] == "finalize_error" and row["score"] is None
+    assert "digest-a" in (row["diagnostic"] or "")
+    assert "config_digest" in (row["diagnostic"] or "")
+    # The evidence is still on the row: what the episode did publish, which is what says it
+    # published no identity.
+    assert "config_digest" not in [item.get("name") for item in row["observed"]]
+
+
+async def test_a_row_that_earned_no_outcome_is_not_asked_to_attest(tmp_path: Path) -> None:
+    """The attestation requirement lands on scored rows and nowhere else.
+
+    An unearned closure already has its own finding to report and its env published no verdict
+    behind it, so demanding an identity item there would replace a precise diagnostic with a
+    vaguer one about a digest, for a row nobody can aggregate either way."""
+    said = {"digest": "digest-a"}
+
+    class _NeverPublishes(_DeclaredDigestEnv):
+        def _verify(
+            self, trajectory: Any, task: Dict[str, Any], *, terminated: bool, evidence: Any = None
+        ) -> FeedbackCollection:
+            return _FixtureScoreEnv._verify(
+                self, trajectory, task, terminated=terminated, evidence=evidence
+            )
+
+    stream = TaskStream(
+        lambda _name: _NeverPublishes(tasks=TASKS, digest=said["digest"]),
+        [TaskRef(ENV_NAME, 0), TaskRef(ENV_NAME, 1)],
+        prov_dir=tmp_path / "prov",
+        identity="fingerprint-a",
+        deadline=0.05,
+    )
+    await stream.__aenter__()
+    try:
+        await stream.get_task()
+        await asyncio.sleep(0.3)  # the deadline ends the task the stream is holding
+    finally:
+        with contextlib.suppress(RuntimeError):
+            await stream.aclose()
+
+    (row,) = _rows(tmp_path)
+    # The deadline's own row, with the deadline's own diagnostic, rather than a refusal about a
+    # digest the env was never going to be scored on.
+    assert row["closure"] == "timeout" and row["score"] is None
+    assert "deadline" in (row["diagnostic"] or "")
+    assert "config_digest" not in (row["diagnostic"] or "")
+
+
 async def test_an_env_that_does_not_describe_itself_binds_nothing(tmp_path: Path) -> None:
     # The state every env was in before this existed, and the one a reconciled crash row is in:
     # no digest is published, so nothing is bound and nothing is refused.
@@ -2336,6 +2433,91 @@ async def test_a_refused_resume_never_displaces_the_claim_it_would_have_taken(
         await serving.dispatch(SUBMIT_TOOL, {"answer": "6"})
     assert [row["position"] for row in _rows(tmp_path)] == [0, 1]
     assert not _claim(tmp_path).exists()
+
+
+async def test_a_takeover_that_cannot_publish_puts_the_incumbent_back(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A resume that displaced a claim and never managed to publish its own.
+
+    The unlink and the create are one critical section, but they are still two syscalls, and the
+    second one can fail: a full disk, a read-only remount. The cleanup used to return at its first
+    line because this constructor never owned anything, so the incumbent's claim stayed unlinked
+    and the directory was owned by nobody. The stream that was serving carried on until its next
+    owned append and stopped there permanently, which is the same run lost that a refusal before
+    the takeover is careful not to cost. What decides whether a restore is owed is whether this
+    call took something away, not whether it managed to own anything."""
+    incumbent = _stream(tmp_path, [0, 1], feedback=Immediate())
+    await incumbent.get_task()
+    held = json.loads(_claim(tmp_path).read_text(encoding="utf-8"))
+
+    published: List[Any] = []
+    real_write = TaskStream._write_claim
+
+    def _first_publication_fails(self: Any, payload: Any) -> None:
+        published.append(payload)
+        if len(published) == 1:
+            raise OSError("no space left on device")
+        real_write(self, payload)
+
+    monkeypatch.setattr(TaskStream, "_write_claim", _first_publication_fails)
+    with pytest.raises(OSError):
+        _stream(tmp_path, [0, 1], resume=True, feedback=Immediate())
+    monkeypatch.undo()
+
+    # The replacement was attempted once and the incumbent's own claim went back, byte for byte.
+    assert len(published) == 2
+    assert json.loads(_claim(tmp_path).read_text(encoding="utf-8")) == held
+    # ...so the stream that was serving is untouched: its append lands and it closes cleanly.
+    async with incumbent:
+        await incumbent.dispatch(SUBMIT_TOOL, {"answer": "4"})
+        await incumbent.get_task()
+        await incumbent.dispatch(SUBMIT_TOOL, {"answer": "6"})
+    assert [row["position"] for row in _rows(tmp_path)] == [0, 1]
+    assert not _claim(tmp_path).exists()
+
+
+@pytest.mark.parametrize(
+    "field, stored",
+    [
+        ("position", "0"),
+        ("position", 0.0),
+        ("task_idx", "0"),
+        ("seq", 1.0),
+        ("seq", True),
+        ("env", 7),
+        ("lease", 7),
+    ],
+)
+async def test_a_persisted_queue_field_is_read_at_the_type_it_was_written(
+    tmp_path: Path, field: str, stored: Any
+) -> None:
+    """The queue fields a resume trusts are read exactly, not coerced into looking right.
+
+    ``int()`` and ``str()`` around a persisted position, index, ``seq``, env key or lease turn a
+    value this module never wrote into one that reads as a task this run already played, a lease
+    it may never mint again, or a number the next row counts past. The provenance directory is the
+    harness's own, so the reachable causes are corruption, a mixed writer and a hand-edited
+    recovery rather than anything an agent can reach; that is what makes failing closed cheap
+    here, not what makes it unnecessary."""
+    async with _stream(tmp_path, [0, 1]) as first:
+        await first.get_task()
+        await first.dispatch(SUBMIT_TOOL, {"answer": "4"})
+
+    for name in ("results.jsonl", "dispenses.jsonl"):
+        path = tmp_path / "prov" / name
+        rewritten = []
+        for line in path.read_text().splitlines():
+            if not line.strip():
+                continue
+            record = json.loads(line)
+            record[field] = stored
+            rewritten.append(json.dumps(record))
+        path.write_text("\n".join(rewritten) + "\n")
+
+    with pytest.raises(ValueError, match=field) as refused:
+        _stream(tmp_path, [0, 1], resume=True)
+    assert "provenance record" in str(refused.value)
 
 
 async def test_a_refused_resume_costs_the_live_stream_nothing_while_it_is_deciding(

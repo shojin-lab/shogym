@@ -159,6 +159,12 @@ class AppWorldEnv(Env):
                 "digest is the notice channel's and is never the report's"
             )
         adapter.ensure_apps()
+        # Before anything else this construction does, because what it clears away is a world of
+        # some earlier run's holding a port and a scratch directory that nobody is coming back
+        # for. A serving process that died abruptly took the only handle on its worker with it,
+        # and a resumed harness has no way to name one; this is where a run reads what an earlier
+        # one wrote down (see `adapter.reap`).
+        adapter.reap()
         self._pulse = int(pulse)
         self._report = report
         self._original = adapter.ensure_corpus() / "data"
@@ -750,6 +756,14 @@ def run_fingerprint(
             world.APPENDED_PARAGRAPH,
             # What decides the seeded backlog. It already names the derived cache, so changing it
             # served a different world under a fingerprint that had not moved.
+            #
+            # This module's own bytes are inside it, and that is not incidental. `_backlog_seed`
+            # below decides the backlog written into a derived task and `_world_seed` decides the
+            # generator the live episode runs from, and both were outside a digest that hashed
+            # three named files elsewhere in the port: an implementation change to either reused a
+            # world and claimed the generator before it. The digest is now the import closure of
+            # the modules that generate a world, and this is one of them (see
+            # `adapter._generator_sources`).
             adapter._generator_digest(),
         ]
     )

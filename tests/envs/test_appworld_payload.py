@@ -6,8 +6,10 @@ submissions rather than argued about.
 
 The properties defended here are the ones that make two arms one comparison. The three classes are
 the same length on the wire. None of them prints an expected value, a rule, or the name of a
-choice. The digest is a function of the agent's own submission alone. And the drawn receipt's
-verdicts do not move when the real ones do, which is the executable form of "it carries nothing".
+choice. The digest is a function of the served task's identity and the agent's own submission, and
+of nothing else: the key is not an input to it, and the identity is the same value in both arms of
+a pair, so it separates two tasks and never two arms. And the drawn receipt's verdicts do not move
+when the real ones do, which is the executable form of "it carries nothing".
 """
 
 from __future__ import annotations
@@ -433,9 +435,10 @@ def test_the_receipt_says_pass_or_fail_and_the_digest_says_neither(
 
 
 def test_the_digest_is_a_function_of_the_submission_alone(backlog: ledger.Backlog) -> None:
-    # Both the task identity and the submission are already in the agent's own transcript, so a
-    # digest carries no information about the key by construction, and no reading of its wording
-    # is needed to establish that. Two different keys over one submission give one digest column.
+    # Half of the contract: the key is not an input. Two different keys over one submission give
+    # one digest column, so no reading of the payload's wording is needed to establish it. What
+    # this cannot show is what the identity does, because the identity is held fixed here; that is
+    # `test_two_tasks_with_one_submission_differ_only_where_the_identity_is`.
     first, second = draw_key(LEG, 0), draw_key(LEG, 3)
     assert first.convention != second.convention
     submission = filing(backlog, first, correct=11)
@@ -452,6 +455,46 @@ def test_the_digest_is_a_function_of_the_submission_alone(backlog: ledger.Backlo
         for key in (first, second)
     }
     assert len(columns) == 1
+
+
+def test_two_tasks_with_one_submission_differ_only_where_the_identity_is(
+    backlog: ledger.Backlog,
+) -> None:
+    """What the placebo is a function of, established rather than asserted.
+
+    The contract is that the digest is computed here from the served task's identity and the
+    agent's submission, and from nothing else. Holding the identity fixed while varying the key
+    shows the key is not an input; it cannot show what the identity does, because a value that
+    never moves cannot be seen. So this varies the identity over one submission and reads what
+    moves: the header cell that prints the task, and the digest column. Every other byte, the
+    status, the counts, the column headings and every scored row's first four columns, is the
+    same, and the two payloads are the same length.
+
+    The receipt is rendered from the same submission for contrast. Its verdicts are computed from
+    the world rather than from the task's name, so two tasks under one submission differ in the
+    header cell alone: the digest column is the only place the identity reaches, which is what the
+    identity being the env's own material buys. Neither payload's difference is visible across a
+    pair, because both arms of a pair are the same task."""
+    key = draw_key(LEG, 0)
+    verdicts = scored(backlog, key, correct=11)
+    other = "1f2e3d4_1"
+    assert len(other) == len(TASK) and leg_of(other) != LEG
+
+    for cell, moves in ((payload.DIGEST, True), (payload.GRADED, False)):
+        first = payload.render(task_id=TASK, verdicts=verdicts, cell=cell)
+        second = payload.render(task_id=other, verdicts=verdicts, cell=cell)
+        assert len(first.encode()) == len(second.encode())
+        left, right = first.splitlines(), second.splitlines()
+        assert left[0] == f"SUBMISSION RECEIPT   task {TASK}"
+        assert right[0] == f"SUBMISSION RECEIPT   task {other}"
+        # The status, the counts, the blank line and the column headings.
+        assert left[1:5] == right[1:5]
+        rows = list(zip(left[5:], right[5:]))
+        assert len(rows) == len(verdicts.items)
+        width = len(f"{payload.PASS:<{payload._LAST_WIDTH}}")
+        assert all(a[:-width] == b[:-width] for a, b in rows), cell
+        differing = [a[-width:] != b[-width:] for a, b in rows]
+        assert all(differing) if moves else not any(differing)
 
 
 def test_a_known_wrong_and_a_correct_submission_render_the_same_shaped_digest(
