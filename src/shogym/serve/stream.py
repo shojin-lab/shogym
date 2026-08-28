@@ -1899,11 +1899,28 @@ def _same_context(one: "contextvars.Context", other: "contextvars.Context") -> b
     identity-checked, because every task copies its context and no two callers ever hold the same
     object. A value that will not compare is a value this cannot vouch for, so it says no."""
     try:
-        return {var.name: value for var, value in one.items()} == {
-            var.name: value for var, value in other.items()
-        }
-    except Exception:  # noqa: BLE001 - a comparison that raises has not established sameness
+        mine = dict(one.items())
+        theirs = dict(other.items())
+    except Exception:  # noqa: BLE001 - a context that will not enumerate has not been vouched for
         return False
+    # Keyed by the `ContextVar` objects, not by their names. A name is a diagnostic label and two
+    # unrelated libraries may both define `ContextVar("tenant")`: compared by name, one caller's
+    # tenant variable and another's matched whenever their rendered values happened to agree, and
+    # a build made for one was handed to the other.
+    if set(mine) != set(theirs):
+        return False
+    for var, value in mine.items():
+        try:
+            if value is not theirs[var] and value != theirs[var]:
+                return False
+        except Exception:  # noqa: BLE001 - a value that will not compare proves nothing
+            return False
+    return True
+
+
+#: How long a replacement build waits for the one it replaces to be let go of. A bound on the
+#: wait, not on the discard: an env whose close never returns is an env whose close never returns.
+_BUILD_SECONDS = 60.0
 
 
 @dataclass
@@ -2453,6 +2470,8 @@ class TaskStream:
             # The env build in flight for each still-owed queue position, so a cancelled pull
             # hands its builder to the next one rather than leaving it running beside a second.
             self._builders: Dict[int, "_Builder"] = {}
+            # A discard a replacement build for the same position has to wait behind.
+            self._replacing: Dict[int, Any] = {}
             self._closed = False
             self._stopped: Optional[_Stopped] = None
             self._watchdog: Optional[asyncio.Task[None]] = None
@@ -3626,9 +3645,14 @@ class TaskStream:
             # resources, and files the session hooks that follow under theirs. Let go of it and
             # build the one this caller asked for.
             del self._builders[position]
-            held.lifecycle.stop_when(
-                _discarded(held.lifecycle, held.building, held.close_context)
-            )
+            discarded = _discarded(held.lifecycle, held.building, held.close_context)
+            held.lifecycle.stop_when(discarded)
+            # The replacement waits behind it. A synchronous factory cannot be told to stop, so
+            # starting the new one at once left the old one running: four cancelled pulls under
+            # four contexts ran four constructors for one queue position at the same time, none
+            # of them inside `max_in_flight`, which is the unbounded construction the registry
+            # exists to prevent.
+            self._replacing[position] = discarded
             held = None
         if held is None:
             lifecycle = _Lifecycle(ref.env)
@@ -3856,6 +3880,14 @@ class TaskStream:
             # inside `max_in_flight`, and a wedged one leaves a thread behind each time. So the
             # build is the *position's*, not the pull's: a pull that is cancelled leaves it here
             # and the next pull for that position joins it instead of starting another.
+            replacing = self._replacing.pop(position, None)
+            if replacing is not None and not replacing.done():
+                # One constructor per position, even across a context change: the build being
+                # replaced is still running and this position may not have two.
+                with contextlib.suppress(BaseException):
+                    await asyncio.wait_for(
+                        asyncio.shield(asyncio.wrap_future(replacing)), timeout=_BUILD_SECONDS
+                    )
             held = self._builder(position, ref)
             lifecycle, building = held.lifecycle, held.building
             try:

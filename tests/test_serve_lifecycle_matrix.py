@@ -69,6 +69,11 @@ EVENTS = (
     "session_slow",
     "span_fails",
     "factory_fails_late",
+    # A cell that says "cannot arise" is a claim, and these are what happens when the claim is
+    # wrong.
+    "normal_close",
+    "cancel_cleanup",
+    "deadline_mid_finalize",
 )
 
 
@@ -538,6 +543,110 @@ async def _span_fails_while_begun(tmp_path: Path) -> None:
         assert loop is asyncio.get_running_loop()
 
 
+
+
+async def _normal_close_while_dispatching(_tmp: Path) -> None:
+    """An ordinary close during a dispatch waits: it does not claim an abort and release the
+    session while the accepted call is still inside the tool."""
+    score_mcp.reset_block()
+    ep = await ServedEpisode.start(score_env.ENV_NAME, task=0)
+    try:
+        running = asyncio.ensure_future(ep.call("noop", {}))
+        await running
+        blocked = asyncio.ensure_future(ep.call("block", {}))
+        await asyncio.sleep(0.1)
+        closing = asyncio.ensure_future(ep.close())
+        await asyncio.sleep(0.1)
+        assert not score_mcp.landed.is_set()
+        assert not closing.done(), "close did not wait for the call the episode had accepted"
+        score_mcp.released.set()
+        assert await asyncio.to_thread(score_mcp.landed.wait, 5.0)
+        await blocked
+        await closing
+        assert [e.tool for e in ep._trajectory][:2] == ["noop", "block"]
+        assert [e.index for e in ep._trajectory][:2] == [1, 2]
+    finally:
+        score_mcp.released.set()
+        await ep.close()
+
+
+async def _cancel_cleanup_while_begun(_tmp: Path) -> None:
+    """A cancellation delivered during setup cleanup does not skip the rest of it: the session is
+    released, the env closed and the lifecycle thread stopped."""
+    class _NoContract(_Watched):
+        def describe(self, task_id: Optional[str] = None) -> Any:
+            raise RuntimeError("no contract")
+
+    env = _NoContract(bind_loop=False, begin_seconds=0.05)
+    real_open = episode_module._open_session_for_spec
+
+    async def opening(spec: Any, **kwargs: Any) -> Any:
+        session = await real_open(spec, **kwargs)
+        closing = session.close
+
+        async def slow() -> None:
+            await asyncio.sleep(0.3)
+            await closing()
+
+        session.close = slow  # type: ignore[method-assign]
+        return session
+
+    episode_module._open_session_for_spec = opening  # type: ignore[assignment]
+    try:
+        opening_task = asyncio.ensure_future(ServedEpisode.open_env(env, task=0))
+        await asyncio.sleep(0.25)
+        opening_task.cancel()
+        with contextlib.suppress(BaseException):
+            await opening_task
+    finally:
+        episode_module._open_session_for_spec = real_open  # type: ignore[assignment]
+    # Awaited rather than blocked on: this env was built on this loop, so its close is posted
+    # back here and a caller that blocks is waiting for work it is preventing.
+    assert await _awaited(env.closed.is_set), "the env was left open by a cancelled cleanup"
+    _holds(env)
+
+
+async def _deadline_mid_finalize_while_finalizing(_tmp: Path) -> None:
+    """A drain and an evaluator created *after* the teardown was arranged still own the env, so
+    the close does not go in front of them."""
+    gate = threading.Event()
+    env = _Watched(finalize_gate=gate)
+    ep = await ServedEpisode.open_env(env, task=0, finalize_deadline=0.05)
+    submitting = asyncio.ensure_future(ep.call(SUBMIT_TOOL, {"answer": "4"}))
+    await asyncio.sleep(0.15)  # the deadline has answered; the evaluator is still held
+    closing = asyncio.ensure_future(ep.close())
+    await asyncio.sleep(0.02)
+    closing.cancel()
+    with contextlib.suppress(BaseException):
+        await closing
+    for _ in range(20):
+        await asyncio.sleep(0.01)
+    assert env.closed_while_owned is False, "closed under an evaluator created after arrangement"
+    gate.set()
+    with contextlib.suppress(BaseException):
+        await submitting
+    await ep.close()
+    _holds(env, sessions=ep)
+
+
+async def _normal_close_while_finalizing(_tmp: Path) -> None:
+    """An ordinary close during a finalization waits for it and scores what it graded."""
+    import json as _json
+
+    gate = threading.Event()
+    env = _Watched(finalize_gate=gate)
+    ep = await ServedEpisode.open_env(env, task=0)
+    submitting = asyncio.ensure_future(ep.call(SUBMIT_TOOL, {"answer": "4"}))
+    await asyncio.sleep(0.05)
+    closing = asyncio.ensure_future(ep.close())
+    await asyncio.sleep(0.05)
+    assert not closing.done()
+    gate.set()
+    assert _json.loads((await submitting).content)["correct"] is True
+    await closing
+    _holds(env, sessions=ep)
+
+
 #: state -> event -> a cell that runs, or the reason the pair cannot arise.
 _MATRIX: Dict[str, Dict[str, Any]] = {
     "building": {
@@ -552,6 +661,9 @@ _MATRIX: Dict[str, Dict[str, Any]] = {
         "env_cancels": "a constructor that raises is `factory_fails_late`",
         "session_slow": "no session is opened before the env is built",
         "span_fails": "spans open after the build, which is `begun`",
+        "normal_close": "no episode exists to close",
+        "cancel_cleanup": "there is no cleanup until there is something built to clean up",
+        "deadline_mid_finalize": "nothing is finalizing",
     },
     "begun": {
         "cancel_start": _cancel_start_while_begun,
@@ -565,12 +677,16 @@ _MATRIX: Dict[str, Dict[str, Any]] = {
         "env_raises": "covered under `releasing`",
         "session_slow": "sessions are opened before the hook; a slow one delays setup, not a race",
         "factory_fails_late": "the factory has already returned",
+        "normal_close": "no episode is returned to close",
+        "cancel_cleanup": _cancel_cleanup_while_begun,
+        "deadline_mid_finalize": "nothing is finalizing",
     },
     "dispatching": {
         "cancel_call": _cancel_call_while_dispatching,
         "deadline_fires": _deadline_fires_while_dispatching,
         "cancel_start": "setup is over",
-        "cancel_close": "a close during a dispatch waits for it; covered under `releasing`",
+        "normal_close": _normal_close_while_dispatching,
+        "cancel_close": "a close during a dispatch waits for it, which is `normal_close` here",
         "second_close": "covered under `releasing`",
         "loop_closes": "an episode whose loop closes mid-dispatch is `begun`'s loop-loss shape",
         "env_raises": "a tool that raises is an ordinary call result, not a lifecycle event",
@@ -578,10 +694,15 @@ _MATRIX: Dict[str, Dict[str, Any]] = {
         "session_slow": "a slow tool is what `cancel_call` blocks on",
         "span_fails": "spans are open by now",
         "factory_fails_late": "the factory has already returned",
+        "cancel_cleanup": "there is no cleanup path here; teardown is `releasing` and `closing`",
+        "deadline_mid_finalize": "nothing is finalizing",
     },
     "finalizing": {
         "cancel_call": _cancel_call_while_finalizing,
         "cancel_close": _cancel_close_while_finalizing,
+        "normal_close": _normal_close_while_finalizing,
+        "deadline_mid_finalize": _deadline_mid_finalize_while_finalizing,
+        "cancel_cleanup": "cleanup has not begun; the finalizer still owns the env",
         "cancel_start": "setup is over",
         "deadline_fires": "covered under `draining`: the deadline is what creates that state",
         "second_close": "covered under `releasing`",
@@ -593,6 +714,9 @@ _MATRIX: Dict[str, Dict[str, Any]] = {
         "factory_fails_late": "the factory has already returned",
     },
     "draining": {
+        "normal_close": "covered under `finalizing`: the same wait, one owner later",
+        "cancel_cleanup": "covered under `closing`",
+        "deadline_mid_finalize": "the deadline is what created this state",
         "cancel_close": _cancel_close_while_draining,
         "cancel_start": "setup is over",
         "cancel_call": "the deadline has already answered the caller",
@@ -606,6 +730,9 @@ _MATRIX: Dict[str, Dict[str, Any]] = {
         "factory_fails_late": "the factory has already returned",
     },
     "releasing": {
+        "normal_close": "the release is what an ordinary close does; this is that path",
+        "cancel_cleanup": "covered under `closing`",
+        "deadline_mid_finalize": "the episode is already sealed",
         "second_close": _second_close_while_releasing,
         "env_raises": _env_raises_while_releasing,
         "cancel_start": "setup is over",
@@ -619,6 +746,9 @@ _MATRIX: Dict[str, Dict[str, Any]] = {
         "factory_fails_late": "the factory has already returned",
     },
     "closing": {
+        "normal_close": "this state is what an ordinary close is",
+        "cancel_cleanup": "covered by `session_slow`, which cancels during disposal",
+        "deadline_mid_finalize": "the episode is already sealed",
         "session_slow": _session_slow_while_closing,
         "env_raises": _env_raises_while_closing,
         "cancel_start": "setup is over",
@@ -632,6 +762,9 @@ _MATRIX: Dict[str, Dict[str, Any]] = {
         "factory_fails_late": "the factory has already returned",
     },
     "closed": {
+        "normal_close": "covered by `second_close`",
+        "cancel_cleanup": "cleanup is over",
+        "deadline_mid_finalize": "the episode is already sealed and released",
         "second_close": _second_close_while_closed,
         "cancel_start": "setup is over",
         "cancel_call": "a call after the close is a tombstone, tested in the episode suite",
@@ -671,4 +804,6 @@ def test_every_pair_is_accounted_for() -> None:
     running = sum(
         1 for state in STATES for event in EVENTS if not isinstance(_MATRIX[state][event], str)
     )
-    assert running >= 15, running
+    # The bound only ratchets.
+    assert running >= 20, running
+    assert len(STATES) * len(EVENTS) == len(STATES) * len(EVENTS)

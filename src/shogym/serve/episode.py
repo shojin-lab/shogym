@@ -31,6 +31,7 @@ import atexit
 import concurrent.futures
 import contextlib
 import contextvars
+import functools
 import json
 import os
 import threading
@@ -277,6 +278,21 @@ class _Lifecycle:
             asyncio.run_coroutine_threadsafe(_in_context(), self._loop)
             return out
 
+    def call_in(
+        self, context: "contextvars.Context", fn: "Callable[..., Any]", *args: Any
+    ) -> "concurrent.futures.Future[Any]":
+        """One synchronous env hook on this thread, under a context somebody kept.
+
+        The release of a session is the counterpart of opening it: a hook that reads a tenant out
+        of a context variable to pick which resource to take must read the same one to give it
+        back. Copying the *closer's* context released whoever happened to be closing, and left
+        the opener's held."""
+
+        async def _run() -> Any:
+            return fn(*args)
+
+        return self.run(_run(), context)
+
     def call(self, fn: "Callable[..., Any]", *args: Any) -> "concurrent.futures.Future[Any]":
         """Run one **synchronous** env hook on this lifecycle's thread.
 
@@ -364,7 +380,10 @@ class _Lifecycle:
             return
         bound = timeout if timeout is not None else _EXIT_SECONDS
         self._thread.join(bound)
-        if self._thread.is_alive():
+        # A stop that asked for no wait has not timed out; it has not waited. Warning there said
+        # a hook was still running when nothing had been given a chance to finish, which is the
+        # message an unknown-env construction failure was producing with no env in existence.
+        if bound > 0 and self._thread.is_alive():
             # Still inside a hook. Said out loud rather than dropped quietly: this lifecycle is
             # no longer tracked and nothing will wait for it again, so if it is holding a
             # process, a port or a directory, this line is the only place that says so.
@@ -585,6 +604,17 @@ class _EnvClose:
             )
         return self._outcome
 
+    def watching(self) -> "concurrent.futures.Future[Any]":
+        """The lifecycle's own half of the close, for a caller that is stopping the lifecycle.
+
+        Not :attr:`outcome`. For a caller-owned env the outcome is completed by the caller's own
+        close, while the lifecycle-side watcher that was following it is still running; stopping
+        on the outcome halted that loop under it, and Python said so twice at every process exit.
+        This is the thing the loop is actually doing."""
+        self.close_env()
+        with self._lock:
+            return self._closing if self._closing is not None else self._outcome
+
     async def _on_the_owning_loop(self) -> None:
         """The close, on whichever loop owns the env, run by the lifecycle and by nobody else.
 
@@ -741,7 +771,7 @@ class _SetupRollback:
         # And the lifecycle stops itself behind that close. Left to a caller continuation it was
         # left to a coroutine that may never resume: a loop-loss rollback closed the env and then
         # its own thread stayed alive for the life of the process.
-        self._lifecycle.stop_when(self._cleanup.close_env())
+        self._lifecycle.stop_when(self._cleanup.watching())
 
     @property
     def released(self) -> bool:
@@ -778,6 +808,15 @@ def _with_preemption(diagnostic: Optional[str], preempted: Optional[str]) -> Opt
         return diagnostic
     note = f"the deadline's terminal overtook an accepted call to {preempted!r}"
     return note if not diagnostic else f"{diagnostic}; {note}"
+
+
+async def _disposed(sessions: "List[MCPSession]") -> None:
+    """Close every session this setup opened, whatever any one of them does."""
+    for session in sessions:
+        try:
+            await session.close()
+        except BaseException:  # noqa: BLE001 - best effort; one may not stop the rest
+            pass
 
 
 def _noted(carried: BaseException, what: str, failure: BaseException) -> None:
@@ -970,6 +1009,7 @@ class ServedEpisode:
         finalize_deadline: Optional[float] = None,
         lifecycle: Optional["_Lifecycle"] = None,
         cleanup: Optional["_EnvClose"] = None,
+        opened_context: "Optional[contextvars.Context]" = None,
     ) -> None:
         self._env = env
         self._env_name = env_name
@@ -1090,6 +1130,10 @@ class ServedEpisode:
         # Whether the env close and this lifecycle's shutdown have been handed over. Once, and
         # never in front of a finalization that is still writing its verdict (`_arrange_teardown`).
         self._teardown_arranged = False
+        # The context this episode was opened in, kept so its session is released under it.
+        self._opened_context = (
+            opened_context if opened_context is not None else contextvars.copy_context()
+        )
         # The one disposal of this episode's MCP sessions (see `_dispose_sessions`).
         self._disposing: Optional["asyncio.Future[None]"] = None
         # The one close of this env. Every path that wants the env closed goes through it, so
@@ -1249,9 +1293,17 @@ class ServedEpisode:
         began: Optional[str] = None
         handed_over = False
         env_name = env_name if env_name is not None else env.name
+        # Every env method, on the loop that built the env. A flagged env may have bound its
+        # constructor loop, and `load_task`, `essential_specs` and `describe` are env work like
+        # any other: run here they broke the same promise `finalize` was breaking.
+        async def on_env(fn: "Callable[..., Any]", *called: Any) -> Any:
+            if built_on_lifecycle:
+                return await asyncio.wrap_future(lifecycle.call(fn, *called))
+            return fn(*called)
+
         try:
             task_idx = int(task) if task is not None else None
-            task_data = env.load_task(task_idx)
+            task_data = await on_env(env.load_task, task_idx)
             # Publish the *resolved* task identity so a random-default episode (task
             # omitted) is still attributable: an env that indexes tasks records the
             # chosen index in task_data (Wordle: "task_idx"), so a `shogym serve wordle_v1`
@@ -1265,7 +1317,7 @@ class ServedEpisode:
             session_id = str(uuid7())
 
             sessions: Dict[str, MCPSession] = {}
-            for spec in env.essential_specs():
+            for spec in await on_env(env.essential_specs):
                 session = await _open_session_for_spec(spec, session_id=session_id)
                 opened.append(session)
                 for tool_config in await session.list_tools():
@@ -1296,7 +1348,7 @@ class ServedEpisode:
             # The one description this episode ever asks for. Everything published about the task
             # and everything enforced on it comes off this single answer — see the snapshot the
             # constructor takes of it.
-            spec = env.describe(resolved_task)
+            spec = await on_env(env.describe, resolved_task)
             # Construct inside the try so the cleanup below also covers the constructor's own
             # fail-loud guard (a `score` manifest with no callable finalize): the sessions
             # opened above are released before the error propagates.
@@ -1313,6 +1365,7 @@ class ServedEpisode:
                 finalize_deadline=finalize_deadline,
                 lifecycle=lifecycle,
                 cleanup=cleanup,
+                opened_context=contextvars.copy_context(),
             )
             handed_over = True
             return episode
@@ -1321,27 +1374,40 @@ class ServedEpisode:
             # everything here. Nothing this does may replace the failure being carried: a caller
             # told "close boom" instead of "setup boom" has been handed the wrong problem, so a
             # cleanup failure is attached to the setup one as a note rather than raised over it.
-            for session in opened:
-                try:
-                    await session.close()
-                except BaseException as closing_failed:  # noqa: BLE001 - noted, not raised
-                    if isinstance(closing_failed, asyncio.CancelledError) and (
-                        _caller_cancelled()
-                    ):
-                        raise
-                    _noted(setup_failed, "an MCP session", closing_failed)
-            if rollback is None and began is not None:
-                # Setup got past `begin_session` and failed after it: `describe` raised, or the
-                # constructor's own fail-loud guard did. The env holds a session either way, and
-                # it is released the same way a cancelled one is.
-                rollback = _SetupRollback(lifecycle, env, began, cleanup)
+            # Arranged before anything is awaited, so a cancellation delivered part-way through
+            # cleanup cannot leave the rest of it undone. It used to: a cancel while one session
+            # close was pending re-raised at once and skipped the sessions after it, the rollback,
+            # the env close and the lifecycle's own shutdown.
+            if began is not None:
+                rollback = rollback or _SetupRollback(lifecycle, env, began, cleanup)
+            disposing = asyncio.ensure_future(_disposed(opened))
+            disposing.add_done_callback(_swallow)
+            try:
+                await asyncio.shield(disposing)
+            except BaseException as closing_failed:  # noqa: BLE001 - noted, not raised
+                if isinstance(closing_failed, asyncio.CancelledError) and _caller_cancelled():
+                    # Handed back, but only after everything above has an owner: the rollback is
+                    # queued on the lifecycle, the sessions are disposing in their own task, and
+                    # the shutdown below is arranged behind the cleanup.
+                    if rollback is not None:
+                        rollback.sessions_closed()
+                    if not handed_over:
+                        lifecycle.stop_when(cleanup.outcome)
+                    raise
+                _noted(setup_failed, "an MCP session", closing_failed)
             if rollback is not None:
+                # Arranged before any of the waiting below, so a cancellation anywhere in it
+                # leaves the whole sequence owned: the rollback runs the release and then the
+                # close, and the lifecycle stops behind that. What follows is a wait, not a
+                # decision, and a wait is the one thing a cancellation may take.
+                rollback.sessions_closed()
+                if not handed_over:
+                    lifecycle.stop_when(cleanup.outcome)
                 # The sessions above are closed before the env is, because `Env.close` releases
                 # what the *constructor* made and those clients may still be using it. The
                 # rollback is told rather than raced: it waits for this line before it arranges
                 # the env close, and goes ahead on its own only if this loop closes first, since
                 # a session entered on a loop that is gone cannot be exited anywhere.
-                rollback.sessions_closed()
                 # The rollback itself was queued on the lifecycle loop when it was made: the
                 # release runs when the setup hook ahead of it finishes, and the env close after
                 # that. Neither depends on this coroutine resuming, which is the difference
@@ -1575,7 +1641,7 @@ class ServedEpisode:
                     # had already published. So this ends the episode against the operation that
                     # is running rather than starting another beside it, and the operation is
                     # tombstoned when it lands.
-                    return self._forced_legacy_ending(tool_name)
+                    return await self._forced_legacy_ending(tool_name)
                 # Non-seal env: the single-step path. Owned and awaited outside the lock for the
                 # same reasons the seal-enabled one is: a cancelled caller would otherwise
                 # abandon an operation that is already in the env.
@@ -1683,7 +1749,7 @@ class ServedEpisode:
         )
         self._terminated = terminated
 
-        feedback = self._env.verify(self._trajectory, self._task, terminated=terminated)
+        feedback = await self._env_verify(terminated=terminated)
         items = [*feedback.inference, *feedback.episode]
 
         if terminated:
@@ -1771,7 +1837,7 @@ class ServedEpisode:
                 self._begin_finalization("horizon", tool_name, None)
         return outcome
 
-    def _forced_legacy_ending(self, tool_name: str) -> CallResult:
+    async def _forced_legacy_ending(self, tool_name: str) -> CallResult:
         """End a non-seal episode against the ordinary call it is still running.
 
         **Called under the lock, and it dispatches nothing.** A non-seal env has no seal
@@ -1782,7 +1848,7 @@ class ServedEpisode:
         the env is tombstoned when it lands (see `_legacy_step`)."""
         self._terminated = True
         self._preempted = self._inflight_tool
-        feedback = self._env.verify(self._trajectory, self._task, terminated=True)
+        feedback = await self._env_verify(terminated=True)
         items = [*feedback.inference, *feedback.episode]
         self._terminal_feedback = [dump_item(item) for item in items]
         # **No trace row.** A step row is one dispatched call, and this dispatches nothing: written
@@ -1888,7 +1954,7 @@ class ServedEpisode:
         self._trajectory.append(
             Step(index=step, tool=tool_name, arguments=args, result=content)
         )
-        feedback = self._env.verify(self._trajectory, self._task, terminated=terminated)
+        feedback = await self._env_verify(terminated=terminated)
         items = [*feedback.inference, *feedback.episode]
         if self._trace_path is not None and write_trace:
             append_trace(
@@ -2133,8 +2199,8 @@ class ServedEpisode:
 
                 # A verifier bug must not strand the episode: fail closed on a verify() raise.
                 try:
-                    feedback = self._env.verify(
-                        self._trajectory, self._task, terminated=True, evidence=evidence
+                    feedback = await self._env_verify(
+                        terminated=True, evidence=evidence
                     )
                     items = [*feedback.inference, *feedback.episode]
                 except Exception as exc:  # noqa: BLE001 (verifier failure => fail closed)
@@ -2321,7 +2387,7 @@ class ServedEpisode:
                 self._released = _settled()
             else:
                 try:
-                    self._released = self._lifecycle.call(release)
+                    self._released = self._lifecycle.call_in(self._opened_context, release)
                 except RuntimeError:
                     # The lifecycle has stopped (a second close), so this caller runs the release.
                     release()
@@ -2345,6 +2411,25 @@ class ServedEpisode:
         if self._cleanup.owned_by_caller:
             return asyncio.ensure_future(finalize(req))  # type: ignore[misc]
         return asyncio.wrap_future(self._lifecycle.run(finalize(req)))  # type: ignore[misc]
+
+    async def _env_verify(self, **kwargs: Any) -> Any:
+        """The env's own `verify`, on the loop that owns the env."""
+        return await self._env_call(
+            functools.partial(self._env.verify, self._trajectory, self._task, **kwargs)
+        )
+
+    async def _env_call(self, fn: "Callable[..., Any]", *args: Any) -> Any:
+        """One synchronous env method, on the loop that owns the env.
+
+        A flagged env was told its work happens on its episode's lifecycle loop, and it is
+        allowed to have bound that loop in its constructor. `load_task`, `describe`, `verify` and
+        the rest are env work like any other, and running them on the serving caller's loop broke
+        the same promise `finalize` was breaking: a fixture that checked its loop in `_load_task`
+        failed on the first dispense. An env the caller built keeps the caller's loop here, where
+        this is a direct call and costs nothing."""
+        if self._cleanup.owned_by_caller:
+            return fn(*args)
+        return await asyncio.wrap_future(self._lifecycle.call(fn, *args))
 
     def _teardown_budget(self) -> float:
         """What is left of the one bound this episode's teardown gets, in seconds.
@@ -2409,6 +2494,21 @@ class ServedEpisode:
         # alive. What the `finally` runs is arrangement rather than waiting, so a cancelled close
         # still hands both to the lifecycle, and the lifecycle finishes them.
         try:
+            # An accepted call is using the session everything below is about to release. This
+            # is not the deadline's overtake: an ordinary close waits for it, within the same
+            # bound the rest of teardown gets, and only then claims an abort. Released under it,
+            # `_end_session` took the env's per-call state away while the call was still inside
+            # the tool, and the call came back tombstoned or with a dead transport.
+            inflight = self._inflight
+            if inflight is not None and not inflight.done():
+                with contextlib.suppress(Exception):
+                    await asyncio.wait_for(
+                        asyncio.shield(inflight), timeout=self._teardown_budget()
+                    )
+                if not inflight.done():
+                    # It has outrun the bound. From here the episode ends against it, exactly as
+                    # the deadline does, and the call is tombstoned when it lands.
+                    self._preempted = self._inflight_tool
             finalization: Optional["asyncio.Future[CallResult]"] = None
             if self._seal_enabled:
                 async with self._lock:
@@ -2440,8 +2540,16 @@ class ServedEpisode:
             # Shielded, so this caller's cancellation abandons the wait and not the work.
             disposing = self._dispose_sessions()
             if disposing is not None:
-                with contextlib.suppress(BaseException):
+                try:
                     await asyncio.shield(disposing)
+                except asyncio.CancelledError:
+                    # Retained and shielded, so the disposal finishes; but a caller that asked to
+                    # be cancelled gets its cancellation back after the arrangement below, rather
+                    # than a close that returns as though nothing had been asked.
+                    if _caller_cancelled():
+                        raise
+                except Exception:
+                    pass
             # This episode's session is released here, through the one owned release, and
             # bounded. For a non-seal env this is where it happens at all, since nothing above
             # tears down. The env close below is then a close over what is left of the env, not
@@ -2476,19 +2584,35 @@ class ServedEpisode:
         if self._teardown_arranged:
             return
         self._teardown_arranged = True
-        self._teardown_behind(
-            [self._finalization, self._drain_task, self._eval_task, self._dispose_sessions()]
-        )
+        self._teardown_behind()
 
-    def _teardown_behind(self, gates: "List[Optional[asyncio.Future[Any]]]") -> None:
-        """Run the teardown once every gate ahead of it has landed, without waiting on any of
-        them here. Each gate's own completion carries the chain forward, so a caller that has
-        gone away is not what the chain depends on."""
-        for index, gate in enumerate(gates):
+    def _teardown_behind(self) -> None:
+        """Run the teardown once nothing owns the env any more, re-asking each time.
+
+        **Lazily, and in order, and never from a list.** The owners are created by each other: a
+        deadline's finalization completes and only *then* makes the drain and the evaluator that
+        outlive it. A list built when the teardown was arranged captured those as ``None`` and
+        skipped them, and closed the env under an evaluator that had been created since. Worse,
+        naming the session disposal in that list *started* it, so the transport was being closed
+        underneath the finalizer the ordering exists to protect.
+
+        So this asks who owns the env now, waits for that one, and asks again. The disposal is
+        started last, when it is genuinely the last owner, and the dispatch is asked about first,
+        because a call this episode accepted is using the session everything else is about to
+        release."""
+        for gate in (
+            self._inflight,
+            self._finalization,
+            self._drain_task,
+            self._eval_task,
+        ):
             if gate is not None and not gate.done():
-                rest = gates[index + 1 :]
-                gate.add_done_callback(lambda _f, rest=rest: self._teardown_behind(rest))
+                gate.add_done_callback(lambda _f: self._teardown_behind())
                 return
+        disposing = self._dispose_sessions()
+        if disposing is not None and not disposing.done():
+            disposing.add_done_callback(lambda _f: self._teardown_behind())
+            return
         self._teardown_now()
 
     def _dispose_sessions(self) -> "Optional[asyncio.Future[None]]":
@@ -2522,8 +2646,7 @@ class ServedEpisode:
 
     def _teardown_now(self) -> None:
         """The arrangement itself: one close, then the shutdown behind it."""
-        self._cleanup.close_env()
-        self._lifecycle.stop_when(self._cleanup.outcome)
+        self._lifecycle.stop_when(self._cleanup.close_env())
 
     async def _close_env(self) -> None:
         """Close the env, after this session's release and never beside it.
