@@ -834,12 +834,154 @@ def test_an_orphan_nothing_can_be_told_about_keeps_its_record_and_its_scratch(
             process.wait(timeout=30)
 
 
+# The fork below is the subject of the test and pytest's own threads are what the interpreter is
+# warning about, so the warning says nothing about this code.
+@pytest.mark.filterwarnings("ignore:This process .* is multi-threaded")
+def test_a_forked_child_writes_down_its_own_birth_and_not_its_parents(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The owner's birth is what keeps a live worker from being read as an orphan, and a fork used
+    to copy somebody else's.
+
+    The value is memoized, because it is one `ps` and a process's start time cannot change. What
+    can change is which process is asking: a fork gives the child every cached value the parent
+    had warmed, and one of them says when the *parent* started. A child that warmed it before
+    forking, or inherited it warm, then wrote that birth into the ledger beside its own pid. A
+    sibling construction reading that record sees a live worker pid under a birth that does not
+    match it, which is the shape of an abandoned worker, and reclaiming one is stopping it.
+
+    The parent below warms the cache the way a spawn does and then waits, because the process
+    table answers in whole seconds and two births inside one second are indistinguishable. What is
+    checked is the ledger rather than the cache, because the ledger is what the next construction
+    reads.
+
+    The child writes one line and says so down a pipe, and nothing else. Reading its own start
+    time means running `ps`, and a fork-and-exec from the child of a multi-threaded process is a
+    thing to keep out of a test that is about something else; the parent asks instead, before it
+    reaps, while the number is still reserved and the table still answers for the zombie."""
+    monkeypatch.setenv("SHOGYM_CACHE", str(tmp_path / "cache"))
+    parent_birth = adapter._own_birth()
+    assert parent_birth, "the process table has to answer for this test to mean anything"
+    time.sleep(1.2)
+
+    read, write = os.pipe()
+    child = os.fork()
+    if child == 0:
+        try:
+            os.close(read)
+            adapter.record_worker(pid=os.getpid(), scratch=str(tmp_path / "scratch"))
+            os.write(write, b"written")
+        finally:
+            os._exit(0)
+    os.close(write)
+    with os.fdopen(read) as handle:
+        assert handle.read() == "written"
+    child_birth = adapter.process_birth(child)
+    os.waitpid(child, 0)
+
+    assert child_birth and child_birth != parent_birth, "the two are a second or more apart"
+    written = adapter.outstanding()
+    assert [record["parent"] for record in written] == [child]
+    assert [record["birth"] for record in written] == [child_birth]
+
+    # The other half of the same fact, at the reader: this process's own number used to be enough
+    # on its own, so a record left by an earlier holder of it read as a live owner forever. The
+    # child's birth is a real one this process does not have, which is what such a record carries.
+    assert adapter._process_is_alive(os.getpid(), parent_birth) is True
+    assert adapter._process_is_alive(os.getpid(), child_birth) is False
+
+
+def test_two_constructions_do_not_both_reclaim_one_record(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Reclaiming is a decision made of three steps, and nothing used to hold them together.
+
+    Reading the outstanding record, asking whether the leader is still the process written down,
+    and signalling its group are three operations, and the ledger's own lock covers none of them:
+    it is taken for one append and released. Two constructions on one machine therefore snapshot
+    the same record, both pass the birth check, and both signal. This probe caught exactly that,
+    two kills aimed at one worker, and the second is the dangerous one: by then the first has
+    killed the leader, and the number the second is aiming at may already have been handed on.
+
+    The signal is slow here on purpose, because the window is what the fix closes. Two sweeps at
+    once, one record between them, and afterwards one signal and one reclaimer."""
+    monkeypatch.setenv("SHOGYM_CACHE", str(tmp_path / "cache"))
+    gone = _sleeper(120)
+    gone_birth = adapter.process_birth(gone.pid)
+    assert gone_birth, "the process table has to answer for this test to mean anything"
+    gone.kill()
+    gone.wait(timeout=30)
+
+    held = _sleeper(120)
+    scratch = tmp_path / "shogym-appworld-orphan"
+    scratch.mkdir()
+    try:
+        adapter._append(
+            "+"
+            + json.dumps(
+                {
+                    "name": "orphan",
+                    "parent": gone.pid,
+                    "birth": gone_birth,
+                    "boot": adapter._boot_id(),
+                    "pid": held.pid,
+                    "pid_birth": adapter.process_birth(held.pid),
+                    "pgid": adapter._group_of(held),
+                    "scratch": str(scratch),
+                }
+            )
+        )
+
+        attempts: List[Any] = []
+        attempted = threading.Lock()
+
+        def _slow_signal(pgid: int, how: int) -> bool:
+            with attempted:
+                attempts.append((pgid, how))
+            # Wide enough that a second sweep with no exclusion is inside it, and short enough
+            # that this test costs nothing if the exclusion works.
+            time.sleep(0.4)
+            return True
+
+        monkeypatch.setattr(adapter, "_signal_group", _slow_signal)
+        swept: Dict[int, List[str]] = {}
+
+        def _sweep(which: int) -> None:
+            swept[which] = adapter.reap()
+
+        sweeps = [threading.Thread(target=_sweep, args=(which,)) for which in (0, 1)]
+        for sweep in sweeps:
+            sweep.start()
+        for sweep in sweeps:
+            sweep.join(60)
+        assert not any(sweep.is_alive() for sweep in sweeps), "a sweep never returned"
+
+        assert len(attempts) == 1, "one record was signalled twice"
+        assert sorted(swept.values()) == [[], ["orphan"]], "and reported reclaimed twice"
+        assert adapter.outstanding() == []
+    finally:
+        held.kill()
+        held.wait(timeout=30)
+
+
 # ----- a stop that cannot be confirmed is not a stop -----
 
 
-def _worker(tmp_path: Path, process: subprocess.Popen) -> Any:
+def _worker(tmp_path: Path, process: subprocess.Popen, *, recorded: bool = False) -> Any:
+    """One worker around ``process``, written into the ledger where the test needs the record.
+
+    Unrecorded by default, which is what the close tests that only care about signalling want. A
+    test about what a close *spends* has to have something to spend."""
     scratch = tmp_path / f"scratch-{process.pid}"
     scratch.mkdir(parents=True, exist_ok=True)
+    record = None
+    if recorded:
+        record = adapter.record_worker(
+            pid=process.pid,
+            pid_birth=adapter.process_birth(process.pid),
+            pgid=adapter._group_of(process),
+            scratch=str(scratch),
+        )
     return adapter.Worker(
         root=tmp_path,
         process=process,
@@ -847,6 +989,7 @@ def _worker(tmp_path: Path, process: subprocess.Popen) -> Any:
         token="unused",
         scratch=scratch,
         pgid=adapter._group_of(process),
+        record=record,
     )
 
 
@@ -920,6 +1063,39 @@ def test_a_worker_that_exited_on_its_own_is_still_stopped_and_confirmed(tmp_path
     assert process.returncode is None
     worker.close(confirm=True)
     assert worker.stopped is True
+
+
+def test_a_close_that_cannot_confirm_the_group_keeps_the_record_and_the_scratch(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The ledger record and the scratch directory are the only way back to a worker, and an
+    unconfirmed stop used to spend them anyway.
+
+    A close signalled the group, failed to see it empty, and then removed the scratch directory
+    and tombstoned the ledger line regardless. Finalization refuses a score on that outcome, which
+    is right and is not the whole of it: a descendant the signal did not reach is then a process
+    nothing names, in a run whose next construction sweeps the ledger looking for exactly that.
+    The tests around this one build workers with no record at all, so none of them could have seen
+    it.
+
+    Both directions below. The table that cannot be read keeps everything; the group that is read
+    and found empty is the one outcome that may spend it."""
+    monkeypatch.setenv("SHOGYM_CACHE", str(tmp_path / "cache"))
+    process = _sleeper(30)
+    worker = _worker(tmp_path, process, recorded=True)
+    monkeypatch.setattr(adapter, "_group_members", lambda pgid: None)
+    worker.close()
+    assert worker.stopped is False, "the stop could not be confirmed"
+    assert worker.scratch.is_dir(), "so what a later construction would remove is still there"
+    assert [record["name"] for record in adapter.outstanding()] == [worker.record]
+
+    stopped = _sleeper(30)
+    confirmed = _worker(tmp_path, stopped, recorded=True)
+    monkeypatch.setattr(adapter, "_group_members", lambda pgid: [])
+    confirmed.close()
+    assert confirmed.stopped is True
+    assert not confirmed.scratch.exists() and confirmed.record is None
+    assert [record["name"] for record in adapter.outstanding()] == [worker.record]
 
 
 def test_an_ordinary_teardown_close_still_never_raises(tmp_path: Path) -> None:
@@ -1028,6 +1204,57 @@ def test_a_grader_that_outruns_its_bound_takes_its_whole_group_with_it(
         raise AssertionError("what the grader started outlived the grader's own timeout")
     assert not list(tmp_path.glob("shogym-appworld-grade-*")), "and the scratch went with it"
     assert adapter.outstanding() == [], "and the ledger entry it was written down under"
+
+
+def test_a_grader_that_ends_leaving_a_descendant_keeps_its_record(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """An ordinary exit used to be read as the end of everything the grader had started.
+
+    The timeout path stops the group and waits for it to empty. Every other way out of `grade`
+    asked nothing at all: a leader that exited 0 had its scratch directory removed and its ledger
+    line tombstoned on the strength of its own status. The evaluator is upstream code that may
+    have started something, and a child of it that holds none of the captured pipes lets
+    `communicate` return at once, so the grade finishes cleanly and what it started becomes a
+    process with nothing naming it. The existing timeout test cannot see this, because there the
+    group really is emptied.
+
+    The grader below is the ordinary success: it answers with a verdict, exits 0, and leaves one
+    child behind on descriptors of its own. What has to survive it is the pair of handles a later
+    construction reclaims through."""
+    script = tmp_path / "leaky_grader.py"
+    told = tmp_path / "descendant.pid"
+    script.write_text(
+        "import json, os, subprocess, sys\n"
+        "sys.stdin.readline()\n"
+        # None of the captured pipes, so the caller's read finishes while this one runs on.
+        "quiet = os.open(os.devnull, os.O_RDWR)\n"
+        "child = subprocess.Popen([sys.executable, '-c', 'import time; time.sleep(120)'],\n"
+        "                        stdin=quiet, stdout=quiet, stderr=quiet)\n"
+        f"open({str(told)!r}, 'w').write(str(child.pid))\n"
+        "print(json.dumps({'output': {'graded': True}}))\n"
+        "sys.stdout.flush()\n"
+    )
+    monkeypatch.setattr(adapter, "runtime", lambda: Path(sys.executable))
+    monkeypatch.setattr(adapter, "WORKER", script)
+    monkeypatch.setattr(adapter.tempfile, "tempdir", str(tmp_path))
+    monkeypatch.setenv("SHOGYM_CACHE", str(tmp_path / "cache"))
+    # The bound on "has the group gone", which this test spends in full because the group has not.
+    monkeypatch.setattr(adapter, "_CLOSE_SECONDS", 1.0)
+
+    graded = adapter.grade(
+        root=tmp_path, task_id="abc_1", outputs=tmp_path, ignore=[], filing={}, timeout=60.0
+    )
+    descendant = int(told.read_text())
+    try:
+        assert graded == {"graded": True}, "the grade itself is unaffected"
+        os.kill(descendant, 0)  # still running, which is the whole point
+        assert list(tmp_path.glob("shogym-appworld-grade-*")), "its scratch is still there"
+        assert [record["pgid"] for record in adapter.outstanding()] == [
+            os.getpgid(descendant)
+        ], "and the ledger still names the group the descendant is running in"
+    finally:
+        os.kill(descendant, signal.SIGKILL)
 
 
 # ----- the caches say what they were built from -----
@@ -1776,6 +2003,66 @@ def test_a_runtime_that_resolved_another_release_never_gets_published(tmp_path: 
     )
     with pytest.raises(adapter.ProvisioningError, match="but this port pins"):
         adapter._check_pin(home)
+
+
+def test_a_runtime_publish_that_fails_leaves_an_interpreter_under_the_name(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Publishing a rebuilt runtime used to be able to leave no runtime at all.
+
+    The incumbent is renamed aside and the staged tree renamed in, and the displaced copy was then
+    removed whatever had happened in between. A failure at the second rename therefore left the
+    canonical name absent and the only interpreter left under a `.replaced` name nothing ever
+    looks for: injected once, the probe found no runtime under the name at all. That is worse than
+    a failed build, because the runtime is what every world runs under and a worker already
+    serving out of the old tree keeps its open files but resolves every new import through the
+    name that has just disappeared.
+
+    The same two outcomes the corpus publish is checked for, and the second is why restoring is
+    not enough on its own. When the incumbent goes back, the caller is still told the publish
+    failed, rather than being handed a path to an interpreter that was never published. When the
+    restore cannot happen either, the displaced copy is kept under its own name, because it is
+    then the only copy of that interpreter there is."""
+    home = tmp_path / "runtime"
+    _fake_runtime(home)
+    (home / "bin" / "python").write_text("what live workers run under")
+
+    def _publishing(failing: Tuple[int, ...]) -> None:
+        """Stage a rebuild and publish it with those renames, by position, refused.
+
+        Rename 1 moves the incumbent aside, rename 2 moves the staged tree in, and rename 3 is the
+        restore that only happens because rename 2 did not."""
+        staging = home.with_name(home.name + ".building")
+        _fake_runtime(staging)
+        (staging / "bin" / "python").write_text("the rebuild")
+        real_replace = os.replace
+        renames: List[int] = []
+
+        def _fails(source: Any, destination: Any, **kwargs: Any) -> None:
+            renames.append(1)
+            if len(renames) in failing:
+                raise OSError(errno.ENOSPC, "no space left on device")
+            real_replace(source, destination, **kwargs)
+
+        monkeypatch.setattr(adapter.os, "replace", _fails)
+        try:
+            with pytest.raises(OSError):
+                adapter._publish_runtime(staging, home)
+        finally:
+            monkeypatch.setattr(adapter.os, "replace", real_replace)
+
+    # The publish fails: the incumbent goes back under its own name, with its own bytes.
+    _publishing(failing=(2,))
+    assert (home / "bin" / "python").read_text() == "what live workers run under"
+    assert not list(tmp_path.glob("*.replaced.*")), "and nothing is left displaced"
+    assert not list(tmp_path.glob("*.building")), "nor left half-built"
+
+    # The restore fails too: the only interpreter left is retained rather than removed.
+    _publishing(failing=(2, 3))
+    displaced = list(tmp_path.glob("*.replaced.*"))
+    assert not home.exists(), "this is the case where the name really is gone"
+    assert len(displaced) == 1, "so the interpreter itself has to still be somewhere"
+    assert (displaced[0] / "bin" / "python").read_text() == "what live workers run under"
 
 
 # ----- what an env goes on serving after it has said what corpus it serves -----

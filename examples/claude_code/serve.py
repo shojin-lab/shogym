@@ -76,7 +76,19 @@ DEADLINE = float(os.environ["SHOGYM_DEADLINE"]) if os.environ.get("SHOGYM_DEADLI
 IN_FLIGHT = int(os.environ.get("SHOGYM_IN_FLIGHT") or 1)
 # --------------------------------------------------------------------------------------------
 
-RUNS = Path(__file__).resolve().parent / "runs"
+# Where the records go. Beside this file by default, which is what a quickstart wants. A run whose
+# scores you intend to defend puts them somewhere the agent is not working: the directory holds
+# `claim.json`, which names the regime and the identity before the first task is dispensed, and
+# `results.jsonl`, which keeps every payload the env published on every row whatever the arm was
+# told. An agent that can read either can read its own assignment and the receipt a control arm
+# withholds, so a paired run names a directory of its own here and takes the file-reading built-ins
+# away (see src/shogym/envs/appworld/README.md).
+#     SHOGYM_RUNS=~/appworld-pair/runs <your harness command>
+RUNS = (
+    Path(os.environ["SHOGYM_RUNS"]).expanduser()
+    if os.environ.get("SHOGYM_RUNS")
+    else Path(__file__).resolve().parent / "runs"
+)
 
 # The policies a launch may name. Closed, and looked up rather than evaluated: the regime is
 # stamped onto every row of the run, so what may produce one is a list in the open.

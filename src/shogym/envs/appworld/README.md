@@ -43,30 +43,89 @@ The paired feedback policies are what this env was built for. `Information()` an
 terminating call with the receipt; `Placebo()` answers it with a digest of the agent's own
 submission, the same size on the wire; `Never()` answers with no channel at all.
 
-Two launches, one per arm, into two records:
+**Which arm is running is the server's configuration and never the agent's.** The agent process is
+launched identically in both arms: the same argv, the same environment, the same working
+directory. What differs between them is one file that only the MCP server reads. That is not
+tidiness. Before the first task is dispensed the run directory holds `claim.json`, which names the
+regime and the structured identity the run is filed under, and afterwards `results.jsonl` holds
+every payload the env published on every row, the receipt included, whichever arm the terminal was
+answered under. An agent that can read its own launch environment, or that directory, can read its
+assignment before treatment and read the receipt the control arm exists to withhold. So the
+configuration travels in the MCP config's `env` block, which reaches the server process and
+nothing else; the records go somewhere the agent is not working; and the built-in tools that could
+read either are taken away.
+
+One directory holds the pair, and it is not one the agent is launched into:
 
 ```bash
-# the treatment: the terminal carries the receipt, and nothing beside it
-SHOGYM_ENV=appworld SHOGYM_TASKS=0 SHOGYM_FEEDBACK=information \
-SHOGYM_IDENTITY=appworld-pulse-0 SHOGYM_DEADLINE=1800 SHOGYM_IN_FLIGHT=1 \
-claude -p "$(cat examples/claude_code/PROMPT.txt)" \
-    --mcp-config examples/claude_code/.mcp.json --strict-mcp-config \
-    --allowedTools 'mcp__shogym__*' --permission-mode dontAsk
+repo=$(git rev-parse --show-toplevel)     # this line from inside your checkout; the rest is absolute
+pair=~/appworld-pair
+mkdir -p "$pair"
 
-# the control: the same channel, the same shape, the inert digest in it
-SHOGYM_ENV=appworld SHOGYM_TASKS=0 SHOGYM_FEEDBACK=placebo \
-SHOGYM_IDENTITY=appworld-pulse-0 SHOGYM_DEADLINE=1800 SHOGYM_IN_FLIGHT=1 \
-claude -p "$(cat examples/claude_code/PROMPT.txt)" \
-    --mcp-config examples/claude_code/.mcp.json --strict-mcp-config \
-    --allowedTools 'mcp__shogym__*' --permission-mode dontAsk
+# The arm, and everything else a record is filed under. Written where the server reads it, on its
+# way to `serve.py`, and nowhere the agent's own process can see. The paths are absolute because
+# Claude Code resolves a relative command argument in an MCP config against the directory the
+# agent was launched from rather than against the directory the config file lives in, so a
+# relative `serve.py` is a server that starts from one directory and not from another.
+arm() {
+  cat > "$pair/mcp.json" <<JSON
+{
+  "mcpServers": {
+    "shogym": {
+      "command": "uv",
+      "args": ["run", "--project", "$repo", "python", "$repo/examples/claude_code/serve.py"],
+      "env": {
+        "SHOGYM_ENV": "appworld",
+        "SHOGYM_TASKS": "0",
+        "SHOGYM_FEEDBACK": "$1",
+        "SHOGYM_IDENTITY": "appworld-pulse-0",
+        "SHOGYM_DEADLINE": "1800",
+        "SHOGYM_IN_FLIGHT": "1",
+        "SHOGYM_RUNS": "$pair/runs"
+      }
+    }
+  }
+}
+JSON
+}
 ```
 
-Each arm writes its own provenance directory, named for its regime
-(`examples/claude_code/runs/appworld-information-<stamp>/`), because a directory that holds one
-arm's rows refuses the other's. The identity, the deadline and the capacity are the same on both
-commands on purpose: all three are members of what a record is filed under, together with what
-the env said about itself, and two runs that disagree on any of them are two measurements rather
-than two arms of one. Read either record back with `examples/claude_code/results.py`.
+Then the two launches, one per arm, and the second is a copy of the first:
+
+```bash
+arm information   # the treatment: the terminal carries the receipt, and nothing beside it
+claude -p "$(cat "$repo/examples/claude_code/PROMPT.txt")" \
+    --mcp-config "$pair/mcp.json" --strict-mcp-config \
+    --allowedTools 'mcp__shogym__*' --permission-mode dontAsk \
+    --disallowedTools Bash,Read,Write,Edit,Glob,Grep,WebFetch,WebSearch,Agent,Task
+
+arm placebo       # the control: the same channel, the same shape, the inert digest in it
+claude -p "$(cat "$repo/examples/claude_code/PROMPT.txt")" \
+    --mcp-config "$pair/mcp.json" --strict-mcp-config \
+    --allowedTools 'mcp__shogym__*' --permission-mode dontAsk \
+    --disallowedTools Bash,Read,Write,Edit,Glob,Grep,WebFetch,WebSearch,Agent,Task
+```
+
+The deny list is part of the measurement here rather than hygiene. Claude Code keeps its built-in
+tools alongside the served ones by default, which is the right default for the quickstart and the
+wrong one for an arm of a pair: `Read` alone reaches the config that says which arm this is, and
+the env's own task definitions on disk. Removing the built-ins is what separates the two arms
+until the agent runs inside a container that cannot see any of it. Do not reach for `--tools ""`,
+which strips the served tools too.
+
+The arms run one after the other, because both name the same config path and only that file's
+contents change between them. Running both at once takes a second `$pair` with a config of its
+own, and then the config path is the one thing the two launches differ in, which is a name that
+says nothing about the arm.
+
+Each arm writes its own provenance directory under `$pair/runs`, named for its regime
+(`appworld-information-<stamp>/`), because a directory that holds one arm's rows refuses the
+other's. The identity, the deadline and the capacity are the same in both configs on purpose: all
+three are members of what a record is filed under, together with what the env said about itself,
+and two runs that disagree on any of them are two measurements rather than two arms of one. Read
+an arm back by naming its directory: `uv run --project "$repo" python
+"$repo/examples/claude_code/results.py" "$pair/runs/appworld-information-<stamp>"`, and again for
+the other one.
 
 **`SHOGYM_FEEDBACK=immediate` is the practice path, not a third arm.** It is the default, it
 hands back every episode-level item the env published (both payloads and the numeric grades), and

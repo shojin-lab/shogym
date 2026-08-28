@@ -432,6 +432,146 @@ async def test_a_namespace_whose_identity_could_change_is_refused_where_it_is_ch
 # ----- failure isolation: begin -----
 
 
+class _Unwindable:
+    """An extension whose span holds something, and is told when the dispense does not happen.
+
+    The shape the unwind exists for: `begin` takes a resource, and the only two ways that span
+    can end are `finalize`, when a task really was dispensed and sealed, and the optional
+    `undispensed` hook, when it never was."""
+
+    def __init__(self, namespace: str, *, fails: bool = False) -> None:
+        self.namespace = namespace
+        self._fails = fails
+        self.opened: List[str] = []
+        self.unwound: List[str] = []
+        self.finalized: List[str] = []
+
+    async def begin(self, ref: TaskRef) -> ProvenanceSpan:
+        if self._fails:
+            raise RuntimeError("this extension will not open a span")
+        self.opened.append(self.namespace)
+        return _UnwindableSpan(self)
+
+
+class _UnwindableSpan:
+    def __init__(self, owner: _Unwindable) -> None:
+        self._owner = owner
+
+    @property
+    def dispensed(self) -> Dict[str, Any]:
+        return {"held": True}
+
+    async def finalize(self, completed: CompletedTask) -> Dict[str, Any]:
+        self._owner.finalized.append(self._owner.namespace)
+        return {"released": True}
+
+    async def undispensed(self) -> None:
+        self._owner.unwound.append(self._owner.namespace)
+
+
+async def test_a_span_opened_for_a_dispense_that_never_happens_is_unwound(
+    tmp_path: Path,
+) -> None:
+    """A span is opened before the task is exposed, and several things after that still refuse
+    the dispense. Those spans used to be dropped on the floor: the map went out of scope and the
+    extension was never told, so anything `begin` had taken stayed taken, once per refused
+    dispense, for the life of the run. There is no outcome to close them against, so this is not
+    `finalize` with an invented closure; it is the other ending."""
+    first, second = _Unwindable("test.first"), _Unwindable("test.second", fails=True)
+    stream = _stream(tmp_path, [0, 1], provenance=[first, second])
+    async with stream:
+        with pytest.raises(ProvenanceError, match="test.second"):
+            await stream.get_task()
+        # The predecessor was opened, and closed again as undispensed rather than finalized.
+        assert first.opened == ["test.first"]
+        assert first.unwound == ["test.first"]
+        assert first.finalized == []
+        # ...and the dispense really did not happen, so the position is still owed.
+        assert read_dispenses(tmp_path / "prov") == []
+        assert stream.queue_info().remaining == 2
+
+
+async def test_a_span_is_unwound_when_the_env_the_task_needed_will_not_build(
+    tmp_path: Path,
+) -> None:
+    """The pre-dispense exit that sat outside every handler.
+
+    Building the env ran between opening the spans and the first `try`, so a factory that refused
+    dropped every span that had already opened. It is the likeliest of these paths in practice,
+    because a factory is the one part of a dispense that does real work."""
+    watcher = _Unwindable("test.only")
+    built: List[str] = []
+
+    def factory(name: str) -> _FixtureScoreEnv:
+        # The catalog is built at construction; the refusal is for the episode's own env.
+        if built:
+            raise RuntimeError("the factory refused to build this episode's env")
+        built.append(name)
+        return _FixtureScoreEnv(tasks=TASKS)
+
+    stream = TaskStream(
+        factory,
+        [TaskRef(ENV_NAME, 0)],
+        prov_dir=tmp_path / "prov",
+        provenance=[watcher],
+    )
+    async with stream:
+        with pytest.raises(RuntimeError, match="the factory refused"):
+            await stream.get_task()
+        assert watcher.opened == ["test.only"]
+        assert watcher.unwound == ["test.only"]
+        assert watcher.finalized == []
+        assert read_dispenses(tmp_path / "prov") == []
+
+
+async def test_spans_are_unwound_newest_first(tmp_path: Path) -> None:
+    """Opening is ordered and an extension may reasonably assume the one before it is still open
+    while it is, so unwinding forwards would tear a predecessor down under its successor."""
+    order: List[str] = []
+
+    class _Ordered(_Unwindable):
+        async def begin(self, ref: TaskRef) -> ProvenanceSpan:
+            span = await super().begin(ref)
+            return span
+
+    class _OrderedSpan(_UnwindableSpan):
+        pass
+
+    watchers = [_Ordered(f"test.{index}") for index in range(3)]
+    for watcher in watchers:
+        watcher.unwound = order  # one shared list, so the order across them is visible
+
+    def factory(name: str) -> _FixtureScoreEnv:
+        if getattr(factory, "built", False):
+            raise RuntimeError("the factory refused")
+        factory.built = True  # type: ignore[attr-defined]
+        return _FixtureScoreEnv(tasks=TASKS)
+
+    stream = TaskStream(
+        factory,
+        [TaskRef(ENV_NAME, 0)],
+        prov_dir=tmp_path / "prov",
+        provenance=watchers,
+    )
+    async with stream:
+        with pytest.raises(RuntimeError, match="the factory refused"):
+            await stream.get_task()
+    assert order == ["test.2", "test.1", "test.0"]
+
+
+async def test_an_extension_with_nothing_to_undo_needs_no_unwind_hook(tmp_path: Path) -> None:
+    """The hook is optional and deliberately not part of the structural protocol: adding it may
+    not be a breaking change for an extension already written against `dispensed` and
+    `finalize`. One that does not define it is simply let go, as before."""
+    plain = _Snapshots()
+    refusing = _Unwindable("test.refusing", fails=True)
+    stream = _stream(tmp_path, [0, 1], provenance=[plain, refusing])
+    async with stream:
+        with pytest.raises(ProvenanceError, match="test.refusing"):
+            await stream.get_task()
+        assert read_dispenses(tmp_path / "prov") == []
+
+
 @pytest.mark.parametrize(
     "kwargs",
     [

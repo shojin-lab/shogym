@@ -150,6 +150,12 @@ directory that holds one arm's rows refuses the other's. Give both arms the same
 `SHOGYM_IDENTITY`, `SHOGYM_DEADLINE` and `SHOGYM_IN_FLIGHT`, because all three are folded into
 what a record is filed under and two runs that disagree on any of them are two measurements.
 
+**Set them on the server rather than on the agent when the pair is the point.** Written on the
+command line above, they are in the agent's own environment, and the arm is then something the
+agent can read about itself before it is treated. `.mcp.json` takes an `env` block, which reaches
+this file and nothing else, and `SHOGYM_RUNS` moves the record out of the directory the agent
+works in. `src/shogym/envs/appworld/README.md` documents the whole shape, deny list included.
+
 Concurrency is available too: `SHOGYM_IN_FLIGHT=N` (or `max_in_flight=N` in `serve.py`) serves
 several tasks at once, each named by a lease (above 1, the served tools gain a `lease` argument).
 
@@ -168,8 +174,9 @@ Knobs worth knowing, all in `serve.py` and all settable for one launch from the 
 `SHOGYM_FEEDBACK` picks the regime (the `immediate` practice default above, `never` for
 evaluation, `information` / `placebo` for the two arms of a pair), `SHOGYM_DEADLINE` bounds each
 task in seconds (an expired task is recorded unscored), `SHOGYM_IN_FLIGHT` serves several tasks
-concurrently, and `SHOGYM_IDENTITY` names the run in its own record. `resume=True` in `serve.py`
-continues an interrupted run's directory instead of refusing it.
+concurrently, `SHOGYM_IDENTITY` names the run in its own record, and `SHOGYM_RUNS` puts `runs/`
+somewhere else, which is how a defended run keeps its record out of the directory the agent works
+in. `resume=True` in `serve.py` continues an interrupted run's directory instead of refusing it.
 
 ## The other quickstarts
 
