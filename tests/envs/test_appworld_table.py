@@ -43,6 +43,27 @@ def _backlog_at(task_id: str, root: Path) -> ledger.Backlog:
     return built
 
 
+def test_the_committed_task_dates_are_the_ones_this_corpus_carries() -> None:
+    """The offline roster tests build backlogs from a committed table of dates; this is the corpus
+    saying that table is true.
+
+    ``tests/envs/test_appworld_ledger.py`` runs without a corpus, so it cannot read the date
+    production draws each task's backlog against. A committed table is the only way it can use
+    production's inputs, and a committed table with nothing checking it is a fixture that drifts
+    silently the first time the manifest or the pinned bundle moves. This is the check, and it
+    runs wherever the corpus is provisioned. Regenerate the table from this corpus when it fails
+    and the move was intended."""
+    root = adapter.ensure_corpus()
+    committed = [
+        line.split("\t")
+        for line in Path(__file__).with_name("appworld_task_dates.tsv").read_text().splitlines()
+        if line.strip() and not line.startswith("#")
+    ]
+    assert [task_id for task_id, _ in committed] == list(adapter.task_ids())
+    live = [[task_id, adapter.task_specs(root, task_id)["datetime"]] for task_id, _ in committed]
+    assert [list(row) for row in committed] == live
+
+
 def test_the_table_covers_the_roster_it_claims_to() -> None:
     """The shape, unconditionally: one entry per possible pass count, and every task-by-convention
     pair filed exactly once. Cheap, and it catches a table built for a different roster. It does

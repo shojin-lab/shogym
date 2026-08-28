@@ -117,6 +117,15 @@ def _rows(tmp_path: Path) -> List[Dict[str, Any]]:
     return [json.loads(line) for line in path.read_text().splitlines() if line.strip()]
 
 
+def _named(stored: Any) -> str:
+    """The caller's own member of a stored run identity, or ``""`` for a record that names none.
+
+    A stored identity is a record rather than a name (env digests, the deadline, the capacity),
+    and these tests are about the member a caller supplies, so they read that member by name
+    instead of comparing whole records."""
+    return stored["caller"] if isinstance(stored, dict) else stored
+
+
 def _episode_level(items: Sequence[Dict[str, Any]]) -> List[Dict[str, Any]]:
     return [dict(item) for item in items if item.get("level") == "episode"]
 
@@ -622,9 +631,9 @@ async def test_an_abandoned_dispense_reconciles_under_its_own_regime(tmp_path: P
     # The identity comes off the dispense for the same reason the regime does. A row that lost it
     # belongs to no particular run, which is exactly the row a later resume under a different
     # configuration would be allowed to append beside.
-    assert [(row.closure, row.feedback_regime, row.run_identity) for row in abandoned] == [
-        ("broker_abort", "immediate", "fingerprint-a")
-    ]
+    assert [
+        (row.closure, row.feedback_regime, _named(row.run_identity)) for row in abandoned
+    ] == [("broker_abort", "immediate", "fingerprint-a")]
     await stream.aclose()
 
 
@@ -738,7 +747,7 @@ async def test_a_resume_under_a_different_run_identity_is_refused(tmp_path: Path
     async with stream:
         await stream.get_task()
         await stream.dispatch(SUBMIT_TOOL, {"answer": "4"})
-    assert [row["run_identity"] for row in _rows(tmp_path)] == ["fingerprint-a"]
+    assert [_named(row["run_identity"]) for row in _rows(tmp_path)] == ["fingerprint-a"]
 
     with pytest.raises(ValueError, match="run identity"):
         _stream(tmp_path, [0, 1], resume=True, identity="fingerprint-b")
@@ -749,6 +758,44 @@ async def test_a_resume_under_a_different_run_identity_is_refused(tmp_path: Path
         _stream(tmp_path, [0, 1], resume=True)
     # The same identity resumes.
     _stream(tmp_path, [0, 1], resume=True, identity="fingerprint-a")
+
+
+async def test_a_record_written_before_the_identity_was_a_record_still_resumes(
+    tmp_path: Path,
+) -> None:
+    """A durable format that grew is not a run that changed.
+
+    A record used to store one opaque name where it now stores a record of members. Refusing an
+    unknown opportunity is right; refusing a *known* one because the shape around it grew would be
+    a format break dressed up as a safety property. So a stored name is compared against the name
+    this caller supplies and against nothing else, because what the record does not carry it never
+    had."""
+    async with _stream(tmp_path, [0], identity="fingerprint-a") as first:
+        await first.get_task()
+        await first.dispatch(SUBMIT_TOOL, {"answer": "4"})
+
+    # Rewritten into the shape an earlier head wrote: the caller's name, and no members.
+    for name in ("results.jsonl", "dispenses.jsonl"):
+        path = tmp_path / "prov" / name
+        rewritten = []
+        for line in path.read_text().splitlines():
+            if not line.strip():
+                continue
+            record = json.loads(line)
+            record["run_identity"] = record["run_identity"]["caller"]
+            rewritten.append(json.dumps(record))
+        path.write_text("\n".join(rewritten) + "\n")
+
+    async with _stream(tmp_path, [0, 1], resume=True, identity="fingerprint-a") as resumed:
+        await resumed.get_task()
+        await resumed.dispatch(SUBMIT_TOOL, {"answer": "6"})
+    assert [_named(row["run_identity"]) for row in _rows(tmp_path)] == [
+        "fingerprint-a",
+        "fingerprint-a",
+    ]
+    # ...and a name that is not the record's is still two runs, whichever shape it is stored in.
+    with pytest.raises(ValueError, match="run identity"):
+        _stream(tmp_path, [0, 1], resume=True, identity="fingerprint-b")
 
 
 async def test_a_record_that_names_no_identity_is_not_silently_adopted(tmp_path: Path) -> None:
@@ -765,7 +812,7 @@ async def test_a_record_that_names_no_identity_is_not_silently_adopted(tmp_path:
     async with stream:
         await stream.get_task()
         await stream.dispatch(SUBMIT_TOOL, {"answer": "4"})
-    assert [row["run_identity"] for row in _rows(tmp_path)] == [""]
+    assert [_named(row["run_identity"]) for row in _rows(tmp_path)] == [""]
     with pytest.raises(ValueError, match="names no run identity") as refused:
         _stream(tmp_path, [0, 1], resume=True, identity="fingerprint-a")
     # The refusal names both ways out, because either may be the right one.
@@ -787,7 +834,7 @@ async def test_a_record_that_names_no_identity_is_continued_as_itself(tmp_path: 
     async with resumed:
         await resumed.get_task()
         await resumed.dispatch(SUBMIT_TOOL, {"answer": "6"})
-    assert [row["run_identity"] for row in _rows(tmp_path)] == ["", ""]
+    assert [_named(row["run_identity"]) for row in _rows(tmp_path)] == ["", ""]
 
 
 async def test_an_adoption_is_recorded_and_the_next_resume_is_ordinary(tmp_path: Path) -> None:
@@ -802,7 +849,7 @@ async def test_an_adoption_is_recorded_and_the_next_resume_is_ordinary(tmp_path:
     async with stream:
         await stream.get_task()
         await stream.dispatch(SUBMIT_TOOL, {"answer": "4"})
-    assert [row["run_identity"] for row in _rows(tmp_path)] == [""]
+    assert [_named(row["run_identity"]) for row in _rows(tmp_path)] == [""]
 
     adopting = _stream(
         tmp_path, [0, 1], resume=True, identity="fingerprint-a", adopt_unidentified=True
@@ -810,12 +857,12 @@ async def test_an_adoption_is_recorded_and_the_next_resume_is_ordinary(tmp_path:
     async with adopting:
         await adopting.get_task()
         await adopting.dispatch(SUBMIT_TOOL, {"answer": "6"})
-    assert [row["run_identity"] for row in _rows(tmp_path)] == ["", "fingerprint-a"]
+    assert [_named(row["run_identity"]) for row in _rows(tmp_path)] == ["", "fingerprint-a"]
 
     # The adoption is auditable: who took the rows on, under which regime, how many of each kind
     # were there, and how far the record's own numbering had reached.
     (adoption,) = read_adoptions(tmp_path / "prov")
-    assert adoption["run_identity"] == "fingerprint-a"
+    assert _named(adoption["run_identity"]) == "fingerprint-a"
     assert adoption["feedback_regime"] == "never"
     assert adoption["results"] == 1 and adoption["dispenses"] == 1
     assert adoption["through_seq"] == 1
@@ -830,8 +877,44 @@ async def test_an_adoption_is_recorded_and_the_next_resume_is_ordinary(tmp_path:
     assert len(read_adoptions(tmp_path / "prov")) == 1
 
     # A configuration nobody adopted is still refused, and told whose those rows are.
-    with pytest.raises(ValueError, match="already adopted by 'fingerprint-a'"):
+    with pytest.raises(ValueError, match="already been adopted by caller='fingerprint-a'"):
         _stream(tmp_path, [0, 1], resume=True, identity="fingerprint-b")
+
+
+async def test_unidentified_rows_are_adopted_by_one_identity_and_no_other(
+    tmp_path: Path,
+) -> None:
+    """A one-time migration performed by two configurations is not one.
+
+    The flag used to be asked only about the *current* caller, so a directory whose blank rows one
+    identity had already adopted said yes to a second one that also passed it, and
+    ``adoptions.jsonl`` named both. The same unidentified rows were then auditable as belonging to
+    two runs, which is the whole of what an adoption exists to rule out. Nothing else stood in the
+    way here: the adopting run appends no named row, so there is no row for the second caller to
+    trip over and the adoption record is the only thing that can refuse it."""
+    stream = _stream(tmp_path, [0])
+    async with stream:
+        await stream.get_task()
+        await stream.dispatch(SUBMIT_TOOL, {"answer": "4"})
+    assert [_named(row["run_identity"]) for row in _rows(tmp_path)] == [""]
+
+    # The first identity adopts and serves nothing at all.
+    async with _stream(
+        tmp_path, [0, 1], resume=True, identity="fingerprint-a", adopt_unidentified=True
+    ):
+        pass
+    assert [_named(record["run_identity"]) for record in read_adoptions(tmp_path / "prov")] == [
+        "fingerprint-a"
+    ]
+    assert [_named(row["run_identity"]) for row in _rows(tmp_path)] == [""]
+
+    # The second is refused, flag and all, and told whose those rows are.
+    with pytest.raises(ValueError, match="already been adopted by caller='fingerprint-a'"):
+        _stream(
+            tmp_path, [0, 1], resume=True, identity="fingerprint-b", adopt_unidentified=True
+        )
+    # And the refusal left no mark that would make a third attempt look reasonable.
+    assert len(read_adoptions(tmp_path / "prov")) == 1
 
 
 async def test_a_construction_that_refuses_leaves_the_record_unadopted(tmp_path: Path) -> None:
@@ -875,7 +958,14 @@ class _DigestedEnv(_FixtureScoreEnv):
     AppWorld publishes a ``config_digest`` at inference level on every terminal, which is the env
     saying which configuration produced this row. This is that shape with a value a test can
     move: the stream reads it off the terminal evidence, never reveals it (no policy reaches
-    inference level), and compares it with the name the record is being filed under."""
+    inference level), and compares it with what the record already holds for this env.
+
+    The item's name is *declared* rather than assumed by the stream, because ``config_digest`` is
+    a name any env is free to publish as an ordinary metric. This one declares it and publishes
+    it, and nothing else — the value cannot be read off the object before an episode runs, which
+    is the state an env is in when only the record can bind it."""
+
+    identity_feedback_name = "config_digest"
 
     def __init__(self, tasks: Any = None, digest: str = "") -> None:
         super().__init__(tasks=tasks)
@@ -892,6 +982,19 @@ class _DigestedEnv(_FixtureScoreEnv):
         return fb
 
 
+class _DeclaredDigestEnv(_DigestedEnv):
+    """The same env, answering to the name it declares before any episode has run.
+
+    This is AppWorld's shape: ``config_digest`` is a property of the env, so a stream can read it
+    off the catalog and fold it into the identity the run is filed under — which is what puts an
+    env digest in the ownership claim, before the first task is dispensed and before any row
+    exists to carry one."""
+
+    @property
+    def config_digest(self) -> str:
+        return self._digest
+
+
 def _digested_stream(
     tmp_path: Path, indices: List[int], said: Dict[str, str], **kwargs: Any
 ) -> TaskStream:
@@ -903,12 +1006,27 @@ def _digested_stream(
     )
 
 
+def _declared_stream(
+    tmp_path: Path, indices: List[int], said: Dict[str, str], **kwargs: Any
+) -> TaskStream:
+    return TaskStream(
+        lambda _name: _DeclaredDigestEnv(tasks=TASKS, digest=said["digest"]),
+        [TaskRef(ENV_NAME, i) for i in indices],
+        prov_dir=tmp_path / "prov",
+        **kwargs,
+    )
+
+
 async def test_a_row_the_env_disowns_is_refused_before_it_is_scored(tmp_path: Path) -> None:
-    """The caller supplies a string and the module compares it with other strings on disk, which
-    is safe against a *changed caller* and says nothing about a caller whose string stopped
-    describing its env. A catalog and an episode factory can be handed configuration B while one
+    """A caller supplies a name and the module compares it with other names on disk, which is
+    safe against a *changed caller* and says nothing about a caller whose name stopped describing
+    its env. A catalog and an episode factory can be handed two configurations while one
     remembered name is stamped on every row, and the env is the only party that notices."""
-    stream = _digested_stream(tmp_path, [0], {"digest": "digest-b"}, identity="digest-a")
+    said = {"digest": "digest-a"}
+    stream = _declared_stream(tmp_path, [0], said, identity="fingerprint-a")
+    # The catalog said `digest-a`, so that is what this run is filed under. The factory now hands
+    # out a different configuration, and the caller's own name has not changed at all.
+    said["digest"] = "digest-b"
     with pytest.raises(RuntimeError):
         async with stream:
             await stream.get_task()
@@ -916,15 +1034,43 @@ async def test_a_row_the_env_disowns_is_refused_before_it_is_scored(tmp_path: Pa
 
     (row,) = _rows(tmp_path)
     # Fail-closed: the disagreeing row is unscored and says why, rather than landing scored under
-    # a name its own env disowns.
+    # an identity its own env disowns.
     assert row["closure"] == "finalize_error" and row["score"] is None
     assert "digest-a" in row["diagnostic"] and "digest-b" in row["diagnostic"]
+
+
+async def test_the_caller_name_is_not_searched_for_the_env_digest(tmp_path: Path) -> None:
+    """What replaced a substring test.
+
+    The digest used to be accepted whenever it occurred anywhere inside the caller's opaque
+    string, so a name with unrelated text around a digest passed and was stamped on a scored row,
+    and a name composing several fields could match by accident. The caller's name is now one
+    member of a record and is never searched: what the env said lives in its own member, exactly,
+    and is compared with what the env says on the row."""
+    said = {"digest": "digest-a"}
+    async with _declared_stream(
+        tmp_path, [0], said, identity="run-42/digest-a/seed-7"
+    ) as stream:
+        await stream.get_task()
+        await stream.dispatch(SUBMIT_TOOL, {"answer": "4"})
+    (stored,) = _rows(tmp_path)
+    # The two facts are kept apart: the caller's name is carried verbatim, and the env's digest is
+    # a member of its own rather than something read out of that name.
+    assert stored["run_identity"]["caller"] == "run-42/digest-a/seed-7"
+    assert stored["run_identity"]["envs"] == {ENV_NAME: "digest-a"}
+
+    # And a run whose env changed is refused although the caller's name still contains the old
+    # digest, which is precisely what containment could not tell apart.
+    said["digest"] = "digest-b"
+    with pytest.raises(ValueError, match="run identity"):
+        _declared_stream(tmp_path, [0, 1], said, resume=True, identity="run-42/digest-a/seed-7")
 
 
 async def test_a_record_is_bound_to_what_its_env_said(tmp_path: Path) -> None:
     """The half a caller's assertion cannot carry, and the half that works for the wildcard.
 
-    Nobody named anything here, so there is no assertion to check. What the second row is refused
+    Nobody named anything here, and this env does not answer to its declared name before an
+    episode runs, so there is nothing to compare at construction. What the second row is refused
     by is the *first* row: the env described itself, that description is what this directory
     holds, and comparing what the env said with what the env said before is not an assertion
     anybody made."""
@@ -944,10 +1090,78 @@ async def test_a_record_is_bound_to_what_its_env_said(tmp_path: Path) -> None:
     assert "digest-one" in rows[1]["diagnostic"] and "digest-two" in rows[1]["diagnostic"]
 
 
+async def test_two_envs_with_two_digests_are_both_scored(tmp_path: Path) -> None:
+    """A queue may name several envs, and what one of them said about itself is a fact about
+    *that* env.
+
+    The binding used to be one value for the whole stream, so an ordinary two-env queue whose
+    envs published different digests scored the first env's task and then filed the second env's
+    first row as an unscored ``finalize_error`` and stopped the run: a supported queue shape
+    reported as an integrity failure."""
+    digests = {"env-one": "digest-one", "env-two": "digest-two"}
+
+    def _factory(name: str) -> _DeclaredDigestEnv:
+        return _DeclaredDigestEnv(tasks=TASKS, digest=digests[name])
+
+    async with TaskStream(
+        _factory,
+        [TaskRef("env-one", 0), TaskRef("env-two", 1)],
+        prov_dir=tmp_path / "prov",
+        identity="fingerprint-a",
+    ) as stream:
+        await stream.get_task()
+        await stream.dispatch(f"env-one__{SUBMIT_TOOL}", {"answer": "4"})
+        await stream.get_task()
+        await stream.dispatch(f"env-two__{SUBMIT_TOOL}", {"answer": "6"})
+
+    rows = _rows(tmp_path)
+    assert [row["closure"] for row in rows] == ["sealed", "sealed"]
+    assert all(row["score"] is not None for row in rows)
+    # Both digests are in the identity, one per env, rather than one of them standing for both.
+    assert rows[0]["run_identity"]["envs"] == digests
+    # And each env is still held to its own: the second env's digest is not an escape hatch for
+    # the first, which a per-env binding could otherwise have become.
+    digests["env-one"] = "digest-three"
+    with pytest.raises(ValueError, match="run identity"):
+        TaskStream(
+            _factory,
+            [TaskRef("env-one", 0), TaskRef("env-two", 1)],
+            prov_dir=tmp_path / "prov",
+            resume=True,
+            identity="fingerprint-a",
+        )
+
+
+async def test_a_resume_under_a_different_env_configuration_is_refused_before_it_serves(
+    tmp_path: Path,
+) -> None:
+    """An env that answers to its declared name is read before the first task is dispensed, so a
+    resume against a changed configuration is refused at construction rather than at the row that
+    would have exposed it. That is also the case a record could not settle on its own: a run
+    killed between its claim and its first result has no row to compare, and the claim now carries
+    what its env said it was."""
+    said = {"digest": "digest-one"}
+    # Claimed and never closed, which is the directory a crash leaves: no dispense, no row, and
+    # nothing but the claim to say what this run was.
+    crashed = _declared_stream(tmp_path, [0], said, identity="fingerprint-a")
+    claim = json.loads((tmp_path / "prov" / "claim.json").read_text())
+    assert claim["run_identity"]["envs"] == {ENV_NAME: "digest-one"}
+    assert not (tmp_path / "prov" / "results.jsonl").exists()
+
+    said["digest"] = "digest-two"
+    with pytest.raises(ValueError, match="run identity") as refused:
+        _declared_stream(tmp_path, [0, 1], said, resume=True, identity="fingerprint-a")
+    assert "digest-one" in str(refused.value) and "digest-two" in str(refused.value)
+    # The refusal displaced nothing: the claim is still the one the crashed run left.
+    assert json.loads((tmp_path / "prov" / "claim.json").read_text()) == claim
+    await crashed.aclose()
+
+
 async def test_a_resume_is_held_to_the_digest_the_record_already_holds(tmp_path: Path) -> None:
     # The binding is durable, because what carries it is already durable: the env's own item is
     # on every row under `observed`, so a resume reads the configuration this directory holds out
-    # of the record rather than out of a caller.
+    # of the record rather than out of a caller. This env publishes its digest and does not
+    # answer to it before an episode runs, so the record is the only thing that can bind it.
     said = {"digest": "digest-one"}
     async with _digested_stream(tmp_path, [0], said) as first:
         await first.get_task()
@@ -1030,7 +1244,7 @@ async def test_the_claim_carries_the_identity_before_any_row_exists(tmp_path: Pa
         # Read while the claim is held: a stream that finishes cleanly releases it, and what this
         # is about is the window before the first row exists.
         claim = json.loads((tmp_path / "prov" / "claim.json").read_text())
-        assert claim["run_identity"] == "fingerprint-a"
+        assert _named(claim["run_identity"]) == "fingerprint-a"
         assert not (tmp_path / "prov" / "results.jsonl").exists()
 
 
@@ -1472,22 +1686,23 @@ async def test_a_run_that_finished_in_the_window_is_not_served_over(
 
 async def test_the_claim_is_taken_before_the_first_write_not_by_it(tmp_path: Path) -> None:
     # Where the ownership has to be decided: a claim taken at the first append would leave the
-    # whole of construction — the env factory, the manifest validation, the replay — as a window
-    # in which two streams both believe they own the directory. So it is taken at construction,
-    # and the loser never reaches a factory call.
+    # rest of construction a window in which two streams both believe they own the directory. So
+    # it is taken at construction, and the loser is refused there rather than at a write.
+    #
+    # It is taken *after* the catalog, not before, and the loser therefore pays for a factory
+    # call it does not get to use — closed again on the way out. That is the price of a refusal
+    # that cannot cost a live stream its run: everything a construction can reject has to happen
+    # before the takeover, or a resume that refuses has already stopped whoever was serving.
     stream = _stream(tmp_path, [0])
     assert _claim(tmp_path).is_file()
     assert not (tmp_path / "prov" / "dispenses.jsonl").exists()
 
-    factories: List[str] = []
-
-    def _counting(name: str) -> _FixtureScoreEnv:
-        factories.append(name)
-        return _env_for(name)
-
     with pytest.raises(ValueError, match="claimed by another stream"):
-        TaskStream(_counting, [TaskRef(ENV_NAME, 0)], prov_dir=tmp_path / "prov")
-    assert factories == []
+        TaskStream(_env_for, [TaskRef(ENV_NAME, 0)], prov_dir=tmp_path / "prov")
+    # The loser wrote nothing at all, and the claim is still the first stream's.
+    assert not (tmp_path / "prov" / "dispenses.jsonl").exists()
+    assert not (tmp_path / "prov" / "results.jsonl").exists()
+    assert stream._holds_claim(json.loads(_claim(tmp_path).read_text()))
     await stream.aclose()
 
 
@@ -1872,13 +2087,15 @@ async def test_a_stream_duplicated_past_the_refusals_still_cannot_write(
     assert not _claim(tmp_path).exists()
 
 
-async def test_a_refused_resume_puts_back_the_claim_it_displaced(tmp_path: Path) -> None:
-    # A resume takes the directory over on the way in — it has to, since everything after that
-    # point builds envs and reads the record it is continuing — so a construction that then
-    # refuses has displaced a claim it never got to use. Leaving it gone would let a mistyped
-    # queue stop a stream that was serving perfectly well: the dispossessed one can no longer
-    # record the task it is holding, and the run nobody asked to stop is the one that had done
-    # nothing wrong. A refusal changes nothing, and that now includes what it took over.
+async def test_a_refused_resume_never_displaces_the_claim_it_would_have_taken(
+    tmp_path: Path,
+) -> None:
+    # A resume that refuses may not cost the stream it would have displaced anything at all.
+    # Leaving the claim gone would let a mistyped queue stop a stream that was serving perfectly
+    # well: the dispossessed one can no longer record the task it is holding, and the run nobody
+    # asked to stop is the one that had done nothing wrong. So a refusal changes nothing, and
+    # what makes that true is the order — everything a construction can refuse for now runs
+    # *before* the takeover rather than after it.
     serving = _stream(tmp_path, [0, 1], feedback=Immediate())
     await serving.get_task()
     held = json.loads(_claim(tmp_path).read_text(encoding="utf-8"))
@@ -1893,6 +2110,60 @@ async def test_a_refused_resume_puts_back_the_claim_it_displaced(tmp_path: Path)
         await serving.dispatch(SUBMIT_TOOL, {"answer": "4"})
         await serving.get_task()
         await serving.dispatch(SUBMIT_TOOL, {"answer": "6"})
+    assert [row["position"] for row in _rows(tmp_path)] == [0, 1]
+    assert not _claim(tmp_path).exists()
+
+
+async def test_a_refused_resume_costs_the_live_stream_nothing_while_it_is_deciding(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The interval a sequential test cannot see.
+
+    Putting a claim file back is all a refusal could ever do on disk, and it was not enough. The
+    record used to be read *after* the takeover and outside the exclusion, so a stream that
+    reached an append in that window found a foreign claim, stopped itself permanently and raised
+    out of its own ``aclose`` — and the refusing constructor then restored a file that could not
+    restore any of that. The read happens inside the claim's own critical section now, so an
+    append arriving while a resume is deciding waits for the answer rather than racing it, and
+    the answer is that nothing changed."""
+    serving = _stream(tmp_path, [0, 1], feedback=Immediate())
+    await serving.get_task()
+    await serving.dispatch(SUBMIT_TOOL, {"answer": "4"})
+    await serving.get_task()  # a task in flight, and a row still owed for it
+
+    deciding = threading.Event()
+    real_read = stream_module.read_dispenses
+
+    def _slow_read(prov_dir: Path) -> Any:
+        records = real_read(prov_dir)
+        deciding.set()
+        time.sleep(0.3)  # the refusing constructor holds the exclusion this long
+        return records
+
+    monkeypatch.setattr(stream_module, "read_dispenses", _slow_read)
+    refusal: List[BaseException] = []
+
+    def _refusing_resume() -> None:
+        try:
+            _stream(tmp_path, [2], resume=True, feedback=Immediate())
+        except BaseException as exc:  # noqa: BLE001 — reported back to the test
+            refusal.append(exc)
+
+    thread = threading.Thread(target=_refusing_resume)
+    thread.start()
+    try:
+        assert deciding.wait(5), "the resume never reached the record it was deciding about"
+        # The live stream's append lands in the middle of that decision. It blocks on the same
+        # exclusion the resume is holding and is answered once the resume has refused.
+        await serving.dispatch(SUBMIT_TOOL, {"answer": "6"})
+    finally:
+        thread.join(10)
+
+    assert refusal and isinstance(refusal[0], ValueError)
+    # The stream that was serving is untouched: not stopped, both rows recorded, closing cleanly.
+    assert not serving.stopped
+    async with serving:
+        pass
     assert [row["position"] for row in _rows(tmp_path)] == [0, 1]
     assert not _claim(tmp_path).exists()
 

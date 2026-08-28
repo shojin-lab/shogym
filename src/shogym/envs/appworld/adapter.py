@@ -35,6 +35,7 @@ import secrets
 import select
 import signal
 import shutil
+import stat
 import subprocess
 import time
 import tempfile
@@ -45,13 +46,23 @@ import urllib.request
 from dataclasses import dataclass
 from functools import lru_cache
 from pathlib import Path
-from typing import Any, Dict, List, Optional, Sequence, Tuple
+from typing import Any, Dict, Iterator, List, Optional, Sequence, Tuple
 
 from shogym.envs._upstream import _locked
 
 # ----- the pins -----
 
 #: The release this port reproduces, and the commit it was cut from.
+#:
+#: **Both are load-bearing, and they are load-bearing in different ways.** The version is what is
+#: installed and what the installed distribution is checked to be (see :func:`_check_pin`), so a
+#: runtime holding some other release is refused rather than served. The commit is not checkable
+#: against the artifact at all: the published wheel carries no marker of the tree it was built
+#: from, so nothing on this machine can say whether ``0.1.3.post1`` was cut from this commit. What
+#: it does instead is *name* the runtime and go into its stamp, so changing the pin builds a
+#: second interpreter under a second name rather than reusing the first, and every run's
+#: fingerprint moves with it. What the realized bytes turned out to be is :func:`runtime_digest`'s
+#: job, which is the question a pin can never answer.
 UPSTREAM_VERSION = "0.1.3.post1"
 UPSTREAM_SHA = "66ad8099e12188ece0d3fe45e661dbc01880813b"
 
@@ -73,6 +84,10 @@ SPLIT = "test_challenge"
 ROOT_ENV_VAR = "APPWORLD_ROOT"
 
 _DOWNLOAD_TIMEOUT_SECONDS = 300.0
+
+#: How long one provisioning subprocess gets: creating the venv, resolving and installing the
+#: pinned release, unpacking the app sources, unpacking the bundle. See :func:`_run`.
+_PROVISION_TIMEOUT_SECONDS = 1800.0
 
 #: How long a worker gets to stop after it is signalled, before it is killed. Short: teardown
 #: runs on the shared loop and a wedged world may not hold the others.
@@ -122,6 +137,12 @@ def cache_root() -> Path:
 WORKER = Path(__file__).with_name("worker.py")
 
 
+#: What a built runtime says it is, written inside it once it is complete and checked before it is
+#: reused. The name carries the same values; this is for the case a name cannot cover, which is a
+#: tree replaced, restored or half-deleted under a name that still claims the old identity.
+_RUNTIME_FILE = ".shogym-runtime"
+
+
 def runtime() -> Path:
     """The interpreter every world runs under, building it if it is not there yet.
 
@@ -129,21 +150,65 @@ def runtime() -> Path:
     and shogym needs ``pydantic>=2.7``: installing it beside shogym is not a thing pip will do,
     and a port that pretended otherwise would fail at resolve time on every machine. Built with
     ``uv`` where it is on the path and with the standard library's own tools otherwise, so the
-    port needs no tool the user did not already have."""
-    home = cache_root() / f"runtime-{UPSTREAM_VERSION}"
-    python = home / ("Scripts" if os.name == "nt" else "bin") / "python"
-    if python.exists():
+    port needs no tool the user did not already have.
+
+    **Named for both pins, and reused only against its own stamp.** The old test was that
+    ``bin/python`` existed, which is true of a venv whose install failed after the interpreter was
+    created, of one a later pin change should have rebuilt, and of one somebody edited. The name
+    now carries the version and the commit, and the stamp inside says the same thing, so what is
+    reused is a tree this code finished building under these pins rather than a directory that
+    happens to hold a Python."""
+    home = cache_root() / f"runtime-{UPSTREAM_VERSION}-{UPSTREAM_SHA[:12]}"
+    python = _interpreter(home)
+    if _stamped(home) and python.exists():
         return python
     home.parent.mkdir(parents=True, exist_ok=True)
-    with _locked(home.parent):
-        if python.exists():
+    # Required, not advisory: the staging tree below has a fixed name and is deleted before it is
+    # written, so two cold builders without exclusion remove and publish each other's half-built
+    # interpreter. See `_upstream._locked`.
+    with _locked(home.parent, required=True):
+        if _stamped(home) and python.exists():
             return python
         _build_runtime(home)
     return python
 
 
+def _runtime_stamp() -> str:
+    """What a runtime built by this code under these pins says about itself."""
+    return json.dumps(
+        {"version": UPSTREAM_VERSION, "sha": UPSTREAM_SHA, "python": _python_series()},
+        sort_keys=True,
+    )
+
+
+def _stamped(home: Path) -> bool:
+    """Whether ``home`` holds this code's own stamp, refusing one that holds a different stamp.
+
+    A missing stamp is a cold cache, or a runtime built by a head that had none, and both are
+    answered by building. A stamp that says something else is a tree under a name that claims an
+    identity it does not have, and the only honest answer to that is to stop: the interpreter is
+    what every world runs under, so serving out of one whose provenance disagrees with its own
+    name would put the disagreement in the scores rather than in an error."""
+    try:
+        held = (home / _RUNTIME_FILE).read_text().strip()
+    except OSError:
+        return False
+    if held != _runtime_stamp():
+        raise ProvisioningError(
+            f"the appworld runtime at {home} says it was built as {held}, but this run pins "
+            f"{_runtime_stamp()}; the interpreter is what every world runs under, so this refuses "
+            "rather than serving out of it. Remove that directory, or point SHOGYM_CACHE elsewhere"
+        )
+    return True
+
+
 def _build_runtime(home: Path) -> None:
-    """Create the environment and install the pinned release into it."""
+    """Create the environment, install the pinned release into it, and check what arrived.
+
+    Checked inside the staging tree and stamped there, before the rename that publishes it. So the
+    final name never exists holding an interpreter that failed its own pin, and a builder that
+    dies part way through leaves a staging directory rather than a runtime other processes would
+    reuse."""
     import shutil
     import venv
 
@@ -157,7 +222,69 @@ def _build_runtime(home: Path) -> None:
     else:
         venv.EnvBuilder(with_pip=True).create(str(staging))
         _run([str(_interpreter(staging)), "-m", "pip", "install", "--quiet", requirement])
+    _check_pin(staging)
+    (staging / _RUNTIME_FILE).write_text(_runtime_stamp())
+    _publish_runtime(staging, home)
+
+
+def _publish_runtime(staging: Path, home: Path) -> None:
+    """Give the staged tree its final name, moving any incumbent aside first.
+
+    ``os.replace`` will not rename a directory over a non-empty one, and there is now a way to
+    reach this with something already under the name: a tree that is not one this code stamped is
+    rebuilt rather than reused, and the tree it is rebuilding over is still there. So the
+    incumbent is renamed away and the publish stays the single atomic step it has to be. A worker
+    already running out of the old tree keeps every file it has open, because a rename moves a
+    name and not an inode; what it loses is the ability to open new ones by that path, which is
+    the same thing it would lose to any rebuild.
+
+    Removing the incumbent afterwards is housekeeping and is allowed to fail: the publish has
+    already happened by then, and a directory left behind costs disk rather than correctness."""
+    displaced: Optional[Path] = None
+    if home.exists():
+        displaced = home.with_name(f"{home.name}.replaced.{os.getpid()}.{secrets.token_hex(8)}")
+        os.replace(home, displaced)
     os.replace(staging, home)
+    if displaced is not None:
+        shutil.rmtree(displaced, ignore_errors=True)
+
+
+def _check_pin(home: Path) -> None:
+    """Refuse a runtime whose installed ``appworld`` is not the pinned release.
+
+    The requirement string asks for one version and the resolver is what answers; a build that
+    resolved something else, or an index that moved under the name, would otherwise be served
+    under a cache name that says the pin was honored. Read off the distribution metadata rather
+    than by running the interpreter, so a broken install fails here rather than at the first
+    episode.
+
+    **This is the whole of what the pins can be checked against, and it is half of one of them.**
+    The wheel carries no record of the commit it was cut from, so :data:`UPSTREAM_SHA` is not
+    verifiable here or anywhere else on this machine (see the pins). What covers the realized code
+    is :func:`runtime_digest`, which reads the bytes rather than the label."""
+    found = sorted(
+        entry.name[: -len(".dist-info")]
+        for packages in _site_packages(home)
+        for entry in packages.iterdir()
+        if entry.name.startswith("appworld-") and entry.name.endswith(".dist-info")
+    )
+    if found != [f"appworld-{UPSTREAM_VERSION}"]:
+        raise ProvisioningError(
+            f"the appworld runtime at {home} installed {found or 'no appworld distribution'}, "
+            f"but this port pins appworld=={UPSTREAM_VERSION}; every task, every database and "
+            "every ground truth in the measurement is read by this interpreter, so a release "
+            "nobody asked for is refused rather than served"
+        )
+
+
+def _site_packages(home: Path) -> List[Path]:
+    """The provisioned interpreter's ``site-packages`` directories, in a stable order.
+
+    Both layouts, because the port names an interpreter and not a platform: POSIX venvs put it
+    under ``lib/pythonX.Y/`` and Windows ones under ``Lib/``. One definition, because the pin
+    check and the runtime digest have to be looking at the same tree."""
+    found = list(home.glob("lib/python*/site-packages")) + list(home.glob("Lib/site-packages"))
+    return sorted(path for path in found if path.is_dir())
 
 
 def _interpreter(home: Path) -> Path:
@@ -169,9 +296,24 @@ def _python_series() -> str:
     return f"{sys.version_info.major}.{sys.version_info.minor}"
 
 
-def _run(command: list) -> None:
-    """Run a provisioning command, and say what it was if it fails."""
-    finished = subprocess.run(command, capture_output=True, text=True)
+def _run(command: list, *, timeout: float = _PROVISION_TIMEOUT_SECONDS) -> None:
+    """Run a provisioning command, and say what it was if it fails or if it never finishes.
+
+    **Bounded, because every one of these is a network call wearing a subprocess.** A ``pip
+    install`` against an index that accepts the connection and then stops sending has no timeout of
+    its own, and neither does an unpack whose child wedged. Construction is what waits on this, and
+    a construction that never returns is a queue that never starts and a run that reports nothing
+    at all, which is strictly worse than a run that says which command hung. The bound is generous
+    on purpose: it is a liveness bound and not a performance one, so a cold resolve on a slow link
+    stays inside it and a wedge does not."""
+    try:
+        finished = subprocess.run(command, capture_output=True, text=True, timeout=timeout)
+    except subprocess.TimeoutExpired as expired:
+        # `subprocess.run` has already killed and reaped the child by the time this is raised.
+        raise ProvisioningError(
+            f"provisioning the appworld runtime timed out after {timeout:.0f}s: "
+            f"{' '.join(command)}"
+        ) from expired
     if finished.returncode != 0:
         raise ProvisioningError(
             f"provisioning the appworld runtime failed: {' '.join(command)}\n"
@@ -189,7 +331,10 @@ def ensure_apps() -> None:
     installed = _installed_package(python)
     if (installed / "apps" / "todoist" / "models.py").exists():
         return
-    with _locked(installed):
+    # Required: this one unpacks *in place*, into the interpreter every world runs under, so two
+    # unpackers without exclusion are two processes writing one tree. There is no staging name to
+    # publish from and no rename to make it atomic.
+    with _locked(installed, required=True):
         if (installed / "apps" / "todoist" / "models.py").exists():
             return
         _run([str(python), str(WORKER), "install"])
@@ -231,7 +376,11 @@ def ensure_corpus() -> Path:
     # machine takes exactly this path.
     runtime()
     ensure_apps()
-    with _locked(root.parent):
+    # Required, for the reason the runtime's lock is: `_fetch_corpus` stages under a fixed
+    # `.building` name it deletes first, so two cold fetchers without exclusion delete and publish
+    # each other's half-unpacked corpus, and the corpus is the material every score is computed
+    # against.
+    with _locked(root.parent, required=True):
         if (root / "data" / "tasks").is_dir():
             return root
         _fetch_corpus(root)
@@ -302,34 +451,90 @@ def task_specs(root: Path, task_id: str) -> Dict[str, Any]:
     ``corpus_digest`` and a new cache name, and the same process went on serving the instruction,
     the supervisor and the datetime it had read the first time. The identity moved and the task
     did not. It is a few kilobytes of JSON, and the cache was also unbounded across a roster of
-    318."""
+    318.
+
+    **A served env does not call this.** It reads its whole roster's specs once, out of the same
+    walk that computes its corpus digest (:func:`corpus_snapshot`), and serves those for its life:
+    an env whose fingerprint and cache names were fixed at construction must not go on reading
+    authored text from a corpus that can change under it. This remains for the callers that want
+    one spec off a corpus as it stands rather than a pinned view of one, which is tooling and the
+    tests that check a committed table against the corpus it was generated from."""
     return json.loads((root / "data" / "tasks" / task_id / "specs.json").read_text())
 
 
 def runtime_digest() -> str:
-    """What the worker's interpreter actually is, as sixteen hex characters.
+    """What the worker's interpreter actually holds, as sixteen hex characters.
 
-    The runtime cache is named for the *direct* AppWorld version alone, while it is built by
-    resolving that release's ranged dependencies against whatever the host's Python and the index
-    offer on the day. Two machines, or one machine a month apart, therefore run a world under
-    different transitive versions under a name that says they are the same. This reads what was
-    realized rather than what was asked for: the interpreter the environment records for itself,
-    and the distribution set on its path, by name and version.
+    The runtime cache is named for the pins, while it is built by resolving the pinned release's
+    ranged dependencies against whatever the host's Python and the index offer on the day. Two
+    machines, or one machine a month apart, therefore run a world under different transitive
+    versions under a name that says they are the same. This reads what was realized rather than
+    what was asked for.
 
-    Read off the filesystem rather than by running the interpreter, so it costs a directory
-    listing. Not memoized, for the reason :func:`corpus_digest` is not."""
+    **Every installed byte, not the distribution names.** This once hashed the platform, the venv
+    config and the ``.dist-info`` directory *names*, which is a list of what was asked for a second
+    time: two different artifacts published under one version were one identity, and so was a
+    module edited in place, which is the one thing a digest over a tree an interpreter runs from
+    exists to catch. A ``.dist-info`` name is a label, and a label is not a fingerprint of the code
+    behind it.
+
+    **``__pycache__`` is skipped, and that is not a hole.** Bytecode caches are derived from the
+    sources this already reads, and they are written lazily by whatever the last process happened
+    to import, so hashing them would make the identity depend on which worker ran first rather
+    than on what is installed. Nothing can be hidden in one that is not in the source beside it:
+    Python discards a ``.pyc`` whose source is newer.
+
+    **Symbolic links are recorded, never followed.** A link's target may be outside the tree
+    entirely, and what a link contributes to this interpreter's identity is where it points.
+
+    Read off the filesystem rather than by running the interpreter, so a broken install still gets
+    an answer. It costs about half a second warm over the roughly ten thousand installed files of
+    this runtime, paid once per env construction beside a corpus digest that costs four times that
+    (:func:`corpus_digest` is the only other thing on the same path, and both are read by
+    :func:`~env_v1.run_fingerprint`, which runs once in a constructor). Not memoized, for the
+    reason :func:`corpus_digest` is not."""
     home = runtime().parent.parent
     material = hashlib.sha256()
     material.update(f"{platform.system()}|{platform.machine()}".encode())
+    material.update(f"{UPSTREAM_VERSION}|{UPSTREAM_SHA}".encode())
     config = home / "pyvenv.cfg"
     material.update(config.read_bytes() if config.exists() else b"")
-    for packages in sorted(home.glob("lib/python*/site-packages")):
-        for entry in sorted(packages.iterdir()):
-            # `name-version.dist-info` is the realized distribution set, which is the thing the
-            # cache name does not carry.
-            if entry.name.endswith(".dist-info"):
-                material.update(entry.name.encode())
+    for packages in _site_packages(home):
+        for relative, path in _installed_files(packages):
+            material.update(relative.encode())
+            material.update(b"\0")
+            if path.is_symlink():
+                material.update(b"link\0")
+                material.update(os.readlink(path).encode())
+                continue
+            material.update(b"file\0")
+            with path.open("rb") as handle:
+                while True:
+                    block = handle.read(1 << 20)
+                    if not block:
+                        break
+                    material.update(block)
     return material.hexdigest()[:16]
+
+
+def _installed_files(packages: Path) -> "Iterator[Tuple[str, Path]]":
+    """Every file under ``packages`` bar the bytecode caches, in one order on every machine.
+
+    Sorted at each level rather than by collecting and sorting the whole tree, so a digest over a
+    hundred thousand files still holds one directory's names at a time.
+
+    A symlinked *directory* is yielded like any other link and never descended into, so it
+    contributes where it points and not a second copy of whatever is over there. Descending would
+    also be how one link makes this walk unbounded."""
+    for directory, children, names in os.walk(packages, followlinks=False):
+        here = Path(directory)
+        linked = [child for child in children if (here / child).is_symlink()]
+        children[:] = sorted(
+            child for child in children if child != "__pycache__" and child not in linked
+        )
+        for name in sorted([*names, *linked]):
+            path = here / name
+            yield str(path.relative_to(packages)), path
 
 
 # ----- the derived corpus -----
@@ -446,6 +651,24 @@ def stamp_cache(root: Path, *, source: str) -> None:
             pass
 
 
+@dataclass(frozen=True)
+class CorpusSnapshot:
+    """One reading of a corpus: what it held, and the authored text it held while it was read.
+
+    The two travel together because they have to be one observation. A digest and a later
+    ``specs.json`` read are two, and the gap between them is a corpus that can change: the env
+    fixed its fingerprint and its cache names from the first and then went on serving instructions
+    and dates read from the second, so an in-place edit served authored text under an identity
+    that had never seen it. Here the spec is parsed from the very bytes the digest was computed
+    over, so ``digest`` states what ``specs`` came from and there is no window between them to
+    edit."""
+
+    #: What the whole of ``data`` held, as sixteen hex characters.
+    digest: str
+    #: Task id to its shipped specification, for the tasks that were asked for and no others.
+    specs: Dict[str, Dict[str, Any]]
+
+
 def corpus_digest(root: Path) -> str:
     """What the corpus at ``root`` actually holds, as sixteen hex characters.
 
@@ -472,8 +695,23 @@ def corpus_digest(root: Path) -> str:
     keeps the value; the cost is about two seconds on a fresh corpus, dominated by the fourteen
     thousand small files in the task tree, and it is the price of the digest meaning what it
     says."""
+    return corpus_snapshot(root, task_ids=()).digest
+
+
+def corpus_snapshot(root: Path, *, task_ids: Sequence[str]) -> CorpusSnapshot:
+    """Read the corpus at ``root`` once: its digest, and the specs of the tasks named.
+
+    One walk rather than two, and that is the point rather than an optimization. The specs are
+    parsed out of the same bytes the digest is computed from, as they are read, so a caller that
+    holds both holds one statement about one corpus at one instant. See :class:`CorpusSnapshot`
+    for what the two-observation version let through.
+
+    A named task whose spec the walk never reached is a manifest and a corpus that disagree, which
+    is refused here rather than at the two-hundredth episode of a run."""
     digest = hashlib.sha256()
     data = root / "data"
+    wanted = set(task_ids)
+    specs: Dict[str, Dict[str, Any]] = {}
     for path in sorted(data.rglob("*")):
         if path.is_symlink():
             # **Refused rather than skipped.** A skipped link is a file the digest does not cover
@@ -488,14 +726,35 @@ def corpus_digest(root: Path) -> str:
             )
         if not path.is_file():
             continue
-        digest.update(str(path.relative_to(data)).encode())
+        relative = path.relative_to(data)
+        digest.update(str(relative).encode())
+        # `tasks/<task_id>/specs.json` and nothing else: a `specs.json` anywhere else in the tree
+        # is not a task's, and a task not asked for is not read into memory.
+        keeping = (
+            relative.parts[:1] == ("tasks",)
+            and len(relative.parts) == 3
+            and relative.parts[2] == "specs.json"
+            and relative.parts[1] in wanted
+        )
+        blocks: List[bytes] = []
         with path.open("rb") as handle:
             while True:
                 block = handle.read(1 << 20)
                 if not block:
                     break
                 digest.update(block)
-    return digest.hexdigest()[:16]
+                if keeping:
+                    blocks.append(block)
+        if keeping:
+            specs[relative.parts[1]] = json.loads(b"".join(blocks))
+    missing = sorted(wanted - set(specs))
+    if missing:
+        raise ProvisioningError(
+            f"the corpus at {root} has no specification for {len(missing)} of the tasks this port "
+            f"serves (first: {missing[0]}); the manifest at {MANIFEST} and this corpus are not "
+            "describing the same split"
+        )
+    return CorpusSnapshot(digest=digest.hexdigest()[:16], specs=specs)
 
 
 def episode_outputs(session_id: str) -> Path:
@@ -839,6 +1098,141 @@ _SNAPSHOT_MAX_BYTES = 1 << 30
 _SNAPSHOT_MAX_DEPTH = 24
 _SNAPSHOT_SECONDS = 60.0
 
+#: How much of one file is moved between two readings of the clock and the stop flag. A bound that
+#: is only checked between files is not a bound on a tree that may hold one enormous file, and a
+#: cancelled finalization would wait out the whole of it. A megabyte is small against the sixty
+#: seconds and large against the cost of a check.
+_SNAPSHOT_CHUNK_BYTES = 1 << 20
+
+
+class _Bound:
+    """The four bounds one snapshot runs under, and the only place any of them is read.
+
+    A class rather than four locals threaded through the walk, because the walk is no longer one
+    loop: enumerating a directory, removing the previous copy and moving one file's bytes are
+    three operations that each have to be able to say "the budget is gone" from inside themselves.
+    The limits are read off the module once, at construction, so a caller that shrinks them for a
+    test shrinks them for the whole of the call and not for half of it."""
+
+    def __init__(self, stop: "Optional[threading.Event]") -> None:
+        self.stop = stop
+        self.began = time.monotonic()
+        self.nodes = 0
+        self.bytes = 0
+        self.max_nodes = _SNAPSHOT_MAX_NODES
+        self.max_bytes = _SNAPSHOT_MAX_BYTES
+        self.max_depth = _SNAPSHOT_MAX_DEPTH
+        self.seconds = _SNAPSHOT_SECONDS
+
+    def alive(self) -> None:
+        """The two bounds that are about *when*, checked before anything that can take time.
+
+        Once per directory entry as it arrives and once per chunk of a file, which is what makes
+        the deadline and the cancellation bounds on the work rather than on the gaps between
+        pieces of it."""
+        if self.stop is not None and self.stop.is_set():
+            raise SnapshotError("the snapshot was abandoned before it finished")
+        if time.monotonic() - self.began > self.seconds:
+            raise SnapshotError(
+                f"the episode's output tree took longer than {self.seconds:.0f}s to copy"
+            )
+
+    def node(self) -> None:
+        """Count one directory entry, having first checked that there is still a budget to spend."""
+        self.alive()
+        self.nodes += 1
+        if self.nodes > self.max_nodes:
+            raise SnapshotError(
+                f"the episode's output tree holds more than {self.max_nodes} entries"
+            )
+
+    def descend(self, depth: int) -> None:
+        if depth > self.max_depth:
+            raise SnapshotError(
+                f"the episode's output tree is deeper than {self.max_depth} directories"
+            )
+
+    def offer(self, size: int) -> None:
+        """Refuse a file whose length alone breaks the budget, before any of it is read."""
+        if self.bytes + size > self.max_bytes:
+            raise SnapshotError(
+                f"the episode's output tree is larger than {self.max_bytes} bytes"
+            )
+
+    def spend(self, count: int) -> None:
+        """Account for bytes actually moved, so a file that grew past its own ``stat`` is caught."""
+        self.bytes += count
+        if self.bytes > self.max_bytes:
+            raise SnapshotError(
+                f"the episode's output tree is larger than {self.max_bytes} bytes"
+            )
+
+
+def _names(source: Path, bound: _Bound) -> List[str]:
+    """One directory's entry names, counted against the bound as they arrive, then sorted.
+
+    ``sorted(source.iterdir())`` read and sorted the whole directory before a single bound was
+    consulted, so a directory holding a million names spent all of that time and memory *after*
+    the deadline had passed and after the finalization had been cancelled. ``os.scandir`` hands
+    them over one at a time, so the bound is spent per entry and the enumeration stops inside the
+    directory rather than at the end of it.
+
+    The order is still the sorted one, and the sort still happens: it runs on the names that got
+    past the bound, which is the difference. A deterministic order is worth keeping, because it
+    decides which of several refusals an episode gets told about."""
+    names: List[str] = []
+    with os.scandir(source) as entries:
+        for entry in entries:
+            bound.node()
+            names.append(entry.name)
+    return sorted(names)
+
+
+def _clear(target: Path, bound: _Bound, depth: int = 0) -> None:
+    """Remove ``target`` and everything under it, under the same bound as the copy that follows.
+
+    ``shutil.rmtree`` was outside every bound, and what it removes is the previous snapshot, which
+    lives at a name one character away from the output root the world is handed: the process that
+    ran the agent's code could work out the name and fill the tree. So a cancelled finalization
+    waited out a deletion the episode had sized, before it reached the copy the bounds cover.
+
+    Depth is bounded here as well as in the copy, and for a second reason: this recurses, so a
+    tree nested ten thousand deep would otherwise be an interpreter stack rather than a refusal."""
+    bound.alive()
+    try:
+        mode = target.lstat().st_mode
+    except FileNotFoundError:
+        return
+    if stat.S_ISDIR(mode) and not stat.S_ISLNK(mode):
+        bound.descend(depth)
+        for name in _names(target, bound):
+            _clear(target / name, bound, depth + 1)
+        target.rmdir()
+        return
+    # A symlink is unlinked, never followed: what it names is outside the tree being removed.
+    target.unlink()
+
+
+def _copy(source: Path, target: Path, bound: _Bound) -> None:
+    """Move one file's bytes, reading the clock and the stop flag between chunks.
+
+    ``shutil.copyfile`` was one call with no way in: a single large or slow file ran to completion
+    however long the copy had already taken and however long ago the finalization it belongs to
+    was abandoned. Checking once per file bounds a tree of small files and bounds nothing about a
+    tree with one big one in it.
+
+    A refused copy leaves a partial file behind in the destination, and that is harmless by
+    construction: a snapshot that raises is an episode refused outright, nothing reads the
+    destination afterwards, and the next call removes it before it writes anything."""
+    with source.open("rb") as reader, target.open("wb") as writer:
+        while True:
+            bound.alive()
+            block = reader.read(_SNAPSHOT_CHUNK_BYTES)
+            if not block:
+                return
+            bound.spend(len(block))
+            writer.write(block)
+
 
 def snapshot_outputs(
     outputs: Path, *, into: Path, stop: "Optional[threading.Event]" = None
@@ -863,8 +1257,15 @@ def snapshot_outputs(
     likes and fills the host's disk on the way, and neither the finalize deadline nor the grader's
     own timeout covers it: a deadline cancels the *await*, and the thread doing the copying does
     not stop for that. Which is what ``stop`` is for: the caller sets it when its await is
-    cancelled and this checks it once per file, so a cancelled finalization stops the copy at the
-    next file rather than at the end of the tree.
+    cancelled, and it is read from inside the work rather than between pieces of it.
+
+    **Every operation that can consume the bound is inside it, which three of them were not.** The
+    previous snapshot was removed by an unbounded ``rmtree`` before the clock was ever consulted;
+    each directory was read and sorted in full before the first check of the entries it produced;
+    and one file was copied by a single call that could not be interrupted however large it was.
+    So a tree an episode had sized could hold finalization open through any of the three while
+    every stated bound stood unbroken. The removal, the enumeration and the copy now each spend
+    the same budget as they go (see :class:`_Bound`).
 
     Every refusal is an episode refused outright rather than an entry skipped, because a grade
     computed over a tree with something quietly dropped is a grade over a tree nobody submitted.
@@ -879,51 +1280,42 @@ def snapshot_outputs(
     root = outputs.resolve()
     if not root.is_dir():
         raise SnapshotError(f"the episode left no output tree at {outputs}")
-    began = time.monotonic()
-    nodes = 0
-    total = 0
-    shutil.rmtree(into, ignore_errors=True)
+    bound = _Bound(stop)
+    try:
+        _clear(into, bound)
+    except OSError as exc:
+        # Typed rather than let out raw: a destination that will not go away is this episode
+        # ending unscored, and that is a snapshot's own kind of failure rather than a bug.
+        raise SnapshotError(
+            f"the previous snapshot at {into} could not be removed ({exc}), so this episode "
+            "cannot be handed to the grader as the tree it submitted"
+        ) from exc
     into.mkdir(parents=True)
     # One pass: what is checked is what is copied. A validate-then-`copytree` would walk the tree
     # twice and bound neither walk.
     pending: List[Tuple[Path, Path, int]] = [(root, into, 0)]
     while pending:
         source, target, depth = pending.pop()
-        if depth > _SNAPSHOT_MAX_DEPTH:
-            raise SnapshotError(
-                f"the episode's output tree is deeper than {_SNAPSHOT_MAX_DEPTH} directories"
-            )
-        for entry in sorted(source.iterdir()):
-            if stop is not None and stop.is_set():
-                raise SnapshotError("the snapshot was abandoned before it finished")
-            if time.monotonic() - began > _SNAPSHOT_SECONDS:
-                raise SnapshotError(
-                    f"the episode's output tree took longer than {_SNAPSHOT_SECONDS:.0f}s to copy"
-                )
-            nodes += 1
-            if nodes > _SNAPSHOT_MAX_NODES:
-                raise SnapshotError(
-                    f"the episode's output tree holds more than {_SNAPSHOT_MAX_NODES} entries"
-                )
+        bound.descend(depth)
+        for name in _names(source, bound):
+            entry = source / name
+            bound.alive()
             if entry.is_symlink():
                 raise SnapshotError(
-                    f"the episode left a symbolic link in its output tree ({entry.name} -> "
+                    f"the episode left a symbolic link in its output tree ({name} -> "
                     f"{os.readlink(entry)}), which a grader must not resolve"
                 )
             if entry.is_dir():
-                (target / entry.name).mkdir()
-                pending.append((entry, target / entry.name, depth + 1))
+                (target / name).mkdir()
+                pending.append((entry, target / name, depth + 1))
                 continue
             if not entry.is_file():
-                raise SnapshotError(
-                    f"the episode left {entry.name}, which is not a file or directory"
-                )
-            total += entry.stat().st_size
-            if total > _SNAPSHOT_MAX_BYTES:
-                raise SnapshotError(
-                    f"the episode's output tree is larger than {_SNAPSHOT_MAX_BYTES} bytes"
-                )
-            shutil.copyfile(entry, target / entry.name, follow_symlinks=False)
+                raise SnapshotError(f"the episode left {name}, which is not a file or directory")
+            # Offered before it is opened, so a file whose length alone breaks the budget costs a
+            # `stat` rather than a gigabyte, and accounted for again as it is read, so a file that
+            # is longer than it said cannot spend more than the budget either.
+            bound.offer(entry.stat().st_size)
+            _copy(entry, target / name, bound)
     return into
 
 
@@ -1114,6 +1506,7 @@ def _first_line(process: subprocess.Popen, timeout: float) -> str:
 
 
 __all__ = [
+    "CorpusSnapshot",
     "DATA_BUNDLE_SHA256",
     "DATA_BUNDLE_URL",
     "DATA_VERSION",
@@ -1130,6 +1523,7 @@ __all__ = [
     "WORKER",
     "cache_root",
     "corpus_digest",
+    "corpus_snapshot",
     "derived_root",
     "episode_outputs",
     "episode_view",

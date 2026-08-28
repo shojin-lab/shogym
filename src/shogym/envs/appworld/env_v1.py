@@ -136,6 +136,16 @@ class AppWorldEnv(Env):
     function_name = "agent"
     score_terminal_tool = SUBMIT_TOOL_NAME
 
+    #: The item a runner may compare against the identity it is filing rows under. Declared here
+    #: rather than assumed there: `config_digest` is an ordinary name any env may publish as a
+    #: metric, and a module that decided what its number meant would turn another env's successful
+    #: terminal into an unscored failure. An env that declares nothing is not checked.
+    #:
+    #: The value is readable off the env itself (`config_digest` below), so a serve layer can fold
+    #: it into the identity a run is filed under before the first task is dispensed, rather than
+    #: waiting for the first row to publish one.
+    identity_feedback_name = "config_digest"
+
     def __init__(
         self,
         pulse: int = DEFAULT_PULSE,
@@ -151,12 +161,23 @@ class AppWorldEnv(Env):
         self._pulse = int(pulse)
         self._report = report
         self._original = adapter.ensure_corpus() / "data"
+        self._task_ids = adapter.task_ids()
         # Read once, from the corpus this run actually serves, and used for three things that all
         # have to agree: the name of the served cache, the name of the grader's cache, and the run
         # fingerprint a resumed record is checked against. They used to be able to disagree, so a
         # process pointed at a second corpus computed a fingerprint for that one and then reused
         # and served task material derived from the first.
-        self._corpus = adapter.corpus_digest(self._original.parent)
+        #
+        # **The roster's authored text comes back from the same read, and is what this env serves
+        # for the rest of its life.** The digest and the cache names were fixed here while the
+        # instructions, the supervisors and the dates went on being reread from the live corpus
+        # every time a task was described, seeded or scored. So a corpus edited after construction
+        # served new authored text under the old fingerprint, out of caches named for the old
+        # bytes, and nothing in the record said so. An env that has stated what corpus it is
+        # serving has to go on serving that one (see `adapter.corpus_snapshot`).
+        snapshot = adapter.corpus_snapshot(self._original.parent, task_ids=self._task_ids)
+        self._corpus = snapshot.digest
+        self._specs = snapshot.specs
         served, graded = (
             adapter.derived_root(self._corpus),
             adapter.graded_root(self._corpus),
@@ -167,7 +188,6 @@ class AppWorldEnv(Env):
         # The grader's view of the same corpus, with the answers linked back in. Only the grading
         # process is ever given this root; the world an agent drives is given the other one.
         self._graded = world.derive_root(original=self._original, derived=graded / "data")
-        self._task_ids = adapter.task_ids()
         self._backlogs: Dict[str, Any] = {}
         self.function = FunctionConfig(example_system_template=_static_instructions())
         # The step budget the serve layer enforces is one past the configured block budget, so
@@ -186,6 +206,28 @@ class AppWorldEnv(Env):
 
     # ----- task loading -----
 
+    def _task_specs(self, task_id: str) -> Dict[str, Any]:
+        """One task's shipped specification, as this env's corpus held it when it was fingerprinted.
+
+        The pinned snapshot rather than the file, and that is the whole point: the instruction, the
+        supervisor and the datetime decide what an agent is asked to do, what world is seeded and
+        which key it is graded against, and all three used to be reread from the live corpus long
+        after this env had fixed the digest it publishes and the cache names it serves out of. A
+        corpus edited in place then produced new authored text under an unchanged fingerprint, so
+        two episodes of one run could be two different tasks that a record calls one.
+
+        Refusing the change instead would need the corpus rehashed on every read, which is two
+        seconds a time, and re-fingerprinting would give one env two identities. Serving what was
+        read is the contract that costs nothing and can be stated: an env serves the corpus it was
+        constructed against, and a corpus that changed is a new env away."""
+        try:
+            return self._specs[task_id]
+        except KeyError:
+            raise KeyError(
+                f"{task_id} is not in this env's roster, so no specification for it was read from "
+                f"the corpus at construction"
+            ) from None
+
     def _load_task(self, task_idx: Optional[int]) -> Dict[str, Any]:
         """Resolve one task: which one it is, and whose accounts its world is driven with."""
         if task_idx is None:
@@ -197,7 +239,7 @@ class AppWorldEnv(Env):
                 f"Task index {task_idx} is out of range for {len(self._task_ids)} tasks"
             )
         task_id = self._task_ids[task_idx]
-        specs = adapter.task_specs(self._original.parent, task_id)
+        specs = self._task_specs(task_id)
         return {
             "task_idx": task_idx,
             "task_id": task_id,
@@ -312,7 +354,7 @@ class AppWorldEnv(Env):
             derived=self._derived, graded=self._graded, task_id=task_id
         ):
             return
-        specs = adapter.task_specs(self._original.parent, task_id)
+        specs = self._task_specs(task_id)
         backlog = self._backlog(task_id, specs)
         rows = world.seeding(
             backlog,
@@ -354,7 +396,7 @@ class AppWorldEnv(Env):
         The paragraph goes last and is byte-identical everywhere, so an agent reading its
         hundredth task reads the same words it read on its first and nothing about the position
         is in the text."""
-        specs = adapter.task_specs(self._original.parent, self._task_ids[task_idx])
+        specs = self._task_specs(self._task_ids[task_idx])
         supervisor = specs["supervisor"]
         who = (
             f"You are working for {supervisor['first_name']} {supervisor['last_name']} "
@@ -389,7 +431,7 @@ class AppWorldEnv(Env):
         session = mcp_server.get_session(req.session_id)
         if session is None:
             raise RuntimeError(f"no open world for session {req.session_id}")
-        specs = adapter.task_specs(self._original.parent, session.task_id)
+        specs = self._task_specs(session.task_id)
         backlog = self._backlog(session.task_id, specs)
         key = draw_key(leg_of(session.task_id), self._pulse)
 
@@ -633,11 +675,13 @@ def run_fingerprint(*, pulse: int, report: str, blocks: int, corpus: str = "") -
             adapter.DATA_BUNDLE_SHA256,
             corpus,
             adapter.UPSTREAM_VERSION,
-            # What the interpreter and its dependency set turned out to be, rather than the one
-            # version that was asked for. The runtime cache is named for the direct AppWorld
-            # release while it is built by resolving that release's ranges against whatever the
-            # host and the index offer on the day, so two runs could sit under one name and one
-            # identity with different worlds underneath them.
+            adapter.UPSTREAM_SHA,
+            # What the interpreter turned out to hold, rather than the one version that was asked
+            # for. The runtime cache is named for the pins while it is built by resolving that
+            # release's ranges against whatever the host and the index offer on the day, so two
+            # runs could sit under one name and one identity with different worlds underneath
+            # them. This reads the installed bytes, so an artifact republished under the pinned
+            # version and a module edited in place both move it.
             adapter.runtime_digest(),
             adapter.MANIFEST.read_text(),
             payload.PASS_COUNTS_FILE.read_text(),
