@@ -625,6 +625,15 @@ def reap(*, alive: Optional[Callable[..., bool]] = None) -> List[str]:
         timeout=_CONTROL_TIMEOUT_SECONDS,
         check=False,
     )
+    # **An inventory that failed is not an inventory that found nothing.** The status was ignored
+    # and the empty stdout of a failed `ps` read as "no orphans", which is the one direction this
+    # must never fail in: a crash orphan is known by its labels and by nothing else, so it is in
+    # neither the ledger nor the ended sidecars, and a pass that concluded there was nothing left
+    # ended the recurrence with a container still holding a cpu quota and a writable mount beside
+    # a live paired sibling. What is recorded instead is that this port does not know, which is a
+    # deferred obligation like any other and is what brings the next pass back (see
+    # `inventory_pending` and `env_v1._deferred_work`).
+    _unknown_inventory(listed.returncode != 0)
     for identifier in listed.stdout.split():
         if _spent(began, removed):
             break
@@ -779,6 +788,27 @@ def _live(lines: Sequence[str]) -> List[str]:
         elif line.startswith("+") and line[1:] not in live:
             live.append(line[1:])
     return [name for name in live if name not in gone]
+
+
+#: Whether the last labelled inventory failed, and so whether this process still owes itself a
+#: look. Process-local rather than a file, because it is a fact about a Docker call this process
+#: made rather than about anything on disk, and because the next pass is this process's to take.
+_INVENTORY_UNKNOWN = False
+
+
+def _unknown_inventory(unknown: bool) -> None:
+    """Record whether the last attempt to list this port's containers succeeded."""
+    global _INVENTORY_UNKNOWN
+    _INVENTORY_UNKNOWN = unknown
+
+
+def inventory_pending() -> bool:
+    """Whether an orphan may exist that this process has not managed to look for.
+
+    Read by the housekeeping recurrence beside the ledger and the ended sidecars: those two are
+    what a *failure* writes down, and a labelled orphan is written down nowhere, so a failed
+    inventory is the only trace that one might be waiting."""
+    return _INVENTORY_UNKNOWN
 
 
 def _spent(began: float, removed: Sequence[str]) -> bool:
@@ -938,6 +968,7 @@ __all__ = [
     "Mount",
     "absent",
     "docker_available",
+    "inventory_pending",
     "neutral_procfs",
     "neutral_resolver",
     "ensure_image",

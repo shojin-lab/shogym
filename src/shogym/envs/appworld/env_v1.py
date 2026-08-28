@@ -983,8 +983,13 @@ def _housekeeping_passes() -> None:
 def _deferred_work() -> bool:
     """Whether anything is still written down as somebody's to clean up.
 
-    The two places work is deferred to: the ledger of containers nobody could remove, and the
-    ended sidecars a teardown that could not finish leaves behind."""
+    The three places work is deferred to: the ledger of containers nobody could remove, the ended
+    sidecars a teardown that could not finish leaves behind, and an inventory of this port's own
+    containers that the daemon would not answer."""
+    # A labelled orphan is written down nowhere, so an inventory this process could not take is
+    # the only trace that one may be waiting for it (see `container.inventory_pending`).
+    if container.inventory_pending():
+        return True
     try:
         if container.outstanding():
             return True

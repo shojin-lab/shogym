@@ -720,23 +720,60 @@ bind onto any other path inside `/proc` is refused by the container runtime outr
 mounted because it is inside /proc`), which was checked against this daemon rather than assumed.
 Covering more would need a userspace filesystem in every container rather than a flag.
 
-**What remains readable, in two kinds.** The first is *constant* on one host: the boot identifier
-(`/proc/sys/kernel/random/boot_id`), the kernel version string (`/proc/version` and
-`/proc/cmdline`), the processor count as `sched_getaffinity` reports it (the port limits cpu by
-quota, not by affinity), and `/sys`. Two arms of a pair on one host read exactly the same bytes
-for all of these, and a test asserts it.
+**What remains readable, and the parity claim over it.** The seven masked entries are covered;
+everything else under `/proc` and `/sys` is a residual, and the list below is what a recursive walk
+of both trees inside a served container actually finds, in both arms, twice per arm. It is
+generated rather than remembered: the earlier version of this section named the top level of
+`/proc` and four nested paths, and a walk found `/proc/sys/fs/file-nr`, a fresh
+`/proc/sys/kernel/random/uuid` on every read, the kernel allocator's counters under
+`/sys/kernel/slab`, per-device statistics and this container's own cgroup accounting varying too.
 
-The second kind is *time-varying*, and it is where the paired guarantee is narrower than "the two
-arms see the same surface". Kernel counters keep counting: `/proc/vmstat`, `/proc/pressure/{cpu,
-io,memory}`, `/proc/buddyinfo`, `/proc/pagetypeinfo`, `/proc/zoneinfo`, `/proc/slabinfo`,
-`/proc/softirqs`, `/proc/cgroups` and the mount table's per-episode source names all move between
-two reads on one machine, so two arms run at two instants do not read them identically and cannot be made to.
-`test_the_machine_a_world_reads_about_is_not_the_host` holds the difference between the arms to
-exactly this set, so a new entry in it is a test failure rather than a quiet widening.
+Two arms of a pair on one host read the same bytes for **every** readable path under `/proc` and
+`/sys` except these, which is about fourteen thousand files against twenty-nine patterns:
 
-What that means for a design: **place a pair on one host**, where every constant is shared and only
-the counters move. Split across machines, the constants differ as well, and a record that says one
-identity would be covering two descriptions of two machines.
+```text
+/proc/buddyinfo
+/proc/cgroups
+/proc/driver/rtc
+/proc/fs/**
+/proc/interrupts
+/proc/locks
+/proc/mounts
+/proc/pagetypeinfo
+/proc/pressure/*
+/proc/sched_debug
+/proc/schedstat
+/proc/slabinfo
+/proc/softirqs
+/proc/sys/fs/*
+/proc/sys/kernel/random/*
+/proc/timer_list
+/proc/vmstat
+/proc/zoneinfo
+/sys/devices/**/stat
+/sys/devices/**/urbnum
+/sys/devices/**/rtc/*/since_epoch
+/sys/devices/**/rtc/*/time
+/sys/devices/virtual/bdi/*/max_bytes
+/sys/fs/cgroup/**
+/sys/fs/ext4/**
+/sys/kernel/irq/*/per_cpu_count
+/sys/kernel/mm/**
+/sys/kernel/slab/**
+/sys/kernel/uevent_seqnum
+```
+
+These are kernel counters, per-device statistics, this container's own cgroup accounting, and
+values that are new on every read. They move between two reads on one machine, so two arms run at
+two instants do not read them identically and cannot be made to.
+`test_the_documented_proc_residual_is_what_a_walk_finds` walks both trees in both arms and holds
+the difference to exactly this list, so a new entry is a test failure rather than a quiet
+widening, and `_generate_proc_residual` is how the list is regenerated when a kernel adds one.
+
+What that means for a design: **place a pair on one host**, where everything but the counters is
+shared. Split across machines, the constants differ as well (the boot identifier, the kernel
+version string, the processor count as `sched_getaffinity` reports it, the device inventory under
+`/sys`), and a record that says one identity would be covering two descriptions of two machines.
 
 **A container whose parent died is swept, not hoped about.** Every container carries the pid that
 started it and this machine's boot, and a housekeeping pass removes the labelled ones whose parent
