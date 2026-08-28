@@ -313,7 +313,12 @@ from shogym.feedback.wire import (
     NOTICE_FEEDBACK_NAME,
     REPORT_FEEDBACK_NAME,
 )
-from shogym.serve.episode import ServedEpisode, _built
+from shogym.serve.episode import (
+    ServedEpisode,
+    _build,
+    _discarded,
+    _Lifecycle,
+)
 from shogym.serve.server import build_tool
 from shogym.shared.terminate_mcp import TERMINATE_TOOL_NAME
 from shogym.task import TaskSpec, ToolManifest
@@ -1894,7 +1899,12 @@ class TaskStream:
             tool manifest the server publishes. Every instance it returns must publish that
             same manifest; one that does not stops the stream when its task comes up, because
             the endpoint was registered from the first instance and cannot be re-registered.
-            Its envs are closed on the loop that built them and on no other: this constructor
+            An env is built, served-side hooks run, and it is closed on **its episode's lifecycle
+            loop** when ``off_loop_factory`` is set: one thread and one loop per episode, which
+            outlive every caller, so "the loop that built the env" and "a loop that will run its
+            close" are the same loop and neither has to be guessed at later. Without that flag an
+            env is built on the caller's loop and closed on the caller's loop, exactly as before.
+            Either way it is closed on the loop that built it and on no other: this constructor
             is synchronous, so if it is called inside a running loop and then fails, the
             catalog envs it built are closed *on that loop*, just after the error propagates
             (see :func:`_close_on_owning_loop`). Nothing is moved to a worker loop, and nothing
@@ -2400,6 +2410,9 @@ class TaskStream:
             # Serialises dispensing, which the registry lock cannot: a dispense opens spans and
             # starts an episode, both of which must happen with the registry free.
             self._dispense_lock = asyncio.Lock()
+            # The env build in flight for each still-owed queue position, so a cancelled pull
+            # hands its builder to the next one rather than leaving it running beside a second.
+            self._builders: Dict[int, Tuple[Any, Any]] = {}
             self._closed = False
             self._stopped: Optional[_Stopped] = None
             self._watchdog: Optional[asyncio.Task[None]] = None
@@ -3554,6 +3567,29 @@ class TaskStream:
             releasing = self._releasing = asyncio.ensure_future(self._release_stream())
         await asyncio.shield(releasing)
 
+    def _builder(self, position: int, ref: TaskRef) -> "Tuple[Any, Any]":
+        """The build owed to one queue position: the one already running, or a new one.
+
+        A synchronous factory has nothing to keep, so this hands back no future and the caller
+        calls it inline on its own loop, which is where that contract says it belongs."""
+        held = self._builders.get(position)
+        if held is not None:
+            return held
+        lifecycle = _Lifecycle(ref.env)
+        building = (
+            lifecycle.run(_build(lambda: self._env_for(ref.env)))
+            if self._off_loop_factory
+            else None
+        )
+        held = self._builders[position] = (lifecycle, building)
+        return held
+
+    def _drop_builders(self) -> None:
+        """Discard every build still owed to a position nobody came back for."""
+        held, self._builders = self._builders, {}
+        for lifecycle, building in held.values():
+            lifecycle.stop_when(_discarded(lifecycle, building))
+
     async def _release_stream(self) -> None:
         """Let go of what only this stream holds: its deadline watchdog, then its catalog envs.
 
@@ -3585,6 +3621,9 @@ class TaskStream:
         while it is the claim: the envs it already popped are unreachable, and every later
         ``aclose`` re-awaits that same cancelled task and raises again. A shutdown with no
         orderly exit, for a teardown failure that is not the run's outcome."""
+        # Builds still owed to positions nobody came back for: the stream is closing, so nobody
+        # ever will, and each one is an env a constructor is still making.
+        self._drop_builders()
         watchdog, self._watchdog = self._watchdog, None
         if watchdog is not None:
             watchdog.cancel()
@@ -3733,11 +3772,36 @@ class TaskStream:
             # that it runs where the caller is: an env that binds a loop in its constructor is a
             # supported env, and moving one to a worker thread would break it with a
             # `RuntimeError` on the first dispense and nothing in the record saying why.
-            if self._off_loop_factory:
-                env = await _built(lambda: self._env_for(ref.env))
-            else:
-                env = self._env_for(ref.env)
-            episode = await ServedEpisode.open_env(env, env_name=ref.env, task=ref.task_idx)
+            #
+            # **One builder per queue position, kept across a cancellation.** A thread cannot be
+            # told to stop, so a pull that gives up mid-build leaves a constructor running. If
+            # the next pull for the same still-owed position starts its own, a client that
+            # cancels repeatedly runs as many constructors at once as it likes, none of them
+            # inside `max_in_flight`, and a wedged one leaves a thread behind each time. So the
+            # build is the *position's*, not the pull's: a pull that is cancelled leaves it here
+            # and the next pull for that position joins it instead of starting another.
+            lifecycle, building = self._builder(position, ref)
+            try:
+                if building is not None:
+                    env = await asyncio.shield(asyncio.wrap_future(building))
+                else:
+                    env = self._env_for(ref.env)
+            except BaseException:
+                if building is None or building.done():
+                    # Nothing left to hand to a later pull: a synchronous factory that raised,
+                    # or a build that has already failed. The one that is merely still running
+                    # stays where it is, owed to this position.
+                    self._builders.pop(position, None)
+                    lifecycle.stop_when(_discarded(lifecycle, building))
+                raise
+            self._builders.pop(position, None)
+            episode = await ServedEpisode.open_env(
+                env,
+                env_name=ref.env,
+                task=ref.task_idx,
+                lifecycle=lifecycle,
+                built_on_lifecycle=self._off_loop_factory,
+            )
             try:
                 # The episode's own snapshot, taken when it was opened and the same for every
                 # reader (see :meth:`ServedEpisode.describe`). That is what makes the check below

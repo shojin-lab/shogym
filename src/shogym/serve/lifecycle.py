@@ -27,6 +27,7 @@ from __future__ import annotations
 import enum
 import hashlib
 import json
+import math
 import os
 import tempfile
 import threading
@@ -41,6 +42,14 @@ EVIDENCE_SCHEMA_VERSION = 1
 
 # The private durable-record filename schema version (independent of the evidence schema).
 RECORD_SCHEMA_VERSION = 1
+
+#: The largest value a pid can take on this platform, for the range check in the decoder. Read
+#: from the kernel where it is published and otherwise a bound generous enough to admit every
+#: real pid and reject the integers that are not pids at all.
+try:  # pragma: no cover - one branch per platform
+    _MAX_PID = int(Path("/proc/sys/kernel/pid_max").read_text(encoding="utf-8").strip())
+except (OSError, ValueError):
+    _MAX_PID = 2 ** 31 - 1
 
 TerminalSource = Literal["explicit_tool", "horizon", "abort"]
 TerminalStatus = Literal["ok", "finalize_error"]
@@ -697,11 +706,40 @@ def _record_from_dict(data: Dict[str, Any]) -> FinalizationRecord:
     # Python, so a boolean is pid 1, which is alive on every machine, so the record is left
     # untouched forever and the pass is recorded as having dealt with it.
     owner = data.get("owner_pid")
-    if owner is not None and (isinstance(owner, bool) or not isinstance(owner, int)):
-        raise TypeError(f"a record's owner_pid is an int or absent, not {type(owner).__name__}")
+    if owner is not None:
+        if isinstance(owner, bool) or not isinstance(owner, int):
+            raise TypeError(
+                f"a record's owner_pid is an int or absent, not {type(owner).__name__}"
+            )
+        # A *pid*, not any integer. `os.kill` reads 0 as "every process in my group" and a
+        # negative number as "the group named by its absolute value", so those are not liveness
+        # questions at all; and a number past the platform's pid range raises `OverflowError`
+        # out of a probe whose only caller can suppress it, which leaves the directory unread
+        # and every later episode reading the whole store again.
+        if not 0 < owner <= _MAX_PID:
+            raise ValueError(f"a record's owner_pid is not a pid a process could have: {owner}")
     version = data.get("schema_version", RECORD_SCHEMA_VERSION)
     if isinstance(version, bool) or not isinstance(version, int):
         raise TypeError(f"a record's schema_version is an int, not {type(version).__name__}")
+    if version != RECORD_SCHEMA_VERSION:
+        # A record written by a schema this reader does not have is not a record this reader may
+        # rewrite: the fields it does not know are dropped on decode, so resolving it would
+        # publish a v-this record over v-that content while keeping the version that said so.
+        # Quarantined instead, which leaves it for a reader that has the migration.
+        raise ValueError(
+            f"a record's schema_version is {version}, and this reader knows "
+            f"{RECORD_SCHEMA_VERSION}"
+        )
+    # `json.loads` accepts `NaN` and `Infinity`, and the writer refuses them (`allow_nan=False`),
+    # so a record carrying one can be read and never written back: recovery rewrites it, the
+    # write raises, and the same failure repeats on every pass. Refused where it is read.
+    for name in ("verdict", "provenance"):
+        section = data.get(name)
+        if isinstance(section, dict) and any(
+            isinstance(value, float) and not math.isfinite(value) for value in section.values()
+        ):
+            raise ValueError(f"a record's {name} carries a number JSON can be read with and "
+                             "not written back")
     digest = data.get("args_digest")
     if digest is not None and not isinstance(digest, str):
         raise TypeError(
