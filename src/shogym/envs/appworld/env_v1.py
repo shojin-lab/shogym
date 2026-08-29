@@ -147,16 +147,6 @@ class AppWorldEnv(Env):
     function_name = "agent"
     score_terminal_tool = SUBMIT_TOOL_NAME
 
-    #: The item a runner may compare against the identity it is filing rows under. Declared here
-    #: rather than assumed there: `config_digest` is an ordinary name any env may publish as a
-    #: metric, and a module that decided what its number meant would turn another env's successful
-    #: terminal into an unscored failure. An env that declares nothing is not checked.
-    #:
-    #: The value is readable off the env itself (`config_digest` below), so a serve layer can fold
-    #: it into the identity a run is filed under before the first task is dispensed, rather than
-    #: waiting for the first row to publish one.
-    identity_feedback_name = "config_digest"
-
     def __init__(
         self,
         pulse: int = DEFAULT_PULSE,
@@ -725,12 +715,12 @@ class AppWorldEnv(Env):
         )
         if evidence is not None and evidence.finalize_error:
             fb.episode.append(EpisodeFeedback(name="finalize_error", value=True))
-        # Recorded, never surfaced. Run identity has to be on every row, because that is what a
-        # resumed directory is checked against; and it has to be off every wire, because it is a
-        # short digest over a small integer pulse and an agent handed one could enumerate pulses
-        # until it matched and then compute every later key. Inference level is exactly that
-        # contract: the record keeps it, and no feedback policy can reveal it, including the one
-        # that reveals everything else.
+        # Recorded, never surfaced. The fingerprint has to be on every row, because that is what
+        # tells a reader afterwards which configuration produced them; and it has to be off every
+        # wire, because it is a short digest over a small integer pulse and an agent handed one
+        # could enumerate pulses until it matched and then compute every later key. Inference
+        # level is exactly that contract: the record keeps it, and no feedback policy can reveal
+        # it, including the one that reveals everything else.
         # On the row's own step, which is the last one the trajectory recorded. A fixed zero was
         # rejected by the trace store on any terminal row past the first step, and the store's
         # refusal was swallowed as degraded persistence: the trace then held no terminal row at
