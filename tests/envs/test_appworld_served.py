@@ -986,6 +986,7 @@ async def _surface_of(tmp_path: Path, name: str, policy: Any) -> Dict[str, Any]:
         [TaskRef("appworld", TASK)],
         prov_dir=tmp_path / name,
         feedback=policy,
+        identity=shogym.make("appworld").config_digest,
     )
     async with stream:
         await stream.get_task()
@@ -1137,12 +1138,14 @@ print(json.dumps({
 }))
 """
     seen = {}
+    identity = shogym.make("appworld").config_digest
     for name, policy in (("information", Information()), ("placebo", Placebo())):
         stream = TaskStream(
             shogym.make,
             [TaskRef("appworld", TASK)],
             prov_dir=tmp_path / name,
             feedback=policy,
+            identity=identity,
         )
         async with stream:
             await stream.get_task()
@@ -1629,6 +1632,126 @@ async def test_the_terminal_row_reaches_the_trace_after_an_ordinary_execute(
 # ----- the matched pair, through a stream -----
 
 
+async def test_the_identity_a_row_is_filed_under_carries_what_this_env_said_it_was(
+    tmp_path: Path,
+) -> None:
+    """The env's half of the identity is the env's own, and the caller's half is never parsed.
+
+    The check used to be containment: this env's digest had to occur somewhere inside the caller's
+    string, which is not a comparison of anything. A name with unrelated text around a digest
+    passed and was stamped on a scored row, and a name composing several fields could match by
+    accident. What a record is filed under is a record now: the caller's opaque name, and beside
+    it what each env in the queue said about itself, read off the env at construction under the
+    item the env declares (`identity_feedback_name`, which this env sets and answers to).
+
+    So the value reaches the ownership claim before the first task is dispensed rather than
+    waiting for a row to publish one, and a caller may call itself whatever it likes without the
+    record losing track of which configuration produced its rows. What a resume is held to is that
+    member, which is the test below."""
+    from shogym.serve.stream import Information, TaskRef, TaskStream
+
+    stream = TaskStream(
+        shogym.make,
+        [TaskRef("appworld", TASK)],
+        prov_dir=tmp_path / "named",
+        feedback=Information(),
+        identity="a name this env never produced",
+    )
+    async with stream:
+        # Read while the claim is held, and before any row exists: this is the window a run killed
+        # early leaves behind, and it used to hold nothing but the caller's own string.
+        claim = json.loads((tmp_path / "named" / "claim.json").read_text())
+        await stream.get_task()
+        await stream.dispatch("submit", {})
+
+    identity = claim["run_identity"]
+    assert identity["caller"] == "a name this env never produced"
+    published = [
+        item["value"]
+        for row in stream.results
+        for item in row.observed
+        if item.get("name") == "config_digest"
+    ]
+    # What the claim recorded before the first task is what the env went on to publish on the row.
+    assert identity["envs"] == {"appworld": published[0]}
+    # And the episode scored: an env that says what it is does not need its caller to repeat it.
+    assert [row.score is not None for row in stream.results] == [True]
+
+
+async def test_a_resume_is_refused_under_a_changed_draw_and_under_a_changed_deadline(
+    tmp_path: Path,
+) -> None:
+    """Two things decide whether rows belong to one record, and only one of them was checked.
+
+    The draw, the payload class and the corpus decide what a score *means*, and the env says so.
+    The deadline and the capacity decide what an episode was allowed to do: a deadline turns a
+    slow episode into a timeout rather than a score, and a capacity changes the tool surface and
+    the scheduling. Two directories that differ in either hold rows about two different
+    opportunities, so both are in what a resume is checked against."""
+    from shogym.serve.stream import Information, TaskRef, TaskStream
+
+    prov = tmp_path / "run"
+    first = shogym.make("appworld")
+    # The opportunity is part of what the caller names, not something the stream appends: a
+    # deadline decides whether a slow episode is scored or timed out, and a capacity decides the
+    # tool surface, so two directories that differ in either hold rows about two different
+    # opportunities. Composing it here keeps `identity` a string the stream compares and never
+    # reads, which is what stops it inferring a format it cannot verify.
+    stream = TaskStream(
+        shogym.make,
+        [TaskRef("appworld", TASK)],
+        prov_dir=prov,
+        feedback=Information(),
+        identity=f"{first.config_digest}|deadline=600.0",
+        deadline=600.0,
+    )
+    async with stream:
+        await stream.get_task()
+        await stream.dispatch("submit", {})
+    assert len(stream.results) == 1
+
+    # A different draw. The env says so itself, and its digest moves with it.
+    other = shogym.make("appworld", config={"pulse": 7})
+    assert other.config_digest != first.config_digest
+    with pytest.raises(ValueError) as changed_draw:
+        TaskStream(
+            shogym.make,
+            [TaskRef("appworld", TASK)],
+            prov_dir=prov,
+            feedback=Information(),
+            identity=f"{other.config_digest}|deadline=600.0",
+            deadline=600.0,
+            resume=True,
+        )
+    assert "run identity" in str(changed_draw.value)
+
+    # The same env, a different deadline. Nothing about the score changed; what an episode was
+    # allowed to do did.
+    with pytest.raises(ValueError) as changed_deadline:
+        TaskStream(
+            shogym.make,
+            [TaskRef("appworld", TASK)],
+            prov_dir=prov,
+            feedback=Information(),
+            identity=f"{first.config_digest}|deadline=30.0",
+            deadline=30.0,
+            resume=True,
+        )
+    assert "run identity" in str(changed_deadline.value)
+
+    # And the unchanged one resumes, so the refusals above are about the change rather than about
+    # resuming at all.
+    TaskStream(
+        shogym.make,
+        [TaskRef("appworld", TASK)],
+        prov_dir=prov,
+        feedback=Information(),
+        identity=f"{first.config_digest}|deadline=600.0",
+        deadline=600.0,
+        resume=True,
+    )
+
+
 async def test_a_forged_completion_neither_earns_a_block_nor_moves_the_grade() -> None:
     """The reply an episode might forge, what it would buy, and what actually stops it today.
 
@@ -1885,44 +2008,48 @@ print(json.dumps({
     assert "proxy.internal" not in json.dumps(seen)
 
 
-async def test_the_machine_a_world_is_given_moves_what_the_env_says_it_is(
+async def test_a_resume_is_refused_under_changed_machine_limits(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:
     """What machine an episode was given is part of what its row measured.
 
     The limits decide latency, what a call timeout means and whether a world is killed for
-    allocating, so rows produced under two of them are rows about two different things. The env
-    says so itself: the limits are captured once per process and folded into `config_digest`, so
-    a reader comparing that value across two records can tell them apart. Acting on the
-    difference is the runner's, and this asserts only the half the environment owes."""
+    allocating, so a record whose rows ran under two of them is a record whose mean is about
+    neither. They are captured once per process and recorded, so a relaunch under a changed one
+    does not pass for the earlier measurement."""
     from shogym.envs.appworld import container as container_module
     from shogym.serve.stream import Information, TaskRef, TaskStream
 
+    prov = tmp_path / "run"
     container_module.limits.cache_clear()
     first = shogym.make("appworld")
     stream = TaskStream(
         shogym.make,
         [TaskRef("appworld", TASK)],
-        prov_dir=tmp_path / "run",
+        prov_dir=prov,
         feedback=Information(),
+        identity=first.config_digest,
     )
     async with stream:
         await stream.get_task()
         await stream.dispatch("submit", {})
-    # The digest the run actually filed is the one the env answered with.
-    published = [
-        item["value"]
-        for row in stream.results
-        for item in row.observed
-        if item.get("name") == "config_digest"
-    ]
-    assert published == [first.config_digest]
 
-    # A machine with more of it. Same draw, same corpus, same image, and a different fingerprint.
+    # A machine with more of it. Same draw, same corpus, same image.
     container_module.limits.cache_clear()
     monkeypatch.setenv("SHOGYM_APPWORLD_CPUS", "8")
+    roomier = shogym.make("appworld")
     try:
-        assert shogym.make("appworld").config_digest != first.config_digest
+        assert roomier.config_digest != first.config_digest
+        with pytest.raises(ValueError) as refused:
+            TaskStream(
+                shogym.make,
+                [TaskRef("appworld", TASK)],
+                prov_dir=prov,
+                feedback=Information(),
+                identity=roomier.config_digest,
+                resume=True,
+            )
+        assert "run identity" in str(refused.value)
     finally:
         monkeypatch.undo()
         container_module.limits.cache_clear()
@@ -1940,6 +2067,10 @@ async def test_information_hands_back_the_receipt_and_placebo_the_digest(
             [TaskRef("appworld", TASK)],
             prov_dir=tmp_path / name,
             feedback=policy,
+            # The port's own fingerprint, which is what makes two of these runs one measurement:
+            # the draw, the payload class, the block budget, the corpus contents and the scoring
+            # version. A resume under a changed pulse or a repointed corpus is refused by it.
+            identity=shogym.make("appworld").config_digest,
         )
         async with stream:
             await stream.get_task()
@@ -2088,6 +2219,7 @@ async def test_the_documented_launch_serves_each_arm_of_the_pair(
             monkeypatch.setenv("SHOGYM_ENV", "appworld")
             monkeypatch.setenv("SHOGYM_TASKS", str(TASK))
             monkeypatch.setenv("SHOGYM_FEEDBACK", arm)
+            monkeypatch.setenv("SHOGYM_IDENTITY", "the-pair")
             monkeypatch.setenv("SHOGYM_DEADLINE", "1800")
             monkeypatch.setenv("SHOGYM_IN_FLIGHT", "1")
             # The constants are read from the environment at import, which is what a launch does.

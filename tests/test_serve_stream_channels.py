@@ -16,6 +16,7 @@ answer.
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import json
 from pathlib import Path
 from typing import Any, Dict, List
@@ -35,6 +36,7 @@ from shogym.serve.stream import (
     Placebo,
     TaskRef,
     TaskStream,
+    read_exposures,
 )
 from tests._fixtures.channel_env import (
     ENV_NAME,
@@ -193,7 +195,28 @@ def test_the_four_regimes_are_distinct() -> None:
     assert len(set(regimes)) == len(regimes)
 
 
-# ----- the regime is the assignment, not a record of what was delivered -----
+# ----- the regime is the assignment; what was delivered is recorded separately -----
+
+
+@pytest.mark.parametrize(
+    "policy, regime", [(Information(), "information"), (Placebo(), "placebo")]
+)
+async def test_a_delivered_verdict_is_recorded_beside_its_row(
+    tmp_path: Path, policy: Any, regime: str
+) -> None:
+    # The ordinary arm of each pair. The row says which channel the task was assigned; the
+    # exposure log says the answer carrying that channel was composed and handed back, and the
+    # two are joinable by the lease the dispense already used.
+    async with _stream(tmp_path, [0], feedback=policy) as stream:
+        await stream.get_task()
+        answer = _payload(await stream.dispatch(SUBMIT_TOOL, {"answer": "4"}))
+
+    assert len(answer["feedback"]) == 1
+    (row,) = _rows(tmp_path)
+    (exposure,) = read_exposures(tmp_path / "prov")
+    assert exposure["lease"] == row["lease"] and exposure["seq"] == row["seq"]
+    assert exposure["feedback_regime"] == row["feedback_regime"] == regime
+    assert exposure["items"] == len(answer["feedback"]) == 1
 
 
 @pytest.mark.parametrize(
@@ -207,9 +230,9 @@ async def test_a_cancelled_terminal_is_a_scored_row_nobody_was_told(
     The row is durable before the policy's answer is composed, which it has to be: the answer is
     composed from the recorded row. So a caller that goes away inside the finalizer leaves a row
     that is sealed, scored and stamped with its arm, and nothing whatever reached the agent. The
-    stamp is still the right thing for an intention-to-treat estimate, because every assigned task
-    has one, and it is not evidence of a delivered verdict. What was actually delivered is the
-    runner's to record."""
+    stamp is still the right thing for an intention-to-treat estimate — every assigned task has
+    one — and it is not evidence of a delivered verdict, which is what the empty exposure log
+    here says and what a reader should join against before calling this task treated."""
     release = asyncio.Event()
 
     class _SlowFinalize(_FixtureChannelEnv):
@@ -243,12 +266,13 @@ async def test_a_cancelled_terminal_is_a_scored_row_nobody_was_told(
     assert row["closure"] == "sealed"
     assert row["score"] is not None and row["score"]["success"] is True
     assert row["feedback_regime"] == regime
+    assert read_exposures(tmp_path / "prov") == []
 
 
-async def test_a_task_the_stream_ended_still_carries_its_assignment(tmp_path: Path) -> None:
+async def test_a_task_the_stream_ended_records_no_exposure(tmp_path: Path) -> None:
     # The other shape of the same absence, and the commoner one: a task the STREAM ended has no
-    # terminating call to answer, so nothing was delivered through the channel it was assigned.
-    # Its row still carries that arm, which is what an intention-to-treat estimate needs from it.
+    # terminating call to answer, so there is no delivery to record. Its row still carries the
+    # arm it was assigned, which is what an intention-to-treat estimate needs from it.
     async with _stream(tmp_path, [0, 1], feedback=Information()) as stream:
         await stream.get_task()
         await stream.get_task()  # displaces and force-scores the first
@@ -257,6 +281,105 @@ async def test_a_task_the_stream_ended_still_carries_its_assignment(tmp_path: Pa
     rows = _rows(tmp_path)
     assert [row["closure"] for row in rows] == ["drained", "sealed"]
     assert {row["feedback_regime"] for row in rows} == {"information"}
+    exposures = read_exposures(tmp_path / "prov")
+    assert [exposure["lease"] for exposure in exposures] == [rows[1]["lease"]]
+
+
+@pytest.mark.parametrize(
+    "policy, regime", [(Information(), "information"), (Placebo(), "placebo")]
+)
+async def test_a_delivery_that_cannot_be_recorded_is_not_delivered(
+    tmp_path: Path, policy: Any, regime: str
+) -> None:
+    """The inverse of the join, closed.
+
+    The answer used to be composed, the exposure written, and the answer returned whatever the
+    write did: a failed append stopped the stream and the report went back to the agent anyway.
+    So a verdict was really read while ``read_exposures`` said nobody was told, which is the one
+    reading that makes an absent line usable as evidence at all. It fails closed on the answer
+    now, and the caller is told what a cancelled terminal is told: the task ended, and nothing
+    more."""
+    stream = _stream(tmp_path, [0], feedback=policy)
+    await stream.__aenter__()
+    # The append fails without reaching inside the stream, the way the durability tests do it.
+    (tmp_path / "prov" / "exposures.jsonl").mkdir(parents=True)
+    await stream.get_task()
+    answer = _payload(await stream.dispatch(SUBMIT_TOOL, {"answer": "4"}))
+
+    # The member is present and empty, which is the shape every other silence uses: nothing new
+    # is readable off this envelope.
+    assert answer["feedback"] == []
+    assert set(answer) == {"content", "terminated", "hint", "feedback"}
+    # The task's own outcome is untouched — the row was durable before any of this ran — and the
+    # run is stopped, loudly, because it can no longer say which verdicts reached the agent.
+    (row,) = _rows(tmp_path)
+    assert row["closure"] == "sealed" and row["score"] is not None
+    assert row["feedback_regime"] == regime
+    assert stream.stopped
+    with pytest.raises(RuntimeError, match="delivery"):
+        await stream.aclose()
+
+
+@pytest.mark.parametrize(
+    "policy, regime", [(Information(), "information"), (Placebo(), "placebo")]
+)
+async def test_a_terminal_that_ran_past_its_deadline_is_told_nothing(
+    tmp_path: Path, policy: Any, regime: str
+) -> None:
+    """A task the stream ended delivers nothing, and a late finalization does not change that.
+
+    The watchdog seals a terminal that outran its deadline into an unscored ``timeout`` row while
+    the call is still inside the env. When the call eventually returned it was handed that row and
+    answered with the report: a dose delivered outside the assignment it was recorded under, at
+    the one moment the design counts as a failed delivery to be scored at the floor and retried
+    rather than as a treatment. Both arms answer with the empty member instead, and the exposure
+    log stays silent about the task, which is how a failed delivery is found."""
+    release = asyncio.Event()
+
+    class _SlowFinalize(_FixtureChannelEnv):
+        async def finalize(self, req: Any) -> Any:
+            await release.wait()
+            return await super().finalize(req)
+
+    stream = TaskStream(
+        lambda _name: _SlowFinalize(tasks=TASKS),
+        [TaskRef(ENV_NAME, 0)],
+        prov_dir=tmp_path / "prov",
+        feedback=policy,
+        deadline=0.05,
+    )
+    await stream.__aenter__()
+    try:
+        await stream.get_task()
+        call = asyncio.ensure_future(stream.dispatch(SUBMIT_TOOL, {"answer": "4"}))
+        await asyncio.sleep(0.3)  # the deadline elapses while the finalizer is blocked
+        release.set()
+        answer = _payload(await call)
+    finally:
+        release.set()  # never leave the evaluator blocked, however this test ends
+        with contextlib.suppress(RuntimeError):
+            await stream.aclose()
+
+    (row,) = _rows(tmp_path)
+    assert row["closure"] == "timeout" and row["score"] is None
+    # The assignment is still stamped, because every assigned task carries one and no filter sits
+    # between the assignment and the estimate.
+    assert row["feedback_regime"] == regime
+    assert answer["feedback"] == []
+    assert set(answer) == {"content", "terminated", "hint", "feedback"}
+    assert read_exposures(tmp_path / "prov") == []
+
+
+async def test_a_run_that_opens_no_channel_writes_no_exposure_log(tmp_path: Path) -> None:
+    # `Never` has no exposure to record, and a directory it wrote is the one it wrote before this
+    # log existed.
+    async with _stream(tmp_path, [0], feedback=Never()) as stream:
+        await stream.get_task()
+        await stream.dispatch(SUBMIT_TOOL, {"answer": "4"})
+
+    assert len(_rows(tmp_path)) == 1
+    assert not (tmp_path / "prov" / "exposures.jsonl").exists()
+    assert read_exposures(tmp_path / "prov") == []
 
 
 # ----- admission is still by exact type -----

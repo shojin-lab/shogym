@@ -47,8 +47,9 @@ submission, the same size on the wire; `Never()` answers with no channel at all.
 launched identically in both arms: the same argv, the same environment, the same working
 directory. What differs between them is one file that only the MCP server reads. That is not
 tidiness. Before the first task is dispensed the run directory holds `claim.json`, which names the
-regime the run serves under, and afterwards `results.jsonl` holds every payload the env published
-on every row, the receipt included, whichever arm the terminal was answered under. An agent that can read its own launch environment, or that directory, can read its
+regime and the structured identity the run is filed under, and afterwards `results.jsonl` holds
+every payload the env published on every row, the receipt included, whichever arm the terminal was
+answered under. An agent that can read its own launch environment, or that directory, can read its
 assignment before treatment and read the receipt the control arm exists to withhold. So the
 configuration travels in the MCP config's `env` block, which reaches the server process and
 nothing else; the records go somewhere the agent is not working; and the built-in tools that could
@@ -77,6 +78,7 @@ arm() {
         "SHOGYM_ENV": "appworld",
         "SHOGYM_TASKS": "0",
         "SHOGYM_FEEDBACK": "$1",
+        "SHOGYM_IDENTITY": "appworld-pulse-0",
         "SHOGYM_DEADLINE": "1800",
         "SHOGYM_IN_FLIGHT": "1",
         "SHOGYM_RUNS": "$pair/runs"
@@ -118,9 +120,9 @@ says nothing about the arm.
 
 Each arm writes its own provenance directory under `$pair/runs`, named for its regime
 (`appworld-information-<stamp>/`), because a directory that holds one arm's rows refuses the
-other's. The deadline and the capacity are the same in both configs on purpose: a deadline decides
-whether a slow episode is scored or timed out and a capacity decides what an agent may work on
-next, so two runs that disagree on either are two measurements rather than two arms of one. Read
+other's. The identity, the deadline and the capacity are the same in both configs on purpose: all
+three are members of what a record is filed under, together with what the env said about itself,
+and two runs that disagree on any of them are two measurements rather than two arms of one. Read
 an arm back by naming its directory: `uv run --project "$repo" python
 "$repo/examples/claude_code/results.py" "$pair/runs/appworld-information-<stamp>"`, and again for
 the other one.
@@ -139,12 +141,11 @@ TaskStream(
     [TaskRef("appworld", 0)],
     prov_dir=...,
     feedback=Information(),
+    # Pass the fingerprint. It is what makes the rows of one record one measurement, and a resume
+    # under a changed draw, payload class, block budget or corpus is refused rather than appended.
+    identity=shogym.make("appworld").config_digest,
 )
 ```
-
-The env publishes `config_digest` on every terminal, at inference level. It is the fingerprint of
-everything the measurement rests on, so a runner that wants to prove two records are one
-measurement compares that value across their rows.
 
 `config_digest` covers the draw, the payload class, the block budget, every constant a payload is
 generated from, the text the agent is given (the world guide, the tool guide and the appended
@@ -159,19 +160,52 @@ come from that one reading, so a corpus edited underneath a running env cannot p
 text behind an unchanged fingerprint. Pinning the text is not the whole of it, because a task's
 databases and its ground truth are read when that task is first served rather than at
 construction, so each unit of the corpus is checked against what the snapshot read before it is
-derived, and a unit that moved is an episode that does not happen. The derived and grader caches
-are named by that source digest, by the image that filled them and by the bytes of the generator's
-own modules, and they carry a stamp inside them saying the same, so a run pointed at a second
-corpus cannot serve material derived from the first and neither can a run whose image or whose
-generator moved.
+derived, and a unit that moved is an episode that does not happen. A stream's `deadline` and
+`max_in_flight` belong to a run's identity too and are not an env's to know, so the stream folds
+them in itself: what a record is filed under is a structured identity whose members are the name
+passed here, the digest each env in the queue published about itself, the deadline and the
+capacity, compared member by member on every resume. The derived and grader caches are named by
+that source digest, by the image that filled them and by the bytes of the generator's own modules,
+and they carry a stamp inside them saying the same, so a run pointed at a second corpus cannot
+serve material derived from the first and neither can a run whose image or whose generator moved.
+
+Passing `identity` is how a record defends itself. A directory that already names one refuses a
+resume that names a different one, and refuses a caller that names none: the record has said what
+produced its rows, and rows that decline to say make it unreadable as one run afterwards. A
+directory recorded before identities existed is refused too, in the other direction: it cannot say
+what produced its rows, so a named caller has to state that it knows
+(`adopt_unidentified=True`) rather than have the silence read as consent. That assertion is
+performed once and written into the directory, so the next ordinary resume under the same identity
+needs no flag.
+
+The name is also checked against the env, which is the one party that knows, and the env's own
+answer is a member of the identity rather than something searched for inside that name. This env
+declares the item it describes itself with (`identity_feedback_name = "config_digest"`) and
+answers to it before any episode runs, so the stream reads the digest off the env at construction
+and writes it into the ownership claim: a run killed between its claim and its first row still
+leaves behind what its env said it was, and a resume against a changed corpus, draw or runtime is
+refused before a task is spent. Every terminal this env produces publishes the same
+`config_digest` at inference level, and a row whose env says something else than the identity
+holds for it is refused before it can be scored. The first row of an env that publishes a digest
+also binds the directory for that env, which is what covers an env that publishes one without
+answering to it, and it works whether or not a caller named an identity at all.
 
 Each row's `feedback_regime` is the arm the task was **assigned**, not the arm it was told through.
 It has to be: the row is fsynced before the policy's answer is composed, because the answer is
 composed from the recorded row. So a cancelled terminal, a task the stream ended itself and a
 policy that could not answer all leave a scored row stamped `information` or `placebo` with nobody
-told. That is the field an intention-to-treat estimate wants, and every assigned task has one.
-Whether a given delivery reached the agent is the runner's to record, and the environment does
-not claim to answer it.
+told. That is the field an intention-to-treat estimate wants, and every assigned task has one. What
+was actually delivered is a separate state in `exposures.jsonl` beside the results, joined by
+lease: a revealing run writes one line per terminating call it answered, and a row with no line
+there was never told. A run under `Never` writes no such log, because it opens no channel.
+
+The absence of a line is load-bearing, so two things fail closed on it. A delivery whose line
+cannot be written is not delivered: the terminating call is answered with the empty member every
+other silence uses, and the stream stops. And a terminal that outran its deadline delivers
+nothing even when the env's finalization eventually returns: the watchdog has already sealed that
+task into an unscored `timeout` row, which the design counts as a failed delivery to be scored at
+the floor and retried rather than as a dose, so the late answer carries the empty member and the
+log stays silent about it.
 
 ## Requirements
 
