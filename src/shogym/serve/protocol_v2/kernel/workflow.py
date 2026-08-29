@@ -64,6 +64,8 @@ with workflow.unsafe.imports_passed_through():
     from shogym.serve.protocol_v2.kernel.messages import (
         ConsumerClaim,
         ConsumerReceipt,
+        EnvironmentCall,
+        EnvironmentLease,
         GeneratePayloadBundleInput,
         GradeAttemptInput,
         OfferedMessage,
@@ -212,6 +214,9 @@ class StreamWorkflow:
         self._seal_ordinal = 0
         self._wait_count = 0
         self._operation_in_flight = False
+        # The environment call the stream is currently held for, if any. It holds the stream
+        # the way an Update does, and it is given back by name rather than by returning.
+        self._environment_call: Optional[str] = None
         self._done_presented = False
         self._draining = False
 
@@ -308,6 +313,73 @@ class StreamWorkflow:
             return QueueClosed(task_count=len(self._start.tasks))
         finally:
             self._operation_in_flight = False
+
+    @workflow.update
+    async def begin_environment_call(self, call: EnvironmentCall) -> EnvironmentLease:
+        """Hold the generation for one call to a world this stream cannot see.
+
+        An ordinary environment call never reaches the stream, so the stream cannot serialize
+        it against its own Updates the way it serializes those against each other, and it
+        cannot refuse it afterwards. What it can do is decide before the call happens and stay
+        held while it does: the generation has to be open and held by nobody else, nothing may
+        be outstanding, and the attempt has to be one this generation is still serving. The
+        decision and the change are one thing that way, rather than a question answered and a
+        world changed after the answer stopped being true.
+
+        The stream is given back through :meth:`end_environment_call` rather than by returning,
+        so every call the generation could otherwise take meanwhile is refused.
+        """
+        self._take_lock()
+        try:
+            try:
+                require_opaque_id("call_id", call.call_id)
+            except WireFormatError as error:
+                raise StreamProtocolError("invalid_message") from error
+            if self._pending is not None:
+                raise StreamProtocolError("outstanding_response")
+            attempt = self._attempts.get(call.attempt_id)
+            if attempt is None or attempt.state != ACTIVE:
+                raise StreamProtocolError("invalid_attempt")
+        except BaseException:
+            # Nothing was granted, so nothing of this call is holding the stream.
+            self._operation_in_flight = False
+            raise
+        self._environment_call = call.call_id
+        return EnvironmentLease(
+            call_id=call.call_id, attempt_id=call.attempt_id, cursor=self._cursor, held=True
+        )
+
+    @workflow.update
+    async def end_environment_call(self, call: EnvironmentCall) -> EnvironmentLease:
+        """Give the generation back once that call has settled, whatever became of it.
+
+        The answer is the same whether or not this call was the one holding the stream, so a
+        caller that never learned whether its grant arrived can give back a lease it is not
+        sure it holds. Only the call named in the grant releases it: a lease taken from a
+        caller is not one that caller may hand on afterwards.
+        """
+        held = self._environment_call == call.call_id
+        if held:
+            self._environment_call = None
+            self._operation_in_flight = False
+        return EnvironmentLease(
+            call_id=call.call_id, attempt_id=call.attempt_id, cursor=self._cursor, held=held
+        )
+
+    @workflow.update
+    async def confirm_state(self) -> StreamState:
+        """Report the generation's state to a caller the stream has to admit first.
+
+        The query below answers whoever asks, because a read costs the generation nothing. It
+        is therefore also answered for a caller the generation has moved on from, which is the
+        wrong question for a transport that is holding something it decided earlier and is
+        about to hand over. That caller asks here instead: this is the path an Update takes, so
+        whatever the stream would refuse a write for it refuses this for, and reading around
+        the stream stops being a way to serve what the stream would not.
+
+        It changes nothing, so asking twice is the same as asking once.
+        """
+        return self.stream_state()
 
     @workflow.query
     def stream_state(self) -> StreamState:
