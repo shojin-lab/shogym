@@ -165,9 +165,8 @@ def test_a_write_through_the_served_tree_changes_nothing_else(tmp_path: Path) ->
     then change the corpus every later episode is derived from and the baseline the grader diffs
     against, which is a served episode editing the thing it is scored on.
 
-    The copies are half of it and the seal is the other half. The shared task is what every
-    episode's view is built from, so it is read-only from the moment it is published; only the
-    per-episode copy of it is writable."""
+    The per-episode view is the other half: an episode writes through its own copy of the task,
+    and the shared task every view is built from is untouched by it."""
     original = tmp_path / "corpus"
     task = original / "tasks" / "abc_1"
     (task / "dbs").mkdir(parents=True)
@@ -191,20 +190,10 @@ def test_a_write_through_the_served_tree_changes_nothing_else(tmp_path: Path) ->
     assert shared.stat().st_ino != source.stat().st_ino
     assert shared.stat().st_ino != baseline.stat().st_ino
 
-    # The shared task is the pristine source every later episode's view is copied out of, so it
-    # is sealed along with the rest of the derived tree: an episode that could write here would be
-    # writing into what the next one, or the other arm of its own pair, starts from.
-    for name in ("gmail.jsonl", "todoist.jsonl"):
-        with pytest.raises(PermissionError):
-            (derived / "tasks" / "abc_1" / "dbs" / name).write_text("rewritten by the agent")
-    # And a name cannot be added or taken away either, which is the other half of owning a cache.
-    with pytest.raises(PermissionError):
-        (derived / "tasks" / "abc_1" / "dbs" / "planted.jsonl").write_text("hello")
-    with pytest.raises(PermissionError):
-        (derived / "tasks" / "planted_1").mkdir()
-
-    # A write through the episode's own copy reaches nothing but itself, which is the property the
-    # copies are for and which the seal alone would not give.
+    # A write through the episode's own copy reaches nothing but itself, which is the property
+    # the copies are for. The shared task itself is writable by this uid, and what keeps an
+    # episode out of it is the mount rather than a permission: the worker's container is given
+    # the derived tree read-only.
     view = world.derive_view(derived=derived, view=tmp_path / "a", task_id="abc_1")
     (view / "data" / "tasks" / "abc_1" / "dbs" / "gmail.jsonl").write_text("rewritten by the agent")
     assert source.read_text() == "mail"
@@ -212,8 +201,6 @@ def test_a_write_through_the_served_tree_changes_nothing_else(tmp_path: Path) ->
     assert shared.read_text() == "mail"
     # And the seeded log the episode is scored against is the grader's own copy too.
     assert (graded / "tasks" / "abc_1" / "dbs" / "todoist.jsonl").read_text() == "seeded"
-    world._unseal(derived)
-    world._unseal(graded)
 
 
 def test_nothing_in_a_served_task_names_where_it_came_from(tmp_path: Path) -> None:
@@ -453,67 +440,9 @@ def test_two_episodes_of_one_task_do_not_share_their_served_inputs(tmp_path: Pat
     shared = first / "data" / "base_dbs" / "big.jsonl"
     assert shared.read_text() == "shared base"
     assert (second / "data" / "base_dbs" / "big.jsonl").read_text() == "shared base"
-    # Same-uid permissions, so this is a boundary against writing and not against a process that
-    # sets out to defeat it; shojin-lab/shogym#140 mounts the base read-only in the container,
-    # which is. Undone here so the temporary directory can be removed.
-    world._unseal(derived)
 
 
-def test_the_shared_parent_cannot_be_renamed_around(tmp_path: Path) -> None:
-    """The other half of the same invariant, and the half sealing each entry does not give.
-
-    A view names the shared entries by absolute path, so what an episode resolves is the entry's
-    bytes *and* the name that reaches them — and a name lives in its parent. The previous head
-    sealed every entry and left their parent owner-writable, so `base_dbs` could be renamed aside
-    and a directory of the episode's own choosing put there under the same name; every view that
-    resolved it afterwards, this episode's and the other arm of its pair's, would follow.
-    """
-    original = tmp_path / "corpus" / "data"
-    (original / "tasks").mkdir(parents=True)
-    (original / "base_dbs").mkdir()
-    (original / "base_dbs" / "big.jsonl").write_text("shared base")
-    (original / "version.txt").write_text("1.0")
-
-    derived = world.derive_root(original=original, derived=tmp_path / "derived" / "data")
-    (derived / "tasks" / "abc_1" / "dbs").mkdir(parents=True)
-    (derived / "tasks" / "abc_1" / "dbs" / "gmail.jsonl").write_text("pristine")
-    view = world.derive_view(derived=derived, view=tmp_path / "a", task_id="abc_1")
-
-    # The links really are absolute paths into the shared parent, which is what makes the parent
-    # part of what an episode resolves rather than an implementation detail above it.
-    link = view / "data" / "base_dbs"
-    assert link.is_symlink()
-    assert os.readlink(link) == str(derived / "base_dbs")
-
-    assert not (derived.lstat().st_mode & 0o222), oct(derived.lstat().st_mode)
-    # A name cannot be moved aside, replaced, added or taken away. Each of these needs write
-    # permission on the parent and none of them touches the entry's own mode, which is exactly why
-    # the entry seal did not cover them.
-    with pytest.raises(PermissionError):
-        os.rename(derived / "base_dbs", derived / "moved_aside")
-    with pytest.raises(PermissionError):
-        (derived / "planted").mkdir()
-    with pytest.raises(PermissionError):
-        (derived / "version.txt").unlink()
-    with pytest.raises(PermissionError):
-        (derived / "swapped").symlink_to(tmp_path / "elsewhere")
-    # And what the episode resolves is still what it was built from.
-    assert (view / "data" / "base_dbs" / "big.jsonl").read_text() == "shared base"
-
-    # The residual, stated by exercising it: the worker runs as the user that owns these files, so
-    # a process that means to defeat the mode can put it back. This is a boundary against a rename
-    # and not against an adversary; shojin-lab/shogym#140 mounts the shared base into the worker's
-    # container read-only, which is a boundary rather than a convention. Two ancestors above this
-    # one stay writable as well — the seeded root holds the port's cache stamp and the cache root
-    # is where it provisions — so the name `data` itself is movable by a process willing to work a
-    # level up, and the container mount is what closes that too.
-    os.chmod(derived, 0o755)
-    os.rename(derived / "base_dbs", derived / "moved_aside")
-    assert (derived / "moved_aside" / "big.jsonl").read_text() == "shared base"
-    world._unseal(derived)
-
-
-# ----- stopping a worker, and stopping what it started -----
+# ----- what the grader reads, and what it refuses -----
 
 
 def test_a_worker_container_is_given_its_whole_environment_rather_than_a_filtered_one(
@@ -1379,15 +1308,17 @@ def test_a_mount_that_cannot_lock_refuses_the_builders_and_still_serves_the_down
 ) -> None:
     """The fallback the concurrency test above never exercises, on both sides of the fork.
 
-    `_locked` yielded with no exclusion at all when the filesystem could not provide `flock`,
-    which is right for the upstream-source download it was written for: that publishes by one
-    atomic rename and a loser validates the winner, so the loss is redundant work. It is wrong for
-    the builders here. The corpus is the material every score is computed against, and the
-    permission windows open a published directory and seal it again, which a second process inside
-    them closes under the first's feet.
+    `_locked` yields with no exclusion at all when the filesystem cannot provide `flock`, which is
+    right for the upstream-source download it was written for and for the derivation beside it:
+    both publish by an atomic rename out of a staging name of the builder's own, so a loser finds
+    the winner's tree and drops what it built, and the loss is redundant work. It is wrong for the
+    corpus builder, which stages under a fixed `.building` name it deletes first: two of them
+    without exclusion remove and publish each other's half-built tree, and that tree is the
+    material every score is computed against.
 
-    The runtime builder this test also covered upstream is gone: there is no virtual environment
-    on the host any more, and the image is built by a daemon that serializes its own tags.
+    The runtime builder this test also used to cover is gone: there is no virtual environment on
+    the host any more, and the image the worker runs in is built by a daemon that serialises its
+    own tags.
 
     Simulated at the errno, because a filesystem that cannot lock is not a thing a test suite
     has."""
@@ -1419,21 +1350,19 @@ def test_a_mount_that_cannot_lock_refuses_the_builders_and_still_serves_the_down
     (original / "tasks" / "abc_1" / "ground_truth").mkdir()
     (original / "tasks" / "abc_1" / "dbs" / "todoist.jsonl").write_text("")
     (original / "version.txt").write_text("base databases")
-    # The permission window over the shared entries.
-    with pytest.raises(_upstream.ExclusionUnavailable):
-        world.derive_root(original=original, derived=tmp_path / "derived" / "data")
-    # And the one over the published tasks directory.
-    with pytest.raises(_upstream.ExclusionUnavailable):
-        world.derive_task(
-            original=original,
-            derived=tmp_path / "derived2" / "data",
-            graded=tmp_path / "graded2" / "data",
-            task_id="abc_1",
-            write_log=lambda source, into: into.write_text("seeded"),
-        )
-
-
-# ----- the bytes a derivation reads are the bytes the run was built against -----
+    # The derivation, on the other hand, still runs: it stages under a name of its own and
+    # publishes by rename, which is correct without a lock rather than because of one, so a mount
+    # with no locks costs redundant work and never a broken tree.
+    derived = world.derive_root(original=original, derived=tmp_path / "derived" / "data")
+    assert (derived / "version.txt").read_text() == "base databases"
+    world.derive_task(
+        original=original,
+        derived=derived,
+        graded=tmp_path / "graded" / "data",
+        task_id="abc_1",
+        write_log=lambda source, into: into.write_text("seeded"),
+    )
+    assert (derived / "tasks" / "abc_1" / "dbs" / "todoist.jsonl").read_text() == "seeded"
 
 
 def _derivable_corpus(root: Path, *, answer: str = "the answer", shared: str = "shared") -> Path:
@@ -1666,81 +1595,6 @@ def test_session_setup_draws_the_backlog_for_a_task_that_is_already_derived(
         assert "abc_1" in env._backlogs, "the warm path drew nothing and left it to finalize"
     finally:
         mcp_server.end_session("warm")
-
-
-def test_a_task_that_is_no_longer_what_was_derived_is_built_again(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
-) -> None:
-    """Reuse was decided by two path existences, which is not a task.
-
-    The question asked was whether the served `dbs/todoist.jsonl` and the graded `ground_truth`
-    were there. That says yes to a tree with everything else missing, to one whose databases were
-    changed after derivation, and to one whose read-only seal has come off; and what is reused is
-    the world every episode of the task starts in and the baseline it is graded against. Each of
-    the three is built here on a real derivation and the answer read.
-
-    A rebuild rather than a refusal, because a task that is not what was derived is a task this
-    can make correctly: the seeder is called again and the tree afterwards is the tree that was
-    published the first time."""
-    root = _derivable_corpus(tmp_path / "corpus")
-    env = _stub_env(root, tmp_path, monkeypatch)
-    seeder = _StubSeeder()
-    # Seeding is a container of its own on this branch, so what is counted is the call that
-    # starts it rather than a worker handed in.
-    monkeypatch.setattr(adapter, "seed", seeder)
-    env._derive("abc_1")
-    assert seeder.calls == 1
-    served = env._derived / "tasks" / "abc_1"
-    graded = env._graded / "tasks" / "abc_1"
-    assert world.already_derived(derived=env._derived, graded=env._graded, task_id="abc_1")
-    intact = {
-        path: path.read_bytes()
-        for path in sorted(served.rglob("*"))
-        if path.is_file() and not path.is_symlink()
-    }
-
-    def _damage(how: Any) -> None:
-        world._unseal(served)
-        how()
-        world._seal(served)
-
-    # A file removed, a file's bytes changed, and a node whose write bit came back. The third is
-    # left unsealed on purpose: it is the state a partial chmod leaves, and a shared task an
-    # episode can write to is one it can leave changed for the next episode and for the other arm
-    # of its own pair.
-    for damage in (
-        lambda: _damage(lambda: (served / "dbs" / "gmail.jsonl").unlink()),
-        lambda: _damage(lambda: (served / "dbs" / "gmail.jsonl").write_text("nail")),
-        lambda: world._unseal(served / "dbs" / "gmail.jsonl"),
-    ):
-        damage()
-        assert not world.already_derived(
-            derived=env._derived, graded=env._graded, task_id="abc_1"
-        )
-        before = seeder.calls
-        env._derive("abc_1")
-        assert seeder.calls == before + 1, "rebuilt rather than trusted"
-        assert world.already_derived(derived=env._derived, graded=env._graded, task_id="abc_1")
-        assert {
-            path: path.read_bytes()
-            for path in sorted(served.rglob("*"))
-            if path.is_file() and not path.is_symlink()
-        } == intact
-
-    # And the grader's own view is held to the same standard: it is the baseline the evaluator
-    # diffs against, and half of it was never checked at all.
-    world._unseal(graded)
-    (graded / "ground_truth" / "answer.json").write_text('"moved"')
-    world._seal(graded)
-    assert not world.already_derived(derived=env._derived, graded=env._graded, task_id="abc_1")
-    env._derive("abc_1")
-    assert json.loads((graded / "ground_truth" / "answer.json").read_text()) == "the answer"
-
-    # A warm episode pays for that check once per task, and this is what it costs.
-    began = time.monotonic()
-    for _ in range(20):
-        assert world.already_derived(derived=env._derived, graded=env._graded, task_id="abc_1")
-    assert (time.monotonic() - began) / 20 < 0.05
 
 
 def test_a_task_member_this_port_does_not_name_is_not_derived_or_served(

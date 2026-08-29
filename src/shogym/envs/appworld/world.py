@@ -33,12 +33,9 @@ from shogym.envs.appworld.ledger import ROLES, SECTIONS, Backlog, Request
 #: The parts of a corpus that no task changes and every world reads: an allowlist, not "everything
 #: except ``tasks``".
 #:
-#: **Named because the mount set is built from this.** A derived root used to hold whatever the
-#: source corpus had at its top level, and the served container mounted all of it, so an entry
-#: nobody here had heard of was inside the boundary by default. The pinned bundle already ships
-#: two (`LICENSE`, `README_BEFORE_SHARING.md`), and ``APPWORLD_ROOT`` takes any directory with a
-#: ``data/tasks`` in it, so what a custom corpus happened to carry was agent-readable because
-#: nothing had said it should not be.
+#: **Named because the mount set is built from this.** The pinned bundle already ships two
+#: (`LICENSE`, `README_BEFORE_SHARING.md`), and ``APPWORLD_ROOT`` takes any directory with a
+#: ``data/tasks`` in it, so a corpus can carry entries nobody here has heard of.
 #:
 #: Anything else is left where it is rather than refused. A corpus is somebody else's directory
 #: and a file this port does not use is not a defect in it; what would be a defect is deriving it,
@@ -50,12 +47,9 @@ SHARED_ENTRIES: Tuple[str, ...] = ("api_docs", "base_dbs", "datasets", "version.
 #: derived task is mounted whole at ``/corpus/data/tasks/<id>``, so what is copied into it is what
 #: an episode can read.
 #:
-#: **A list, where this was "everything except `dbs` and `ground_truth`".** Every task in the
-#: pinned corpus holds exactly `dbs`, `ground_truth` and `specs.json`, and the exclusion of the
-#: answers was the whole of the rule: an unrecognised member of somebody's own corpus was copied
-#: and mounted because it was neither of the two names that had been thought of. ``ground_truth``
-#: stays out by not being on the list rather than by being named, which is the difference between
-#: a boundary and a habit of remembering.
+#: Every task in the pinned corpus holds exactly `dbs`, `ground_truth` and `specs.json`.
+#: ``ground_truth`` stays out by not being on the list rather than by being named, which is the
+#: difference between a boundary and a habit of remembering.
 TASK_ENTRIES: Tuple[str, ...] = ("specs.json",)
 
 # ----- the appended paragraph -----
@@ -288,10 +282,10 @@ def already_derived(*, derived: Path, graded: Path, task_id: str) -> bool:
 def _grading_view(target: Path, view: Path, answers: Path) -> None:
     """The grader's view of a derived task: the same world, with the answers linked back in.
 
-    Independent copies of the served task's own files. They were hard links, one instance on disk
-    under two names, which made this view move whenever a served episode wrote through its own: the
-    baseline the grader diffs against was editable by the thing being graded. The answers are
-    copied from the corpus, and this tree is the only place in the port that names them."""
+    Independent copies of the served task's own files, never hard links: one instance on disk
+    under two names would make this view move whenever a served episode wrote through its own, so
+    the baseline the grader diffs against would be editable by the thing being graded. The answers
+    are copied from the corpus, and this tree is the only place in the port that names them."""
     building = _staging(view.parent, view.name)
     (building / "dbs").mkdir(parents=True)
     for entry in sorted(target.iterdir()):
@@ -310,12 +304,11 @@ def derive_view(*, derived: Path, view: Path, task_id: str) -> Path:
     """One episode's own served corpus, and return the root to hand the worker.
 
     **Why an episode cannot share the served tree.** The derived corpus is one deterministic
-    global root and every worker was handed it as ``APPWORLD_ROOT``. The files in it are writable
-    by the process that runs agent-authored code, and nothing put them back, so a write through
-    episode A's served view was still there in episode B's starting inputs. Two arms of one pair
-    are the same task served at the same time, so the arm that was supposed to differ only in what
-    it was told could also differ in the world it was given, and the difference would be one the
-    treatment did not make.
+    global root. The files in it are writable by the process that runs agent-authored code, and
+    nothing puts them back, so a write through episode A's served view would still be there in
+    episode B's starting inputs. Two arms of one pair are the same task served at the same time,
+    so the arm that was supposed to differ only in what it was told could also differ in the world
+    it was given, and the difference would be one the treatment did not make.
 
     **The task is copied; everything else is a symlink.** A task's own world is 28 KB, so a copy
     per episode is nothing, and it is the only part an episode has state in. The rest is 129 MB of
@@ -376,29 +369,21 @@ def derive_root(
     starting state, and reading them without a check would build that state out of whatever the
     corpus held at the moment of the copy rather than out of what the run says it is serving."""
     derived.mkdir(parents=True, exist_ok=True)
-    # Required, for the reason :func:`derive_task`'s is: the body below opens this directory for
-    # writing and seals it again, and what a second process without exclusion would find is not a
-    # stale tree but an open one. A window that another process can close is not a window.
-    with _locked(derived, required=True):
-        # What is missing is decided before the directory is opened, so a construction that has
-        # nothing to build never opens it at all. That matters because the ordinary case is warm:
-        # an env is constructed while another episode of the pair is already running, and opening
-        # the parent on every construction would put a writable window beside every live worker
-        # rather than only beside a cold build.
+    # Advisory: the staging name and the rename are what make a concurrent build safe. What the
+    # lock buys is that two cold builders usually copy 134 MB once rather than twice.
+    with _locked(derived):
+        # A target that exists and is not marked complete was left by a crash. It is not repaired
+        # in place: a fresh tree is staged beside it and published over it, so nothing ever reads
+        # a directory while it is being made correct.
         #
-        # A target that exists but is not both complete and sealed was left by a crash or by a
-        # chmod that failed part way through. It is not repaired in place: a fresh tree is staged
-        # beside it and published over it, so nothing ever reads a directory while it is being
-        # made correct.
         # Named rather than enumerated, and only the ones this corpus has: a corpus missing one
-        # of them fails where the world tries to open it, with upstream's own words, which is
-        # where it failed before this list existed too. What the list changes is the other
-        # direction, which is that an entry nobody named is not derived and so is never mounted.
+        # of them fails where the world tries to open it, with upstream's own words. What the list
+        # changes is the other direction, which is that an entry nobody named is not derived and
+        # so is never mounted.
         outstanding = [
             original / name
             for name in SHARED_ENTRIES
-            if (original / name).exists()
-            and not (_complete(derived / name) and _sealed(derived / name))
+            if (original / name).exists() and not _complete(derived / name)
         ]
         (derived / "tasks").mkdir(exist_ok=True)
         for entry in outstanding:
@@ -415,9 +400,9 @@ def derive_root(
 def _staging(parent: Path, name: str) -> Path:
     """A directory to build ``name`` in, under a name no other process can be using.
 
-    The pid alone was the old answer and it is not unique enough: pids are recycled, and a
-    crashed builder's leftovers under the same number would be deleted out from under a live one.
-    Eight random bytes beside it make the name this call's."""
+    The pid alone is not unique enough: pids are recycled, and a crashed builder's leftovers under
+    the same number would be deleted out from under a live one. Eight random bytes beside it make
+    the name this call's."""
     parent.mkdir(parents=True, exist_ok=True)
     building = parent / f".{name}.{os.getpid()}.{secrets.token_hex(8)}.building"
     shutil.rmtree(building, ignore_errors=True)
