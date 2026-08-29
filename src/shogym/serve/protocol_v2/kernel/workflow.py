@@ -27,7 +27,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 from datetime import timedelta
 from hashlib import sha256
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, Tuple
 
 from temporalio import workflow
 from temporalio.common import RetryPolicy
@@ -35,12 +35,15 @@ from temporalio.exceptions import ApplicationError
 
 with workflow.unsafe.imports_passed_through():
     from shogym.serve.protocol_v2 import (
+        RELEASE_AT_SEAL,
+        Assignment,
         Done,
         Payload,
         PresentationAck,
         PresentationCommit,
         ProtocolError,
         PullRequest,
+        ScheduleView,
         SealAck,
         SealReject,
         Task,
@@ -48,6 +51,9 @@ with workflow.unsafe.imports_passed_through():
         WireFormatError,
         canonical_bytes,
         canonical_json,
+        check_release,
+        eligible_tasks,
+        order_key,
         presentation_request_identity,
         pull_request_identity,
         require_opaque_id,
@@ -77,8 +83,10 @@ with workflow.unsafe.imports_passed_through():
         StreamStart,
         StreamState,
         TaskItem,
+        assignments_for,
         hidden_seal_id,
     )
+    from shogym.serve.protocol_v2.schedule import PAYLOAD, TASK
 
 PLANNED = "planned"
 TASK_OFFERED = "task_offered"
@@ -88,9 +96,17 @@ SEALED = "sealed"
 ACK_PRESENTED = "ack_presented"
 
 ASSIGNED = "assigned"
+MATERIALIZED = "materialized"
 ELIGIBLE = "eligible"
 OFFERED = "offered"
 PRESENTED = "presented"
+
+# The states Done has to look through. An attempt that has not reached a presented
+# acknowledgement is still live, and an obligation that has not been presented is still owed.
+# The failure states a later element adds are terminal and obligation fulfilling, so they join
+# the fulfilled side rather than either of these.
+LIVE_ATTEMPT = (PLANNED, TASK_OFFERED, ACTIVE, SEALING, SEALED)
+UNFULFILLED_OBLIGATION = (ASSIGNED, MATERIALIZED, ELIGIBLE, OFFERED)
 
 OPEN = "open"
 DONE = "done"
@@ -144,8 +160,18 @@ class _Attempt:
 class _Obligation:
     item: TaskItem
     state: str = ASSIGNED
-    materialized: bool = False
     candidate: Optional[PayloadCandidate] = None
+
+
+@dataclass
+class _Eligibility:
+    """An obligation becoming eligible: which plan released it, on what, and in what order."""
+
+    attempt_id: str
+    release_plan_id: str
+    causal_event: str
+    priority: str
+    order_key: Tuple[int, int, str]
 
 
 @dataclass
@@ -186,25 +212,42 @@ class StreamWorkflow:
     def __init__(self, start: StreamStart) -> None:
         _check_start(start)
         self._start = start
+        self._release = start.release
         self._id_key = bytes.fromhex(start.id_key_hex)
         self._generation_state = OPEN
         self._consumer_id: Optional[str] = None
         self._claim_epoch = 0
         self._cursor = start.initial_cursor
         self._queue_closed = False
-        self._next_task = 0
+        self._items: Dict[str, TaskItem] = {item.attempt_id: item for item in start.tasks}
+        self._assignments: Dict[str, Assignment] = {
+            row.attempt_id: row for row in _roster(start)
+        }
         self._attempts: Dict[str, _Attempt] = {
             item.attempt_id: _Attempt(item=item) for item in start.tasks
         }
-        self._obligations: Dict[str, _Obligation] = {
-            item.attempt_id: _Obligation(item=item) for item in start.tasks
-        }
+        # Never creates no payload obligation, so under it there is no row to materialize,
+        # release, offer, or wait for. The outbox does not exist rather than sitting empty.
+        # A roster row that carries no payload is the other case, one position at a time: its
+        # task is served and scored and nothing is ever delivered against it.
+        self._obligations: Dict[str, _Obligation] = (
+            {
+                item.attempt_id: _Obligation(item=item)
+                for item in start.tasks
+                if self._assignments[item.attempt_id].creates_payload_obligation
+            }
+            if self._release.creates_obligations
+            else {}
+        )
         self._pending: Optional[_Pending] = None
         self._pull_requests: Dict[str, _Bound] = {}
         self._terminal_requests: Dict[str, _Bound] = {}
         self._attestations: Dict[str, PresentationAck] = {}
         self._attestation_identities: Dict[str, str] = {}
-        self._presented: List[str] = []
+        # Every presented message, in order, with the kind it was. The kind is what keeps
+        # payload delivery a count of its own rather than a share of the presentations.
+        self._presented: Dict[str, str] = {}
+        self._eligibilities: List[_Eligibility] = []
         self._issued_ids = {start.initial_cursor, start.done_message_id}
         for item in start.tasks:
             self._issued_ids.update({item.task_message_id, item.ack_message_id})
@@ -383,7 +426,14 @@ class StreamWorkflow:
 
     @workflow.query
     def stream_state(self) -> StreamState:
-        """Report the generation's state to the harness. Queries write nothing."""
+        """Report the generation's state to the harness. Queries write nothing.
+
+        Assignment, release, materialization, eligibility, offer, and presentation are reported
+        as six facts. A reader that wants to know whether a payload was delivered has to read
+        the presentation count for payloads, which is the only one of the six that says so.
+        Whether the model consumed what was delivered belongs to the harness transcript, which
+        is the record of that, and no count here answers it.
+        """
         return StreamState(
             generation_state=self._generation_state,
             cursor=self._cursor,
@@ -391,16 +441,27 @@ class StreamWorkflow:
             stream_state_sha256=self._projection_hash(),
             consumer_id=self._consumer_id,
             queue_closed=self._queue_closed,
-            tasks_remaining=len(self._start.tasks) - self._next_task,
+            tasks_remaining=sum(
+                1 for attempt in self._attempts.values() if attempt.state == PLANNED
+            ),
             capacity=self._start.capacity,
             capacity_in_use=self._capacity_in_use(),
             pending_message_id=None if self._pending is None else self._pending.message.message_id,
             pending_kind=None if self._pending is None else self._pending.message.kind,
             attempts={key: value.state for key, value in self._attempts.items()},
             obligations={key: value.state for key, value in self._obligations.items()},
+            release_plan_id=self._release.release_plan_id,
+            release_predicate=self._release.predicate,
+            assignment_count=len(self._assignments),
+            materialization_count=self._materialized(),
+            eligibility_count=len(self._eligibilities),
             offer_count=len(self._offers),
             presentation_count=len(self._presented),
+            payload_delivery_count=sum(
+                1 for kind in self._presented.values() if kind == PAYLOAD
+            ),
             wait_count=self._wait_count,
+            wait_reasons=self._wait_reason_counts(),
         )
 
     # Pull.
@@ -421,27 +482,12 @@ class StreamWorkflow:
         return self._select(request.request_id, identity)
 
     def _select(self, request_id: str, identity: str) -> OfferedMessage:
-        obligation = self._eligible_obligation()
-        if obligation is not None:
-            candidate = obligation.candidate
-            assert candidate is not None
-            obligation.state = OFFERED
-            result = Payload(
-                message_id=obligation.item.payload_message_id,
-                attempt_id=obligation.item.attempt_id,
-                body=candidate.body,
-            )
-            return self._offer(result, "pull", request_id, identity, obligation.item.attempt_id)
-        item = self._eligible_task()
-        if item is not None:
-            self._next_task += 1
-            self._attempts[item.attempt_id].state = TASK_OFFERED
-            result = Task(
-                message_id=item.task_message_id,
-                attempt_id=item.attempt_id,
-                body=item.body,
-            )
-            return self._offer(result, "pull", request_id, identity, item.attempt_id)
+        choice = self._first_eligible()
+        if choice is not None:
+            kind, attempt_id = choice
+            if kind == PAYLOAD:
+                return self._offer_payload(attempt_id, request_id, identity)
+            return self._offer_task(attempt_id, request_id, identity)
         if self._done_eligible():
             done = Done(message_id=self._start.done_message_id)
             return self._offer(done, "pull", request_id, identity, None)
@@ -452,39 +498,124 @@ class StreamWorkflow:
         )
         return self._offer(wait, "pull", request_id, identity, None, self._wait_reason())
 
-    def _eligible_obligation(self) -> Optional[_Obligation]:
-        """The eligible payload at the lowest declared position. Payloads outrank tasks."""
-        eligible = [o for o in self._obligations.values() if o.state == ELIGIBLE]
-        if not eligible:
-            return None
-        return min(eligible, key=lambda o: (o.item.payload_position, o.item.attempt_id))
+    def _first_eligible(self) -> Optional[Tuple[str, str]]:
+        """The message the declared order puts first, as its kind and the attempt it belongs to.
 
-    def _eligible_task(self) -> Optional[TaskItem]:
-        """The next task, if the queue has one and capacity is free to reserve."""
+        Both kinds are ranked by the same declared key, so a payload outranking a task is the
+        plan's priority rather than this method's opinion, and two messages that became eligible
+        at the same moment are separated by the plan's tie key rather than by arrival.
+        """
+        ranked: List[Tuple[Tuple[int, int, str], str, str]] = [
+            (
+                order_key(self._release, PAYLOAD, self._assignments[obligation.item.attempt_id]),
+                PAYLOAD,
+                obligation.item.attempt_id,
+            )
+            for obligation in self._eligible_obligations()
+        ]
+        ranked += [
+            (order_key(self._release, TASK, row), TASK, row.attempt_id)
+            for row in self._eligible_tasks()
+        ]
+        if not ranked:
+            return None
+        _, kind, attempt_id = min(ranked)
+        return kind, attempt_id
+
+    def _eligible_obligations(self) -> List[_Obligation]:
+        """Every obligation the plan has released and no pull has taken yet."""
+        return [o for o in self._obligations.values() if o.state == ELIGIBLE]
+
+    def _eligible_tasks(self) -> List[Assignment]:
+        """Every task the schedule would let this pull reserve, when capacity allows one.
+
+        Capacity is checked here rather than in the schedule because it is a property of the
+        generation and not of the plan: the same plan under a wider capacity releases the same
+        tasks and more of them can be in flight.
+        """
         if self._capacity_in_use() >= self._start.capacity:
-            return None
-        if self._next_task >= len(self._start.tasks):
-            return None
-        return self._start.tasks[self._next_task]
+            return []
+        return eligible_tasks(self._release, list(self._assignments.values()), self._view())
+
+    def _view(self) -> ScheduleView:
+        """The facts the schedule reads, taken from the generation's own state."""
+        return ScheduleView(
+            offered_attempts=frozenset(
+                key for key, value in self._attempts.items() if value.state != PLANNED
+            ),
+            sealed_attempts=frozenset(
+                key
+                for key, value in self._attempts.items()
+                if value.state in (SEALED, ACK_PRESENTED)
+            ),
+            presented_payload_positions=frozenset(
+                o.item.payload_position
+                for o in self._obligations.values()
+                if o.state == PRESENTED
+            ),
+        )
+
+    def _offer_payload(self, attempt_id: str, request_id: str, identity: str) -> OfferedMessage:
+        obligation = self._obligations[attempt_id]
+        candidate = obligation.candidate
+        assert candidate is not None
+        obligation.state = OFFERED
+        result = Payload(
+            message_id=obligation.item.payload_message_id,
+            attempt_id=attempt_id,
+            body=candidate.body,
+        )
+        return self._offer(result, "pull", request_id, identity, attempt_id)
+
+    def _offer_task(self, attempt_id: str, request_id: str, identity: str) -> OfferedMessage:
+        item = self._items[attempt_id]
+        self._attempts[attempt_id].state = TASK_OFFERED
+        result = Task(
+            message_id=item.task_message_id,
+            attempt_id=attempt_id,
+            body=item.body,
+        )
+        return self._offer(result, "pull", request_id, identity, attempt_id)
 
     def _done_eligible(self) -> bool:
         """Done is monotonic and late: a live attempt or an unfulfilled payload keeps it away.
 
-        A caller reaches this only with nothing outstanding, which is the third condition.
+        The two tuples it reads cover every attempt and obligation state that exists here, so a
+        state a later element adds has to be classified rather than silently counted as done. A
+        caller reaches this only with nothing outstanding, which is the other condition.
         """
         if not self._queue_closed:
             return False
-        if any(attempt.state != ACK_PRESENTED for attempt in self._attempts.values()):
+        if any(attempt.state in LIVE_ATTEMPT for attempt in self._attempts.values()):
             return False
-        return all(o.state == PRESENTED for o in self._obligations.values())
+        return not any(o.state in UNFULFILLED_OBLIGATION for o in self._obligations.values())
 
     def _wait_reason(self) -> str:
-        """The hidden reason for a Wait. It is recorded, and it is never on the wire."""
+        """The hidden reason for a Wait. It is recorded here, and it is never on the wire."""
         if self._capacity_in_use() >= self._start.capacity:
             return "capacity"
+        if any(attempt.state == PLANNED for attempt in self._attempts.values()):
+            return "gate"
         if not self._queue_closed:
             return "queue_open"
         return "obligation_pending"
+
+    def _materialized(self) -> int:
+        """How many obligations have their candidate built.
+
+        The candidate is the materialization: it carries the renderer, the match group, the
+        hashes, and the byte count a family gate compares, so counting the obligations that
+        hold one is reading the fact rather than a tally kept beside it.
+        """
+        return sum(1 for o in self._obligations.values() if o.candidate is not None)
+
+    def _wait_reason_counts(self) -> Dict[str, int]:
+        """How many Waits each hidden reason accounts for, for the harness alone."""
+        counts: Dict[str, int] = {}
+        for offer in self._offers:
+            if offer.wait_reason is not None:
+                counts[offer.wait_reason] = counts.get(offer.wait_reason, 0) + 1
+        return counts
 
     def _capacity_in_use(self) -> int:
         occupied = (TASK_OFFERED, ACTIVE, SEALING)
@@ -595,32 +726,37 @@ class StreamWorkflow:
         # which obligation asked and not which filing was answered.
         if graded.attempt_id != attempt.item.attempt_id or graded.seal_id != attempt.seal_id:
             raise _unusable("the score is not this seal's")
-        bundle = await workflow.execute_activity(
-            generate_payload_bundle_activity,
-            GeneratePayloadBundleInput(
-                attempt_id=attempt.item.attempt_id,
-                payload_position=attempt.item.payload_position,
-                payload_message_id=attempt.item.payload_message_id,
-                submission_digest=attempt.submission_digest,
-                canonical_submission_text=sealed.canonical_submission_text,
-            ),
-            start_to_close_timeout=_ACTIVITY_TIMEOUT,
-            retry_policy=_ACTIVITY_RETRY,
-        )
-        if len(bundle.candidates) != 1:
-            raise ApplicationError(
-                "the kernel payload family has exactly one candidate",
-                type="IncompleteCandidateBundle",
-                non_retryable=True,
+        # An attempt with no obligation has nothing to build, so nothing is built: neither the
+        # generation under Never nor the one position a roster gave no payload asks a renderer
+        # for a candidate. An absent outbox row is not an outbox row nobody reads.
+        candidate: Optional[PayloadCandidate] = None
+        if attempt.item.attempt_id in self._obligations:
+            bundle = await workflow.execute_activity(
+                generate_payload_bundle_activity,
+                GeneratePayloadBundleInput(
+                    attempt_id=attempt.item.attempt_id,
+                    payload_position=attempt.item.payload_position,
+                    payload_message_id=attempt.item.payload_message_id,
+                    submission_digest=attempt.submission_digest,
+                    canonical_submission_text=sealed.canonical_submission_text,
+                ),
+                start_to_close_timeout=_ACTIVITY_TIMEOUT,
+                retry_policy=_ACTIVITY_RETRY,
             )
-        if (
-            bundle.attempt_id != attempt.item.attempt_id
-            or bundle.payload_position != attempt.item.payload_position
-            or bundle.submission_digest != attempt.submission_digest
-        ):
-            raise _unusable("the candidate bundle is not the one this obligation asked for")
-        candidate = bundle.candidates[0]
-        _check_candidate(attempt.item, candidate)
+            if len(bundle.candidates) != 1:
+                raise ApplicationError(
+                    "the kernel payload family has exactly one candidate",
+                    type="IncompleteCandidateBundle",
+                    non_retryable=True,
+                )
+            if (
+                bundle.attempt_id != attempt.item.attempt_id
+                or bundle.payload_position != attempt.item.payload_position
+                or bundle.submission_digest != attempt.submission_digest
+            ):
+                raise _unusable("the candidate bundle is not the one this obligation asked for")
+            candidate = bundle.candidates[0]
+            _check_candidate(attempt.item, candidate)
         # One transition, no await inside it: the score, the bundle, the released capacity,
         # the obligation, and the acknowledgement all become authoritative together or not
         # at all. The bytes go out after this, which is what puts the seal before the Ack.
@@ -629,10 +765,8 @@ class StreamWorkflow:
         self._seal_ordinal += 1
         attempt.seal_ordinal = self._seal_ordinal
         attempt.state = SEALED
-        obligation = self._obligations[attempt.item.attempt_id]
-        obligation.candidate = candidate
-        obligation.materialized = True
-        obligation.state = ELIGIBLE
+        if candidate is not None:
+            self._materialize(attempt.item, candidate)
         ack = SealAck(
             message_id=attempt.item.ack_message_id,
             attempt_id=attempt.item.attempt_id,
@@ -641,6 +775,39 @@ class StreamWorkflow:
         )
         return self._offer(
             ack, "terminal", metadata.request_id, identity, attempt.item.attempt_id
+        )
+
+    # Materialization and release.
+
+    def _materialize(self, item: TaskItem, candidate: PayloadCandidate) -> None:
+        """Record the built candidate against its obligation, then apply the release plan.
+
+        Materialization and eligibility are two facts. A plan that released later would leave
+        the obligation materialized here and make it eligible somewhere else, and the ledger
+        would still say when each happened, which is the whole reason they are not one field.
+        """
+        obligation = self._obligations[item.attempt_id]
+        obligation.candidate = candidate
+        obligation.state = MATERIALIZED
+        if self._release.predicate == RELEASE_AT_SEAL:
+            self._release_obligation(obligation, "seal")
+
+    def _release_obligation(self, obligation: _Obligation, causal_event: str) -> None:
+        """Make one obligation eligible, and record which plan did it and on what.
+
+        The release decides readiness and nothing else. It reads no candidate content and it
+        has no way to choose among candidates, so what an assignment fixed it cannot move.
+        """
+        obligation.state = ELIGIBLE
+        assignment = self._assignments[obligation.item.attempt_id]
+        self._eligibilities.append(
+            _Eligibility(
+                attempt_id=obligation.item.attempt_id,
+                release_plan_id=self._release.release_plan_id,
+                causal_event=causal_event,
+                priority=self._release.priority,
+                order_key=order_key(self._release, PAYLOAD, assignment),
+            )
         )
 
     # Presentation.
@@ -666,7 +833,7 @@ class StreamWorkflow:
             raise StreamProtocolError("invalid_message")
         _check_blobs(pending.message.kind, commit)
         self._apply_presentation(pending.message.kind, pending.message.attempt_id)
-        self._presented.append(commit.message_id)
+        self._presented[commit.message_id] = pending.message.kind
         self._cursor = commit.message_id
         self._pending = None
         ack = PresentationAck(
@@ -765,10 +932,10 @@ class StreamWorkflow:
             "generation_state": self._generation_state,
             "cursor": self._cursor,
             "configuration_hash": self._start.configuration_hash,
+            "release_plan_id": self._release.release_plan_id,
             "consumer_id": self._consumer_id,
             "claim_epoch": self._claim_epoch,
             "queue_closed": self._queue_closed,
-            "next_task": self._next_task,
             "capacity_in_use": self._capacity_in_use(),
             "pending_message_id": (
                 None if self._pending is None else self._pending.message.message_id
@@ -776,6 +943,8 @@ class StreamWorkflow:
             "attempts": {key: value.state for key, value in self._attempts.items()},
             "obligations": {key: value.state for key, value in self._obligations.items()},
             "presented": list(self._presented),
+            "materializations": self._materialized(),
+            "eligibilities": len(self._eligibilities),
             "offers": len(self._offers),
             "seal_ordinal": self._seal_ordinal,
         }
@@ -806,6 +975,52 @@ def _check_start(start: StreamStart) -> None:
         raise StreamProtocolError("invalid_message") from error
     if len(set(identifiers)) != len(identifiers):
         raise StreamProtocolError("invalid_message")
+    _check_schedule(start)
+
+
+def _roster(start: StreamStart) -> List[Assignment]:
+    """Return the generation's assignment rows.
+
+    A generation started without a roster gets the one its closed manifest implies, built here
+    before anything is offered. That is still assignment before behavior: what the contract
+    forbids is a row appearing after the behavior it could explain, not a row a manifest wrote.
+    """
+    return list(start.assignments) or assignments_for(start.tasks, start.release)
+
+
+def _check_schedule(start: StreamStart) -> None:
+    """Refuse a roster and a plan that do not describe this generation.
+
+    The roster is checked against the queue rather than trusted beside it, because a row whose
+    positions or public IDs disagree with the manifest would make two answers to the same
+    question true at once.
+    """
+    roster = _roster(start)
+    try:
+        check_release(start.release, roster, evaluation_only=start.evaluation_only)
+    except WireFormatError as error:
+        raise StreamProtocolError("configuration_mismatch") from error
+    rows = {row.attempt_id: row for row in roster}
+    if set(rows) != {item.attempt_id for item in start.tasks}:
+        raise StreamProtocolError("configuration_mismatch")
+    for item in start.tasks:
+        row = rows[item.attempt_id]
+        fixed = (
+            row.task_position,
+            row.payload_position,
+            row.task_message_id,
+            row.ack_message_id,
+            row.payload_message_id,
+        )
+        declared = (
+            item.task_position,
+            item.payload_position,
+            item.task_message_id,
+            item.ack_message_id,
+            item.payload_message_id,
+        )
+        if fixed != declared:
+            raise StreamProtocolError("configuration_mismatch")
 
 
 def _unusable(what: str) -> ApplicationError:
