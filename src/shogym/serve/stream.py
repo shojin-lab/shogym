@@ -292,6 +292,7 @@ from typing import (
     Callable,
     ClassVar,
     Dict,
+    FrozenSet,
     Iterator,
     Mapping,
     List,
@@ -1334,6 +1335,22 @@ class _Live:
     # publishes the stop it owes afterwards — so more than one caller can reach it; the first
     # claims it and the rest await this rather than closing the episode again.
     releasing: Optional["asyncio.Task[None]"] = None
+    # The dispatches admitted to this task and not yet finished with it. Each is one ticket, and
+    # a ticket is held from before the episode is awaited until after whatever that call owed the
+    # record has been written or refused.
+    #
+    # **A set rather than a flag, and every dispatch rather than the declared terminals.** The
+    # entry is what holds the claim an exposure is appended under, and `_run_seal` retired it as
+    # soon as the row was durable, so a shutdown landing between the row and the line found an
+    # empty registry, released the claim and returned an orderly finish over a delivery that then
+    # could not be recorded. A flag closed that for one caller of one declared tool and left two
+    # ways through: an ordinary call is the terminal when it reaches the horizon, which no
+    # manifest can say in advance, and two callers on one entry shared one flag, so a tombstoned
+    # sibling cleared the accepted terminal's mark while it still owed its line.
+    pending: Set[int] = field(default_factory=set)
+    # Set while nothing is pending, which is what `aclose` waits on. Cleared by the first ticket
+    # and set again by the last, so a wait is never satisfied by an earlier call's finish.
+    delivered: "asyncio.Event" = field(default_factory=asyncio.Event)
     row: Optional[ResultRow] = None
     # The tool that actually ended the task, so the stream knows whether the agent ended it
     # itself and how. Written by the one call that entered the terminal — never by a call the
@@ -3128,6 +3145,14 @@ class TaskStream:
                 name: next((m.name for m in tools if m.terminal_kind == "score"), None)
                 for name, tools in self._manifest.items()
             }
+            # Every tool that ends a task, which is the scoring terminal and the reserved abort.
+            # Read before the call rather than after it, because what a dispatch owes the record
+            # has to be registered before the env is awaited: see `dispatch`, where the mark this
+            # decides goes on, and `_answers_recorded`, which is what waits for it.
+            self._terminal_tools: Dict[str, FrozenSet[str]] = {
+                name: frozenset(m.name for m in tools if m.terminal_kind != "none")
+                for name, tools in self._manifest.items()
+            }
             # What the agent actually sees, per env: the native manifest at capacity 1 with a single
             # env, wrapped with the required `lease` above capacity 1, and prefixed `<env>__<tool>`
             # when more than one env is in play (`prefixed`, decided above the catalog).
@@ -3218,6 +3243,9 @@ class TaskStream:
             # module promises a lease is never reused, and it is the run that has to keep the
             # promise.
             self._issued: set[str] = set()
+            # One number per dispatch this stream admits, so two callers on one task hold two
+            # tickets rather than one flag between them (see `_admit_dispatch`).
+            self._dispatch_seq = 0
             self._done_positions: set[int] = set()
             self._seq = 0
             # How much of the stored record names no identity, counted while it is read, so that
@@ -4900,6 +4928,7 @@ class TaskStream:
                     # BaseException and passes through untouched, leaving the task for the retry
                     # the claim hand-back exists for.)
                     await self._release(live)
+            await self._answers_recorded()
         finally:
             try:
                 await self._released()
@@ -4923,6 +4952,34 @@ class TaskStream:
                     self._release_claim()
         if self._stopped is not None:
             raise RuntimeError(self._stopped.closing) from self._stopped.cause
+
+    async def _answers_recorded(self) -> None:
+        """Wait for every terminating caller that has not yet recorded what it was told.
+
+        **What a drain has to outlast is delivery, not only the row.** A row is durable in the
+        middle of its seal and the exposure line is written after it, by the continuation that
+        will return the answer, so a shutdown that stopped at the rows could release the
+        provenance directory while a delivery this stream had already composed was still on its
+        way to being recorded. The append then failed, the stream stopped and the answer was
+        correctly withheld — but the close had already returned, reporting an orderly finish over
+        a task whose delivery it was the reason for losing.
+
+        Re-read rather than collected once, because the mark is set by the continuation itself and
+        one may reach it after this drain read the registry. It terminates because the stream is
+        closed before any of this: nothing new is dispensed, no further terminal is entered, and
+        what is outstanding is a finite set of continuations each of which sets its event on every
+        path out of itself, cancellation included.
+
+        Not shielded and not bounded. A shutdown cancelled here leaves the entries in the registry
+        and the claim unreleased, which is the same state a shutdown cancelled mid-seal leaves and
+        is finished by the same later ``aclose``."""
+        while True:
+            async with self._lock:
+                waiting = [live for live in self._live.values() if live.pending]
+            if not waiting:
+                return
+            for live in waiting:
+                await live.delivered.wait()
 
     async def _released(self) -> None:
         """Wait for the shutdown release — **without being able to abandon it**. Claimed once;
@@ -5515,6 +5572,67 @@ class TaskStream:
         # deadline needs that lock to arbitrate — an env slow in a tool or in its finalizer must
         # not be able to spend the wall clock and still be recorded as an ordinary seal.
         cancellation = _Cancellation()
+        # **Registered before the env is awaited, not after it comes back.** A terminating call
+        # owes the record a line saying what it was told, and the entry is what holds the claim
+        # that line is written under. Marking it on the way out of the episode transaction left a
+        # window one statement wide and a whole env terminal long: a close arriving while the
+        # transaction had completed but this coroutine had not resumed saw an unmarked entry,
+        # drove the seal itself, retired the row, found nothing outstanding and let the directory
+        # go. The delivery this call then composed could not be recorded and was correctly
+        # withheld, over a close that had already reported an orderly finish.
+        #
+        # Registered here, with no await between the admission above and this line, so a shutdown
+        # reading the registry sees either a call this stream has not admitted or one it is
+        # waiting for, and never a call in between.
+        #
+        # **Every dispatch, not the declared terminals.** Which calls may owe the record a line is
+        # not a question the manifest can answer: an ordinary tool is the terminal when it reaches
+        # the horizon (see `ServedEpisode.call`), and AppWorld's block budget is served exactly
+        # that way. So a ticket is taken for anything admitted and given back when the call is
+        # done with the entry, which for a non-terminal call is as soon as it has answered.
+        ticket = self._admit_dispatch(live)
+        try:
+            return await self._dispatched(live, native, args, cancellation)
+        finally:
+            self._finish_dispatch(live, ticket)
+
+    def _admit_dispatch(self, live: _Live) -> int:
+        """Take a ticket for one dispatch on ``live``, and say which."""
+        self._dispatch_seq += 1
+        live.pending.add(self._dispatch_seq)
+        live.delivered.clear()
+        return self._dispatch_seq
+
+    def _finish_dispatch(self, live: _Live, ticket: int) -> None:
+        """Give one dispatch's ticket back, and retire the entry when nothing is owed for it.
+
+        The retirement `_run_seal` defers, under the condition that method cannot use on itself:
+        :attr:`_Live.settled` is a row *and* a finished seal, and inside `_run_seal`'s own
+        ``finally`` the seal is by definition not finished, so the two halves ask the question the
+        only way each of them can. Whichever of the two runs last is the one that retires.
+
+        **A row is not the end of a task, and asking only for one retired live episodes.** The row
+        is appended in the middle of the seal, with the episode still open behind it and any stop
+        it owes unpublished, so a terminal caller cancelled in that tail took its ticket with it
+        and this retired an entry whose episode had not been released. At capacity one the next
+        `get_task` then dispensed over it, and a shutdown returned and dropped the provenance
+        claim while the seal was still running."""
+        live.pending.discard(ticket)
+        if live.pending:
+            return
+        live.delivered.set()
+        if live.settled:
+            self._retire_settled(live)
+
+    async def _dispatched(
+        self, live: _Live, native: str, args: Dict[str, Any], cancellation: "_Cancellation"
+    ) -> ToolResult:
+        """The body of :meth:`dispatch` once the call is routed, so the mark it runs under can be
+        set and cleared in one place.
+
+        Split out for the ``finally`` alone: what it guards is that a terminating call is
+        registered before the env is awaited and deregistered however the await ends, including
+        the cancellation that ends it without a value."""
         try:
             call = await live.episode.call(native, args)
         except BaseException as exc:  # noqa: BLE001 — see below; never re-raised at the agent
@@ -5576,7 +5694,7 @@ class TaskStream:
                     f"({rendered})"
                 ),
             )
-            return self._answered_terminal(live, await self._seal_redacted(live))
+            return await self._answer_and_retire(live)
         if not call.terminated:
             return ToolResult(content=json.dumps({"content": call.content, "terminated": False}))
         if call.tombstoned:
@@ -5595,7 +5713,7 @@ class TaskStream:
         # whoever claims the seal already sees it. The payload is not taken from here at
         # all: it is the core's to stamp, and `_record` reads it off the episode.
         live.terminal_tool = native
-        return self._answered_terminal(live, await self._seal_redacted(live))
+        return await self._answer_and_retire(live)
 
     # ----- routing -----
 
@@ -5948,6 +6066,28 @@ class TaskStream:
             # Zero rather than `None`: the channel was open and the policy could not put anything
             # through it, which is a different fact from a run that opened none.
             return _TASK_OVER_SILENT, 0
+
+    async def _answer_and_retire(self, live: _Live) -> ToolResult:
+        """Seal this task, answer the call that ended it, and only then let the entry go.
+
+        **The entry is what holds the claim, and the exposure needs the claim.** A row is durable
+        in the middle of the seal, and the seal retired the entry as soon as it was: a shutdown
+        arriving in the window between that and this continuation's exposure line found an empty
+        registry, released the provenance directory and returned reporting an orderly finish. The
+        append that followed was then a write into a directory this stream no longer owned, so it
+        failed, the stream stopped, and the delivery it had already composed was correctly
+        withheld — a close that had reported success over a task it had just made undeliverable.
+
+        So the window is marked before the seal is even started, the retirement waits for the end
+        of it, and `aclose` waits for the mark to clear (see :meth:`aclose`). Marked before rather
+        than after, because a shutdown that reads the registry while this is inside the seal has
+        to see the same thing it would see a moment later.
+
+        Cleared in a `finally` for the same reason the mark exists: a cancelled continuation still
+        owes the shutdown an answer about whether it is coming back, and `answered` is that
+        answer. A cancellation between the seal and the exposure records nothing, which is what a
+        cancelled terminal has always meant, and the row already says the task ended."""
+        return self._answered_terminal(live, await self._seal_redacted(live))
 
     def _answered_terminal(self, live: _Live, row: Optional[ResultRow]) -> ToolResult:
         """Compose the answer to the call that ended this task, record what it was told, and
@@ -6461,7 +6601,13 @@ class TaskStream:
         finally:
             # Only a task whose row is durable is finished with; one whose append failed keeps
             # its entry, because the claim is handed back and a later drain retries the write.
-            if live.row is not None:
+            #
+            # And not while a terminating caller is still between this seal and the line that
+            # records what it was told: retiring there empties the registry, which is what lets a
+            # concurrent shutdown release the claim, and the exposure that follows is an append
+            # into a directory this stream no longer owns. That caller retires the entry itself
+            # once its answer is recorded or refused (see `_answer_and_retire`).
+            if live.row is not None and not live.pending:
                 self._retire_settled(live)
 
     async def _retained_row(self, live: _Live, forced: Optional[Closure]) -> ResultRow:

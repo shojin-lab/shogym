@@ -418,3 +418,311 @@ async def test_a_shadowed_reveal_on_an_admitted_policy_is_not_called(tmp_path: P
     assert answer["feedback"] == [
         {"name": CHANNEL_FEEDBACK_NAME, "value": REPORT_TEXT, "level": "episode"}
     ]
+
+
+async def test_a_close_racing_the_last_answer_does_not_take_the_delivery_with_it(
+    tmp_path: Path,
+) -> None:
+    """A shutdown may not overtake the delivery it is shutting down over.
+
+    A row is durable in the middle of its seal, and the seal retired the entry as soon as it was.
+    The exposure line is written afterwards, by the continuation that returns the answer, so a
+    close arriving in that gap found an empty registry, released the provenance directory and
+    returned reporting an orderly finish. The append that followed was then a write into a
+    directory this stream no longer owned: it failed, the stream stopped, and the delivery it had
+    already composed was correctly withheld. Every part of that is honest except the close, which
+    had reported success over the task whose delivery it was the reason for losing.
+
+    Parked exactly there rather than raced: the seal has finished, the row is durable, and the
+    line that says what this caller was told has not been written."""
+    stream = _stream(tmp_path, [0], feedback=Information())
+    await stream.__aenter__()
+    await stream.get_task()
+
+    inside = asyncio.Event()
+    proceed = asyncio.Event()
+    sealing = stream._seal_redacted
+
+    async def _parked(live: Any) -> Any:
+        row = await sealing(live)
+        inside.set()
+        await proceed.wait()
+        return row
+
+    stream._seal_redacted = _parked  # type: ignore[method-assign]
+    answering = asyncio.ensure_future(stream.dispatch(SUBMIT_TOOL, {"answer": "4"}))
+    await inside.wait()
+    # The row is already durable and the exposure is not written: this is the window.
+    (row,) = _rows(tmp_path)
+    assert row["closure"] == "sealed"
+    assert read_exposures(tmp_path / "prov") == []
+
+    closing = asyncio.ensure_future(stream.aclose())
+    for _ in range(20):
+        await asyncio.sleep(0)
+    # The close cannot finish while an answer is still owed a line, and it has not let the
+    # directory go: an append into a directory this stream no longer owned is what used to lose
+    # the delivery.
+    assert not closing.done()
+    assert (tmp_path / "prov" / "claim.json").exists()
+
+    proceed.set()
+    answer = _payload(await answering)
+    await closing
+
+    # The delivery happened and is on file, which is the whole point: neither half was lost to
+    # the shutdown.
+    assert answer["feedback"] == [
+        {"name": CHANNEL_FEEDBACK_NAME, "value": REPORT_TEXT, "level": "episode"}
+    ]
+    (exposure,) = read_exposures(tmp_path / "prov")
+    assert exposure["lease"] == row["lease"]
+    assert not stream.stopped
+    # And the orderly close still leaves nothing behind: the claim is let go once the entry is.
+    assert not (tmp_path / "prov" / "claim.json").exists()
+
+
+async def test_a_close_racing_the_episode_transaction_does_not_take_the_delivery_either(
+    tmp_path: Path,
+) -> None:
+    """The window before the one above, and the reason the mark moved off the answer.
+
+    A terminating call owes the record a line saying what it was told, and the entry is what holds
+    the claim that line is written under. Marking it on the way *out* of the episode transaction
+    left a window one statement wide and a whole env terminal long: a close arriving after the
+    transaction had completed and before this coroutine resumed saw an unmarked entry, drove the
+    seal itself, retired the durable row, found nothing outstanding and let the directory go. The
+    delivery the call then composed could not be recorded and was correctly withheld, over a close
+    that had already returned reporting an orderly finish.
+
+    Parked exactly there: the env's terminal has returned its result and nothing in the stream has
+    run since."""
+    stream = _stream(tmp_path, [0], feedback=Information())
+    await stream.__aenter__()
+    await stream.get_task()
+
+    (live,) = list(stream._live.values())
+    inside = asyncio.Event()
+    proceed = asyncio.Event()
+    calling = live.episode.call
+
+    async def _parked(tool_name: str, arguments: Any = None) -> Any:
+        result = await calling(tool_name, arguments)
+        inside.set()
+        await proceed.wait()
+        return result
+
+    live.episode.call = _parked  # type: ignore[method-assign]
+    answering = asyncio.ensure_future(stream.dispatch(SUBMIT_TOOL, {"answer": "4"}))
+    await inside.wait()
+    # The episode transaction is over and the stream has not seen it come back: no row yet, and
+    # nothing recorded about what anybody was told.
+    assert not (tmp_path / "prov" / "results.jsonl").exists()
+    assert read_exposures(tmp_path / "prov") == []
+
+    closing = asyncio.ensure_future(stream.aclose())
+    # Given real time rather than a few turns of the loop, because the drain here has a whole seal
+    # to run: it claims the task the parked terminal already ended, composes its row and records
+    # it. All of that used to finish, and the close used to return, while this delivery was still
+    # pending. It may not finish now, and two seconds is many times what it takes when it does.
+    with contextlib.suppress(asyncio.TimeoutError):
+        await asyncio.wait_for(asyncio.shield(closing), timeout=2.0)
+    assert not closing.done(), "the close overtook a terminal that had already ended the task"
+    assert (tmp_path / "prov" / "claim.json").exists()
+
+    proceed.set()
+    answer = _payload(await answering)
+    await closing
+
+    assert answer["feedback"] == [
+        {"name": CHANNEL_FEEDBACK_NAME, "value": REPORT_TEXT, "level": "episode"}
+    ]
+    (exposure,) = read_exposures(tmp_path / "prov")
+    (row,) = _rows(tmp_path)
+    assert exposure["lease"] == row["lease"]
+    assert row["closure"] == "sealed" and row["score"] is not None
+    assert not stream.stopped
+    assert not (tmp_path / "prov" / "claim.json").exists()
+
+
+def _park_after(live: Any, *, on: int) -> Any:
+    """Let ``live``'s episode answer, then hold the caller there until the test lets it go.
+
+    The window the barrier is about: the episode transaction is over, the stream has not seen it
+    come back, and nothing it owes the record has been written."""
+    calling = live.episode.call
+    state = {"seen": 0, "inside": asyncio.Event(), "proceed": asyncio.Event()}
+
+    async def _parked(tool_name: str, arguments: Any = None) -> Any:
+        result = await calling(tool_name, arguments)
+        state["seen"] += 1
+        if state["seen"] == on:
+            state["inside"].set()
+            await state["proceed"].wait()
+        return result
+
+    live.episode.call = _parked  # type: ignore[method-assign]
+    return state
+
+
+async def test_a_call_that_becomes_the_terminal_at_the_horizon_is_waited_for(
+    tmp_path: Path,
+) -> None:
+    """Which calls owe the record a line is not a question the manifest can answer.
+
+    The mark was armed for the tools an env declares terminal, and an ordinary tool is the
+    terminal when it reaches the horizon: the episode dispatches it, then finalizes on the same
+    step. AppWorld's block budget is served exactly that way, so the call that ends a real episode
+    is routinely one no manifest names. Parked on that call, a close used to write the row, retire
+    the entry and remove the claim while the caller was still pending, and the answer it then
+    composed carried an empty channel with no exposure behind it.
+
+    A ticket is taken for every admitted dispatch now, so what the barrier waits for is the call
+    rather than its name."""
+    stream = _stream(tmp_path, [0], feedback=Information())
+    await stream.__aenter__()
+    await stream.get_task()
+    (live,) = list(stream._live.values())
+
+    # Two ordinary calls, and the third is the horizon: `HORIZON` is 3 and `noop` is not a
+    # terminal this env declares.
+    assert _payload(await stream.dispatch("noop", {}))["terminated"] is False
+    assert _payload(await stream.dispatch("noop", {}))["terminated"] is False
+    parked = _park_after(live, on=1)
+
+    answering = asyncio.ensure_future(stream.dispatch("noop", {}))
+    await parked["inside"].wait()
+    closing = asyncio.ensure_future(stream.aclose())
+    with contextlib.suppress(asyncio.TimeoutError):
+        await asyncio.wait_for(asyncio.shield(closing), timeout=2.0)
+    assert not closing.done(), "the close overtook a call that had reached the horizon"
+    assert (tmp_path / "prov" / "claim.json").exists()
+
+    parked["proceed"].set()
+    answer = _payload(await answering)
+    await closing
+
+    assert answer["terminated"] is True
+    assert answer["feedback"] == [
+        {"name": CHANNEL_FEEDBACK_NAME, "value": REPORT_TEXT, "level": "episode"}
+    ]
+    (exposure,) = read_exposures(tmp_path / "prov")
+    (row,) = _rows(tmp_path)
+    assert exposure["lease"] == row["lease"]
+    assert not stream.stopped
+    assert not (tmp_path / "prov" / "claim.json").exists()
+
+
+async def test_a_second_caller_finishing_does_not_release_the_first_ones_delivery(
+    tmp_path: Path,
+) -> None:
+    """Two callers on one task shared one flag between them.
+
+    A terminal may be overtaken: a call arriving after the episode has ended is answered with a
+    tombstone, and that sibling runs the seal and returns while the accepted terminal is still
+    between its own transaction and the line saying what it was told. Its `finally` cleared the
+    one mark, so a close arriving next saw nothing outstanding, let the directory go, and the
+    accepted answer lost its channel and its exposure with it.
+
+    Each dispatch holds its own ticket now, so what a sibling gives back is its own."""
+    stream = _stream(tmp_path, [0], feedback=Information())
+    await stream.__aenter__()
+    await stream.get_task()
+    (live,) = list(stream._live.values())
+    parked = _park_after(live, on=1)
+
+    accepted = asyncio.ensure_future(stream.dispatch(SUBMIT_TOOL, {"answer": "4"}))
+    await parked["inside"].wait()
+    # The sibling: the episode has already ended, so this one is tombstoned. It runs the seal and
+    # returns, which is the whole of the race.
+    sibling = _payload(await stream.dispatch(SUBMIT_TOOL, {"answer": "4"}))
+    assert sibling["terminated"] is True
+    assert sibling["feedback"] == []
+
+    closing = asyncio.ensure_future(stream.aclose())
+    with contextlib.suppress(asyncio.TimeoutError):
+        await asyncio.wait_for(asyncio.shield(closing), timeout=2.0)
+    assert not closing.done(), "a sibling's finish released the accepted terminal's barrier"
+    assert (tmp_path / "prov" / "claim.json").exists()
+
+    parked["proceed"].set()
+    answer = _payload(await accepted)
+    await closing
+
+    # The caller that ended the task is the one that was told, and it is the one on file.
+    assert answer["feedback"] == [
+        {"name": CHANNEL_FEEDBACK_NAME, "value": REPORT_TEXT, "level": "episode"}
+    ]
+    (exposure,) = read_exposures(tmp_path / "prov")
+    (row,) = _rows(tmp_path)
+    assert exposure["lease"] == row["lease"]
+    assert not stream.stopped
+    assert not (tmp_path / "prov" / "claim.json").exists()
+
+
+async def test_a_caller_cancelled_in_the_seal_tail_does_not_retire_a_live_episode(
+    tmp_path: Path,
+) -> None:
+    """A row is not the end of a task, and a ticket that asked only for one said it was.
+
+    The row is appended in the middle of the seal, with the episode still open behind it and any
+    stop it owes unpublished: `_Live.settled` says so, and that is why it wants a finished seal as
+    well as a row. The ticket a dispatch gives back asked only for the row, so a terminal caller
+    cancelled in the seal tail took its ticket with it and retired an entry whose episode had not
+    been released. At capacity one the next `get_task` then dispensed over a live episode, and a
+    shutdown could return and drop the provenance claim while the seal was still running.
+
+    Parked exactly in that tail: the append has happened and the release has not returned."""
+    stream = _stream(tmp_path, [0, 1], feedback=Information())
+    await stream.__aenter__()
+    await stream.get_task()
+    (live,) = list(stream._live.values())
+
+    releasing = stream._release
+    inside = asyncio.Event()
+    proceed = asyncio.Event()
+
+    async def _parked(entry: Any) -> None:
+        inside.set()
+        await proceed.wait()
+        await releasing(entry)
+
+    stream._release = _parked  # type: ignore[method-assign]
+    answering = asyncio.ensure_future(stream.dispatch(SUBMIT_TOOL, {"answer": "4"}))
+    await inside.wait()
+    # The row is durable and the seal has not finished: this is the tail.
+    assert live.row is not None
+    assert not live.settled
+
+    answering.cancel()
+    with contextlib.suppress(asyncio.CancelledError):
+        await answering
+    for _ in range(20):
+        await asyncio.sleep(0)
+
+    # The cancelled caller gave its ticket back and the entry stayed, because nothing about this
+    # task is finished with until its seal is.
+    assert live.lease in stream._live, "a live episode was retired by a cancelled caller"
+    # So the slot is still spent: no second task is dispensed over the first one's episode.
+    pulling = asyncio.ensure_future(stream.get_task())
+    for _ in range(20):
+        await asyncio.sleep(0)
+    assert not pulling.done(), "capacity was handed back over an unreleased episode"
+    # And an orderly close cannot pass the seal tail either.
+    closing = asyncio.ensure_future(stream.aclose())
+    with contextlib.suppress(asyncio.TimeoutError):
+        await asyncio.wait_for(asyncio.shield(closing), timeout=2.0)
+    assert not closing.done(), "the close overtook a seal that was still running"
+    assert (tmp_path / "prov" / "claim.json").exists()
+
+    proceed.set()
+    pulling.cancel()
+    with contextlib.suppress(asyncio.CancelledError, RuntimeError):
+        await pulling
+    await closing
+    (row,) = _rows(tmp_path)
+    assert row["closure"] == "sealed"
+    # A cancelled terminal records no delivery, which is what a cancelled terminal has always
+    # meant, and the close still let the directory go once the seal was over.
+    assert read_exposures(tmp_path / "prov") == []
+    assert not (tmp_path / "prov" / "claim.json").exists()

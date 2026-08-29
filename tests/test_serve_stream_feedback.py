@@ -1619,6 +1619,35 @@ async def test_the_claim_carries_the_identity_before_any_row_exists(tmp_path: Pa
         assert not (tmp_path / "prov" / "results.jsonl").exists()
 
 
+async def test_the_recorded_identity_is_what_the_stream_actually_runs_under(
+    tmp_path: Path,
+) -> None:
+    """The deadline and the capacity are read off this stream, not taken from the caller's word.
+
+    They used to be the caller's to state inside its own opaque string, and a documented example
+    did exactly that: it recorded `deadline=600.0` in the name while passing no deadline at all,
+    so a runner following it filed an unbounded opportunity as a bounded one and every row of it
+    said something about the run that was not true. Nothing could catch that, because the string
+    was never parsed. They are members of the record now, composed from the arguments this stream
+    is serving under, so a record cannot say a deadline the stream is not keeping."""
+    stream = _stream(tmp_path, [0, 1], identity="fingerprint-a", deadline=600.0, max_in_flight=2)
+    async with stream:
+        claim = json.loads((tmp_path / "prov" / "claim.json").read_text())
+    identity = claim["run_identity"]
+    assert identity["caller"] == "fingerprint-a"
+    assert identity["deadline"] == 600.0
+    assert identity["max_in_flight"] == 2 == stream.max_in_flight
+
+    # And the other way, which is the half the example got wrong: a stream given no deadline
+    # records none, whatever its caller called itself.
+    other = _stream(tmp_path / "second", [0], identity="fingerprint-a|deadline=600.0|flight=1")
+    async with other:
+        claim = json.loads((tmp_path / "second" / "prov" / "claim.json").read_text())
+    identity = claim["run_identity"]
+    assert identity["deadline"] is None
+    assert identity["max_in_flight"] == 1
+
+
 @pytest.mark.parametrize("bad", [True, "immediate", None, 1, Immediate])
 async def test_a_feedback_argument_that_is_not_a_policy_is_refused(
     tmp_path: Path, bad: Any
