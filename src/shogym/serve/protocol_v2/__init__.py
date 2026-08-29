@@ -1,0 +1,78 @@
+"""The protocol v2 wire layer: records, canonical bytes, and request identities.
+
+Nothing here does any I/O. A record is either exactly what the protocol declares or it is
+refused, the canonical encoding of a record is one byte string and not a family of equivalent
+ones, and every identity is a domain-separated hash over length-prefixed fields. The layers
+above hash what this one produces, so this is where "the same value serializes the same way"
+has to be true.
+
+The v1 serving path in :mod:`shogym.serve.stream` is untouched and does not import this.
+"""
+
+from shogym.serve.protocol_v2.errors import WireFormatError
+from shogym.serve.protocol_v2.identity import (
+    length_prefixed,
+    presentation_request_identity,
+    pull_request_identity,
+    stream_message_id,
+    submission_digest,
+    terminal_request_identity,
+)
+from shogym.serve.protocol_v2.jcs import encode as canonical_json
+from shogym.serve.protocol_v2.records import (
+    PROTOCOL_ERROR_CODES,
+    PROTOCOL_VERSION,
+    Done,
+    Payload,
+    PresentationAck,
+    PresentationCommit,
+    ProtocolError,
+    PullRequest,
+    PullResult,
+    Record,
+    SealAck,
+    SealReject,
+    Task,
+    TerminalMetadata,
+    TerminalResult,
+    Wait,
+    canonical_bytes,
+    decode_pull_result,
+    decode_terminal_result,
+    mcp_text_content,
+    require_opaque_id,
+    visible_bytes,
+)
+
+__all__ = [
+    "PROTOCOL_ERROR_CODES",
+    "PROTOCOL_VERSION",
+    "Done",
+    "Payload",
+    "PresentationAck",
+    "PresentationCommit",
+    "ProtocolError",
+    "PullRequest",
+    "PullResult",
+    "Record",
+    "SealAck",
+    "SealReject",
+    "Task",
+    "TerminalMetadata",
+    "TerminalResult",
+    "Wait",
+    "WireFormatError",
+    "canonical_bytes",
+    "canonical_json",
+    "decode_pull_result",
+    "decode_terminal_result",
+    "length_prefixed",
+    "mcp_text_content",
+    "presentation_request_identity",
+    "pull_request_identity",
+    "require_opaque_id",
+    "stream_message_id",
+    "submission_digest",
+    "terminal_request_identity",
+    "visible_bytes",
+]
