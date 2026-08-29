@@ -33,18 +33,30 @@ def _build_parser() -> argparse.ArgumentParser:
         default="v1",
         help="serving protocol (default: v1; v2 needs the `durable` extra)",
     )
+    serve.add_argument(
+        "--run-dir",
+        default=None,
+        help="v2 only: directory for the stream's blobs and resume manifest (default: none)",
+    )
     return parser
 
 
 def main(argv: Optional[Sequence[str]] = None) -> None:
-    args = _build_parser().parse_args(argv)
+    parser = _build_parser()
+    args = parser.parse_args(argv)
     if args.command == "serve":
+        if args.run_dir and args.protocol != "v2":
+            parser.error("--run-dir belongs to protocol v2, which keeps blobs and a manifest")
         if args.protocol == "v2":
             # Imported here, not above: protocol v2 runs on Temporal, and the quickstart path
             # must not import it to serve an episode.
             from shogym.serve.protocol_v2.gateway import run_stdio_v2
 
-            asyncio.run(run_stdio_v2(args.env, task=args.task, trace_path=args.trace))
+            asyncio.run(
+                run_stdio_v2(
+                    args.env, task=args.task, trace_path=args.trace, run_directory=args.run_dir
+                )
+            )
         else:
             asyncio.run(run_stdio(args.env, task=args.task, trace_path=args.trace))
 

@@ -45,7 +45,7 @@ from __future__ import annotations
 import asyncio
 import logging
 import secrets
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from functools import partial
 from hashlib import sha256
 from pathlib import Path
@@ -75,6 +75,8 @@ from shogym.serve.episode import ServedEpisode
 from shogym.serve.protocol_v2 import (
     IMMEDIATE,
     NEVER,
+    BlobStore,
+    FilesystemBlobStore,
     ProtocolError,
     PullRequest,
     ReleasePlan,
@@ -88,6 +90,7 @@ from shogym.serve.protocol_v2 import (
     require_opaque_id,
 )
 from shogym.serve.protocol_v2.kernel import (
+    STREAM_TASK_QUEUE,
     ConsumerClaim,
     EnvironmentCall,
     OfferedMessage,
@@ -99,10 +102,18 @@ from shogym.serve.protocol_v2.kernel import (
     TaskItem,
     TerminalTool,
     assignments_for,
+    configuration_hash,
+    discard_stream,
     durable_client,
     protocol_error_code,
     start_stream,
     stream_worker,
+)
+from shogym.serve.protocol_v2.rundir import (
+    create_run_directory,
+    prepare_run_directory,
+    stage_run_directory,
+    staged_generation,
 )
 from shogym.serve.server import build_tool
 from shogym.task import TaskSpec, ToolManifest
@@ -550,8 +561,13 @@ class StreamGateway:
         *,
         initial_cursor: str,
         open_episode: Optional[EpisodeOpener] = None,
+        blobs: Optional[BlobStore] = None,
+        generation: Optional[StreamStart] = None,
     ) -> None:
         self._stream = stream
+        # The composition this generation was started from, when this gateway is the thing that
+        # started it. A gateway built over a stream somebody else composed does not know it.
+        self._generation = generation
         # The world the attempt in front of the model is working in, the attempt it belongs to,
         # and how the attempt after it gets one of its own. A task is a fresh world: the seal
         # captures what an attempt left behind, so a second attempt in a world its predecessor
@@ -565,6 +581,7 @@ class StreamGateway:
         self._cursor = initial_cursor
         self._active: FrozenSet[str] = frozenset()
         self._transcript: List[bytes] = []
+        self._blobs = blobs
         self._closed = False
         # What each tool declares it takes, which is what a call to it is held to. The wrapper
         # carries the native object where the transport's own schema does not reach it.
@@ -611,6 +628,19 @@ class StreamGateway:
         self._refusals += 1
         _LOG.info("protocol v2 refusal: %s", code)
         return _refusal(code)
+
+    @property
+    def generation(self) -> Optional[StreamStart]:
+        """The composition this generation was started from, when this gateway started it.
+
+        A resume is held to what its new owner serves, so the value a later owner presents is a
+        composition rather than anything the run directory recorded. Most of that composition is
+        reproducible from the environment and the task, and the identifiers this generation
+        minted are not, so a controller that let this call compose the generation for it needs
+        the composition back to be able to take the generation over later. It is ``None`` for a
+        gateway handed a stream somebody else composed, which is the only other way to build one.
+        """
+        return self._generation
 
     def check_native_arguments(self, tool_name: str, arguments: Dict[str, Any]) -> None:
         """Hold a wrapped call's native object to the schema its tool declares.
@@ -1208,9 +1238,15 @@ class StreamGateway:
         return await self._present(record)
 
     async def _attestation(self, message: OfferedMessage) -> PresentationCommit:
-        """Build the one attestation that will present ``message``, from the stream itself."""
+        """Build the one attestation that will present ``message``, from the stream itself.
+
+        The transcript is installed in the blob store before it is referenced, because the
+        stream verifies the reference and a hash of bytes nobody stored is a reference to
+        nothing. Without a store the reference is still the hash of the same bytes, and the
+        stream reports that it verifies nothing.
+        """
         state = await self._sent(self._stream.stream_state())
-        transcript_blob = self._transcript_hash(message.visible_text)
+        transcript_blob = self._install_transcript(message.visible_text)
         completed_turn = message.kind == "seal_ack"
         return PresentationCommit(
             attestation_id=_opaque(),
@@ -1355,17 +1391,19 @@ class StreamGateway:
         self._episode = None
         self._world_attempt = None
 
-    def _transcript_hash(self, text: str) -> str:
-        """Hash everything presented so far, with ``text`` appended.
+    def _install_transcript(self, text: str) -> str:
+        """Install everything presented so far, with ``text`` appended, and return its hash.
 
         Each entry is length prefixed, so no two transcripts of different messages hash alike
-        by running one message's bytes into the next.
+        by running one message's bytes into the next. The reference is the hash of exactly the
+        bytes installed, which is what lets the stream check it by reading the store.
         """
-        digest = sha256()
-        for entry in self._transcript:
-            digest.update(length_prefixed(entry))
-        digest.update(length_prefixed(text.encode("utf-8")))
-        return digest.hexdigest()
+        transcript = b"".join(
+            length_prefixed(entry) for entry in self._transcript + [text.encode("utf-8")]
+        )
+        if self._blobs is None:
+            return sha256(transcript).hexdigest()
+        return self._blobs.put(transcript, media_type="application/octet-stream").sha256
 
 
 def _read_failure(landing: "asyncio.Future[Any]") -> None:
@@ -1439,6 +1477,7 @@ async def open_gateway(
     consumer_id: Optional[str] = None,
     start: Optional[StreamStart] = None,
     open_episode: Optional[EpisodeOpener] = None,
+    run_directory: Optional[Union[str, Path]] = None,
 ) -> StreamGateway:
     """Start a generation for ``episode`` and bind this transport as its one consumer.
 
@@ -1458,6 +1497,25 @@ async def open_gateway(
     seals its own worlds can record which world each attempt filed in and end that attempt in
     the world it worked in. ``episode`` is the first attempt's world, so the route a caller
     builds from the opener covers every attempt after that one.
+
+    ``run_directory`` is where this generation keeps the blobs its presentations reference and
+    the manifest a later owner resumes it from. The directory is made before the stream starts,
+    because a directory that already holds another generation refuses this one before there is
+    a generation to refuse it for. The manifest goes in afterwards, once the stream it names
+    exists: a manifest is what makes a directory a generation somebody can resume, and one
+    written first would say that about a stream a crash left unstarted.
+
+    Between those two the name is still written down. A run that dies after starting a stream
+    and before recording it would otherwise leave an authority running that nothing points at:
+    its identifier was minted here and here only, and the next attempt mints another. So the
+    identifier goes into the directory first, and the attempt that finds one there ends the
+    generation it names before starting its own. What it ends never had a consumer, because
+    the manifest is written before this binds one.
+
+    The composition this opened is on the gateway it returns. A resume presents what its new
+    owner serves rather than what the directory recorded, so the directory alone is not enough
+    to take a generation over: the identifiers a generation mints are its own, and a controller
+    that let this call compose one has nowhere else to read them back from.
     """
     spec = episode.describe()
     terminal = terminal_manifest(spec)
@@ -1470,9 +1528,29 @@ async def open_gateway(
             "with; each task is worked in a world of its own, so composing more than one needs "
             "a way to open the next"
         )
-    stream = await start_stream(
-        client, composed, workflow_id=workflow_id or f"stream/{_opaque()}/1"
-    )
+    identifier = workflow_id or f"stream/{_opaque()}/1"
+    blobs: Optional[FilesystemBlobStore] = None
+    if run_directory is not None:
+        blobs = FilesystemBlobStore.under(run_directory)
+        composed = replace(composed, blob_root=str(blobs.root))
+        prepare_run_directory(run_directory)
+        abandoned = staged_generation(run_directory)
+        if abandoned is not None:
+            await discard_stream(client, workflow_id=abandoned.workflow_id)
+        stage_run_directory(
+            run_directory,
+            workflow_id=identifier,
+            task_queue=STREAM_TASK_QUEUE,
+            configuration_hash=configuration_hash(composed),
+        )
+    stream = await start_stream(client, composed, workflow_id=identifier)
+    if run_directory is not None:
+        create_run_directory(
+            run_directory,
+            workflow_id=identifier,
+            task_queue=STREAM_TASK_QUEUE,
+            configuration_hash=configuration_hash(composed),
+        )
     receipt = await stream.claim_consumer(
         ConsumerClaim(
             consumer_id=consumer_id or _opaque(), claim_hash=composed.consumer_claim_hash
@@ -1485,6 +1563,8 @@ async def open_gateway(
         terminal,
         initial_cursor=receipt.initial_cursor,
         open_episode=open_episode,
+        blobs=blobs,
+        generation=composed,
     )
 
 
@@ -1493,11 +1573,14 @@ async def run_stdio_v2(
     *,
     task: Optional[Union[int, str]] = None,
     trace_path: Optional[Union[str, Path]] = None,
+    run_directory: Optional[Union[str, Path]] = None,
 ) -> None:
     """Serve one environment under protocol v2 over stdio, durably.
 
     The service, the Worker, and the stream all belong to this process, so a harness spawns one
-    command and gets a durable stream without installing or starting anything.
+    command and gets a durable stream without installing or starting anything. Given a run
+    directory it also leaves behind what a later owner needs to take the generation over: the
+    blobs its events reference, and the manifest saying which generation this was.
 
     The gateway is stopped before the Worker and the service are, because stopping it settles
     whatever call was accepted when the transport went away, and that call may still need the
@@ -1509,7 +1592,7 @@ async def run_stdio_v2(
     try:
         async with durable_client() as client:
             async with stream_worker(client):
-                gateway = await open_gateway(client, episode)
+                gateway = await open_gateway(client, episode, run_directory=run_directory)
                 # This command is the controller as well as the transport, and its manifest is
                 # complete the moment it is built: one episode, one task. So it closes the
                 # queue before the model can pull, which is what makes Done reachable once

@@ -45,6 +45,7 @@ from shogym.serve.protocol_v2 import (  # noqa: E402
 )
 from shogym.serve.protocol_v2 import Payload  # noqa: E402
 from shogym.serve.protocol_v2.kernel import (  # noqa: E402
+    STREAM_TASK_QUEUE,
     ConsumerClaim,
     EnvironmentCall,
     GeneratePayloadBundleInput,
@@ -336,7 +337,9 @@ async def test_an_offer_belongs_to_its_request_until_it_is_presented(caller: Cal
     # The same logical request under a fresh Update, so the workflow answers rather than
     # Temporal's own deduplication.
     replayed = await caller.stream.handle.execute_update(
-        StreamWorkflow.pull, request, id="replay-of-the-first-pull"
+        StreamWorkflow.pull,
+        args=[request, caller.stream.writer],
+        id="replay-of-the-first-pull",
     )
     assert replayed == task
 
@@ -351,7 +354,9 @@ async def test_an_offer_belongs_to_its_request_until_it_is_presented(caller: Cal
     assert (
         await refused(
             caller.stream.handle.execute_update(
-                StreamWorkflow.pull, request, id="replay-after-presentation"
+                StreamWorkflow.pull,
+                args=[request, caller.stream.writer],
+                id="replay-after-presentation",
             )
         )
         == "already_presented"
@@ -398,7 +403,9 @@ async def test_a_terminal_request_seals_once_and_replays_until_presented(caller:
     ack = await caller.seal(request)
 
     replayed = await caller.stream.handle.execute_update(
-        StreamWorkflow.seal_attempt, request, id="replay-of-the-terminal-request"
+        StreamWorkflow.seal_attempt,
+        args=[request, caller.stream.writer],
+        id="replay-of-the-terminal-request",
     )
     assert replayed == ack
     state = await caller.stream.stream_state()
@@ -408,7 +415,9 @@ async def test_a_terminal_request_seals_once_and_replays_until_presented(caller:
     assert (
         await refused(
             caller.stream.handle.execute_update(
-                StreamWorkflow.seal_attempt, request, id="replay-after-ack-presentation"
+                StreamWorkflow.seal_attempt,
+                args=[request, caller.stream.writer],
+                id="replay-after-ack-presentation",
             )
         )
         == "already_presented"
@@ -648,11 +657,16 @@ async def test_the_stream_outlives_its_worker(env) -> None:
 async def test_a_version_one_generation_never_starts(env) -> None:
     """The kernel serves protocol v2 and refuses to guess at anything else."""
     async with stream_worker(env.client):
-        stream = await start_stream(
-            env.client, make_start(version=1), workflow_id="stream/test/4"
+        # Started without going through `start_stream`, which would claim ownership of a
+        # generation that never opened.
+        handle = await env.client.start_workflow(
+            StreamWorkflow.run,
+            make_start(version=1),
+            id="stream/test/4",
+            task_queue=STREAM_TASK_QUEUE,
         )
         with pytest.raises(WorkflowFailureError) as caught:
-            await stream.handle.result()
+            await handle.result()
         assert protocol_error_code(caught.value.cause) == "unsupported_version"
 
 
@@ -694,11 +708,12 @@ async def test_the_seal_key_is_branch_local_while_the_attempt_id_is_not() -> Non
     assert all(ATTEMPT not in key for key in keys)
 
 
-def test_the_worker_registers_the_stream_and_its_three_activities() -> None:
+def test_the_worker_registers_the_stream_and_every_activity_it_schedules() -> None:
     """The names a Worker serves are the names the workflow schedules."""
     names = {activity.__temporal_activity_definition.name for activity in kernel_activities()}
     assert names == {
         "shogym.protocol_v2.SealAttemptActivity",
         "shogym.protocol_v2.GradeAttemptActivity",
         "shogym.protocol_v2.GeneratePayloadBundleActivity",
+        "shogym.protocol_v2.VerifyBlobsActivity",
     }

@@ -1,9 +1,13 @@
-"""The three Activities the seal transaction depends on, in a version that touches nothing.
+"""The Activities the stream depends on: three stand-ins, and one that is not.
 
-These are stand-ins. They compute deterministically from their inputs, hold no state between
-calls, and reach no environment, grader, or blob store. What is not a stand-in is their shape:
-each already carries the attempt ID, the seal ID, the hashes, the protocol version, and the
-blob references a real implementation needs, so replacing a body here does not move a boundary.
+The seal transaction's three compute deterministically from their inputs, hold no state between
+calls, and reach no environment or grader. What is not a stand-in is their shape: each already
+carries the attempt ID, the seal ID, the hashes, the protocol version, and the blob references
+a real implementation needs, so replacing a body here does not move a boundary.
+
+:func:`verify_blobs_activity` is real. Verifying a reference means reading the object and
+hashing it, and the workflow may not open a file, so the read lives here and the decision the
+read supports lives there.
 
 Everything that will one day be I/O is already on this side of the line. The workflow computes
 the submission digest from what :func:`seal_attempt_activity` returns and never opens a file,
@@ -13,11 +17,13 @@ a socket, or a clock of its own.
 from __future__ import annotations
 
 from hashlib import sha256
+from pathlib import Path
 
 from temporalio import activity
 
-from shogym.serve.protocol_v2 import Payload, visible_bytes
+from shogym.serve.protocol_v2 import FilesystemBlobStore, Payload, blob_ref, visible_bytes
 from shogym.serve.protocol_v2.kernel.messages import (
+    BlobsVerified,
     GeneratePayloadBundleInput,
     GradeAttemptInput,
     GradeAttemptResult,
@@ -25,12 +31,13 @@ from shogym.serve.protocol_v2.kernel.messages import (
     PayloadCandidate,
     SealAttemptInput,
     SealAttemptResult,
-    blob_ref,
+    VerifyBlobsInput,
 )
 
 SEAL_ATTEMPT = "shogym.protocol_v2.SealAttemptActivity"
 GRADE_ATTEMPT = "shogym.protocol_v2.GradeAttemptActivity"
 GENERATE_PAYLOAD_BUNDLE = "shogym.protocol_v2.GeneratePayloadBundleActivity"
+VERIFY_BLOBS = "shogym.protocol_v2.VerifyBlobsActivity"
 
 KERNEL_CELL = "graded"
 KERNEL_MATCH_GROUP = "kernel"
@@ -103,6 +110,27 @@ async def generate_payload_bundle_activity(request: GeneratePayloadBundleInput) 
     )
 
 
+@activity.defn(name=VERIFY_BLOBS)
+async def verify_blobs_activity(request: VerifyBlobsInput) -> BlobsVerified:
+    """Read the store and say which references it can produce the exact bytes for.
+
+    This one is not a stand-in. Reading a blob is the verification, so the answer is a fact
+    about installed bytes rather than a claim about them, and it is computed here because the
+    workflow that acts on it may not open a file.
+    """
+    store = FilesystemBlobStore(Path(request.blob_root))
+    unverified = store.unverified(request.references)
+    return BlobsVerified(
+        verified=[digest for digest in request.references if digest not in unverified],
+        unverified=unverified,
+    )
+
+
 def kernel_activities() -> list:
     """Return the Activities a stream Worker registers."""
-    return [seal_attempt_activity, grade_attempt_activity, generate_payload_bundle_activity]
+    return [
+        seal_attempt_activity,
+        grade_attempt_activity,
+        generate_payload_bundle_activity,
+        verify_blobs_activity,
+    ]

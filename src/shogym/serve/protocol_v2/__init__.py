@@ -1,14 +1,23 @@
 """The protocol v2 wire layer: records, canonical bytes, and request identities.
 
-Nothing here does any I/O. A record is either exactly what the protocol declares or it is
-refused, the canonical encoding of a record is one byte string and not a family of equivalent
-ones, and every identity is a domain-separated hash over length-prefixed fields. The layers
-above hash what this one produces, so this is where "the same value serializes the same way"
-has to be true.
+A record is either exactly what the protocol declares or it is refused, the canonical encoding
+of a record is one byte string and not a family of equivalent ones, and every identity is a
+domain-separated hash over length-prefixed fields. The layers above hash what this one
+produces, so this is where "the same value serializes the same way" has to be true. The one
+part of this layer that touches a filesystem is the blob store, where an object is named by
+the hash of its own bytes and reading it is a verification.
 
 The v1 serving path in :mod:`shogym.serve.stream` is untouched and does not import this.
 """
 
+from shogym.serve.protocol_v2.blobs import (
+    BLOB_DIRECTORY,
+    BlobRef,
+    BlobStore,
+    FilesystemBlobStore,
+    blob_ref,
+    require_digest,
+)
 from shogym.serve.protocol_v2.errors import WireFormatError
 from shogym.serve.protocol_v2.identity import (
     length_prefixed,
@@ -52,6 +61,7 @@ from shogym.serve.protocol_v2.schedule import (
     PREDICATE_VERSION,
     RELEASE_AT_SEAL,
     RELEASE_NEVER,
+    SCHEDULE_VERSION,
     TASK_FIRST,
     Assignment,
     EligibilityGate,
@@ -65,6 +75,7 @@ from shogym.serve.protocol_v2.schedule import (
 )
 
 __all__ = [
+    "BLOB_DIRECTORY",
     "BY_ATTEMPT_ID",
     "BY_POSITION",
     "IMMEDIATE",
@@ -75,10 +86,14 @@ __all__ = [
     "PROTOCOL_VERSION",
     "RELEASE_AT_SEAL",
     "RELEASE_NEVER",
+    "SCHEDULE_VERSION",
     "TASK_FIRST",
     "Assignment",
+    "BlobRef",
+    "BlobStore",
     "Done",
     "EligibilityGate",
+    "FilesystemBlobStore",
     "Payload",
     "PresentationAck",
     "PresentationCommit",
@@ -96,6 +111,7 @@ __all__ = [
     "Wait",
     "WireFormatError",
     "assignment_id_for",
+    "blob_ref",
     "canonical_bytes",
     "canonical_json",
     "check_release",
@@ -108,6 +124,7 @@ __all__ = [
     "order_key",
     "presentation_request_identity",
     "pull_request_identity",
+    "require_digest",
     "require_opaque_id",
     "stream_message_id",
     "submission_digest",

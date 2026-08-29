@@ -13,6 +13,12 @@ offer is a reservation and a presentation is an observation, so an offered resul
 pending slot until the harness attests to the exact bytes, and until then a retry of the
 originating request gets those bytes back and anything else gets an error.
 
+Replay is what brings the state back after a worker dies, and it is not what makes the resumed
+stream safe. One writer owns the generation at a time, under an epoch that only a compare and
+swap moves and a token only that owner holds. Every call that can change the stream presents
+both, at entry and again after every await, so the writer a resume replaced is refused rather
+than raced, including the call it left in flight.
+
 An attempt is state in this workflow rather than a workflow of its own. That is deliberate: a
 seal has to make the result, the score, the candidate bundle, the schedule transition, the
 released capacity, and the acknowledgement authoritative together, and Temporal has no
@@ -27,7 +33,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 from datetime import timedelta
 from hashlib import sha256
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Dict, List, Optional, Set, Tuple
 
 from temporalio import workflow
 from temporalio.common import RetryPolicy
@@ -35,7 +41,9 @@ from temporalio.exceptions import ApplicationError
 
 with workflow.unsafe.imports_passed_through():
     from shogym.serve.protocol_v2 import (
+        PROTOCOL_VERSION,
         RELEASE_AT_SEAL,
+        SCHEDULE_VERSION,
         Assignment,
         Done,
         Payload,
@@ -66,6 +74,7 @@ with workflow.unsafe.imports_passed_through():
         generate_payload_bundle_activity,
         grade_attempt_activity,
         seal_attempt_activity,
+        verify_blobs_activity,
     )
     from shogym.serve.protocol_v2.kernel.messages import (
         ConsumerClaim,
@@ -75,6 +84,8 @@ with workflow.unsafe.imports_passed_through():
         GeneratePayloadBundleInput,
         GradeAttemptInput,
         OfferedMessage,
+        OwnershipClaim,
+        OwnershipReceipt,
         PayloadCandidate,
         QueueClosed,
         SealAttemptInput,
@@ -83,7 +94,10 @@ with workflow.unsafe.imports_passed_through():
         StreamStart,
         StreamState,
         TaskItem,
+        VerifyBlobsInput,
+        Writer,
         assignments_for,
+        configuration_hash,
         hidden_seal_id,
     )
     from shogym.serve.protocol_v2.schedule import PAYLOAD, TASK
@@ -144,6 +158,12 @@ class StreamProtocolError(ApplicationError):
 class _Attempt:
     item: TaskItem
     state: str = PLANNED
+    # The checkpoint this attempt would be restored from, and how many calls to a world the
+    # generation has authorized since it committed. A reference in the flat set of everything a
+    # presentation carried says an object is cited somewhere. A resume needs to know which
+    # attempt it belongs to, and whether anything has happened after it.
+    task_start_checkpoint: Optional[str] = None
+    environment_calls: int = 0
     terminal_request_id: Optional[str] = None
     terminal_identity: Optional[str] = None
     seal_id: Optional[str] = None
@@ -190,6 +210,29 @@ class _Pending:
 
 
 @dataclass
+class _Ownership:
+    """One writer taking the generation from the last one, and the swap that proved it could.
+
+    The witness is the epoch the claimant read before it claimed. Keeping it beside the epoch
+    it won is what makes the compare and swap a fact in the record rather than a step that
+    happened somewhere.
+    """
+
+    ownership_epoch: int
+    previous_epoch: int
+    witnessed_epoch: int
+    fencing_token_hash: str
+    replaced_token_hash: Optional[str]
+    claimant_id: str
+    consumer_claim_hash: str
+    reason: str
+    # The attempts this owner said it had put back before it claimed. A takeover that continues
+    # a world somebody restored is a different fact from one that continues a world nothing
+    # happened in, and the record says which of the two this was.
+    restored_attempts: List[str]
+
+
+@dataclass
 class _Offer:
     """The server-side record of a reservation. An offer is not a delivery."""
 
@@ -214,7 +257,13 @@ class StreamWorkflow:
         self._start = start
         self._release = start.release
         self._id_key = bytes.fromhex(start.id_key_hex)
+        self._configuration_hash = configuration_hash(start)
         self._generation_state = OPEN
+        # Nobody owns the generation until somebody claims it, and until then no call that
+        # could change the stream is accepted. Creation is a claim like a resume is.
+        self._ownership_epoch = 0
+        self._fencing_token_hash: Optional[str] = None
+        self._ownership: List[_Ownership] = []
         self._consumer_id: Optional[str] = None
         self._claim_epoch = 0
         self._cursor = start.initial_cursor
@@ -247,6 +296,10 @@ class StreamWorkflow:
         # Every presented message, in order, with the kind it was. The kind is what keeps
         # payload delivery a count of its own rather than a share of the presentations.
         self._presented: Dict[str, str] = {}
+        # Every object a committed presentation referenced, once each. A reference verified when
+        # its event committed is a fact about that moment, and this is what makes it a question
+        # a resume can ask again.
+        self._committed_blobs: List[str] = []
         self._eligibilities: List[_Eligibility] = []
         self._issued_ids = {start.initial_cursor, start.done_message_id}
         for item in start.tasks:
@@ -257,9 +310,15 @@ class StreamWorkflow:
         self._seal_ordinal = 0
         self._wait_count = 0
         self._operation_in_flight = False
-        # The environment call the stream is currently held for, if any. It holds the stream
-        # the way an Update does, and it is given back by name rather than by returning.
+        # The environment call the stream is currently held for, if any, and the ticket it
+        # holds it under. It holds the stream the way an Update does, and it is given back by
+        # name rather than by returning.
         self._environment_call: Optional[str] = None
+        self._environment_ticket = 0
+        # Which call holds the stream. A handler releases the stream only when the ticket it
+        # took is still the current one, because an owner that fenced it has already given the
+        # stream to somebody else.
+        self._operation_ticket = 0
         self._done_presented = False
         self._draining = False
 
@@ -280,7 +339,85 @@ class StreamWorkflow:
     # The Updates a gateway calls.
 
     @workflow.update
-    async def claim_consumer(self, claim: ConsumerClaim) -> ConsumerReceipt:
+    async def claim_ownership(self, claim: OwnershipClaim) -> OwnershipReceipt:
+        """Take the generation from whoever held it, by compare and swap on the epoch.
+
+        This is the first call a writer makes, at creation and again at every resume, and it is
+        the only way an epoch moves. The compare is the epoch the claimant read: a claimant that
+        read a stale one loses without changing anything, so two would-be owners resolve to one.
+        The swap installs the new token's hash, which is what every later call is held to.
+
+        The configuration is checked before the swap. A claimant resuming something other than
+        what is running here is refused with nothing touched, because a generation whose queue,
+        roster, plan, capacity, or versions have moved is a different generation and continuing
+        it under the old history would serve a configuration nobody committed to.
+
+        A resume reads the store before it swaps. Every reference a committed presentation
+        carried was verified when that presentation committed, and a resume is the moment to
+        ask again, because a history citing bytes the store can no longer produce is not one to
+        hand a new owner. The read covers what the writer being replaced commits while it is
+        running, because that is part of the same history.
+
+        An active attempt is restored to active only when nothing has happened since the
+        checkpoint it would be restored from. That is a precondition this call checks rather
+        than assumes: an attempt the generation has granted a call to a world under is one whose
+        world has moved past its checkpoint, and a claimant that has not put that world back
+        would carry on in a different one, seal it, and have it graded. So the claim has to say
+        which attempts it restored and from which checkpoint, and a claim that says nothing
+        about an attempt in that state is refused with nothing touched. Restoring is the
+        claimant's, because the world is not something this generation can reach; naming what
+        was restored, and holding a claim to it, is this generation's.
+
+        The claim also releases the stream. A call that was in flight when this epoch arrived is
+        not in flight for the new owner: it will fail its own epoch check before it can commit,
+        and until then it must not be holding the stream against the owner that replaced it. An
+        environment call is the one hold carried over rather than released, because that call is
+        changing a world this stream cannot reach and nothing here can fence it. The new owner
+        ends it by name before the generation grants another one.
+        """
+        self._check_claim(claim)
+        if claim.reason == "resume":
+            await self._verify_committed_blobs()
+            # The store was read outside this transition, so the claim is checked again on the
+            # way back in. A claimant that another one overtook while this read was running
+            # loses the swap it witnessed, and the swap below still has no await inside it.
+            self._check_claim(claim)
+        replaced = self._fencing_token_hash
+        previous = self._ownership_epoch
+        self._ownership_epoch = previous + 1
+        self._fencing_token_hash = _token_hash(claim.fencing_token)
+        self._operation_ticket += 1
+        self._operation_in_flight = self._environment_call is not None
+        if self._environment_call is not None:
+            self._environment_ticket = self._operation_ticket
+        restored = sorted(claim.restored_checkpoints)
+        for attempt_id in restored:
+            # The world is back at the checkpoint, so nothing has happened since it again.
+            self._attempts[attempt_id].environment_calls = 0
+        self._ownership.append(
+            _Ownership(
+                ownership_epoch=self._ownership_epoch,
+                previous_epoch=previous,
+                witnessed_epoch=claim.previous_epoch,
+                fencing_token_hash=self._fencing_token_hash,
+                replaced_token_hash=replaced,
+                claimant_id=claim.claimant_id,
+                consumer_claim_hash=self._start.consumer_claim_hash,
+                reason=claim.reason,
+                restored_attempts=restored,
+            )
+        )
+        return OwnershipReceipt(
+            ownership_epoch=self._ownership_epoch,
+            previous_epoch=previous,
+            fencing_token_hash=self._fencing_token_hash,
+            configuration_hash=self._configuration_hash,
+            claimant_id=claim.claimant_id,
+            reason=claim.reason,
+        )
+
+    @workflow.update
+    async def claim_consumer(self, claim: ConsumerClaim, writer: Writer) -> ConsumerReceipt:
         """Bind the generation's one logical consumer.
 
         The same claim presented twice returns the same receipt, because a lost response must
@@ -289,6 +426,9 @@ class StreamWorkflow:
         """
         if self._generation_state != OPEN:
             raise StreamProtocolError("closed_stream")
+        self._require_writer(writer)
+        if claim.protocol_version != PROTOCOL_VERSION:
+            raise StreamProtocolError("unsupported_version")
         if claim.claim_hash != self._start.consumer_claim_hash:
             raise StreamProtocolError("consumer_conflict")
         if self._consumer_id is None:
@@ -300,11 +440,11 @@ class StreamWorkflow:
             consumer_id=self._consumer_id,
             claim_epoch=self._claim_epoch,
             initial_cursor=self._start.initial_cursor,
-            configuration_hash=self._start.configuration_hash,
+            configuration_hash=self._configuration_hash,
         )
 
     @workflow.update
-    async def pull(self, request: PullRequest) -> OfferedMessage:
+    async def pull(self, request: PullRequest, writer: Writer) -> OfferedMessage:
         """Return the one message this request is entitled to.
 
         A retry of the same request gets its own result back while that result is unpresented,
@@ -312,28 +452,30 @@ class StreamWorkflow:
         cursor and only when nothing is outstanding: a second request never inherits the first
         one's offer.
         """
-        self._take_lock()
+        ticket = self._take_lock(writer)
         try:
             return self._pull(request)
         finally:
-            self._operation_in_flight = False
+            self._release_lock(ticket)
 
     @workflow.update
-    async def seal_attempt(self, request: SealRequest) -> OfferedMessage:
+    async def seal_attempt(self, request: SealRequest, writer: Writer) -> OfferedMessage:
         """End an attempt, or say why the filing was not one this tool accepts.
 
         Nothing about the seal becomes authoritative until the last transition below, which
         contains no await. The acknowledgement is built there and returned after it, so a
         crash anywhere earlier leaves a stream that has not acknowledged anything.
         """
-        self._take_lock()
+        ticket = self._take_lock(writer)
         try:
-            return await self._seal(request)
+            return await self._seal(request, writer)
         finally:
-            self._operation_in_flight = False
+            self._release_lock(ticket)
 
     @workflow.update
-    async def commit_presentation(self, commit: PresentationCommit) -> PresentationAck:
+    async def commit_presentation(
+        self, commit: PresentationCommit, writer: Writer
+    ) -> PresentationAck:
         """Accept the harness's attestation that the exact offered bytes were delivered.
 
         Delivery is what the attestation says: the bytes were handed to the transport that
@@ -341,24 +483,26 @@ class StreamWorkflow:
         here. Everything in the attestation is checked against something already held here, so
         this is a verification and not a report. The cursor advances only on the way out.
         """
-        self._take_lock()
+        ticket = self._take_lock(writer)
         try:
-            return self._commit_presentation(commit)
+            return await self._commit_presentation(commit, writer)
         finally:
-            self._operation_in_flight = False
+            self._release_lock(ticket)
 
     @workflow.update
-    async def close_queue(self) -> QueueClosed:
+    async def close_queue(self, writer: Writer) -> QueueClosed:
         """Close the queue to insertion. It revokes nothing and seals nothing."""
-        self._take_lock()
+        ticket = self._take_lock(writer)
         try:
             self._queue_closed = True
             return QueueClosed(task_count=len(self._start.tasks))
         finally:
-            self._operation_in_flight = False
+            self._release_lock(ticket)
 
     @workflow.update
-    async def begin_environment_call(self, call: EnvironmentCall) -> EnvironmentLease:
+    async def begin_environment_call(
+        self, call: EnvironmentCall, writer: Writer
+    ) -> EnvironmentLease:
         """Hold the generation for one call to a world this stream cannot see.
 
         An ordinary environment call never reaches the stream, so the stream cannot serialize
@@ -371,8 +515,12 @@ class StreamWorkflow:
 
         The stream is given back through :meth:`end_environment_call` rather than by returning,
         so every call the generation could otherwise take meanwhile is refused.
+
+        Ownership is checked here like it is everywhere else, and this is the call that makes
+        it reach the world: a writer that was fenced cannot change an environment either, and
+        without this its only unfenced path would be the one the stream never sees.
         """
-        self._take_lock()
+        ticket = self._take_lock(writer)
         try:
             try:
                 require_opaque_id("call_id", call.call_id)
@@ -385,43 +533,54 @@ class StreamWorkflow:
                 raise StreamProtocolError("invalid_attempt")
         except BaseException:
             # Nothing was granted, so nothing of this call is holding the stream.
-            self._operation_in_flight = False
+            self._release_lock(ticket)
             raise
         self._environment_call = call.call_id
+        self._environment_ticket = ticket
+        # The grant is the last thing this stream knows about that world. What the call does to
+        # it happens somewhere this stream cannot see and is never reported back, so the grant
+        # is counted as the change it authorized, and a later claim is held to it.
+        self._attempts[call.attempt_id].environment_calls += 1
         return EnvironmentLease(
             call_id=call.call_id, attempt_id=call.attempt_id, cursor=self._cursor, held=True
         )
 
     @workflow.update
-    async def end_environment_call(self, call: EnvironmentCall) -> EnvironmentLease:
+    async def end_environment_call(
+        self, call: EnvironmentCall, writer: Writer
+    ) -> EnvironmentLease:
         """Give the generation back once that call has settled, whatever became of it.
 
         The answer is the same whether or not this call was the one holding the stream, so a
         caller that never learned whether its grant arrived can give back a lease it is not
         sure it holds. Only the call named in the grant releases it: a lease taken from a
-        caller is not one that caller may hand on afterwards.
+        caller is not one that caller may hand on afterwards, and a writer that was fenced
+        while holding one has already had the stream taken from it by the claim.
         """
+        self._require_writer(writer)
         held = self._environment_call == call.call_id
         if held:
             self._environment_call = None
-            self._operation_in_flight = False
+            self._release_lock(self._environment_ticket)
         return EnvironmentLease(
             call_id=call.call_id, attempt_id=call.attempt_id, cursor=self._cursor, held=held
         )
 
     @workflow.update
-    async def confirm_state(self) -> StreamState:
+    async def confirm_state(self, writer: Writer) -> StreamState:
         """Report the generation's state to a caller the stream has to admit first.
 
         The query below answers whoever asks, because a read costs the generation nothing. It
-        is therefore also answered for a caller the generation has moved on from, which is the
-        wrong question for a transport that is holding something it decided earlier and is
-        about to hand over. That caller asks here instead: this is the path an Update takes, so
-        whatever the stream would refuse a write for it refuses this for, and reading around
-        the stream stops being a way to serve what the stream would not.
+        is therefore also answered for a writer this generation has fenced, which is the wrong
+        question for a transport that is holding something it decided under an earlier epoch
+        and is about to hand over. That caller asks here instead, and a fenced one is refused
+        here as it would be on any other write, so reading around the stream stops being a way
+        to serve what the stream would not.
 
-        It changes nothing, so asking twice is the same as asking once.
+        It takes no lock, because what it is asked about is often something outstanding, and it
+        changes nothing, so asking twice is the same as asking once.
         """
+        self._require_writer(writer)
         return self.stream_state()
 
     @workflow.query
@@ -433,12 +592,28 @@ class StreamWorkflow:
         the presentation count for payloads, which is the only one of the six that says so.
         Whether the model consumed what was delivered belongs to the harness transcript, which
         is the record of that, and no count here answers it.
+
+        It also reports what the generation is holding open, which is what an owner that did not
+        open it has to know. A reserved result is owed to one request and no other, a held
+        environment call is ended by name, and a prepared seal is continued by the exact filing
+        that prepared it, so all three are named here: a replacement process that kept none of
+        its predecessor's memory can still learn what is outstanding and which call may finish
+        it.
+
+        The checkpoints are the fourth of those, read before a claim rather than after one. Each
+        active attempt names the checkpoint it would be restored from, and the ones a claim must
+        restore before it may continue them are listed apart: those are the attempts whose world
+        this generation has authorized a change to since that checkpoint committed.
         """
         return StreamState(
             generation_state=self._generation_state,
             cursor=self._cursor,
-            configuration_hash=self._start.configuration_hash,
+            configuration_hash=self._configuration_hash,
             stream_state_sha256=self._projection_hash(),
+            ownership_epoch=self._ownership_epoch,
+            fencing_token_hash=self._fencing_token_hash,
+            ownership_claims=len(self._ownership),
+            blob_verification="unchecked" if self._start.blob_root is None else "required",
             consumer_id=self._consumer_id,
             queue_closed=self._queue_closed,
             tasks_remaining=sum(
@@ -448,6 +623,20 @@ class StreamWorkflow:
             capacity_in_use=self._capacity_in_use(),
             pending_message_id=None if self._pending is None else self._pending.message.message_id,
             pending_kind=None if self._pending is None else self._pending.message.kind,
+            pending_origin=None if self._pending is None else self._pending.origin,
+            pending_request_id=None if self._pending is None else self._pending.request_id,
+            environment_call=self._environment_call,
+            prepared_seals={
+                key: value.terminal_request_id
+                for key, value in self._attempts.items()
+                if value.state == SEALING and value.terminal_request_id is not None
+            },
+            task_checkpoints={
+                key: value.task_start_checkpoint
+                for key, value in self._attempts.items()
+                if value.task_start_checkpoint is not None
+            },
+            restoration_required=self._restoration_required(),
             attempts={key: value.state for key, value in self._attempts.items()},
             obligations={key: value.state for key, value in self._obligations.items()},
             release_plan_id=self._release.release_plan_id,
@@ -623,7 +812,7 @@ class StreamWorkflow:
 
     # Seal.
 
-    async def _seal(self, request: SealRequest) -> OfferedMessage:
+    async def _seal(self, request: SealRequest, writer: Writer) -> OfferedMessage:
         metadata = request.metadata
         try:
             identity = terminal_request_identity(
@@ -650,7 +839,18 @@ class StreamWorkflow:
         attempt = self._attempts.get(metadata.attempt_id)
         if attempt is None:
             raise StreamProtocolError("invalid_attempt")
-        if attempt.state in (SEALING, SEALED, ACK_PRESENTED):
+        if attempt.state == SEALING:
+            # A prepared seal whose owner was fenced before it committed. The exact terminal
+            # request continues it, keyed by the same seal ID, rather than starting a second
+            # one: the submission was fixed by value when it was prepared, and this path grades
+            # what was filed then. Any other filing for the attempt is a conflict.
+            if (
+                attempt.terminal_request_id == metadata.request_id
+                and attempt.terminal_identity == identity
+            ):
+                return await self._seal_accepted(request, attempt, identity, writer)
+            raise StreamProtocolError("conflicting_seal")
+        if attempt.state in (SEALED, ACK_PRESENTED):
             raise StreamProtocolError("conflicting_seal")
         if attempt.state != ACTIVE:
             raise StreamProtocolError("invalid_attempt")
@@ -670,10 +870,10 @@ class StreamWorkflow:
             return self._offer(
                 reject, "terminal", metadata.request_id, identity, attempt.item.attempt_id
             )
-        return await self._seal_accepted(request, attempt, identity)
+        return await self._seal_accepted(request, attempt, identity, writer)
 
     async def _seal_accepted(
-        self, request: SealRequest, attempt: _Attempt, identity: str
+        self, request: SealRequest, attempt: _Attempt, identity: str, writer: Writer
     ) -> OfferedMessage:
         metadata = request.metadata
         attempt.state = SEALING
@@ -757,6 +957,10 @@ class StreamWorkflow:
                 raise _unusable("the candidate bundle is not the one this obligation asked for")
             candidate = bundle.candidates[0]
             _check_candidate(attempt.item, candidate)
+        # Everything above was awaited, so the owner is checked again before any of it is made
+        # authoritative. A seal that was in flight when a resume fenced its writer commits
+        # nothing: the attempt stays prepared, and the new owner's exact retry continues it.
+        self._require_writer(writer)
         # One transition, no await inside it: the score, the bundle, the released capacity,
         # the obligation, and the acknowledgement all become authoritative together or not
         # at all. The bytes go out after this, which is what puts the seal before the Ack.
@@ -812,7 +1016,17 @@ class StreamWorkflow:
 
     # Presentation.
 
-    def _commit_presentation(self, commit: PresentationCommit) -> PresentationAck:
+    async def _commit_presentation(
+        self, commit: PresentationCommit, writer: Writer
+    ) -> PresentationAck:
+        """Verify an attestation, then commit it.
+
+        The replay of an attestation already committed is answered before anything else and
+        without an await, so a lost acknowledgement costs a caller one round trip and nothing
+        else. Everything after that is verification: the outstanding message, the cursor, the
+        exact bytes, the pre-event projection, and the blobs the reference names. The commit
+        itself is the last stretch, and it contains no await.
+        """
         identity = presentation_request_identity(commit)
         known = self._attestation_identities.get(commit.attestation_id)
         if known is not None:
@@ -832,8 +1046,15 @@ class StreamWorkflow:
         if commit.stream_state_before_sha256 != self._projection_hash():
             raise StreamProtocolError("invalid_message")
         _check_blobs(pending.message.kind, commit)
-        self._apply_presentation(pending.message.kind, pending.message.attempt_id)
+        await self._verify_referenced_blobs(commit)
+        # The store was read outside this transition, so the owner is checked again on the way
+        # back in. A presentation from an epoch that has since been fenced commits nothing.
+        self._require_writer(writer)
+        self._apply_presentation(pending.message.kind, pending.message.attempt_id, commit)
         self._presented[commit.message_id] = pending.message.kind
+        for reference in _references(commit):
+            if reference not in self._committed_blobs:
+                self._committed_blobs.append(reference)
         self._cursor = commit.message_id
         self._pending = None
         ack = PresentationAck(
@@ -845,9 +1066,16 @@ class StreamWorkflow:
         self._attestations[commit.attestation_id] = ack
         return ack
 
-    def _apply_presentation(self, kind: str, attempt_id: Optional[str]) -> None:
+    def _apply_presentation(
+        self, kind: str, attempt_id: Optional[str], commit: PresentationCommit
+    ) -> None:
         if kind == "task" and attempt_id is not None:
-            self._attempts[attempt_id].state = ACTIVE
+            attempt = self._attempts[attempt_id]
+            attempt.state = ACTIVE
+            # The attempt keeps the checkpoint it would be restored from, so a resume can ask
+            # about this attempt rather than about the set of everything anything referenced.
+            attempt.task_start_checkpoint = commit.task_start_checkpoint_blob
+            attempt.environment_calls = 0
         elif kind == "seal_ack" and attempt_id is not None:
             self._attempts[attempt_id].state = ACK_PRESENTED
         elif kind == "payload" and attempt_id is not None:
@@ -859,19 +1087,164 @@ class StreamWorkflow:
 
     # Shared machinery.
 
-    def _take_lock(self) -> None:
+    def _take_lock(self, writer: Writer) -> int:
         """Refuse a call the generation cannot accept, then hold the stream against overlap.
 
         This runs before the first await in every stream-affecting handler. Waiting on a lock
-        would queue an overlapping call; the protocol rejects it instead.
+        would queue an overlapping call; the protocol rejects it instead. The ownership check is
+        part of taking the stream rather than a step inside the call, so a fenced writer is
+        refused before it has read a cursor, let alone written one.
         """
         if self._generation_state != OPEN or self._draining:
             raise StreamProtocolError("closed_stream")
+        self._require_writer(writer)
         if self._consumer_id is None:
             raise StreamProtocolError("consumer_conflict")
         if self._operation_in_flight:
             raise StreamProtocolError("overlapping_call")
         self._operation_in_flight = True
+        self._operation_ticket += 1
+        return self._operation_ticket
+
+    def _release_lock(self, ticket: int) -> None:
+        """Release the stream, unless it has already been given to somebody else.
+
+        A handler fenced part way through still runs its own exit. What it must not do then is
+        clear a lock the new owner is holding, so the release is conditional on the ticket the
+        call took still being the current one.
+        """
+        if self._operation_ticket == ticket:
+            self._operation_in_flight = False
+
+    def _check_claim(self, claim: OwnershipClaim) -> None:
+        """Refuse a claim this generation cannot accept, without touching anything.
+
+        It is separate from the swap because it runs twice on a resume, once before the store is
+        read and once after, and because everything it does is a refusal: a claim that fails
+        here leaves the epoch, the token, and the stream exactly where it found them.
+        """
+        if claim.protocol_version != PROTOCOL_VERSION:
+            raise StreamProtocolError("unsupported_version")
+        if self._generation_state != OPEN or self._draining:
+            raise StreamProtocolError("closed_stream")
+        if claim.configuration_hash != self._configuration_hash:
+            raise StreamProtocolError("configuration_mismatch")
+        if not _is_token(claim.fencing_token):
+            raise StreamProtocolError("invalid_message")
+        # The swap is compared before the claim's own account of itself, so a claimant that
+        # read a stale epoch is told it was fenced whatever else its claim says.
+        if claim.previous_epoch != self._ownership_epoch:
+            raise StreamProtocolError("fenced_writer")
+        if claim.reason not in ("fresh", "resume"):
+            raise StreamProtocolError("invalid_message")
+        if (claim.reason == "fresh") != (self._ownership_epoch == 0):
+            raise StreamProtocolError("invalid_message")
+        self._check_restorations(claim)
+
+    def _check_restorations(self, claim: OwnershipClaim) -> None:
+        """Refuse a claim that would continue an active attempt nobody restored.
+
+        Every attempt the claim names has to be one this generation is holding active, under the
+        exact checkpoint it retained for that attempt: a claim about some other attempt, or about
+        bytes this generation never made the checkpoint, describes a restoration that did not
+        happen here. And every attempt that needs one has to be named, which is the half that
+        fails closed: the default claim restores nothing and is refused.
+        """
+        for attempt_id, checkpoint in claim.restored_checkpoints.items():
+            attempt = self._attempts.get(attempt_id)
+            if attempt is None or attempt.state != ACTIVE:
+                raise StreamProtocolError("invalid_attempt")
+            if attempt.task_start_checkpoint != checkpoint:
+                raise StreamProtocolError("invalid_attempt")
+        for attempt_id in self._restoration_required():
+            if attempt_id not in claim.restored_checkpoints:
+                raise StreamProtocolError("invalid_attempt")
+
+    def _restoration_required(self) -> List[str]:
+        """The active attempts a claim may not simply continue, in the order the queue holds them.
+
+        An active attempt comes back as active only when nothing committed after the task-start
+        checkpoint it would come back from. What this generation can commit against an attempt
+        while it is active is one thing: permission for a call to a world this stream cannot
+        see. A provider turn commits with an acknowledgement and a checkpoint with a Task, and
+        the attempt is in neither state by then. So a granted call is the whole of the later
+        commit here, and it is counted rather than inferred, because this stream never learns
+        what the call did and a grant is the last moment at which it could have learned.
+        """
+        return [
+            attempt_id
+            for attempt_id, attempt in self._attempts.items()
+            if attempt.state == ACTIVE and attempt.environment_calls > 0
+        ]
+
+    def _require_writer(self, writer: Writer) -> None:
+        """Refuse a call that does not hold the generation's current ownership.
+
+        The epoch says which owner is speaking and the token proves it. Both are checked here,
+        at the start of every stream-affecting call and again after every await inside one,
+        because a resume can arrive while a call is waiting on an Activity and the call that
+        comes back is then speaking for an owner that no longer exists.
+        """
+        if writer.protocol_version != PROTOCOL_VERSION:
+            raise StreamProtocolError("unsupported_version")
+        if self._fencing_token_hash is None:
+            raise StreamProtocolError("fenced_writer")
+        if writer.ownership_epoch != self._ownership_epoch:
+            raise StreamProtocolError("fenced_writer")
+        if _token_hash(writer.fencing_token) != self._fencing_token_hash:
+            raise StreamProtocolError("fenced_writer")
+
+    async def _verify_referenced_blobs(self, commit: PresentationCommit) -> None:
+        """Refuse a presentation whose blobs the store cannot produce.
+
+        An event may cite a blob only once the complete object is installed and hashes to its
+        own name, so this is a read of the store rather than a reading of the attestation. A
+        generation given no store verifies nothing and reports that it does not, which is the
+        honest answer: there is no object here to check the reference against.
+        """
+        root = self._start.blob_root
+        if root is None:
+            return
+        await self._verify(root, _references(commit))
+
+    async def _verify_committed_blobs(self) -> None:
+        """Refuse to hand the generation on over references the store can no longer produce.
+
+        A presentation's references were read once, when it committed, and that read said the
+        objects were there then. A resume is where to ask again: the object can change under its
+        name afterwards, and a new owner would otherwise build on a history citing bytes nobody
+        can produce. The refusal is the one an unverifiable reference gets anywhere else.
+
+        The set is read until it stops growing, not once. The writer this claim replaces is
+        still the writer while the store is being read, and a presentation it had already begun
+        can commit in that window: its references would be in the history the claim is about to
+        hand on and outside the set the claim checked. So each pass reads whatever the history
+        cites that this claim has not read yet, and the last pass finds nothing new, which is
+        what leaves no await between the check and the swap.
+        """
+        root = self._start.blob_root
+        if root is None:
+            return
+        read: Set[str] = set()
+        while True:
+            outstanding = [
+                reference for reference in self._committed_blobs if reference not in read
+            ]
+            if not outstanding:
+                return
+            await self._verify(root, outstanding)
+            read.update(outstanding)
+
+    async def _verify(self, root: str, references: List[str]) -> None:
+        """Read the store, and refuse when it cannot produce the exact bytes a name promises."""
+        verified = await workflow.execute_activity(
+            verify_blobs_activity,
+            VerifyBlobsInput(blob_root=root, references=references),
+            start_to_close_timeout=_ACTIVITY_TIMEOUT,
+            retry_policy=_ACTIVITY_RETRY,
+        )
+        if verified.unverified:
+            raise StreamProtocolError("invalid_message")
 
     def _offer(
         self,
@@ -931,10 +1304,11 @@ class StreamWorkflow:
         projection = {
             "generation_state": self._generation_state,
             "cursor": self._cursor,
-            "configuration_hash": self._start.configuration_hash,
+            "configuration_hash": self._configuration_hash,
             "release_plan_id": self._release.release_plan_id,
             "consumer_id": self._consumer_id,
             "claim_epoch": self._claim_epoch,
+            "ownership_epoch": self._ownership_epoch,
             "queue_closed": self._queue_closed,
             "capacity_in_use": self._capacity_in_use(),
             "pending_message_id": (
@@ -951,13 +1325,27 @@ class StreamWorkflow:
         return sha256(canonical_json(projection)).hexdigest()
 
 
+def _token_hash(token: str) -> str:
+    """Return what the generation keeps of a fencing token: the hash of it, and not it."""
+    return sha256(token.encode("utf-8")).hexdigest()
+
+
+def _is_token(value: str) -> bool:
+    """Whether ``value`` is shaped like a fencing token: 32 bytes, in lower-case hexadecimal."""
+    return len(value) == 64 and set(value) <= set("0123456789abcdef")
+
+
 def _check_start(start: StreamStart) -> None:
     """Refuse a generation this code cannot serve, before it serves anything.
 
     A malformed manifest has to fail the workflow rather than an Update, because there is no
-    caller yet to refuse and nothing here can be repaired later.
+    caller yet to refuse and nothing here can be repaired later. Both versions are checked, so
+    a start input that mixes them, protocol two under a schedule this code does not implement,
+    never serves a message either.
     """
-    if start.protocol_version != 2:
+    if start.protocol_version != PROTOCOL_VERSION:
+        raise StreamProtocolError("unsupported_version")
+    if start.schedule_version != SCHEDULE_VERSION:
         raise StreamProtocolError("unsupported_version")
     if start.capacity < 1 or start.wait_retry_after_ms < 0:
         raise StreamProtocolError("invalid_message")
@@ -1074,6 +1462,16 @@ def _argument_complaint(names: List[str], arguments: Dict[str, Any]) -> Optional
     if unknown:
         parts.append("unknown " + ", ".join(unknown))
     return "; ".join(parts)
+
+
+def _references(commit: PresentationCommit) -> List[str]:
+    """Every object this presentation names, once each and in a fixed order."""
+    named = [commit.transcript_blob, commit.provider_turn_blob, commit.task_start_checkpoint_blob]
+    ordered: List[str] = []
+    for reference in named:
+        if reference is not None and reference not in ordered:
+            ordered.append(reference)
+    return ordered
 
 
 def _check_blobs(kind: str, commit: PresentationCommit) -> None:
