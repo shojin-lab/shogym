@@ -376,20 +376,13 @@ def derive_root(
     starting state, and reading them without a check would build that state out of whatever the
     corpus held at the moment of the copy rather than out of what the run says it is serving."""
     derived.mkdir(parents=True, exist_ok=True)
-    # Required, for the reason :func:`derive_task`'s is: the body below opens this directory for
-    # writing and seals it again, and what a second process without exclusion would find is not a
-    # stale tree but an open one. A window that another process can close is not a window.
-    with _locked(derived, required=True):
-        # What is missing is decided before the directory is opened, so a construction that has
-        # nothing to build never opens it at all. That matters because the ordinary case is warm:
-        # an env is constructed while another episode of the pair is already running, and opening
-        # the parent on every construction would put a writable window beside every live worker
-        # rather than only beside a cold build.
+    # Advisory: the staging name and the rename are what make a concurrent build safe. What the
+    # lock buys is that two cold builders usually copy 134 MB once rather than twice.
+    with _locked(derived):
+        # A target that exists and is not marked complete was left by a crash. It is not repaired
+        # in place: a fresh tree is staged beside it and published over it, so nothing ever reads
+        # a directory while it is being made correct.
         #
-        # A target that exists but is not both complete and sealed was left by a crash or by a
-        # chmod that failed part way through. It is not repaired in place: a fresh tree is staged
-        # beside it and published over it, so nothing ever reads a directory while it is being
-        # made correct.
         # Named rather than enumerated, and only the ones this corpus has: a corpus missing one
         # of them fails where the world tries to open it, with upstream's own words, which is
         # where it failed before this list existed too. What the list changes is the other
@@ -397,8 +390,7 @@ def derive_root(
         outstanding = [
             original / name
             for name in SHARED_ENTRIES
-            if (original / name).exists()
-            and not (_complete(derived / name) and _sealed(derived / name))
+            if (original / name).exists() and not _complete(derived / name)
         ]
         (derived / "tasks").mkdir(exist_ok=True)
         for entry in outstanding:
