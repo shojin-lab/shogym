@@ -37,6 +37,14 @@ shogym = "shogym.cli:main"
 
 [project.optional-dependencies]
 analysis = ["pandas>=2.2", "duckdb>=1.0"]
+# Durable serving under protocol v2 (src/shogym/serve/protocol_v2/kernel). Temporal owns the
+# stream's history, its replay, and its timers, so the durable runner needs the `temporalio`
+# client, worker, and workflow SDK. Kept optional because the quickstart must not need it:
+# `pip install shogym` plus an API key still runs an episode, and nothing on that path imports
+# `temporalio`. The runner starts its own embedded dev server (a SQLite file under
+# ~/.cache/shogym/temporal/, or SHOGYM_TEMPORAL_ADDRESS to use a server someone else runs), so
+# installing this extra is the whole of the setup.
+durable = ["temporalio>=1.32"]
 # The tau2-bench port (src/shogym/envs/tau2). Upstream is pinned to commit 1d244f5 but **cannot be
 # a requirement**: PyPI forbids direct (`@ git+https://`) references, and the `tau2` name on PyPI
 # belongs to an unrelated magnetochemistry library, so a plain `tau2` requirement would silently
@@ -172,6 +180,10 @@ dev = [
     "shogym[frontier_bench]",
     "shogym[automationbench]",
     "shogym[browsecomp_plus]",
+    # Not an env extra: the durable kernel's workflow code has to be type-checked and its
+    # offline tests have to import it, so `uv sync` installs it. A user who never wants
+    # Temporal never installs this group.
+    "shogym[durable]",
 ]
 
 [build-system]
