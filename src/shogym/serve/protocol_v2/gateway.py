@@ -51,11 +51,14 @@ from hashlib import sha256
 from pathlib import Path
 from typing import (
     Any,
+    Awaitable,
+    Callable,
     Coroutine,
     Dict,
     FrozenSet,
     List,
     Optional,
+    Sequence,
     Tuple,
     TypeVar,
     Union,
@@ -70,13 +73,17 @@ from temporalio.service import RPCError
 
 from shogym.serve.episode import ServedEpisode
 from shogym.serve.protocol_v2 import (
+    IMMEDIATE,
+    NEVER,
     ProtocolError,
     PullRequest,
+    ReleasePlan,
     TerminalMetadata,
     WireFormatError,
     PresentationCommit,
     canonical_bytes,
     canonical_json,
+    check_release,
     length_prefixed,
     require_opaque_id,
 )
@@ -84,12 +91,14 @@ from shogym.serve.protocol_v2.kernel import (
     ConsumerClaim,
     EnvironmentCall,
     OfferedMessage,
+    QueueClosed,
     SealRequest,
     StreamHandle,
     StreamStart,
     StreamState,
     TaskItem,
     TerminalTool,
+    assignments_for,
     durable_client,
     protocol_error_code,
     start_stream,
@@ -114,6 +123,17 @@ _CLOSING = "closing"
 _CLOSED = "closed"
 
 _Result = TypeVar("_Result")
+
+#: How a generation gets a world for the task it is about to serve. One episode is one task's
+#: world: it is opened when that task is presented and closed when the attempt is over. It is
+#: told which attempt it is opening for, because sealing an attempt belongs to the environment
+#: rather than to this transport, and an environment that seals by stopping its own world has to
+#: be told which world that attempt filed in. This gateway is the only thing that knows.
+EpisodeOpener = Callable[[str], Awaitable[ServedEpisode]]
+
+#: A release plan built from the queue it releases. A gate names an attempt and the attempts are
+#: minted where the generation is, so a composer that gates one is handed the tasks it gates.
+ReleaseFor = Callable[[Sequence[TaskItem]], ReleasePlan]
 
 # The version this gateway declares for the canonical submission its terminal captures. The
 # capture itself belongs to the environment, so the name says which gateway made the promise.
@@ -268,17 +288,65 @@ def _configuration_hash(spec: TaskSpec, terminal: ToolManifest) -> str:
     return sha256(canonical_json(served_manifest(spec, terminal))).hexdigest()
 
 
-def stream_start(spec: TaskSpec, terminal: ToolManifest, *, claim_hash: str) -> StreamStart:
-    """Return the generation that serves ``spec``: one task, one attempt, one obligation."""
-    item = TaskItem(
-        task_position=0,
-        attempt_id=_opaque(),
-        task_message_id=_opaque(),
-        ack_message_id=_opaque(),
-        payload_position=0,
-        payload_message_id=_opaque(),
-        body=spec.instructions,
+def stream_start(
+    spec: TaskSpec,
+    terminal: ToolManifest,
+    *,
+    claim_hash: str,
+    bodies: Optional[Sequence[str]] = None,
+    release: Optional[Union[ReleasePlan, ReleaseFor]] = None,
+    without_payload: Sequence[int] = (),
+    evaluation_only: bool = False,
+) -> StreamStart:
+    """Return a generation that serves ``spec``.
+
+    This is the one place a generation is built, so it is the one place the manifest, the
+    preallocated public identifiers, the assignment roster, and the release plan are decided
+    together. They have to be: a roster names positions the manifest declares, and a plan can
+    gate a task only by the attempt ID this function minted for it. So a plan that gates
+    anything is given as a function of the queue rather than as a finished value: it is called
+    with the tasks, in order, once they exist and before anything has been served.
+
+    ``bodies`` is the closed queue, one work order to an entry, and it defaults to the episode's
+    own instructions as a single task. ``without_payload`` names the positions this generation
+    delivers nothing against: they are served, worked, and scored like every other task, and a
+    leg's filler is what needs them. An evaluation-only generation is one that scores without
+    delivering: it pins Never, and a plan that would produce an outbox is refused here rather
+    than left to be noticed when a payload turns up in a transcript.
+
+    What comes back is a generation the stream would accept, because the same check the stream
+    makes at start is made here, where the caller composing a run is the one who reads it.
+    """
+    items = [
+        TaskItem(
+            task_position=position,
+            attempt_id=_opaque(),
+            task_message_id=_opaque(),
+            ack_message_id=_opaque(),
+            payload_position=position,
+            payload_message_id=_opaque(),
+            body=body,
+        )
+        for position, body in enumerate(bodies if bodies is not None else [spec.instructions])
+    ]
+    if callable(release):
+        plan = release(items)
+    else:
+        plan = release if release is not None else (NEVER if evaluation_only else IMMEDIATE)
+    if evaluation_only and plan.creates_obligations:
+        raise ValueError(
+            "an evaluation-only generation delivers no payload, so its release plan must be "
+            f"Never, and this one releases {plan.predicate!r}"
+        )
+    if any(position not in range(len(items)) for position in without_payload):
+        raise ValueError(
+            "a position that carries no payload is one of this generation's own tasks, and "
+            f"this queue has {len(items)}"
+        )
+    roster = assignments_for(
+        items, plan, without_payload=[items[position].attempt_id for position in without_payload]
     )
+    check_release(plan, roster, evaluation_only=evaluation_only)
     return StreamStart(
         configuration_hash=_configuration_hash(spec, terminal),
         consumer_claim_hash=claim_hash,
@@ -292,7 +360,10 @@ def stream_start(spec: TaskSpec, terminal: ToolManifest, *, claim_hash: str) -> 
             native_terminal_name=terminal.name,
             argument_names=declared_argument_names(terminal.input_schema),
         ),
-        tasks=[item],
+        tasks=items,
+        release=plan,
+        assignments=roster,
+        evaluation_only=evaluation_only,
     )
 
 
@@ -478,9 +549,17 @@ class StreamGateway:
         terminal: ToolManifest,
         *,
         initial_cursor: str,
+        open_episode: Optional[EpisodeOpener] = None,
     ) -> None:
         self._stream = stream
-        self._episode = episode
+        # The world the attempt in front of the model is working in, the attempt it belongs to,
+        # and how the attempt after it gets one of its own. A task is a fresh world: the seal
+        # captures what an attempt left behind, so a second attempt in a world its predecessor
+        # worked in would file that predecessor's work. The generation's own episode belongs to
+        # nobody until the first task is presented, and it belongs to that attempt afterwards.
+        self._episode: Optional[ServedEpisode] = episode
+        self._world_attempt: Optional[str] = None
+        self._open_episode = open_episode
         self._spec = spec
         self._terminal = terminal.name
         self._cursor = initial_cursor
@@ -624,7 +703,9 @@ class StreamGateway:
             await asyncio.wait([landing])
         await self._given_back_on_stop()
         self._serving = _CLOSED
-        await self._episode.close()
+        # A generation that sealed its last attempt has already let go of the world it was in,
+        # so stopping closes the world there is one of and not the one there was.
+        await self._close_world()
 
     async def _given_back_on_stop(self) -> None:
         """Give back a grant this transport is still holding, and keep what it landed with."""
@@ -665,6 +746,24 @@ class StreamGateway:
         result = await self._decisive(key, self._stream.seal(request))
         return await self._deliver(result, key)
 
+    async def stream_state(self) -> StreamState:
+        """Read the generation's state without changing it.
+
+        Harness-only, like the Query it forwards. No tool reaches this: a model that could read
+        the schedule's counts would learn from them what a Wait is shaped to withhold.
+        """
+        return await self._stream.stream_state()
+
+    async def close_queue(self) -> QueueClosed:
+        """Close the generation's queue to insertion.
+
+        This is a controller call and not a tool. It is reachable from the process that composed
+        the generation and from nothing the model can reach. Closing is what makes Done
+        reachable, so who does it and when is a decision about the run rather than about this
+        transport.
+        """
+        return await self._sent(self._stream.close_queue())
+
     async def _environment(
         self, key: bytes, tool_name: str, arguments: Dict[str, Any]
     ) -> ToolResult:
@@ -680,13 +779,16 @@ class StreamGateway:
         owed = await self._resumed(key)
         if owed is not None:
             return owed
+        episode = self._episode
+        if episode is None:  # pragma: no cover - an active attempt has a world by definition
+            raise self._refuse("invalid_attempt")
         held = _LeaseHeld(
             owner=key, call=EnvironmentCall(call_id=_opaque(), attempt_id=attempt_id)
         )
         self._recovery = held
         await self._granted(held)
         try:
-            observation = await self._episode.call(tool_name, native)
+            observation = await episode.call(tool_name, native)
         except BaseException:
             # The world's own failure is what its caller is told about. The release still goes,
             # and one that faults too leaves the grant where this call will find it again.
@@ -1135,7 +1237,14 @@ class StreamGateway:
         the stream answers a repeated attestation with the acknowledgement of the one it did
         apply. What the message owes survives the acknowledgement, because the bytes are not
         read until the call that asked for them returns them.
+
+        The world this message opens or closes changes before the attestation rather than after
+        it. A Presentation is durable the moment it is committed, so anything that can fail is on
+        the side of that commit where failing costs nothing: the message stays where the stream
+        is holding it, and the call that comes back for it starts over. What is left after the
+        commit is bookkeeping that cannot fail.
         """
+        await self._prepared(record.message)
         self._recovery = _PresentationUncertain(
             owner=record.owner, message=record.message, commit=record.commit
         )
@@ -1164,18 +1273,87 @@ class StreamGateway:
         )
         return record.message.visible_text
 
+    async def _prepared(self, message: OfferedMessage) -> None:
+        """Finish the world this message moves before the Presentation that reports it.
+
+        A presented task and a presented acknowledgement are the two moments a world opens and
+        closes, and both reach something outside this process, so both can fail. They happen
+        here, before the commit, and each of them repeats: a message this call could not
+        prepare is still the message the stream is holding, and the call that comes back for it
+        finds the world already opened or already closed and goes on to the commit.
+        """
+        if message.kind == "task" and message.attempt_id is not None:
+            await self._open_world(message.attempt_id)
+        elif message.kind == "seal_ack" and message.attempt_id is not None:
+            # The attempt is sealed, so nothing may still be done to it, and the world it was
+            # working in is what was sealed. A SealReject leaves the attempt where it was and
+            # deliberately does not reach this branch.
+            await self._close_world()
+
     def _applied(self, message: OfferedMessage, cursor: str) -> None:
-        """Move this transport the way presenting ``message`` moved the stream."""
+        """Move this transport the way presenting ``message`` moved the stream.
+
+        Nothing here reaches anything outside this process, which is what lets it run after the
+        Presentation is already durable: there is no state in which it half happened.
+        """
         self._transcript.append(message.visible_text.encode("utf-8"))
         self._cursor = cursor
         if message.kind == "task" and message.attempt_id is not None:
             self._active = self._active | {message.attempt_id}
         elif message.kind == "seal_ack" and message.attempt_id is not None:
-            # The attempt is sealed, so nothing may still be done to it. A SealReject leaves
-            # the attempt where it was and deliberately does not reach this branch.
             self._active = self._active - {message.attempt_id}
         elif message.kind == "done":
             self._closed = True
+
+    async def _open_world(self, attempt_id: str) -> None:
+        """Give the attempt being presented a world of its own.
+
+        A world belongs to the attempt it was opened for. The episode a generation was opened on
+        belongs to the first attempt it serves, and every attempt after that one gets a world
+        nothing has filed in yet: the seal captures what an attempt left behind, and a second
+        attempt in the same world would be filing the first attempt's work a second time.
+
+        So the world of an attempt that is over is retired here rather than inherited. A seal
+        retires it as it is acknowledged, but a seal is not the only way an attempt ends: one
+        the generation itself finalized, on a step cap or a deadline, presents nothing at all,
+        and the only place that shows is the next task arriving under a different attempt.
+
+        The opener is told the attempt its world is for, and this is the only moment anything
+        outside this gateway can learn it. Ordinary calls are routed here, but sealing is the
+        environment's own, and an environment that seals by stopping a world it started is
+        handed an attempt ID and has to find that attempt's world from it.
+        """
+        if self._world_attempt == attempt_id:
+            return
+        if self._world_attempt is None and self._episode is not None:
+            self._world_attempt = attempt_id
+            return
+        await self._close_world()
+        if self._open_episode is None:
+            raise RuntimeError(
+                "this generation has a task after the one its episode was opened for, and no "
+                "way to open a world for it"
+            )
+        self._episode = await self._open_episode(attempt_id)
+        self._world_attempt = attempt_id
+
+    async def _close_world(self) -> None:
+        """Let go of the world an attempt is done with.
+
+        Sealing is what makes the submission, so nothing this transport can still do to that
+        world would be part of it. An environment that seals by stopping its own world has
+        already stopped it; closing here is what releases everything the serving process was
+        holding for it, and it is the same call the process that opened the episode would make.
+
+        The reference is dropped after the close returns rather than before it. A cleanup that
+        failed is one something can still reach, and closing an episode twice is the episode's
+        own business, so the call that comes back for this message asks for it again.
+        """
+        episode = self._episode
+        if episode is not None:
+            await episode.close()
+        self._episode = None
+        self._world_attempt = None
 
     def _transcript_hash(self, text: str) -> str:
         """Hash everything presented so far, with ``text`` appended.
@@ -1259,29 +1437,55 @@ async def open_gateway(
     *,
     workflow_id: Optional[str] = None,
     consumer_id: Optional[str] = None,
+    start: Optional[StreamStart] = None,
+    open_episode: Optional[EpisodeOpener] = None,
 ) -> StreamGateway:
     """Start a generation for ``episode`` and bind this transport as its one consumer.
 
     The claim secret is minted here and never leaves. It is what authentication amounts to at
     this layer: the stream binds whoever presents it first, and a second transport presenting
     anything else is refused before a message has been offered.
+
+    ``start`` is the generation a controller composed, for a run whose manifest and schedule are
+    decided above one episode. Without it this opens the one-task generation the episode
+    implies. Either way the queue is left open: closing it is a controller's call rather than a
+    consequence of a transport connecting.
+
+    ``open_episode`` is how each task after the first gets its own world, and a generation with
+    more than one task is refused without it. The alternative is a run that reports success
+    while every task after the first was worked and scored in the world its predecessor sealed.
+    It is called with the attempt its world is for, so a caller serving an environment that
+    seals its own worlds can record which world each attempt filed in and end that attempt in
+    the world it worked in. ``episode`` is the first attempt's world, so the route a caller
+    builds from the opener covers every attempt after that one.
     """
     spec = episode.describe()
     terminal = terminal_manifest(spec)
-    start = stream_start(spec, terminal, claim_hash=sha256(secrets.token_bytes(32)).hexdigest())
+    composed = start or stream_start(
+        spec, terminal, claim_hash=sha256(secrets.token_bytes(32)).hexdigest()
+    )
+    if len(composed.tasks) > 1 and open_episode is None:
+        raise ValueError(
+            f"this generation has {len(composed.tasks)} tasks and one episode to serve them "
+            "with; each task is worked in a world of its own, so composing more than one needs "
+            "a way to open the next"
+        )
     stream = await start_stream(
-        client, start, workflow_id=workflow_id or f"stream/{_opaque()}/1"
+        client, composed, workflow_id=workflow_id or f"stream/{_opaque()}/1"
     )
     receipt = await stream.claim_consumer(
         ConsumerClaim(
-            consumer_id=consumer_id or _opaque(), claim_hash=start.consumer_claim_hash
+            consumer_id=consumer_id or _opaque(), claim_hash=composed.consumer_claim_hash
         )
     )
-    # The queue is closed at the start because it is complete at the start: this gateway serves
-    # the one episode it was opened on, so nothing can be inserted later and Done becomes
-    # reachable once that episode's task has been sealed, acknowledged, and paid out.
-    await stream.close_queue()
-    return StreamGateway(stream, episode, spec, terminal, initial_cursor=receipt.initial_cursor)
+    return StreamGateway(
+        stream,
+        episode,
+        spec,
+        terminal,
+        initial_cursor=receipt.initial_cursor,
+        open_episode=open_episode,
+    )
 
 
 async def run_stdio_v2(
@@ -1306,6 +1510,11 @@ async def run_stdio_v2(
         async with durable_client() as client:
             async with stream_worker(client):
                 gateway = await open_gateway(client, episode)
+                # This command is the controller as well as the transport, and its manifest is
+                # complete the moment it is built: one episode, one task. So it closes the
+                # queue before the model can pull, which is what makes Done reachable once
+                # that task has been sealed, acknowledged, and paid out.
+                await gateway.close_queue()
                 try:
                     await build_gateway_server(gateway).run_async(transport="stdio")
                 finally:
