@@ -1786,13 +1786,15 @@ async def test_an_interrupted_world_is_not_graded_even_when_it_stopped_cleanly(
 async def test_a_terminal_that_overtakes_a_block_does_not_grade_the_interrupted_save() -> None:
     """The race the serve layer creates on purpose, and what finalization does about it.
 
-    A terminal may overtake an ordinary call: a deadline has to be able to end an episode whose
-    block is not coming back. What must not follow is removing the container while upstream is
-    inside the save it ends every block with, because that leaves a tree that is stable and
-    partial and a grade taken over it is a grade of half a save.
+    A forced terminal may overtake an ordinary call: a deadline has to be able to end an episode
+    whose block is not coming back, and it is the only caller that may (an agent's own submission
+    queues behind the call the episode has already accepted). What must not follow is removing the
+    container while upstream is inside the save it ends every block with, because that leaves a
+    tree that is stable and partial and a grade taken over it is a grade of half a save.
 
     So finalization waits for the accepted call, bounded, and a world that will not settle is
-    refused rather than stopped underneath. This submits while a block is still running."""
+    refused rather than stopped underneath. This submits, as the deadline does, while a block is
+    still running."""
     import asyncio as _asyncio
 
     from shogym.envs.appworld import env_v1
@@ -1808,7 +1810,9 @@ async def test_a_terminal_that_overtakes_a_block_does_not_grade_the_interrupted_
     try:
         block = _asyncio.create_task(episode.call("execute", {"code": slow}))
         await _asyncio.sleep(1.0)
-        terminal = await episode.call("submit", {})
+        # `forced`, which is what the watchdog passes and what makes this a race at all: an
+        # ordinary submission waits for the block to commit, so it would find nothing to interrupt.
+        terminal = await episode.call("submit", {}, forced=True)
         block.cancel()
         with contextlib.suppress(BaseException):
             await block
