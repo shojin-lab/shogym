@@ -407,11 +407,11 @@ async def test_a_world_that_would_not_close_leaves_the_acknowledgement_where_it_
         def __getattr__(self, name: str) -> Any:
             return getattr(self._wrapped, name)
 
-        async def close(self) -> None:
+        async def close(self, *, finalize: bool = True) -> None:
             closes.append(len(closes))
             if len(closes) == 1:
                 raise RuntimeError("the world would not stop")
-            await self._wrapped.close()
+            await self._wrapped.close(finalize=finalize)
 
     async def open_world(attempt_id: str) -> Any:
         return WillNotStopOnce(await wordle_world(attempt_id))

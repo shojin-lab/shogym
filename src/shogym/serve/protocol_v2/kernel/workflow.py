@@ -126,6 +126,12 @@ OPEN = "open"
 DONE = "done"
 
 _ACTIVITY_TIMEOUT = timedelta(seconds=60)
+# What the seal and the grade are given instead. They are the two Activities that reach an
+# environment: stopping a world, copying what it persisted and running a grader over it are each
+# bounded by the environment rather than by this stream, and those bounds are minutes. Sixty
+# seconds is a cap the work would not fit under, and an Activity retried while its first attempt
+# is still running is the case a finalizer key has to survive rather than the case to arrange.
+_TERMINAL_ACTIVITY_TIMEOUT = timedelta(minutes=20)
 _ACTIVITY_RETRY = RetryPolicy(
     initial_interval=timedelta(seconds=1),
     backoff_coefficient=2.0,
@@ -171,8 +177,12 @@ class _Attempt:
     canonical_submission_text: Optional[str] = None
     environment_recovery_token: Optional[str] = None
     finalizer_key: Optional[str] = None
-    score: Optional[int] = None
+    score: Optional[float] = None
     decode_state: Optional[str] = None
+    # The object the environment took this score out of, by the hash that names it. The score is
+    # a number and this is what produced it, so a reader with the run's store can go from the
+    # committed headline to the verdict behind it.
+    graded_evidence: Optional[str] = None
     seal_ordinal: Optional[int] = None
 
 
@@ -636,6 +646,11 @@ class StreamWorkflow:
                 for key, value in self._attempts.items()
                 if value.task_start_checkpoint is not None
             },
+            graded_evidence={
+                key: value.graded_evidence
+                for key, value in self._attempts.items()
+                if value.graded_evidence is not None
+            },
             restoration_required=self._restoration_required(),
             attempts={key: value.state for key, value in self._attempts.items()},
             obligations={key: value.state for key, value in self._obligations.items()},
@@ -892,8 +907,9 @@ class StreamWorkflow:
                 native_terminal_name=request.native_terminal_name,
                 canonicalization_version=self._start.canonicalization_version,
                 native_arguments=request.native_arguments,
+                blob_root=self._start.blob_root,
             ),
-            start_to_close_timeout=_ACTIVITY_TIMEOUT,
+            start_to_close_timeout=_TERMINAL_ACTIVITY_TIMEOUT,
             retry_policy=_ACTIVITY_RETRY,
         )
         if sealed.attempt_id != attempt.item.attempt_id or sealed.seal_id != attempt.seal_id:
@@ -916,8 +932,9 @@ class StreamWorkflow:
                 submission_digest=attempt.submission_digest,
                 canonical_submission_text=sealed.canonical_submission_text,
                 environment_recovery_token=sealed.environment_recovery_token,
+                blob_root=self._start.blob_root,
             ),
-            start_to_close_timeout=_ACTIVITY_TIMEOUT,
+            start_to_close_timeout=_TERMINAL_ACTIVITY_TIMEOUT,
             retry_policy=_ACTIVITY_RETRY,
         )
         # Each result is checked where it arrives, before the next Activity is asked for. The
@@ -966,6 +983,13 @@ class StreamWorkflow:
         # at all. The bytes go out after this, which is what puts the seal before the Ack.
         attempt.score = graded.score
         attempt.decode_state = graded.decode_state
+        # The score and what it was taken from become authoritative together. A committed score
+        # whose evidence the generation kept no name for is a headline with nothing under it, so
+        # the reference is kept on the attempt and counted among the objects this history cites:
+        # a claim reads the store for all of them again before it may continue the generation.
+        attempt.graded_evidence = graded.evidence.sha256
+        if graded.evidence.sha256 not in self._committed_blobs:
+            self._committed_blobs.append(graded.evidence.sha256)
         self._seal_ordinal += 1
         attempt.seal_ordinal = self._seal_ordinal
         attempt.state = SEALED

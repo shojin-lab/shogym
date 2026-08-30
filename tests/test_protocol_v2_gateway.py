@@ -35,6 +35,7 @@ from mcp.shared.exceptions import McpError  # noqa: E402
 from temporalio.service import RPCError, RPCStatusCode  # noqa: E402
 
 from shogym.serve.episode import ServedEpisode  # noqa: E402
+from shogym.serve.protocol_v2 import gateway as gateway_module  # noqa: E402
 from shogym.serve.protocol_v2 import (  # noqa: E402
     Done,
     Payload,
@@ -47,13 +48,16 @@ from shogym.serve.protocol_v2 import (  # noqa: E402
     visible_bytes,
 )
 from shogym.serve.protocol_v2.gateway import (  # noqa: E402
+    CANONICALIZATION_VERSION,
     PULL_TOOL,
     GatewayClosed,
     StreamGateway,
     build_gateway_server,
     declared_argument_names,
     durable_client,
+    environment_terminal,
     open_gateway,
+    stream_start,
     stream_worker,
     terminal_manifest,
     wrapped_manifests,
@@ -70,11 +74,20 @@ from shogym.serve.protocol_v2.gateway import (  # noqa: E402
 from shogym.serve.protocol_v2.kernel import OfferedMessage, StreamProtocolError  # noqa: E402
 from shogym.serve.protocol_v2.rundir import open_run_directory  # noqa: E402
 from shogym.task import TaskSpec, ToolManifest  # noqa: E402
+from shogym.trace import load_traces  # noqa: E402
+
+from tests._fixtures import score_env, score_mcp  # noqa: E402
 
 TEST_ENV = "wordle_v1"
+# The env that scores its own terminal. It is what brings a seal lifecycle and a durable
+# finalization store, and a test that reads what a v2 ending leaves behind needs an env that has
+# them: an env without them has nothing to end twice.
+SCORING_ENV = score_env.ENV_NAME
 ATTEMPT = "00000000000000000000000000000100"
 TASK_ID = "00000000000000000000000000000101"
 ACK_ID = "00000000000000000000000000000102"
+SECOND_ATTEMPT = "00000000000000000000000000000200"
+SECOND_TASK_ID = "00000000000000000000000000000201"
 DONE_ID = "00000000000000000000000000000002"
 CURSOR = "00000000000000000000000000000001"
 
@@ -100,6 +113,10 @@ ACK_OFFER = offered(
         canonicalization_version="shogym.gateway.1",
     ),
     ATTEMPT,
+)
+SECOND_TASK_OFFER = offered(
+    Task(message_id=SECOND_TASK_ID, attempt_id=SECOND_ATTEMPT, body="Guess the next word."),
+    SECOND_ATTEMPT,
 )
 DONE_OFFER = offered(Done(message_id=DONE_ID))
 
@@ -400,6 +417,15 @@ async def episode() -> AsyncIterator[ServedEpisode]:
         await started.close()
 
 
+async def scoring_world(trace_path: Optional[Path] = None) -> ServedEpisode:
+    """One world of the env that scores its own terminal, started the way this protocol serves.
+
+    In one place because it is what the cross layer tests below open, and what a world of theirs
+    is started with is a property of this protocol rather than of any one of them.
+    """
+    return await ServedEpisode.start(SCORING_ENV, task=0, trace_path=trace_path)
+
+
 def make_gateway(episode: ServedEpisode, stream: ScriptedStream) -> StreamGateway:
     spec = episode.describe()
     return StreamGateway(
@@ -606,6 +632,231 @@ def test_the_configuration_is_what_this_gateway_serves() -> None:
     assert served == ["act", "file_bands"]
     changed = with_tool(spec, "terminate", description="Give up already.")
     assert configuration_of(changed) == configuration_of(spec)
+
+
+def test_what_the_environment_is_configured_as_is_part_of_the_configuration() -> None:
+    """A setting the model cannot see can still decide what its filing is worth.
+
+    An environment may draw a hidden key, grade against one corpus rather than another, or hand
+    an episode a different machine, and none of that appears in a tool description. So a
+    generation carries the digest the environment publishes of itself, and a resume under a
+    changed one is refused rather than worked and scored against a key nobody drew for it. An
+    environment that publishes nothing hashes exactly what it hashed before.
+    """
+    spec = hashing_spec()
+    terminal = terminal_manifest(spec)
+    plain = stream_start(spec, terminal, claim_hash="a" * 64)
+    assert plain.configuration_hash == configuration_of(spec)
+    first = stream_start(spec, terminal, claim_hash="a" * 64, environment_digest="pulse-0")
+    second = stream_start(spec, terminal, claim_hash="a" * 64, environment_digest="pulse-1")
+    assert first.configuration_hash != second.configuration_hash
+    assert first.configuration_hash != plain.configuration_hash
+
+
+def test_an_environment_is_asked_how_its_attempts_end_and_answers_with_its_own_route() -> None:
+    """One that brings its own terminal replaces the version, the Activities and the identity.
+
+    The route is what the answer is built over rather than one world, because the Activities are
+    registered once and a generation may serve a task after this one. An environment that brings
+    nothing keeps the stand-ins, declares this gateway's version, and adds nothing to the
+    identity, which is what leaves every other environment's generation byte for byte as it was.
+    """
+    asked: List[Any] = []
+
+    class Own:
+        def protocol_v2_terminal(self, route: Any) -> Any:
+            asked.append(route)
+            return "world.1", ["seal", "grade"], "config-7"
+
+    own = environment_terminal(SimpleNamespace(env=Own(), session_id="session-1"))
+    assert own.canonicalization_version == "world.1"
+    assert own.activities == ["seal", "grade"]
+    assert own.configuration_digest == "config-7"
+    assert asked == [own.route]
+    assert own.route("00000000000000000000000000000100") is None
+
+    plain = environment_terminal(SimpleNamespace(env=object(), session_id="session-2"))
+    assert plain.canonicalization_version == CANONICALIZATION_VERSION
+    assert plain.configuration_digest is None
+    assert len(plain.activities) == 4
+
+
+def test_a_world_belongs_to_the_attempt_it_was_opened_for() -> None:
+    """The route says which world each attempt filed in, and answers nothing for the others."""
+    route = environment_terminal(SimpleNamespace(env=object(), session_id="session-1")).route
+    world = SimpleNamespace(env="env-a", session_id="session-a")
+    route.record("00000000000000000000000000000100", world)
+    assert route("00000000000000000000000000000100") == ("env-a", "session-a")
+    assert route("00000000000000000000000000000200") is None
+
+
+async def test_a_generation_a_controller_composed_ends_the_way_its_environment_does(
+    episode: ServedEpisode, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The environment says how its attempts end, whoever composed the queue they end in.
+
+    A run whose manifest and schedule are decided above one episode hands this call the
+    generation it composed, and that is the ordinary shape for more than one task. The
+    environment is still what the acknowledgements declare their digests were taken under and
+    still the other half of what the generation is, so both are applied here rather than only
+    where this call composes the generation itself. A composed one that kept this gateway's own
+    version would have its first terminal refused as a mismatch, by the environment, after the
+    world was worked.
+    """
+    spec = episode.describe()
+    terminal = terminal_manifest(spec)
+    composed = stream_start(spec, terminal, claim_hash="a" * 64, bodies=["one", "two"])
+    assert composed.canonicalization_version == CANONICALIZATION_VERSION
+
+    monkeypatch.setattr(
+        episode.env,
+        "protocol_v2_terminal",
+        lambda route: ("world.1", [], "pulse-7"),
+        raising=False,
+    )
+    environment = environment_terminal(episode)
+    started: List[Any] = []
+
+    class Started:
+        async def claim_consumer(self, claim: Any) -> Any:
+            return SimpleNamespace(initial_cursor=CURSOR)
+
+    async def capture(client: Any, start: Any, *, workflow_id: str) -> Any:
+        started.append(start)
+        return Started()
+
+    async def opener(attempt_id: str) -> ServedEpisode:
+        raise AssertionError("no world is opened by composing a generation")
+
+    monkeypatch.setattr(gateway_module, "start_stream", capture)
+    await open_gateway(
+        None,  # type: ignore[arg-type]
+        episode,
+        start=composed,
+        open_episode=opener,
+        environment=environment,
+    )
+    assert started[0].canonicalization_version == "world.1"
+    assert started[0].configuration_hash == _configuration_hash(spec, terminal, "pulse-7")
+    assert started[0].tasks == composed.tasks
+    # The controller's own object is left as it composed it.
+    assert composed.canonicalization_version == CANONICALIZATION_VERSION
+
+
+class ClaimedStream(ScriptedStream):
+    """The scripted stream, reachable through the call that starts a generation on one."""
+
+    async def claim_consumer(self, claim: Any) -> Any:
+        return SimpleNamespace(initial_cursor=CURSOR)
+
+
+async def test_a_world_that_is_not_the_environment_the_generation_declared_is_refused(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A later task is worked in the environment the generation committed to, or in none.
+
+    The generation's identity carries what its environment is configured as, taken from the
+    episode it was opened on, and that is what a resume is held to. Every task after the first
+    is worked in a world this gateway opens, and an opener that answered with a differently
+    configured environment would have that task scored under a hidden rule the generation never
+    committed to, while its own hash still named the first one. So the answer is checked before
+    the world is routed or the task presented, and a world that is not what the generation
+    declared is let go of rather than served.
+    """
+    first = await scoring_world()
+    later = await scoring_world()
+    monkeypatch.setattr(
+        first.env,
+        "protocol_v2_terminal",
+        lambda route: ("world.1", [], "pulse-0"),
+        raising=False,
+    )
+    monkeypatch.setattr(
+        later.env,
+        "protocol_v2_terminal",
+        lambda route: ("world.1", [], "pulse-1"),
+        raising=False,
+    )
+    environment = environment_terminal(first)
+    spec = first.describe()
+    composed = stream_start(
+        spec, terminal_manifest(spec), claim_hash="a" * 64, bodies=["one", "two"]
+    )
+    stream = ClaimedStream(TASK_OFFER, ACK_OFFER, SECOND_TASK_OFFER)
+
+    async def started(client: Any, start: Any, *, workflow_id: str) -> Any:
+        return stream
+
+    opened: List[str] = []
+
+    async def opener(attempt_id: str) -> ServedEpisode:
+        opened.append(attempt_id)
+        return later
+
+    monkeypatch.setattr(gateway_module, "start_stream", started)
+    gateway = await open_gateway(
+        None,  # type: ignore[arg-type]
+        first,
+        start=composed,
+        open_episode=opener,
+        environment=environment,
+    )
+    assert json.loads(await gateway.pull({}))["kind"] == "task"
+    filing = {"attempt_id": ATTEMPT, "arguments": {"answer": "4"}}
+    assert json.loads(await gateway.terminal(filing))["kind"] == "seal_ack"
+
+    with pytest.raises(RuntimeError):
+        await gateway.pull({})
+    assert opened == [SECOND_ATTEMPT]
+    # The world was let go of, so nothing is left running in a configuration nothing serves.
+    assert score_mcp.gold(later.session_id) == ""
+    # It was never routed, so no seal can reach it, and the task was never presented, so the
+    # model never saw work it would have had scored under it.
+    assert environment.route(SECOND_ATTEMPT) is None
+    assert gateway.cursor == ACK_ID
+    assert [commit.message_id for commit in stream.commits] == [TASK_ID, ACK_ID]
+    assert stream.pending is SECOND_TASK_OFFER
+    await gateway.aclose()
+
+
+async def test_a_world_the_stream_sealed_is_let_go_of_without_a_second_ending(
+    tmp_path: Path,
+) -> None:
+    """The stream sealed and scored this attempt, so nothing here may end it a second time.
+
+    An environment that scores its own terminal brings a seal lifecycle and a durable
+    finalization store with it, and under this protocol a filing reaches neither: it becomes the
+    stream's terminal request, and what it was worth comes back in the acknowledgement. The
+    world is still let go of as that acknowledgement is presented, and an ordinary close reads
+    the untouched lifecycle as an episode that ended without a seal and claims an abort for it.
+    That abort is a second result for a scored attempt, in a durable record and in the trace,
+    and it says the attempt was aborted and worth nothing.
+    """
+    trace = tmp_path / "run.jsonl"
+    episode = await scoring_world(trace)
+    session = episode.session_id
+    stream = ScriptedStream(TASK_OFFER, ACK_OFFER)
+    gateway = make_gateway(episode, stream)
+    try:
+        assert json.loads(await gateway.pull({}))["kind"] == "task"
+        played = await gateway.environment("noop", {"attempt_id": ATTEMPT, "arguments": {}})
+        assert json.loads(played.content[0].text)["ok"]
+        filing = {"attempt_id": ATTEMPT, "arguments": {"answer": "4"}}
+        assert json.loads(await gateway.terminal(filing))["kind"] == "seal_ack"
+    finally:
+        await gateway.aclose()
+
+    # The world is let go of the way any other is: the session it was worked in is released.
+    assert score_mcp.gold(session) == ""
+    # And nothing ended it a second time. The durable store holds no record, the episode has no
+    # verdict of its own, and the trace ends at the last call that really happened.
+    assert episode._store is not None
+    assert episode._store.load_all() == []
+    assert episode._evidence is None
+    assert episode._terminal_feedback == []
+    rows = load_traces(trace)
+    assert [row["tool"] for row in rows] == ["noop"]
+    assert [row for row in rows if row.get("terminated") or "verdict" in row] == []
 
 
 async def test_pull_takes_nothing_and_every_environment_tool_is_wrapped(
@@ -1415,6 +1666,7 @@ class BlockingEpisode:
         self.landed: List[str] = []
         self.fault: Optional[BaseException] = None
         self.closed_after: Optional[List[str]] = None
+        self.finalized: Optional[bool] = None
 
     async def call(self, tool_name: str, arguments: Dict[str, Any]) -> Any:
         await self.gate.wait()
@@ -1423,9 +1675,14 @@ class BlockingEpisode:
         self.landed.append(tool_name)
         return Observation()
 
-    async def close(self) -> None:
-        """Record what had landed by the time this episode was closed."""
+    async def close(self, *, finalize: bool = True) -> None:
+        """Record what had landed by the time this episode was closed, and how.
+
+        The keyword is the real episode's: a world let go of by this transport is not a world
+        whose attempt this transport ends, so what a stream-owned cleanup passes is read here.
+        """
         self.closed_after = list(self.landed)
+        self.finalized = finalize
 
 
 async def test_a_cancelled_call_holds_the_gateway_until_the_environment_lands(
@@ -2301,6 +2558,9 @@ async def test_closing_this_gateway_is_idempotent_and_closes_the_episode_last(
 
     await gateway.aclose()
     assert world.closed_after == []
+    # Released rather than ended. What became of the attempt this world was opened for is the
+    # generation's to say, and a transport stopping is not it saying so.
+    assert world.finalized is False
     shutdown = gateway._shutdown
     await gateway.aclose()
     assert gateway._shutdown is shutdown
