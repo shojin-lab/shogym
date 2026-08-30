@@ -34,6 +34,7 @@ import json
 import os
 import re
 import subprocess
+import tempfile
 import time
 import uuid
 from dataclasses import dataclass
@@ -44,6 +45,13 @@ from typing import IO, Callable, Dict, List, Optional, Sequence, Tuple
 from shogym.envs._upstream import _locked
 
 _DOCKER = "docker"
+
+#: The host kernel's ring buffer, and the way to ask for it on a machine that keeps that buffer
+#: privileged. Both are read only, both are read only after a worker has already been killed, and
+#: neither changes anything: ``dmesg`` prints, and the second invocation is the first one under a
+#: ``sudo`` that is told never to prompt for a password.
+_DMESG = "dmesg"
+_SUDO = "sudo"
 
 #: Where the served corpus is mounted, and where an episode's world therefore lives. A fixed name
 #: rather than the host's own path: the host path names a directory in the run's cache, and a name
@@ -178,6 +186,63 @@ _CONTROL_TIMEOUT_SECONDS = 10.0
 #: worth a graceful shutdown (the state upstream persists is written at the end of every block,
 #: not at exit), and every second here is a second of the teardown budget.
 _STOP_GRACE_SECONDS = 0
+
+#: How long the client gets to finish exiting before :func:`diagnosis` reports it as still running.
+#: End-of-file on the client's stdout means the client is on its way out, so this is a short wait
+#: on a process that has already stopped rather than a poll of a running one.
+_CLIENT_EXIT_SECONDS = 5.0
+
+#: How much of a dead container's stderr a failure carries. The last bytes are the ones worth
+#: having: a daemon's refusal to start anything is a single line, and a worker that died inside a
+#: call wrote whatever it managed at the end. A few hundred fits on one line of a CI log.
+_STDERR_TAIL_BYTES = 400
+
+#: How long the daemon gets to answer for a window of events that has already closed. Short,
+#: because this runs on a failure path a caller is already waiting on and what it adds corroborates
+#: a diagnosis rather than making one: nothing is lost by giving up on it.
+_EVENTS_TIMEOUT_SECONDS = 5.0
+
+#: How much of the kernel's ring buffer a killed worker's diagnosis looks at. The kill this is
+#: after happened seconds ago, so it is at the end of the buffer by construction, and a tail keeps
+#: a busy host's earlier pressure out of the reading.
+_KERNEL_LOG_LINES = 200
+
+#: How many matching kernel lines the diagnosis carries. A host kill writes several: the
+#: constraint, the accounting for every candidate, and the verdict. The last two are the verdict
+#: and the line before it, which is what names the process, and a CI log is a line wide.
+_KERNEL_LOG_MATCHES = 2
+
+#: How much of one kernel line is kept. The victim and its numbers are at the end of the line the
+#: kernel writes, so an unbounded line is not worth an unbounded failure message.
+_KERNEL_LINE_BYTES = 300
+
+#: How long the kernel log gets to be read. Same reasoning as the daemon's events: a caller is
+#: already waiting on a failure, and this corroborates a case rather than deciding one.
+_KERNEL_LOG_TIMEOUT_SECONDS = 5.0
+
+#: What the kernel writes when it kills for memory. ``Out of memory`` and ``Killed process`` are
+#: the killer's own wording, ``oom-kill`` is the structured line newer kernels write beside them,
+#: and any of the three is the evidence this is looking for. It matches whatever process the
+#: kernel names, not only a worker: a host that killed something else at that instant is a host
+#: under memory pressure, which is the fact in question.
+_OOM_KILL = re.compile(r"Out of memory|oom-kill|Killed process")
+
+#: The stderr of every container this process started and has not yet given up, by name.
+#:
+#: **A file rather than a pipe, and that is what makes capturing it safe.** Nothing here reads a
+#: worker's stderr while the worker is running, so a pipe fills at the kernel's buffer and the
+#: container blocks in ``write`` for ever, which is a hang introduced to explain a hang. A
+#: temporary file is unlinked when it is made, so it costs one descriptor, holds nothing after
+#: this process ends, and never applies back pressure to the writer.
+_STDERR: Dict[str, "IO[bytes]"] = {}
+
+#: When each container this process launched was started, by name.
+#:
+#: ``docker events`` is a query over a window and needs one end of it. The daemon's own answer,
+#: ``State.StartedAt``, is on the container and so is gone exactly when the events are worth
+#: reading; the launch instant is this process's own, is never later than the container's, and a
+#: window that starts a little early is a window that misses nothing.
+_LAUNCHED: Dict[str, float] = {}
 
 #: Every container this port starts carries these. The first says whose they are, the second says
 #: which process started them, and together they are what lets a later run tell an abandoned
@@ -420,7 +485,10 @@ def run(
     container = name or f"shogym-appworld-{role}-{uuid.uuid4().hex[:12]}"
     args: List[str] = [
         "run",
-        "--rm",
+        # **Not `--rm`.** The daemon holds a container's `State.ExitCode` and `State.OOMKilled` on
+        # the corpse and discards both with the container, so a container removed the instant it
+        # exits is one nothing can ask about. Every path out of a worker removes it by name
+        # instead (see `remove`), and the labels below are what a sweep finds when no path ran.
         "-i",
         "--name",
         container,
@@ -491,13 +559,25 @@ def run(
     # mutable: a rebuild between resolving the identity and starting the world would run bytes the
     # run recorded nothing about. The id names one image and cannot move.
     args += [image_identity(image_name()).split()[0], role, *arguments]
-    process = subprocess.Popen(
-        [_DOCKER, *args],
-        stdin=subprocess.PIPE,
-        stdout=subprocess.PIPE,
-        stderr=subprocess.DEVNULL,
-        bufsize=0,
-    )
+    # Kept rather than discarded, because it is the only place a container that died says why.
+    # See `_STDERR` for why it is a file and not a pipe.
+    errors = tempfile.TemporaryFile()
+    # Before the launch and not after it, because it is one end of the window `diagnosis` asks
+    # the daemon's event log about and an end taken late is events dropped.
+    launched = time.time()
+    try:
+        process = subprocess.Popen(
+            [_DOCKER, *args],
+            stdin=subprocess.PIPE,
+            stdout=subprocess.PIPE,
+            stderr=errors,
+            bufsize=0,
+        )
+    except OSError:
+        errors.close()
+        raise
+    _STDERR[container] = errors
+    _LAUNCHED[container] = launched
     return process, container
 
 
@@ -530,12 +610,268 @@ def absent(container: str) -> bool:
     )
 
 
+def stderr_tail(container: str, limit: int = _STDERR_TAIL_BYTES) -> str:
+    """The end of what a container wrote to stderr, or the empty string if it wrote nothing.
+
+    Read with ``pread`` rather than a seek. ``subprocess`` hands the child a duplicate of this
+    descriptor, so the two share one file offset: seeking to the end to measure the file would
+    move the offset a still-running container writes at, and the next line it wrote would land on
+    top of an earlier one."""
+    handle = _STDERR.get(container)
+    if handle is None:
+        return ""
+    try:
+        descriptor = handle.fileno()
+        size = os.fstat(descriptor).st_size
+        start = max(0, size - limit)
+        return os.pread(descriptor, size - start, start).decode("utf-8", "replace")
+    except (OSError, ValueError):
+        return ""
+
+
+def forget(container: str) -> None:
+    """Drop what this process was holding for a container that is over.
+
+    Every removal path calls this, because the alternative is a descriptor, a temporary file and
+    a launch instant per container for the life of a serving process that may start hundreds."""
+    _LAUNCHED.pop(container, None)
+    handle = _STDERR.pop(container, None)
+    if handle is None:
+        return
+    try:
+        handle.close()
+    except OSError:
+        pass
+
+
+def _client_exit(process: subprocess.Popen) -> Optional[int]:
+    """The status the ``docker run`` client exited with, or ``None`` if it has not exited."""
+    try:
+        return process.wait(timeout=_CLIENT_EXIT_SECONDS)
+    except (subprocess.TimeoutExpired, OSError, ValueError):
+        return None
+
+
+def _container_state(container: str) -> Tuple[Optional[int], bool, str]:
+    """What the daemon still knows about a container: its exit code, whether it was OOM killed,
+    and a phrase for the case where there is nothing left to ask about.
+
+    Read as structure and not as words, for the reason the reaper reads its labels that way: two
+    fields printed side by side and split on whitespace is a value rebuilt rather than a value
+    read.
+
+    **A worker's container is left standing when it exits, which is what makes this answer.**
+    Absence is still a possible answer, and it says one of two things: the daemon never had this
+    container, or somebody else has already taken it."""
+    answered = _run(
+        ["inspect", "--format", "{{json .State}}", container],
+        timeout=_CONTROL_TIMEOUT_SECONDS,
+        check=False,
+    )
+    if answered.returncode != 0:
+        said = (answered.stderr + answered.stdout).strip()
+        if any(phrase in said.lower() for phrase in _NOT_FOUND):
+            return None, False, "the container is absent"
+        return None, False, f"the container's state could not be read ({said[:200]})"
+    try:
+        state = json.loads(answered.stdout or "{}") or {}
+    except ValueError:
+        return None, False, "the container's state did not parse"
+    code = state.get("ExitCode")
+    return (
+        code if isinstance(code, int) else None,
+        bool(state.get("OOMKilled")),
+        "the container's state names no exit code",
+    )
+
+
+def _events(container: str) -> str:
+    """What the daemon logged about a container ending, over a window that has already closed.
+
+    A second witness, and not the same one. ``docker inspect`` reports the state that survived the
+    death; the log reports what the daemon was told at the time, so an ``oom`` line is there even
+    where the surviving state recorded none, and the exit code a ``die`` carries is the daemon's
+    own rather than the one the client relayed. A death the two disagree about is worth reading as
+    itself.
+
+    Bounded, and with ``--until`` already past, so this is a query rather than the stream
+    ``docker events`` is by default. Anything that fails is nothing at all: this corroborates a
+    diagnosis and no case rests on it.
+
+    Called before the container is removed, like everything else here, because ``--filter
+    container=`` takes a name and the daemon resolves names it still has."""
+    since = _LAUNCHED.get(container)
+    if since is None:
+        return ""
+    try:
+        answered = _run(
+            [
+                "events",
+                "--since",
+                f"{since:.3f}",
+                "--until",
+                f"{time.time():.3f}",
+                "--filter",
+                f"container={container}",
+                "--filter",
+                "event=die",
+                "--filter",
+                "event=oom",
+                "--format",
+                "{{json .}}",
+            ],
+            timeout=_EVENTS_TIMEOUT_SECONDS,
+            check=False,
+        )
+    except DockerError:
+        return ""
+    if answered.returncode != 0:
+        return ""
+    said: List[str] = []
+    for line in answered.stdout.splitlines():
+        # As structure, for the reason the labels are read that way: a rendering is a value
+        # rebuilt, and this one is rebuilt by a daemon whose version is the machine's.
+        try:
+            event = json.loads(line)
+        except ValueError:
+            continue
+        action = str(event.get("Action") or "")
+        if not action:
+            continue
+        attributes = (event.get("Actor") or {}).get("Attributes") or {}
+        code = attributes.get("exitCode")
+        said.append(f"{action} exitCode {code}" if code is not None else action)
+    return ", ".join(said)
+
+
+def _ring_buffer(command: Sequence[str]) -> Optional[List[str]]:
+    """The kernel's log as that command prints it, or ``None`` if the command could not print it.
+
+    ``None`` is "I could not look", and it is not the same answer as an empty list. A machine
+    without ``dmesg``, a kernel buffer this user may not read and a command that hung all exit
+    without lines, and reading any of them as "the kernel killed nothing" would be reading a
+    missing witness as an exonerating one.
+
+    Nothing is offered on stdin, so the ``sudo`` form cannot reach for a terminal and wait: it is
+    already passed ``-n``, and this is the second lock on the same door."""
+    try:
+        finished = subprocess.run(
+            list(command),
+            text=True,
+            capture_output=True,
+            stdin=subprocess.DEVNULL,
+            timeout=_KERNEL_LOG_TIMEOUT_SECONDS,
+        )
+    except (OSError, ValueError, subprocess.SubprocessError):
+        return None
+    if finished.returncode != 0:
+        return None
+    return finished.stdout.splitlines()
+
+
+def _kernel_log() -> str:
+    """What the host's own kernel says about killing something for memory, in one phrase.
+
+    The witness outside Docker, and the last one this can call. A worker its own cgroup killed is
+    named by the daemon: ``State.OOMKilled`` is true, or an ``oom`` event is in the daemon's log.
+    A worker killed from outside is exactly the case where both of those say nothing, so the
+    question left is whether the host kernel killed it, and the kernel writes that down.
+
+    Read twice at most: unprivileged first, because a runner whose buffer is world readable
+    answers there, then under ``sudo -n``, which is what a GitHub runner allows and what a
+    developer's machine declines without prompting. A machine that declines both says so, which
+    is a reading and not an error.
+
+    Read only, bounded, and it cannot fail: this runs on a path a caller reached by already
+    failing, so anything it raised would replace the diagnosis with a second failure that says
+    less than the first one did."""
+    try:
+        for command in (
+            [_DMESG, "--time-format", "iso"],
+            [_SUDO, "-n", _DMESG, "--time-format", "iso"],
+        ):
+            lines = _ring_buffer(command)
+            if lines is None:
+                continue
+            matched = [line for line in lines[-_KERNEL_LOG_LINES:] if _OOM_KILL.search(line)]
+            if not matched:
+                return "the kernel log names no oom kill"
+            kept = [line.strip()[:_KERNEL_LINE_BYTES] for line in matched[-_KERNEL_LOG_MATCHES:]]
+            # Verbatim, and quoted so that a line stays a line: this is evidence.
+            return "the kernel log names " + " then ".join(repr(line) for line in kept)
+    except Exception:  # noqa: BLE001 - a diagnosis that raises is a diagnosis nobody reads
+        pass
+    return "the kernel log is unreadable"
+
+
+def diagnosis(process: subprocess.Popen, container: str) -> str:
+    """Why a worker's channel went quiet, in one line, naming the case.
+
+    End-of-file on the worker's stdout is the same seven words whether the container was killed,
+    stopped because its parent closed its stdin, or was never started at all, and those three want
+    three different fixes. This reads what is left and says which case it makes.
+
+    The three, and what says so: **killed** is a client or container status of 137, or the
+    daemon reporting ``OOMKilled``; **exited on stdin EOF** is a status of zero, which is the
+    worker's ordinary end when its parent goes away; **never started** is 125, the status the
+    client uses for its own failures, or a container the daemon never heard of and no status to
+    read. Anything else is reported with its numbers and not named, because a case this cannot
+    tell apart is not a case it may assert.
+
+    Beside the case, the daemon's own log of the container ending, when it has one (see
+    :func:`_events`). A second witness rather than another reading: an ``oom`` line names a kill
+    the surviving state may not have recorded, and the exit code a ``die`` carries is the daemon's
+    own. No case is decided on it.
+
+    And on **killed**, the host kernel's log (see :func:`_kernel_log`). The reading the daemon
+    cannot resolve, ``OOMKilled false`` with ``die exitCode 137``, says the kill came from outside
+    the container's own accounting and stops there. The kernel is the only witness left that could
+    name a host out-of-memory kill, and it is asked only here, because that is the only case whose
+    remaining question it answers.
+
+    Called before the container is removed. Removal is what discards the exit code and the memory
+    flag, what makes the daemon say absent, what closes the stderr this reads and what takes the
+    name the event query filters on, so a caller that tears down first is a caller that diagnoses
+    nothing."""
+    client = _client_exit(process)
+    code, killed_for_memory, presence = _container_state(container)
+    status = code if code is not None else client
+    if killed_for_memory or status == 137:
+        case = "killed"
+    elif status == 125:
+        case = "never started"
+    elif status == 0:
+        case = "exited on stdin EOF"
+    elif status is None and presence == "the container is absent":
+        case = "never started"
+    else:
+        case = "gone for a reason nothing here can name"
+    facts = [
+        "the docker client is still running"
+        if client is None
+        else f"the docker client exited {client}"
+    ]
+    if code is None:
+        facts.append(presence)
+    else:
+        facts.append(f"the container exited {code}")
+        facts.append(f"OOMKilled {'true' if killed_for_memory else 'false'}")
+    tail = stderr_tail(container)
+    facts.append(f"its stderr ended {tail!r}" if tail else "it wrote nothing to stderr")
+    logged = _events(container)
+    if logged:
+        facts.append(f"the daemon logged {logged}")
+    if case == "killed":
+        facts.append(_kernel_log())
+    return f"{case}: {', '.join(facts)}"
+
+
 def remove(container: str, *, confirm: bool = False) -> bool:
     """Remove a container and, when asked, refuse to pretend it worked.
 
-    ``--rm`` covers the ordinary exit and the case where the parent dies (the worker reads
-    end-of-file on its stdin and stops), but a container whose world is wedged in a native call
-    ignores that, and one nobody removed is a world holding its mounts open.
+    **This is the only thing that removes one.** A worker's container is left standing when it
+    exits, so it is removed here, by name, on every path out of a worker. What is not covered is a
+    container whose world is wedged in a native call, which is why the sweep exists.
 
     Returns whether the container is known to be gone. Teardown reads that; finalization does
     not have to, because for it the alternative to certainty is an exception.
@@ -546,6 +882,10 @@ def remove(container: str, *, confirm: bool = False) -> bool:
     nothing can write to the tree it is about to grade, and a removal it did not confirm is an
     invariant it cannot claim. ``confirm=True`` asks the daemon whether the container is really
     gone and raises when it is not."""
+    # First, and whatever the daemon goes on to say: a container being removed is one whose stderr
+    # nothing is going to read again, and every path out of a worker arrives here. `diagnosis` runs
+    # before its caller removes anything, for exactly this reason.
+    forget(container)
     # Stopped first and then removed. `rm -f` alone is a signal followed by the daemon's own
     # timeout, and an explicit stop with no grace period is the shortest path to "no process in
     # there is running", which is the fact grading depends on.
@@ -592,8 +932,14 @@ def reap(*, alive: Optional[Callable[..., bool]] = None) -> List[str]:
 
     The case it exists for is the one teardown cannot reach: a parent that dies while a world is
     wedged inside a command. The worker only notices its parent through end-of-file on the next
-    read, and a container whose process never returns to that read never exits, so ``--rm`` never
-    fires. What is left is a container nobody is going to remove and nothing names.
+    read, and a container whose process never returns to that read never exits. What is left is a
+    container nobody is going to remove and nothing names.
+
+    **And the ordinary crash as well.** A worker's container is left standing when it exits so
+    that a death can be asked about, so a parent that dies leaves a stopped container behind
+    rather than nothing. The inventory below is ``--all``, so a container that exited is as
+    visible to this as one still running, and the gate is the same either way: it goes when the
+    process that started it is gone.
 
     So every container carries the pid that started it and this machine's boot time, and this runs
     at construction: a labelled container whose parent is not running is one nobody is coming back
@@ -959,7 +1305,9 @@ __all__ = [
     "DockerError",
     "Mount",
     "absent",
+    "diagnosis",
     "docker_available",
+    "forget",
     "inventory_pending",
     "neutral_procfs",
     "neutral_resolver",
@@ -976,4 +1324,5 @@ __all__ = [
     "require_docker",
     "run",
     "running",
+    "stderr_tail",
 ]

@@ -236,8 +236,10 @@ def _unpack_in_container(staging: Path, bundle_name: str) -> None:
         ) from None
     else:
         _close_pipes(process)
+        # The container is left standing when it exits, so that a death can be asked about, which
+        # makes removing it this port's job on the ordinary path as well as the failing ones.
+        _discard(name)
     if finished != 0:
-        _release(process, name)
         raise ProvisioningError(f"unpacking the data bundle failed (status {finished})")
 
 
@@ -1065,18 +1067,30 @@ def _send(process: subprocess.Popen, payload: Dict[str, Any], *, deadline: float
         pending = pending[written:]
 
 
-def _release(process: subprocess.Popen, name: str) -> None:
-    """Give up a container and the local client together, and never raise doing it.
+def _discard(name: str) -> None:
+    """Remove one container, and never raise doing it.
 
-    The ordering is deliberate and so is the ``finally``: the container is what holds a mount, so
-    it goes first, and the pipes and the child are this process's own, so they go whatever the
-    daemon said. A removal nobody could confirm is handed to the sweep by name, because the
-    ordinary sweep skips a container whose parent is still alive and here the parent is."""
+    A removal nobody could confirm is handed to the sweep by name, because the ordinary sweep
+    skips a container whose parent is still alive and on every path that calls this the parent is.
+
+    Its own function because the ordinary ends want it too. A worker's container is left standing
+    when it exits, so that a death can be asked what killed it, and the corpse is then this
+    port's to take."""
     try:
         if not container.remove(name):
             container.disowned(name)
     except container.DockerError:
         container.disowned(name)
+
+
+def _release(process: subprocess.Popen, name: str) -> None:
+    """Give up a container and the local client together, and never raise doing it.
+
+    The ordering is deliberate and so is the ``finally``: the container is what holds a mount, so
+    it goes first, and the pipes and the child are this process's own, so they go whatever the
+    daemon said."""
+    try:
+        _discard(name)
     finally:
         try:
             process.kill()
@@ -1235,7 +1249,19 @@ class Worker:
         frames = _Frames(process.stdout.fileno())
         try:
             opening = frames.frame(_SPAWN_TIMEOUT_SECONDS, expect=_READY_FRAME)
-        except (TimeoutError, EOFError, ValueError, FramingError) as exc:
+        except EOFError as exc:
+            # Asked before anything is released, because the removal is what discards the exit
+            # code and the memory flag, what makes the daemon say absent and what closes the
+            # container's stderr. A worker that was killed, one that stopped when its parent went
+            # away and one the daemon never started all reach this line as the same end-of-file,
+            # and the three want three different fixes.
+            reason = container.diagnosis(process, name)
+            _release(process, name)
+            raise WorkerError(
+                f"the appworld worker container closed its output before it was ready: {reason}; "
+                f"waited {_SPAWN_TIMEOUT_SECONDS:.0f}s"
+            ) from exc
+        except (TimeoutError, ValueError, FramingError) as exc:
             # The container first, the local process and its pipes whatever that did. Removal can
             # raise on a control timeout, and nothing after it may be skipped: no worker is
             # returned, so nothing else would release the pipes, and the ordinary sweep skips a
@@ -1363,7 +1389,16 @@ class Worker:
                 self._stop_after_failure()
                 raise WorkerError(f"the appworld worker: {self.poisoned}") from exc
             except (BrokenPipeError, EOFError) as exc:
-                self.poisoned = f"the container stopped during {command!r}: {exc}"
+                # The evidence is read here and not later, because the container is removed on
+                # every path out of a failed worker and a removed container answers nothing. See
+                # `container.diagnosis` for the three cases and what tells them apart.
+                reason = container.diagnosis(self.process, self.container)
+                self.poisoned = f"the container stopped during {command!r}: {exc}; {reason}"
+                # And removed, once it has been asked. A container is left standing when it exits
+                # so that this line has something to read; leaving the corpse there afterwards
+                # would be a stopped container holding a writable mount for the rest of an
+                # episode, which is what the sweep is for and not what this path should need.
+                self._stop_after_failure()
                 raise WorkerError(f"the appworld worker container {self.poisoned}") from exc
             except TimeoutError as exc:
                 self.poisoned = (
@@ -1403,10 +1438,11 @@ class Worker:
 
         The container is removed first and by name. Closing the pipe would be the polite way and
         is not the reliable one: a world wedged in a native call never reads its stdin again, and
-        the ``docker run`` client does not stop a container by dying. What ``--rm`` and the pipe
-        do cover is the case this cannot: a parent that crashes leaves a worker reading
-        end-of-file, which stops it, and :func:`~shogym.envs.appworld.container.reap` covers the
-        parent that crashes while the worker cannot get back to that read.
+        the ``docker run`` client does not stop a container by dying. A worker's container is left
+        standing when it exits, so that a death can be asked what killed it, which makes this the
+        only thing that takes one: what the pipe covers is a parent that crashes, whose worker
+        reads end-of-file and stops, and :func:`~shogym.envs.appworld.container.reap` removes what
+        that leaves along with the worker that never got back to the read at all.
 
         **Two callers, two failure modes, and the bounds compose.** ``confirm`` is finalization's,
         and it is the difference between a removal and a fact: finalization removes this container
@@ -1465,15 +1501,28 @@ def _one_shot(
     except TimeoutError as exc:
         _release(process, name)
         raise WorkerError(f"{what} did not finish within {timeout:.0f}s; it was killed") from exc
-    except (BrokenPipeError, EOFError, ValueError, FramingError, WorkerError) as exc:
+    except (BrokenPipeError, EOFError) as exc:
+        # Before the release, which is what removes the container and closes its stderr. Seeding
+        # is one of the two places the channel goes quiet.
+        reason = container.diagnosis(process, name)
+        _release(process, name)
+        raise WorkerError(f"{what} failed: {type(exc).__name__}: {exc}; {reason}") from exc
+    except (ValueError, FramingError, WorkerError) as exc:
         _release(process, name)
         raise WorkerError(f"{what} failed: {type(exc).__name__}: {exc}") from exc
     else:
         try:
             process.wait(timeout=_CLOSE_SECONDS)
         except subprocess.TimeoutExpired:
+            # The client is still attached, so the container and this process's own half of it go
+            # together; `_release` closes the pipes as part of that.
             _release(process, name)
-        _close_pipes(process)
+        else:
+            _close_pipes(process)
+            # A one-shot role ends by exiting, and its container is left standing when it does so
+            # that a death can be asked what killed it. So the ordinary end removes one too, and
+            # this is also what drops the stderr and the launch instant held for it.
+            _discard(name)
     if "error" in answer:
         raise WorkerError(f"{what} failed: {answer['error']}")
     return answer["output"]

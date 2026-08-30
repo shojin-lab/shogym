@@ -778,19 +778,30 @@ version string, the processor count as `sched_getaffinity` reports it, the devic
 
 **A container whose parent died is swept, not hoped about.** Every container carries the pid that
 started it and this machine's boot, and a housekeeping pass removes the labelled ones whose parent
-is gone. The case is a run that dies while a world is wedged in a command: the worker learns its
-parent has gone only from end-of-file on its next read, which it never reaches, so it never exits
-and `--rm` never fires.
+is gone, running or stopped. The case is a run that dies while a world is wedged in a command: the
+worker learns its parent has gone only from end-of-file on its next read, which it never reaches,
+so it never exits and nothing removes it. The stopped half of that sweep is load-bearing too: a
+worker's container is deliberately left standing when it exits, because the daemon discards
+`State.ExitCode` and `State.OOMKilled` with the container and those two are the first answer to
+what killed a worker that went away.
+
+**Where the daemon runs out of answers, the kernel is asked.** `OOMKilled false` beside `die
+exitCode 137` says the kill came from outside the container's own accounting, and Docker has no
+further witness to offer. So a worker diagnosed as killed also carries the host kernel's log:
+`dmesg` unprivileged, then under `sudo -n`, read only, bounded to the end of the ring buffer, with
+the last two lines naming an out-of-memory kill quoted verbatim into the failure. A machine that
+will not show its ring buffer, which is every developer's laptop, says the log is unreadable, and
+that is a reading rather than an error.
 
 This is where the host-worker branch keeps a ledger of worker *processes*, with a pid, a start
 time, a token and a scratch directory, and a keep-alive pipe each worker watches so it kills its
 own group when its parent goes. None of that exists here and none of it is needed: a worker is a
-container, it holds no scratch directory of the host's and no token, `--rm` and the pipe cover the
-parent that exits cleanly, and what a later run reads to recognise an abandoned world is the
-container's own labels rather than anything a dead process wrote down. What the two branches share
-is the question, which is whether the process that started this thing is still the process that
-started it; this port answers it in one place, for containers and for the per-episode trees beside
-them.
+container, it holds no scratch directory of the host's and no token, the pipe and the removal by
+name cover the parent that exits cleanly, and what a later run reads to recognise an abandoned
+world is the container's own labels rather than anything a dead process wrote down. What the two
+branches share is the question, which is whether the process that started this thing is still the
+process that started it; this port answers it in one place, for containers and for the
+per-episode trees beside them.
 
 **The residual, stated exactly.** The daemon is trusted: a container is a boundary against the
 code inside it and not against whoever can talk to Docker, and this port's own parent process can

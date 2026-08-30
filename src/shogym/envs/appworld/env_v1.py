@@ -894,8 +894,8 @@ def _housekeep() -> None:
 
     Two jobs. Containers whose parent process is gone, which is the case teardown cannot reach: a
     run that died while a world was wedged inside a command leaves a worker that never gets back
-    to the read that would tell it its parent had gone, so it never exits and ``--rm`` never
-    fires. And the per-episode trees teardown declined to walk, plus whatever a crash left behind.
+    to the read that would tell it its parent had gone, so it never exits and nothing removes it.
+    And the per-episode trees teardown declined to walk, plus whatever a crash left behind.
 
     **On a thread, because the caller may be an event loop.** Both are Docker control calls and
     filesystem walks over what a previous run left, and construction runs in a call a serve layer
@@ -904,13 +904,11 @@ def _housekeep() -> None:
     bounded as well (see :func:`container.reap` and :func:`_sweep_leftovers`), and a bounded stall
     on the loop that dispenses tasks is still a stall on it.
 
-    **And it recurs while there is work, because deferring work is not doing it.** Construction was
-    the only thing that ever started a pass, and the failures that write work down happen after it:
-    a container the daemon would not remove is disowned during a teardown, and a tree that could not
-    be walked is marked ended there too. A run that builds one env and serves two hundred tasks
-    from it, which is what this port's README recommends, therefore recorded deferred work that
-    nothing in the process was ever going to come back to. Every episode's end asks for a pass, and
-    a pass that leaves work behind schedules the next one itself.
+    **And it recurs while there is work, because deferring work is not doing it.** The failures
+    that write work down happen after a construction's own pass: a container the daemon would not
+    remove is disowned during a teardown, and a tree that could not be walked is marked ended there
+    too. So every episode's end asks for a pass, and a pass that leaves work behind schedules the
+    next one itself.
 
     One pass at a time, and failures are swallowed: this is housekeeping, and an env that could
     not tidy up after a previous run is an env that can still serve."""

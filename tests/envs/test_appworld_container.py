@@ -19,7 +19,7 @@ import sys
 import threading
 import time
 from pathlib import Path
-from typing import Any, Dict, List, Sequence
+from typing import Any, Dict, List, Optional, Sequence, Tuple
 
 import pytest
 
@@ -169,7 +169,10 @@ def test_a_worker_container_drops_what_a_world_does_not_need(
     assert args[args.index("--cap-drop") + 1] == "ALL"
     assert args[args.index("--security-opt") + 1] == "no-new-privileges"
     assert "--pids-limit" in args
-    assert "--rm" in args
+    # And not `--rm`. The daemon discards `State.ExitCode` and `State.OOMKilled` with the
+    # container, so a container removed the instant it exits cannot be asked what killed it;
+    # this port removes one by name instead, on every path out of a worker.
+    assert "--rm" not in args
     # Not root, and the host user's own uid, so what it writes into the mounted output tree is
     # owned by the run rather than by root.
     assert "--user" in args and args[args.index("--user") + 1].count(":") == 1
@@ -502,10 +505,15 @@ def test_the_reaper_removes_a_container_whose_parent_is_gone(
     """The case teardown cannot reach: a parent that dies while a world is wedged in a command.
 
     The worker learns its parent is gone only from end-of-file on its next read, and a command
-    that never returns never reaches that read, so the container never exits and `--rm` never
-    fires. A random name leaves a later run nothing to recognize it by, so every container carries
+    that never returns never reaches that read, so the container never exits and nothing removes
+    it. A random name leaves a later run nothing to recognize it by, so every container carries
     the pid that started it and this boot, and construction sweeps the ones whose parent is not
     there any more.
+
+    **And the inventory is `--all`, which is load-bearing.** A worker's container is left
+    standing when it exits so that a death can be asked what killed it, so a parent that crashed
+    leaves a stopped container rather than nothing, and a sweep that listed only running ones
+    would walk past every one of them. A stopped container still holds its mounts.
 
     Removing containers is destructive, so the ambiguous cases must do nothing: an unreadable
     label, and a pid that belongs to somebody else's live process, are both left alone."""
@@ -516,9 +524,11 @@ def test_the_reaper_removes_a_container_whose_parent_is_gone(
         "unlabelled": "{}",
     }
     removed: List[str] = []
+    inventoried: List[List[str]] = []
 
     def _run(args, **_):
         if args[0] == "ps":
+            inventoried.append(list(args))
             return _Finished(0, "\n".join(listed))
         if args[0] == "inspect":
             # A daemon that answers about what it still has. The reaper confirms a removal now,
@@ -538,6 +548,8 @@ def test_the_reaper_removes_a_container_whose_parent_is_gone(
     assert swept == ["dead1"]
     # A stop and a removal, and only for the one whose parent is gone.
     assert set(removed) == {"dead1"}
+    # The inventory covers stopped containers, which is what an abandoned worker leaves.
+    assert inventoried and "--all" in inventoried[0]
     # It really went, so nothing is written down for a later pass to come back to.
     assert container.outstanding() == []
 
@@ -1120,6 +1132,293 @@ def test_a_spawn_that_never_becomes_ready_releases_everything(
     assert container.outstanding() == ["stuck-container"]
     assert process.poll() is not None
     assert process.stdout is None or process.stdout.closed
+
+
+def _fake_docker(
+    home: Path,
+    *,
+    status: int,
+    said: str,
+    inspected: Tuple[str, str, int],
+    logged: str = "",
+) -> Path:
+    """A stand-in for the docker client: one exit status and one line of stderr for the launch,
+    one answer for ``inspect``, one page of the daemon's log for ``events``, and success for the
+    two calls teardown makes.
+
+    A script rather than a patched function, because the launch's stderr has to travel the way the
+    real one does: written by another process into the descriptor this port hands it."""
+    home.mkdir(parents=True, exist_ok=True)
+    script = home / "docker"
+    plan = json.dumps(
+        {"status": status, "said": said, "inspected": list(inspected), "logged": logged}
+    )
+    script.write_text(
+        f"#!{sys.executable}\n"
+        "import json, sys\n"
+        f"plan = json.loads({plan!r})\n"
+        "if sys.argv[1] in ('stop', 'rm'):\n"
+        "    sys.exit(0)\n"
+        "if sys.argv[1] == 'events':\n"
+        "    sys.stdout.write(plan['logged'])\n"
+        "    sys.exit(0)\n"
+        "if sys.argv[1] == 'inspect':\n"
+        "    said, complained, code = plan['inspected']\n"
+        "    sys.stdout.write(said)\n"
+        "    sys.stderr.write(complained)\n"
+        "    sys.exit(code)\n"
+        "sys.stderr.write(plan['said'])\n"
+        "sys.exit(plan['status'])\n"
+    )
+    script.chmod(0o755)
+    return script
+
+
+def _fake_dmesg(home: Path, *, printed: str, status: int, privileged: bool = False) -> Path:
+    """A stand-in for the kernel's ring buffer: one page of lines, one exit status, and whether
+    the page is refused to anyone who did not come through ``sudo``.
+
+    A script for the same reason the docker stand-in is one, and because what is under test is a
+    command being run rather than a function being called: the fallback only exists because the
+    first invocation exits nonzero on a machine whose buffer is privileged, and a patched function
+    could not show that."""
+    home.mkdir(parents=True, exist_ok=True)
+    script = home / "dmesg"
+    plan = json.dumps({"printed": printed, "status": status, "privileged": privileged})
+    script.write_text(
+        f"#!{sys.executable}\n"
+        "import json, sys\n"
+        f"plan = json.loads({plan!r})\n"
+        # `sudo -n <this> --time-format iso` arrives with sudo's own flag in front of it, which is
+        # how this tells the second invocation from the first.
+        "if plan['privileged'] and '-n' not in sys.argv[1:]:\n"
+        "    sys.stderr.write('dmesg: read kernel buffer failed: Operation not permitted\\n')\n"
+        "    sys.exit(1)\n"
+        "sys.stdout.write(plan['printed'])\n"
+        "sys.exit(plan['status'])\n"
+    )
+    script.chmod(0o755)
+    return script
+
+
+def _kernel_page(*, tail: Sequence[str], decoy: str) -> str:
+    """A ring buffer with a kill in it that is older than the window, and whatever else is asked
+    for at the end of it."""
+    noise = [f"2026-08-31T00:00:{index % 60:02d},000000+00:00 usb 1-1: ok" for index in range(210)]
+    return "\n".join([decoy, *noise, *tail]) + "\n"
+
+
+def test_a_host_kill_is_read_off_the_kernels_own_log(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """The daemon has already said everything it can, and it was not enough.
+
+    ``OOMKilled false`` beside ``die exitCode 137`` says the kill did not come from the container's
+    own accounting, and Docker has no further witness. The kernel does, so a killed worker carries
+    what the host kernel wrote, and the readings below are what it can carry.
+
+    Verbatim and bounded: the last two matching lines, out of the tail of the buffer, cut to a
+    length a CI log can hold. Older pressure is not evidence about this kill, so a matching line
+    from before the window is not in the answer.
+
+    **"I could not look" is not "nothing was killed."** A buffer this user may not read, a machine
+    with no ``dmesg`` at all and a command that fails all say unreadable, which is the honest
+    reading and the one a developer's laptop gives. A runner that keeps the buffer privileged and
+    allows ``sudo`` without a password is the case the fallback is for, and it answers."""
+    victim = (
+        "2026-08-31T00:01:02,000000+00:00 Out of memory: Killed process 4242 (python3) "
+        "total-vm:9000000kB, anon-rss:7000000kB, file-rss:0kB, shmem-rss:0kB, UID:1001"
+    )
+    constraint = (
+        "2026-08-31T00:01:02,000000+00:00 oom-kill:constraint=CONSTRAINT_NONE,"
+        "nodemask=(null),cpuset=/,mems_allowed=0,global_oom,task=python3,pid=4242,uid=1001"
+    )
+    earlier = "2026-08-31T00:00:01,000000+00:00 Killed process 11 (an-older-victim)"
+    stale = "0.0 Out of memory: Killed process 1 (init)"
+    page = _kernel_page(tail=[earlier, constraint, victim], decoy=stale)
+    unbounded = _kernel_page(
+        tail=["2026-08-31T00:01:02,000000+00:00 Out of memory: Killed process 9 " + "x" * 900],
+        decoy=stale,
+    )
+    cases: List[Tuple[str, str, int, bool, List[str], List[str]]] = [
+        (
+            "a host out of memory kill, which is the trigger the daemon could not name",
+            page,
+            0,
+            False,
+            [repr(constraint), "then", repr(victim)],
+            [repr(earlier), "Out of memory: Killed process 1 (init)"],
+        ),
+        (
+            "the same buffer, readable only to root, which is what a GitHub runner has",
+            page,
+            0,
+            True,
+            [repr(constraint), repr(victim)],
+            ["unreadable"],
+        ),
+        (
+            "a host that killed nothing, which is a reading and not an absence of one",
+            "2026-08-31T00:00:01,000000+00:00 usb 1-1: ok\n",
+            0,
+            False,
+            ["the kernel log names no oom kill"],
+            ["Killed process"],
+        ),
+        (
+            "a buffer nobody here may read, which is what a developer's machine says",
+            "",
+            1,
+            False,
+            ["the kernel log is unreadable"],
+            ["no oom kill"],
+        ),
+        (
+            "a kernel line longer than a failure message has any business carrying",
+            unbounded,
+            0,
+            False,
+            ["Out of memory: Killed process 9 " + "x" * 60],
+            ["x" * (container._KERNEL_LINE_BYTES + 1)],
+        ),
+    ]
+    for index, (why, printed, status, privileged, expected, absent) in enumerate(cases):
+        stub = _fake_dmesg(
+            tmp_path / str(index), printed=printed, status=status, privileged=privileged
+        )
+        monkeypatch.setattr(container, "_DMESG", str(stub))
+        monkeypatch.setattr(container, "_SUDO", str(stub))
+        said = container._kernel_log()
+        for fact in expected:
+            assert fact in said, (why, fact, said)
+        for fact in absent:
+            assert fact not in said, (why, fact, said)
+        assert "\n" not in said
+        assert len(said) < 2 * container._KERNEL_LINE_BYTES + 200, (why, len(said))
+
+    # A machine with no `dmesg` on it at all, which is the same answer by another road.
+    monkeypatch.setattr(container, "_DMESG", str(tmp_path / "nothing-is-here"))
+    monkeypatch.setattr(container, "_SUDO", str(tmp_path / "nothing-is-here"))
+    assert container._kernel_log() == "the kernel log is unreadable"
+
+
+def _event(action: str, code: Optional[str] = None) -> str:
+    """One line of what ``docker events --format '{{json .}}'`` prints for a container."""
+    attributes = {"name": "worker"}
+    if code is not None:
+        attributes["exitCode"] = code
+    return json.dumps({"Type": "container", "Action": action, "Actor": {"Attributes": attributes}})
+
+
+def test_a_worker_that_went_away_says_which_way_it_went(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """End-of-file on the worker's stdout is the same seven words three different ways.
+
+    A container killed by the host, a container that stopped because its parent closed its stdin,
+    and a container the daemon never started all arrive as one silent pipe, and they want three
+    different fixes. Here each case is staged against a stand-in for the client, and what the
+    failure says is checked for the name of the case and for the readings it rests on.
+
+    **The corpse is the point.** A worker's container is left standing when it exits, so an
+    ordinary death is a container the daemon still has and can be asked for ``State.ExitCode``
+    and ``State.OOMKilled``: the first two rows below are that container, present and exited.
+    Absence is still an answer and the last two rows are it, one where the daemon never had the
+    container and one where somebody took it first, and in the second the client's own status and
+    the daemon's log are what still name the case.
+
+    On one line, because the reader is a CI log."""
+    root = _corpus(tmp_path / "seeded")
+    # Warmed before the client is replaced, for the reason `_captured` gives.
+    container._boot_id()
+    monkeypatch.setattr(container, "process_birth", lambda pid: "Thu Jan  1 00:00:00 2026")
+    monkeypatch.setattr(container, "image_identity", lambda name: "sha256:stub linux/arm64")
+    monkeypatch.setattr(container, "image_name", lambda: "shogym-appworld-worker:test")
+    monkeypatch.setattr(container, "_ledger", lambda: tmp_path / "disowned.txt")
+    # The kernel log is a reading off the host, so it is stubbed here rather than left to whatever
+    # the machine running the suite happens to say. What it can say is its own test.
+    silent = _fake_dmesg(tmp_path / "kernel", printed="", status=1)
+    monkeypatch.setattr(container, "_DMESG", str(silent))
+    monkeypatch.setattr(container, "_SUDO", str(silent))
+    gone = ("", "Error: No such object: worker\n", 1)
+    killing = _event("oom") + "\n" + _event("die", "137") + "\n"
+    cases: List[Tuple[str, str, int, str, Tuple[str, str, int], str, List[str]]] = [
+        (
+            "a squeezed memory limit, which is the local reproduction of the CI failure",
+            "killed",
+            137,
+            "",
+            ('{"ExitCode": 137, "OOMKilled": true}\n', "", 0),
+            killing,
+            [
+                "the docker client exited 137",
+                "the container exited 137",
+                "OOMKilled true",
+                "it wrote nothing to stderr",
+                "the daemon logged oom, die exitCode 137",
+                "the kernel log is unreadable",
+            ],
+        ),
+        (
+            "the parent going away, which the worker reads as end-of-file on its stdin",
+            "exited on stdin EOF",
+            0,
+            "",
+            ('{"ExitCode": 0, "OOMKilled": false}\n', "", 0),
+            _event("die", "0") + "\n",
+            [
+                "the docker client exited 0",
+                "the container exited 0",
+                "OOMKilled false",
+                "the daemon logged die exitCode 0",
+            ],
+        ),
+        (
+            "a daemon that refused the launch, so there is no container to ask about",
+            "never started",
+            125,
+            "docker: Error response from daemon: no such image\n",
+            gone,
+            "",
+            [
+                "the docker client exited 125",
+                "the container is absent",
+                "its stderr ended 'docker: Error response from daemon: no such image\\n'",
+            ],
+        ),
+        (
+            "a container somebody removed before this looked, which is what CI kept reporting",
+            "killed",
+            137,
+            "",
+            gone,
+            killing,
+            [
+                "the docker client exited 137",
+                "the container is absent",
+                "the daemon logged oom, die exitCode 137",
+                "the kernel log is unreadable",
+            ],
+        ),
+    ]
+    for index, (why, case, status, said, inspected, logged, expected) in enumerate(cases):
+        home = tmp_path / f"{index}-{case.replace(' ', '-')}"
+        client = _fake_docker(
+            home, status=status, said=said, inspected=inspected, logged=logged
+        )
+        monkeypatch.setattr(container, "_DOCKER", str(client))
+        with pytest.raises(adapter.WorkerError) as raised:
+            adapter.Worker.spawn(root, task_id="abc_1", outputs=home / "outputs")
+        message = str(raised.value)
+        assert f"closed its output before it was ready: {case}:" in message, (why, message)
+        for fact in expected:
+            assert fact in message, (why, fact, message)
+        # The kernel is asked about a kill and about nothing else. A worker that exited because
+        # its parent went away was not killed by anybody, and a launch the daemon refused never
+        # reached the kernel at all.
+        if case != "killed":
+            assert "the kernel log" not in message, (why, message)
+        assert "\n" not in message
 
 
 def test_a_snapshot_that_is_a_whole_prefix_is_not_a_whole_save(tmp_path: Path) -> None:
