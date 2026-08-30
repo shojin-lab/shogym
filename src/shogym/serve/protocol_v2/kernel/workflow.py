@@ -24,12 +24,19 @@ seal has to make the result, the score, the candidate bundle, the schedule trans
 released capacity, and the acknowledgement authoritative together, and Temporal has no
 transaction spanning two histories.
 
+Not every attempt is ended by a filing. A controller may end one that nothing is going to
+finish, and the generation may end one whose deadline has passed. Either way the attempt fails
+finally: capacity comes back, the payload it was owed is resolved without being rendered, the
+assigned outcome is written at the floor, and no acknowledgement is minted, because an
+acknowledgement is a fact about a submission and there is no submission here.
+
 The refusals are protocol errors, raised as :class:`StreamProtocolError`. They carry a code
 from the closed set and nothing else, they change no state, and they are never a message.
 """
 
 from __future__ import annotations
 
+import asyncio
 from dataclasses import dataclass
 from datetime import timedelta
 from hashlib import sha256
@@ -37,7 +44,7 @@ from typing import Any, Dict, List, Optional, Set, Tuple
 
 from temporalio import workflow
 from temporalio.common import RetryPolicy
-from temporalio.exceptions import ApplicationError
+from temporalio.exceptions import ActivityError, ApplicationError
 
 with workflow.unsafe.imports_passed_through():
     from shogym.serve.protocol_v2 import (
@@ -77,10 +84,18 @@ with workflow.unsafe.imports_passed_through():
         verify_blobs_activity,
     )
     from shogym.serve.protocol_v2.kernel.messages import (
+        ABANDONED,
+        DEADLINE,
+        FINAL_FAILURE_REASONS,
+        SEAL_FAILED,
+        SEAL_UNUSABLE,
+        AttemptFinalized,
         ConsumerClaim,
         ConsumerReceipt,
         EnvironmentCall,
         EnvironmentLease,
+        FinalizeRequest,
+        finalize_request_identity,
         GeneratePayloadBundleInput,
         GradeAttemptInput,
         OfferedMessage,
@@ -108,6 +123,7 @@ ACTIVE = "active"
 SEALING = "sealing"
 SEALED = "sealed"
 ACK_PRESENTED = "ack_presented"
+FINAL_FAILED = "final_failed"
 
 ASSIGNED = "assigned"
 MATERIALIZED = "materialized"
@@ -117,10 +133,14 @@ PRESENTED = "presented"
 
 # The states Done has to look through. An attempt that has not reached a presented
 # acknowledgement is still live, and an obligation that has not been presented is still owed.
-# The failure states a later element adds are terminal and obligation fulfilling, so they join
-# the fulfilled side rather than either of these.
+# A final failure is neither: it is terminal and obligation fulfilling on both sides, so it is
+# in neither tuple and Done reads it as resolved.
 LIVE_ATTEMPT = (PLANNED, TASK_OFFERED, ACTIVE, SEALING, SEALED)
 UNFULFILLED_OBLIGATION = (ASSIGNED, MATERIALIZED, ELIGIBLE, OFFERED)
+
+# The analysis outcome a finalized attempt is assigned. An attempt that was ended rather than
+# filed has nothing to grade, and the floor is what the outcome is fixed at instead.
+FLOOR = 0.0
 
 OPEN = "open"
 DONE = "done"
@@ -160,6 +180,27 @@ class StreamProtocolError(ApplicationError):
         )
 
 
+class _UnusableResult(ApplicationError):
+    """A failure for an Activity result the seal cannot vouch for.
+
+    It is not a refusal: nothing the caller sent is wrong, so it carries no protocol code. It is
+    raised before the transition that would make an acknowledgement authoritative, which is the
+    last place such a result can still be caught, so the filing that raised it offers no
+    protocol result, commits no presentation, and moves no cursor.
+
+    It does reach the caller, as the generic failure of the tool call that filed. A harness
+    keeping its own transcript records that failure the way it records any other, so this is a
+    thing the model can see happen even though the generation minted nothing it can read. What
+    does not travel with it is why the result was unusable: that reason is this generation's,
+    and it stays in the history and the server's log.
+
+    The Activity that produced the result succeeded, so there is no step left to retry: the
+    exact filing sent again asks for the same work and is handed the same result back. That is
+    why it is one type rather than a description of each way a result can be wrong, and why the
+    seal that raised it ends the attempt it prepared.
+    """
+
+
 @dataclass
 class _Attempt:
     item: TaskItem
@@ -184,6 +225,16 @@ class _Attempt:
     # committed headline to the verdict behind it.
     graded_evidence: Optional[str] = None
     seal_ordinal: Optional[int] = None
+    final_failure: Optional[str] = None
+    # When this attempt's deadline expires, in milliseconds on the generation's clock. It is set
+    # when the attempt becomes active and cleared the moment the attempt is no longer one a
+    # deadline could end, so an armed deadline and a live attempt are the same fact.
+    deadline_at: Optional[int] = None
+    # Whether that deadline has passed. The timer firing is recorded here rather than acted on
+    # where it fires, because the attempt may be holding a call to a world this stream cannot
+    # see, and ending it under one would be deciding an effect nothing here can observe. The
+    # expiry is the durable fact; the ending happens at the first moment the stream is quiet.
+    deadline_expired: bool = False
 
 
 @dataclass
@@ -210,6 +261,19 @@ class _Bound:
 
     identity: str
     message: OfferedMessage
+
+
+@dataclass
+class _BoundFinalization:
+    """A logical finalization, its canonical identity, and the receipt bound to it.
+
+    A finalization mints no message, so what a retry has to reach is the receipt rather than
+    reserved bytes. It is otherwise the same fact as a bound pull: one logical request, one
+    answer, for as long as the generation runs.
+    """
+
+    identity: str
+    receipt: AttemptFinalized
 
 
 @dataclass
@@ -301,6 +365,7 @@ class StreamWorkflow:
         self._pending: Optional[_Pending] = None
         self._pull_requests: Dict[str, _Bound] = {}
         self._terminal_requests: Dict[str, _Bound] = {}
+        self._finalize_requests: Dict[str, _BoundFinalization] = {}
         self._attestations: Dict[str, PresentationAck] = {}
         self._attestation_identities: Dict[str, str] = {}
         # Every presented message, in order, with the kind it was. The kind is what keeps
@@ -334,8 +399,14 @@ class StreamWorkflow:
 
     @workflow.run
     async def run(self, start: StreamStart) -> StreamOutcome:
-        """Serve until Done has been presented, then let every accepted call finish."""
-        await workflow.wait_condition(lambda: self._done_presented)
+        """Serve until Done has been presented, then let every accepted call finish.
+
+        The generation waits here, and while it waits it is also the only thing watching the
+        clock. A stream whose attempts have no deadline waits once and creates no timer at all,
+        which is what a generation that declares none should cost.
+        """
+        while not self._done_presented:
+            await self._wait_for_done_or_a_deadline()
         await workflow.wait_condition(workflow.all_handlers_finished)
         return StreamOutcome(
             generation_state=self._generation_state,
@@ -344,7 +415,118 @@ class StreamWorkflow:
             payloads_delivered=sum(
                 1 for o in self._obligations.values() if o.state == PRESENTED
             ),
+            finalized=sum(1 for a in self._attempts.values() if a.state == FINAL_FAILED),
         )
+
+    async def _wait_for_done_or_a_deadline(self) -> None:
+        """Wait until Done, until the armed deadlines change, or until the earliest one expires.
+
+        The timer is durable, so an attempt's deadline survives the worker that armed it and a
+        resume neither loses it nor restarts it. It is the earliest one that is waited on: any
+        change to the armed set brings the wait back here to choose again, which is what keeps
+        one timer at a time correct for a generation serving more than one attempt.
+
+        An expiry already recorded and not yet acted on is the other thing this waits for. It
+        is applied at the top of every pass, so the wait below can end on the stream falling
+        quiet as well as on the clock.
+        """
+        self._end_expired()
+        armed = self._armed_deadlines()
+        if not armed:
+            await workflow.wait_condition(
+                lambda: self._done_presented
+                or bool(self._armed_deadlines())
+                or self._expiry_can_be_applied()
+            )
+            return
+        attempt_id, deadline = min(armed.items(), key=lambda row: (row[1], row[0]))
+        remaining = deadline - self._now_ms()
+        if remaining > 0:
+            try:
+                await workflow.wait_condition(
+                    lambda: self._done_presented
+                    or self._armed_deadlines() != armed
+                    or self._expiry_can_be_applied(),
+                    timeout=timedelta(milliseconds=remaining),
+                )
+                return
+            except asyncio.TimeoutError:
+                pass
+        self._expire(attempt_id, deadline)
+
+    def _armed_deadlines(self) -> Dict[str, int]:
+        """Every attempt with a deadline, and when it expires."""
+        return {
+            key: value.deadline_at
+            for key, value in self._attempts.items()
+            if value.deadline_at is not None
+        }
+
+    def _now_ms(self) -> int:
+        """The generation's clock, in milliseconds. Deterministic, and replayed rather than read."""
+        return int(workflow.now().timestamp() * 1000)
+
+    def _arm_deadline(self, attempt: _Attempt) -> None:
+        """Start this attempt's clock, if the generation declared one."""
+        if self._start.attempt_deadline_ms > 0:
+            attempt.deadline_at = self._now_ms() + self._start.attempt_deadline_ms
+
+    def _quiet(self) -> bool:
+        """Whether nothing is part way through: no call holding the stream, no result owed."""
+        return not self._operation_in_flight and self._pending is None
+
+    def _expiry_can_be_applied(self) -> bool:
+        """Whether a recorded expiry is waiting and the stream is free to act on it."""
+        return self._quiet() and any(
+            attempt.deadline_expired for attempt in self._attempts.values()
+        )
+
+    def _expire(self, attempt_id: str, deadline: int) -> None:
+        """Record that this attempt's deadline passed, and disarm the timer that said so.
+
+        The firing is a fact and it is written down where it happens, rather than a decision
+        deferred until the stream is free. Everything is checked again here rather than assumed
+        from the timer, because the attempt may have sealed while the stream was busy, its
+        terminal may be in flight, or the generation may be over: a deadline that no longer
+        applies is dropped, and it never overtakes a filing.
+        """
+        attempt = self._attempts.get(attempt_id)
+        if attempt is None or attempt.deadline_at != deadline:
+            return
+        attempt.deadline_at = None
+        if self._generation_state != OPEN or self._draining:
+            return
+        if attempt.state != ACTIVE or attempt.terminal_request_id is not None:
+            return
+        attempt.deadline_expired = True
+        self._end_expired()
+
+    def _end_expired(self) -> None:
+        """End every attempt whose deadline has passed, once nothing is part way through.
+
+        Ending is held back from the moment the timer fires for one reason: the attempt may be
+        holding a call to a world this stream cannot see. Finalizing under one would be this
+        generation deciding an effect it cannot observe, so the expiry waits for that call to
+        come back rather than cancelling it. What ends the wait is the stream falling quiet,
+        which a call that returns does and which a resume that ends the grant by name does too.
+
+        The expiry is dropped where it stopped applying. A filing that reached the stream first
+        owns the attempt, and this never takes one back from a seal.
+        """
+        for attempt in list(self._attempts.values()):
+            if not attempt.deadline_expired:
+                continue
+            if (
+                self._generation_state != OPEN
+                or self._draining
+                or attempt.state != ACTIVE
+                or attempt.terminal_request_id is not None
+            ):
+                attempt.deadline_expired = False
+                continue
+            if not self._quiet():
+                continue
+            self._finalize(attempt, DEADLINE)
 
     # The Updates a gateway calls.
 
@@ -496,6 +678,24 @@ class StreamWorkflow:
         ticket = self._take_lock(writer)
         try:
             return await self._commit_presentation(commit, writer)
+        finally:
+            self._release_lock(ticket)
+
+    @workflow.update
+    async def finalize_attempt(
+        self, request: FinalizeRequest, writer: Writer
+    ) -> AttemptFinalized:
+        """End one attempt that nothing is going to finish, and say why.
+
+        This is a controller call and not a tool: no model reaches it, and it mints no result,
+        so an attempt ended this way leaves the transcript exactly as it was and the next pull
+        is the only thing that says anything happened. What it may end is narrow. An attempt
+        whose terminal was accepted is the seal's, whatever became of it, and an attempt with a
+        result outstanding is a caller's until that result is presented.
+        """
+        ticket = self._take_lock(writer)
+        try:
+            return self._finalize_requested(request)
         finally:
             self._release_lock(ticket)
 
@@ -666,6 +866,14 @@ class StreamWorkflow:
             ),
             wait_count=self._wait_count,
             wait_reasons=self._wait_reason_counts(),
+            final_failures={
+                key: value.final_failure
+                for key, value in self._attempts.items()
+                if value.final_failure is not None
+            },
+            deadline_expired=[
+                key for key, value in self._attempts.items() if value.deadline_expired
+            ],
         )
 
     # Pull.
@@ -865,7 +1073,10 @@ class StreamWorkflow:
             ):
                 return await self._seal_accepted(request, attempt, identity, writer)
             raise StreamProtocolError("conflicting_seal")
-        if attempt.state in (SEALED, ACK_PRESENTED):
+        if attempt.state in (SEALED, ACK_PRESENTED, FINAL_FAILED):
+            # A finalized attempt refuses a filing for the same reason a sealed one does: it has
+            # an outcome already, and this filing would be a second one. The refusal is the same
+            # bytes however many times the request is retried, and it moves nothing.
             raise StreamProtocolError("conflicting_seal")
         if attempt.state != ACTIVE:
             raise StreamProtocolError("invalid_attempt")
@@ -890,8 +1101,45 @@ class StreamWorkflow:
     async def _seal_accepted(
         self, request: SealRequest, attempt: _Attempt, identity: str, writer: Writer
     ) -> OfferedMessage:
+        """Run the seal's batch, and end the attempt if that batch cannot go on.
+
+        An accepted terminal makes the attempt the seal's, and the exact filing sent again is
+        what continues one that was interrupted. That reading holds while the seal can still
+        make progress. It stops holding in two ways. The work behind the filing can fail for
+        good: an Activity the retry policy has given up on, or one that declared itself
+        non-retryable, is not a step this filing can take again. Or the work can succeed and
+        hand back a result the seal cannot vouch for, which the exact filing sent again would
+        ask for and be given a second time. Either way an attempt left prepared under it would
+        stay live for ever with no acknowledgement, no outcome, and no way to Done.
+
+        So a batch that cannot go on is an ending. It commits the final failure and nothing
+        else: no seal, no score, no candidate, no acknowledgement, and the caller is told what
+        failed rather than being answered. The two ways in are written apart, because a step
+        that never happened and a step whose answer was unusable are different things to read
+        afterwards. A writer that a resume fenced meanwhile commits nothing at all, and the
+        attempt stays prepared for the owner that replaced it.
+        """
+        try:
+            return await self._seal_batch(request, attempt, identity, writer)
+        except StreamProtocolError:
+            raise
+        except ActivityError:
+            self._require_writer(writer)
+            self._finalize(attempt, SEAL_FAILED)
+            raise
+        except _UnusableResult:
+            self._require_writer(writer)
+            self._finalize(attempt, SEAL_UNUSABLE)
+            raise
+
+    async def _seal_batch(
+        self, request: SealRequest, attempt: _Attempt, identity: str, writer: Writer
+    ) -> OfferedMessage:
         metadata = request.metadata
         attempt.state = SEALING
+        # The deadline is disarmed as the terminal is accepted, not when the seal commits. What
+        # the deadline is for is an attempt nobody is finishing, and this one is being finished.
+        attempt.deadline_at = None
         attempt.terminal_request_id = metadata.request_id
         attempt.terminal_identity = identity
         attempt.seal_id = hidden_seal_id(
@@ -961,7 +1209,7 @@ class StreamWorkflow:
                 retry_policy=_ACTIVITY_RETRY,
             )
             if len(bundle.candidates) != 1:
-                raise ApplicationError(
+                raise _UnusableResult(
                     "the kernel payload family has exactly one candidate",
                     type="IncompleteCandidateBundle",
                     non_retryable=True,
@@ -1003,6 +1251,140 @@ class StreamWorkflow:
         )
         return self._offer(
             ack, "terminal", metadata.request_id, identity, attempt.item.attempt_id
+        )
+
+    # Final failure.
+
+    def _finalize_requested(self, request: FinalizeRequest) -> AttemptFinalized:
+        """Check what a controller may end, then end it.
+
+        The order of the refusals is the order of the facts. An attempt this generation never
+        assigned is not an attempt. One whose terminal was accepted belongs to the seal, and
+        that stays true after the seal has committed and after a finalization has already run,
+        so all of those conflict rather than being told the attempt is unknown. And a result
+        nobody has presented is a caller's turn, not a controller's.
+
+        The request is bound first, for the reason a pull's is. A controller that loses the
+        answer retries the request it made, and the retry has to reach the answer it already
+        has: the receipt is kept against the logical request and handed back unchanged, rather
+        than the retry being told the attempt it ended is now in conflict. One logical request
+        is one ending, so the same ID carrying anything else is a conflict rather than a second
+        one.
+        """
+        if request.protocol_version != PROTOCOL_VERSION:
+            raise StreamProtocolError("unsupported_version")
+        try:
+            require_opaque_id("request_id", request.request_id)
+        except WireFormatError as error:
+            raise StreamProtocolError("invalid_message") from error
+        identity = finalize_request_identity(request)
+        bound = self._finalize_requests.get(request.request_id)
+        if bound is not None:
+            if bound.identity != identity:
+                raise StreamProtocolError("request_conflict")
+            return bound.receipt
+        if request.reason not in FINAL_FAILURE_REASONS:
+            raise StreamProtocolError("invalid_message")
+        attempt = self._attempts.get(request.attempt_id)
+        if attempt is None:
+            raise StreamProtocolError("invalid_attempt")
+        if attempt.terminal_request_id is not None or attempt.state in (
+            SEALING,
+            SEALED,
+            ACK_PRESENTED,
+            FINAL_FAILED,
+        ):
+            raise StreamProtocolError("conflicting_seal")
+        if self._pending is not None:
+            raise StreamProtocolError("outstanding_response")
+        if attempt.state not in (PLANNED, ACTIVE):
+            raise StreamProtocolError("invalid_attempt")
+        receipt = self._finalize(attempt, request.reason)
+        self._finalize_requests[request.request_id] = _BoundFinalization(
+            identity=identity, receipt=receipt
+        )
+        return receipt
+
+    def _finalize(self, attempt: _Attempt, reason: str) -> AttemptFinalized:
+        """Fail one attempt finally, and with it every attempt that was waiting on it.
+
+        One transition, no await inside it, and it mints nothing. There is no acknowledgement,
+        because an acknowledgement says a submission was sealed under a digest and there is no
+        submission. There is no payload either: the obligation is resolved where it stands,
+        which before a seal is assigned and unbuilt, so nothing rendered is being thrown away
+        and nothing unrendered is being invented.
+
+        The ending reaches further than the attempt named in it, and it has to. A schedule may
+        gate one task on another sealing or on a payload being presented, and an attempt that
+        ended without a filing will never do either: the gate it holds shut can no longer open.
+        Leaving those attempts planned would leave the generation waiting for a fact that
+        cannot happen, with Done unreachable behind them. So they are floored here, in the same
+        transition, which is also what the schedule asks for: a stop before an outcome is
+        scored writes the floor over everything that outcome was going to cover, rather than
+        letting one part of the scope be omitted and another wait for ever.
+        """
+        self._fail(attempt, reason)
+        cascaded = self._fail_the_waiting()
+        obligation = self._obligations.get(attempt.item.attempt_id)
+        return AttemptFinalized(
+            attempt_id=attempt.item.attempt_id,
+            reason=reason,
+            score=FLOOR,
+            capacity_in_use=self._capacity_in_use(),
+            obligation_state=None if obligation is None else obligation.state,
+            also_finalized=cascaded,
+        )
+
+    def _fail(self, attempt: _Attempt, reason: str) -> None:
+        """Write one attempt's ending: the floor, the reason, and the obligation it was owed."""
+        attempt.state = FINAL_FAILED
+        attempt.final_failure = reason
+        attempt.score = FLOOR
+        attempt.deadline_at = None
+        attempt.deadline_expired = False
+        obligation = self._obligations.get(attempt.item.attempt_id)
+        if obligation is not None:
+            obligation.state = FINAL_FAILED
+
+    def _fail_the_waiting(self) -> List[str]:
+        """Floor every planned attempt whose gate can no longer open, to a fixed point.
+
+        The reason is abandonment rather than whatever ended the attempt in front: this one was
+        never served, never given a deadline and never spent a step, and what happened to it is
+        that the fact it was waiting for stopped being possible. Floors cascade, because a task
+        gated on a task that was itself gated is one more attempt nothing will reach.
+        """
+        cascaded: List[str] = []
+        moved = True
+        while moved:
+            moved = False
+            for attempt_id, attempt in self._attempts.items():
+                if attempt.state != PLANNED or not self._gate_is_shut_for_good(attempt_id):
+                    continue
+                self._fail(attempt, ABANDONED)
+                cascaded.append(attempt_id)
+                moved = True
+        return cascaded
+
+    def _gate_is_shut_for_good(self, attempt_id: str) -> bool:
+        """Whether the fact this attempt's gate waits on can no longer happen.
+
+        A gate names one of two facts, and an ending closes each of them the same way. A task
+        waiting for another to seal waits for ever once that one has failed finally, because a
+        finally failed attempt has an outcome and will never file. A task waiting for a payload
+        waits for ever once the obligation at that position has been resolved without being
+        rendered, which is what an ending does to it.
+        """
+        gate = self._release.gate_for(attempt_id)
+        if gate is None:
+            return False
+        if gate.after_sealed_attempt_id is not None:
+            blocking = self._attempts.get(gate.after_sealed_attempt_id)
+            return blocking is not None and blocking.state == FINAL_FAILED
+        return any(
+            obligation.item.payload_position == gate.after_payload_position
+            and obligation.state == FINAL_FAILED
+            for obligation in self._obligations.values()
         )
 
     # Materialization and release.
@@ -1074,6 +1456,13 @@ class StreamWorkflow:
         # The store was read outside this transition, so the owner is checked again on the way
         # back in. A presentation from an epoch that has since been fenced commits nothing.
         self._require_writer(writer)
+        # The projection is compared again for the same reason, and against the same clock. The
+        # store read is the one await in here, and the deadline runs under it: an attestation
+        # found current before the read can be describing a stream that has moved by the time
+        # it comes back. Committing it then would file a description of a stream in which the
+        # deadline had not passed, over one in which it had.
+        if commit.stream_state_before_sha256 != self._projection_hash():
+            raise StreamProtocolError("invalid_message")
         self._apply_presentation(pending.message.kind, pending.message.attempt_id, commit)
         self._presented[commit.message_id] = pending.message.kind
         for reference in _references(commit):
@@ -1100,6 +1489,9 @@ class StreamWorkflow:
             # about this attempt rather than about the set of everything anything referenced.
             attempt.task_start_checkpoint = commit.task_start_checkpoint_blob
             attempt.environment_calls = 0
+            # An attempt's clock starts when the task is delivered, because that is when the
+            # attempt is one a model could be working on and therefore one it could abandon.
+            self._arm_deadline(attempt)
         elif kind == "seal_ack" and attempt_id is not None:
             self._attempts[attempt_id].state = ACK_PRESENTED
         elif kind == "payload" and attempt_id is not None:
@@ -1324,6 +1716,15 @@ class StreamWorkflow:
         The projection is what a presentation attests against, so it holds the state the
         harness could have observed and nothing derived from it. It carries no hash of its
         own, which is what keeps hashing it well defined.
+
+        A deadline that passed is part of it. The expiry is a durable transition the harness
+        can read, and it happens on the generation's own clock rather than on a call, so it is
+        the one transition that can land between an attestation being built and being
+        committed. Without it here that attestation would still pass, and it would say the
+        attempt's deadline had not passed when it had. When the deadline was armed is not
+        here: no caller can read it, so nobody holding this generation's state could rebuild
+        this hash from what they can observe, and every transition that moves it moves the
+        attempt's state or its expiry with it.
         """
         projection = {
             "generation_state": self._generation_state,
@@ -1339,6 +1740,14 @@ class StreamWorkflow:
                 None if self._pending is None else self._pending.message.message_id
             ),
             "attempts": {key: value.state for key, value in self._attempts.items()},
+            "final_failures": {
+                key: value.final_failure
+                for key, value in self._attempts.items()
+                if value.final_failure is not None
+            },
+            "deadline_expired": sorted(
+                key for key, value in self._attempts.items() if value.deadline_expired
+            ),
             "obligations": {key: value.state for key, value in self._obligations.items()},
             "presented": list(self._presented),
             "materializations": self._materialized(),
@@ -1372,6 +1781,11 @@ def _check_start(start: StreamStart) -> None:
     if start.schedule_version != SCHEDULE_VERSION:
         raise StreamProtocolError("unsupported_version")
     if start.capacity < 1 or start.wait_retry_after_ms < 0:
+        raise StreamProtocolError("invalid_message")
+    # Zero is the one value that turns the deadline off. A negative one is a configuration that
+    # meant to declare a deadline and does not, and it fails here rather than serving an attempt
+    # nothing will ever end.
+    if start.attempt_deadline_ms < 0:
         raise StreamProtocolError("invalid_message")
     if len(start.id_key_hex) != 64 or not set(start.id_key_hex) <= set("0123456789abcdef"):
         raise StreamProtocolError("invalid_message")
@@ -1435,14 +1849,9 @@ def _check_schedule(start: StreamStart) -> None:
             raise StreamProtocolError("configuration_mismatch")
 
 
-def _unusable(what: str) -> ApplicationError:
-    """A failure for an Activity result the seal cannot vouch for.
-
-    It is not a refusal: nothing the caller sent is wrong, so it carries no protocol code and
-    reaches no transcript. It is raised before the transition that would make an
-    acknowledgement authoritative, which is the last place such a result can still be caught.
-    """
-    return ApplicationError(what, type="UnusableActivityResult", non_retryable=True)
+def _unusable(what: str) -> _UnusableResult:
+    """Say what is wrong with an Activity result, as the failure that ends the attempt."""
+    return _UnusableResult(what, type="UnusableActivityResult", non_retryable=True)
 
 
 def _check_candidate(item: TaskItem, candidate: PayloadCandidate) -> None:

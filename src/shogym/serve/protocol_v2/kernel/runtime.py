@@ -54,10 +54,13 @@ from shogym.serve.protocol_v2 import (
 )
 from shogym.serve.protocol_v2.kernel.activities import kernel_activities
 from shogym.serve.protocol_v2.kernel.messages import (
+    AttemptFinalized,
     ConsumerClaim,
     ConsumerReceipt,
     EnvironmentCall,
     EnvironmentLease,
+    FinalizeRequest,
+    finalize_request_identity,
     OfferedMessage,
     OwnershipClaim,
     OwnershipReceipt,
@@ -490,6 +493,24 @@ class StreamHandle:
             args=[call, writer],
             id=f"environment-end-{writer.ownership_epoch}-{call.call_id}",
         )
+
+    async def finalize(self, request: FinalizeRequest) -> AttemptFinalized:
+        """End one attempt that nothing is going to finish.
+
+        The Update ID is the logical request and the whole of what it asked, so a controller
+        that lost the answer reaches the same Update rather than a second ending, while the
+        same logical ID carrying anything else reaches the workflow and is judged there. The
+        identity is hashed rather than concatenated from the fields the ending reads, so a
+        request that differs only in a field this ID forgot cannot be answered from the cache.
+        """
+        writer = self.writer
+        identity = finalize_request_identity(request)
+        return await self.handle.execute_update(
+            StreamWorkflow.finalize_attempt,
+            args=[request, writer],
+            id=f"finalize-{writer.ownership_epoch}-{request.request_id}-{identity[:32]}",
+        )
+
 
     async def close_queue(self) -> QueueClosed:
         """Close the queue to insertion."""

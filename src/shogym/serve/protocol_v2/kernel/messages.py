@@ -40,6 +40,24 @@ from shogym.serve.protocol_v2 import (
 )
 
 
+# Why an attempt ended without a filing. The set is closed and the reasons are declared before a
+# generation runs, so what ends an attempt is a property of the configuration rather than
+# something a caller composes at the moment it gives up on one.
+STEP_CAP = "step_cap"
+DEADLINE = "deadline"
+ABANDONED = "abandoned"
+# The two reasons no caller asks for: they are written where the batch behind an accepted
+# terminal cannot go on, and a controller that named either would be reporting something only
+# the seal can know. They are told apart because the two say different things about the run. The
+# first is the seal's own work failing for good, which is a step that did not happen. The second
+# is a step that happened and came back with a result the seal cannot vouch for, which is what a
+# reader looks at when the Activities all report success and the attempts still end.
+SEAL_FAILED = "seal_failed"
+SEAL_UNUSABLE = "seal_unusable"
+FINAL_FAILURE_REASONS = (STEP_CAP, DEADLINE, ABANDONED)
+FINAL_FAILURES = FINAL_FAILURE_REASONS + (SEAL_FAILED, SEAL_UNUSABLE)
+
+
 @dataclass(frozen=True)
 class TaskItem:
     """One entry of the closed queue, with every public identifier it will ever use.
@@ -91,6 +109,10 @@ class StreamStart:
     value together with the manifest, the roster, the plan, the capacity, and the versions, and
     it is what a resume has to present. ``blob_root`` is the directory the blobs an event may
     reference are installed in. A generation without one verifies no reference, and says so.
+
+    ``attempt_deadline_ms`` is how long an attempt may stay active before the generation ends it
+    itself. Zero is off, which is the default: a deadline is a property of the run rather than of
+    this kernel, so a generation that declares none has none and waits as long as it is asked to.
     """
 
     configuration_hash: str
@@ -104,6 +126,7 @@ class StreamStart:
     tasks: List[TaskItem]
     capacity: int = 1
     wait_retry_after_ms: int = 1000
+    attempt_deadline_ms: int = 0
     execution_ordinal: int = 0
     release: ReleasePlan = field(default_factory=lambda: IMMEDIATE)
     assignments: List[Assignment] = field(default_factory=list)
@@ -138,6 +161,7 @@ def configuration_hash(start: StreamStart) -> str:
         "consumer_claim_hash": start.consumer_claim_hash,
         "capacity": start.capacity,
         "wait_retry_after_ms": start.wait_retry_after_ms,
+        "attempt_deadline_ms": start.attempt_deadline_ms,
         "evaluation_only": start.evaluation_only,
         "canonicalization_version": start.canonicalization_version,
         "execution_ordinal": start.execution_ordinal,
@@ -387,6 +411,48 @@ class EnvironmentLease:
 
 
 @dataclass(frozen=True)
+class FinalizeRequest:
+    """A controller's request to end one attempt that nothing is going to finish.
+
+    ``reason`` comes from the closed set above. With the attempt it is the whole of what the
+    caller supplies: there is no score here and no message, because a finalization writes the
+    floor and produces nothing the model can read.
+
+    ``request_id`` is this call's logical identity, and it is here for the same reason a pull
+    carries one. A controller that loses the answer retries the request it made, and the retry
+    has to reach the answer it already has rather than a second ending or a stale refusal.
+    """
+
+    request_id: str
+    attempt_id: str
+    reason: str
+    protocol_version: int = PROTOCOL_VERSION
+
+
+@dataclass(frozen=True)
+class AttemptFinalized:
+    """The controller's receipt for an ended attempt: why, at what score, and what came back.
+
+    ``capacity_in_use`` is read after the release, so the receipt says the capacity is free
+    rather than promising that it will be.
+
+    ``also_finalized`` names every other attempt the same transition floored: an attempt whose
+    gate waits on a fact this ending made impossible has no way left to run, so it is ended
+    here rather than left waiting for it. They are in the receipt because the floor is one
+    atomic fact about several attempts, and a receipt naming only the one that was asked about
+    would say less than happened.
+    """
+
+    attempt_id: str
+    reason: str
+    score: float
+    capacity_in_use: int
+    obligation_state: Optional[str] = None
+    also_finalized: List[str] = field(default_factory=list)
+    protocol_version: int = PROTOCOL_VERSION
+
+
+@dataclass(frozen=True)
 class QueueClosed:
     """The controller's receipt for a closed queue."""
 
@@ -434,6 +500,15 @@ class StreamState:
     number, and a reader that has the run's store can go from it to the verdict behind it: the
     reference is the generation's own, and it is committed with the score rather than left in
     the result of a call nobody kept.
+
+    ``final_failures`` says why each ended attempt ended. It is here and nowhere else: a model
+    that could read it would learn from an ending what the protocol gives it no message about.
+
+    ``deadline_expired`` names the attempts whose deadline has passed and which the generation
+    has not ended yet. There is one reason to be in it: the attempt is holding a call to a world
+    this stream cannot see, so the ending is waiting for that call rather than cancelling an
+    effect nothing here can observe. It is the operator's signal that a call is not coming back,
+    and the takeover that ends the grant by name is what releases it.
     """
 
     generation_state: str
@@ -470,6 +545,8 @@ class StreamState:
     payload_delivery_count: int
     wait_count: int
     wait_reasons: Dict[str, int]
+    final_failures: Dict[str, str]
+    deadline_expired: List[str] = field(default_factory=list)
     protocol_version: int = PROTOCOL_VERSION
 
 
@@ -486,6 +563,7 @@ class StreamOutcome:
     cursor: str
     sealed: int
     payloads_delivered: int
+    finalized: int = 0
     protocol_version: int = PROTOCOL_VERSION
 
 
@@ -608,6 +686,29 @@ class PayloadBundle:
     submission_digest: str
     candidates: List[PayloadCandidate]
     protocol_version: int = PROTOCOL_VERSION
+
+
+def finalize_request_identity(request: FinalizeRequest) -> str:
+    """Return the canonical identity of a finalization request.
+
+    It covers the whole request and not the fields the ending happens to read, the declared
+    protocol version among them. A retry carrying the same request ID and the same identity
+    replays its receipt; one carrying the same ID and anything else is a conflict, which is the
+    point of hashing the request rather than trusting the ID beside a few of its fields.
+    """
+    return sha256(
+        length_prefixed(b"finalize-request-v2")
+        + length_prefixed(
+            canonical_json(
+                {
+                    "request_id": request.request_id,
+                    "attempt_id": request.attempt_id,
+                    "reason": request.reason,
+                    "protocol_version": request.protocol_version,
+                }
+            )
+        )
+    ).hexdigest()
 
 
 def hidden_seal_id(hidden_execution_id: str, execution_ordinal: int, attempt_id: str) -> str:
