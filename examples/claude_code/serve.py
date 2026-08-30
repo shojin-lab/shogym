@@ -8,7 +8,7 @@ task it played: a task record carries an attempt id and a body, and has no field
 target could be written into.
 
 One launch is one episode, over one env at one task, so three tasks are three launches. Serving
-needs the durable extra (``uv sync --extra durable``, or ``pip install "shogym[durable]"``).
+runs on Temporal, which ``pip install shogym`` installs, so there is no extra to ask for.
 """
 
 from __future__ import annotations
@@ -18,6 +18,7 @@ import os
 import sys
 from datetime import datetime, timezone
 from pathlib import Path
+from secrets import token_hex
 
 from shogym.serve.protocol_v2.gateway import run_stdio_v2
 
@@ -33,15 +34,15 @@ from shogym.serve.protocol_v2.gateway import run_stdio_v2
 # envs need an extra installed and a key; see their READMEs under src/shogym/envs/.)
 # `SHOGYM_ENV` wins when it is set, so a run can swap envs without editing this file:
 #     SHOGYM_ENV=wordle_v1 <your harness command>
-ENV = os.environ.get("SHOGYM_ENV") or "automationbench"
+ENV = os.environ.get("SHOGYM_ENV") or "wordle_v1"
 
 # Which task this launch serves. One index, because one generation is one episode over one env.
 #     SHOGYM_TASK=7 <your harness command>
 TASK = int(os.environ.get("SHOGYM_TASK") or 0)
 
-# Where the generation keeps its blobs and the manifest a later owner would resume it from.
-# Beside this file by default, which is what a quickstart wants; somewhere the agent is not
-# working when the run is one whose record you intend to defend.
+# Where the generation keeps its blobs, the manifest a later owner would resume it from, and the
+# history the seal wrote its grade into. Beside this file by default, which is what a quickstart
+# wants; somewhere the agent is not working when the run is one whose record you intend to defend.
 #     SHOGYM_RUNS=~/somewhere-else/runs <your harness command>
 RUNS = (
     Path(os.environ["SHOGYM_RUNS"]).expanduser()
@@ -56,8 +57,11 @@ def new_run_dir(env: str = ENV, runs: Path = RUNS, task: int = TASK) -> Path:
 
     Fresh per launch on purpose. The manifest is written once and never rewritten, because a
     resume compares against it, so a directory that already holds one is refused rather than
-    added to."""
-    return runs / f"{env}-{task}-{datetime.now(timezone.utc):%Y%m%dT%H%M%SZ}"
+    added to. The stamp on its own does not make it fresh: it names whole seconds, so two
+    launches of one task inside one second would take one directory, and the generation's
+    durable history is a file in that directory. The token is what keeps them apart."""
+    stamp = f"{datetime.now(timezone.utc):%Y%m%dT%H%M%SZ}"
+    return runs / f"{env}-{task}-{stamp}-{token_hex(3)}"
 
 
 async def main() -> None:

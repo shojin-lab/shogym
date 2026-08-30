@@ -1,8 +1,8 @@
 """The durable protocol v2 kernel: one stream generation as a Temporal workflow.
 
-This package is behind the ``shogym[durable]`` extra and nothing outside it imports Temporal.
-A quickstart install still runs an episode; a durable stream needs the extra, and then the
-runner starts its own embedded service, so a user never installs or runs a server.
+This package is where Temporal is imported, and nothing outside it imports Temporal. A
+quickstart install has it, because serving is what the package is for, and the runner starts
+its own embedded service, so a user never installs or runs a server.
 
 What is here is the generic kernel: a typed pull, a durable seal before any acknowledgement,
 offers and presentations against a harness cursor, a schedule model, and a monotonic Done. A
@@ -15,9 +15,12 @@ and no delayed release, blocked obligations, or end-of-queue tail policies.
 The Python API a gateway calls
 ------------------------------
 
-Start a service and a Worker::
+Start a service and a Worker. ``run_directory`` is the run this service is for, and the history
+it writes goes there, beside that run's blobs and manifest. A client opened without one gets a
+database that goes when the process does, which is the right answer for a stream nobody will
+take over and the wrong one for every other::
 
-    async with durable_client() as client:
+    async with durable_client(run_directory=run) as client:
         async with stream_worker(client):
             ...
 
@@ -29,10 +32,12 @@ the initial cursor, and the terminal tool::
     await stream.claim_consumer(ConsumerClaim(consumer_id=..., claim_hash=...))
 
 Starting is a claim of ownership, and so is taking a generation over after the process that was
-serving it went away::
+serving it went away. The client that takes it over is opened against that run's directory,
+because the history the last process wrote is what is being resumed and that is where it is::
 
-    stream = await resume_stream(client, workflow_id="stream/run-1/gen-1",
-                                 configuration_hash=configuration_hash(start))
+    async with durable_client(run_directory=run) as client:
+        stream = await resume_stream(client, workflow_id="stream/run-1/gen-1",
+                                     configuration_hash=configuration_hash(start))
 
 That fences the previous writer. Its handle keeps the epoch it had, and every call it makes
 from then on is refused without touching the stream, including one that was already in flight.

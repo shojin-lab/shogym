@@ -671,7 +671,7 @@ async def test_a_version_one_generation_never_starts(env) -> None:
 
 
 async def test_a_quickstart_install_never_imports_temporal() -> None:
-    """Importing shogym must not pull in Temporal. The durable path is opt in."""
+    """Importing shogym must not pull in Temporal. Serving is what reaches it."""
     probe = "import shogym, sys; assert 'temporalio' not in sys.modules, sorted(sys.modules)"
     subprocess.run([sys.executable, "-c", probe], check=True)
 

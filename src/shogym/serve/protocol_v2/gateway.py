@@ -1792,7 +1792,9 @@ async def run_stdio_v2(
     The service, the Worker, and the stream all belong to this process, so a harness spawns one
     command and gets a durable stream without installing or starting anything. Given a run
     directory it also leaves behind what a later owner needs to take the generation over: the
-    blobs its events reference, and the manifest saying which generation this was.
+    blobs its events reference, the manifest saying which generation this was, and the history
+    the service wrote, all three in that directory. Given none, the history lives and dies with
+    this process, along with everything else there would have been to resume.
 
     The gateway is stopped before the Worker and the service are, because stopping it settles
     whatever call was accepted when the transport went away, and that call may still need the
@@ -1805,7 +1807,7 @@ async def run_stdio_v2(
     stopped = False
     try:
         environment = environment_terminal(episode)
-        async with durable_client() as client:
+        async with durable_client(run_directory=run_directory) as client:
             async with stream_worker(client, activities=environment.activities):
                 gateway = await open_gateway(
                     client,

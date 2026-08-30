@@ -26,7 +26,7 @@ env_test = shogym.make("wordle_v1", config={"task_split": "test"})
 **Serve it as a stdio MCP server** any harness can spawn (`--trace` optional):
 
 ```bash
-uv sync --extra durable          # outside this repo: pip install "shogym[durable]"
+uv sync                          # outside this repo: pip install shogym
 shogym serve wordle_v1 --task 0 --trace ./shogym_logs/wordle.jsonl
 ```
 

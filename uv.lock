@@ -2372,6 +2372,7 @@ dependencies = [
     { name = "minijinja" },
     { name = "numpy" },
     { name = "pydantic" },
+    { name = "temporalio" },
 ]
 
 [package.optional-dependencies]
@@ -2386,9 +2387,6 @@ browsecomp-plus = [
     { name = "datasets" },
     { name = "openai" },
     { name = "pyserini" },
-]
-durable = [
-    { name = "temporalio" },
 ]
 hle = [
     { name = "datasets" },
@@ -2435,7 +2433,7 @@ dev = [
     { name = "pytest" },
     { name = "pytest-asyncio" },
     { name = "ruff" },
-    { name = "shogym", extra = ["automationbench", "browsecomp-plus", "durable", "hle", "tau2", "yc-bench"] },
+    { name = "shogym", extra = ["automationbench", "browsecomp-plus", "hle", "tau2", "yc-bench"] },
 ]
 
 [package.metadata]
@@ -2478,7 +2476,7 @@ requires-dist = [
     { name = "sqlalchemy", marker = "extra == 'yc-bench'", specifier = ">=2.0" },
     { name = "streamlit", marker = "extra == 'yc-bench'", specifier = ">=1.55.0" },
     { name = "tabulate", marker = "extra == 'tau2'", specifier = ">=0.9.0" },
-    { name = "temporalio", marker = "extra == 'durable'", specifier = ">=1.32" },
+    { name = "temporalio", specifier = ">=1.32" },
     { name = "tenacity", marker = "extra == 'tau2'", specifier = ">=9.0.0" },
     { name = "toml", marker = "extra == 'tau2'", specifier = ">=0.10.2" },
     { name = "typer", marker = "extra == 'tau2'", specifier = ">=0.12.5" },
@@ -2495,7 +2493,6 @@ dev = [
     { name = "ruff", specifier = ">=0.8" },
     { name = "shogym", extras = ["automationbench"] },
     { name = "shogym", extras = ["browsecomp-plus"] },
-    { name = "shogym", extras = ["durable"] },
     { name = "shogym", extras = ["frontier-bench"] },
     { name = "shogym", extras = ["hle"] },
     { name = "shogym", extras = ["tau2"] },
