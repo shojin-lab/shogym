@@ -100,7 +100,7 @@ def _wire_form(spec: TaskSpec) -> TaskSpec:
     """The published contract as the wire carries it: every advertised tool round-tripped through
     JSON, so the values this episode *enforces* are the values a client is *shown*.
 
-    A schema is the env's object, and a JSON scalar in it may be a subclass — the models coerce
+    A schema is the env's object, and a JSON scalar in it may be a subclass: the models coerce
     one away at construction but do not validate on assignment, so it reaches here verbatim. It
     serializes like the scalar it subclasses, which is exactly what makes it invisible: a server
     advertises ordinary text while this episode validates against something that answers a
@@ -109,12 +109,11 @@ def _wire_form(spec: TaskSpec) -> TaskSpec:
 
     **Contained, and that is not a hole.** A schema that will not serialize keeps the env's own
     object, because the only honest alternative here is to fail opening an episode that a caller
-    may have no other way to refuse — and refusing it is a decision for the layer that knows
+    may have no other way to refuse, and refusing it is a decision for the layer that knows
     whether an alternative exists. A stream makes that decision one step later and stops the run:
     it compares this contract against the one its endpoint published, and a schema that cannot be
-    serialized cannot be compared either (see :meth:`TaskStream._require_published_manifest`), so
-    the task is never dispensed. What is left is a single-episode server enforcing exactly what it
-    advertises, which is what it did before."""
+    serialized cannot be compared either, so the task is never offered. What is left is a
+    single-episode server enforcing exactly what it advertises."""
     tools = []
     changed = False
     for manifest in spec.tools:
@@ -1043,6 +1042,7 @@ class ServedEpisode:
         lifecycle: Optional["_Lifecycle"] = None,
         cleanup: Optional["_EnvClose"] = None,
         opened_context: "Optional[contextvars.Context]" = None,
+        ends_on_horizon: bool = True,
     ) -> None:
         self._env = env
         self._env_name = env_name
@@ -1055,6 +1055,12 @@ class ServedEpisode:
         self._trajectory: Trajectory = []
         self._step = 0
         self._terminated = False
+        # Whether spending the env's step budget ends this episode. It does for a caller that
+        # owns the episode outright, which is the only ending such a caller has. It does not for
+        # one that ends the episode itself: an ending decided in here would seal and grade behind
+        # that caller's back, and the record of the ending would be this layer's rather than the
+        # one the caller keeps. See `call` and `_legacy_step`.
+        self._ends_on_horizon = ends_on_horizon
         # The terminal step's feedback in wire form (inference + episode), retained so
         # the in-process `evaluate()` can report the score without a trace file. Same
         # list `result_from_trace` reconstructs from the terminal row.
@@ -1216,7 +1222,8 @@ class ServedEpisode:
             # Restart recovery, transport-independent: resolve any finalization records left
             # dangling (SEALED/PENDING) by a crashed prior run to a fail-closed verdict —
             # the evaluator is never re-invoked. Done here at construction (not only in
-            # `run_stdio`) so `evaluate()` and every in-process caller get the same guarantee.
+            # the durable runner) so `evaluate()` and every in-process caller get the same
+            # guarantee.
             # This episode has not sealed yet, so it owns no record here; only prior/other
             # sessions' dangling records are resolved. Best-effort: a read-only-store I/O error
             # never blocks startup.
@@ -1246,6 +1253,7 @@ class ServedEpisode:
         env_config: Optional[Dict[str, Any]] = None,
         finalize_deadline: Optional[float] = None,
         off_loop_factory: bool = False,
+        ends_on_horizon: bool = True,
     ) -> "ServedEpisode":
         """Build the env, load the task instance, open the essential MCP sessions, and push
         per-episode state into the (in-process) tool servers.
@@ -1260,7 +1268,10 @@ class ServedEpisode:
         construction rather than by anybody keeping track.
 
         Off by default: an env is allowed to bind the caller's loop in its constructor, and a
-        caller that has not said this one does not is a caller whose env this may not move."""
+        caller that has not said this one does not is a caller whose env this may not move.
+
+        ``ends_on_horizon`` says whether spending the env's step budget ends the episode here.
+        A caller that ends the episode itself passes False; see the property of that name."""
         lifecycle = _Lifecycle("start")
         if off_loop_factory:
             # No handler here, deliberately. A cancelled `_built` has already arranged the
@@ -1286,6 +1297,7 @@ class ServedEpisode:
             finalize_deadline=finalize_deadline,
             lifecycle=lifecycle,
             built_on_lifecycle=off_loop_factory,
+            ends_on_horizon=ends_on_horizon,
         )
 
     @classmethod
@@ -1300,15 +1312,19 @@ class ServedEpisode:
         lifecycle: Optional["_Lifecycle"] = None,
         built_on_lifecycle: bool = False,
         context: "Optional[contextvars.Context]" = None,
+        ends_on_horizon: bool = True,
     ) -> "ServedEpisode":
         """Start an episode on an **already-constructed** env, which this episode then owns.
 
         Same contract as :meth:`start` except the caller supplies the env instance instead of
         a name, which lets a caller that serves several episodes at once give each one its own
         env. Ownership transfers: :meth:`close` closes this env, and a failure during setup
-        closes it here — so the caller must hand over a *fresh* instance per episode rather
+        closes it here, so the caller must hand over a *fresh* instance per episode rather
         than a shared one (``Env.close`` ends **every** session the instance tracks, which
         would tear down any sibling episode sharing the instance).
+
+        ``ends_on_horizon`` says whether spending the env's step budget ends the episode here.
+        A caller that ends the episode itself passes False; see the property of that name.
         """
         opened: List[MCPSession] = []
         # The episode's own thread and loop. Built here so the setup hook and its rollback are
@@ -1400,6 +1416,7 @@ class ServedEpisode:
                 lifecycle=lifecycle,
                 cleanup=cleanup,
                 opened_context=contextvars.copy_context(),
+                ends_on_horizon=ends_on_horizon,
             )
             handed_over = True
             return episode
@@ -1524,6 +1541,16 @@ class ServedEpisode:
         world and grading what was sealed are two steps there rather than one, and only the env
         that owns the world knows how to take either."""
         return self._env
+
+    @property
+    def ends_on_horizon(self) -> bool:
+        """True iff spending the env's step budget ends this episode here.
+
+        A caller that ends the episode itself sets this False and keeps the ending: reaching the
+        budget then commits its step like any other and decides nothing, so no seal, no verdict
+        and no terminal row are produced by a layer the caller is not the author of. Enforcing
+        the budget is that caller's business too."""
+        return self._ends_on_horizon
 
     @property
     def seal_enabled(self) -> bool:
@@ -1711,7 +1738,11 @@ class ServedEpisode:
                 # finalization write that same step as the single terminal row (no phantom
                 # ``<horizon>`` step). Otherwise it's a normal mid-episode step.
                 horizon = self._env.horizon
-                is_horizon = horizon is not None and (self._step + 1) >= horizon
+                is_horizon = (
+                    self._ends_on_horizon
+                    and horizon is not None
+                    and (self._step + 1) >= horizon
+                )
                 dispatch = self._begin_dispatch(
                     tool_name, args, write_trace=not is_horizon, seals_on_horizon=is_horizon
                 )
@@ -1787,7 +1818,7 @@ class ServedEpisode:
 
         horizon = self._env.horizon
         terminated = tool_name == TERMINATE_TOOL_NAME or (
-            horizon is not None and step >= horizon
+            self._ends_on_horizon and horizon is not None and step >= horizon
         )
         self._terminated = terminated
 
@@ -2037,14 +2068,13 @@ class ServedEpisode:
         ``type: string`` accepts ``""``).
 
         **Only the caller's request is answered here.** The schema is the env's own object and
-        validating against it runs the env's code — a key checked against the instance, a key
-        formatted into a message — so this can fail for reasons the caller could never fix. Those
+        validating against it runs the env's code (a key checked against the instance, a key
+        formatted into a message), so this can fail for reasons the caller could never fix. Those
         are deliberately *not* turned into a validation error the caller is invited to retry:
         nothing it sends will satisfy a contract that cannot be read, and answering as if it
         might leaves the harness above composing an outcome for a task nobody could finish. They
-        propagate, and the layer that owns the task's record classifies it (see
-        :meth:`shogym.serve.stream.TaskStream.dispatch`). What does not propagate is the *name* of
-        an argument this refusal is about — see :func:`_named`."""
+        propagate, and the layer that owns the task's record classifies it. What does not
+        propagate is the *name* of an argument this refusal is about, see :func:`_named`."""
         schema = self._score_schemas.get(tool_name, {})
         try:
             jsonschema.validate(instance=args, schema=schema)

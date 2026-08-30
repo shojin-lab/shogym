@@ -1,9 +1,17 @@
-An MCP server provides a stream of tasks, in your kernel as the skill `shogym_stream`.
-Nothing external loops for you - drive yourself:
+An MCP server hands out work one task at a time, in your kernel as the skill `shogym_stream`.
+Nothing external loops for you, so drive yourself:
 
-1. `json.loads(await shogym_stream.get_task())` pulls the next task.
-   If it returns {done: true}, the stream is exhausted, stop.
-2. The task can be completed using the tools it lists, as `await shogym_stream.<tool>(...)`.
-   Every call answers with a JSON string, so parse each one before you read it.
-   One of them ends the task; call it before pulling the next.
-3. Continue until the stream is exhausted.
+1. `json.loads(await shogym_stream.pull())` takes no arguments and answers with one JSON
+   record. Every call answers with a JSON string, so parse each one before you read it.
+   `kind` says what the record is:
+     "task"    work to do. It carries `attempt_id` and `body`, the instructions.
+     "payload" content delivered against the task you just ended. Read it, then pull again.
+     "wait"    nothing is ready yet. Pull again shortly.
+     "done"    nothing more is coming. Stop.
+2. Work the task with the tools it lists, as
+   `await shogym_stream.<tool>(attempt_id=..., arguments={...the tool's own arguments...})`.
+   The attempt_id is what routes the call to your task; a call without it is refused.
+3. One of those tools ends the task. Call it, in the same wrapper, when you are finished.
+   It answers "seal_ack" once the filing is accepted, or "seal_reject" if the arguments
+   were malformed, which leaves the task open for you to correct and file again.
+4. Go back to step 1. Stop when a record's `kind` is "done".

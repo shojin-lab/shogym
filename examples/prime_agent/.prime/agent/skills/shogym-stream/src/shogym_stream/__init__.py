@@ -6,7 +6,7 @@ the whole client. ``McpIntegration`` connects over streamable HTTP, discovers th
 tools and binds each one as an async method::
 
     import shogym_stream
-    task = json.loads(await shogym_stream.get_task())
+    record = json.loads(await shogym_stream.pull())
 
 Two class attributes are load-bearing:
 
@@ -17,7 +17,7 @@ Two class attributes are load-bearing:
               the reason ``SHOGYM_MCP_TOKEN`` exists. ``McpIntegration._open_session`` resolves
               a token before every connection and raises ``NotEnabled`` without one; there is
               no unauthenticated path through it. ``serve.py`` authenticates nobody, so the
-              value is a formality -- but it must be set and non-empty, in the shell that
+              value is a formality, but it must be set and non-empty, in the shell that
               launches ``prime-agent``, or the kernel cannot connect at all.
 """
 
@@ -29,8 +29,8 @@ from rlm import McpIntegration
 # instead. ``McpIntegration._open_session`` hands the MCP SDK a bare
 # ``httpx.AsyncClient(headers=...)`` with no ``timeout``, which silently inherits httpx's 5s
 # *inactivity* defaults in place of the SDK's own 30s general / 300s SSE-read ones. Any tool that
-# goes five seconds without emitting a response byte then fails -- and ``get_task`` does exactly
-# that, because building an env takes ~12s and says nothing while it works. The surfaced error
+# goes five seconds without emitting a response byte then fails, and the call that ends a task
+# does exactly that: it seals and grades server-side before it answers. The surfaced error
 # names none of this: the real ``httpx.ReadTimeout`` is swallowed into a debug log, and what
 # reaches the caller is ``SSE stream ended without a response`` inside an ExceptionGroup.
 #
@@ -97,7 +97,7 @@ class ShogymStream(McpIntegration):
 
 shogym_stream = ShogymStream()
 
-# Forward bare module access (`import shogym_stream; await shogym_stream.get_task()`) to the
+# Forward bare module access (`import shogym_stream; await shogym_stream.pull()`) to the
 # instance, but NOT the names the kernel bootstrap probes -- forwarding `run` would make it
 # treat the module as a callable skill and break tool dispatch.
 _RESERVED = {"run", "__wrapped__", "__call__"}

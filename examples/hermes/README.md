@@ -1,19 +1,18 @@
 # Hermes quickstart
 
-Point the `hermes` CLI you already use at a **stream of shogym tasks**. The agent pulls a task,
-plays it with the env's own tools, pulls the next one, and stops when the queue is empty. The
-server scores every task as it ends; you read the scores back afterwards, out of a durable record
+Point the `hermes` CLI you already use at **one shogym task, served over MCP**. The agent pulls
+the work, plays it with the env's own tools, ends it with the tool that ends it, and pulls again
+until the stream says it is done. The stream seals and scores the attempt itself, into a record
 the agent never sees.
 
 Three moves, and the whole quickstart is these three:
 
-1. **A stream of tasks.** `serve.py` publishes one MCP endpoint for a whole queue: `get_task`
-   plus the env's native tools, routed to whichever task is live.
+1. **One task, served.** `serve.py` publishes one MCP endpoint: `pull` plus the env's native
+   tools, each wrapped so that a call names the attempt it belongs to.
 2. **One variable swaps the env.** `ENV = "automationbench"` at the top of `serve.py`. That line
    is the entire migration to any other env in the catalogue.
-3. **The server keeps the score.** Every task is scored server-side into a durable record that
-   `results.py` reads back. The agent hears its score as it goes (the practice default); the
-   record is what you trust.
+3. **The stream keeps the score.** Sealing is server-side and the score stays in the stream's own
+   durable history. The agent is not told it, and neither is anything else.
 
 ## Prerequisites
 
@@ -21,8 +20,13 @@ Three moves, and the whole quickstart is these three:
   below, which is less obvious than it looks.
 - Credentials for it. See [Providers](#providers) below, which has one trap worth reading.
 - [uv](https://docs.astral.sh/uv/), for the pinned Python 3.12 venv. `uv sync` at the repo root
-  installs shogym with every env extra (the default dev group), which is what the default env
-  below needs. On its first run `automationbench` also fetches its pinned upstream source into
+  installs shogym with every env extra and with the `durable` extra, which is what serving needs
+  now: the stream's history, replay and timers are Temporal's. Outside this repo that extra is
+  `pip install "shogym[durable]"` (or `uv sync --extra durable`); `import shogym` still works
+  without it, and only serving does not.
+- Network, once. The first serve starts an embedded durable service and downloads its binary
+  into `~/.cache/shogym/temporal/`; set `SHOGYM_TEMPORAL_ADDRESS` to use a service you already
+  run instead. On its first run `automationbench` also fetches its pinned upstream source into
   `~/.cache/shogym` once; after that it is fully offline and needs no key.
 
 ### Installing Hermes
@@ -53,8 +57,7 @@ Two things that will otherwise cost you an afternoon:
 - **The pin inside that extra is load-bearing**, not routine hygiene: `mcp==1.28.1`. Hermes probes
   for `mcp.client.streamable_http.streamablehttp_client` at import and silently sets
   `_MCP_HTTP_AVAILABLE = False` when it is missing, so an unpinned `mcp` 2.0.0 leaves stdio working
-  while the HTTP transport quietly disappears. Symptom: the stdio server below connects and the
-  `url:` variant does not.
+  while the HTTP transport quietly disappears.
 
 ## Run it
 
@@ -72,10 +75,10 @@ cp config.yaml "$HERMES_HOME/config.yaml"
 # 3. install (from anywhere in the repo)
 uv sync
 
-# 4. check the wiring -- connects, lists tools, disconnects. No model, no spend, no run recorded
+# 4. check the wiring: connects, lists tools, disconnects. No model, no spend, no run recorded
 hermes mcp test shogym
 
-# 5. play the stream
+# 5. play the task
 #   -z                    -> one-shot: run the prompt to completion, print only the final text
 #   --provider openai-api -> the direct OpenAI API (NOT `openai`; see Providers)
 #   --usage-file          -> a JSON token/cost report written even if the run fails
@@ -83,92 +86,100 @@ hermes -z "$(cat PROMPT.txt)" \
     --provider openai-api --model gpt-5.6-terra \
     --reasoning low \
     --usage-file usage.json
-
-# 6. read the scores
-uv run python results.py
 ```
 
 `hermes mcp test shogym` is the cheapest thing in this directory and worth running first. It
 spawns `serve.py`, completes the MCP handshake and prints the tool list, which is exactly what
-the agent will be handed:
+the agent will be handed. With `ENV = "automationbench"` the shape is:
 
 ```
   Testing 'shogym'...
   Transport: stdio → uv
   Auth: none
-  ✓ Connected (12642ms)
-  ✓ Tools discovered: 7
+  ✓ Connected
+  ✓ Tools discovered: 5
 
-    get_task                             Takes the next task off the queue and starts it...
-    queue_info                           Reports ``{remaining, consumed, in_flight}`` for the ta...
-    terminate                            End the current episode...
-    api_search                           Search available API endpoints by keyword (BM25 over en...
-    api_fetch                            Call an API endpoint by its full URL, routing to the ap...
-    base64_encode                        Encode text to base64url — the format Gmail API body fi...
-    done                                 Finish the task: end the episode and score the final wo...
+    pull                                 Ask the stream for your next message. Takes no argum...
+    api_search                           Search available API endpoints by keyword (BM25 over...
+    api_fetch                            Call an API endpoint by its full URL, routing to the...
+    base64_encode                        Encode text to base64url, the format Gmail API body ...
+    done                                 Finish the task: end the episode and score the final...
 ```
 
-(Real output, `ENV = "automationbench"`. The first connect builds the env, hence the seconds;
-`connect_timeout: 90.0` in `config.yaml` exists for exactly that.)
+Expect that connect to take seconds rather than milliseconds: it builds the env and starts the
+durable service before the server answers, which is what `connect_timeout: 180.0` in `config.yaml`
+is for. The env's reserved abort is not in the list because the stream serves exactly one tool
+that can end an attempt, and for this env that is `done`.
 
-Hermes keeps its own toolsets (terminal, file, web, memory, and the rest) alongside the
-stream's tools,
-which is the right default for a quickstart. For a run whose scores you want to defend, hand it
-only what it needs: an agent with the `file` toolset can find the env's task definitions on
-disk. Hermes makes that an allowlist rather than a deny list, because **each MCP server is
+Hermes keeps its own toolsets (terminal, file, web, memory, and the rest) alongside the served
+tools, which is the right default for a quickstart. For a run whose scores you want to defend,
+hand it only what it needs: an agent with the `file` toolset can find the env's task definitions
+on disk. Hermes makes that an allowlist rather than a deny list, because **each MCP server is
 itself a toolset**, registered as `mcp-<server>` with the bare server name as an alias:
 
 ```bash
-hermes -z "$(cat PROMPT.txt)" -t shogym        # the stream, and nothing else
+hermes -z "$(cat PROMPT.txt)" -t shogym        # the served tools, and nothing else
 ```
 
 `-t/--toolsets` replaces the enabled set outright, so naming only `shogym` turns every built-in
-toolset off. What survives is the stream plus Hermes's own tool-calling surface, verified by
-asking a run under `-t shogym` to list its tools:
+toolset off. What survives is this server plus Hermes's own tool-calling surface:
 
 ```
 tool_search  tool_describe  tool_call  parallel
-mcp__shogym__get_task     mcp__shogym__queue_info    mcp__shogym__terminate
-mcp__shogym__api_search   mcp__shogym__api_fetch     mcp__shogym__base64_encode   mcp__shogym__done
+mcp__shogym__pull         mcp__shogym__api_search    mcp__shogym__api_fetch
+mcp__shogym__base64_encode   mcp__shogym__done
 mcp__shogym__get_prompt   mcp__shogym__list_prompts  mcp__shogym__list_resources  mcp__shogym__read_resource
 ```
 
-(Real output, reflowed; `ENV = "automationbench"`.) `mcp__<server>__<tool>` is the wire name, so
-the server key in `config.yaml` is what the model sees. The four `get_prompt`/`list_*`/
-`read_resource` entries are the MCP protocol surface Hermes registers per server; shogym publishes
-neither prompts nor resources, so they return nothing. `hermes tools disable <toolset>` makes the
-same choice persistent in this `HERMES_HOME` instead of per-invocation.
+`mcp__<server>__<tool>` is the wire name, so the server key in `config.yaml` is what the model
+sees. The four `get_prompt`/`list_*`/`read_resource` entries are the MCP protocol surface Hermes
+registers per server; shogym publishes neither prompts nor resources, so they return nothing.
+`hermes tools disable <toolset>` makes the same choice persistent in this `HERMES_HOME` instead of
+per-invocation.
 
-### Over HTTP instead
+## One episode per launch
 
-Hermes speaks streamable HTTP natively, and it is the easier transport when the env needs a
-secret or the agent runs somewhere else. Start the server yourself, in your own shell, with your
-own environment:
+`serve.py` serves one env at one task and closes the queue before the agent can pull, so `done`
+arrives as soon as that task has been sealed and paid out. A run of three tasks is three launches
+of the `hermes` command, one per task, and not one queue of three:
 
 ```bash
-uv run python serve.py http 8973      # 127.0.0.1:8973/mcp
+for task in 0 1 2; do SHOGYM_TASK=$task hermes -z "$(cat PROMPT.txt)" \
+    --provider openai-api --model gpt-5.6-terra --reasoning low; done
 ```
 
-and point the same server key at it. No `command`, no `args`, no `env` block:
+Each launch gets a fresh env, and each writes its own directory under `runs/`.
 
-```yaml
-mcp_servers:
-  shogym:
-    url: http://127.0.0.1:8973/mcp
-    connect_timeout: 60.0
-    enabled: true
+## The loop the agent runs
+
+`PROMPT.txt` is the whole of it, and the shape on the wire is worth knowing before you read a
+session log:
+
+```jsonc
+// pull, which takes no arguments
+{"protocol_version": 2, "kind": "task", "message_id": "...", "attempt_id": "9f3c...", "body": "..."}
+
+// every env tool, wrapped: the attempt is the routing handle
+{"attempt_id": "9f3c...", "arguments": {"word": "crane"}}
+
+// the tool that ends the task, wrapped the same way, answered by the stream and not the env
+{"protocol_version": 2, "kind": "seal_ack", "attempt_id": "9f3c...", "submission_digest": "..."}
+
+// pull again
+{"protocol_version": 2, "kind": "done", "message_id": "..."}
 ```
 
-`hermes mcp add shogym --url http://127.0.0.1:8973/mcp` is the `mcp add` form of the same entry.
-Hermes also supports `transport: sse` for SSE servers; shogym serves streamable HTTP, so leave it
-off.
+A `wait` record means nothing is ready yet, so pull again shortly. A `seal_reject` means the
+terminal's own arguments were malformed; the task is still open, so the agent can correct them and
+file again. There is no queue to inspect and no task index anywhere on the wire: a task record
+carries an attempt id and a body, and has no field an index or a target could be written into.
 
 ## Swap the env
 
 Either set it for one run, without touching a tracked file:
 
 ```bash
-SHOGYM_ENV=wordle_v1 SHOGYM_TASKS=0,1 <the command above>
+SHOGYM_ENV=wordle_v1 SHOGYM_TASK=1 <the command above>
 ```
 
 or change the default, which is one line in `serve.py`:
@@ -180,58 +191,11 @@ ENV = os.environ.get("SHOGYM_ENV") or "automationbench"   # "wordle_v1", "hle", 
 `SHOGYM_ENV` wins when it is set, so the environment variable is the one to reach for while you are
 trying envs out and the literal is the one to edit when you have picked.
 
-Nothing else changes. Not `config.yaml`, not the prompt, not `results.py`, not the command above.
-`TASKS = [0, 1, 2]` is the other constant, and the only thing to check when you swap: task index
-ranges differ per env, and some envs need their extra installed and a key exported (see
-`src/shogym/envs/<env>/README.md`, and the `env:` block above for how a key reaches a stdio
-server). `wordle_v1` needs neither and is the cheapest place to start.
-
-## Read the results
-
-Real output from this quickstart's own smoke run. `ENV = "wordle_v1"`, `TASKS = [0, 1]`,
-`--provider openai-api --model gpt-5.4-mini --reasoning low`. `--usage-file` reported 11 API
-calls, 21.4k input and 5.2k output tokens for the whole run:
-
-```
-runs/wordle_v1-20260806T053309Z  (2 tasks)
-
-  #1   wordle_v1[0]  sealed         reward=1.0  success=None
-  #2   wordle_v1[1]  drained        reward=0.0  success=None
-
-  scored   2/2
-  reward   mean 0.500
-```
-
-Hermes's own final message on that run was *"Stream exhausted. I completed 2 tasks."* The record
-says one sealed task and one drained with `count_turns = 0.0`: the agent pulled the second task
-and never played it. Both statements are sincere; only one of them was scored by something other
-than the agent. That gap is the whole reason the scoring lives in the server.
-
-One row per dispensed task, and the columns are the record's own fields:
-
-- **`closure`** says how the task ended: `sealed` (the agent called the env's score terminal, or
-  spent its budget), `aborted` (the agent called `terminate`), `drained` (the stream forced the
-  terminal because the agent moved on or the run ended), `timeout`, `finalize_error`, or
-  `broker_abort` (dispensed and never sealed, i.e. the server was killed holding it).
-- **`reward`** and **`success`** are whatever the env published at episode level under those
-  names. `None` means the env published no such field, not zero; some envs report their verdict
-  under other names (`partial_credit`, `check_answer`, which is what `wordle_v1` does above).
-  `results.py --verbose` prints every value the env published, verbatim.
-- The last three closures carry **no score at all**, so an infrastructure failure can never be
-  averaged in as a zero. `results.py` reports `scored N/M` for exactly that reason.
-
-The rows are JSONL on disk under `runs/<env>-<stamp>/`, so any reader will do:
-
-```bash
-uv run python -c "
-from shogym.serve.stream import read_results
-for r in read_results('runs/wordle_v1-<stamp>'):
-    print(r.position, r.env, r.task_idx, r.closure, r.score and r.score.reward)"
-```
-
-`results.py` adds one thing over `read_results`: it also calls `reconcile()`, which pairs
-`dispenses.jsonl` against `results.jsonl` and reports any task that went out and never came back
-as a `broker_abort`. A clean run has none. A `docker rm -f` mid-run has one.
+Nothing else changes. Not `config.yaml`, not the prompt, not the command above. `TASK = 0` is the
+other constant, and the only thing to check when you swap: task index ranges differ per env, and
+some envs need their extra installed and a key exported (see `src/shogym/envs/<env>/README.md`,
+and the `env:` block below for how a key reaches a stdio server). `wordle_v1` needs neither and is
+the cheapest place to start.
 
 ## An isolated HERMES_HOME
 
@@ -240,9 +204,8 @@ Hermes has no project-local MCP file. `mcp_servers` lives in the single `config.
 a quickstart server there would edit your real setup, and removing it afterwards is on you.
 
 So give the quickstart its own home. `HERMES_HOME` is read before anything else, and the
-directory is created on demand:
-
-Those are steps 1 and 2 of [Run it](#run-it) above. The home is throwaway and gitignored.
+directory is created on demand. Those are steps 1 and 2 of [Run it](#run-it) above. The home is
+throwaway and gitignored.
 
 That home starts as one file. Hermes scaffolds the rest on first use (`sessions/`, `logs/`,
 `skills/`, `memories/`, `state.db`, a default `SOUL.md`), and all of it is this quickstart's, so
@@ -257,12 +220,12 @@ mcp_servers:
   shogym:
     command: uv
     args: ["run", "python", "serve.py"]
-    connect_timeout: 90.0
+    connect_timeout: 180.0
     enabled: true
 ```
 
 That is the whole file, and Hermes accepts it as-is: everything else in a Hermes config has a
-default. `hermes mcp add shogym --command uv --args run python serve.py --connect-timeout 90`
+default. `hermes mcp add shogym --command uv --args run python serve.py --connect-timeout 180`
 writes the same block (plus a `_config_version:` line and a commented template of every other
 setting), and `hermes mcp list` / `hermes mcp test` / `hermes mcp remove shogym` manage it. Note
 that `mcp add` is discovery-first (it connects, lists the tools, and asks which to enable), so
@@ -282,7 +245,9 @@ load-bearing:
         OPENAI_API_KEY: "${OPENAI_API_KEY}"     # ${VAR} resolves from your env or $HERMES_HOME/.env
   ```
 
-  Or use the HTTP transport below, where the server runs in your shell with your environment.
+  That is the whole of the answer now. Protocol v2 ships one serving entrypoint and it speaks
+  stdio, so the HTTP variant of `serve.py` this quickstart used to offer, which ran in your own
+  shell with your own environment, is gone.
 
 ## Providers
 
@@ -301,42 +266,41 @@ Native Anthropic is `--provider anthropic` with `ANTHROPIC_API_KEY` (`--provider
 to it). Hermes will also read `CLAUDE_CODE_OAUTH_TOKEN` as a fallback, but a Claude subscription
 OAuth token is **not** a substitute for an API key: Anthropic restricts subscription credentials
 to its own products, and the refusal comes from the API, not from Hermes. `hermes mcp test`
-needs no provider at all, which is why it is step 2 above.
+needs no provider at all, which is why it is step 4 above.
 
-## The server keeps the score
+## The stream keeps the score
 
-Scoring is server-side and the durable record is the authority. By default this quickstart uses
-`feedback=Immediate()`: ending a task returns the env's own published verdict, which is the
-useful setting for iterating on an agent, and every row is stamped `feedback_regime="immediate"`
-so the records say what regime produced them.
+The stream seals the attempt, grades it server-side and records the outcome in its own durable
+history. Nothing surfaces that score where you can read it: a live generation reports states and
+counts rather than scores, and `runs/<env>-<task>-<stamp>/` holds the blobs a presentation
+referenced plus a `generation.json` manifest saying which generation lived there. A reader that
+reports the score is not part of this protocol yet, so this quickstart does not ship one and you
+should not infer a number from the run directory.
 
-For scores you intend to defend, construct `EvalStream` instead of `TaskStream` in `serve.py`.
-It refuses any feedback policy at construction, answers every task ending with one fixed
-acknowledgement, stamps rows `feedback_regime="never"`, and refuses to resume a directory whose
-rows were produced under any other regime. The agent is never told how it did; the harness
-cannot grade itself.
+This is the part worth keeping when the harness sounds confident. A Hermes run of the retired
+serving path ended with *"Stream exhausted. I completed 2 tasks."* while the record showed one
+task played and one pulled and abandoned. Both statements were sincere; only one of them was
+written by something other than the agent.
 
-Concurrency is available too: `max_in_flight=N` serves several tasks at once, each named by a
-lease (above 1, the served tools gain a `lease` argument).
+Runs recorded by that retired v1 path are still readable offline, with
+`shogym.serve.v1_runs.read_results` / `read_dispenses` / `reconcile` over their old directories.
+Nothing in this quickstart writes those any more.
 
 ## Files
 
 | File | What it is |
 |---|---|
-| `serve.py` | the MCP endpoint Hermes spawns: builds the `TaskStream`, serves it over stdio (or HTTP) |
+| `serve.py` | the MCP endpoint Hermes spawns: one env, one task, served over stdio |
 | `config.yaml` | the `mcp_servers` block, copied into an isolated `$HERMES_HOME`, server key `shogym` |
-| `PROMPT.txt` | the loop the agent runs: `get_task`, play, end, repeat |
-| `results.py` | reads the durable rows back out after the run |
+| `PROMPT.txt` | the loop the agent runs: `pull`, work, end the task, `pull`, stop on `done` |
 | `.hermes/` | the throwaway Hermes home this quickstart creates. Gitignored. |
-| `runs/` | one directory per run (`results.jsonl` + `dispenses.jsonl`). Gitignored. |
+| `runs/` | one directory per launch (blobs + `generation.json`). Gitignored. |
 
-Knobs worth knowing, all in `serve.py`: `feedback=` (the `Immediate()` default above;
-`Never()` or `EvalStream` for evaluation), `deadline=` bounds each task in seconds (an expired
-task is recorded unscored), `max_in_flight=` serves several tasks concurrently, and
-`resume=True` continues an interrupted run's directory instead of refusing it.
+Knobs worth knowing, both in `serve.py` and both settable for one launch from the environment:
+`SHOGYM_ENV` names the env and `SHOGYM_TASK` names the task index.
 
 ## The other quickstarts
 
 `examples/` holds one directory per harness, each idiomatic to that harness rather
 than squeezed into a shared abstraction. `claude_code/` is the reference implementation; this one
-and `codex/` and `pi/` demonstrate the same three moves in their own idiom.
+and `codex/`, `pi/` and `prime_agent/` demonstrate the same three moves in their own idiom.

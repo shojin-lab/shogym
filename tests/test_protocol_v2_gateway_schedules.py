@@ -91,7 +91,7 @@ async def serving(env: WorkflowEnvironment) -> AsyncIterator[WorkflowEnvironment
 
 @pytest_asyncio.fixture
 async def episode() -> AsyncIterator[ServedEpisode]:
-    started = await ServedEpisode.start(TEST_ENV, task=0)
+    started = await ServedEpisode.start(TEST_ENV, task=0, ends_on_horizon=False)
     try:
         yield started
     finally:
@@ -111,12 +111,12 @@ async def refused(awaitable: Any) -> str:
 
 async def wordle_world(attempt_id: str) -> ServedEpisode:
     """One task's world. A generation of twelve tasks is twelve of these, one after another."""
-    return await ServedEpisode.start(TEST_ENV, task=0)
+    return await ServedEpisode.start(TEST_ENV, task=0, ends_on_horizon=False)
 
 
 async def score_world() -> ServedEpisode:
     """One task's world in the env whose per-session state can be read from out here."""
-    return await ServedEpisode.start(FIXTURE_ENV, task=0)
+    return await ServedEpisode.start(FIXTURE_ENV, task=0, ends_on_horizon=False)
 
 
 async def opened(

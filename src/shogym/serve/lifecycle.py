@@ -337,13 +337,13 @@ class FinalizationStore:
         startup recovery is *reachable*: a crashed prior session's record must sit in a
         directory the next process scans. Records are keyed by a globally-unique
         ``finalization_id`` (and each carries its own ``session_id``), so sharing a directory is
-        safe — no per-session subdir is needed and, critically, a per-session subdir would hide
+        safe: no per-session subdir is needed and, critically, a per-session subdir would hide
         a crashed run's record from recovery.
 
-        - **With a trace path:** ``<trace_dir>/finalizations`` — next to the trace.
+        - **With a trace path:** ``<trace_dir>/finalizations``, next to the trace.
         - **Without one:** a stable, zero-config fallback root (``~/.cache/shogym/sessions``, or
-          the system temp dir if that can't be created) — *not* keyed by session, so a later
-          ``run_stdio`` startup recovers dangling records from a prior crashed run there.
+          the system temp dir if that can't be created), *not* keyed by session, so a later
+          episode's startup recovers dangling records from a prior crashed run there.
         """
         if trace_path is not None:
             return Path(trace_path).parent / "finalizations"

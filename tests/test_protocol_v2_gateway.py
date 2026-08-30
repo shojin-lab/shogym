@@ -6,11 +6,11 @@ whether two calls may overlap, and what a refusal looks like on the wire. The st
 element two's and is not re-tested here.
 
 Two tests need the durable stream itself. One runs the whole arc for real: it spawns ``shogym
-serve --protocol v2`` as a stdio MCP server, drives it through Task, terminal, SealAck, Payload,
-and Done with a scripted client, and reads the bytes the model would have read. The other is the
-one recovery a double cannot vouch for, because what it turns on is the stream answering a
-completed call rather than running it again. Both are marked ``network`` because the durable
-service downloads its binary the first time, and both skip when that service cannot start.
+serve`` as a stdio MCP server, drives it through Task, terminal, SealAck, Payload, and Done with
+a scripted client, and reads the bytes the model would have read. The other is the one recovery
+a double cannot vouch for, because what it turns on is the stream answering a completed call
+rather than running it again. Both are marked ``network`` because the durable service downloads
+its binary the first time, and both skip when that service cannot start.
 """
 
 from __future__ import annotations
@@ -410,7 +410,7 @@ def stream_writes(stream: ScriptedStream) -> Dict[str, Any]:
 
 @pytest_asyncio.fixture
 async def episode() -> AsyncIterator[ServedEpisode]:
-    started = await ServedEpisode.start(TEST_ENV, task=0)
+    started = await ServedEpisode.start(TEST_ENV, task=0, ends_on_horizon=False)
     try:
         yield started
     finally:
@@ -423,7 +423,9 @@ async def scoring_world(trace_path: Optional[Path] = None) -> ServedEpisode:
     In one place because it is what the cross layer tests below open, and what a world of theirs
     is started with is a property of this protocol rather than of any one of them.
     """
-    return await ServedEpisode.start(SCORING_ENV, task=0, trace_path=trace_path)
+    return await ServedEpisode.start(
+        SCORING_ENV, task=0, trace_path=trace_path, ends_on_horizon=False
+    )
 
 
 def make_gateway(episode: ServedEpisode, stream: ScriptedStream) -> StreamGateway:
@@ -2869,7 +2871,7 @@ async def test_the_whole_arc_over_stdio(tmp_path) -> None:
 
 
 async def _drive_stdio(address: str, tmp_path: Any) -> None:
-    """Spawn ``shogym serve --protocol v2`` and run one episode through it."""
+    """Spawn ``shogym serve`` and run one episode through it."""
     environment = dict(os.environ)
     # The served process joins the service this test already started rather than starting a
     # second one on the same database.
@@ -2883,8 +2885,6 @@ async def _drive_stdio(address: str, tmp_path: Any) -> None:
             TEST_ENV,
             "--task",
             "0",
-            "--protocol",
-            "v2",
             "--run-dir",
             str(tmp_path / "run"),
         ],

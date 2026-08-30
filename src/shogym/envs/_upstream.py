@@ -205,18 +205,18 @@ def _locked(directory: Path) -> Iterator[None]:
 
     ``_provision_lock`` only serializes threads inside one interpreter, and a cold cache is
     routinely hit by several processes at once (a parallel test run, several served episodes
-    starting together). Without this they each download the same tarball — 93 MB apiece for
-    tau2-bench — and then race check-then-``os.replace`` on the publish, where the loser's rename
+    starting together). Without this they each download the same tarball, 93 MB apiece for
+    tau2-bench, and then race check-then-``os.replace`` on the publish, where the loser's rename
     fails with ``ENOTEMPTY`` against the winner's finished tree.
 
-    An ``flock`` rather than a lock *file*, for the reason ``serve.stream._locked`` gives: a lock
-    made of a file existing survives the process that made it, so a crash mid-download would wedge
+    An ``flock`` rather than a lock *file*: a lock made of a file existing survives the process
+    that made it, so a crash mid-download would wedge
     every later provisioner behind residue that only a liveness guess could clear. This lock is
     owned by the kernel and released when the descriptor closes, which happens however the process
     ends.
 
     Two directories are locked, for two jobs. ``<cache>/<package>/``, the parent of the per-SHA
-    trees, is the provisioning critical section — so one upstream's provisioning never waits on
+    trees, is the provisioning critical section, so one upstream's provisioning never waits on
     another's. Each ``.dl-*`` staging directory is locked by its owner for as long as it is in use,
     which is what lets :func:`_sweep_download_residue` recognize an abandoned one.
 

@@ -33,7 +33,7 @@ from shogym.serve.protocol_v2.rundir import (
     stage_run_directory,
     staged_generation,
 )
-from shogym.serve.stream import read_dispenses
+from shogym.serve.v1_runs import read_dispenses
 
 CONFIGURATION = "a" * 64
 

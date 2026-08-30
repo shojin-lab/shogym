@@ -1,24 +1,18 @@
-"""Serve a queue of shogym tasks to Hermes over MCP.
+"""Serve one shogym task to Hermes over stdio MCP.
 
 Hermes spawns this file as an MCP server (see ``config.yaml``); it never spawns Hermes. What it
-publishes is a :class:`~shogym.serve.stream.TaskStream`: one endpoint that hands out tasks one at a
-time (``get_task``), routes the env's own tools to whichever task is live, and, the part that
-matters, **seals and scores each task itself**. The agent is never told its score. It is not even
-told which task it played: ``get_task`` answers with ``{env, instructions, budget, tools}`` and
-has no field a task index or a target could be written into.
+publishes is one generation of the protocol v2 stream: ``pull`` hands out the work, every env tool
+is wrapped so each call names the attempt it belongs to, and the terminal tool is intercepted and
+sealed by the stream instead of reaching the env. The agent is not told which task it played: a
+task record carries an attempt id and a body, and has no field an index or a target could be
+written into.
 
-Two transports, because Hermes speaks both natively::
+Stdio only. Protocol v2 ships one serving entrypoint and it speaks stdio; an env that needs a key
+gets it from the ``env:`` block in ``config.yaml``, because Hermes hands a stdio subprocess a
+filtered environment.
 
-    python serve.py                # stdio -- Hermes spawns this process itself
-    python serve.py http [port]    # streamable HTTP on 127.0.0.1:<port>, you run it
-
-stdio is the default and needs nothing running. Reach for ``http`` when the env needs a secret:
-Hermes hands stdio subprocesses a *filtered* environment (PATH, HOME, and little else), so an
-exported key does not reach a stdio server unless you name it in ``config.yaml``. Started from
-your own shell, this process just has your environment.
-
-Every dispensed task lands exactly one durable row under ``runs/<env>-<stamp>/``. Read them back
-with ``results.py`` once the run is over.
+One launch is one episode, over one env at one task, so three tasks are three launches. Serving
+needs the durable extra (``uv sync --extra durable``, or ``pip install "shogym[durable]"``).
 """
 
 from __future__ import annotations
@@ -28,81 +22,45 @@ import os
 import sys
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Optional, Sequence
 
-import shogym
-from shogym.serve.stream import Immediate, TaskRef, TaskStream, build_stream_server
+from shogym.serve.protocol_v2.gateway import run_stdio_v2
 
 # --------------------------------------------------------------------------------------------
-# The one variable. Swapping envs is this line and nothing else: the queue, the endpoint, the
-# scoring and the readout are all env-agnostic, and the tools the agent is handed come from
-# whatever env this names.
+# The one variable. Swapping envs is this line and nothing else: the endpoint, the wrapper shape
+# and the sealing are all env-agnostic, and the tools the agent is handed come from whatever env
+# this names.
 #
 #     automationbench   wordle_v1   hle   yc_bench   browsecomp_plus   frontier_bench
 #     tau2_mock   tau2_airline   tau2_retail   tau2_telecom   tau2_banking_knowledge
 #
-# (`python -c "import shogym; print(shogym.registered_envs())"` prints the live catalogue. Some envs
-# need an extra installed and a key; see their READMEs under src/shogym/envs/.)
+# (`python -c "import shogym; print(shogym.registered_envs())"` prints the live catalogue. Some
+# envs need an extra installed and a key; see their READMEs under src/shogym/envs/.)
 # `SHOGYM_ENV` wins when it is set, so a run can swap envs without editing this file:
 #     SHOGYM_ENV=wordle_v1 <your harness command>
 ENV = os.environ.get("SHOGYM_ENV") or "automationbench"
 
-# Which tasks to serve, in order. A repeat is legal: a task's identity within a run is its
-# position in this queue, not its index, so `[0, 0, 1]` plays task 0 twice and records both.
-# `SHOGYM_TASKS` overrides it the same way: SHOGYM_TASKS=0,0,1
-TASKS = [int(t) for t in os.environ["SHOGYM_TASKS"].split(",")] if os.environ.get("SHOGYM_TASKS") else [0, 1, 2]
+# Which task this launch serves.
+#     SHOGYM_TASK=7 <your harness command>
+TASK = int(os.environ.get("SHOGYM_TASK") or 0)
 # --------------------------------------------------------------------------------------------
 
 RUNS = Path(__file__).resolve().parent / "runs"
 
 
-def new_run_dir(env: str = ENV, runs: Path = RUNS) -> Path:
-    """A fresh provenance directory for one run.
+def new_run_dir(env: str = ENV, runs: Path = RUNS, task: int = TASK) -> Path:
+    """A fresh directory for one generation, holding its blobs and its resume manifest.
 
-    Fresh per run on purpose. A stream numbers rows from the start of its own queue, so pointing
-    two runs at one directory would file both under the same positions. ``TaskStream`` refuses
-    that outright (pass ``resume=True`` to continue an interrupted run instead)."""
-    return runs / f"{env}-{datetime.now(timezone.utc):%Y%m%dT%H%M%SZ}"
-
-
-def build_stream(
-    env: str = ENV,
-    tasks: Sequence[int] = TASKS,
-    prov_dir: Optional[Path] = None,
-) -> TaskStream:
-    """The queue, ready to serve. ``shogym.make`` is passed as a **factory**: the stream builds a
-    fresh env per task and closes it, so no two tasks share state."""
-    return TaskStream(
-        shogym.make,
-        [TaskRef(env, i) for i in tasks],
-        prov_dir=prov_dir if prov_dir is not None else new_run_dir(env),
-        # deadline=600.0,  # optional: seconds per task; an expired task is recorded unscored
-        # Feedback on submission: the terminal response carries the env's published
-        # verdict (the practice default). For evaluation-grade scores use EvalStream.
-        feedback=Immediate(),
-    )
+    Fresh per launch on purpose. The manifest is written once and never rewritten, because a
+    resume compares against it, so a directory that already holds one is refused rather than
+    added to."""
+    return runs / f"{env}-{task}-{datetime.now(timezone.utc):%Y%m%dT%H%M%SZ}"
 
 
-async def main(argv: Optional[Sequence[str]] = None) -> None:
-    args = list(sys.argv[1:] if argv is None else argv)
-    http = bool(args) and args[0] == "http"
-    port = int(args[1]) if len(args) > 1 else 8973
-
-    stream = build_stream()
-    # Under stdio, stdout is the MCP wire, so everything this process says goes to stderr.
-    where = f"http://127.0.0.1:{port}/mcp" if http else "stdio"
-    print(
-        f"[shogym] serving {ENV} tasks {list(TASKS)} on {where} -> {stream.prov_dir}",
-        file=sys.stderr,
-    )
-    async with stream:
-        # `async with` is what makes the record complete: on disconnect it forces the terminal on
-        # a task still in flight and records it, rather than leaving a dispense with no outcome.
-        server = build_stream_server(stream, name="shogym")
-        if http:
-            await server.run_async(transport="http", host="127.0.0.1", port=port)
-        else:
-            await server.run_async(transport="stdio")
+async def main() -> None:
+    run_dir = new_run_dir()
+    # stdout is the MCP wire, so everything this process says goes to stderr.
+    print(f"[shogym] serving {ENV} task {TASK} -> {run_dir}", file=sys.stderr)
+    await run_stdio_v2(ENV, task=TASK, run_directory=run_dir)
 
 
 if __name__ == "__main__":

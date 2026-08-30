@@ -1461,6 +1461,7 @@ class StreamGateway:
                 "way to open a world for it"
             )
         opened = await self._open_episode(attempt_id)
+        _ended_by_the_stream(opened)
         started_as = self._declared_environment
         if started_as is not None:
             declared = environment_terminal(opened)
@@ -1527,6 +1528,19 @@ async def _let_go(episode: ServedEpisode) -> None:
     the session and tearing the env down, is what this is here for.
     """
     await episode.close(finalize=False)
+
+
+def _ended_by_the_stream(episode: ServedEpisode) -> None:
+    """Refuse a world that would end itself, whichever task this generation opened it for.
+
+    The rule is the one :func:`open_gateway` states, and a generation opens a world for every
+    task rather than only for its first, so every one of them is held to it here.
+    """
+    if episode.ends_on_horizon:
+        raise ValueError(
+            "this episode ends itself when its step budget runs out, and under this protocol "
+            "the stream is what ends an attempt; start it with ends_on_horizon=False"
+        )
 
 
 def _read_failure(landing: "asyncio.Future[Any]") -> None:
@@ -1659,7 +1673,14 @@ async def open_gateway(
     owner serves rather than what the directory recorded, so the directory alone is not enough
     to take a generation over: the identifiers a generation mints are its own, and a controller
     that let this call compose one has nowhere else to read them back from.
+
+    An episode that ends on its own horizon is refused here. Under this protocol the stream is
+    what ends an attempt, and an episode that seals and grades itself when a step budget runs
+    out would end one behind the stream's back: the attempt would still be ACTIVE, nothing the
+    ledger holds would say the environment had been graded, and the terminal the model went on
+    to call would seal a world that was already gone.
     """
+    _ended_by_the_stream(episode)
     spec = episode.describe()
     terminal = terminal_manifest(spec)
     composed = start or stream_start(
@@ -1778,7 +1799,9 @@ async def run_stdio_v2(
     stream. Stopping it closes the episode, so the episode is closed here only when there was
     no gateway to do it or its stop did not finish.
     """
-    episode = await ServedEpisode.start(env_name, task=task, trace_path=trace_path)
+    episode = await ServedEpisode.start(
+        env_name, task=task, trace_path=trace_path, ends_on_horizon=False
+    )
     stopped = False
     try:
         environment = environment_terminal(episode)
