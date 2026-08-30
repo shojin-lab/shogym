@@ -89,7 +89,11 @@ on a durable timer that survives the worker that armed it.
 A refusal arrives as an Update failure carrying one code from the protocol's closed set. Read
 it with :func:`protocol_error_code`; anything that function returns ``None`` for is a fault
 and not a protocol answer. :meth:`StreamHandle.stream_state` is harness-only and writes
-nothing.
+nothing, and so is :meth:`StreamWorkflow.attempt_records`, which answers with one
+:class:`~shogym.serve.protocol_v2.kernel.messages.AttemptRecord` per attempt: its positions, its
+filing, its score or the ending it got instead, which of its messages were handed to the
+transport, and whether a payload was owed against it at all.
+:mod:`shogym.serve.protocol_v2.reader` is that Query read from a run directory.
 """
 
 from shogym.serve.protocol_v2 import BlobRef, blob_ref
@@ -109,6 +113,7 @@ from shogym.serve.protocol_v2.kernel.messages import (
     SEAL_UNUSABLE,
     STEP_CAP,
     AttemptFinalized,
+    AttemptRecord,
     BlobsVerified,
     ConsumerClaim,
     ConsumerReceipt,
@@ -167,6 +172,7 @@ __all__ = [
     "STREAM_TASK_QUEUE",
     "TEMPORAL_ADDRESS_ENV",
     "AttemptFinalized",
+    "AttemptRecord",
     "BlobRef",
     "BlobsVerified",
     "ConsumerClaim",
