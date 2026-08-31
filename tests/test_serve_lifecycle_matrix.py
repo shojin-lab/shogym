@@ -36,7 +36,6 @@ import pytest
 
 from shogym.serve import ServedEpisode
 from shogym.serve import episode as episode_module
-from shogym.serve.stream import TaskRef, TaskStream
 from shogym.shared.terminate_mcp import TERMINATE_TOOL_NAME
 
 from tests._fixtures import score_env, score_mcp
@@ -67,7 +66,6 @@ EVENTS = (
     "env_raises",
     "env_cancels",
     "session_slow",
-    "span_fails",
     "factory_fails_late",
     # A cell that says "cannot arise" is a claim, and these are what happens when the claim is
     # wrong.
@@ -499,52 +497,6 @@ async def _second_close_while_closed(_tmp: Path) -> None:
     _holds(env, sessions=ep)
 
 
-async def _span_fails_while_begun(tmp_path: Path) -> None:
-    """Pass 6 finding 5 and pass 7 finding 3: a span that refuses must not leak the env, on
-    either factory contract."""
-    for off_loop in (True, False):
-        closed = threading.Event()
-        loop = asyncio.get_running_loop()
-        seen: Dict[str, Any] = {}
-
-        class _Noticing(_FixtureScoreEnv):
-            def __init__(self, **kwargs: Any) -> None:
-                self.built_on = asyncio.get_running_loop()
-                super().__init__(**kwargs)
-
-            async def _close(self) -> None:
-                seen["foreign"] = asyncio.get_running_loop() is not self.built_on
-                closed.set()
-
-        class _Refusing:
-            namespace = "refusing"
-
-            async def begin(self, *args: Any, **kwargs: Any) -> None:
-                raise RuntimeError("no span for you")
-
-            async def finalize(self, *args: Any, **kwargs: Any) -> None:
-                return None
-
-        stream = TaskStream(
-            lambda _name: _Noticing(tasks=list(TASKS)),
-            [TaskRef(ENV_NAME, 0)],
-            prov_dir=tmp_path / f"prov-{off_loop}",
-            off_loop_factory=off_loop,
-            provenance=[_Refusing()],  # type: ignore[list-item]
-        )
-        with pytest.raises(BaseException):
-            await stream.get_task()
-        # Awaited rather than blocked on: for the default contract the close is posted back to
-        # this very loop, so a caller that blocks it is waiting for work it is preventing.
-        assert await _awaited(closed.is_set), f"off_loop={off_loop}: never closed"
-        assert seen.get("foreign") is False, f"off_loop={off_loop}: closed on a foreign loop"
-        with contextlib.suppress(BaseException):
-            await stream.aclose()
-        assert loop is asyncio.get_running_loop()
-
-
-
-
 async def _normal_close_while_dispatching(_tmp: Path) -> None:
     """An ordinary close during a dispatch waits: it does not claim an abort and release the
     session while the accepted call is still inside the tool."""
@@ -647,7 +599,6 @@ async def _normal_close_while_finalizing(_tmp: Path) -> None:
     _holds(env, sessions=ep)
 
 
-
 async def _cancel_cleanup_before_begin(_tmp: Path) -> None:
     """A cancellation before `begin_session` still closes the env: with no rollback there is no
     session to release, so nothing else would start the close."""
@@ -718,7 +669,6 @@ _MATRIX: Dict[str, Dict[str, Any]] = {
         "env_raises": "a constructor that raises is `factory_fails_late`",
         "env_cancels": "a constructor that raises is `factory_fails_late`",
         "session_slow": "no session is opened before the env is built",
-        "span_fails": "spans open after the build, which is `begun`",
         "normal_close": "no episode exists to close",
         "cancel_cleanup": "there is no cleanup until there is something built to clean up",
         "deadline_mid_finalize": "nothing is finalizing",
@@ -727,7 +677,6 @@ _MATRIX: Dict[str, Dict[str, Any]] = {
         "cancel_start": _cancel_start_while_begun,
         "env_cancels": _env_cancels_while_begun,
         "loop_closes": _loop_closes_while_begun,
-        "span_fails": _span_fails_while_begun,
         "cancel_call": "no call has been made yet",
         "cancel_close": "covered under `releasing`: a close here has no session state to race",
         "deadline_fires": "a task is not dispensed until setup returns, so no clock is running",
@@ -750,7 +699,6 @@ _MATRIX: Dict[str, Dict[str, Any]] = {
         "env_raises": "a tool that raises is an ordinary call result, not a lifecycle event",
         "env_cancels": "covered under `releasing`: the hook boundary is where it matters",
         "session_slow": _normal_close_while_dispatching_legacy,
-        "span_fails": "spans are open by now",
         "factory_fails_late": "the factory has already returned",
         "cancel_cleanup": "there is no cleanup path here; teardown is `releasing` and `closing`",
         "deadline_mid_finalize": "nothing is finalizing",
@@ -768,7 +716,6 @@ _MATRIX: Dict[str, Dict[str, Any]] = {
         "env_raises": "a finalizer that raises is a fail-closed verdict, tested in terminal suite",
         "env_cancels": "covered under `releasing`",
         "session_slow": "covered under `closing`",
-        "span_fails": "spans are open by now",
         "factory_fails_late": "the factory has already returned",
     },
     "draining": {
@@ -784,7 +731,6 @@ _MATRIX: Dict[str, Dict[str, Any]] = {
         "env_raises": "covered under `releasing`",
         "env_cancels": "covered under `releasing`",
         "session_slow": "covered under `closing`",
-        "span_fails": "spans are open by now",
         "factory_fails_late": "the factory has already returned",
     },
     "releasing": {
@@ -800,7 +746,6 @@ _MATRIX: Dict[str, Dict[str, Any]] = {
         "loop_closes": "covered under `begun`",
         "env_cancels": "the release path's cancellation is `begun`'s, at the same hook",
         "session_slow": "sessions are closed before the release",
-        "span_fails": "spans are open by now",
         "factory_fails_late": "the factory has already returned",
     },
     "closing": {
@@ -816,7 +761,6 @@ _MATRIX: Dict[str, Dict[str, Any]] = {
         "second_close": "covered under `releasing`",
         "loop_closes": "covered under `begun`",
         "env_cancels": "covered under `releasing`",
-        "span_fails": "spans are open by now",
         "factory_fails_late": "the factory has already returned",
     },
     "closed": {
@@ -832,7 +776,6 @@ _MATRIX: Dict[str, Dict[str, Any]] = {
         "env_raises": "the env has been closed",
         "env_cancels": "the env has been closed",
         "session_slow": "the sessions are closed",
-        "span_fails": "spans are finalized with the row",
         "factory_fails_late": "the factory has already returned",
     },
 }

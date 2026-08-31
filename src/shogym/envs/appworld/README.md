@@ -139,9 +139,6 @@ TaskStream(
     [TaskRef("appworld", 0)],
     prov_dir=...,
     feedback=Information(),
-    # This env's constructor binds no event loop, and building one is real work: say so, and each
-    # task's env is built in a thread instead of on the loop serving the other episodes.
-    off_loop_factory=True,
 )
 ```
 
@@ -555,16 +552,20 @@ nothing in this file.
 ## Gotchas
 
 - **`env.num_tasks` is 318, not 417.** Task indices address the manifest, not the split.
-- **Construction is slow, online, and blocking.** Building the runtime, fetching the corpus and
-  copying it into the two derived views is a one-time cost; deriving a task's seeded world costs
-  about a second the first time it is served and nothing after that. `TaskStream` and
-  `ServedEpisode.start` build each task's env off the event loop when they are told the factory
-  is safe there (`off_loop_factory=True`, which this env is), so a served queue is not held by
-  per-task construction. **The first construction is still the caller's.** `TaskStream.__init__`
-  is synchronous and builds one env per name for the published manifest, which for this env is
-  the cold provisioning call, so a caller on a loop it is also serving on must build the stream
-  off that loop: `await asyncio.to_thread(TaskStream, ...)`. The same goes for a caller that
-  calls `make()` itself. Set `APPWORLD_ROOT` to skip the download.
+- **Construction is slow, online, and blocking, and it happens on the serving loop.** Building the
+  runtime, fetching the corpus and copying it into the two derived views is a one-time cost;
+  deriving a task's seeded world costs about a second the first time it is served and nothing
+  after that. A warm construction is still about four seconds, and `TaskStream.get_task()` calls
+  the env factory synchronously, on the loop it serves on. So while one task is being constructed
+  nothing else on that loop runs: a live sibling episode cannot dispatch a call and its deadline
+  cannot fire, and a 50 ms heartbeat was measured arriving 4.689 s late behind one construction.
+  At `max_in_flight=1` that is dead time and nothing worse; above it, the capacity is not what it
+  says. The mechanism that fixes it is the `off_loop_factory=True` keyword on
+  `TaskStream` / `ServedEpisode` from
+  [shojin-lab/shogym#141](https://github.com/shojin-lab/shogym/pull/141), which this port depends
+  on and which is not on this branch, so nothing here passes it yet. A caller constructing an env
+  directly on a loop it is also serving on has the same problem for the same reason and should
+  build it in a thread. Set `APPWORLD_ROOT` to skip the download.
 - **A different `pulse` is a different experiment.** It fixes the convention and the four stored
   slots for every leg. Scores drawn under two pulses are not comparable, and neither the pulse nor
   the payload class appears anywhere else in a run's record, so every row carries a

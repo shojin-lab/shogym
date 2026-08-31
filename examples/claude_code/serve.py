@@ -131,12 +131,7 @@ def build_stream(
     max_in_flight: int = IN_FLIGHT,
 ) -> TaskStream:
     """The queue, ready to serve. ``shogym.make`` is passed as a **factory**: the stream builds a
-    fresh env per task and closes it, so no two tasks share state.
-
-    Synchronous, and called off the loop by :func:`main` below. Building an env is blocking work
-    and for some envs it is real work (AppWorld provisions a corpus and copies two views of it),
-    and this constructor builds one per env name for the manifest it publishes. Called from
-    inside the serving loop it would hold that loop for the whole of it."""
+    fresh env per task and closes it, so no two tasks share state."""
     return TaskStream(
         shogym.make,
         [TaskRef(env, i) for i in tasks],
@@ -147,14 +142,11 @@ def build_stream(
         # What a terminating call reveals (see `FEEDBACK`). For evaluation-grade scores use
         # EvalStream, which is `Never` made structural and refuses any policy at construction.
         feedback=policy(regime),
-        # `shogym.make` binds no event loop, so each task's env is built in a thread rather than
-        # on the loop that is serving the others.
-        off_loop_factory=True,
     )
 
 
 async def main() -> None:
-    stream = await asyncio.to_thread(build_stream)
+    stream = build_stream()
     # stdout is the MCP wire, so everything this process says goes to stderr.
     print(
         f"[shogym] serving {ENV} tasks {list(TASKS)} under {FEEDBACK} -> {stream.prov_dir}",
