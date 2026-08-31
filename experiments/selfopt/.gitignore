@@ -1,0 +1,11 @@
+# Run artifacts NEVER belong in git: full stream-json traces, whole-workdir snapshots,
+# provenance, metrics, and anything an agent (full tools + web) might have written — which
+# could include a secret it fetched. Everything the harness produces lands under runs/.
+runs/
+*.jsonl
+!/dev/null
+
+# Any stray credentials / env files (defense in depth — nothing here should ever write one).
+.env
+*.envrc
+.mcp.json
