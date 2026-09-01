@@ -14,7 +14,7 @@ from __future__ import annotations
 
 import json
 from pathlib import Path
-from typing import Any, AsyncIterator, Dict, List, Sequence, Tuple
+from typing import Any, AsyncIterator, Dict, List, Optional, Sequence, Tuple
 
 import pytest
 
@@ -38,18 +38,34 @@ from shogym.serve.protocol_v2 import (  # noqa: E402
     check_release,
 )
 from shogym.serve.protocol_v2.gateway import (  # noqa: E402
+    CANONICALIZATION_VERSION,
     PULL_TOOL,
+    EnvironmentTerminal,
     StreamGateway,
+    WorldRoute,
     build_gateway_server,
+    environment_terminal,
     open_gateway,
     stream_start,
     terminal_manifest,
 )
+from shogym.serve.protocol_v2.policy import (  # noqa: E402
+    BLINDED_RECEIPT_V1,
+    DELIVER,
+    EXPERIMENT,
+    KERNEL_STAND_IN_GRADE,
+    ORDINARY,
+    WITHHOLD,
+    PayloadDisposition,
+    policy_digest,
+)
+from shogym.envs.wordle.protocol_v2 import WORDLE_GRADE  # noqa: E402
 from shogym.serve.protocol_v2.kernel import (  # noqa: E402
     STREAM_TASK_QUEUE,
     OfferedMessage,
     TaskItem,
     configuration_hash,
+    kernel_activities,
     resume_run_directory,
     start_stream,
     stream_worker,
@@ -90,6 +106,25 @@ async def serving(env: WorkflowEnvironment) -> AsyncIterator[WorkflowEnvironment
 
 
 @pytest_asyncio.fixture
+async def serving_wordle(
+    env: WorkflowEnvironment,
+) -> AsyncIterator[Tuple[WorkflowEnvironment, EnvironmentTerminal]]:
+    """A service running wordle's own terminal, which is what a real wordle generation runs on.
+
+    The Activities and the route come back together and both go to one place: the Worker
+    registers the Activities and the gateway is opened on the terminal that holds their route,
+    because a seal that cannot find the world an attempt was played in has nothing to capture.
+    """
+    episode = await ServedEpisode.start(TEST_ENV, task=0, ends_on_horizon=False)
+    try:
+        terminal = environment_terminal(episode)
+    finally:
+        await episode.close()
+    async with stream_worker(env.client, activities=terminal.activities):
+        yield env, terminal
+
+
+@pytest_asyncio.fixture
 async def episode() -> AsyncIterator[ServedEpisode]:
     started = await ServedEpisode.start(TEST_ENV, task=0, ends_on_horizon=False)
     try:
@@ -119,6 +154,50 @@ async def score_world() -> ServedEpisode:
     return await ServedEpisode.start(FIXTURE_ENV, task=0, ends_on_horizon=False)
 
 
+def kernel_environment() -> EnvironmentTerminal:
+    """The stream's own stand-in terminal, declared as what these generations are served on.
+
+    What is under test here is the schedule, so these generations keep the stand-ins: they
+    compute from the shape of a filing, reach no world, and are the same for every task. The
+    declaration says so rather than leaving it to be inferred, which is what lets the composition
+    below register a body that reports nothing about the work.
+    """
+    return EnvironmentTerminal(
+        CANONICALIZATION_VERSION,
+        list(kernel_activities()),
+        None,
+        WorldRoute(),
+        KERNEL_STAND_IN_GRADE,
+    )
+
+
+def blinded(rows: Sequence[Any]) -> List[PayloadDisposition]:
+    """Register a body that says a filing was answered and nothing about how good it was.
+
+    A generation over the stand-in grade has no grade to publish, so a fixture that wants
+    payloads registers the blinded receipt for every position it owes one against and the reason
+    it owes none for the rest. Both are rows in the record: this is an experiment saying what it
+    delivers, which is the only way a body that conceals is served at all.
+    """
+    return [
+        PayloadDisposition(
+            attempt_id=row.attempt_id,
+            payload_position=row.payload_position,
+            kind=DELIVER,
+            policy_digest=policy_digest(BLINDED_RECEIPT_V1),
+            cell=BLINDED_RECEIPT_V1.cells[0],
+        )
+        if row.creates_payload_obligation
+        else PayloadDisposition(
+            attempt_id=row.attempt_id,
+            payload_position=row.payload_position,
+            kind=WITHHOLD,
+            reason="the schedule under test delivers nothing here",
+        )
+        for row in rows
+    ]
+
+
 async def opened(
     environment: WorkflowEnvironment,
     episode: ServedEpisode,
@@ -127,8 +206,16 @@ async def opened(
     bodies: Tuple[str, ...],
     release: Any,
     open_episode: Any = wordle_world,
+    terminal: Optional[EnvironmentTerminal] = None,
 ) -> StreamGateway:
-    """Compose a generation, bind this transport to it, and close its manifest."""
+    """Compose a generation, bind this transport to it, and close its manifest.
+
+    A generation over an environment with a grader of its own is an ordinary run and delivers
+    the honest body. One over the stand-ins has no grade to publish, so it registers the blinded
+    receipt for the positions it owes and the reason for the ones it does not. Both are composed
+    here rather than in each test, because what a schedule does is the same either way.
+    """
+    served_on = terminal if terminal is not None else kernel_environment()
     spec = episode.describe()
     start = stream_start(
         spec,
@@ -136,6 +223,10 @@ async def opened(
         claim_hash=CLAIM_HASH,
         bodies=list(bodies),
         release=release,
+        grade=served_on.grade,
+        profile=ORDINARY if not served_on.grade.stand_in else EXPERIMENT,
+        dispositions=None if not served_on.grade.stand_in else blinded,
+        experiment="" if not served_on.grade.stand_in else "what_a_schedule_does",
     )
     gateway = await open_gateway(
         environment.client,
@@ -143,6 +234,7 @@ async def opened(
         workflow_id=workflow_id,
         start=start,
         open_episode=open_episode,
+        environment=served_on,
     )
     # The controller closes the queue. A transport connecting is not what makes a run stop
     # accepting work, so the queue is open until this call, which is what is read here: a
@@ -177,14 +269,16 @@ async def served(gateway: StreamGateway, *, limit: int = 200) -> List[Dict[str, 
 
 
 @pytest.mark.network
-async def test_a_dose_of_twelve_tasks_and_their_payloads(serving, episode) -> None:
+async def test_a_dose_of_twelve_tasks_and_their_payloads(serving_wordle, episode) -> None:
     """Task, acknowledgement, payload, twelve times, and then Done, as a model would see it."""
+    serving, terminal = serving_wordle
     gateway = await opened(
         serving,
         episode,
         workflow_id="stream/gateway-immediate/1",
         bodies=tuple(f"Round {index}." for index in range(DOSE)),
         release=IMMEDIATE,
+        terminal=terminal,
     )
     seen = await served(gateway)
     assert [record["kind"] for record in seen] == ["task", "seal_ack", "payload"] * DOSE + ["done"]
@@ -210,14 +304,16 @@ async def test_a_dose_of_twelve_tasks_and_their_payloads(serving, episode) -> No
 
 
 @pytest.mark.network
-async def test_the_same_dose_under_never_delivers_nothing(serving, episode) -> None:
+async def test_the_same_dose_under_never_delivers_nothing(serving_wordle, episode) -> None:
     """The same twelve tasks with no payload between them, through the same tools."""
+    serving, terminal = serving_wordle
     gateway = await opened(
         serving,
         episode,
         workflow_id="stream/gateway-never/1",
         bodies=tuple(f"Round {index}." for index in range(DOSE)),
         release=NEVER,
+        terminal=terminal,
     )
     seen = await served(gateway)
     assert [record["kind"] for record in seen] == ["task", "seal_ack"] * DOSE + ["done"]
@@ -341,7 +437,9 @@ async def test_a_task_is_sealed_in_the_world_its_own_calls_reached(serving) -> N
 
 
 @pytest.mark.network
-async def test_a_world_that_would_not_open_leaves_the_task_where_it_was(serving, episode) -> None:
+async def test_a_world_that_would_not_open_leaves_the_task_where_it_was(
+    serving_wordle, episode
+) -> None:
     """A world is opened before the Presentation that reports the task, not after it.
 
     Starting one reaches something outside this process and can fail. If it failed after the
@@ -356,6 +454,7 @@ async def test_a_world_that_would_not_open_leaves_the_task_where_it_was(serving,
             raise RuntimeError(failures.pop())
         return await wordle_world(attempt_id)
 
+    serving, terminal = serving_wordle
     gateway = await opened(
         serving,
         episode,
@@ -363,6 +462,7 @@ async def test_a_world_that_would_not_open_leaves_the_task_where_it_was(serving,
         bodies=("Round 0.", "Round 1."),
         release=IMMEDIATE,
         open_episode=open_world,
+        terminal=terminal,
     )
     first = json.loads(await gateway.pull({}))
     await gateway.terminal({"attempt_id": first["attempt_id"], "arguments": {}})
@@ -387,7 +487,7 @@ async def test_a_world_that_would_not_open_leaves_the_task_where_it_was(serving,
 
 @pytest.mark.network
 async def test_a_world_that_would_not_close_leaves_the_acknowledgement_where_it_was(
-    serving, episode
+    serving_wordle, episode
 ) -> None:
     """The world an attempt sealed is let go of before the acknowledgement is committed.
 
@@ -416,6 +516,7 @@ async def test_a_world_that_would_not_close_leaves_the_acknowledgement_where_it_
     async def open_world(attempt_id: str) -> Any:
         return WillNotStopOnce(await wordle_world(attempt_id))
 
+    serving, terminal = serving_wordle
     gateway = await opened(
         serving,
         episode,
@@ -423,6 +524,7 @@ async def test_a_world_that_would_not_close_leaves_the_acknowledgement_where_it_
         bodies=("Round 0.", "Round 1."),
         release=IMMEDIATE,
         open_episode=open_world,
+        terminal=terminal,
     )
     first = json.loads(await gateway.pull({}))
     await gateway.terminal({"attempt_id": first["attempt_id"], "arguments": {}})
@@ -506,6 +608,7 @@ async def test_a_generation_of_more_than_one_task_needs_a_world_for_each(
         terminal_manifest(spec),
         claim_hash=CLAIM_HASH,
         bodies=[f"Round {index}." for index in range(DOSE)],
+        grade=WORDLE_GRADE,
     )
     with pytest.raises(ValueError, match="a world of its own"):
         await open_gateway(None, episode, start=start)  # type: ignore[arg-type]
@@ -666,7 +769,7 @@ async def test_a_run_this_call_composed_can_still_be_taken_over(
 
     # Composing the same environment and task again is composing another generation.
     spec = episode.describe()
-    afresh = stream_start(spec, terminal_manifest(spec), claim_hash=CLAIM_HASH)
+    afresh = stream_start(spec, terminal_manifest(spec), claim_hash=CLAIM_HASH, grade=WORDLE_GRADE)
     assert configuration_hash(afresh) != manifest.configuration_hash
 
     taken = await resume_run_directory(
@@ -705,6 +808,7 @@ async def test_the_roster_a_composed_generation_carries(episode: ServedEpisode) 
         terminal_manifest(spec),
         claim_hash=CLAIM_HASH,
         bodies=[f"Round {index}." for index in range(DOSE)],
+        grade=WORDLE_GRADE,
     )
     assert [row.task_position for row in start.assignments] == list(range(DOSE))
     assert [row.payload_position for row in start.assignments] == list(range(DOSE))
@@ -745,6 +849,7 @@ async def test_a_leg_is_composed_with_the_attempts_its_plan_gates(episode: Serve
         bodies=["A.", "B.", "The filler."],
         release=leg,
         without_payload=(1, 2),
+        grade=WORDLE_GRADE,
     )
     minted = [item.attempt_id for item in start.tasks]
     assert [gate.attempt_id for gate in start.release.gates] == [minted[2], minted[1]]

@@ -85,7 +85,19 @@ The history is the record. Nothing reads this file back to decide anything, and 
 changes no fact about the run: delete it and the next read writes it again.
 """
 
-_COLUMNS = ("task", "attempt", "state", "seal", "score", "ending", "decode", "delivered")
+_COLUMNS = (
+    "task",
+    "attempt",
+    "state",
+    "seal",
+    "score",
+    "ending",
+    "decode",
+    "delivered",
+    "policy",
+    "profile",
+    "decided",
+)
 
 
 class NothingToRead(RuntimeError):
@@ -239,6 +251,15 @@ def format_records(records: List[AttemptRecord]) -> str:
     filing scores the floor and the number on its own does not say that is what it is. The
     identifiers are printed whole: they are what a row is joined on, and a shortened one is a
     row somebody has to go back to the file for.
+
+    The policy column says what the agent was allowed to be told about that score. A run
+    recorded before a generation carried one reads as the legacy placeholder, which is what its
+    bodies were, and never as an honest receipt nobody can now check.
+
+    The profile and the column beside it say who decided that. The same policy is the right
+    answer for an ordinary run the platform stamped and for an experiment cell somebody
+    registered, so a reader asking whether a run was blinded by design or by accident is asking
+    these two columns rather than the policy.
     """
     if not records:
         return "no attempts"
@@ -368,6 +389,9 @@ def _cells(record: AttemptRecord) -> Tuple[str, ...]:
         _optional(record.final_failure),
         _optional(record.decode_state),
         " ".join(delivered) or "-",
+        _optional(record.payload_policy),
+        record.profile,
+        _optional(record.payload_resolution_source),
     )
 
 

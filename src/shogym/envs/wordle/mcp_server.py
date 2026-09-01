@@ -15,7 +15,7 @@ Lifecycle (in-process only for now):
 from __future__ import annotations
 
 import threading
-from typing import Any, Dict
+from typing import Any, Dict, Optional
 
 from fastmcp import FastMCP
 
@@ -43,7 +43,24 @@ def begin_session(session_id: str, target: str) -> None:
     sessions[session_id] = {
         "target": target.lower(),
         "remaining": MAX_GUESSES,
+        # Every word this session accepted a guess for, in order. It is the server's own record
+        # of what was played, which is what a grade over the finished session is taken from: the
+        # words are the arguments the agent sent, and the results it was shown are not consulted.
+        "entries": [],
     }
+
+
+def played(session_id: str) -> Optional[Dict[str, Any]]:
+    """Return this session's target and its accepted guesses, or nothing if it has none.
+
+    The snapshot is a copy. What it is for is a grade taken after the episode is over, and a
+    grader holding the server's live list would be reading a world that can still change.
+    """
+    with _state_lock:
+        state = sessions.get(session_id)
+        if state is None:
+            return None
+        return {"target": str(state["target"]), "entries": list(state["entries"])}
 
 
 def end_session(session_id: str) -> None:
@@ -100,6 +117,9 @@ def guess(word: str, _session_id: str) -> Dict[str, Any]:
         # Decrement the budget on every accepted entry — even invalid ones —
         # so a flood of bad guesses can't bypass the cap.
         state["remaining"] = max(0, remaining_before - 1)
+        # Recorded whether or not it was well formed, because an entry that spent a guess is an
+        # entry a grade over this session counts.
+        state["entries"].append(word if isinstance(word, str) else "")
         remaining_after = state["remaining"]
 
         if not valid:

@@ -114,6 +114,33 @@ class WordleV1Env(Env):
             )
         return fb
 
+    def protocol_v2_grade(self):
+        """What this env's grader is, asked before a generation is built over it.
+
+        A generation may publish its score to the agent only where the number is the
+        environment's own. Wordle's is: the word was found within the allowed guesses or it was
+        not, scored from the recorded guesses and the task's target.
+        """
+        from shogym.envs.wordle.protocol_v2 import WORDLE_GRADE
+
+        return WORDLE_GRADE
+
+    def protocol_v2_terminal(self, route: Any):
+        """The version this env declares, how to seal and grade one attempt, and what it is.
+
+        A durable stream asks the env it is serving rather than being told which env it has.
+        Without this the stream's stand-ins would end a wordle attempt on the empty abort, which
+        carries nothing to score, so every attempt would be worth what an empty filing is worth.
+
+        ``route`` says which world an attempt was played in, and the seal asks it when it seals
+        rather than now: these Activities are registered once and a generation may serve several
+        tasks, each in a world of its own.
+        """
+        from shogym.envs.wordle.protocol_v2 import configuration_digest, wordle_terminal
+
+        version, activities = wordle_terminal(route)
+        return version, activities, configuration_digest(self._words, self._task_split)
+
 
 def _score_guess_step(step: Step, target: str) -> Tuple[bool, bool, Optional[str]]:
     """Score a recorded guess against the task answer.

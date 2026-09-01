@@ -133,7 +133,11 @@ and no native argument can collide with a protocol field:
 The env's terminal tool is wrapped the same way and then intercepted: it never reaches the env
 from the transport, it becomes the stream's terminal request, and it answers with the
 acknowledgement the stream minted (or a refusal, which leaves the attempt open to file again). So
-the loop is `pull`, work, end the task, `pull`, and stop on `done`. There is no task index
+the loop is `pull`, work, end the task, `pull`, and stop on `done`. The payload that arrives after
+an acknowledgement is honest by default: it carries the score the seal committed and the numbers
+the env published beside it, so an agent under the defaults can tell how it did. Concealing that,
+or replacing it with something else, is a payload policy an experiment registers, and the run's own
+records name the policy every attempt was served under. There is no task index
 anywhere on the wire: a task record carries an attempt id and a body, and has no field an index or
 a target could be written into.
 

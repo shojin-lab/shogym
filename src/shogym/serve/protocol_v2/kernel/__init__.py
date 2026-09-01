@@ -9,8 +9,14 @@ offers and presentations against a harness cursor, a schedule model, and a monot
 generation carries an immutable assignment roster and one release plan. Immediate makes an
 obligation eligible at the seal of the attempt it belongs to, Never creates no obligation at
 all, and a plan may gate a named task on a payload being presented or on another task sealing.
-The experimental profile is not here: no leg automata, payload families, fork, or retry scopes,
+The experimental schedule is not here: no leg automata, payload families, fork, or retry scopes,
 and no delayed release, blocked obligations, or end-of-queue tail policies.
+
+A generation also carries what it delivers. Every payload obligation is resolved before anything
+is served, per obligation and per branch, either to a payload policy and a cell or to a
+withholding and a reason. An ordinary run resolves to the honest policy, whose body reports the
+score the seal committed; a run that conceals or replaces that registers the policy it wants and
+is recorded as having done so. A generation that has resolved nothing is not started.
 
 The Python API a gateway calls
 ------------------------------

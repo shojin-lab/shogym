@@ -38,6 +38,16 @@ from shogym.serve.protocol_v2 import (
     canonical_json,
     length_prefixed,
 )
+from shogym.serve.protocol_v2.policy import (
+    LEGACY,
+    GradeIdentity,
+    MatchedFamily,
+    PayloadDisposition,
+    PolicyProvenance,
+    PublicGrade,
+    disposition_key,
+    number_text,
+)
 
 
 # Why an attempt ended without a filing. The set is closed and the reasons are declared before a
@@ -54,8 +64,14 @@ ABANDONED = "abandoned"
 # reader looks at when the Activities all report success and the attempts still end.
 SEAL_FAILED = "seal_failed"
 SEAL_UNUSABLE = "seal_unusable"
+# The third of those, and a subtype of the second rather than a new ending: the batch came back
+# with a candidate built under something other than the policy this obligation was resolved to.
+# It ends the attempt the way any unusable result does and is named apart, because a reader
+# looking at a run that served the wrong bodies needs to see that rather than a generic result
+# the seal could not vouch for.
+SEAL_RENDERER = "seal_renderer_mismatch"
 FINAL_FAILURE_REASONS = (STEP_CAP, DEADLINE, ABANDONED)
-FINAL_FAILURES = FINAL_FAILURE_REASONS + (SEAL_FAILED, SEAL_UNUSABLE)
+FINAL_FAILURES = FINAL_FAILURE_REASONS + (SEAL_FAILED, SEAL_UNUSABLE, SEAL_RENDERER)
 
 
 @dataclass(frozen=True)
@@ -113,6 +129,27 @@ class StreamStart:
     ``attempt_deadline_ms`` is how long an attempt may stay active before the generation ends it
     itself. Zero is off, which is the default: a deadline is a property of the run rather than of
     this kernel, so a generation that declares none has none and waits as long as it is asked to.
+
+    ``profile`` and ``dispositions`` are what this generation delivers and under what. The
+    profile is the run's own class rather than the name of whatever function composed it, and
+    the dispositions are one resolved row per obligation per branch. Neither has a serving
+    default: a generation created now says which profile it is and carries a row for every
+    position, and one that says nothing is a history recorded before a policy was a fact about a
+    generation, read as the legacy placeholder and never as honest.
+
+    ``provenance`` is what entitles the generation to the profile it claims: the experiment that
+    registered its rows, or the platform default it was stamped from, with the digest of the
+    exact rows that authority answered for. A profile with no authority behind it is a word a
+    caller wrote, so a generation created now carries both or does not start.
+
+    ``families`` are the matched arms this generation's rows are cells of, each declaring the
+    group its candidates are built in and the byte count they come to, so a concealed cell and
+    an informative one cannot be told apart by their shape.
+
+    ``grade`` is what the environment said its grader is. A generation may resolve an obligation
+    to a policy that publishes the score only where that grader is the environment's own, so the
+    claim is carried here and checked at start rather than being a property of whichever builder
+    composed the generation.
     """
 
     configuration_hash: str
@@ -132,6 +169,11 @@ class StreamStart:
     assignments: List[Assignment] = field(default_factory=list)
     evaluation_only: bool = False
     blob_root: Optional[str] = None
+    profile: str = LEGACY
+    grade: Optional[GradeIdentity] = None
+    dispositions: List[PayloadDisposition] = field(default_factory=list)
+    provenance: Optional[PolicyProvenance] = None
+    families: List[MatchedFamily] = field(default_factory=list)
     schedule_version: str = SCHEDULE_VERSION
     protocol_version: int = PROTOCOL_VERSION
 
@@ -151,10 +193,26 @@ def configuration_hash(start: StreamStart) -> str:
 
     The blob store's location is not here. Where a run keeps its bytes is deployment, and the
     same generation moved to another directory is the same generation.
+
+    What a generation delivers is here, and it is folded in only where a generation declares it.
+    A history recorded before a policy was a fact about a generation hashed exactly these keys,
+    and adding one to what it presents would refuse every resume of it, so the legacy profile
+    hashes what it always hashed and a generation that names a profile hashes its dispositions
+    along with everything else. Each of those names its policy by the digest of the policy's
+    preimage, so what a body was allowed to say is inside the identity a resume is held to,
+    along with the authority that decided it and the matched families its rows are cells of.
+
+    The grader is here whole, every field of it. Which grader, which version, whether its number
+    is the environment's own, which measure the headline is, how fine that measure is, and what
+    it may publish beside it are each a fact the record depends on, and a claimant composed over
+    another of them is composing a different generation. The resolution is one of them for the
+    reason the components' is: a run recorded under one headline precision and resumed by a
+    process composed for another would take the generation over and disagree with it afterwards,
+    at the first seal, rather than being refused before it owned anything.
     """
     roster = list(start.assignments) or assignments_for(start.tasks, start.release)
     plan = start.release
-    declared = {
+    declared: Dict[str, Any] = {
         "protocol_version": start.protocol_version,
         "schedule_version": start.schedule_version,
         "environment_configuration": start.configuration_hash,
@@ -218,6 +276,61 @@ def configuration_hash(start: StreamStart) -> str:
             ],
         },
     }
+    if start.profile != LEGACY:
+        declared["profile"] = start.profile
+        declared["grade"] = (
+            None
+            if start.grade is None
+            else {
+                "grader_id": start.grade.grader_id,
+                "grader_version": start.grade.grader_version,
+                "stand_in": start.grade.stand_in,
+                "score_component": start.grade.score_component,
+                "score_places": start.grade.score_places,
+                "public_components": [
+                    {
+                        "name": number.name,
+                        "minimum": number_text(number.minimum),
+                        "maximum": number_text(number.maximum),
+                        "places": number.places,
+                    }
+                    for number in start.grade.public_components
+                ],
+            }
+        )
+        declared["dispositions"] = [
+            {
+                "attempt_id": row.attempt_id,
+                "payload_position": row.payload_position,
+                "branch_slot": row.branch_slot,
+                "kind": row.kind,
+                "policy_digest": row.policy_digest,
+                "cell": row.cell,
+                "reason": row.reason,
+                "resolution_source": row.resolution_source,
+                "family_id": row.family_id,
+            }
+            for row in sorted(start.dispositions, key=disposition_key)
+        ]
+        declared["provenance"] = (
+            None
+            if start.provenance is None
+            else {
+                "authority": start.provenance.authority,
+                "roster_digest": start.provenance.roster_digest,
+                "experiment_id": start.provenance.experiment_id,
+                "descriptor_digest": start.provenance.descriptor_digest,
+            }
+        )
+        declared["families"] = [
+            {
+                "family_id": family.family_id,
+                "match_group": family.match_group,
+                "cells": [list(cell) for cell in family.cells],
+                "visible_byte_count": family.visible_byte_count,
+            }
+            for family in sorted(start.families, key=lambda family: family.family_id)
+        ]
     return sha256(canonical_json(declared)).hexdigest()
 
 
@@ -490,6 +603,14 @@ class StreamState:
     not here: the arguments a model wrote belong in the transcript that holds them, and what a
     replacement cannot rebuild from there is the identity the call was made under.
 
+    ``environment_calls`` is how many calls to a world this generation has authorized against
+    each attempt since that attempt's task was presented or its checkpoint was restored. The
+    calls themselves never reach the stream, so a grant is the only trace of one, and this is
+    what a transport enforcing an environment's step budget is counting. A transport that kept
+    none of its predecessor's memory reads the spent budget here rather than starting the
+    attempt again at nothing. ``restoration_required`` is the same fact asked as a question
+    about a claim.
+
     ``task_checkpoints`` names the checkpoint each attempt would be restored from, per attempt,
     and ``restoration_required`` names the active attempts a claim may not simply continue:
     ones the generation has authorized a change to a world for since that checkpoint committed.
@@ -509,6 +630,16 @@ class StreamState:
     this stream cannot see, so the ending is waiting for that call rather than cancelling an
     effect nothing here can observe. It is the operator's signal that a call is not coming back,
     and the takeover that ends the grant by name is what releases it.
+
+    ``dispositions`` says what this generation delivers against each obligation and under what,
+    one entry per obligation per branch. It is here rather than derivable, because what a run
+    told its agent is a fact about the run and an operator reading a live generation should not
+    have to infer it from which bodies happened to come out.
+
+    ``profile`` and ``experiment_id`` are which kind of run this is and, where it is an
+    experiment, which experiment registered it. They travel with the dispositions because the
+    two questions an analysis asks of a body are what it said and who decided it would: a
+    stamped honest body and a registered honest cell are the same delivery and different facts.
     """
 
     generation_state: str
@@ -532,6 +663,7 @@ class StreamState:
     prepared_seals: Dict[str, str]
     task_checkpoints: Dict[str, str]
     graded_evidence: Dict[str, str]
+    environment_calls: Dict[str, int]
     restoration_required: List[str]
     attempts: Dict[str, str]
     obligations: Dict[str, str]
@@ -547,6 +679,9 @@ class StreamState:
     wait_reasons: Dict[str, int]
     final_failures: Dict[str, str]
     deadline_expired: List[str] = field(default_factory=list)
+    dispositions: Dict[str, str] = field(default_factory=dict)
+    profile: str = LEGACY
+    experiment_id: Optional[str] = None
     protocol_version: int = PROTOCOL_VERSION
 
 
@@ -554,9 +689,10 @@ class StreamState:
 class AttemptRecord:
     """One attempt as a record: what it was assigned, what it filed, what it scored.
 
-    This is the row an analysis counts. It is harness-only for the same reason the score is: an
-    acknowledgement commits to what was filed and says nothing about how good it was, and a
-    model that could read one of these would be told.
+    This is the row an analysis counts. It is harness-only: the acknowledgement commits to what
+    was filed and says nothing about how good it was, and this row carries the assignment, the
+    ending, the disposition and the score together, which is more than any policy publishes.
+    What the agent is told is the payload, and the policy this row names is what decided it.
 
     The positions are the assignment's, so a row says where the attempt sat in its manifest
     rather than what order a stream happened to serve. The three message identifiers are the
@@ -584,6 +720,17 @@ class AttemptRecord:
     a row that was never going to have one, which is what a filler is. Those are a missed
     treatment and a structural absence, and an analysis that cannot tell them apart is counting
     fillers as failures. A row that creates no obligation has no obligation state.
+
+    ``payload_policy`` and ``payload_disposition`` are what this row was told and under what
+    rules. A generation recorded before a policy was a fact about one reads as the legacy
+    placeholder rather than as honest, because absence is a history that predates the question
+    and never an answer to it.
+
+    ``profile`` and ``payload_resolution_source`` are who decided that. An analysis counting
+    these rows is asking which of two mistakes a run made, if either: an experiment cell served
+    as an ordinary default, or an ordinary run blinded by something nobody registered. Neither
+    question can be answered from the policy name alone, because the same name is a correct
+    answer to both.
     """
 
     attempt_id: str
@@ -606,6 +753,10 @@ class AttemptRecord:
     payload_delivered: bool
     creates_payload_obligation: bool
     payload_state: Optional[str]
+    payload_policy: Optional[str]
+    payload_disposition: Optional[str]
+    profile: str = LEGACY
+    payload_resolution_source: Optional[str] = None
     protocol_version: int = PROTOCOL_VERSION
 
 
@@ -692,22 +843,56 @@ class GradeAttemptResult:
     ``decode_state`` distinguishes a submission that said nothing from one the grader could
     not read, and both are successful results: neither is an infrastructure failure and
     neither is retried.
+
+    ``grade`` is the grader saying which grader it is. A generation is built over a declared
+    grade identity and its honest bodies publish that grader's number, so the number arriving
+    here carries the same identity or the generation is publishing one grader's verdict under
+    another's name. The kernel's grade computes from the shape of a filing, reaches no world, and
+    says so, which is what stops a transport fixture from being printed as a verdict. It is
+    absent by default because a result recorded before graders said this is one nobody can now
+    ask, and an absent one is read as a stand-in rather than as an environment's own.
+
+    ``public_components`` is what the environment published for the agent beside the score, as
+    numbers under token names. It is not the verdict and not the evidence: those stay in the
+    reference this result carries, which a harness can resolve and a renderer cannot. What names
+    may appear is the roster in the grade identity, declared before the run rather than taken
+    from whatever the grader returned.
+
+    Every field arrives as whatever the grader put in it. They are declared that way on purpose,
+    and the reason is the same for the identity and the reference as it is for the numbers: a
+    field with a type is a field the decoder has to make that type of, and a grader that returned
+    a string, a list or an object under one would fail the decoding rather than the check. That
+    failure is not an ending. It happens while the generation is being handed the result, before
+    any code of its own runs, so the generation fails that step again on every retry, records
+    nothing about why, and answers no question while it does. So the wire shape is permissive and
+    the authority is strict: what a score, a name, an identity and a reference are gets decided
+    where the result is read, and a value that is none of them ends the attempt with a reason.
     """
 
-    attempt_id: str
-    seal_id: str
-    score: float
-    decode_state: str
-    evidence: BlobRef
-    protocol_version: int = PROTOCOL_VERSION
+    attempt_id: Any
+    seal_id: Any
+    score: Any
+    decode_state: Any
+    evidence: Any
+    grade: Any = None
+    public_components: Any = field(default_factory=dict)
+    protocol_version: Any = PROTOCOL_VERSION
 
 
 @dataclass(frozen=True)
 class GeneratePayloadBundleInput:
     """Build every candidate this obligation might deliver, before the acknowledgement.
 
-    The score is deliberately not an input. A renderer that cannot see the verdict cannot
-    leak it, and the restriction is cheaper to keep here than to test for later.
+    ``policy_digest`` is what this obligation was resolved to, and it decides which renderer
+    runs. A digest this build does not implement is a failure rather than a body: there is no
+    renderer to fall back to, because falling back is how a run comes to serve something other
+    than what its record says it served. An empty digest is a request from a history recorded
+    before policies existed and renders the placeholder it recorded.
+
+    ``public_grade`` is the whole of what a renderer may know about the verdict, and it is
+    present only where the resolved policy publishes it. A blinded renderer is not given a grade
+    to withhold: it is handed a request with no grade in it, so leaking one is not a discipline
+    it keeps but a value it does not have.
     """
 
     attempt_id: str
@@ -715,12 +900,23 @@ class GeneratePayloadBundleInput:
     payload_message_id: str
     submission_digest: str
     canonical_submission_text: str
+    policy_digest: str = ""
+    cell: str = ""
+    public_grade: Optional[PublicGrade] = None
     protocol_version: int = PROTOCOL_VERSION
 
 
 @dataclass(frozen=True)
 class PayloadCandidate:
-    """One rendered candidate, with the proof metadata a family gate will need."""
+    """One rendered candidate, with the proof metadata a family gate will need.
+
+    ``policy_digest`` and ``renderer_version`` are echoed from the request rather than being the
+    renderer's own opinion of itself. What they catch is a Worker running code the generation did
+    not ask for: a build that never learned about policies returns neither, and the seal that
+    asked for one refuses the candidate instead of serving whatever came back under an honest
+    label. Both are empty where the request carried no policy, which is what a replayed legacy
+    result looks like.
+    """
 
     cell: str
     renderer_id: str
@@ -729,6 +925,8 @@ class PayloadCandidate:
     inner_sha256: str
     visible_sha256: str
     visible_byte_count: int
+    renderer_version: str = ""
+    policy_digest: str = ""
 
 
 @dataclass(frozen=True)
