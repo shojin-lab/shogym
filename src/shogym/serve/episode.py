@@ -40,12 +40,12 @@ import time
 import warnings
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, Callable, Dict, List, Optional, Union
+from typing import Any, Callable, Dict, List, Optional, Sequence, Union
 
 import jsonschema
 
 from shogym.envs import make
-from shogym.feedback.wire import build_meta, dump_item, select_inband
+from shogym.feedback.wire import FeedbackItem, build_meta, dump_item, select_inband
 from shogym.mcp.session import MCPSession
 from shogym.mcp.toolset import _open_session_for_spec
 from shogym.serve.lifecycle import (
@@ -2010,7 +2010,7 @@ class ServedEpisode:
         # Eval-safe default: dense inference feedback is recorded (above) but not surfaced
         # in-band. v0 exposes no per-tool opt-in, so surface_inference stays False; episode
         # feedback rides out only on the terminal result.
-        inband = select_inband(items, terminal=terminated, surface_inference=False)
+        inband = self._inband(items, terminal=terminated)
         return (
             CallResult(
                 content=content,
@@ -2089,7 +2089,7 @@ class ServedEpisode:
         # trace ends at the last call that really happened, which is what it is for; the verdict
         # is on this result and in `_terminal_feedback`, which is where a non-seal ending is read
         # from.
-        inband = select_inband(items, terminal=True, surface_inference=False)
+        inband = self._inband(items, terminal=True)
         return CallResult(
             content="<episode ended by the deadline; no further tool calls are dispatched>",
             meta=build_meta(inband, terminate=True),
@@ -2205,7 +2205,7 @@ class ServedEpisode:
                     terminated=terminated,
                 ),
             )
-        inband = select_inband(items, terminal=terminated, surface_inference=False)
+        inband = self._inband(items, terminal=terminated)
         return (
             CallResult(
                 content=content,
@@ -2547,7 +2547,7 @@ class ServedEpisode:
                 await self._teardown()
 
         public = self._sanitize_terminal(evidence)
-        inband = select_inband(items, terminal=True, surface_inference=False)
+        inband = self._inband(items, terminal=True)
         return CallResult(
             content=json.dumps(public),
             meta=build_meta(inband, terminate=True),
@@ -2680,6 +2680,21 @@ class ServedEpisode:
         return await self._env_call(
             functools.partial(self._env.verify, self._trajectory, self._task, **kwargs)
         )
+
+    def _inband(self, items: Sequence[FeedbackItem], *, terminal: bool) -> List[FeedbackItem]:
+        """The feedback this result may carry out, under the env's own declaration.
+
+        The visibility rule decides what a terminal result MAY carry; an env decides
+        whether its own episode feedback goes out at all. An env whose score is what a
+        controlled experiment delivers rather than what the episode hands back sets
+        ``inband_terminal_feedback`` False, and then the score reaches the trace and
+        ``evaluate()`` and nothing else. Withholding is per env and not per call: a
+        terminal that returns the score sometimes is a terminal that returns it.
+        """
+        chosen = select_inband(items, terminal=terminal, surface_inference=False)
+        if terminal and not getattr(self._env, "inband_terminal_feedback", True):
+            return [item for item in chosen if not isinstance(item, EpisodeFeedback)]
+        return chosen
 
     def _scoring_budget(self) -> float:
         """What the verifier gets, which is not always what is left of the answer.
