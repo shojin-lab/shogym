@@ -66,6 +66,17 @@ class Env(ABC):
     # tools and the seal transaction never engages.
     score_terminal_tool: Optional[str] = None
 
+    # Whether this env's episode feedback may ride out on the terminal result's
+    # ``_meta["shogym/feedback"]`` sidecar. True everywhere by default, which is the
+    # existing behaviour: a harness reads the score off the terminal result.
+    #
+    # An env sets it False when the score is what an EXPERIMENT delivers rather than
+    # what the episode hands back. The feedback is still computed, still written to the
+    # trace, and still returned by ``evaluate()``; it is withheld from the one channel
+    # that crosses into the agent's own process. There is no per-call override, because
+    # a terminal that returns the score sometimes is a terminal that returns the score.
+    inband_terminal_feedback: bool = True
+
     # The optional, typed terminal-transaction hook. Default ``None`` means the env has no
     # scoring finalizer (a pure-verify / abort-only env): the serve layer never engages the
     # seal transaction for it and it behaves exactly as before. An env opts in by declaring a
