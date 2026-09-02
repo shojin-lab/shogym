@@ -211,6 +211,41 @@ class AutomationBenchEnv(Env):
             diagnostic=f"scored source={req.source} partial_credit={pc} success={success}",
         )
 
+    # ----- the durable stream's terminal -----
+
+    def protocol_v2_grade(self):
+        """What this env's grader is, asked before a generation is built over it.
+
+        A generation may publish its score to the agent only where the number is the
+        environment's own. AutomationBench's is: the fraction of the task's assertions the
+        workspace satisfies, scored by the upstream rubric against the world the agent left.
+        """
+        from shogym.envs.automationbench.protocol_v2 import AUTOMATIONBENCH_GRADE
+
+        return AUTOMATIONBENCH_GRADE
+
+    def protocol_v2_terminal(self, route: Any):
+        """The version this env declares, how to seal and grade one attempt, and what it is.
+
+        A durable stream asks the env it is serving rather than being told which env it has.
+        Without this the stream's stand-ins would end an automationbench attempt on the empty
+        ``done``, which carries nothing to score, so every attempt would be worth what an empty
+        filing is worth however much of the workflow was carried out.
+        """
+        from shogym.envs.automationbench.protocol_v2 import (
+            automationbench_terminal,
+            configuration_digest,
+        )
+
+        version, activities = automationbench_terminal(route)
+        return (
+            version,
+            activities,
+            configuration_digest(
+                domain=self._domain, max_steps=self._max_steps, tasks=self._tasks
+            ),
+        )
+
     # ----- verify -----
 
     def _verify(

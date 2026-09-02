@@ -35,6 +35,7 @@ from __future__ import annotations
 
 import json
 import threading
+from hashlib import sha256
 from typing import Any, Dict, Optional, Tuple
 
 from fastmcp import FastMCP
@@ -58,6 +59,11 @@ class _Session:
         self.world = world
         self.initial_state = initial_state
         self.assertions = assertions
+        # The world as it was handed over, named by its own bytes. What it answers is whether the
+        # world a seal reads is still the one this session was seeded with, which is the one thing
+        # a task with no assertion satisfied cannot say for itself: a run that changed nothing and
+        # a run that changed the wrong things both score zero and are not the same filing.
+        self.seeded_digest = _world_digest(world)
 
 
 # ----- session lifecycle (called in-process by the env) -----
@@ -110,6 +116,44 @@ def score_session(session_id: Optional[str]) -> Tuple[float, float]:
     if session is None:
         return 0.0, 0.0
     return adapter.score_state(session.world, session.initial_state, session.assertions)
+
+
+def _world_digest(world: Any) -> str:
+    """Name one world by the bytes it serializes to.
+
+    The dump is not what the rubric reads and is not offered as one: part of what a score is taken
+    from is recorded outside the model's declared fields (see :func:`adapter.score_state`). What a
+    digest over it is good for is saying which end state this is, which is what a submission has
+    to name and what an unchanged world has to be distinguishable by.
+    """
+    return sha256(world.model_dump_json().encode("utf-8")).hexdigest()
+
+
+def sealed_state(session_id: str) -> Optional[Dict[str, Any]]:
+    """This session's end state and what the reused rubric makes of it, or nothing at all.
+
+    :func:`score_session` answers a session that is not here with zeros, which is not faithful
+    under a durable stream: a seal can arrive after the world has been let go, and a zero
+    published there is a grade for a world nobody read. So this says which of the two happened
+    and lets the caller refuse.
+
+    The world itself does not come back, because a capture is kept and the world is large. What
+    comes back is its digest beside the numbers the rubric produced from it, which is everything a
+    grade and a submission are taken from.
+    """
+    session = _session_for(session_id)
+    if session is None:
+        return None
+    partial_credit, success = adapter.score_state(
+        session.world, session.initial_state, session.assertions
+    )
+    digest = _world_digest(session.world)
+    return {
+        "world_sha256": digest,
+        "untouched": digest == session.seeded_digest,
+        "partial_credit": float(partial_credit),
+        "success": float(success),
+    }
 
 
 def _no_session_error() -> str:
@@ -205,5 +249,6 @@ __all__ = [
     "end_session",
     "reset_state",
     "score_session",
+    "sealed_state",
     "DONE_TOOL_NAME",
 ]

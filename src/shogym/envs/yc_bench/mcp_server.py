@@ -177,6 +177,19 @@ _UNSEEDED_VERDICT: Dict[str, Any] = {
 }
 
 
+def sealed_state(session_id: str) -> Optional[Dict[str, Any]]:
+    """The sim's own end state for a live session, or nothing at all when the session is gone.
+
+    :func:`read_verdict` answers a missing session with the unseeded fallback, which reads as a
+    company that ended the year with nothing and is not faithful under a durable stream: a seal
+    can arrive after the session has been torn down, and the fallback published there is a result
+    for a company nobody read. So this says which of the two happened and lets the caller refuse
+    instead.
+    """
+    session = _session_for(session_id)
+    return None if session is None else session.verdict()
+
+
 def read_verdict(session_id: str) -> Dict[str, Any]:
     """Read the authoritative terminal metrics off the **live** sim DB for ``session_id``.
 
@@ -241,6 +254,7 @@ __all__ = [
     "end_session",
     "read_verdict",
     "reset_state",
+    "sealed_state",
     "RUN_COMMAND_TOOL_NAME",
     "SUBMIT_TOOL_NAME",
 ]
