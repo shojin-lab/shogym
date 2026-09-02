@@ -1,21 +1,33 @@
-"""Guard tests for the AutomationBench cell runner: the roster it composes and the table it reads.
+"""Guard tests for the AutomationBench cell runner: what it composes, what it reads, what it runs.
 
-Two halves, and neither needs a model or a durable service. The composition is a pure function of
+Three halves, and none needs a model or a durable service. The composition is a pure function of
 the roster and the schedule, so what is checked there is that a schedule name decides what the
 agent is told and that nothing else does. The table is a pure function of three files, so what is
 checked there is the join: a score belongs to the task the roster says it does, a position nobody
-reached says so, and a tool call is counted against the attempt it named.
+reached says so, and a tool call is counted against the attempt it named. The launch is a pair of
+commands, so what is checked there is what each container was given: the boundary this cell rests
+on is a mount list, and a mount list is something a test can read.
 
 Nothing here spawns the ``claude`` CLI or spends a token, and nothing here provisions the
 AutomationBench upstream source: the grade identity this cell composes over is a declaration and
 importing it reaches no upstream package.
+
+Two tests at the end are the exception, and they are because of what they check: neither a network
+nor an empty cache is something a fixture can answer for. So the two domains are stood up on this
+host, once with the probe run from a container joined to the server's own network stack, and once
+from a cache that starts empty. Both are skipped unless the host already holds both images,
+because a check of the boundary has no business building an image to make its point.
 """
 
 from __future__ import annotations
 
 import asyncio
 import json
+import os
+import shutil
+import signal
 import subprocess
+import tarfile
 from hashlib import sha256
 from pathlib import Path
 from typing import Any, Dict, List, Optional
@@ -26,6 +38,7 @@ pytest.importorskip("temporalio")
 
 from examples.automationbench_cell import cell as launcher  # noqa: E402
 from examples.automationbench_cell import pinned  # noqa: E402
+from examples.automationbench_cell import sandbox  # noqa: E402
 from examples.automationbench_cell import serve as cell  # noqa: E402
 from examples.automationbench_cell import table as read_back  # noqa: E402
 from shogym.envs.automationbench.protocol_v2 import AUTOMATIONBENCH_GRADE  # noqa: E402
@@ -316,9 +329,7 @@ def counted(refusals: int) -> read_back.Counted:
 
 def body(identifier: str) -> str:
     """The bytes one presented message goes as, which are the bytes both records are about."""
-    return json.dumps(
-        {"kind": KINDS[identifier[1]], "message_id": identifier, "protocol_version": 2}
-    )
+    return json.dumps(_message(identifier))
 
 
 def presentations(identifiers: Optional[List[str]] = None) -> List[PresentedMessage]:
@@ -383,19 +394,40 @@ def _assistant(blocks):
     return {"type": "assistant", "message": {"content": blocks}}
 
 
-def _call(name, arguments, *, call: str = "u"):
+def _call(name, arguments, call: str = "u"):
     return {"type": "tool_use", "id": call, "name": name, "input": arguments}
 
 
+def _message(identifier: str) -> Dict[str, Any]:
+    """One of the three records a harness hands back, as the wire carries it.
+
+    They are built whole rather than abbreviated: what makes a result a task the run served is
+    that it decodes as a Task, so a fixture carrying a few of a Task's fields would be asserting
+    against something this cell does not count.
+    """
+    kind = KINDS[identifier[1]]
+    common = {"message_id": identifier, "attempt_id": "a" * 32, "protocol_version": 2}
+    if kind == "done":
+        return {"message_id": identifier, "kind": kind, "protocol_version": 2}
+    if kind == "seal_ack":
+        return {
+            **common,
+            "kind": kind,
+            "submission_digest": "d" * 64,
+            "canonicalization_version": "shogym.automationbench.1",
+        }
+    return {**common, "kind": kind, "body": f"the {kind} body"}
+
+
 def _result(text: str, *, call: str = "u", is_error: bool = False):
-    result: Dict[str, Any] = {
+    block: Dict[str, Any] = {
         "type": "tool_result",
         "tool_use_id": call,
         "content": [{"type": "text", "text": text}],
     }
     if is_error:
-        result["is_error"] = True
-    return {"type": "user", "message": {"content": [result]}}
+        block["is_error"] = True
+    return {"type": "user", "message": {"content": [block]}}
 
 
 def _refused(code: str):
@@ -777,16 +809,14 @@ def test_the_default_schedule_is_the_regime_the_earlier_cell_ran() -> None:
 def test_the_served_tools_reach_the_model_under_the_name_that_cell_saw(tmp_path: Path) -> None:
     # A tool name is part of the prompt prefix, so the server key is pinned to the earlier cell's.
     # The prompt does not name it: the model meets the name in every tool it is offered.
-    config = json.loads(
-        launcher.mcp_config(
-            tmp_path, tasks="cell-one:2", domain="public", schedule="immediate"
-        ).read_text()
-    )
+    url = sandbox.gateway_url("a-server")
+    config = json.loads(launcher.mcp_config(tmp_path, url=url).read_text())
     assert list(config["mcpServers"]) == [cell.SERVER] == ["curriculum"]
     served = config["mcpServers"][cell.SERVER]
-    assert served["args"][-1].endswith("serve.py")
-    assert served["env"]["SHOGYM_CELL_SCHEDULE"] == "immediate"
-    assert served["env"]["SHOGYM_CELL_RUN_DIR"].endswith(launcher.GRADES)
+    # The agent is given somewhere to connect and nothing to spawn, which is what puts the server
+    # on the far side of a container rather than in the agent's own process tree.
+    assert served == {"type": "http", "url": url}
+    assert "command" not in served and "args" not in served and "env" not in served
     assert read_back.SERVED_PREFIX == "mcp__curriculum__"
     prompt = (Path(launcher.HERE) / "PROMPT.txt").read_text()
     assert prompt.startswith("Get Better.")
@@ -841,8 +871,8 @@ def test_the_agent_starts_from_the_file_that_cell_put_in_front_of_it(tmp_path: P
     assert (work / "CLAUDE.md").read_bytes() == b"# self\n"
 
 
-def test_the_child_environment_is_built_and_never_the_operators(tmp_path: Path) -> None:
-    """What the agent and its server are handed is a list, so a shell cannot reach into a run.
+def test_the_environment_each_container_gets_is_built_and_never_the_operators() -> None:
+    """What either container is handed is a list, so a shell cannot reach into a run.
 
     The two the benchmark itself reads are the reason this matters: an operator holding either
     would serve tasks from somewhere other than the pinned source while the run's own record
@@ -857,17 +887,360 @@ def test_the_child_environment_is_built_and_never_the_operators(tmp_path: Path) 
         "ANTHROPIC_BASE_URL": "https://somewhere-else",
         "EDITOR": "vim",
     }
-    built = pinned.child_environment(ambient, config_dir=tmp_path / "home")
-    assert built["PATH"] == "/usr/bin" and built["HOME"] == "/home/somebody"
+    built = pinned.agent_environment(ambient)
     assert built["CLAUDE_CODE_OAUTH_TOKEN"] == "a-token-nobody-should-read"
     assert built["IS_SANDBOX"] == "1" and built["ENABLE_TOOL_SEARCH"] == "true"
-    assert built["CLAUDE_CONFIG_DIR"] == str(tmp_path / "home")
-    for name in ("AUTOMATIONBENCH_SRC", "SHOGYM_CACHE", "ANTHROPIC_BASE_URL", "EDITOR"):
-        assert name not in built
+    # The image supplies the operating system, so the ambient one contributes nothing at all.
+    assert set(built) == {"IS_SANDBOX", "ENABLE_TOOL_SEARCH", "CLAUDE_CODE_OAUTH_TOKEN"}
+    # The server is told the run and nothing else, and the cache it reads is the one bound into
+    # it rather than whichever path the launching shell was pointing at.
+    served = sandbox.server_environment(tasks="cell-one:2", domain="public", schedule="immediate")
+    assert served["SHOGYM_CACHE"] == sandbox.CACHE_MOUNT
+    assert served["SHOGYM_CELL_RUN_DIR"] == sandbox.GRADES_MOUNT
+    assert "AUTOMATIONBENCH_SRC" not in served
+    assert not any(served.get(name) == value for name, value in ambient.items())
     # The record says which name carried the credential and never what it was worth.
     assert pinned.redacted(built)["CLAUDE_CODE_OAUTH_TOKEN"] == pinned.REDACTED
     assert pinned.credential_name(ambient) == "CLAUDE_CODE_OAUTH_TOKEN"
     assert pinned.credential_name({"PATH": "/usr/bin"}) is None
+
+
+def test_the_recorded_image_inputs_are_the_ones_this_tree_would_build(tmp_path: Path) -> None:
+    """An image id says which image answered and not what it was made of.
+
+    The old cell recorded neither, and its image is gone, so nothing here can claim equality with
+    it. What it can do is pin what this cell builds: the base by digest rather than by a tag that
+    moves, the package and the registry the CLI comes from, the version, and a digest of the
+    recipe. An edit to the file that nobody recorded here is a failing test rather than a rebuild
+    somebody finds out about from a comparison months later.
+    """
+    assert sandbox.agent_build_inputs() == pinned.AGENT_IMAGE_BUILD
+    assert "@sha256:" in pinned.AGENT_BASE
+    assert "@sha256:" in server_inputs(tmp_path)["base"]
+    pinned.check_image_build(pinned.AGENT_IMAGE_BUILD, allow_drift=False)
+    with pytest.raises(ValueError, match="a-mirror"):
+        pinned.check_image_build(
+            {**pinned.AGENT_IMAGE_BUILD, "cli_registry": "https://a-mirror"}, allow_drift=False
+        )
+    pinned.check_image_build({}, allow_drift=True)
+
+
+def test_the_agents_os_packages_are_a_frozen_archive_and_an_exact_version_each() -> None:
+    """The shell the model reaches through Bash, pinned the way the CLI build is.
+
+    A base pinned by digest fixes the image the build starts from and fixes nothing about what is
+    installed on top of it: `apt-get install git curl jq` resolves against whatever the live
+    repository is serving that day, so an image rebuilt next month held a different `git`, a
+    different `curl` and a different `python3` under an identity that said nothing had moved. The
+    archive is read at one immutable moment and every package names its version, and both are part
+    of what the launch compares.
+    """
+    recipe = (Path(sandbox.HERE) / "agent.Dockerfile").read_text(encoding="utf-8")
+    assert f"snapshot.debian.org/archive/debian/${{{'APT_SNAPSHOT'}}}" in recipe
+    # The list lives in the pins rather than in the recipe, so what is installed and what is
+    # recorded cannot be two lists that drift apart.
+    assert "${APT_PACKAGES}" in recipe
+    assert pinned.APT_PACKAGES and all(
+        len(package.split("=")) == 2 and all(package.split("=")) for package in pinned.APT_PACKAGES
+    )
+    inputs = sandbox.agent_build_inputs()
+    assert inputs["apt_snapshot"] == pinned.APT_SNAPSHOT
+    assert inputs["apt_packages"] == " ".join(pinned.APT_PACKAGES)
+    # A resolution that moved is the same refusal a moved base or a moved CLI build gets.
+    with pytest.raises(ValueError, match="apt_packages"):
+        pinned.check_image_build(
+            {**pinned.AGENT_IMAGE_BUILD, "apt_packages": "git jq curl"}, allow_drift=False
+        )
+    with pytest.raises(ValueError, match="apt_snapshot"):
+        pinned.check_image_build(
+            {**pinned.AGENT_IMAGE_BUILD, "apt_snapshot": "20200101T000000Z"}, allow_drift=False
+        )
+
+
+def test_the_server_installs_the_lock_rather_than_resolving_the_ranges_beside_it(
+    tmp_path: Path,
+) -> None:
+    """What the measurement is made of, pinned to what was chosen rather than to what is allowed.
+
+    `pip install ".[automationbench]"` resolves the ranges in pyproject.toml live, which gave the
+    server a FastMCP two major versions above the locked one, a benchmark loader and a validator
+    nobody chose, and a label that said the recorded inputs matched. The lock says which
+    distributions were chosen, so the image installs from it, with a hash for each, and the lock is
+    one of the inputs the label is a digest of.
+    """
+    recipe = (Path(sandbox.HERE) / "server.Dockerfile").read_text(encoding="utf-8")
+    assert "uv.lock" in recipe and "uv export --frozen" in recipe
+    assert "--require-hashes" in recipe and '"uv==${UV_VERSION}"' in recipe
+    assert 'pip install --no-cache-dir ".[automationbench]"' not in recipe
+    assert sandbox.SERVER_LOCK == "uv.lock" and sandbox.SERVER_LOCK in sandbox.SERVER_SOURCE
+    inputs = server_inputs(tmp_path)
+    assert inputs["lock"] == sandbox.file_digest(sandbox.REPO / sandbox.SERVER_LOCK)
+    assert inputs["uv_version"] == sandbox.UV_VERSION
+
+
+def test_the_server_builds_no_wheel_and_so_resolves_no_build_backend() -> None:
+    """The last live resolution in the image, which the hashed export did not cover.
+
+    Building the project here is a PEP 517 construction: pip fetches the backend the ranges name,
+    at whatever version the index is serving that day, and that backend produces the wheel holding
+    the gateway and the grader. It is an input to the measurement that is in neither the hashed
+    requirements nor the identity this image carries. So the project is not built at all: the
+    source the image already copied is on the path, which is the same bytes the digest was taken
+    over and one fewer thing resolved from outside it.
+    """
+    recipe = (Path(sandbox.HERE) / "server.Dockerfile").read_text(encoding="utf-8")
+    assert "ENV PYTHONPATH=/app/src" in recipe
+    assert "pip install --no-cache-dir --no-deps ." not in recipe
+    assert "--no-build-isolation" not in recipe
+    # The export is taken without the project, so the path above is what makes the project
+    # importable and nothing else has to be.
+    assert "--no-emit-project" in recipe
+
+
+def test_each_image_is_built_with_the_pins_its_identity_records(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # The pins reach the build as arguments, so the identity a label holds is the identity the
+    # build was handed rather than a description of one kept beside it.
+    ran: List[List[str]] = []
+    monkeypatch.setattr(
+        sandbox,
+        "_docker",
+        lambda args, **kwargs: (
+            ran.append(list(args)), subprocess.CompletedProcess(args, 0, stdout="", stderr="")
+        )[1],
+    )
+    sandbox.build_images(agent="an-agent", server="a-server", rebuild=True)
+    agent, server = (command for command in ran if command[0] == "build")
+    assert f"APT_SNAPSHOT={pinned.APT_SNAPSHOT}" in agent
+    assert f"APT_PACKAGES={' '.join(pinned.APT_PACKAGES)}" in agent
+    assert f"CLAUDE_CODE_VERSION={pinned.CLI_VERSION}" in agent
+    assert f"UV_VERSION={sandbox.UV_VERSION}" in server
+
+
+def test_an_image_whose_inputs_moved_is_rebuilt_rather_than_reused(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The tag is not the identity, so what the tag names is asked what it was built from.
+
+    Skipping the build whenever the tag existed is what left a server image from an earlier
+    checkout serving the grades under the name of this one, and an operator who forgot --build
+    with no way to tell. The inputs are digested into a label at build time and read back before
+    reuse, so an image that cannot say what it holds is one that gets built again.
+    """
+    labels = {"an-agent": sandbox.build_identity(sandbox.agent_build_inputs()), "a-server": "older"}
+    ran: List[List[str]] = []
+
+    def fake_docker(args, **kwargs):
+        ran.append(list(args))
+        if args[:2] == ["image", "inspect"]:
+            return subprocess.CompletedProcess(args, 0, stdout=f"{labels[args[-1]]}\n", stderr="")
+        return subprocess.CompletedProcess(args, 0, stdout="", stderr="")
+
+    monkeypatch.setattr(sandbox, "_docker", fake_docker)
+    built = sandbox.build_images(agent="an-agent", server="a-server")
+    builds = [command for command in ran if command[0] == "build"]
+    # The agent's image says what this tree builds, so it stands. The server's says something
+    # else, so it is made again and labelled with what it was made of this time.
+    assert [command[command.index("-t") + 1] for command in builds] == ["a-server"]
+    identity = sandbox.build_identity(server_inputs(tmp_path))
+    assert f"{sandbox.BUILD_LABEL}={identity}" in builds[0]
+    assert built["an-agent"] == pinned.AGENT_IMAGE_BUILD
+    # The lock is one of them, because it is what decides which distributions the image installs:
+    # the ranges beside it say what is admissible and it says what was chosen, and only the second
+    # is what serves the run.
+    assert set(built["a-server"]) == {"base", "dockerfile", "lock", "source", "uv_version"}
+    assert built["a-server"]["lock"] == sandbox.file_digest(sandbox.REPO / sandbox.SERVER_LOCK)
+    # An image built before any of this existed says nothing, which is the answer no image gives.
+    labels["an-agent"] = "<no value>"
+    ran.clear()
+    sandbox.build_images(agent="an-agent", server="a-server")
+    assert [command[command.index("-t") + 1] for command in ran if command[0] == "build"] == [
+        "an-agent",
+        "a-server",
+    ]
+
+
+def test_a_generated_file_changes_neither_the_source_digest_nor_the_build_context(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """What this repository generates is left out of what the image is built from, in both places.
+
+    The digest and the context were two walks over one tree and only the digest was a list: docker
+    was handed the directory, so a probe's own run directory, and the bytecode beside any source
+    that had been imported, crossed into the image under a label saying the source in this checkout
+    was what built it. The next launch computed another identity, rebuilt, and embedded the last
+    run's transcripts and grades. So there is one archive now, and this is the test that it is one:
+    the identity is a digest of the bytes the build is handed, and neither moves when the generated
+    files appear.
+    """
+    monkeypatch.setattr(sandbox, "REPO", tmp_path)
+    monkeypatch.setattr(sandbox, "SERVER_SOURCE", ("src", "examples/cell"))
+    (tmp_path / sandbox.SERVER_LOCK).write_text("a lock\n", encoding="utf-8")
+    (tmp_path / "src" / "pkg").mkdir(parents=True)
+    (tmp_path / "src" / "pkg" / "kept.py").write_text("kept\n", encoding="utf-8")
+    (tmp_path / "examples" / "cell").mkdir(parents=True)
+    (tmp_path / "examples" / "cell" / "recipe").write_text("recipe\n", encoding="utf-8")
+    names = ("src", "examples/cell")
+    held = ["examples/cell/recipe", "src/pkg/kept.py"]
+    assert sorted(name for _, name in sandbox.source_files(names)) == held
+    digest = sandbox.file_digest(
+        sandbox.write_context(tmp_path / "before.tar", sandbox.source_files(names))
+    )
+
+    runs = tmp_path / "examples" / "cell" / "runs" / "probe-1"
+    runs.mkdir(parents=True)
+    (runs / "run.json").write_text("{}\n", encoding="utf-8")
+    (runs / "stream.jsonl").write_text("{}\n", encoding="utf-8")
+    (tmp_path / "src" / "pkg" / "__pycache__").mkdir()
+    (tmp_path / "src" / "pkg" / "__pycache__" / "kept.cpython-312.pyc").write_bytes(b"\x00")
+    (tmp_path / "src" / "pkg.egg-info").mkdir()
+    (tmp_path / "src" / "pkg.egg-info" / "PKG-INFO").write_text("name\n", encoding="utf-8")
+
+    assert sorted(name for _, name in sandbox.source_files(names)) == held
+    archive = sandbox.server_context(tmp_path / "context.tar")
+    assert sandbox.file_digest(archive) == digest
+    with tarfile.open(archive) as bundle:
+        assert sorted(bundle.getnames()) == held
+    # And the build is handed that archive rather than a list it walks again: the bytes the
+    # identity is a digest of are the bytes docker gets, so nothing saved between the two can
+    # label one context as another.
+    streamed: List[bytes] = []
+
+    def fake_docker(args, **kwargs):
+        if args[0] == "build":
+            streamed.append(kwargs["stdin"].read())
+        return subprocess.CompletedProcess(args, 0, stdout="", stderr="")
+
+    monkeypatch.setattr(sandbox, "_docker", fake_docker)
+    built = sandbox.build_images(agent="an-agent", server="a-server", rebuild=True)
+    assert built["a-server"]["source"] == digest
+    assert f"sha256:{sha256(streamed[-1]).hexdigest()}" == digest
+    # And the pattern that leaves a run directory out is the pattern that names the directory the
+    # README's own probe and launch write to by default, which is how those files come to be here.
+    monkeypatch.undo()
+    default_runs = (sandbox.HERE / "runs" / "probe-1" / "run.json").relative_to(sandbox.REPO)
+    assert sandbox.generated(default_runs.as_posix())
+
+
+def test_the_benchmark_cache_is_filled_before_it_is_mounted_read_only(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The first launch on a clean host, which had nowhere to put the benchmark it needed.
+
+    The server reads the task definitions, the answers and the scoring assertions, and writes to
+    none of them, so the source is mounted read only. Nothing filled it: the loader inside the
+    server was what fetched the pinned source, and it met a read-only filesystem and stopped
+    before the endpoint opened. The fetch is its own container now, holding that one directory
+    writable and nothing else of the run, and it happens before the server is started.
+    """
+    commands: List[List[str]] = []
+
+    def fake_docker(args, **kwargs):
+        commands.append(["docker", *args])
+        return subprocess.CompletedProcess(args, 0, stdout="", stderr="")
+
+    def fake_run(argv, **kwargs):
+        commands.append(list(argv))
+        return subprocess.CompletedProcess(argv, 0)
+
+    monkeypatch.setattr(sandbox, "_docker", fake_docker)
+    monkeypatch.setattr(sandbox, "wait_for_gateway", lambda server, **kwargs: None)
+    monkeypatch.setattr(launcher.subprocess, "run", fake_run)
+    cache = tmp_path / "cache"
+    domains = launcher.open_domains(
+        tmp_path / "cell", tasks="cell-one:1", domain="public", schedule="immediate", cache=cache
+    )
+    source, target, mode = sandbox.cache_mounts(cache)[0]
+    provisioned = [at for at, command in enumerate(commands) if f"{source}:{target}:rw" in command]
+    served = [at for at, command in enumerate(commands) if domains.server in command]
+    assert provisioned and served and provisioned[0] < served[0]
+    provision = commands[provisioned[0]]
+    assert provision[:3] == ["docker", "run", "--rm"]
+    assert f"SHOGYM_CACHE={sandbox.CACHE_MOUNT}" in provision
+    assert provision[-3:] == ["python", "-c", sandbox.PROVISION]
+    assert domains.server_image in provision
+    # It runs under this run's own name, so a launch that is stopped while it fetches has
+    # something to take down. Nothing else on this host answers to that name.
+    assert provision[provision.index("--name") + 1] == sandbox.provisioner_name(domains.server)
+    # The mount the run then holds for as long as it serves is the read-only one: what the fetch
+    # needed writable is a container that has already exited.
+    assert mode == "ro" and f"{source}:{target}:ro" in sandbox.mount_record(domains.mounts)
+    assert f"{source}:{target}:rw" not in sandbox.mount_record(domains.mounts)
+
+
+def test_a_cache_that_cannot_be_filled_is_a_launch_that_starts_nothing(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # The refusal names the cache, because the alternative is the server dying on a read-only
+    # filesystem inside a container whose log a launcher only saves at teardown.
+    monkeypatch.setattr(
+        sandbox,
+        "_docker",
+        lambda args, **kwargs: subprocess.CompletedProcess(
+            args, 0 if args[0] == "info" else 1, stdout="", stderr="no space left on device"
+        ),
+    )
+    with pytest.raises(RuntimeError, match="no space left on device"):
+        launcher.open_domains(
+            tmp_path / "cell",
+            tasks="cell-one:1",
+            domain="public",
+            schedule="immediate",
+            cache=tmp_path / "cache",
+        )
+
+
+def test_a_launch_on_an_image_built_from_other_inputs_starts_nothing(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # The same refusal the CLI build gets, for the same reason: the shell, the Node and the OS
+    # packages the model reaches through Bash belong to that image, so an image nobody recorded is
+    # a different agent and not a different serving contract.
+    ran = no_docker(monkeypatch)
+    monkeypatch.setattr(
+        sandbox,
+        "build_images",
+        lambda **kwargs: {
+            kwargs["agent"]: {**pinned.AGENT_IMAGE_BUILD, "base": "node:22-bookworm-slim"},
+            kwargs["server"]: {},
+        },
+    )
+    run_dir = tmp_path / "cell"
+    with pytest.raises(ValueError, match="node:22-bookworm-slim"):
+        launcher.launch(
+            run_dir,
+            tasks="cell-one:2",
+            domain="public",
+            schedule="immediate",
+            model="claude-opus-5",
+            effort="xhigh",
+            cache=tmp_path / "cache",
+        )
+    assert ran == [] and not (run_dir / launcher.RUN_FILE).exists()
+
+
+def test_a_launch_the_environment_does_not_authenticate_starts_nothing(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # The agent's Claude Code home is fresh, so the environment is the only thing that can
+    # authenticate it. Without a credential the launch would build both images, serve the roster
+    # and record an agent that exited at once; it refuses before any of that instead.
+    ran = no_docker(monkeypatch)
+    for name in pinned.CREDENTIALS:
+        monkeypatch.delenv(name, raising=False)
+    run_dir = tmp_path / "cell"
+    with pytest.raises(ValueError, match="CLAUDE_CODE_OAUTH_TOKEN or ANTHROPIC_API_KEY"):
+        launcher.launch(
+            run_dir,
+            tasks="cell-one:2",
+            domain="public",
+            schedule="immediate",
+            model="claude-opus-5",
+            effort="xhigh",
+            cache=tmp_path / "cache",
+        )
+    assert ran == [] and not (run_dir / launcher.RUN_FILE).exists()
 
 
 def test_a_cli_that_is_not_the_recorded_build_is_refused_until_it_is_allowed() -> None:
@@ -910,27 +1283,102 @@ def test_the_surface_the_run_started_with_is_compared_to_the_one_that_cell_saw(
     assert "init" in pinned.surface_drift(None)
 
 
+def server_inputs(scratch: Path) -> Dict[str, str]:
+    """What the server's image is built from, read off a snapshot taken the way a build takes one.
+
+    The source input is a digest of the archive docker is handed, so asking what an image is built
+    from means writing that archive. Two writes of one tree are the same bytes, which is what lets
+    a test compute the identity a build computed.
+    """
+    return sandbox.server_build_inputs(sandbox.server_context(scratch / "server.tar"))
+
+
+#: What a working run leaves behind for the two reads that say whether it happened: the agent's
+#: transcript holds the call that asked for work, and the gateway's log holds the request that
+#: reached the server. A fake launch writes both, because a launch that produced neither is a
+#: launch this cell refuses, which is its own test below.
+SERVED_LOG = 'INFO:     172.31.0.3:56632 - "POST /mcp HTTP/1.1" 200 OK\n'
+
+
+@pytest.fixture(autouse=True)
+def a_credential(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Every test runs as an operator whose shell authenticates the agent.
+
+    A launch refuses without a credential, so the one test about that refusal takes it away
+    again; everything else is about what a launch does once it has one.
+    """
+    monkeypatch.setenv("CLAUDE_CODE_OAUTH_TOKEN", "a-token-nobody-should-read")
+
+
+def no_docker(
+    monkeypatch: pytest.MonkeyPatch,
+    version: str = "2.1.220",
+    *,
+    pulled: bool = True,
+    answered: bool = True,
+    served: bool = True,
+) -> List[List[str]]:
+    """Answer for the daemon, and return the list every command a launch runs lands in.
+
+    Nothing in this file starts a container. What a launch decides is which commands it would run,
+    and those are what the boundary is made of, so they are collected rather than executed.
+
+    ``pulled`` and ``served`` are the two halves of whether the run happened: what the agent's
+    transcript records asking for, and what the server's log records answering. ``answered`` is
+    the difference between the two halves of the first: a pull the model wrote, and a pull that
+    came back with a task.
+    """
+    ran: List[List[str]] = []
+    monkeypatch.setattr(pinned, "resolve_cli_version", lambda command=(): version)
+    monkeypatch.setattr(sandbox, "docker_available", lambda: True)
+    monkeypatch.setattr(
+        sandbox,
+        "build_images",
+        lambda **kwargs: {
+            kwargs["agent"]: dict(pinned.AGENT_IMAGE_BUILD),
+            kwargs["server"]: {"base": "python", "dockerfile": "sha256:1", "source": "sha256:2"},
+        },
+    )
+    monkeypatch.setattr(sandbox, "image_id", lambda image: f"sha256:{image}")
+    monkeypatch.setattr(sandbox, "create_network", lambda network: None)
+    monkeypatch.setattr(sandbox, "remove_network", lambda network: None)
+    monkeypatch.setattr(sandbox, "remove_container", lambda name: None)
+    monkeypatch.setattr(sandbox, "wait_for_gateway", lambda server, **kwargs: None)
+    monkeypatch.setattr(sandbox, "provision_source", lambda image, *, cache, name: None)
+    monkeypatch.setattr(sandbox, "listening_sockets", lambda server: ["0.0.0.0:9000"])
+    monkeypatch.setattr(
+        sandbox, "save_logs", lambda server, path: path.write_text(SERVED_LOG if served else "")
+    )
+
+    def fake_run(argv, **kwargs):
+        ran.append(list(argv))
+        if "stdout" in kwargs and hasattr(kwargs["stdout"], "write"):
+            lines: List[Dict[str, Any]] = [init_line(claude_code_version=version)]
+            if pulled:
+                lines.append(_assistant([_call(read_back.PULL_TOOL, {})]))
+            if pulled and answered:
+                lines.append(_result(body(message_id(0, "a"))))
+            for line in lines:
+                kwargs["stdout"].write(json.dumps(line).encode() + b"\n")
+        return subprocess.CompletedProcess(argv, 0)
+
+    monkeypatch.setattr(launcher.subprocess, "run", fake_run)
+    return ran
+
+
 def test_a_launch_records_the_argv_environment_and_directories_it_resolved(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     """The whole effective launch, written where a comparison can read it back.
 
-    Nothing here spawns the CLI: what is checked is that the process would be given the argv, the
-    working directory and the environment the record names, that the record carries a digest of
-    every directory the agent started from, and that the surface the run reported is read back
-    out of the transcript afterwards.
+    Nothing here starts a container: what is checked is that the command the agent would be
+    started with is the one the record names, that the record carries a digest of every directory
+    the agent started from, and that the surface the run reported is read back out of the
+    transcript afterwards.
     """
-    monkeypatch.setattr(pinned, "resolve_cli_version", lambda executable="claude": "2.1.220")
+    ran = no_docker(monkeypatch)
     monkeypatch.setenv("CLAUDE_CODE_OAUTH_TOKEN", "a-token-nobody-should-read")
     monkeypatch.setenv("AUTOMATIONBENCH_SRC", "/tmp/another-benchmark")
-    spawned: Dict[str, Any] = {}
-
-    def fake_run(argv, **kwargs):
-        spawned.update(argv=argv, cwd=kwargs["cwd"], env=kwargs["env"])
-        kwargs["stdout"].write(json.dumps(init_line()).encode("utf-8") + b"\n")
-        return subprocess.CompletedProcess(argv, 0)
-
-    monkeypatch.setattr(launcher.subprocess, "run", fake_run)
     run_dir = tmp_path / "cell"
     assert (
         launcher.launch(
@@ -940,35 +1388,39 @@ def test_a_launch_records_the_argv_environment_and_directories_it_resolved(
             schedule="immediate",
             model="claude-opus-5",
             effort="xhigh",
+            cache=tmp_path / "cache",
         )
         == 0
     )
     text = (run_dir / launcher.RUN_FILE).read_text()
     written = json.loads(text)
-    assert written["argv"] == spawned["argv"] == list(spawned["argv"])
-    assert written["cwd"] == str(spawned["cwd"]) == str(run_dir / launcher.SELF)
-    assert written["environment"] == pinned.redacted(spawned["env"])
+    server_argv, agent_argv = ran
+    assert written["argv"] == agent_argv
+    assert written["cwd"] == sandbox.WORK == "/work"
+    assert agent_argv[agent_argv.index("-w") + 1] == sandbox.WORK
+    assert written["environment"] == pinned.redacted(pinned.agent_environment(dict(os.environ)))
     assert written["credential"] == "CLAUDE_CODE_OAUTH_TOKEN"
+    # The credential is handed to docker by name, so the run's record and the host's process table
+    # both hold which name authenticated the run and neither holds what it was worth.
     assert "a-token-nobody-should-read" not in text
+    assert "a-token-nobody-should-read" not in " ".join(agent_argv + server_argv)
+    assert "-e" in agent_argv and "CLAUDE_CODE_OAUTH_TOKEN" in agent_argv
     assert "AUTOMATIONBENCH_SRC" not in written["environment"]
     assert written["cli_version"] == written["cli_version_recorded"] == pinned.CLI_VERSION
     assert written["digests"]["work"] == pinned.digest_tree(run_dir / launcher.SELF)
     assert written["digests"]["config"] == pinned.digest_tree(run_dir / launcher.CONFIG)
     assert written["init"]["claude_code_version"] == pinned.CLI_VERSION
     assert written["drift"] == {} and written["exit_code"] == 0
+    # A run that served work and was taken down afterwards says so, and says nothing else.
+    assert written["status"] == launcher.COMPLETE and written["reason"] == []
 
 
-def test_a_launch_on_a_build_that_is_not_the_recorded_one_spawns_nothing(
+def test_a_launch_on_a_build_that_is_not_the_recorded_one_starts_nothing(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    # The refusal comes before the directories, the config and the process, so a host that cannot
-    # run the comparison leaves no run directory that looks as though it did.
-    monkeypatch.setattr(pinned, "resolve_cli_version", lambda executable="claude": "2.1.258")
-
-    def never(*args: Any, **kwargs: Any):
-        raise AssertionError("a launch that was refused must not spawn the agent")
-
-    monkeypatch.setattr(launcher.subprocess, "run", never)
+    # The refusal comes before the directories, the network and either container, so a host that
+    # cannot run the comparison leaves no run directory that looks as though it did.
+    ran = no_docker(monkeypatch, version="2.1.258")
     run_dir = tmp_path / "cell"
     with pytest.raises(ValueError, match="2.1.258"):
         launcher.launch(
@@ -978,8 +1430,9 @@ def test_a_launch_on_a_build_that_is_not_the_recorded_one_spawns_nothing(
             schedule="immediate",
             model="claude-opus-5",
             effort="xhigh",
+            cache=tmp_path / "cache",
         )
-    assert not (run_dir / launcher.RUN_FILE).exists()
+    assert ran == [] and not (run_dir / launcher.RUN_FILE).exists()
 
 
 def test_a_launch_that_allows_the_drift_records_it_rather_than_hiding_it(
@@ -987,16 +1440,316 @@ def test_a_launch_that_allows_the_drift_records_it_rather_than_hiding_it(
 ) -> None:
     # The override is what a rerun on another host needs, and what it costs is written down: the
     # run's own record names the build that served it and how its surface differed.
-    monkeypatch.setattr(pinned, "resolve_cli_version", lambda executable="claude": "2.1.258")
+    no_docker(monkeypatch, version="2.1.258")
+    run_dir = tmp_path / "cell"
+    assert (
+        launcher.launch(
+            run_dir,
+            tasks="cell-one:2",
+            domain="public",
+            schedule="immediate",
+            model="claude-opus-5",
+            effort="xhigh",
+            cache=tmp_path / "cache",
+            allow_cli_drift=True,
+        )
+        == 0
+    )
+    written = json.loads((run_dir / launcher.RUN_FILE).read_text())
+    assert written["cli_version"] == "2.1.258"
+    assert written["drift"]["claude_code_version"]["resolved"] == "2.1.258"
+
+
+def test_the_agent_is_given_three_directories_and_no_fourth(tmp_path: Path) -> None:
+    """The boundary this cell rests on, read off the command that makes it.
+
+    Two of the three are the agent's own and one names the endpoint. The run directory, this
+    repository and the benchmark cache are in none of them, which is the whole of the answer to
+    what an agent under bypassPermissions can read about the tasks it is playing.
+    """
+    run_dir = tmp_path / "cell-immediate-stamp-abc123"
+    mounts = sandbox.agent_mounts(run_dir, self_dir="self", home_dir="home", config_dir="cfg")
+    assert sandbox.mount_record(mounts) == [
+        f"{run_dir / 'self'}:/work:rw",
+        f"{run_dir / 'home'}:/root/.claude:rw",
+        f"{run_dir / 'cfg'}:/cfg:ro",
+    ]
+    argv = sandbox.agent_argv(
+        image="an-image",
+        name="an-agent",
+        network="a-network",
+        mounts=mounts,
+        environment=pinned.PINNED_ENVIRONMENT,
+        credential="CLAUDE_CODE_OAUTH_TOKEN",
+        command=["claude", "-p", "Begin."],
+    )
+    bound = [argv[index + 1] for index, flag in enumerate(argv) if flag == "-v"]
+    assert bound == sandbox.mount_record(mounts)
+    for absent in (str(run_dir / "grades"), str(sandbox.REPO), str(sandbox.default_cache())):
+        assert not any(mount.startswith(f"{absent}:") for mount in bound)
+    assert argv[-3:] == ["claude", "-p", "Begin."]
+    assert "-w" in argv and argv[argv.index("-w") + 1] == "/work"
+    assert "IS_SANDBOX=1" in argv and "ENABLE_TOOL_SEARCH=true" in argv
+
+
+def test_the_probe_and_the_launch_build_one_container_between_them(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """What the probe measures is only the agent's if the container it asks from is the agent's.
+
+    It used to write out an environment of its own, with the two pinned variables and no
+    credential, so a variable the launch added and the probe did not know about was invisible to
+    the check that claimed to have asked. Both are built here now, from one function of the
+    launching environment.
+    """
+    monkeypatch.setenv("CLAUDE_CODE_OAUTH_TOKEN", "a-token-nobody-should-read")
+    domains = launcher.Domains(
+        network="a-network",
+        server="a-server",
+        agent="an-agent",
+        agent_image="an-image",
+        server_image="a-server-image",
+        mounts=[],
+        environment={},
+        url="http://a-server:9000/mcp",
+    )
+    run_dir = tmp_path / "cell"
+    environment = pinned.agent_environment(os.environ)
+    started = launcher.agent_command(
+        domains,
+        run_dir,
+        command=["bash", "-c", "echo"],
+        environment=environment,
+        credential=pinned.credential_name(os.environ),
+    )
+    assert started.argv[started.argv.index("--name") + 1] == "an-agent"
+    assert started.mounts == sandbox.agent_mounts(
+        run_dir, self_dir=launcher.SELF, home_dir=launcher.HOME, config_dir=launcher.CONFIG
+    )
+    assert "IS_SANDBOX=1" in started.argv and "ENABLE_TOOL_SEARCH=true" in started.argv
+    # The credential reaches the probe's container the way it reaches the agent's, by name.
+    assert "CLAUDE_CODE_OAUTH_TOKEN" in started.argv
+    assert "a-token-nobody-should-read" not in " ".join(started.argv)
+
+
+def test_the_measurement_is_bound_into_the_server_and_published_to_nobody(tmp_path: Path) -> None:
+    """The other side of the same boundary: the run, the source and the grades are all in there.
+
+    The server publishes no port. It is reachable by container name on the private network the
+    run makes for itself, so the endpoint is the only way in and it is only a way in for the
+    container this run started.
+    """
+    run_dir = tmp_path / "cell-immediate-stamp-abc123"
+    cache = tmp_path / "cache"
+    mounts = sandbox.server_mounts(run_dir, grades_dir="grades", cache=cache)
+    assert sandbox.mount_record(mounts) == [
+        f"{run_dir / 'grades'}:/grades:rw",
+        f"{cache / 'automationbench'}:/cache/automationbench:ro",
+        f"{cache / 'cell-server-temporal'}:/cache/temporal:rw",
+    ]
+    argv = sandbox.server_argv(
+        image="an-image",
+        name="a-server",
+        network="a-network",
+        mounts=mounts,
+        environment=sandbox.server_environment(
+            tasks="cell-one:2", domain="public", schedule="immediate"
+        ),
+    )
+    assert "-p" not in argv and "--publish" not in argv
+    assert argv[argv.index("--network") + 1] == "a-network"
+    # The path the server publishes, and not the one it answers with a redirect.
+    assert sandbox.gateway_url("a-server") == "http://a-server:9000/mcp"
+    # The task definitions, the answers and the scoring assertions are read and never written.
+    assert f"{cache / 'automationbench'}:/cache/automationbench:ro" in argv
+
+
+def test_two_runs_on_one_host_reach_each_other_by_no_name_they_can_resolve() -> None:
+    first = sandbox.names("aaaaaa")
+    second = sandbox.names("bbbbbb")
+    assert not set(first) & set(second)
+    assert sandbox.gateway_url(first[1]) != sandbox.gateway_url(second[1])
+
+
+def test_the_run_says_what_boundary_it_ran_behind(tmp_path: Path, monkeypatch) -> None:
+    """The mount list and the network policy, kept where a later reader can check the claim.
+
+    Built from the same lists the two commands were built from, so a record saying the agent was
+    given three directories is saying what the launch gave it.
+    """
+    ran = no_docker(monkeypatch)
+    run_dir = tmp_path / "cell-immediate-stamp-abc123"
+    launcher.launch(
+        run_dir,
+        tasks="cell-one:2",
+        domain="public",
+        schedule="immediate",
+        model="claude-opus-5",
+        effort="xhigh",
+        cache=tmp_path / "cache",
+    )
+    topology = json.loads((run_dir / launcher.RUN_FILE).read_text())["topology"]
+    assert topology["kind"] == "two-domain"
+    assert topology["gateway_url"] == sandbox.gateway_url(topology["server"]["container"])
+    assert topology["agent"]["mounts"] == [
+        f"{run_dir / 'self'}:/work:rw",
+        f"{run_dir / 'home'}:/root/.claude:rw",
+        f"{run_dir / 'cfg'}:/cfg:ro",
+    ]
+    assert topology["agent"]["workdir"] == "/work"
+    # The record names the credential the launch was authenticated by, and never its value.
+    assert topology["agent"]["credential"] == "CLAUDE_CODE_OAUTH_TOKEN"
+    assert "a-token-nobody-should-read" not in (run_dir / launcher.RUN_FILE).read_text()
+    assert f"{run_dir / 'grades'}:/grades:rw" in topology["server"]["mounts"]
+    assert "no port is published to the host" in topology["network_policy"]
+    # Each image is named three ways, because an id says which image on this host answered and
+    # only the inputs can be compared with a rerun somewhere else.
+    assert topology["agent"]["build"] == dict(pinned.AGENT_IMAGE_BUILD)
+    assert topology["server"]["build"]["source"] == "sha256:2"
+    # The agent's command carries the endpoint and never a command to spawn a server with.
+    config = json.loads((run_dir / launcher.CONFIG / ".mcp.json").read_text())
+    assert config["mcpServers"][cell.SERVER]["url"] == topology["gateway_url"]
+    assert ran[1][ran[1].index("--mcp-config") + 1] == "/cfg/.mcp.json"
+
+
+def test_a_launch_whose_agent_never_reached_the_endpoint_is_not_a_successful_run(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The failure the corrected endpoint had already caused once, told this time.
+
+    A CLI that cannot negotiate with the server prints its opening line and exits nought, and that
+    line reports the MCP server as pending whether or not the connection ever came, exactly as the
+    recorded cell's own does. So neither the exit code nor the init line can answer whether the
+    run happened, and a pilot reading either would file an empty cell beside a full one.
+    """
+    no_docker(monkeypatch, pulled=False, served=False)
+    run_dir = tmp_path / "cell"
+    assert (
+        launcher.launch(
+            run_dir,
+            tasks="cell-one:2",
+            domain="public",
+            schedule="immediate",
+            model="claude-opus-5",
+            effort="xhigh",
+            cache=tmp_path / "cache",
+        )
+        == 1
+    )
+    written = json.loads((run_dir / launcher.RUN_FILE).read_text())
+    # Everything that used to say the run succeeded still says it, which is the point.
+    assert written["exit_code"] == 0 and written["drift"] == {}
+    assert written["init"]["claude_code_version"] == pinned.CLI_VERSION
+    assert written["status"] == launcher.INCOMPLETE
+    assert any("no pull came back with a task" in reason for reason in written["reason"])
+    assert any("gateway answered no request" in reason for reason in written["reason"])
+
+
+def test_a_pull_that_came_back_with_nothing_is_not_a_run_that_served_anything(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The half of the first failure that survived its first fix.
+
+    A `pull` in the transcript is a call the model wrote, not work it received. The CLI can
+    negotiate far enough to list the tools, write the call, have the request refused or redirected
+    or answered with a protocol error, and exit nought having been handed no task at all, while an
+    initialization that arrived before any of that answers the server's side on its own. So the
+    call counts for nothing here and the result is what is read.
+    """
+    no_docker(monkeypatch, answered=False)
+    run_dir = tmp_path / "cell"
+    assert (
+        launcher.launch(
+            run_dir,
+            tasks="cell-one:2",
+            domain="public",
+            schedule="immediate",
+            model="claude-opus-5",
+            effort="xhigh",
+            cache=tmp_path / "cache",
+        )
+        == 1
+    )
+    written = json.loads((run_dir / launcher.RUN_FILE).read_text())
+    assert written["exit_code"] == 0 and written["status"] == launcher.INCOMPLETE
+    assert written["reason"] == ["no pull came back with a task, so this run served nothing"]
+    read = read_back.read_transcript(run_dir / launcher.TRANSCRIPT)
+    assert read.pulls == 1 and read.tasks == 0
+
+
+def test_a_pull_answered_with_an_error_or_a_record_that_is_not_a_task_served_nothing(
+    tmp_path: Path,
+) -> None:
+    """What the transcript has to hold, asked of the four ways a pull comes back empty.
+
+    The decoder is the protocol's own, so a task is what the wire calls a task rather than
+    anything carrying the word. A refusal the harness marked as an error, a body that is not a
+    record, a record of another kind and a task missing a field are each a pull that served no
+    work, and a run made of them is a cell with nothing in it.
+    """
+    path = tmp_path / "stream.jsonl"
+
+    def answered(result: Optional[Dict[str, Any]]) -> read_back.Transcript:
+        lines: List[Dict[str, Any]] = [
+            init_line(),
+            _assistant([_call(read_back.PULL_TOOL, {}, call="p1")]),
+        ]
+        if result is not None:
+            lines.append(result)
+        path.write_text("".join(json.dumps(line) + "\n" for line in lines), encoding="utf-8")
+        return read_back.read_transcript(path)
+
+    def answer(text: str, *, error: bool = False) -> Dict[str, Any]:
+        block: Dict[str, Any] = {
+            "type": "tool_result",
+            "tool_use_id": "p1",
+            "content": [{"type": "text", "text": text}],
+        }
+        if error:
+            block["is_error"] = True
+        return {"type": "user", "message": {"content": [block]}}
+
+    task = json.dumps(_message(message_id(0, "a")))
+    assert answered(None).tasks == 0
+    assert answered(answer(task, error=True)).tasks == 0
+    assert answered(answer("MCP error -32603: the gateway refused")).tasks == 0
+    assert answered(answer(json.dumps(_message(message_id(0, "c"))))).tasks == 0
+    thin = json.loads(task)
+    del thin["body"]
+    assert answered(answer(json.dumps(thin))).tasks == 0
+    # And the one shape that is a task: the canonical record, in the result of the call that
+    # asked for it.
+    served = answered(answer(task))
+    assert served.pulls == 1 and served.tasks == 1
+
+
+def test_the_gateway_log_answers_for_the_endpoint_and_for_requests_it_answered(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The server's side of the run, read exactly rather than by prefix.
+
+    Any line beginning `/mcp` used to count, whatever the path went on to say and whatever the
+    server answered. So the redirect this cell's URL was corrected away from, a path that is not
+    the endpoint, and a request the gateway refused each said the measurement had been reached.
+    """
+    assert sandbox.served_requests(SERVED_LOG) == 1
+    for line in (
+        'INFO:     172.31.0.3:1 - "POST /mcp/ HTTP/1.1" 307 Temporary Redirect\n',
+        'INFO:     172.31.0.3:1 - "POST /mcpx HTTP/1.1" 404 Not Found\n',
+        'INFO:     172.31.0.3:1 - "POST /mcp HTTP/1.1" 404 Not Found\n',
+        'INFO:     172.31.0.3:1 - "POST /mcp HTTP/1.1" 403 Forbidden\n',
+        'INFO:     172.31.0.3:1 - "POST /mcp HTTP/1.1" 500 Internal Server Error\n',
+        "INFO:     Uvicorn running on http://0.0.0.0:9000\n",
+    ):
+        assert sandbox.served_requests(line) == 0
+    # A run whose only request was refused is a run nothing reached, however the transcript reads.
+    no_docker(monkeypatch)
     monkeypatch.setattr(
-        launcher.subprocess,
-        "run",
-        lambda argv, **kwargs: (
-            kwargs["stdout"].write(
-                json.dumps(init_line(claude_code_version="2.1.258")).encode("utf-8") + b"\n"
-            ),
-            subprocess.CompletedProcess(argv, 0),
-        )[1],
+        sandbox,
+        "save_logs",
+        lambda server, path: path.write_text(
+            'INFO:     172.31.0.3:1 - "POST /mcp HTTP/1.1" 404 Not Found\n'
+        ),
     )
     run_dir = tmp_path / "cell"
     assert (
@@ -1007,10 +1760,461 @@ def test_a_launch_that_allows_the_drift_records_it_rather_than_hiding_it(
             schedule="immediate",
             model="claude-opus-5",
             effort="xhigh",
-            allow_cli_drift=True,
+            cache=tmp_path / "cache",
+        )
+        == 1
+    )
+    written = json.loads((run_dir / launcher.RUN_FILE).read_text())
+    assert written["reason"] == [
+        "the gateway answered no request, so nothing reached the measurement"
+    ]
+
+
+def test_a_launch_the_server_never_heard_from_says_so_even_with_a_transcript(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # The two sides are asked apart. A transcript is the agent's own record, so a run whose agent
+    # recorded a call the gateway never answered is still a run that served nothing.
+    no_docker(monkeypatch, served=False)
+    run_dir = tmp_path / "cell"
+    assert (
+        launcher.launch(
+            run_dir,
+            tasks="cell-one:2",
+            domain="public",
+            schedule="immediate",
+            model="claude-opus-5",
+            effort="xhigh",
+            cache=tmp_path / "cache",
+        )
+        == 1
+    )
+    written = json.loads((run_dir / launcher.RUN_FILE).read_text())
+    assert written["reason"] == ["the gateway answered no request, so nothing reached the "
+                                "measurement"]
+    # The gateway's own access log is what answers this, and its readiness check leaves no line
+    # there: a connection that says nothing is not a request the server answered.
+    assert sandbox.served_requests("") == 0
+
+
+def test_a_launch_stopped_by_a_signal_takes_both_domains_down_and_records_the_ending(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Ordinary termination, which is how a scheduler ends a job that ran out of time.
+
+    A signal used to end the launcher without unwinding it, so the agent went on calling the
+    server and writing into the two directories the run is measuring while the launcher watching
+    them was gone. What the run came to has to be the launcher's last act rather than something
+    lost with it, so the signal is handled, both containers are stopped by name, the network comes
+    down, and the record says which signal it was.
+    """
+    ran = no_docker(monkeypatch)
+    taken: List[str] = []
+    monkeypatch.setattr(sandbox, "remove_container", lambda name: taken.append(name))
+    monkeypatch.setattr(sandbox, "remove_network", lambda network: taken.append(network))
+
+    def signalled(argv, **kwargs):
+        ran.append(list(argv))
+        if "stdout" in kwargs and hasattr(kwargs["stdout"], "write"):
+            # The agent is running, and the launcher is asked to stop.
+            os.kill(os.getpid(), signal.SIGTERM)
+        return subprocess.CompletedProcess(argv, 0)
+
+    monkeypatch.setattr(launcher.subprocess, "run", signalled)
+    run_dir = tmp_path / "cell-immediate-stamp-abc123"
+    before = signal.getsignal(signal.SIGTERM)
+    code = launcher.launch(
+        run_dir,
+        tasks="cell-one:2",
+        domain="public",
+        schedule="immediate",
+        model="claude-opus-5",
+        effort="xhigh",
+        cache=tmp_path / "cache",
+    )
+    assert code == 128 + int(signal.SIGTERM)
+    network, server, agent = sandbox.names("abc123")
+    # The fetch's name is taken first, because a launch owns that container before it owns a
+    # network or a server, and every one of them is gone when the launcher is.
+    assert taken == [sandbox.provisioner_name(server), agent, server, network]
+    written = json.loads((run_dir / launcher.RUN_FILE).read_text())
+    assert written["status"] == launcher.INCOMPLETE
+    assert written["reason"] == ["the launcher was stopped by SIGTERM"]
+    assert written["exit_code"] is None
+    # And the handler is the launch's own for as long as the launch owns containers, not
+    # something left behind for whatever the process does next.
+    assert signal.getsignal(signal.SIGTERM) is before
+
+
+def test_a_launch_stopped_while_the_source_is_fetched_takes_the_fetch_down(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The same termination, at the one moment the launch owns a container and nothing else.
+
+    A signal ends the docker client and not the container it started, so a fetch interrupted here
+    went on holding and writing the shared cache with the launch that started it gone. There was
+    no run directory, no network and no server yet, so the teardown that takes a run down had
+    nothing to take: the fetch was unnamed. It runs under this run's own name now and comes down
+    however the fetch ends, which is what this asks for at the moment it is running.
+    """
+    no_docker(monkeypatch)
+    taken: List[str] = []
+    monkeypatch.setattr(sandbox, "remove_container", lambda name: taken.append(name))
+    monkeypatch.setattr(sandbox, "remove_network", lambda network: taken.append(network))
+
+    def fetching(image, *, cache, name):
+        # The fetch is running, and the launcher is asked to stop.
+        os.kill(os.getpid(), signal.SIGTERM)
+
+    monkeypatch.setattr(sandbox, "provision_source", fetching)
+    run_dir = tmp_path / "cell-immediate-stamp-abc123"
+    code = launcher.launch(
+        run_dir,
+        tasks="cell-one:2",
+        domain="public",
+        schedule="immediate",
+        model="claude-opus-5",
+        effort="xhigh",
+        cache=tmp_path / "cache",
+    )
+    assert code == 128 + int(signal.SIGTERM)
+    _, server, _ = sandbox.names("abc123")
+    # The fetch, and nothing else, because nothing else had been started yet.
+    assert taken == [sandbox.provisioner_name(server)]
+    written = json.loads((run_dir / launcher.RUN_FILE).read_text())
+    assert written["status"] == launcher.INCOMPLETE
+    assert written["reason"] == ["the launcher was stopped by SIGTERM"]
+
+
+def test_a_teardown_attempts_every_target_before_it_reports_any_failure(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # Callers rely on this running to the end, so one container that will not die, or a log write
+    # that fails, must not be what stops the network and the other container coming down.
+    attempted: List[str] = []
+
+    def refuse(server, path):
+        attempted.append("log")
+        raise OSError("read-only file system")
+
+    def remove(name: str) -> Optional[str]:
+        attempted.append(name)
+        return f"{name} is still here" if "agent" in name else None
+
+    monkeypatch.setattr(sandbox, "save_logs", refuse)
+    monkeypatch.setattr(sandbox, "remove_container", remove)
+    monkeypatch.setattr(sandbox, "remove_network", lambda network: attempted.append(network))
+    domains = launcher.Domains(
+        network="a-network",
+        server="a-server",
+        agent="an-agent",
+        agent_image="an-image",
+        server_image="a-server-image",
+        mounts=[],
+        environment={},
+        url="http://a-server:9000/mcp",
+    )
+    failures = launcher.close_domains(domains, log=tmp_path / "server.log")
+    assert attempted == ["log", "an-agent", "a-server", "a-network"]
+    assert failures == ["the server's log could not be saved: read-only file system",
+                        "an-agent is still here"]
+
+
+def test_a_probe_removes_the_container_it_started(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The probe's container is the agent's, so it is one the teardown knows the name of.
+
+    It used to run under a name of its own and the teardown removed the name it did not use, which
+    left the probe's container running and its network up behind an interrupted diagnostic.
+    """
+    ran = no_docker(monkeypatch)
+    taken: List[str] = []
+    monkeypatch.setattr(sandbox, "remove_container", lambda name: taken.append(name))
+    monkeypatch.setattr(sandbox, "remove_network", lambda network: taken.append(network))
+
+    def answered(argv, **kwargs):
+        ran.append(list(argv))
+        return subprocess.CompletedProcess(argv, 0, stdout="ok    something\nfailed=0\n", stderr="")
+
+    monkeypatch.setattr(launcher.subprocess, "run", answered)
+    run_dir = tmp_path / "probe-immediate-stamp-abc123"
+    assert (
+        launcher.probe(
+            run_dir,
+            tasks="cell-one:2",
+            domain="public",
+            schedule="immediate",
+            cache=tmp_path / "cache",
         )
         == 0
     )
-    written = json.loads((run_dir / launcher.RUN_FILE).read_text())
-    assert written["cli_version"] == "2.1.258"
-    assert written["drift"]["claude_code_version"]["resolved"] == "2.1.258"
+    network, server, agent = sandbox.names("abc123")
+    started = ran[-1][ran[-1].index("--name") + 1]
+    assert started == agent
+    assert taken == [sandbox.provisioner_name(server), agent, server, network]
+
+
+def test_only_the_gateway_is_bound_where_another_container_could_reach_it() -> None:
+    """The network half of the boundary, read the way the run reads it off the server.
+
+    The rows are the kernel's own table, hexadecimal and least significant byte first. What the
+    run asks of them is which listeners are on an address another container could route to, and
+    the answer has to be the endpoint alone: the durable service holding the history is one of the
+    others, and it is on that container's loopback.
+    """
+    table = "\n".join(
+        [
+            "  sl  local_address rem_address   st",
+            "   0: 00000000:2328 00000000:0000 0A",  # 0.0.0.0:9000, the gateway
+            "   1: 0100007F:1C39 00000000:0000 0A",  # 127.0.0.1:7225, the durable service
+            "   2: 0B00007F:5F41 00000000:0000 01",  # not listening, so not a way in
+        ]
+    )
+    listeners = sandbox.parse_listeners(table)
+    assert listeners == ["0.0.0.0:9000", "127.0.0.1:7225"]
+    assert sandbox.unexpected_listeners(listeners) == []
+
+
+def test_a_port_that_merely_ends_in_the_gateways_digits_is_not_the_gateway() -> None:
+    """The address and the port are compared apart, and each of them exactly.
+
+    A suffix test waved through every port ending in the endpoint's digits, so a service on 19000
+    read as the gateway. An address the parse cannot place is not loopback either: a listener
+    nobody can locate is not one anybody has shown to be out of reach.
+    """
+    assert sandbox.unexpected_listeners(
+        ["0.0.0.0:9000", "0.0.0.0:19000", "0.0.0.0:29000", "127.0.0.1:42233", "::1:7233"]
+    ) == ["0.0.0.0:19000", "0.0.0.0:29000"]
+    assert sandbox.unexpected_listeners(["somewhere:9001"]) == ["somewhere:9001"]
+
+
+def test_the_agents_own_network_namespace_is_measured_and_not_assumed() -> None:
+    """The claim the flag was standing in for, made into a question the probe can ask.
+
+    A container started to share the server's network stack passes every other check here: the
+    same three mounts, the same environment, the same resolver, the same 404s. What it also has is
+    the server's loopback, which is where the durable service holding the history is bound. So the
+    namespace is read on both sides and compared, and the addresses the server keeps to itself are
+    the ones the agent's container is asked about, each at the address it was bound to.
+    """
+    assert "readlink /proc/1/ns/net" in sandbox.PROBE_SCRIPT
+    assert sandbox.loopback_listeners(
+        ["0.0.0.0:9000", "127.0.0.1:7233", "127.0.0.11:43711", "::1:8233", "somewhere:9001"]
+    ) == ["127.0.0.1:7233", "127.0.0.11:43711", "::1:8233"]
+    command = sandbox.probe_command(
+        run_dir=Path("/runs/cell"),
+        cache=Path("/cache"),
+        server="a-server",
+        environment=["IS_SANDBOX"],
+        server_namespace="net:[4026532296]",
+        server_loopback=["127.0.0.1:7233", "::1:8233"],
+    )
+    assert "net:[4026532296]" in command and "127.0.0.1:7233 ::1:8233" in command
+    # Told neither, it fails the checks it cannot make rather than passing them: a namespace
+    # nobody could ask about is not one anybody has shown to be separate.
+    told_nothing = sandbox.probe_command(
+        run_dir=Path("/runs/cell"), cache=Path("/cache"), server="a-server", environment=[]
+    )
+    assert told_nothing[-2:] == ["", ""]
+
+
+def test_a_namespace_that_could_not_be_read_is_refused_like_a_listener_that_could_not(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # Answering with a name that matches nothing would pass the comparison whenever the asking
+    # broke, which is the failure the listener read already refuses.
+    answers: List[subprocess.CompletedProcess] = []
+    monkeypatch.setattr(sandbox, "_docker", lambda args, **kwargs: answers.pop(0))
+    answers.append(subprocess.CompletedProcess([], 1, stdout="", stderr="No such container"))
+    with pytest.raises(ValueError, match="unknown"):
+        sandbox.network_namespace("a-server")
+    answers.append(subprocess.CompletedProcess([], 0, stdout="\n", stderr=""))
+    with pytest.raises(ValueError, match="unknown"):
+        sandbox.network_namespace("a-server")
+    answers.append(subprocess.CompletedProcess([], 0, stdout="net:[4026532296]\n", stderr=""))
+    assert sandbox.network_namespace("a-server") == "net:[4026532296]"
+
+
+def test_listeners_that_could_not_be_read_are_refused_and_never_read_as_none(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # An empty list is what a container listening on nothing looks like, so answering one for a
+    # container nobody could ask is a check that passes whenever the asking breaks.
+    monkeypatch.setattr(
+        sandbox,
+        "_docker",
+        lambda args, **kwargs: subprocess.CompletedProcess(
+            args, 1, stdout="", stderr="Error: No such container"
+        ),
+    )
+    with pytest.raises(ValueError, match="unknown"):
+        sandbox.listening_sockets("a-server")
+
+
+def test_the_probe_reads_its_own_verdict() -> None:
+    # The probe is a script in another container, so what it found comes back as text. A run that
+    # printed no verdict is a run that proved nothing, which is not the same as one that passed.
+    assert sandbox.read_probe("ok    something\nfailed=0\n") == 0
+    assert sandbox.read_probe("FAIL  something\nfailed=1\n") == 1
+    with pytest.raises(ValueError, match="no verdict"):
+        sandbox.read_probe("ok    something\n")
+    # Every host path the probe checks for is passed to it, so it is asking about this run.
+    command = sandbox.probe_command(
+        run_dir=Path("/runs/cell"),
+        cache=Path("/cache"),
+        server="a-server",
+        environment=["IS_SANDBOX", "ENABLE_TOOL_SEARCH"],
+    )
+    assert "/runs/cell" in command and "/cache" in command
+    assert str(sandbox.REPO) in command
+    assert sandbox.gateway_url("a-server") in command
+
+
+def test_what_the_probe_is_told_reaches_it_as_arguments_and_not_as_environment() -> None:
+    """The probe asks what its own process was handed, so it cannot be told through that.
+
+    Six variables of its own were how it used to carry the paths it was checking for, which left
+    it measuring an environment no agent is ever launched with. They are arguments now, and the
+    names the launch would set are one more of them, so what the check compares is the launch's
+    own list rather than a copy of it kept here.
+    """
+    command = sandbox.probe_command(
+        run_dir=Path("/runs/cell"),
+        cache=Path("/cache"),
+        server="a-server",
+        environment=["CLAUDE_CODE_OAUTH_TOKEN", "ENABLE_TOOL_SEARCH", "IS_SANDBOX"],
+    )
+    assert command[:2] == ["bash", "-c"] and command[2] == sandbox.PROBE_SCRIPT
+    assert not any("=" in part for part in command[3:])
+    assert "CLAUDE_CODE_OAUTH_TOKEN ENABLE_TOOL_SEARCH IS_SANDBOX" in command
+    assert " ".join(sandbox.IMAGE_ENVIRONMENT) in command
+
+
+def test_the_probe_asks_about_every_local_surface_it_claims_to_have_measured() -> None:
+    """The verdict names the boundary, so the script has to have asked about all of it.
+
+    Reachability by URL was the whole of what it asked. A container also has a config directory it
+    could rewrite, an environment somebody could have added to, a process table, a privilege and
+    seccomp state, a container runtime socket, a resolver, and a metadata service holding the
+    host's own credentials, and each of those is a way to the grades that answers no curl.
+    """
+    for surface in (
+        "/cfg/.mcp.json",
+        "/proc/1/environ",
+        "/proc/[0-9]*",
+        "CapBnd",
+        "Seccomp",
+        "docker.sock",
+        "2375",
+        "169.254.169.254",
+        "metadata.google.internal",
+        "getent hosts",
+    ):
+        assert surface in sandbox.PROBE_SCRIPT
+    # And it says what it did not measure: general egress is retained rather than absent, so a
+    # host the agent can reach is reported as the egress it is and never counted as isolation.
+    assert "general egress is retained" in sandbox.PROBE_SCRIPT
+    if shutil.which("bash"):
+        syntax = subprocess.run(
+            ["bash", "-n", "-c", sandbox.PROBE_SCRIPT], capture_output=True, text=True
+        )
+        assert syntax.returncode == 0, syntax.stderr
+
+
+def _images_are_here() -> bool:
+    """Whether this host already holds both images, whatever they were built from.
+
+    Building one to make a point about a network or a cache is work these checks do not own, so
+    without them they are skipped. What each image was built from does not bear on either, which
+    is why only their presence is asked about.
+    """
+    if not sandbox.docker_available():
+        return False
+    images = (f"{sandbox.AGENT_IMAGE}:{pinned.CLI_VERSION}", f"{sandbox.SERVER_IMAGE}:latest")
+    return all(sandbox.image_id(image) is not None for image in images)
+
+
+def _domains_can_be_stood_up() -> bool:
+    """Whether this host holds both images and the benchmark source the server reads."""
+    return _images_are_here() and (sandbox.default_cache() / "automationbench").is_dir()
+
+
+@pytest.mark.skipif(
+    not _images_are_here(),
+    reason="the live cold-cache check needs both images built here",
+)
+def test_a_launch_with_an_empty_cache_fills_it_and_reaches_the_gateway(tmp_path: Path) -> None:
+    """The first launch on a clean host, run as the thing it used to be.
+
+    A cache nobody has filled is the ordinary state of a pilot machine and of an operator who
+    named a cache of their own, and it was the one state this cell could not launch from: the
+    source is mounted read only, so the loader inside the server raised on a read-only filesystem
+    and the endpoint never opened. What is checked here is the whole of that path, with a cache
+    that starts empty: the pinned source is in it afterwards, and the gateway is listening.
+
+    It is slower than the rest of this file by a lot, because an empty cache is also an empty
+    durable-service cache and both are fetched here.
+    """
+    cache = tmp_path / "cache"
+    run_dir = launcher.new_run_dir(tmp_path, schedule="immediate", prefix="probe")
+    domains = launcher.open_domains(
+        run_dir, tasks="cell-one:1", domain="public", schedule="immediate", cache=cache
+    )
+    try:
+        # The source, under the commit the adapter pins, in the directory the server has read only.
+        assert list((cache / "automationbench").glob("*/automationbench/__init__.py"))
+        assert f"0.0.0.0:{sandbox.SERVER_PORT}" in sandbox.listening_sockets(domains.server)
+    finally:
+        assert launcher.close_domains(domains) == []
+
+
+@pytest.mark.skipif(
+    not _domains_can_be_stood_up(),
+    reason="the live boundary check needs both images built here and the benchmark source cached",
+)
+def test_a_probe_sharing_the_servers_network_stack_is_a_probe_that_fails(tmp_path: Path) -> None:
+    """The false negative the probe used to have, run as the thing it would have missed.
+
+    Everything else the probe asks stays true of a container joined to the server's own network
+    stack: the same three mounts, the same environment, the same resolver, the same 404s at the
+    gateway, the same refusals on the alternate ports. What such a container also has is the
+    server's loopback, where the durable service holding the history is bound. So the run below is
+    the real launch with one thing changed, and the probe has to come back non-zero: the namespace
+    it reports is the server's, and the addresses the server keeps to itself answer inside it.
+    """
+    cache = sandbox.default_cache()
+    run_dir = launcher.new_run_dir(tmp_path, schedule="immediate", prefix="probe")
+    pinned.seed_workdir(run_dir / launcher.SELF)
+    (run_dir / launcher.HOME).mkdir(parents=True, exist_ok=True)
+    domains = launcher.open_domains(
+        run_dir, tasks="cell-one:2", domain="public", schedule="immediate", cache=cache
+    )
+    try:
+        launcher.mcp_config(run_dir, url=domains.url)
+        environment = pinned.agent_environment(os.environ)
+        started = launcher.agent_command(
+            # The one change: the agent's container joins the server's network stack instead of
+            # the run's own network. Nothing else about the launch moves.
+            domains._replace(network=f"container:{domains.server}"),
+            run_dir,
+            command=sandbox.probe_command(
+                run_dir=run_dir,
+                cache=cache,
+                server=domains.server,
+                environment=sorted(environment),
+                server_namespace=sandbox.network_namespace(domains.server),
+                server_loopback=sandbox.loopback_listeners(
+                    sandbox.listening_sockets(domains.server)
+                ),
+            ),
+            environment=environment,
+            credential=pinned.credential_name(os.environ),
+        )
+        done = subprocess.run(started.argv, capture_output=True, text=True, check=False)
+    finally:
+        assert launcher.close_domains(domains) == []
+    failures = [line for line in done.stdout.splitlines() if line.startswith("FAIL")]
+    assert sandbox.read_probe(done.stdout) == len(failures) > 0, done.stdout
+    assert any("network namespace" in line for line in failures), done.stdout
+    assert any("is this container's loopback" in line for line in failures), done.stdout
