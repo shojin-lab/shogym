@@ -2493,12 +2493,13 @@ def test_a_worker_that_replaced_the_one_which_sealed_grades_the_play_it_sealed(
 def test_no_quickstart_promises_that_the_agent_is_not_told_its_score() -> None:
     """The default is honest, so no document that describes it may promise concealment.
 
-    Five harness quickstarts say the same three things in the same words, and a change made in
-    one of them is a change made in one of them. The claim is checked rather than reviewed.
+    The harness quickstarts say the same three things in the same words, and a change made in
+    one of them is a change made in one of them. The claim is checked rather than reviewed, and
+    the count is checked beside it so a document added under ``examples`` is read here too.
     """
     root = Path(__file__).resolve().parents[1]
     documents = sorted((root / "examples").glob("*/README.md")) + [root / "README.md"]
-    assert len(documents) == 6
+    assert len(documents) == 7
     for path in documents:
         text = path.read_text(encoding="utf-8")
         for promise in (
