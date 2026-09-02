@@ -46,14 +46,15 @@ import json
 import time
 from contextlib import asynccontextmanager, suppress
 from datetime import timedelta
+from hashlib import sha256
 from pathlib import Path
-from typing import Any, AsyncIterator, Dict, List, Sequence, Tuple
+from typing import Any, AsyncIterator, Dict, List, Optional, Sequence, Tuple
 
 import pytest
 import pytest_asyncio
 from temporalio import activity
 from temporalio.api.enums.v1 import EventType
-from temporalio.client import Client
+from temporalio.client import Client, WorkflowHandle
 from temporalio.testing import WorkflowEnvironment
 from temporalio.worker import Worker
 
@@ -71,6 +72,7 @@ from shogym.serve.protocol_v2.kernel import (
     GradeAttemptResult,
     OfferedMessage,
     PayloadBundle,
+    PresentedMessage,
     SealAttemptInput,
     SealAttemptResult,
     SealRequest,
@@ -231,8 +233,15 @@ class Driver:
         )
         self.cursor = ack.cursor
 
-    async def file(self, attempt_id: str) -> OfferedMessage:
-        """File the terminal for one attempt and return the acknowledgement it offers."""
+    async def file(
+        self, attempt_id: str, *, arguments: Optional[Dict[str, Any]] = None
+    ) -> OfferedMessage:
+        """File the terminal for one attempt and return what it offers back.
+
+        ``arguments`` is what the filing carries. The default is a filing the terminal declares,
+        which is acknowledged; arguments it does not declare come back as a SealReject, which is
+        a result like any other and leaves the attempt where it was.
+        """
         return await self.stream.seal(
             SealRequest(
                 metadata=TerminalMetadata(
@@ -242,7 +251,7 @@ class Driver:
                 ),
                 public_tool_name="submit",
                 native_terminal_name="submit",
-                native_arguments={"answer": "42"},
+                native_arguments={"answer": "42"} if arguments is None else arguments,
             )
         )
 
@@ -263,7 +272,7 @@ class Driver:
         return list(await self.stream.handle.query(StreamWorkflow.attempt_records))
 
     async def delivered(self) -> Tuple[bool, bool, bool]:
-        """Which of the one attempt's three messages have been handed to the transport."""
+        """Which of the one attempt's three messages the generation has committed."""
         record = (await self.records())[0]
         return (record.task_delivered, record.ack_delivered, record.payload_delivered)
 
@@ -455,6 +464,25 @@ def field_names() -> List[str]:
 
 def by_id(records: List[AttemptRecord]) -> Dict[str, AttemptRecord]:
     return {record.attempt_id: record for record in records}
+
+
+def queries_asked(monkeypatch: pytest.MonkeyPatch) -> List[Any]:
+    """Record which Query definition every Query from here on names, and how many there are.
+
+    What a read asks for is part of what it promises. A reader that went back to asking for the
+    rows and then for the commitments would answer with two moments of a generation that can
+    move between them, and every assertion about the answer's content would still pass, because
+    nothing moved while the test was looking. So the call itself is what is checked.
+    """
+    asked: List[Any] = []
+    answering = WorkflowHandle.query
+
+    async def counting(self: Any, query: Any, *args: Any, **kwargs: Any) -> Any:
+        asked.append(query)
+        return await answering(self, query, *args, **kwargs)
+
+    monkeypatch.setattr(WorkflowHandle, "query", counting)
+    return asked
 
 
 @pytest.mark.network
@@ -714,7 +742,22 @@ async def test_the_file_a_read_leaves_behind_holds_exactly_those_rows(
         await driver.solve()
         records = await driver.records()
 
-    run = RunRecords(root=tmp_path, workflow_id=WORKFLOW_ID, records=records)
+    # The commitments are carried too, and the file is still one object per attempt. A writer
+    # that appended them only when there were some to append would pass this on an empty list.
+    run = RunRecords(
+        root=tmp_path,
+        workflow_id=WORKFLOW_ID,
+        records=records,
+        presentations=[
+            PresentedMessage(
+                order=0,
+                kind="task",
+                message_id=oid(0x101),
+                attempt_id=oid(0x100),
+                visible_bytes_sha256="d" * 64,
+            )
+        ],
+    )
     path = write_records(run)
     assert path == tmp_path / RECORDS_FILE
 
@@ -726,6 +769,162 @@ async def test_the_file_a_read_leaves_behind_holds_exactly_those_rows(
     assert "derived view" in note
     assert WORKFLOW_ID in note
     assert RECORDS_FILE in note
+
+
+@pytest.mark.network
+async def test_a_run_says_what_it_committed_to_deliver_and_commits_to_the_bytes(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The other half of a read: the commitments, in order, each holding its bytes to a digest.
+
+    The rows say what an attempt came to. This says which bytes were committed to get there,
+    which is what a harness keeping the model's transcript reconciles its own writing against. It
+    is a sequence rather than a set because the order is part of the claim, and the digest is the
+    whole comparison: a result carrying a message's identifier under other bytes is not that
+    message arriving, and nothing but the bytes can tell the two apart.
+
+    Every kind is here, not the three an attempt's row has columns for. A Wait, a SealReject and
+    the Done that ends the generation are committed the same way, and a reconciliation blind to
+    them would pass a run whose own record had lost one.
+
+    The read makes one Query, which is the other thing this checks. A reader that asked for the
+    rows and then for the commitments would answer with two moments of a generation that can move
+    between them, and every assertion here about the content would still pass.
+    """
+    monkeypatch.delenv(TEMPORAL_ADDRESS_ENV, raising=False)
+    start = make_start(("first",))
+    root = a_run_directory(tmp_path, start)
+    async with durable_client(run_directory=root) as client:
+        async with stream_worker(client):
+            driver = await open_stream(client, start)
+            task = await driver.take()
+            assert task.attempt_id is not None
+            # Nothing is available while this attempt holds the capacity, so a pull waits.
+            waiting = await driver.take()
+            # Arguments the terminal never declared are refused as a result rather than a fault,
+            # and the attempt stays where it was.
+            rejected = await driver.file(task.attempt_id, arguments={"reply": "42"})
+            await driver.present(rejected)
+            acknowledgement = await driver.file(task.attempt_id)
+            await driver.present(acknowledgement)
+            payload = await driver.take()
+            await driver.stream.close_queue()
+            done = await driver.take()
+
+    committed = [task, waiting, rejected, acknowledgement, payload, done]
+    asked = queries_asked(monkeypatch)
+    run = await read_records(root)
+    assert asked == [StreamWorkflow.generation_records]
+
+    assert [(row.order, row.kind, row.message_id) for row in run.presentations] == [
+        (order, message.kind, message.message_id) for order, message in enumerate(committed)
+    ]
+    assert [row.kind for row in run.presentations] == [
+        "task",
+        "wait",
+        "seal_reject",
+        "seal_ack",
+        "payload",
+        "done",
+    ]
+    # A Wait and the Done belong to the generation rather than to an attempt, and say so.
+    assert [row.attempt_id for row in run.presentations] == [
+        task.attempt_id,
+        None,
+        task.attempt_id,
+        task.attempt_id,
+        task.attempt_id,
+        None,
+    ]
+    assert [row.visible_bytes_sha256 for row in run.presentations] == [
+        sha256(message.visible_text.encode("utf-8")).hexdigest() for message in committed
+    ]
+    # The rows and the commitments are the one read and answer for the one attempt.
+    assert [record.attempt_id for record in run.records] == [task.attempt_id]
+
+
+@pytest.mark.network
+async def test_a_commitment_stands_although_nobody_ever_received_those_bytes(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """What a row is: what the generation accepted, and not what any transport handed over.
+
+    A presentation is accepted before the transport that asked for it has a result to give
+    anybody. So an acknowledgement lost on the way back leaves a message this generation has
+    counted and a caller holding nothing, and here that is made permanent: another owner takes
+    the generation over, and the transport that would have carried those bytes is fenced out of
+    it. The row stands, because a row records the commitment and never the handoff, and the
+    reconciliation against the harness's own transcript is what settles the rest.
+    """
+    monkeypatch.delenv(TEMPORAL_ADDRESS_ENV, raising=False)
+    start = make_start(("first",))
+    root = a_run_directory(tmp_path, start)
+    async with durable_client(run_directory=root) as client:
+        async with stream_worker(client):
+            driver = await open_stream(client, start)
+            task = await driver.offer()
+            await driver.stream.present(
+                task,
+                attestation_id=driver.next_id(),
+                transcript_blob=TRANSCRIPT_BLOB,
+                task_start_checkpoint_blob=CHECKPOINT_BLOB,
+            )
+            # The acknowledgement is where this transport stops. It never reached the call that
+            # asked, so those bytes were never anybody's to return.
+
+            # And another owner has the generation now, so this transport will not get a second
+            # chance to hand them on.
+            taken = await resume_run_directory(client, root, start=start, claimant_id="the-next")
+            state = await taken.stream_state()
+            assert state.cursor == task.message_id
+
+    run = await read_records(root)
+    assert [(row.kind, row.message_id) for row in run.presentations] == [
+        ("task", task.message_id)
+    ]
+    assert run.presentations[0].visible_bytes_sha256 == (
+        sha256(task.visible_text.encode("utf-8")).hexdigest()
+    )
+    # The attempt's own row says the same thing in its own column, which is the commitment.
+    assert run.records[0].task_delivered
+
+
+@pytest.mark.network
+async def test_the_rows_and_the_commitments_come_back_from_one_moment(
+    env: WorkflowEnvironment,
+) -> None:
+    """Both halves are answered by one handler call, so they describe one state of the run.
+
+    A generation that is still serving moves. Asked in two Queries, the rows can come from before
+    a Presentation committed and the commitments from after it, and the pair then says a payload
+    was owed and committed at once. So the two are asked together, and what that buys is checked
+    where a torn read would show: with the payload offered and not yet presented, and again once
+    it has been, both halves say the same thing about it each time.
+    """
+    async with stream_worker(env.client):
+        driver = await open_stream(env.client, make_start(("first",)))
+        task = await driver.take()
+        assert task.attempt_id is not None
+        await driver.present(await driver.file(task.attempt_id))
+        payload = await driver.offer()
+
+        offered = await driver.stream.handle.query(StreamWorkflow.generation_records)
+        assert not offered.attempts[0].payload_delivered
+        assert payload.message_id not in {row.message_id for row in offered.presentations}
+
+        await driver.present(payload)
+        presented = await driver.stream.handle.query(StreamWorkflow.generation_records)
+        assert presented.attempts[0].payload_delivered
+        assert presented.presentations[-1].message_id == payload.message_id
+
+        # The halves either one came from are still there, and answer the same as this one does
+        # for a generation nothing is moving.
+        assert list(await driver.stream.handle.query(StreamWorkflow.attempt_records)) == list(
+            presented.attempts
+        )
+        assert list(await driver.stream.handle.query(StreamWorkflow.presented_messages)) == list(
+            presented.presentations
+        )
 
 
 @pytest.mark.network
@@ -1029,7 +1228,14 @@ async def test_a_run_on_a_named_service_is_read_through_whoever_is_serving_it(
                 assert task.attempt_id is not None
                 served = await driver.records()
                 # The deployment is up, so it answers, and the read started nothing to ask it.
-                assert (await read_records(root)).records == served
+                asked = queries_asked(monkeypatch)
+                answered = await read_records(root)
+                assert answered.records == served
+                # One Query, and it is the one that answers with both halves. A read that asked
+                # twice would be asking a live generation twice, and this is the path where
+                # there is no stopped copy to make that safe.
+                assert asked == [StreamWorkflow.generation_records]
+                assert [row.message_id for row in answered.presentations] == [task.message_id]
 
                 filing = asyncio.create_task(driver.file(task.attempt_id))
                 await asyncio.wait_for(environment.reached.wait(), timeout=60)

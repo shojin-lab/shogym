@@ -54,7 +54,11 @@ from typing import Any, Dict, List, Optional, Tuple, Union
 from temporalio.client import Client, WorkflowExecutionDescription
 from temporalio.service import RPCError, RPCStatusCode
 
-from shogym.serve.protocol_v2.kernel.messages import AttemptRecord
+from shogym.serve.protocol_v2.kernel.messages import (
+    AttemptRecord,
+    GenerationRecords,
+    PresentedMessage,
+)
 from shogym.serve.protocol_v2.kernel.runtime import (
     STREAM_DATABASE_FILE,
     TEMPORAL_ADDRESS_ENV,
@@ -101,6 +105,12 @@ _COLUMNS = (
 )
 
 
+# What one read comes back with, before it is a :class:`RunRecords`: the attempts, and the
+# messages this generation committed to deliver in the order it committed them. Both halves come
+# back from one Query, so they describe the generation at one moment rather than at two.
+_Answer = GenerationRecords
+
+
 class NothingToRead(RuntimeError):
     """A run directory with no records to read, carrying the reason it has none."""
 
@@ -111,11 +121,26 @@ class ReadRefused(RuntimeError):
 
 @dataclass(frozen=True)
 class RunRecords:
-    """What one run directory answered with: which generation, and its attempts."""
+    """What one run directory answered with: which generation, its attempts, its commitments.
+
+    ``presentations`` is what the generation committed to deliver, in order. It is read beside
+    the records rather than instead of them, because the two answer different questions: a record
+    says what an attempt came to, and a presentation says which bytes were committed for it.
+
+    A commitment is where the claim stops. It is accepted before the transport has a result to
+    give anybody, so whether those bytes reached the transport at all, and whether a model then
+    read them, are facts about the harness. A harness that keeps the model's transcript is the
+    one that can say either, by reconciling its own writing against these rows; a harness that
+    keeps no transcript can ignore them.
+
+    Both halves are answered by one Query, so a row and the commitments beside it are the same
+    generation at the same point rather than two reads of one that moved between them.
+    """
 
     root: Path
     workflow_id: str
     records: List[AttemptRecord]
+    presentations: List[PresentedMessage] = dataclasses.field(default_factory=list)
 
 
 async def read_records(root: Union[str, Path]) -> RunRecords:
@@ -129,13 +154,18 @@ async def read_records(root: Union[str, Path]) -> RunRecords:
     run = open_run_directory(root)
     _require_authority(run.root)
     if os.environ.get(TEMPORAL_ADDRESS_ENV):
-        records = await _read_through_a_deployment(run)
+        answer = await _read_through_a_deployment(run)
     else:
-        records = await _read_off_a_copy(run)
-    return RunRecords(root=run.root, workflow_id=run.manifest.workflow_id, records=records)
+        answer = await _read_off_a_copy(run)
+    return RunRecords(
+        root=run.root,
+        workflow_id=run.manifest.workflow_id,
+        records=list(answer.attempts),
+        presentations=list(answer.presentations),
+    )
 
 
-async def _read_off_a_copy(run: RunDirectory) -> List[AttemptRecord]:
+async def _read_off_a_copy(run: RunDirectory) -> _Answer:
     """Answer out of a copy of this run's own history, or refuse because the read moved it.
 
     The copy is what makes a read cost the run nothing. Neither half of a read can be asked to
@@ -176,16 +206,16 @@ async def _read_off_a_copy(run: RunDirectory) -> List[AttemptRecord]:
             if arrived is not None:
                 _refuse_unapplied_work(workflow_id, arrived)
             async with stream_worker(client, task_queue=run.manifest.task_queue, activities=[]):
-                records = await _query(client, workflow_id)
+                answer = await _query(client, workflow_id)
             _refuse_a_moved_history(
                 workflow_id,
                 _history_length(arrived),
                 _history_length(await _described(client, workflow_id)),
             )
-            return records
+            return answer
 
 
-async def _read_through_a_deployment(run: RunDirectory) -> List[AttemptRecord]:
+async def _read_through_a_deployment(run: RunDirectory) -> _Answer:
     """Ask a service somebody else runs, as a client of it and never as a Worker on it.
 
     There is no copy to take here. The history belongs to whoever runs the service, and a run
@@ -205,11 +235,12 @@ async def _read_through_a_deployment(run: RunDirectory) -> List[AttemptRecord]:
     async with durable_client() as client:
         handle = client.get_workflow_handle_for(StreamWorkflow.run, workflow_id)
         try:
-            return list(
-                await handle.query(
-                    StreamWorkflow.attempt_records,
-                    rpc_timeout=_A_SERVING_WORKER_ANSWERS_WITHIN,
-                )
+            # One Query for both halves. A live generation moves between two of them, and a
+            # read that asked twice would answer with rows from one moment and commitments from
+            # another, which is a table describing no generation that ever existed.
+            return await handle.query(
+                StreamWorkflow.generation_records,
+                rpc_timeout=_A_SERVING_WORKER_ANSWERS_WITHIN,
             )
         except RPCError as error:
             if error.status is RPCStatusCode.NOT_FOUND:
@@ -353,11 +384,16 @@ def _refuse_a_moved_history(workflow_id: str, before: Optional[int], after: Opti
     )
 
 
-async def _query(client: Client, workflow_id: str) -> List[AttemptRecord]:
-    """Ask one generation for its records, or say that this history does not hold it."""
+async def _query(client: Client, workflow_id: str) -> _Answer:
+    """Ask one generation for its rows and its commitments, or say this history holds neither.
+
+    One Query answers with both, so the two halves are the projection as it stood in one handler
+    call. Asking twice would be asking a generation that can commit a presentation in between,
+    and the pair would describe a run that was never in either state.
+    """
     handle = client.get_workflow_handle_for(StreamWorkflow.run, workflow_id)
     try:
-        return list(await handle.query(StreamWorkflow.attempt_records))
+        return await handle.query(StreamWorkflow.generation_records)
     except RPCError as error:
         if error.status is not RPCStatusCode.NOT_FOUND:
             raise

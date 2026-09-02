@@ -777,6 +777,59 @@ class AttemptRecord:
 
 
 @dataclass(frozen=True)
+class PresentedMessage:
+    """One message this generation committed to deliver, in the order it committed them.
+
+    A row here is a commitment and not a handoff. What the generation verified is that the
+    digest a transport claimed matched the bytes it was holding out, and what it then did is
+    accept that claim and advance its cursor past the message. All of that happens before the
+    transport has a result to hand anybody: an acknowledgement that never gets back to the call
+    that asked for it leaves a message this generation has counted and no bytes anywhere, and a
+    generation whose owner is replaced while such a result is owed never hands those bytes over
+    at all.
+
+    So the reconciliation is what establishes both of the things this cannot. Whether the bytes
+    reached the transport, and whether a model then read them, are facts about the harness, and
+    the harness's own transcript is where a claim about either has to be checked against these
+    rows. A reader holding these rows alone holds an account of what was committed.
+
+    An attempt's record says which of its three messages were committed, and that is the fact an
+    analysis counts. This says which bytes each of them was, and it says it for every kind rather
+    than for those three: a Wait, a SealReject and the Done that ends the generation are
+    committed under the same attestation, and a harness reconciling its own transcript against
+    what was committed would report a run as whole while its own record was missing one.
+
+    ``visible_bytes_sha256`` is the digest the presentation was verified against. It is the whole
+    of what a reconciliation needs and less than the bytes themselves: it does not say what the
+    bytes were, and whoever compares already holds what the harness wrote down, so what is being
+    asked is only whether the two are the same.
+    """
+
+    order: int
+    kind: str
+    message_id: str
+    attempt_id: Optional[str]
+    visible_bytes_sha256: str
+    protocol_version: int = PROTOCOL_VERSION
+
+
+@dataclass(frozen=True)
+class GenerationRecords:
+    """One generation's attempts and its commitments, read out of the same moment.
+
+    The two are answered together because a generation that is still serving moves between two
+    questions. Asked separately, a payload can be owed in the first answer and committed in the
+    second, and the pair describes a generation that never existed in either state. Asked here,
+    both halves are read off the one projection, so a row and the commitments beside it are the
+    same run at the same point.
+    """
+
+    attempts: List[AttemptRecord]
+    presentations: List[PresentedMessage]
+    protocol_version: int = PROTOCOL_VERSION
+
+
+@dataclass(frozen=True)
 class StreamOutcome:
     """What a finished generation returns: counts, not content.
 

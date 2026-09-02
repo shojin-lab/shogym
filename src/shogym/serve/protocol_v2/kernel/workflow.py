@@ -102,12 +102,14 @@ with workflow.unsafe.imports_passed_through():
         FinalizeRequest,
         finalize_request_identity,
         GeneratePayloadBundleInput,
+        GenerationRecords,
         GradeAttemptInput,
         GradeAttemptResult,
         OfferedMessage,
         OwnershipClaim,
         OwnershipReceipt,
         PayloadCandidate,
+        PresentedMessage,
         QueueClosed,
         SealAttemptInput,
         SealRequest,
@@ -423,9 +425,11 @@ class StreamWorkflow:
         self._finalize_requests: Dict[str, _BoundFinalization] = {}
         self._attestations: Dict[str, PresentationAck] = {}
         self._attestation_identities: Dict[str, str] = {}
-        # Every presented message, in order, with the kind it was. The kind is what keeps
-        # payload delivery a count of its own rather than a share of the presentations.
-        self._presented: Dict[str, str] = {}
+        # Every presented message, in order, with the kind it was and the digest of the bytes
+        # it went as. The kind is what keeps payload delivery a count of its own rather than a
+        # share of the presentations, and the digest is what a harness reconciling its own
+        # transcript against these deliveries compares what it wrote down with.
+        self._presented: Dict[str, PresentedMessage] = {}
         # Every object a committed presentation referenced, once each. A reference verified when
         # its event committed is a fact about that moment, and this is what makes it a question
         # a resume can ask again.
@@ -957,7 +961,7 @@ class StreamWorkflow:
             offer_count=len(self._offers),
             presentation_count=len(self._presented),
             payload_delivery_count=sum(
-                1 for kind in self._presented.values() if kind == PAYLOAD
+                1 for message in self._presented.values() if message.kind == PAYLOAD
             ),
             wait_count=self._wait_count,
             wait_reasons=self._wait_reason_counts(),
@@ -998,6 +1002,47 @@ class StreamWorkflow:
             key=lambda attempt: (attempt.item.task_position, attempt.item.attempt_id),
         )
         return [self._record(attempt) for attempt in ordered]
+
+    @workflow.query
+    def presented_messages(self) -> List[PresentedMessage]:
+        """Report every message this generation committed to deliver, in commitment order.
+
+        The attempt records answer what an attempt was and what it scored. This answers which
+        bytes were committed to get there, which is the other half of the one question a harness
+        asks after an episode: are the bytes in its own transcript the bytes this generation
+        stands behind. Kinds the records have no column for are here for that reason, because a
+        Wait, a SealReject and the Done are committed the same way, and a reconciliation blind to
+        them would pass a run that lost one.
+
+        Commitment is the whole of what this answers. It is accepted before the transport has a
+        result to hand anybody, so a message counted here can be one whose bytes never left: an
+        acknowledgement lost on the way back to the call that asked leaves exactly that. Whether
+        the bytes reached the transport, and whether a model then read them, are the harness's
+        facts, and its transcript is what a claim about either is reconciled against.
+
+        Order is the order they were committed in, so the comparison is of two sequences rather
+        than of two sets: a message that turned up somewhere else in the harness's own record is
+        not the message that was committed at that point.
+        """
+        return list(self._presented.values())
+
+    @workflow.query
+    def generation_records(self) -> GenerationRecords:
+        """Report the attempts and the commitments, both read out of this one call.
+
+        A Query is answered against the projection as it stands when the handler runs, so two
+        Queries are two moments. A generation that is still serving can commit a presentation
+        between them, and a caller that asked for the rows and then for the commitments gets a
+        payload that one half says is owed and the other says was committed. Neither answer is
+        wrong and the pair describes no generation at all.
+
+        So a reader that wants both asks for both here. The separate queries stay, because a
+        caller that wants one half is not made wrong by the other being available, and a
+        generation nobody is serving cannot move between two questions anyway.
+        """
+        return GenerationRecords(
+            attempts=self.attempt_records(), presentations=self.presented_messages()
+        )
 
     def _record(self, attempt: _Attempt) -> AttemptRecord:
         """Return one attempt's record, read out of the attempt and the presentations.
@@ -1774,7 +1819,13 @@ class StreamWorkflow:
         if commit.stream_state_before_sha256 != self._projection_hash():
             raise StreamProtocolError("invalid_message")
         self._apply_presentation(pending.message.kind, pending.message.attempt_id, commit)
-        self._presented[commit.message_id] = pending.message.kind
+        self._presented[commit.message_id] = PresentedMessage(
+            order=len(self._presented),
+            kind=pending.message.kind,
+            message_id=commit.message_id,
+            attempt_id=pending.message.attempt_id,
+            visible_bytes_sha256=commit.visible_bytes_sha256,
+        )
         for reference in _references(commit):
             if reference not in self._committed_blobs:
                 self._committed_blobs.append(reference)
