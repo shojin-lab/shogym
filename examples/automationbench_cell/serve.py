@@ -1,10 +1,15 @@
-"""Serve one generation over a roster of AutomationBench tasks to Claude Code over stdio MCP.
+"""Serve one generation over a roster of AutomationBench tasks to Claude Code.
 
 This is the quickstart's endpoint with one thing changed: the queue is a roster rather than a
-single task. Claude Code spawns this file as an MCP server, ``pull`` hands out one task at a
-time, every env tool is wrapped so each call names the attempt it belongs to, and the terminal
-is intercepted and sealed by the stream. What the agent sees is what the quickstart's agent
-sees, and it is not told which task it played or how many are left.
+single task. ``pull`` hands out one task at a time, every env tool is wrapped so each call names
+the attempt it belongs to, and the terminal is intercepted and sealed by the stream. What the
+agent sees is what the quickstart's agent sees, and it is not told which task it played or how
+many are left.
+
+It speaks either transport. Told a port it publishes over streamable HTTP, which is how the cell
+runs it: this process, the benchmark source and every grade the run commits are then in a
+container the agent has no mount of, and the endpoint is the only way across. Told none it speaks
+stdio as a child of whatever spawned it, which is what a run on one host wants.
 
 One launch is one generation over the whole roster, because that is what a cell is: one agent
 session working a list of tasks in order. Each task is worked in a world of its own, opened when
@@ -28,7 +33,7 @@ import secrets
 import sys
 from hashlib import sha256
 from pathlib import Path
-from typing import Dict, List, Optional
+from typing import Dict, List, Mapping, Optional, Tuple
 
 import shogym
 from shogym.serve.episode import ServedEpisode
@@ -294,14 +299,26 @@ def refusal_sink(run_dir: Path) -> RefusalSink:
 
 
 async def serve(
-    positions: List[int], *, domain: str, schedule: str, run_dir: Path, claim_hash: str
+    positions: List[int],
+    *,
+    domain: str,
+    schedule: str,
+    run_dir: Path,
+    claim_hash: str,
+    bind: Optional[Tuple[str, int]] = None,
 ) -> None:
-    """Serve the roster over stdio until the stream says it is done.
+    """Serve the roster until the stream says it is done.
 
     The service, the Worker and the stream all belong to this process, exactly as they do for
     the one-task quickstart. What is added is the opener: every attempt after the first gets a
     world of its own, and the position it belongs to is the one the roster assigned that attempt
     before anything was served.
+
+    ``bind`` is what decides which side of the boundary this process is on. Without it the server
+    speaks stdio and is a child of whatever spawned it, which is the quickstart's shape. With it
+    the same generation and the same tools are published over streamable HTTP, which is what lets
+    the process, the benchmark source and every grade this run commits sit in a container the
+    agent has no mount of and reach it only through the endpoint.
 
     Each of those worlds is opened without an ending of its own, because the stream is what ends
     an attempt here. The step budget is still the task's, and what running it out comes to is
@@ -366,8 +383,13 @@ async def serve(
                 # a different fact from a server that never started, and only the first of those
                 # has a count to show for itself.
                 counted(gateway.refusals)
+                server = build_gateway_server(gateway)
                 try:
-                    await build_gateway_server(gateway).run_async(transport="stdio")
+                    if bind is None:
+                        await server.run_async(transport="stdio")
+                    else:
+                        host, port = bind
+                        await server.run_async(transport="http", host=host, port=port)
                 finally:
                     # A server that reaches here says so once more. Everything the count needed
                     # to survive was already written by the calls that made it.
@@ -379,14 +401,23 @@ async def serve(
             await first.close()
 
 
+def binding(environment: Mapping[str, str]) -> Optional[Tuple[str, int]]:
+    """Where this server publishes, or nothing when it is a stdio child of whoever spawned it."""
+    port = environment.get("SHOGYM_CELL_PORT")
+    return (environment.get("SHOGYM_CELL_HOST") or "127.0.0.1", int(port)) if port else None
+
+
 async def main() -> None:
     positions = roster(os.environ.get("SHOGYM_CELL_TASKS") or "0")
     domain = os.environ.get("SHOGYM_CELL_DOMAIN") or "public"
     schedule = os.environ.get("SHOGYM_CELL_SCHEDULE") or "immediate"
     run_dir = Path(os.environ["SHOGYM_CELL_RUN_DIR"]).expanduser()
-    # stdout is the MCP wire, so everything this process says goes to stderr.
+    bind = binding(os.environ)
+    # Under stdio this process's stdout is the MCP wire, so everything it says goes to stderr.
+    where = "stdio" if bind is None else f"http://{bind[0]}:{bind[1]}/mcp/"
     print(
-        f"[shogym] serving {ENV}/{domain} tasks {positions} under {schedule} -> {run_dir}",
+        f"[shogym] serving {ENV}/{domain} tasks {positions} under {schedule} on {where} "
+        f"-> {run_dir}",
         file=sys.stderr,
     )
     await serve(
@@ -394,6 +425,7 @@ async def main() -> None:
         domain=domain,
         schedule=schedule,
         run_dir=run_dir,
+        bind=bind,
         # The claim secret is minted here and never leaves this process, exactly as the one the
         # quickstart's gateway mints for itself: it is what binds this transport as the
         # generation's one consumer, and a composition made here has to carry its own.
