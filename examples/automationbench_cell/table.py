@@ -37,7 +37,9 @@ from pathlib import Path
 from typing import Dict, FrozenSet, List, Optional, Tuple
 
 from examples.automationbench_cell.serve import REFUSAL_FILE, ROSTER_FILE, SERVER
+from shogym.serve.protocol_v2.errors import WireFormatError
 from shogym.serve.protocol_v2.kernel.messages import AttemptRecord, PresentedMessage
+from shogym.serve.protocol_v2.records import Task
 
 #: The prefix Claude Code namespaces this server's tools under. It is the server key in
 #: ``.mcp.json``, so a call to the env's own tools is one whose name starts with this and a call
@@ -85,10 +87,17 @@ class Handed:
 
 @dataclass(frozen=True)
 class Transcript:
-    """What the agent's own transcript holds: its calls, and the messages it was handed."""
+    """What the agent's own transcript holds: its calls, and the messages it was handed.
+
+    ``pulls`` and ``tasks`` are two facts rather than one. A pull is a call the model wrote, and
+    writing one is not receiving work: the request can be refused, redirected or answered with an
+    error, and the call stands in the transcript either way. So the tasks a run actually served
+    are counted off the results those calls came back with.
+    """
 
     per_attempt: Dict[str, int]
     pulls: int
+    tasks: int
     unserved: int
     handed: Tuple[Handed, ...]
     refusals: Tuple[str, ...]
@@ -140,6 +149,12 @@ def read_transcript(transcript: Path) -> Transcript:
     call of its own and read one back out of a file, and neither is the protocol handing it
     anything: what the cell delivered is what came back from the cell.
 
+    A pull is counted where the model wrote it and a task is counted where one came back, by that
+    same identifier, and it is a task only if it is not an error and decodes as a Task: a pull the
+    transport refused, redirected or answered with a protocol error is a call that received no
+    work, and a run whose every pull ended that way served nothing however many of them the model
+    wrote.
+
     The bytes are kept as a digest of each text item rather than as the item, because a run over
     a whole roster hands the model more text than a read of it needs to hold, and the whole of
     what the comparison asks is whether two byte strings are the same one.
@@ -147,67 +162,97 @@ def read_transcript(transcript: Path) -> Transcript:
     An error result is a refusal or a fault rather than a message, so it is read for the refusal
     code it carries. That code is the only record of a refusal there is: it advances no protocol
     state, so nothing in the generation counts it, and this transcript is where the model saw it.
+
+    It is read a line at a time rather than all at once. A session that worked a whole roster with
+    partial messages on writes a transcript far larger than the run it describes, and every launch
+    reads this at the end to find out whether the agent ever asked for work.
     """
     per_attempt: Dict[str, int] = {}
     pulls = 0
+    tasks = 0
     unserved = 0
     served: Dict[str, str] = {}
+    asked: set = set()
     handed: List[Handed] = []
     refusals: List[str] = []
-    for line in Path(transcript).read_text(encoding="utf-8", errors="replace").splitlines():
-        line = line.strip()
-        if not line.startswith("{"):
-            continue
-        try:
-            event = json.loads(line)
-        except json.JSONDecodeError:
-            continue
-        if not isinstance(event, dict):
-            continue
-        message = event.get("message")
-        content = message.get("content") if isinstance(message, dict) else None
-        for block in content if isinstance(content, list) else []:
-            if not isinstance(block, dict):
+    with Path(transcript).open(encoding="utf-8", errors="replace") as stream:
+        for raw in stream:
+            line = raw.strip()
+            if not line.startswith("{"):
                 continue
-            if event.get("type") == "user" and block.get("type") == "tool_result":
-                call = block.get("tool_use_id")
-                if not isinstance(call, str) or call not in served:
+            try:
+                event = json.loads(line)
+            except json.JSONDecodeError:
+                continue
+            if not isinstance(event, dict):
+                continue
+            message = event.get("message")
+            content = message.get("content") if isinstance(message, dict) else None
+            for block in content if isinstance(content, list) else []:
+                if not isinstance(block, dict):
                     continue
-                texts = _result_texts(block.get("content"))
-                if block.get("is_error"):
-                    refusals.extend(_refusal_codes(texts))
-                    continue
-                handed.extend(
-                    Handed(
-                        digest=sha256(text.encode("utf-8")).hexdigest(),
-                        ids=frozenset(_MESSAGE_ID.findall(text)),
+                if event.get("type") == "user" and block.get("type") == "tool_result":
+                    call = block.get("tool_use_id")
+                    if not isinstance(call, str) or call not in served:
+                        continue
+                    texts = _result_texts(block.get("content"))
+                    if block.get("is_error"):
+                        asked.discard(call)
+                        refusals.extend(_refusal_codes(texts))
+                        continue
+                    if call in asked:
+                        asked.discard(call)
+                        if any(_is_task(text) for text in texts):
+                            tasks += 1
+                    handed.extend(
+                        Handed(
+                            digest=sha256(text.encode("utf-8")).hexdigest(),
+                            ids=frozenset(_MESSAGE_ID.findall(text)),
+                        )
+                        for text in texts
                     )
-                    for text in texts
-                )
-                continue
-            if event.get("type") != "assistant" or block.get("type") != "tool_use":
-                continue
-            name = str(block.get("name", ""))
-            if not name.startswith(SERVED_PREFIX):
-                unserved += 1
-                continue
-            call = block.get("id")
-            if isinstance(call, str):
-                served[call] = name
-            if name == PULL_TOOL:
-                pulls += 1
-                continue
-            arguments = block.get("input")
-            attempt = arguments.get("attempt_id") if isinstance(arguments, dict) else None
-            if isinstance(attempt, str):
-                per_attempt[attempt] = per_attempt.get(attempt, 0) + 1
+                    continue
+                if event.get("type") != "assistant" or block.get("type") != "tool_use":
+                    continue
+                name = str(block.get("name", ""))
+                if not name.startswith(SERVED_PREFIX):
+                    unserved += 1
+                    continue
+                call = block.get("id")
+                if isinstance(call, str):
+                    served[call] = name
+                if name == PULL_TOOL:
+                    pulls += 1
+                    if isinstance(call, str):
+                        asked.add(call)
+                    continue
+                arguments = block.get("input")
+                attempt = arguments.get("attempt_id") if isinstance(arguments, dict) else None
+                if isinstance(attempt, str):
+                    per_attempt[attempt] = per_attempt.get(attempt, 0) + 1
     return Transcript(
         per_attempt=per_attempt,
         pulls=pulls,
+        tasks=tasks,
         unserved=unserved,
         handed=tuple(handed),
         refusals=tuple(refusals),
     )
+
+
+def _is_task(text: str) -> bool:
+    """Whether a result's text is the canonical bytes of a Task rather than something like one.
+
+    The protocol's own decoder answers this, so a work order is what the wire calls a work order:
+    the exact field set, each field's own shape, and the kind fixed on it. A refusal, a redirect's
+    body, a truncated result or any other record the agent was handed instead is not a task, and a
+    ``pull`` answered with one of those is a pull that served no work.
+    """
+    try:
+        Task.from_wire(json.loads(text))
+    except (json.JSONDecodeError, WireFormatError):
+        return False
+    return True
 
 
 def read_refusals(run_dir: Path) -> Counted:
