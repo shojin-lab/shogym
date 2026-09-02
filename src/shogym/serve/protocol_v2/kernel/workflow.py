@@ -51,6 +51,7 @@ with workflow.unsafe.imports_passed_through():
         PROTOCOL_VERSION,
         RELEASE_AT_SEAL,
         SCHEDULE_VERSION,
+        TERMINAL_SOURCES,
         Assignment,
         BlobRef,
         Done,
@@ -253,6 +254,7 @@ class _Attempt:
     terminal_request_id: Optional[str] = None
     terminal_identity: Optional[str] = None
     terminal_tool: Optional[str] = None
+    terminal_source: Optional[str] = None
     seal_id: Optional[str] = None
     submission_digest: Optional[str] = None
     canonical_submission_text: Optional[str] = None
@@ -1040,6 +1042,7 @@ class StreamWorkflow:
             payload_position=item.payload_position,
             state=attempt.state,
             terminal_tool=attempt.terminal_tool,
+            terminal_source=attempt.terminal_source,
             canonicalization_version=self._start.canonicalization_version,
             submission_digest=attempt.submission_digest,
             score=attempt.score,
@@ -1230,12 +1233,15 @@ class StreamWorkflow:
 
     async def _seal(self, request: SealRequest, writer: Writer) -> OfferedMessage:
         metadata = request.metadata
+        if request.terminal_source not in TERMINAL_SOURCES:
+            raise StreamProtocolError("invalid_message")
         try:
             identity = terminal_request_identity(
                 metadata,
                 request.public_tool_name,
                 request.native_terminal_name,
                 request.native_arguments,
+                request.terminal_source,
             )
         except WireFormatError as error:
             # Arguments with no canonical encoding have no identity either, so there is
@@ -1345,6 +1351,10 @@ class StreamWorkflow:
         # another was refused above, so this is kept as the fact rather than derived later from a
         # configuration that a generation with two terminals would no longer answer for.
         attempt.terminal_tool = request.native_terminal_name
+        # And who filed it. The seal is the same transaction either way, so this is written here
+        # with the rest of what the filing fixed rather than being derived afterwards from a
+        # budget the stream counted and an ending nothing recorded.
+        attempt.terminal_source = request.terminal_source
         attempt.seal_id = hidden_seal_id(
             self._start.hidden_execution_id,
             self._start.execution_ordinal,

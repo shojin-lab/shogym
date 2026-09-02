@@ -224,6 +224,20 @@ class AutomationBenchEnv(Env):
 
         return AUTOMATIONBENCH_GRADE
 
+    def protocol_v2_horizon_ending(self) -> str:
+        """What spending the step budget does to an attempt over this env.
+
+        It grades. The budget is the task's own rule rather than a guard on a run: the prompts
+        advertise it, the workflow is meant to be finished inside it, and a run that reaches the
+        end of it has done as much of the workflow as it is going to. Scoring is end-state only,
+        so the world at that moment is a filing like any other, and the same finalizer reads it
+        that an explicit ``done`` would. Ending such an attempt at the floor instead would report
+        nothing for every assertion it satisfied on the way.
+        """
+        from shogym.serve.protocol_v2 import GRADED_HORIZON
+
+        return GRADED_HORIZON
+
     def protocol_v2_terminal(self, route: Any):
         """The version this env declares, how to seal and grade one attempt, and what it is.
 

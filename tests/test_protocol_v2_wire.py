@@ -20,6 +20,7 @@ from typing import Any, Dict, Tuple, Type
 import pytest
 
 from shogym.serve.protocol_v2 import (
+    HORIZON_FILED,
     PROTOCOL_ERROR_CODES,
     Done,
     Payload,
@@ -503,7 +504,7 @@ def test_the_pull_request_identity_is_pinned() -> None:
 def test_the_terminal_request_identity_is_pinned() -> None:
     assert (
         terminal_request_identity(TERMINAL_METADATA, "submit", TERMINAL_TOOL, NATIVE_ARGUMENTS)
-        == "4d956d1eb6f9fe3a27a37e9c25b7e0e2e89f806c3be8308e524ba66cd8a1c689"
+        == "e8fc63641bdf1089ed8d407edbbd80a995241119a0e91ec3d134aed5b54445ce"
     )
 
 
@@ -523,9 +524,12 @@ def test_an_identity_moves_when_any_of_its_inputs_moves() -> None:
         terminal_request_identity(
             TERMINAL_METADATA, "submit", TERMINAL_TOOL, {**NATIVE_ARGUMENTS, "answer": "43"}
         ),
+        terminal_request_identity(
+            TERMINAL_METADATA, "submit", TERMINAL_TOOL, NATIVE_ARGUMENTS, HORIZON_FILED
+        ),
     )
     assert base not in moved
-    assert len(set(moved)) == 4
+    assert len(set(moved)) == 5
     assert pull_request_identity(PULL_REQUEST) != presentation_request_identity(PRESENTATION_COMMIT)
 
 

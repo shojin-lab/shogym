@@ -16,6 +16,7 @@ from typing import Any, Mapping
 from shogym.serve.protocol_v2 import jcs
 from shogym.serve.protocol_v2.errors import WireFormatError
 from shogym.serve.protocol_v2.records import (
+    AGENT_FILED,
     PresentationCommit,
     PullRequest,
     TerminalMetadata,
@@ -59,11 +60,14 @@ def terminal_request_identity(
     public_tool_name: str,
     native_terminal_name: str,
     native_arguments: Mapping[str, Any],
+    terminal_source: str = AGENT_FILED,
 ) -> str:
     """Return the canonical identity of a terminal request.
 
     Both tool names are covered, so the same arguments filed through a different tool are a
-    different request rather than a replay of the first.
+    different request rather than a replay of the first. Who filed is covered for the same
+    reason: an agent's own call and one made on its behalf at the horizon are two different
+    endings, and the same ID carrying the other one is a conflict rather than a retry.
     """
     return sha256(
         length_prefixed(b"terminal-request-v2")
@@ -71,6 +75,7 @@ def terminal_request_identity(
         + length_prefixed(_utf8("public_tool_name", public_tool_name))
         + length_prefixed(_utf8("native_terminal_name", native_terminal_name))
         + length_prefixed(jcs.encode(native_arguments))
+        + length_prefixed(_utf8("terminal_source", terminal_source))
     ).hexdigest()
 
 

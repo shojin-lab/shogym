@@ -30,8 +30,14 @@ from shogym.serve.protocol_v2.identity import (
 )
 from shogym.serve.protocol_v2.jcs import encode as canonical_json
 from shogym.serve.protocol_v2.records import (
+    AGENT_FILED,
+    FLOOR_HORIZON,
+    GRADED_HORIZON,
+    HORIZON_ENDINGS,
+    HORIZON_FILED,
     PROTOCOL_ERROR_CODES,
     PROTOCOL_VERSION,
+    TERMINAL_SOURCES,
     Done,
     Payload,
     PresentationAck,
@@ -76,9 +82,14 @@ from shogym.serve.protocol_v2.schedule import (
 )
 
 __all__ = [
+    "AGENT_FILED",
     "BLOB_DIRECTORY",
     "BY_ATTEMPT_ID",
     "BY_POSITION",
+    "FLOOR_HORIZON",
+    "GRADED_HORIZON",
+    "HORIZON_ENDINGS",
+    "HORIZON_FILED",
     "IMMEDIATE",
     "NEVER",
     "PAYLOAD_FIRST",
@@ -89,6 +100,7 @@ __all__ = [
     "RELEASE_NEVER",
     "SCHEDULE_VERSION",
     "TASK_FIRST",
+    "TERMINAL_SOURCES",
     "Assignment",
     "BlobRef",
     "BlobStore",

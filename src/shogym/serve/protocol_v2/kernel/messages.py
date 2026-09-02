@@ -27,6 +27,7 @@ from hashlib import sha256
 from typing import Any, Dict, List, Optional, Sequence
 
 from shogym.serve.protocol_v2 import (
+    AGENT_FILED,
     IMMEDIATE,
     PROTOCOL_VERSION,
     SCHEDULE_VERSION,
@@ -485,12 +486,20 @@ class OfferedMessage:
 
 @dataclass(frozen=True)
 class SealRequest:
-    """A terminal call, as the harness saw it, with the metadata only the harness can set."""
+    """A terminal call, as the harness saw it, with the metadata only the harness can set.
+
+    ``terminal_source`` is who made it. The stream does not care which of the two filed: the
+    seal, the grade and the acknowledgement are the same either way. What it does is write the
+    answer down, because a reader counting how a generation's attempts ended is asking a
+    question the score cannot answer, and an ending the agent chose and one its own step budget
+    forced on it are two different things to count.
+    """
 
     metadata: TerminalMetadata
     public_tool_name: str
     native_terminal_name: str
     native_arguments: Dict[str, Any] = field(default_factory=dict)
+    terminal_source: str = AGENT_FILED
 
 
 @dataclass(frozen=True)
@@ -714,6 +723,12 @@ class AttemptRecord:
     yet acted on, which is what a row carries while the attempt is still holding a call to a
     world nothing here can see.
 
+    ``terminal_source`` is who filed, for the attempts that were filed at all. A generation over
+    an environment whose horizon is a graded ending seals an attempt that spent its budget
+    without waiting for the agent to file, so a sealed row is no longer proof the agent chose to
+    end there. The two are separated here rather than left to be guessed from a step count, and
+    an attempt nobody filed carries neither.
+
     ``creates_payload_obligation`` is the roster's own column, and ``payload_state`` is what
     became of the obligation it promised. Without them ``payload_delivered`` being false says
     two different things at once: a row this generation owed a payload and never delivered, and
@@ -738,6 +753,7 @@ class AttemptRecord:
     payload_position: int
     state: str
     terminal_tool: Optional[str]
+    terminal_source: Optional[str]
     canonicalization_version: str
     submission_digest: Optional[str]
     score: Optional[float]

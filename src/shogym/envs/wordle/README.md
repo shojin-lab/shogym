@@ -163,6 +163,13 @@ write-once store on the machine that sealed them, and the grade scores those wor
 task's target: one if the word was found within the allowed guesses and zero if it was not, with
 `guesses_used` (0 to 6) published beside the score.
 
+The six-guess budget is an ending under that stream too, and this env says so: it declares its
+horizon a **graded ending**, which is what a v1 episode does with it. The sixth guess is
+dispatched and answered, the server then files `terminate` for the attempt, and the board those
+six guesses built is sealed and graded. The acknowledgement comes back in that guess's own
+result and the score reaches the agent as the next payload; the record says the horizon filed
+rather than the agent.
+
 ## Fidelity & deviations
 
 `wordle_v1` is shogym's own reference environment, not a port of an external benchmark — there

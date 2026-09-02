@@ -92,6 +92,7 @@ _COLUMNS = (
     "seal",
     "score",
     "ending",
+    "filed",
     "decode",
     "delivered",
     "policy",
@@ -248,9 +249,11 @@ def format_records(records: List[AttemptRecord]) -> str:
 
     The score column is the one a reader came for, so an unsealed attempt reads as a dash and
     never as a zero. The ending is printed beside it, because an attempt that ended without a
-    filing scores the floor and the number on its own does not say that is what it is. The
-    identifiers are printed whole: they are what a row is joined on, and a shortened one is a
-    row somebody has to go back to the file for.
+    filing scores the floor and the number on its own does not say that is what it is. And who
+    filed is printed beside that, because a generation over an environment whose horizon is a
+    graded ending files for an attempt that ran out of world work, so a sealed row no longer
+    says the agent chose to stop there. The identifiers are printed whole: they are what a row
+    is joined on, and a shortened one is a row somebody has to go back to the file for.
 
     The policy column says what the agent was allowed to be told about that score. A run
     recorded before a generation carried one reads as the legacy placeholder, which is what its
@@ -387,6 +390,7 @@ def _cells(record: AttemptRecord) -> Tuple[str, ...]:
         _optional(record.seal_ordinal),
         "-" if record.score is None else f"{record.score:.3f}",
         _optional(record.final_failure),
+        _optional(record.terminal_source),
         _optional(record.decode_state),
         " ".join(delivered) or "-",
         _optional(record.payload_policy),
