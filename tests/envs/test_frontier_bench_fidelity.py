@@ -139,11 +139,38 @@ def test_describe_returns_instruction_with_provenance() -> None:
     # The real upstream instruction (with its canary HTML comment) is published verbatim.
     assert manifest.CANARY_GUID in spec.instructions
     assert "SA-CCR" in spec.instructions
+    # This task's own instruction.md carries its input paths; the template no longer does.
     assert "/app/inputs/" in spec.instructions
-    # Provenance footer.
+    # Provenance footer: the commit a reader can fetch leads, the recorded label follows it.
     assert "terminal-bench/fin-saccr-rwa" in spec.instructions
-    assert "v0.1.0" in spec.instructions
+    digest = manifest.load_task("fin-saccr-rwa").digest
+    assert f"- pinned: frontier-bench eb4af26c (v0.1.0) · {digest}" in spec.instructions
     assert spec.horizon == env.horizon
+
+
+def test_served_system_template_leaves_input_paths_to_each_instruction() -> None:
+    # Only fin-saccr-rwa keeps its inputs under /app/inputs/; the other four vendored tasks use
+    # another layout, so the template every task carries names no input directory at all and each
+    # task's own instruction.md is the single place the paths come from.
+    spec = shogym.make("frontier_bench").describe("0")
+    system = [t.template for t in spec.reference_templates if t.role == "system"]
+    assert len(system) == 1
+    template = system[0]
+    assert "/app/inputs" not in template
+    # The rest of the framing survives: read the instruction first, write outputs under /app.
+    assert "Call `describe` first to read the full task instruction" in template
+    assert "write outputs under `/app` as the instruction directs" in template
+
+
+def test_served_exec_tool_description_names_no_input_directory() -> None:
+    # The `exec` tool description rides in the same TaskSpec as the template and carried the same
+    # claim, so it points at the task's own instruction too. Listing tool schemas builds no
+    # container, so this needs no Docker daemon.
+    spec = shogym.make("frontier_bench").describe("0")
+    described = {t.name: (t.description or "") for t in spec.tools}
+    assert "/app/inputs" not in described["exec"]
+    assert "names where its inputs live" in described["exec"]
+    assert "write outputs under ``/app``" in described["exec"]
 
 
 @pytest.mark.parametrize("name", VENDORED)
