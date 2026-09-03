@@ -9,6 +9,38 @@ direction.
 
 ## Unreleased
 
+### `serve`: the version one serving contract is retired, and protocol v2 is the only path
+
+`shogym.serve.stream` is gone, and with it `TaskStream`, `EvalStream`, `TaskRef`,
+`build_stream_server`, the `get_task` and `queue_info` tools, feedback riding a terminal
+response, and the feedback policies `Never`, `Immediate`, `Information` and `Placebo`. Every
+consumer of any of those has to move. **This removes a public API.**
+
+`shogym serve` now serves one env at one task as a durable protocol v2 stream, and the
+`--protocol` flag is gone because there is nothing left to select. The model asks for its work
+with `pull`, which takes no arguments and answers with exactly one JSON record (`task`,
+`payload`, `wait` or `done`); every environment tool is wrapped as
+`{"attempt_id": ..., "arguments": {...}}`; and the env's terminal call is intercepted into one
+seal transaction that answers with `seal_ack`. Serving needs the `durable` extra now.
+`import shogym` still needs nothing, and `shogym.evaluate` in process is unchanged.
+
+Three things the retired path did are not in the protocol that replaced it. It served a queue of
+tasks over one endpoint, and a v2 generation serves one episode. It reported a score offline, and
+v2 keeps the score in the stream's own history where no reader reaches it. It served two matched
+feedback arms, and the payload families that would replace them belong to the experiment layer
+rather than to this package.
+
+Run directories the retired path wrote stay readable. `shogym.serve.v1_runs` reads them, with the
+same `read_dispenses`, `read_results` and `reconcile` and the same row shape, and it does nothing
+else: there is no writer, and a protocol v2 resume refuses such a directory before it claims
+anything.
+
+`ServedEpisode` gains `ends_on_horizon`. It defaults to True, which is what a caller driving an
+episode directly has always had: spending the env's step budget seals the episode and grades it.
+A caller that ends the episode itself passes False, and the durable stream does, because an
+episode that sealed and graded itself when a budget ran out would end an attempt the stream still
+held open and record nothing about it where the stream could read it.
+
 ### `appworld`: withdrawn
 
 The `appworld` environment is gone, and with it the port, the loopback worker each world ran in,

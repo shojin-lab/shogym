@@ -1,15 +1,15 @@
-"""Wrap a :class:`ServedEpisode` in a FastMCP server (RFC 008 §5, §6).
+"""Wrap a :class:`ServedEpisode` in a FastMCP server.
 
 The env's essential tools (from its ``TaskSpec``) become FastMCP tools whose bodies run one
 served step; the task contract is published as the ``shogym://task`` resource and a
-``describe`` tool. Feedback rides each tool result's ``_meta``. ``run_stdio`` is what
-``shogym serve`` executes and what an external harness spawns as its MCP server.
+``describe`` tool. Feedback rides each tool result's ``_meta``. This is the in-process server
+:func:`shogym.evaluate` drives, and :func:`build_tool` is what the durable stream's gateway
+builds its own tools with.
 """
 
 from __future__ import annotations
 
-from pathlib import Path
-from typing import Any, Awaitable, Callable, Dict, Optional, Union
+from typing import Any, Awaitable, Callable, Dict, Optional
 
 from fastmcp import FastMCP
 from fastmcp.server.middleware import Middleware
@@ -143,24 +143,3 @@ def build_server(episode: ServedEpisode, *, name: Optional[str] = None) -> FastM
         return episode.describe().model_dump()
 
     return server
-
-
-async def run_stdio(
-    env_name: str,
-    *,
-    task: Optional[Union[int, str]] = None,
-    trace_path: Optional[Union[str, Path]] = None,
-) -> None:
-    """Start an episode and serve it over stdio until the client disconnects — the body of
-    ``shogym serve``, which a harness spawns as its MCP server."""
-    # Restart recovery runs transport-independently inside ServedEpisode.start (at store
-    # construction), so `shogym serve`, `evaluate()`, and every in-process caller share it — no
-    # extra step is needed here.
-    episode = await ServedEpisode.start(env_name, task=task, trace_path=trace_path)
-    try:
-        # Inside the guard: build_server can raise (e.g. a reserved-name collision) after
-        # the episode has opened sessions + pushed state that must be released.
-        server = build_server(episode)
-        await server.run_async(transport="stdio")
-    finally:
-        await episode.close()

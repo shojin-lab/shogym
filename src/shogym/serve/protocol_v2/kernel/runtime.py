@@ -23,11 +23,12 @@ from __future__ import annotations
 
 import os
 import secrets
-from contextlib import asynccontextmanager
+import sys
+from contextlib import asynccontextmanager, contextmanager
 from dataclasses import dataclass
 from hashlib import sha256
 from pathlib import Path
-from typing import Any, AsyncIterator, Dict, Optional, Sequence, Union
+from typing import Any, AsyncIterator, Dict, Iterator, Optional, Sequence, Union
 
 from temporalio.client import Client, WorkflowHandle, WorkflowUpdateFailedError
 from temporalio.exceptions import ApplicationError
@@ -75,6 +76,34 @@ def temporal_home() -> Path:
     return root / "temporal"
 
 
+@contextmanager
+def _service_output_off_the_wire() -> Iterator[None]:
+    """Point this process's descriptor 1 at its standard error while the service is spawned.
+
+    The embedded service is another program, and it prints a banner naming its address and its
+    database when it starts. It inherits this process's descriptors, so on a server whose
+    standard output is the protocol wire that banner arrives in the middle of the transport's
+    framing and a strict client rejects it before the handshake.
+
+    The descriptor is swapped rather than ``sys.stdout``, because the writer never sees a Python
+    object. The child keeps whatever descriptor 1 named when it was spawned, so restoring this
+    one afterwards leaves the service talking to standard error for the rest of its life and
+    leaves this process talking to the wire.
+    """
+    sys.stdout.flush()
+    try:
+        saved = os.dup(1)
+    except OSError:  # pragma: no cover - a process with no descriptor 1 has no wire to protect
+        yield
+        return
+    try:
+        os.dup2(2, 1)
+        yield
+    finally:
+        os.dup2(saved, 1)
+        os.close(saved)
+
+
 @asynccontextmanager
 async def durable_client(*, namespace: str = "default") -> AsyncIterator[Client]:
     """Yield a client for the durable service, starting an embedded one if needed.
@@ -88,11 +117,12 @@ async def durable_client(*, namespace: str = "default") -> AsyncIterator[Client]
         return
     home = temporal_home()
     home.mkdir(parents=True, exist_ok=True)
-    environment = await WorkflowEnvironment.start_local(
-        namespace=namespace,
-        dev_server_database_filename=str(home / _DATABASE_FILE),
-        download_dest_dir=str(home),
-    )
+    with _service_output_off_the_wire():
+        environment = await WorkflowEnvironment.start_local(
+            namespace=namespace,
+            dev_server_database_filename=str(home / _DATABASE_FILE),
+            download_dest_dir=str(home),
+        )
     try:
         yield environment.client
     finally:

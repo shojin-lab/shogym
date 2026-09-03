@@ -1,4 +1,4 @@
-# Project-scoped Codex config: this is how the stream gets attached.
+# Project-scoped Codex config: this is how the server gets attached.
 #
 # Codex layers `.codex/config.toml` files found between the working directory and the repo root
 # on top of your user config, for a project you have trusted. So this file is in force exactly
@@ -15,12 +15,14 @@ args = ["run", "python", "serve.py"]
 # Pre-approve this server's tools, and note the value: `approve` grants them up front, `auto`
 # decides per tool and an unannotated tool decides to ask. `codex exec` has nobody to ask, so
 # without this every call returns "user cancelled MCP tool call" and the agent reasonably
-# concludes the stream is broken. This is the one knob to reach for when that happens.
+# concludes the server is broken. This is the one knob to reach for when that happens.
 default_tools_approval_mode = "approve"
 
-# Startup imports shogym and opens the queue. The 10s default is tight for a cold venv.
-startup_timeout_sec = 60.0
+# Startup builds the env and starts the durable service before the server answers, and an env
+# that fetches its pinned upstream source pays for that download here. The 10s default covers
+# none of it.
+startup_timeout_sec = 180.0
 
-# One tool call is one step of an episode, and the first `get_task` of an env that fetches its
-# pinned upstream source pays for that download. The 60s default does not cover it.
+# One tool call is one step of an episode, and the call that ends a task seals and grades it
+# server-side before it answers. The 60s default does not cover that.
 tool_timeout_sec = 900.0

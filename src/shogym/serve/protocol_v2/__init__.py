@@ -7,7 +7,8 @@ produces, so this is where "the same value serializes the same way" has to be tr
 part of this layer that touches a filesystem is the blob store, where an object is named by
 the hash of its own bytes and reading it is a verification.
 
-The v1 serving path in :mod:`shogym.serve.stream` is untouched and does not import this.
+This is the only serving path. The version one one is retired, and the run directories it wrote
+are read offline by :mod:`shogym.serve.v1_runs`.
 """
 
 from shogym.serve.protocol_v2.blobs import (

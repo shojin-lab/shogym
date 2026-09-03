@@ -4,9 +4,9 @@ A gym for running agents on tasks: bring any harness.
 
 An environment describes a task, serves its tools over MCP, and verifies the recorded trajectory
 with a pure function. A harness (Claude Code, Codex, Pi, Hermes, Prime Agent, or a plain loop)
-drives the tools; shōgym never owns the model, the prompt, or the agent loop. The core is
-zero-infrastructure: `pip install shogym`, point a harness at a served env, get a trace and a
-score.
+drives the tools; shōgym never owns the model, the prompt, or the agent loop. The core stays
+small: `pip install shogym` gets you the envs and an in-process episode, and serving one to a
+harness adds one extra (`pip install "shogym[durable]"`) and nothing you have to run yourself.
 
 It is a substrate for questions about agents on tasks. How do agents improve themselves? What
 does adding a tool change? Does an agent's self-report match an honest score?
@@ -21,12 +21,13 @@ the recorded trajectory.
 
 Start with a harness. [`examples/`](examples/) holds one directory per harness, each idiomatic to
 that harness rather than squeezed into a shared abstraction. Every quickstart does the same three
-things: serve a **stream** of tasks over one endpoint, swap the env with **one variable**, and
-read the scores back out of the server's own durable rows (the harness never grades itself).
+things: serve **one task** over one endpoint, swap the env with **one variable**, and leave the
+scoring to the stream, which seals and grades each attempt itself (the harness never grades
+itself).
 
 - **[`claude_code/`](examples/claude_code/README.md)**: the reference implementation. One
-  `--mcp-config` flag points the [`claude` CLI](https://claude.com/claude-code) at a queue of
-  tasks; `results.py` reads the scores back.
+  `--mcp-config` flag points the [`claude` CLI](https://claude.com/claude-code) at the served
+  task.
 - **[`pi/`](examples/pi/README.md)**: [Pi](https://github.com/earendil-works/pi) ships no MCP
   client, so this one adds a bridge extension, pinned to an exact version and scoped to the
   project's `.pi/`.
@@ -34,17 +35,18 @@ read the scores back out of the server's own durable rows (the harness never gra
   [Hermes](https://hermes-agent.nousresearch.com) speaks MCP natively (with its `[mcp]` extra),
   configured by one `config.yaml` under an isolated `HERMES_HOME`.
 - **[`codex/`](examples/codex/README.md)**: [Codex](https://github.com/openai/codex) runs
-  `codex exec` with the stream declared inline on the command line, or read from the
+  `codex exec` with the server declared inline on the command line, or read from the
   project-scoped `.codex/config.toml` checked in here.
 - **[`prime_agent/`](examples/prime_agent/README.md)**:
   [Prime Agent](https://github.com/PrimeIntellect-ai/prime-agent) takes MCP as a Python-backed
   kernel skill, and `serve.py` runs over HTTP in a second shell.
 
-Each one defaults to `automationbench` over tasks `[0, 1, 2]`. One variable swaps the env for a
-run, without editing a tracked file:
+Each one defaults to `automationbench` at task `0`, and one launch is one episode: the stream
+serves a single env at a single task, so three tasks are three launches. Two variables name the
+env and the task for one run, without editing a tracked file:
 
 ```bash
-SHOGYM_ENV=tau2_banking_knowledge SHOGYM_TASKS=0,1 <the quickstart's command>
+SHOGYM_ENV=tau2_banking_knowledge SHOGYM_TASK=1 <the quickstart's command>
 ```
 
 That one needs the `tau2` extra, tau2's data, and `OPENAI_API_KEY` for the user simulator, and it
@@ -55,7 +57,10 @@ needs no extra and no key, and is the cheapest place to start.
 
 shōgym is pinned to **Python 3.12** (`requires-python = ">=3.12,<3.13"`, with a committed
 `.python-version`) because the tau2-bench port needs it. With [uv](https://docs.astral.sh/uv/),
-`uv sync` builds the 3.12 venv and `uv run …` runs against it.
+`uv sync` builds the 3.12 venv and `uv run …` runs against it. Serving needs the `durable` extra
+on top of the core (`uv sync --extra durable`, or `pip install "shogym[durable]"`), because the
+stream's history, replay and timers are Temporal's; `uv sync` at the repo root already includes
+it, and `import shogym` never does.
 
 ## Environments
 
@@ -98,52 +103,49 @@ README covers the model and the shared env-README template.
 
 ## The task server
 
-Every quickstart is a thin wrapper around one object. A `TaskStream` publishes a whole queue over
-a single MCP endpoint: it hands out tasks one at a time through `get_task`, routes the env's own
-tools to whichever task is live, and seals and scores each one server-side.
+Every quickstart is a thin wrapper around one command. It serves one env at one task over stdio
+MCP, and the generation behind it is durable: the stream owns the queue, the attempt, the seal and
+the score, and this process is only its transport.
 
-```python
-import asyncio
-from pathlib import Path
-
-import shogym
-from shogym.serve.stream import Immediate, TaskRef, TaskStream, build_stream_server
-
-
-async def main() -> None:
-    stream = TaskStream(
-        shogym.make,  # a factory, so each task gets a fresh env
-        [TaskRef("tau2_banking_knowledge", i) for i in (0, 1, 2)],
-        # Fresh per run: a stream refuses a directory another run recorded into.
-        prov_dir=Path("runs/banking-0001"),
-        feedback=Immediate(),  # ending a task returns the env's own verdict
-    )
-    async with stream:
-        await build_stream_server(stream, name="shogym").run_async(transport="stdio")
-
-
-asyncio.run(main())
+```bash
+shogym serve wordle_v1 --task 17 --run-dir runs/wordle-0001 --trace ./shogym_logs/run.jsonl
 ```
 
-Every dispensed task lands exactly one durable row under `prov_dir`, which
-`shogym.serve.stream.read_results` reads back after the run.
+Two kinds of tool reach the model. `pull` takes no arguments and answers with exactly one JSON
+record, which is the whole of what the agent is told:
 
-For scores you intend to defend, construct `EvalStream` instead. It pins `feedback=Never()` and
-refuses the argument outright, so a terminating call answers with the same fixed payload for every
-env, task and outcome. It stamps `feedback_regime="never"` on every row it writes, and refuses to
-resume a directory whose rows were recorded under any other regime. The agent is never told how it
-did, so the harness cannot grade itself.
+```jsonc
+{"protocol_version": 2, "kind": "task",    "message_id": "...", "attempt_id": "9f3c...", "body": "..."}
+{"protocol_version": 2, "kind": "payload", "message_id": "...", "attempt_id": "9f3c...", "body": "..."}
+{"protocol_version": 2, "kind": "wait",    "message_id": "...", "retry_after_ms": 500}
+{"protocol_version": 2, "kind": "done",    "message_id": "..."}
+```
+
+Every environment tool is the second kind, wrapped so that a call names the attempt it belongs to
+and no native argument can collide with a protocol field:
+
+```jsonc
+{"attempt_id": "9f3c...", "arguments": {"word": "crane"}}
+```
+
+The env's terminal tool is wrapped the same way and then intercepted: it never reaches the env
+from the transport, it becomes the stream's terminal request, and it answers with the
+acknowledgement the stream minted (or a refusal, which leaves the attempt open to file again). So
+the loop is `pull`, work, end the task, `pull`, and stop on `done`. There is no task index
+anywhere on the wire: a task record carries an attempt id and a body, and has no field an index or
+a target could be written into.
+
+`--run-dir` is where the generation keeps the blobs its presentations reference and the manifest a
+later owner would resume it from. The score is not in there. Sealing grades server-side and the
+outcome stays in the stream's own durable history, which reports states and counts rather than
+scores; a reader that surfaces the score is not part of this protocol yet. Directories written by
+the retired v1 serving path stay readable offline, through
+`shogym.serve.v1_runs.read_results` / `read_dispenses` / `reconcile`.
 
 ## One episode, no harness
 
-The quickstarts serve a stream of tasks. A single episode is smaller: `shogym serve` publishes
-one task over MCP for any client to spawn and drive, and scores it off a local JSONL trace.
-
-```bash
-shogym serve wordle_v1 --task 17 --trace ./shogym_logs/run.jsonl
-```
-
-Or drive one in-process and read the terminal feedback:
+The quickstarts serve a task to somebody else's agent. A single episode is smaller: drive one
+in-process and read the terminal feedback, with no MCP transport and nothing durable underneath.
 
 ```python
 import shogym

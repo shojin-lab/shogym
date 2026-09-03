@@ -1,8 +1,16 @@
-An MCP server provides a stream of tasks.
-Nothing external loops for you - drive yourself:
+An MCP server hands out work one task at a time.
+Nothing external loops for you, so drive yourself:
 
-1. Calling `get_task` pulls the next task.
-   If it returns {done: true}, the stream is exhausted, stop.
-2. The task can be completed using the tools listed.
-   One of them ends the task; call it before pulling the next.
-3. Continue until the stream is exhausted.
+1. Call `pull`. It takes no arguments and answers with one JSON record.
+   `kind` says what it is:
+     "task"    work to do. It carries `attempt_id` and `body`, the instructions.
+     "payload" content delivered against the task you just ended. Read it, then pull again.
+     "wait"    nothing is ready yet. Pull again shortly.
+     "done"    nothing more is coming. Stop.
+2. Work the task with the tools you were given. Every one of them is called as
+   {"attempt_id": "<the attempt_id from the task>", "arguments": {...the tool's own arguments...}}.
+   The attempt_id is what routes the call to your task; a call without it is refused.
+3. One of those tools ends the task. Call it, in the same wrapper, when you are finished.
+   It answers "seal_ack" once the filing is accepted, or "seal_reject" if the arguments
+   were malformed, which leaves the task open for you to correct and file again.
+4. Go back to step 1. Stop when a record's `kind` is "done".

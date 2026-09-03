@@ -8,7 +8,7 @@
 #     export HERMES_HOME="$PWD/.hermes"
 #     mkdir -p "$HERMES_HOME" && cp config.yaml "$HERMES_HOME/config.yaml"
 #
-# `hermes mcp add shogym --command uv --args run python serve.py --connect-timeout 90` writes the
+# `hermes mcp add shogym --command uv --args run python serve.py --connect-timeout 180` writes the
 # same block; this file is the shape it writes, checked in so you can read it before you run
 # anything. Hermes stamps a `_config_version:` line on configs it writes itself; it is not
 # required, and everything else in a Hermes config has a default -- this is the whole file.
@@ -20,8 +20,9 @@ mcp_servers:
     # a stdio server config takes no `cwd` key.
     command: uv
     args: ["run", "python", "serve.py"]
-    # First call builds the env, which on some envs means a one-time download. 90s is slack.
-    connect_timeout: 90.0
+    # Connecting builds the env and starts the durable service before the server answers, and
+    # on some envs that means a one-time download. 180s is slack.
+    connect_timeout: 180.0
     enabled: true
     # Hermes hands stdio subprocesses a FILTERED environment -- PATH, HOME, USER, LANG, TERM,
     # SHELL, TMPDIR, XDG_* and nothing else -- so that an MCP server you installed cannot read
@@ -31,5 +32,5 @@ mcp_servers:
     # env:
     #   OPENAI_API_KEY: "${OPENAI_API_KEY}"
     #
-    # The alternative is `python serve.py http`, which runs in your own shell with your own
-    # environment; then this entry is `url: http://127.0.0.1:8973/mcp` and no `env` block.
+    # Naming it here is the whole of the answer now: protocol v2 serves over stdio, so there is
+    # no HTTP variant of `serve.py` to run in your own shell instead.

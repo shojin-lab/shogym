@@ -26,8 +26,16 @@ env_test = shogym.make("wordle_v1", config={"task_split": "test"})
 **Serve it as a stdio MCP server** any harness can spawn (`--trace` optional):
 
 ```bash
+uv sync --extra durable          # outside this repo: pip install "shogym[durable]"
 shogym serve wordle_v1 --task 0 --trace ./shogym_logs/wordle.jsonl
 ```
+
+That is one env at one task, published as a durable protocol v2 stream, which is what the
+`durable` extra is for. The model asks for work with `pull`, which takes no arguments and answers
+with one JSON record (`task`, `payload`, `wait` or `done`), and calls `guess` as
+`{"attempt_id": "<the attempt_id from the task>", "arguments": {"word": "crane"}}`. `terminate` is
+wrapped the same way and then intercepted: it becomes the stream's terminal request rather than
+reaching the env, and it answers with a `seal_ack`.
 
 **Drive it with Claude Code** (the reference external harness) via the quickstart at
 [`examples/claude_code/`](../../../../examples/claude_code/), with one variable set:
@@ -36,8 +44,10 @@ shogym serve wordle_v1 --task 0 --trace ./shogym_logs/wordle.jsonl
 ENV = "wordle_v1"
 ```
 
-Claude Code spawns the quickstart's `serve.py` as its MCP server and plays each task through
-`get_task` plus the env's own tools; shogym never sees its model, prompt, or loop.
+Claude Code spawns the quickstart's `serve.py` as its MCP server and plays the task through `pull`
+plus the env's own tools, each wrapped so that a call names the attempt it belongs to; shogym never
+sees its model, prompt, or loop. One launch is one episode, so a roster of tasks is a roster of
+launches.
 
 **Drive it in-process** with `shogym.evaluate` — hand it an async harness callable that
 receives a FastMCP `Client` connected to the served env:
@@ -119,7 +129,9 @@ Feedback emitted:
   - `count_turns` — the number of `guess` steps consumed (capped at `MAX_GUESSES`).
 
 Termination happens when `terminate` is called **or** the horizon is reached (step count
-≥ 6), whichever comes first — gated env-side in the serving engine.
+≥ 6), whichever comes first, gated env-side in the serving engine. A durably served episode is
+opened with `ends_on_horizon=False` and its `terminate` is intercepted, so neither of those
+happens: the stream ends the attempt instead.
 
 ## Tasks
 
@@ -142,6 +154,13 @@ print(result.terminated, result.value("check_answer"), result.value("partial_cre
 `result_from_trace` treats `env` / `task` / `session_id` as **filters** — see
 [Reading a score back](../README.md#reading-a-score-back-result_from_trace) for the shared
 semantics (each run should own its trace file for a guaranteed 1:1 mapping).
+
+That readout is for an episode whose terminal reaches the env: `shogym.evaluate`, or a
+`ServedEpisode` driven in process. A durably served episode leaves a trace of the guesses and no
+terminal row, and `verify` does not run at all. What the stream scores an attempt with is the
+kernel's stand-in terminal, which computes from the terminal call's arguments and reaches no env,
+so `check_answer` and `partial_credit` are not what a `shogym serve wordle_v1` run records. This
+env brings no terminal of its own.
 
 ## Fidelity & deviations
 
