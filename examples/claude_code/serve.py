@@ -75,8 +75,8 @@ IN_FLIGHT = int(os.environ.get("SHOGYM_IN_FLIGHT") or 1)
 # `results.jsonl`, which keeps every payload the env published on every row whatever the arm was
 # told. An agent that can read either can read its own assignment and the receipt a control arm
 # withholds, so a paired run names a directory of its own here and takes the file-reading built-ins
-# away (see src/shogym/envs/appworld/README.md).
-#     SHOGYM_RUNS=~/appworld-pair/runs <your harness command>
+# away.
+#     SHOGYM_RUNS=~/paired-run/runs <your harness command>
 RUNS = (
     Path(os.environ["SHOGYM_RUNS"]).expanduser()
     if os.environ.get("SHOGYM_RUNS")

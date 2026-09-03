@@ -28,7 +28,7 @@ import socket
 import ssl
 import urllib.error
 from types import ModuleType
-from typing import Callable, Iterator, List, Optional, TypeVar
+from typing import Iterator, List, Optional
 
 import pytest
 
@@ -83,34 +83,7 @@ def _environmental_reason(exc: BaseException, *, package: str, extra: str) -> Op
             if missing == "shogym" or missing.startswith("shogym."):
                 return None
             return f"{extra} extra not installed (no module {missing!r})"
-        # A port that provisions an interpreter or a corpus rather than importing one raises this
-        # when a provisioning step fails. On a laptop it means "not provisioned here"; in CI,
-        # where the network is up, `_required()` turns it back into the failure it may also be:
-        # a pin that no longer resolves.
-        if type(cause).__name__ == "ProvisioningError":
-            return f"{extra}: not provisioned on this machine ({cause})"
     return None
-
-
-_T = TypeVar("_T")
-
-
-def provisioned(provision: Callable[[], _T], *, package: str, extra: str) -> _T:
-    """Run ``provision``, a port's own provisioning step, and return what it produced.
-
-    The counterpart to :func:`gate` for a port whose upstream is not provisioned at import. The
-    appworld port builds an interpreter of its own and downloads a corpus when an env is
-    *constructed*, because upstream cannot be installed beside shogym at all, so the failure to
-    classify happens at the first call rather than at the first import. Same rule as ``gate``:
-    only a recognizably environmental failure skips, and only when ``SHOGYM_REQUIRE_UPSTREAM``
-    is unset."""
-    try:
-        return provision()
-    except BaseException as exc:
-        reason = _environmental_reason(exc, package=package, extra=extra)
-        if reason is None or _required():
-            raise
-        pytest.skip(reason, allow_module_level=True)
 
 
 def gate(module: str, *, package: str, extra: str) -> ModuleType:
@@ -127,4 +100,4 @@ def gate(module: str, *, package: str, extra: str) -> ModuleType:
         pytest.skip(reason, allow_module_level=True)
 
 
-__all__ = ["REQUIRE_ENV_VAR", "gate", "provisioned"]
+__all__ = ["REQUIRE_ENV_VAR", "gate"]

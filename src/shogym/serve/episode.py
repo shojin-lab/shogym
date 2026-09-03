@@ -2560,9 +2560,10 @@ class ServedEpisode:
 
         Off the caller's loop and bounded, for the reason `begin_session` is: this runs on the
         shared loop and an env that waits on a wedged child would hold every other episode with
-        it. At the bound the wait is abandoned, never the release: an env that needs its own
-        release to be certain has to make its hook bounded too, which is why the appworld
-        worker's close signals and reaps rather than asking politely over a socket.
+        it. At the bound the wait is abandoned, never the release: an env whose own hook carries
+        no timeout leaves this the only bound there is, as frontier_bench's release does when it
+        reaches Docker cleanup, so an env that needs its own release to be certain has to bound
+        that hook itself.
 
         **What a second caller joins is the release, not the fact that somebody started a
         wait.** A flag meaning "a wait has been made" let a second close skip to the env close
