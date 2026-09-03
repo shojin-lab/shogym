@@ -27,11 +27,15 @@ from __future__ import annotations
 import enum
 import hashlib
 import json
+import math
 import os
 import tempfile
+import threading
+import time
+import warnings
 from dataclasses import asdict, dataclass
 from pathlib import Path
-from typing import Any, Dict, List, Literal, Optional, Union
+from typing import Any, Dict, List, Literal, Optional, Sequence, Set, Tuple, Union
 
 # The evidence-schema version. Stamped on every :class:`TerminalEvidence`, the durable
 # record, and the trace ``terminal`` event so a reader can tell which envelope it is parsing.
@@ -39,6 +43,18 @@ EVIDENCE_SCHEMA_VERSION = 1
 
 # The private durable-record filename schema version (independent of the evidence schema).
 RECORD_SCHEMA_VERSION = 1
+
+#: The largest value a pid can take on this platform, for the range check in the decoder. Read
+#: from the kernel where it is published and otherwise a bound generous enough to admit every
+#: real pid and reject the integers that are not pids at all.
+try:  # pragma: no cover - one branch per platform
+    _MAX_PID = int(Path("/proc/sys/kernel/pid_max").read_text(encoding="utf-8").strip())
+except (OSError, ValueError):
+    _MAX_PID = 2 ** 31 - 1
+
+#: Where the no-trace finalization store lives, when a caller says. Read by every process, so a
+#: test that opens an episode in a child interpreter can keep it out of the developer's own store.
+SESSIONS_ROOT_ENV_VAR = "SHOGYM_SESSIONS_ROOT"
 
 TerminalSource = Literal["explicit_tool", "horizon", "abort"]
 TerminalStatus = Literal["ok", "finalize_error"]
@@ -346,7 +362,8 @@ class FinalizationStore:
         only in the page cache is no more durable than that entry."""
         _mkdir_durable(self._dir)
         target = self._path(record.finalization_id)
-        blob = json.dumps(asdict(record), sort_keys=True, allow_nan=False)
+        payload = asdict(record)
+        blob = json.dumps(payload, sort_keys=True, allow_nan=False)
         fd, tmp = tempfile.mkstemp(dir=str(self._dir), suffix=".tmp")
         try:
             with os.fdopen(fd, "w", encoding="utf-8") as f:
@@ -364,23 +381,61 @@ class FinalizationStore:
         _fsync_dir(self._dir)
 
     def read(self, finalization_id: str) -> Optional[FinalizationRecord]:
+        """One record by id, through the same reader a scan uses.
+
+        One reader, one answer: a direct read and a recovery scan may not disagree about what a
+        record is."""
         path = self._path(finalization_id)
         if not path.exists():
             return None
-        return _record_from_dict(json.loads(path.read_text(encoding="utf-8")))
+        return self._read_path(path)
 
     def load_all(self) -> List[FinalizationRecord]:
+        return self._load_all()[0]
+
+    def _load_all(self) -> Tuple[List[FinalizationRecord], List[Path]]:
+        """Every record this directory holds, and every entry in it that is not one.
+
+        Skipping an unreadable entry is right for a caller that wants the records: one bad file
+        is not a reason to refuse the rest. It is not enough for a caller that has to say the
+        directory has been dealt with, because the entry it could not read may be exactly the
+        record recovery exists for. So the entries are named rather than counted, and the caller
+        can come back to those and only those."""
         if not self._dir.exists():
-            return []
+            return [], []
         out: List[FinalizationRecord] = []
-        for path in sorted(self._dir.glob("finalization-*.json")):
-            try:
-                out.append(
-                    _record_from_dict(json.loads(path.read_text(encoding="utf-8")))
-                )
-            except (ValueError, OSError):
-                continue
-        return out
+        unreadable: List[Path] = []
+        try:
+            paths = sorted(self._dir.glob("finalization-*.json"))
+        except OSError:
+            # The directory itself could not be listed, so there is no entry to name and no
+            # record to trust. Reported as an unreadable directory rather than an empty one.
+            raise
+        for path in paths:
+            record = self._read_path(path)
+            if record is None:
+                unreadable.append(path)
+            else:
+                out.append(record)
+        return out, unreadable
+
+    def _read_path(self, path: Path) -> Optional[FinalizationRecord]:
+        """One record from one entry, or ``None`` when that entry is not a record.
+
+        **The name and the contents have to agree.** A record is written to the file its own
+        ``finalization_id`` names, so an entry whose contents claim a different id is not a
+        record this store wrote. Trusted, it is resolved and then *written back under the id it
+        claims*: one malformed file overwrites a valid `FINALIZED` record belonging to another
+        episode with its own fail-closed resolution, destroys that evidence, and stays
+        unresolved itself because its own file is never touched."""
+        record = None
+        try:
+            record = _record_from_dict(json.loads(path.read_text(encoding="utf-8")))
+        except _UNREADABLE:
+            return None
+        if self._path(record.finalization_id) != path:
+            return None
+        return record
 
     def recover(self) -> List[FinalizationRecord]:
         """Restart-recovery, fail-closed **and concurrency-safe**. For every record left
@@ -393,8 +448,18 @@ class FinalizationStore:
         resolved to a safe zero rather than re-run. ``FINALIZED`` records are left as-is (they
         replay their stored evidence); ``FAILED`` is already terminal fail-closed.
         """
+        return self._recover()[0]
+
+    def _recover(self) -> Tuple[List[FinalizationRecord], List[Path]]:
+        """:meth:`recover`, plus the entries the pass could not read. A write that fails is not
+        caught here: a record this pass could not resolve is a record the next pass has to see
+        again, so the failure belongs to the caller rather than to a flag."""
+        records, unreadable = self._load_all()
+        return self._resolve(records), unreadable
+
+    def _resolve(self, records: List[FinalizationRecord]) -> List[FinalizationRecord]:
         resolved: List[FinalizationRecord] = []
-        for record in self.load_all():
+        for record in records:
             if record.status in ("SEALED", "PENDING") and not _pid_alive(record.owner_pid):
                 record.status = "FAILED"
                 record.verdict = fail_closed_verdict(
@@ -407,6 +472,179 @@ class FinalizationStore:
                 self.write(record)
                 resolved.append(record)
         return resolved
+
+    def _recover_paths(
+        self, paths: Sequence[Path]
+    ) -> Tuple[List[FinalizationRecord], List[Path]]:
+        """Recovery over named entries only: the ones a previous pass could not read.
+
+        A directory that has been scanned does not need scanning again for its own sake, and
+        re-reading tens of thousands of known-good records because one file was corrupt is the
+        cost this whole mechanism exists to remove. What can change is an entry that was not a
+        record: a file half-written when its writer died, one a later process rewrote whole. Those
+        come back here, and nothing else does."""
+        records: List[FinalizationRecord] = []
+        still: List[Path] = []
+        for path in paths:
+            if not path.exists():
+                continue  # deleted since; there is nothing left to quarantine
+            record = self._read_path(path)
+            if record is None:
+                still.append(path)
+            else:
+                records.append(record)
+        return self._resolve(records), still
+
+    def recover_once(self) -> List[FinalizationRecord]:
+        """:meth:`recover` for the first caller in this process to ask about this directory, and
+        nothing at all for every caller after it.
+
+        Recovery is a **startup** question: which records did a process that is no longer here
+        leave mid-finalize? The answer cannot change because this process opened another episode,
+        so asking it again per episode buys nothing and costs a full read of the directory,
+        which is shared across every session that runs without a trace path and therefore holds
+        every record the machine has ever written. On a developer machine that is tens of
+        thousands of files, so an episode that should open in milliseconds spends seconds reading
+        JSON, and a suite that opens eighty episodes spends minutes of it. Asked once, the cost
+        is paid once.
+
+        What this gives up is small and named: a record another process abandons *while this one
+        runs* is resolved by the next process to start rather than by this one's next episode.
+        Recovery is for the run before this one, and a live owner's record is left alone.
+
+        **A pass that finished counts, and one bad file does not undo it.** The directory is
+        remembered after the scan, along with the entries the scan could not read. A later caller
+        comes back to *those* and only those: an entry that was half-written when its writer died
+        may be whole now, and one that is still not a record costs one open rather than a second
+        read of every known-good record beside it. Remembering nothing because one file was
+        corrupt is the O(machine history) behaviour this exists to remove, arrived at by a
+        different route; and remembering the pass as complete would leave a record that may be
+        exactly the dangling one unresolved for good.
+
+        A write that fails is different and raises out of here having remembered nothing: the
+        records it could not rewrite are known-good ones, and they have to be seen again.
+
+        **Once per process means this process.** A forked child is another process: the record
+        its parent left alone belongs to an owner that was alive when the parent looked and may
+        not be now, so the child asks again. The cache is emptied in the child at fork, and keyed
+        by pid as well, for a platform that cannot register a fork handler."""
+        key = str(self._dir.resolve()) if self._dir.exists() else str(self._dir)
+        while True:
+            with _RECOVERED_LOCK:
+                quarantined = _recovered().get(key)
+                if quarantined is not None or key not in _SCANNING:
+                    if quarantined is None:
+                        # Claimed before the scan, not after it. Checked and released, every cold
+                        # caller for one directory scanned the whole shared store: "once per
+                        # process" held for the answer and not for the work, which is the entire
+                        # cost this exists to remove. Claiming serialises callers for *this*
+                        # directory only, so a different store is still scanned in parallel.
+                        _SCANNING.add(key)
+                    break
+            # Somebody is scanning this directory. Wait for them rather than doing it again.
+            time.sleep(0.005)
+        if quarantined is not None:
+            if not quarantined:
+                return []
+            resolved, still = self._recover_paths(quarantined)
+            with _RECOVERED_LOCK:
+                _recovered()[key] = tuple(still)
+            return resolved
+        # Outside the lock: this reads a directory that can hold every record the machine has
+        # written, and holding a process-wide lock across it would stop episodes opening against
+        # every other store. Two callers racing the same directory both scan, which costs a
+        # second read and nothing else, because resolving a record is idempotent.
+        try:
+            resolved, unreadable = self._recover()
+        except BaseException:
+            with _RECOVERED_LOCK:
+                _SCANNING.discard(key)
+            raise
+        with _RECOVERED_LOCK:
+            _recovered()[key] = tuple(unreadable)
+            _SCANNING.discard(key)
+        if unreadable:
+            warnings.warn(
+                f"{len(unreadable)} entries in {self._dir} are not finalization records and were "
+                f"skipped: {', '.join(sorted(path.name for path in unreadable)[:5])}"
+                f"{' ...' if len(unreadable) > 5 else ''}. If one of them was a record left "
+                "mid-finalize by a crashed run, its episode has not been resolved fail-closed. "
+                "They are re-read on the next recovery in this process; the rest of the store is "
+                "not.",
+                RuntimeWarning,
+                stacklevel=2,
+            )
+        return resolved
+
+
+#: The store directories already recovered **by this process**, keyed by resolved path, each
+#: mapped to the entries in it that were not records, alongside the pid that recovered them.
+#: Recovery is a startup question asked once per directory (see
+#: :meth:`FinalizationStore.recover_once`); the lock is here because episodes are opened
+#: concurrently.
+_RECOVERED: Dict[str, Tuple[Path, ...]] = {}
+_RECOVERED_PID: Optional[int] = None
+#: Directories a caller in this process is scanning right now, so a second caller for the same one
+#: waits for the answer instead of computing it again.
+_SCANNING: Set[str] = set()
+_RECOVERED_LOCK = threading.Lock()
+
+
+def _recovered() -> Dict[str, Tuple[Path, ...]]:
+    """The map for the process asking, from store directory to the entries in it that were not
+    records. Call with :data:`_RECOVERED_LOCK` held.
+
+    A fork handler empties this in the child, and the pid is checked here as well because a
+    platform without ``register_at_fork`` would otherwise let a child answer out of its parent's
+    memory of a directory the child has never looked at."""
+    global _RECOVERED, _RECOVERED_PID
+    pid = os.getpid()
+    if _RECOVERED_PID != pid:
+        _RECOVERED = {}
+        _SCANNING.clear()
+        _RECOVERED_PID = pid
+    return _RECOVERED
+
+
+def _forget_recovered() -> None:
+    """A forked child inherits the parent's answers and, worse, whatever state the lock was in
+    when the fork happened. Both are replaced."""
+    global _RECOVERED, _RECOVERED_PID, _RECOVERED_LOCK
+    _RECOVERED = {}
+    _SCANNING.clear()
+    _RECOVERED_PID = os.getpid()
+    _RECOVERED_LOCK = threading.Lock()
+
+
+if hasattr(os, "register_at_fork"):
+    os.register_at_fork(after_in_child=_forget_recovered)
+
+
+def _has_unwritable_number(value: Any) -> bool:
+    """Is there a ``NaN`` or an infinity anywhere in here?
+
+    Walks the whole structure, because :meth:`FinalizationStore.write` does: it serialises with
+    ``allow_nan=False``, so a check that stops at the first level passes records the writer will
+    never accept.
+
+    **Iteratively, and that is the whole point.** Recursively it raises ``RecursionError`` on a
+    file deeper than the interpreter's stack, which is an exception the reader refuses nothing
+    with: the pass raises, the directory is never cached, and every episode rescans the whole
+    store. A depth *limit* is the wrong repair for it: v1 records and
+    ``TerminalEvidence.verdict`` have no bound, so a limit puts one on records this project has
+    already written and on verdicts an env may legally return."""
+    stack: List[Any] = [value]
+    while stack:
+        item = stack.pop()
+        if isinstance(item, float):
+            if not math.isfinite(item):
+                return True
+        elif isinstance(item, dict):
+            stack.extend(item.keys())
+            stack.extend(item.values())
+        elif isinstance(item, (list, tuple)):
+            stack.extend(item)
+    return False
 
 
 def _pid_alive(pid: Optional[int]) -> bool:
@@ -437,6 +675,15 @@ def _sessions_cache_root() -> Path:
     That keeps the contract local: the root exists and its entry is on disk when this returns,
     with no appeal to a later write that a recovery-only startup never performs."""
     try:
+        # An explicit root, when one is named. This is the seam a test suite needs: a fixture
+        # that patches a function reaches only the interpreter it runs in, and this repository
+        # has tests that open episodes in fresh interpreters. An environment variable is what a
+        # child process inherits.
+        named = os.environ.get(SESSIONS_ROOT_ENV_VAR)
+        if named:
+            base = Path(named)
+            _mkdir_durable(base)
+            return base
         base = Path(os.path.expanduser("~")) / ".cache" / "shogym" / "sessions"
         _mkdir_durable(base)
         return base
@@ -498,7 +745,91 @@ def _fsync_dir(directory: Path) -> None:
         os.close(fd)
 
 
+#: What a decoded record may fail as. A store file is arbitrary bytes from the filesystem, not a
+#: value this process produced: it can be valid JSON that is not an object (`AttributeError` on
+#: the mapping), an object missing the fields a record is made of (`TypeError` from the
+#: constructor), or an object whose fields are the wrong shape, which raises wherever they are
+#: first used rather than where they were read. All of it means one thing to a reader, which is
+#: that this file is not a record.
+_UNREADABLE = (
+    ValueError,
+    TypeError,
+    AttributeError,
+    KeyError,
+    IndexError,
+    OSError,
+    RecursionError,
+)
+
+
 def _record_from_dict(data: Dict[str, Any]) -> FinalizationRecord:
+    """One record from one decoded file, refusing anything that is not the shape of a record.
+
+    Validated here rather than caught later. A `verdict` that is a list decodes without complaint
+    and raises on `.get` three frames away, in recovery, where the failure looks like a bug in
+    recovery rather than a file that was never a record; and the caller that has to survive it is
+    an episode opening against a directory shared with every session the machine has ever run."""
+    if not isinstance(data, dict):
+        raise TypeError(f"a finalization record is a JSON object, not {type(data).__name__}")
+    for name in ("session_id", "finalization_id", "status", "source"):
+        if not isinstance(data.get(name), str):
+            raise TypeError(f"a record's {name} is a string, not {type(data.get(name)).__name__}")
+    if data.get("status") not in ("SEALED", "PENDING", "FINALIZED", "FAILED"):
+        raise ValueError(f"a record's status is not one this reader knows: {data.get('status')!r}")
+    for name in ("verdict", "provenance"):
+        value = data.get(name)
+        if value is not None and not isinstance(value, dict):
+            raise TypeError(
+                f"a record's {name} is a JSON object or absent, not {type(value).__name__}"
+            )
+    for name in ("diagnostic",):
+        value = data.get(name)
+        if value is not None and not isinstance(value, str):
+            raise TypeError(f"a record's {name} is a string or absent, not {type(value).__name__}")
+    # Every field recovery *operates* on, not only the ones it reads back. `owner_pid` decides
+    # whether a record belongs to a live process, and it reaches `os.kill`: a string raises there,
+    # three frames from here, in a caller that can only suppress it; and `True` is an `int` to
+    # Python, so a boolean is pid 1, which is alive on every machine, so the record is left
+    # untouched forever and the pass is recorded as having dealt with it.
+    owner = data.get("owner_pid")
+    if owner is not None:
+        if isinstance(owner, bool) or not isinstance(owner, int):
+            raise TypeError(
+                f"a record's owner_pid is an int or absent, not {type(owner).__name__}"
+            )
+        # A *pid*, not any integer. `os.kill` reads 0 as "every process in my group" and a
+        # negative number as "the group named by its absolute value", so those are not liveness
+        # questions at all; and a number past the platform's pid range raises `OverflowError`
+        # out of a probe whose only caller can suppress it, which leaves the directory unread
+        # and every later episode reading the whole store again.
+        if not 0 < owner <= _MAX_PID:
+            raise ValueError(f"a record's owner_pid is not a pid a process could have: {owner}")
+    version = data.get("schema_version", RECORD_SCHEMA_VERSION)
+    if isinstance(version, bool) or not isinstance(version, int):
+        raise TypeError(f"a record's schema_version is an int, not {type(version).__name__}")
+    if version != RECORD_SCHEMA_VERSION:
+        # A record written by a schema this reader does not have is not a record this reader may
+        # rewrite: the fields it does not know are dropped on decode, so resolving it would
+        # publish a v-this record over v-that content while keeping the version that said so.
+        # Quarantined instead, which leaves it for a reader that has the migration.
+        raise ValueError(
+            f"a record's schema_version is {version}, and this reader knows "
+            f"{RECORD_SCHEMA_VERSION}"
+        )
+    # `json.loads` accepts `NaN` and `Infinity`, and the writer refuses them (`allow_nan=False`),
+    # so a record carrying one can be read and never written back: recovery rewrites it, the
+    # write raises, and the same failure repeats on every pass. Refused where it is read, and
+    # refused the way the writer refuses it: all the way down.
+    for name in ("verdict", "provenance"):
+        if _has_unwritable_number(data.get(name)):
+            raise ValueError(
+                f"a record's {name} carries a number JSON can be read with and not written back"
+            )
+    digest = data.get("args_digest")
+    if digest is not None and not isinstance(digest, str):
+        raise TypeError(
+            f"a record's args_digest is a string or absent, not {type(digest).__name__}"
+        )
     fields = {
         "session_id",
         "finalization_id",
