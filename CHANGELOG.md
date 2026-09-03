@@ -23,6 +23,27 @@ inside the call that issues a refusal. A refusal advances no protocol state, so 
 harness-side audit surface and this is the only moment a transport that is killed rather than
 stopped is certain to reach.
 
+### `serve`: an episode's finalization records go in the run directory
+
+`ServedEpisode.start` and `ServedEpisode.open_env` take `run_directory`, and it decides where the
+episode's durable finalization records live. The precedence is the run directory first
+(`<run_dir>/finalizations`), then the directory holding the trace, then the unchanged shared
+fallback under `~/.cache/shogym/sessions`. Every root is still shared across the sessions of
+whatever it scopes, so the startup pass that resolves a record a crashed session left mid-finalize
+scans the store this precedence selected. **A caller that passes a run directory and a trace path
+gets its records in the run rather than beside the trace.**
+
+`shogym serve --run-dir` now designates that store as well as the stream's blobs, manifest and
+history, because it passes the directory to the episode it serves. Protocol v2 itself releases
+every world with `close(finalize=False)`, so a v2 run currently produces no episode finalization
+record of its own; what the run directory gains is where such a record goes and where recovery
+looks for one, not a new record.
+
+The Prime Agent example, which is `run_stdio_v2` with the transport swapped, is corrected to match
+it: it passes the run directory to its episode, and it releases the world through `gateway.aclose()`
+rather than closing the episode with the default `finalize=True`, which claimed an abort verdict for
+an attempt the generation had already answered for.
+
 ### `serve`: the version one serving contract is retired, and protocol v2 is the only path
 
 `shogym.serve.stream` is gone, and with it `TaskStream`, `EvalStream`, `TaskRef`,

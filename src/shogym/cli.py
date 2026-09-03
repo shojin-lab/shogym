@@ -34,7 +34,10 @@ def _build_parser() -> argparse.ArgumentParser:
     serve.add_argument(
         "--run-dir",
         default=None,
-        help="directory for the stream's blobs and resume manifest (default: none)",
+        help=(
+            "directory for the stream's blobs, resume manifest, and finalization records "
+            "(default: none)"
+        ),
     )
 
     results = sub.add_parser("results", help="read a run directory's attempt records")

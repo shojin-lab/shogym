@@ -89,27 +89,48 @@ async def main(argv: Optional[Sequence[str]] = None) -> None:
         f"[shogym] serving {ENV} task {TASK} on http://127.0.0.1:{port}/mcp -> {run_dir}",
         file=sys.stderr,
     )
-    # The episode is built before anything durable starts, and closed however this ends, so a
-    # Ctrl-C leaves no env holding a session open behind a stream nobody is serving.
-    episode = await ServedEpisode.start(ENV, task=TASK, ends_on_horizon=False)
+    # The episode is built before anything durable starts, and let go of however this ends, so a
+    # Ctrl-C leaves no env holding a session open behind a stream nobody is serving. It is given
+    # the run directory as well: any finalization record the episode produces then stays with
+    # the run, rather than in a store shared with every session this machine has served. Under
+    # this protocol the stream ends an attempt and the world is released rather than finalized,
+    # so that is where such a record would go rather than one this launch expects to write.
+    episode = await ServedEpisode.start(
+        ENV, task=TASK, ends_on_horizon=False, run_directory=run_dir
+    )
+    stopped = False
     try:
-        version, activities = environment_terminal(episode)
+        environment = environment_terminal(episode)
         # The run directory holds this generation's history as well as its blobs and its
         # manifest, so a second server started beside this one has a database of its own.
         async with durable_client(run_directory=run_dir) as client:
-            async with stream_worker(client, activities=activities):
+            async with stream_worker(client, activities=environment.activities):
                 gateway = await open_gateway(
-                    client, episode, run_directory=run_dir, canonicalization_version=version
+                    client, episode, run_directory=run_dir, environment=environment
                 )
                 # This process is the controller as well as the transport, and its manifest is
                 # complete the moment it is built: one episode, one task. So it closes the queue
                 # before the model can pull, which is what makes `done` reachable once that task
                 # has been sealed and acknowledged.
                 await gateway.close_queue()
-                server = build_gateway_server(gateway)
-                await server.run_async(transport="http", host="127.0.0.1", port=port)
+                try:
+                    server = build_gateway_server(gateway)
+                    await server.run_async(transport="http", host="127.0.0.1", port=port)
+                finally:
+                    # The gateway is stopped before the worker and the service are, because
+                    # stopping it settles whatever call was accepted when the transport went
+                    # away, and that call may still need the stream. Stopping it lets the world
+                    # go, so the episode is released below only when there was no gateway to do
+                    # it or its stop did not finish.
+                    await gateway.aclose()
+                    stopped = True
     finally:
-        await episode.close()
+        if not stopped:
+            # Released rather than ended. Under this protocol the stream is what ends an
+            # attempt, and an ordinary close reads an untouched lifecycle as an episode that
+            # stopped without a seal and claims an abort verdict for it, beside whatever the
+            # generation committed.
+            await episode.close(finalize=False)
 
 
 if __name__ == "__main__":

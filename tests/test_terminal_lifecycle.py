@@ -1305,6 +1305,83 @@ def test_finalization_store_defaults_next_to_trace_and_falls_back(tmp_path: Path
     d2 = FinalizationStore.resolve_dir("sid-2", None)
     d3 = FinalizationStore.resolve_dir("sid-3", None)
     assert d2 == d3
+    # A run directory is the narrower home of the two and wins over the trace: the records
+    # belong to one run, and a trace may be written anywhere and by several of them. It is
+    # still shared across the sessions of that run, so recovery still reaches a crashed one.
+    run_dir = tmp_path / "run"
+    assert FinalizationStore.resolve_dir("sid-4", trace, run_dir) == run_dir / "finalizations"
+    assert FinalizationStore.resolve_dir("sid-5", None, run_dir) == run_dir / "finalizations"
+
+
+async def test_a_run_directory_keeps_the_records_of_a_finalization_that_failed(
+    tmp_path: Path,
+) -> None:
+    """A hole in a run's results is explained from the directory the results were read from.
+
+    The record is what carries the cause: the class of the failure and the text it failed with,
+    which the agent never sees and a reader of an unscored row has nothing else to go on
+    without. So it goes inside the run. Under the trace it is somewhere a run need not have
+    written anything and several runs may write together, and under the shared fallback root it
+    is in with every session this machine has ever served, which is the correlation by hand
+    that made a hole take a trace-by-trace investigation to explain.
+    """
+    def explode(_req: FinalizeRequest, _correct: bool) -> None:
+        raise RuntimeError("the evaluator could not answer")
+
+    run_dir = tmp_path / "run"
+    trace = tmp_path / "traces" / "run.jsonl"
+    ep = await ServedEpisode.start(
+        "_fixture_score",
+        task=0,
+        trace_path=trace,
+        env_config=_config(finalize_hook=explode),
+        run_directory=run_dir,
+    )
+    try:
+        result = await ep.call("submit", {"answer": "4"})
+        assert json.loads(result.content)["finalize_error"] is True
+    finally:
+        await ep.close()
+
+    assert ep._store is not None
+    assert ep._store.directory == run_dir / "finalizations"
+    records = FinalizationStore(run_dir / "finalizations").load_all()
+    assert [record.session_id for record in records] == [ep.session_id]
+    assert records[0].status == "FAILED"
+    assert "RuntimeError" in (records[0].diagnostic or "")
+    # And nowhere else. The trace was written, so the directory beside it exists and holds no
+    # records, which is the case a test that only looked in the run would pass without.
+    assert trace.exists()
+    assert not (trace.parent / "finalizations").exists()
+
+
+async def test_a_run_recovers_the_record_a_crash_left_in_that_run(tmp_path: Path) -> None:
+    """Moving the records into the run moves the recovery that resolves them with it.
+
+    The root is shared across a run's sessions for the reason it was shared across a machine's
+    before: a record left dangling by a session that is gone has to sit where the next
+    session's startup will scan. A run is where that scan looks now, so a crash mid-finalize in
+    one session of a run is resolved fail-closed by the next episode of the same run.
+    """
+    run_dir = tmp_path / "run"
+    store = FinalizationStore(FinalizationStore.resolve_dir("prior-session", None, run_dir))
+    store.write(
+        FinalizationRecord(
+            session_id="prior-session",
+            finalization_id="f-crash",
+            status="PENDING",
+            source="explicit_tool",
+        )
+    )
+    ep = await ServedEpisode.start(
+        "_fixture_score", task=0, env_config=_config(), run_directory=run_dir
+    )
+    await ep.close()
+
+    resolved = store.read("f-crash")
+    assert resolved is not None
+    assert resolved.status == "FAILED"
+    assert resolved.verdict["finalize_error"] is True
 
 
 def test_no_trace_recovery_reaches_a_prior_sessions_dangling_record() -> None:

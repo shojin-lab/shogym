@@ -283,8 +283,12 @@ def format_records(records: List[AttemptRecord]) -> str:
     filing scores the floor and the number on its own does not say that is what it is. And who
     filed is printed beside that, because a generation over an environment whose horizon is a
     graded ending files for an attempt that ran out of world work, so a sealed row no longer
-    says the agent chose to stop there. The identifiers are printed whole: they are what a row
-    is joined on, and a shortened one is a row somebody has to go back to the file for.
+    says the agent chose to stop there. The attempt identifier is printed whole: it is what a
+    row is named by, and a shortened one is a row somebody has to go back to the file for.
+
+    These columns are what a person reads, and they are not everything a row holds. This is the
+    answer to what a generation came to, one line wide and read at a glance, so the derived
+    ``records.jsonl`` carries every field of the record and this stays the columns that fit.
 
     The policy column says what the agent was allowed to be told about that score. A run
     recorded before a generation carried one reads as the legacy placeholder, which is what its

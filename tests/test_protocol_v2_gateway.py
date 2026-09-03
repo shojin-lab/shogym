@@ -19,6 +19,7 @@ import asyncio
 import json
 import os
 import sys
+from contextlib import asynccontextmanager
 from dataclasses import replace
 from pathlib import Path
 from types import SimpleNamespace
@@ -3141,6 +3142,104 @@ async def test_a_gateway_built_directly_closes_the_episode_it_was_given(
     # Nothing of this gateway's is still running: it starts no task of its own, so serving two
     # calls and stopping leaves the loop with exactly what it had before.
     assert asyncio.all_tasks() == running
+
+
+async def test_serving_over_stdio_gives_the_run_to_each_half_and_stops_in_order(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """What the command is made of, without a service, a port or an env.
+
+    Three things are given the run directory and each needs it for something else: the episode
+    keeps its finalization records there, the durable client keeps the generation's history
+    there, and the gateway keeps the blobs and the manifest. A directory that reached only the
+    stream would leave the episode's records in a store shared with every session this machine
+    has served, and nothing else about the command would look different.
+
+    Stopping is an order and not a set. The gateway is stopped first, because stopping it
+    settles whatever call was accepted when the transport went away and that call may still
+    need the stream, so the Worker and the service have to outlive it. The arc test cannot see
+    that: a service that comes up and goes down again reads the same either way.
+    """
+    events: List[str] = []
+    made: Dict[str, Any] = {}
+
+    class _Episode:
+        """The world, as far as this command touches one."""
+
+        def __init__(self, **started: Any) -> None:
+            self.started = started
+            self.closed_with: List[bool] = []
+
+        async def close(self, *, finalize: bool = True) -> None:
+            self.closed_with.append(finalize)
+            events.append("episode closed")
+
+    class _Gateway:
+        async def close_queue(self) -> None:
+            events.append("queue closed")
+
+        async def aclose(self) -> None:
+            events.append("gateway stopped")
+
+    async def start(env_name: str, **kwargs: Any) -> Any:
+        made["episode"] = _Episode(env_name=env_name, **kwargs)
+        return made["episode"]
+
+    @asynccontextmanager
+    async def client(*, run_directory: Any = None) -> AsyncIterator[Any]:
+        made["client_run_directory"] = run_directory
+        try:
+            yield SimpleNamespace()
+        finally:
+            events.append("client left")
+
+    @asynccontextmanager
+    async def worker(client: Any, *, activities: Any = ()) -> AsyncIterator[Any]:
+        try:
+            yield SimpleNamespace()
+        finally:
+            events.append("worker left")
+
+    async def opened(client: Any, episode: Any, **kwargs: Any) -> Any:
+        made["gateway_run_directory"] = kwargs.get("run_directory")
+        if made.get("refuse_to_open"):
+            raise RuntimeError("there is no generation here")
+        return _Gateway()
+
+    def served(gateway: Any) -> Any:
+        async def run_async(**kwargs: Any) -> None:
+            events.append("served")
+
+        return SimpleNamespace(run_async=run_async)
+
+    monkeypatch.setattr(gateway_module, "ServedEpisode", SimpleNamespace(start=start))
+    monkeypatch.setattr(
+        gateway_module, "environment_terminal", lambda episode: SimpleNamespace(activities=[])
+    )
+    monkeypatch.setattr(gateway_module, "durable_client", client)
+    monkeypatch.setattr(gateway_module, "stream_worker", worker)
+    monkeypatch.setattr(gateway_module, "open_gateway", opened)
+    monkeypatch.setattr(gateway_module, "build_gateway_server", served)
+
+    run_dir = tmp_path / "run"
+    await gateway_module.run_stdio_v2(TEST_ENV, task=0, run_directory=run_dir)
+
+    assert made["episode"].started["run_directory"] == run_dir
+    assert made["client_run_directory"] == run_dir
+    assert made["gateway_run_directory"] == run_dir
+    assert events == ["queue closed", "served", "gateway stopped", "worker left", "client left"]
+    # The gateway let the world go, so nothing here ended the episode a second time.
+    assert made["episode"].closed_with == []
+
+    # And the path where there was no gateway to let it go. The world is released rather than
+    # ended: an ordinary close would claim an abort verdict for an attempt this command never
+    # served, beside whatever the generation would say about it.
+    events.clear()
+    made["refuse_to_open"] = True
+    with pytest.raises(RuntimeError):
+        await gateway_module.run_stdio_v2(TEST_ENV, task=0, run_directory=run_dir)
+    assert made["episode"].closed_with == [False]
+    assert events == ["worker left", "client left", "episode closed"]
 
 
 # The whole arc, over a real stdio server against a real durable service.

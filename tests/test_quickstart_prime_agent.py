@@ -20,8 +20,10 @@ from __future__ import annotations
 import ast
 import importlib
 import json
+from contextlib import asynccontextmanager
 from pathlib import Path
-from typing import Dict
+from types import SimpleNamespace
+from typing import Any, AsyncIterator, Dict, List, Optional
 
 import pytest
 
@@ -150,6 +152,131 @@ def test_run_dirs_are_fresh_per_launch(tmp_path: Path) -> None:
     second = serve_mod.new_run_dir(TEST_ENV, tmp_path)
     assert first.parent == tmp_path and TEST_ENV in first.name
     assert first != second
+
+
+class _Episode:
+    """A world that records what it was started with and what became of it.
+
+    The launch touches nothing else on an episode: it hands it to the gateway and, on the one
+    path where there is no gateway to let it go, closes it.
+    """
+
+    def __init__(self, **started: Any) -> None:
+        self.started = started
+        self.closed_with: List[bool] = []
+
+    async def close(self, *, finalize: bool = True) -> None:
+        self.closed_with.append(finalize)
+
+
+class _Gateway:
+    """The generation, as far as the launch is concerned: it is closed, and it says so."""
+
+    def __init__(self) -> None:
+        self.queue_closed = False
+        self.stopped = False
+
+    async def close_queue(self) -> None:
+        self.queue_closed = True
+
+    async def aclose(self) -> None:
+        self.stopped = True
+
+
+def _launch_doubles(
+    monkeypatch: pytest.MonkeyPatch, run_dir: Path, *, opening: Optional[Exception] = None
+) -> Dict[str, Any]:
+    """Replace everything the launch reaches, and keep what it was asked for.
+
+    Nothing durable starts, nothing binds a port, and no env is built. What is left is the
+    wiring this file owns: what the episode is given, what the gateway is given, and what is
+    done with each of them on the way out.
+    """
+    made: Dict[str, Any] = {"gateway": _Gateway()}
+
+    async def start(env: str, **kwargs: Any) -> _Episode:
+        made["episode"] = _Episode(env=env, **kwargs)
+        return made["episode"]
+
+    @asynccontextmanager
+    async def client(*, run_directory: Any = None) -> AsyncIterator[Any]:
+        made["client_run_directory"] = run_directory
+        yield SimpleNamespace()
+
+    @asynccontextmanager
+    async def worker(client: Any, *, activities: Any = ()) -> AsyncIterator[Any]:
+        yield SimpleNamespace()
+
+    async def opened(client: Any, episode: Any, **kwargs: Any) -> _Gateway:
+        made["gateway_run_directory"] = kwargs.get("run_directory")
+        if opening is not None:
+            raise opening
+        return made["gateway"]
+
+    def served(gateway: Any) -> Any:
+        async def run_async(**kwargs: Any) -> None:
+            made["served"] = kwargs
+
+        return SimpleNamespace(run_async=run_async)
+
+    monkeypatch.setattr(serve_mod, "new_run_dir", lambda: run_dir)
+    monkeypatch.setattr(serve_mod, "ServedEpisode", SimpleNamespace(start=start))
+    monkeypatch.setattr(
+        serve_mod, "environment_terminal", lambda episode: SimpleNamespace(activities=[])
+    )
+    monkeypatch.setattr(serve_mod, "durable_client", client)
+    monkeypatch.setattr(serve_mod, "stream_worker", worker)
+    monkeypatch.setattr(serve_mod, "open_gateway", opened)
+    monkeypatch.setattr(serve_mod, "build_gateway_server", served)
+    return made
+
+
+async def test_the_launch_gives_the_run_to_the_episode_as_well_as_to_the_stream(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """This file is ``run_stdio_v2`` with the transport swapped, so it holds the same lifecycle.
+
+    The run directory is the episode's as well as the generation's. An episode picks the store
+    its durable records go in when it is constructed, so a directory handed only to the gateway
+    arrives after that choice was made and leaves the records in a store shared with every
+    session this machine has served, where a reader of this run cannot find them.
+
+    And the world is let go of rather than ended. Stopping the gateway is what releases it, and
+    an ordinary close would read the untouched lifecycle as an episode that stopped without a
+    seal and claim an abort verdict for it, beside whatever the generation committed.
+    """
+    run_dir = tmp_path / "run"
+    made = _launch_doubles(monkeypatch, run_dir)
+
+    await serve_mod.main(["8971"])
+
+    assert made["episode"].started["run_directory"] == run_dir
+    assert made["client_run_directory"] == run_dir
+    assert made["gateway_run_directory"] == run_dir
+    # The queue is closed before anything is served, the server ran, and the gateway is what
+    # stopped: nothing ended this episode.
+    assert made["gateway"].queue_closed is True
+    assert made["served"]["port"] == 8971
+    assert made["gateway"].stopped is True
+    assert made["episode"].closed_with == []
+
+
+async def test_a_launch_that_never_opened_a_generation_releases_its_world(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The one path that closes the episode here closes it the way the stream would.
+
+    A world nothing is serving still has to be released, and releasing it is not ending the
+    attempt it was opened for: an abort verdict claimed on the way out of a failed launch is a
+    result for an attempt nobody worked.
+    """
+    made = _launch_doubles(monkeypatch, tmp_path / "run", opening=RuntimeError("no service"))
+
+    with pytest.raises(RuntimeError):
+        await serve_mod.main([])
+
+    assert made["episode"].closed_with == [False]
+    assert made["gateway"].stopped is False
 
 
 async def test_the_served_surface_is_the_loop_the_prompt_describes() -> None:

@@ -2604,13 +2604,22 @@ async def run_stdio_v2(
     the service wrote, all three in that directory. Given none, the history lives and dies with
     this process, along with everything else there would have been to resume.
 
+    The world's durable finalization store is rooted in that directory as well. A record an
+    episode leaves about how it ended is then inside the run somebody reads rather than in a
+    store shared with every session this machine has served, and the startup pass that resolves
+    what a crash left dangling reads the run's own records rather than that shared store.
+
     The gateway is stopped before the Worker and the service are, because stopping it settles
     whatever call was accepted when the transport went away, and that call may still need the
     stream. Stopping it closes the episode, so the episode is closed here only when there was
     no gateway to do it or its stop did not finish.
     """
     episode = await ServedEpisode.start(
-        env_name, task=task, trace_path=trace_path, ends_on_horizon=False
+        env_name,
+        task=task,
+        trace_path=trace_path,
+        ends_on_horizon=False,
+        run_directory=run_directory,
     )
     stopped = False
     try:
