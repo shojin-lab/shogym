@@ -21,6 +21,7 @@ import asyncio
 import json
 import os
 from pathlib import Path
+from typing import Any
 
 import pytest
 
@@ -28,6 +29,7 @@ from fastmcp import Client
 
 from shogym.core import Env
 from shogym.envs.registration import _ENV_REGISTRY, register
+from shogym.feedback.wire import FEEDBACK_META_KEY
 from shogym.serve import (
     FinalizationRecord,
     FinalizationStore,
@@ -36,12 +38,12 @@ from shogym.serve import (
     TerminalEvidence,
 )
 from shogym.serve import lifecycle
-from shogym.serve.lifecycle import FinalizeRequest, fail_closed_verdict
+from shogym.serve.lifecycle import FinalizeRequest, args_digest, fail_closed_verdict
 from shogym.serve.server import build_server
 from shogym.shared.terminate_mcp import TERMINATE_TOOL_NAME
 from shogym.task import TaskSpec, ToolManifest
 from shogym.trace import load_traces
-from shogym.types import FeedbackCollection
+from shogym.types import EpisodeFeedback, FeedbackCollection
 
 import tests._fixtures.score_env as fixture  # registers `_fixture_score`
 from tests._fixtures import score_mcp
@@ -482,8 +484,9 @@ async def test_non_dict_verdict_fails_closed_and_records_finalized_not_pending(
     )
 
     async def list_verdict(req):
-        # A misbehaving env: a non-dict (list) verdict. json.dumps([...]) succeeds, so the old
-        # `_json_safe`-only guard let it through to `dict(evidence.verdict)`, which raises.
+        # A misbehaving env: a non-dict (list) verdict. json.dumps([...]) succeeds, so a guard
+        # that asked only whether the verdict serializes let it through to
+        # `dict(evidence.verdict)`, which raises.
         return TerminalEvidence(
             source=req.source, status="ok", verdict=["correct", True]  # type: ignore[arg-type]
         )
@@ -515,6 +518,518 @@ async def test_non_dict_verdict_fails_closed_and_records_finalized_not_pending(
     assert rec.verdict["finalize_error"] is True
     assert rec.verdict["correct"] is False
     assert rec.to_evidence().finalize_error is True
+
+
+async def test_a_verdict_that_raises_while_being_read_fails_closed(tmp_path: Path) -> None:
+    # Deciding whether a verdict is serializable runs the env's own object: `json.dumps` reads a
+    # dict subclass through its `items()`, which is the env's code. A failure there is a reason to
+    # refuse the verdict, so it has to end in the same fail-closed commit a NaN or a list does —
+    # not escape the guard, raise at the client, and leave the durable record at PENDING.
+    from shogym.serve.lifecycle import TerminalEvidence
+
+    class _UnreadableVerdict(dict):
+        def items(self):
+            raise RuntimeError("this verdict will not be read")
+
+    trace = tmp_path / "run.jsonl"
+    ep = await ServedEpisode.start(
+        "_fixture_score", task=0, trace_path=trace, env_config=_config()
+    )
+
+    async def unreadable_verdict(req):
+        return TerminalEvidence(
+            source=req.source, status="ok", verdict=_UnreadableVerdict(correct=True)
+        )
+
+    ep._finalize = unreadable_verdict  # type: ignore[assignment]
+    try:
+        result = await ep.call("submit", {"answer": "4", "confidence": 50})
+        assert result.terminated is True
+        payload = json.loads(result.content)
+        assert payload["correct"] is False  # fail-closed, not the unreadable verdict
+        assert payload["finalize_error"] is True
+        assert ep._evidence is not None
+        assert ep._evidence.verdict == fail_closed_verdict(50)
+        assert ep._state is LifecycleState.CLOSED  # teardown ran
+    finally:
+        await ep.close()
+
+    store = FinalizationStore(FinalizationStore.resolve_dir(ep.session_id, trace))
+    recs = store.load_all()
+    assert len(recs) == 1
+    assert recs[0].status == "FAILED"  # resolved fail-closed, never stranded at PENDING
+
+
+async def test_a_failure_that_will_not_render_still_gets_its_fail_closed_row(
+    tmp_path: Path,
+) -> None:
+    # The private diagnostic renders the evaluator's exception, which runs that exception's own
+    # `__str__`. One that raises used to replace the evaluator failure with the formatter failure
+    # inside the handler that was writing the fail-closed record, so no record was written at all.
+    # The row is what the failure is for: it is still written, and it still names the type.
+    class _UnrenderableFailure(RuntimeError):
+        def __str__(self) -> str:
+            raise RuntimeError("this failure will not describe itself")
+
+    trace = tmp_path / "run.jsonl"
+    ep = await ServedEpisode.start(
+        "_fixture_score", task=0, trace_path=trace, env_config=_config()
+    )
+
+    async def unrenderable_failure(req):
+        raise _UnrenderableFailure()
+
+    ep._finalize = unrenderable_failure  # type: ignore[assignment]
+    try:
+        result = await ep.call("submit", {"answer": "4", "confidence": 50})
+        assert result.terminated is True
+        payload = json.loads(result.content)
+        assert payload["correct"] is False  # fail-closed
+        assert payload["finalize_error"] is True
+        assert ep._evidence is not None
+        assert ep._evidence.status == "finalize_error"
+        # The diagnostic keeps the one thing the failure could still be asked for: its type.
+        assert ep._evidence.diagnostic is not None
+        assert "_UnrenderableFailure" in ep._evidence.diagnostic
+        assert ep._evidence.failure == {"error": "_UnrenderableFailure"}
+        assert ep._state is LifecycleState.CLOSED  # teardown ran
+    finally:
+        await ep.close()
+
+    store = FinalizationStore(FinalizationStore.resolve_dir(ep.session_id, trace))
+    recs = store.load_all()
+    assert len(recs) == 1
+    assert recs[0].status == "FAILED"
+    assert recs[0].diagnostic is not None
+    assert "_UnrenderableFailure" in recs[0].diagnostic
+
+
+async def test_a_verdict_that_cancels_while_being_read_fails_closed(tmp_path: Path) -> None:
+    # An env's `items()` can raise cancellation as readily as anything else, and this boundary
+    # already holds that an env's own cancellation is contained: the evaluator handler above
+    # catches it and fails closed rather than stranding the episode FINALIZING. Reading the
+    # verdict to see whether it can be committed is the same kind of read, so it ends the same
+    # way, in the fail-closed record, not carrying the transaction out with it.
+    class _CancellingVerdict(dict):
+        def items(self):
+            raise asyncio.CancelledError()
+
+    trace = tmp_path / "run.jsonl"
+    ep = await ServedEpisode.start(
+        "_fixture_score", task=0, trace_path=trace, env_config=_config()
+    )
+
+    async def cancelling_verdict(req):
+        return TerminalEvidence(
+            source=req.source, status="ok", verdict=_CancellingVerdict(correct=True)
+        )
+
+    ep._finalize = cancelling_verdict  # type: ignore[assignment]
+    try:
+        result = await ep.call("submit", {"answer": "4", "confidence": 50})
+        assert result.terminated is True
+        payload = json.loads(result.content)
+        assert payload["correct"] is False  # fail-closed, not the unreadable verdict
+        assert payload["finalize_error"] is True
+        assert ep._evidence is not None
+        assert ep._evidence.verdict == fail_closed_verdict(50)
+        assert ep._state is LifecycleState.CLOSED  # teardown ran
+    finally:
+        await ep.close()
+
+    store = FinalizationStore(FinalizationStore.resolve_dir(ep.session_id, trace))
+    recs = store.load_all()
+    assert len(recs) == 1
+    assert recs[0].status == "FAILED"  # resolved fail-closed, never stranded at PENDING
+
+
+async def test_a_failure_whose_type_will_not_name_itself_still_gets_its_row(
+    tmp_path: Path,
+) -> None:
+    # Falling back to the type name is only a fallback if the name is a string. A metaclass
+    # decides what `__name__` answers, so it can answer with an object of the env's own, and the
+    # diagnostic that object lands in is the one being written because the evaluator already
+    # failed. The row survives with a fixed name in place of the one that would not render.
+    class _UnprintableName:
+        def __str__(self) -> str:
+            raise RuntimeError("this type will not name itself")
+
+    class _NamelessType(type):
+        @property
+        def __name__(cls) -> Any:  # type: ignore[override]
+            return _UnprintableName()
+
+    class _FailureWithoutAName(RuntimeError, metaclass=_NamelessType):
+        pass
+
+    trace = tmp_path / "run.jsonl"
+    ep = await ServedEpisode.start(
+        "_fixture_score", task=0, trace_path=trace, env_config=_config()
+    )
+
+    async def nameless_failure(req):
+        raise _FailureWithoutAName()
+
+    ep._finalize = nameless_failure  # type: ignore[assignment]
+    try:
+        result = await ep.call("submit", {"answer": "4", "confidence": 50})
+        assert result.terminated is True
+        payload = json.loads(result.content)
+        assert payload["correct"] is False  # fail-closed
+        assert payload["finalize_error"] is True
+        assert ep._evidence is not None
+        assert ep._evidence.diagnostic == "finalize failed: <unreadable>"
+        assert ep._evidence.failure == {"error": "<unreadable>"}
+        assert ep._state is LifecycleState.CLOSED  # teardown ran
+    finally:
+        await ep.close()
+
+    store = FinalizationStore(FinalizationStore.resolve_dir(ep.session_id, trace))
+    recs = store.load_all()
+    assert len(recs) == 1
+    assert recs[0].status == "FAILED"
+
+
+async def test_the_diagnostic_reads_a_failure_once_and_before_the_summary() -> None:
+    # A structured failure describes itself through `errors()`, which is the env's method and may
+    # do anything, including change what the exception says about itself. The diagnostic renders
+    # the failure as it was caught, and the summary is the only thing that asks it for structure,
+    # so the row carries the message the evaluator failed with rather than one produced by being
+    # asked about it.
+    class _Stateful(RuntimeError):
+        calls = 0
+
+        def __init__(self) -> None:
+            super().__init__("original")
+
+        def errors(self):
+            type(self).calls += 1
+            self.args = (f"mutated on errors call {type(self).calls}",)
+            return [{"type": "value_error", "loc": ("answer",)}]
+
+    ep = await _start()
+
+    async def stateful_failure(req):
+        raise _Stateful()
+
+    ep._finalize = stateful_failure  # type: ignore[assignment]
+    try:
+        result = await ep.call("submit", {"answer": "4", "confidence": 50})
+        assert result.terminated is True
+        assert json.loads(result.content)["finalize_error"] is True
+        assert ep._evidence is not None
+        assert ep._evidence.diagnostic == "finalize failed: _Stateful: original"
+        assert _Stateful.calls == 1  # the summary asked; the diagnostic did not
+        assert ep._evidence.failure == {"error": "_Stateful", "error_count": 1}
+    finally:
+        await ep.close()
+
+
+async def test_feedback_that_cannot_be_recorded_still_gets_the_fail_closed_row(
+    tmp_path: Path,
+) -> None:
+    # Between the caught evaluator failure and the durable record that says so, the verifier
+    # runs and its feedback is put into wire form, which validates it. The models do not validate
+    # on assignment, so a mutated item is an ordinary malformed env output; recording it used to
+    # raise after the evidence had been failed closed in memory and before the record was
+    # replaced, leaving the record at PENDING and the failure invisible to recovery.
+    trace = tmp_path / "run.jsonl"
+    ep = await ServedEpisode.start(
+        "_fixture_score", task=0, trace_path=trace, env_config=_config()
+    )
+
+    async def failing_finalize(req):
+        raise RuntimeError("the evaluator is down")
+
+    def unrecordable_feedback(trajectory, task, *, terminated, evidence=None):
+        collection = FeedbackCollection(episode=[EpisodeFeedback(name="score", value=1.0)])
+        collection.episode[0].value = object()  # type: ignore[assignment]
+        return collection
+
+    ep._finalize = failing_finalize  # type: ignore[assignment]
+    ep._env.verify = unrecordable_feedback  # type: ignore[method-assign]
+    try:
+        result = await ep.call("submit", {"answer": "4", "confidence": 50})
+        assert result.terminated is True
+        payload = json.loads(result.content)
+        assert payload["correct"] is False  # fail-closed
+        assert payload["finalize_error"] is True
+        assert ep.terminal_feedback == []  # nothing recordable survived the verifier
+        assert ep._evidence is not None
+        assert ep._evidence.status == "finalize_error"
+        assert ep._evidence.failure == {"error": "ValueError"}  # what actually happened
+        assert ep._state is LifecycleState.CLOSED  # teardown ran
+    finally:
+        await ep.close()
+
+    store = FinalizationStore(FinalizationStore.resolve_dir(ep.session_id, trace))
+    recs = store.load_all()
+    assert len(recs) == 1
+    assert recs[0].status == "FAILED"  # resolved fail-closed, never stranded at PENDING
+
+
+async def _fail_closed_record(tmp_path: Path, finalize) -> FinalizationRecord:
+    """Run one terminal call against `finalize`, require the fail-closed result at the caller,
+    and hand back the single durable record the transaction left behind."""
+    trace = tmp_path / "run.jsonl"
+    ep = await ServedEpisode.start(
+        "_fixture_score", task=0, trace_path=trace, env_config=_config()
+    )
+    ep._finalize = finalize  # type: ignore[assignment]
+    try:
+        result = await ep.call("submit", {"answer": "4", "confidence": 50})
+        assert result.terminated is True
+        payload = json.loads(result.content)
+        assert payload["correct"] is False  # fail-closed, never the env's own word
+        assert payload["finalize_error"] is True
+        assert ep._state is LifecycleState.CLOSED  # teardown ran
+    finally:
+        await ep.close()
+    recs = FinalizationStore(FinalizationStore.resolve_dir(ep.session_id, trace)).load_all()
+    assert len(recs) == 1
+    return recs[0]
+
+
+async def test_a_verdict_the_record_cannot_rebuild_still_resolves_the_row(
+    tmp_path: Path,
+) -> None:
+    # Serializing a verdict proves it can be serialized and nothing else. The durable record is
+    # built with `asdict`, which rebuilds a mapping by calling its own type, and the type is the
+    # env's: one that refuses the rebuild used to raise inside the write, after the transaction
+    # had committed in memory and while the row still said PENDING. The verdict the record is
+    # written from is the plain one this core read out of the env's, so the rebuild is its own.
+    class _UnrebuildableVerdict(dict):
+        def __init__(self, *args: Any, **kwargs: Any) -> None:
+            if args:  # `asdict` rebuilds by passing the pairs back in
+                raise asyncio.CancelledError()
+            super().__init__(**kwargs)
+
+    async def unrebuildable_verdict(req):
+        return TerminalEvidence(
+            source=req.source,
+            status="finalize_error",
+            verdict=_UnrebuildableVerdict(correct=False, finalize_error=True),
+        )
+
+    rec = await _fail_closed_record(tmp_path, unrebuildable_verdict)
+    assert rec.status == "FAILED"  # resolved fail-closed, never stranded at PENDING
+    assert rec.verdict == {"correct": False, "finalize_error": True}
+    assert type(rec.verdict) is dict  # the plain value, not the env's mapping
+
+
+async def test_a_verdict_whose_type_takes_no_arguments_still_resolves_the_row(
+    tmp_path: Path,
+) -> None:
+    # The same rebuild, refused by an ordinary mapping rather than a hostile one: a dict subclass
+    # that only constructs empty. The write failed, the flag it set was in memory, and the row on
+    # disk stayed PENDING, which is the state a recovery reads as an unfinished finalization.
+    class _ZeroArgVerdict(dict):
+        def __init__(self) -> None:
+            super().__init__(correct=True, score=1)
+
+    async def zero_arg_verdict(req):
+        return TerminalEvidence(source=req.source, status="ok", verdict=_ZeroArgVerdict())
+
+    trace = tmp_path / "run.jsonl"
+    ep = await ServedEpisode.start(
+        "_fixture_score", task=0, trace_path=trace, env_config=_config()
+    )
+    ep._finalize = zero_arg_verdict  # type: ignore[assignment]
+    try:
+        # This verdict is honest, only oddly typed: it is scored, not failed closed.
+        result = await ep.call("submit", {"answer": "4", "confidence": 50})
+        payload = json.loads(result.content)
+        assert payload["correct"] is True
+        assert payload["finalize_error"] is False
+        assert ep._persist_degraded is False  # the record was written, not degraded
+    finally:
+        await ep.close()
+
+    recs = FinalizationStore(FinalizationStore.resolve_dir(ep.session_id, trace)).load_all()
+    assert len(recs) == 1
+    assert recs[0].status == "FINALIZED"  # resolved, never stranded at PENDING
+    assert recs[0].verdict == {"correct": True, "score": 1}
+
+
+async def test_a_status_that_will_not_compare_fails_closed(tmp_path: Path) -> None:
+    # The declared status is env data too, and it is read by comparison: the public payload asks
+    # whether it is `finalize_error` before the durable write. A string subclass whose equality
+    # raises used to take the whole transaction out through that question. The status this core
+    # keeps is its own constant, matched once inside the guard, so an answer that will not be
+    # compared is an outcome rather than an escape.
+    class _HostileStatus(str):
+        __hash__ = str.__hash__
+
+        def __eq__(self, other: object) -> bool:
+            raise RuntimeError("status equality failed")
+
+    async def hostile_status(req):
+        return TerminalEvidence(
+            source=req.source,
+            status=_HostileStatus("ok"),  # type: ignore[arg-type]
+            verdict={"correct": True},
+        )
+
+    rec = await _fail_closed_record(tmp_path, hostile_status)
+    assert rec.status == "FAILED"  # resolved fail-closed, never stranded at PENDING
+    # The verdict was fine; the row says which field the refusal came from.
+    assert rec.diagnostic == "finalize returned an undeclared or unreadable status"
+
+
+async def test_an_undeclared_status_says_so_in_the_row(tmp_path: Path) -> None:
+    # The returned status is dropped, so the diagnostic is the only thing left to send whoever
+    # repairs the env to the field that refused. A row that blames the verdict for a status this
+    # core does not declare sends them to a value that was serializable and correct.
+    async def undeclared_status(req):
+        return TerminalEvidence(
+            source=req.source,
+            status="future_status",  # type: ignore[arg-type]
+            verdict={"correct": True, "score": 1.0},
+        )
+
+    rec = await _fail_closed_record(tmp_path, undeclared_status)
+    assert rec.status == "FAILED"
+    assert rec.diagnostic == "finalize returned an undeclared or unreadable status"
+    assert "future_status" not in rec.diagnostic  # the env's value is named nowhere
+
+
+async def test_an_integer_grade_keeps_its_type_everywhere(tmp_path: Path) -> None:
+    # A feedback value is read once and the items are rebuilt from that read, so the rebuild is
+    # what the score becomes. The wire contract admits a whole number and the models' value type
+    # does not name one, so rebuilding through validation would turn the grade into a float: the
+    # retained score, the trace row and the sidecar would carry a different number from the one
+    # the verifier reported, and a large one would carry a different number from each other.
+    big = 2**60 + 1  # exact as an int, not as a float
+
+    def integer_verify(trajectory, task, *, terminated, evidence=None):
+        item = EpisodeFeedback(name="score", value=1.0)
+        item.value = big  # a post-construction assignment, which the models allow
+        return FeedbackCollection(episode=[item])
+
+    trace = tmp_path / "run.jsonl"
+    ep = await ServedEpisode.start(
+        "_fixture_score", task=0, trace_path=trace, env_config=_config()
+    )
+    ep._env.verify = integer_verify  # type: ignore[method-assign]
+    try:
+        result = await ep.call("submit", {"answer": "4", "confidence": 50})
+        retained = ep.terminal_feedback[0]["value"]
+        assert retained == big and type(retained) is int
+        surfaced = result.meta[FEEDBACK_META_KEY][0]["value"]
+        assert surfaced == big and type(surfaced) is int
+    finally:
+        await ep.close()
+
+    step = [r for r in load_traces(trace) if r.get("kind") != "terminal"][-1]
+    recorded = step["feedback"][0]["value"]
+    assert recorded == big and type(recorded) is int
+
+
+async def test_a_verifier_cannot_rewrite_a_caught_failure_into_a_success(
+    tmp_path: Path,
+) -> None:
+    # The verifier is handed the evidence to score, and the evidence is a plain dataclass, so
+    # what it is handed it can also edit. One that declares the failed evaluation `ok` and swaps
+    # the verdict used to have the handler persist FINALIZED with a success verdict and the
+    # fail-closed diagnostic still beside it. The verifier scores a copy; the row is written from
+    # the instance it never saw.
+    trace = tmp_path / "run.jsonl"
+    ep = await ServedEpisode.start(
+        "_fixture_score", task=0, trace_path=trace, env_config=_config()
+    )
+
+    async def failing_finalize(req):
+        raise RuntimeError("the evaluator is down")
+
+    def rewriting_verify(trajectory, task, *, terminated, evidence=None):
+        assert evidence is not None
+        evidence.status = "ok"
+        evidence.verdict.clear()
+        evidence.verdict.update({"correct": True, "mutated_by_verify": True})
+        evidence.diagnostic = None
+        evidence.failure = None
+        evidence.provenance = {"core": "not-shogym"}
+        evidence.finalization_id = "forged"
+        return FeedbackCollection()
+
+    ep._finalize = failing_finalize  # type: ignore[assignment]
+    ep._env.verify = rewriting_verify  # type: ignore[method-assign]
+    try:
+        result = await ep.call("submit", {"answer": "4", "confidence": 50})
+        payload = json.loads(result.content)
+        assert payload["correct"] is False  # fail-closed, not the verifier's rewrite
+        assert payload["finalize_error"] is True
+        assert "mutated_by_verify" not in payload
+        assert ep._evidence is not None
+        assert ep._evidence.status == "finalize_error"
+        assert ep._evidence.verdict == fail_closed_verdict(50)
+        assert ep._evidence.provenance is not None
+        assert ep._evidence.provenance["core"] == "shogym-serve"
+    finally:
+        await ep.close()
+
+    recs = FinalizationStore(FinalizationStore.resolve_dir(ep.session_id, trace)).load_all()
+    assert len(recs) == 1
+    assert recs[0].status == "FAILED"  # grading never completed; the row says so
+    assert recs[0].verdict is not None and recs[0].verdict["correct"] is False
+    assert recs[0].diagnostic is not None and "finalize failed" in recs[0].diagnostic
+
+
+async def test_a_finalizer_that_mutates_the_request_args_still_gets_its_row(
+    tmp_path: Path,
+) -> None:
+    # The finalizer is handed the caller's own args dict, and the durable write used to digest
+    # that dict again on its way in, which is an env-influenced read outside the write's guard.
+    # A cycle added by the finalizer made the digest raise and left the row PENDING. The digest
+    # is taken once at the seal, before any env code runs, and every row uses that one string.
+    async def cyclic_args(req):
+        req.args["itself"] = req.args  # the caller's dict, by reference
+        raise RuntimeError("the evaluator is down")
+
+    rec = await _fail_closed_record(tmp_path, cyclic_args)
+    assert rec.status == "FAILED"  # resolved fail-closed, never stranded at PENDING
+    # The digest is of the args the transaction was entered with, not of what the env made them.
+    assert rec.args_digest == args_digest({"answer": "4", "confidence": 50})
+
+
+async def test_feedback_is_read_once_and_the_trace_reads_the_core_copy(
+    tmp_path: Path,
+) -> None:
+    # A feedback item is the verifier's object and is serialized more than once on the way out:
+    # for the retained score, for the trace row, and for the result's sidecar. An item that
+    # answered the first read and refused the later ones degraded the trace and then raised at
+    # the caller, after the episode had already been scored. The item is read once and rebuilt
+    # from its own wire form, so everything after that serializes a core object.
+    reads = {"value": 0}
+
+    class _ReadOnceItem(EpisodeFeedback):
+        def __getattribute__(self, name: str) -> Any:
+            if name == "value":
+                reads["value"] += 1
+                if reads["value"] > 1:
+                    raise RuntimeError(f"value reread {reads['value']}")
+            return super().__getattribute__(name)
+
+    def read_once_verify(trajectory, task, *, terminated, evidence=None):
+        return FeedbackCollection(episode=[_ReadOnceItem(name="score", value=1.0)])
+
+    trace = tmp_path / "run.jsonl"
+    ep = await ServedEpisode.start(
+        "_fixture_score", task=0, trace_path=trace, env_config=_config()
+    )
+    ep._env.verify = read_once_verify  # type: ignore[method-assign]
+    try:
+        result = await ep.call("submit", {"answer": "4", "confidence": 50})
+        assert result.terminated is True
+        assert json.loads(result.content)["finalize_error"] is False
+        assert reads["value"] == 1  # the verifier's object, read exactly once
+        assert _feedback(ep) == {"score": 1.0}
+        assert ep._persist_degraded is False
+    finally:
+        await ep.close()
+
+    step = [r for r in load_traces(trace) if r.get("kind") != "terminal"][-1]
+    assert step["feedback"] == [{"name": "score", "value": 1.0, "level": "episode"}]
 
 
 async def test_durable_store_write_failure_still_yields_a_verdict() -> None:

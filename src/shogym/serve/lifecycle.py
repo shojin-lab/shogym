@@ -111,8 +111,9 @@ class TerminalEvidence:
     the ``provenance`` (a system field the harness cannot supply) before it is trusted, so a
     returned ``provenance`` is always overwritten. ``verdict`` is the public-safe authoritative
     score, public-safe because the RFC forbids returning judge reasoning or extracted answers —
-    not because anything rewrote it, so it is the env's dict verbatim and a key in it that the
-    core also owns is still only the env's word for that key. ``status`` is the env's *declared*
+    not because anything rewrote what it says. The serve layer does normalize it onto the wire,
+    serializing it once and reading it back, so what travels on is JSON values in a dict the core
+    built; a key in it that the core also owns is still only the env's word for that key. ``status`` is the env's *declared*
     outcome and the one channel that decides it; :attr:`finalize_error` reads that, never the
     verdict. ``diagnostic`` is private (server-side logs / the durable store only) and must
     never reach the agent.
@@ -179,6 +180,34 @@ def _certified_error_kind(entry: Any) -> Optional[str]:
     return kind if url.endswith("/v/" + kind) else None
 
 
+# What a type that will not name itself is called in a record. Fixed, and owned here, so a
+# failure whose type is unreadable still has a name a reader can match across rows.
+_UNREADABLE_TYPE_NAME = "<unreadable>"
+
+
+def failure_type_name(exc: BaseException) -> str:
+    """The name of a caught failure's type as a plain string, or ``"<unreadable>"``.
+
+    Reading a type's name runs code the raiser owns: a metaclass decides what ``__name__``
+    answers, so the read can raise, and the answer can be an object that is not a string. Both
+    go on to a diagnostic and a record that are only being written because something already
+    failed, so both are contained here. Only an exact ``str`` passes: a subclass of ``str`` is
+    still the raiser's object, carrying the raiser's ``__str__`` and ``__format__``, and the
+    whole point of this is that what a caller renders or persists from here cannot refuse.
+
+    ``SystemExit`` and ``KeyboardInterrupt`` raised at the top level still propagate, the same
+    line the rest of this package holds: an interpreter-level signal costs the record loudly
+    rather than being swallowed in a summary.
+    """
+    try:
+        name = type(exc).__name__
+    except (SystemExit, KeyboardInterrupt):
+        raise
+    except BaseException:  # noqa: BLE001 (a contained failure may not escape through its type)
+        return _UNREADABLE_TYPE_NAME
+    return name if type(name) is str else _UNREADABLE_TYPE_NAME
+
+
 def failure_summary(exc: BaseException) -> Dict[str, Any]:
     """A structural description of a contained failure, for the harness-side record.
 
@@ -210,15 +239,15 @@ def failure_summary(exc: BaseException) -> Dict[str, Any]:
     whoever raised it, a second time and outside the ``except`` that just caught it, so an
     accident in here would not stay caught. It would leave carrying the caller's job with it,
     and the caller's job at this point is committing a fail-closed verdict. ``SystemExit`` and
-    ``KeyboardInterrupt`` still propagate, the same line the rest of this package holds: an
-    interpreter-level signal costs the record loudly rather than being swallowed in a summary.
+    ``KeyboardInterrupt`` raised at the top level still propagate, the same line the rest of this
+    package holds: an interpreter-level signal costs the record loudly rather than being
+    swallowed in a summary.
     """
-    try:
-        name = type(exc).__name__
-    except (SystemExit, KeyboardInterrupt):
-        raise
-    except BaseException:  # noqa: BLE001 (a contained failure may not escape through its type)
-        return {"error": "<unreadable>"}
+    name = failure_type_name(exc)
+    if name == _UNREADABLE_TYPE_NAME:
+        # A type that would not say what it is has answered for the whole summary already:
+        # nothing more is asked of an object that refused that much.
+        return {"error": name}
     summary: Dict[str, Any] = {"error": name}
     try:
         # Structured errors are duck-typed rather than isinstance-checked against pydantic:
@@ -254,8 +283,9 @@ def args_digest(args: Optional[Dict[str, Any]]) -> Optional[str]:
 class FinalizationRecord:
     """One durable finalization record, keyed by ``(session_id, finalization_id)``.
 
-    ``verdict`` is the public-safe score exactly as the env's ``finalize`` returned it — evidence
-    of what the env said, not authority over what happened: :attr:`status` is where the core
+    ``verdict`` is the public-safe score the env's ``finalize`` returned, in the wire form the
+    serve layer normalized it to — evidence of what the env said, not authority over what
+    happened: :attr:`status` is where the core
     recorded the outcome, and :meth:`to_evidence` takes the outcome from that and only that,
     reconstructing the rest of the evidence around it. ``provenance`` and
     ``diagnostic`` are confidential (they live here, in the private store — never in the
@@ -287,7 +317,7 @@ class FinalizationRecord:
         reaches it only through ``TerminalEvidence.status``, the one channel that declares an
         outcome, and that is the same channel the live path answered from. Reading it back
         replays the live answer rather than deriving a second one. ``verdict`` is the opposite —
-        persisted as the env's ``finalize`` returned it, verbatim — so consulting it as well
+        persisted as the env's ``finalize`` returned it, in wire form — so consulting it as well
         would let an env overturn a decision the core had already made.
         Reading it by truthiness gets that wrong twice over, because an episode feedback value
         legally admits text and numbers and ``bool("false")`` is ``True``; but reading it

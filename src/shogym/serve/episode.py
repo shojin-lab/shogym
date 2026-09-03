@@ -31,6 +31,7 @@ import atexit
 import concurrent.futures
 import contextlib
 import contextvars
+import copy
 import functools
 import json
 import os
@@ -56,6 +57,7 @@ from shogym.serve.lifecycle import (
     args_digest,
     fail_closed_verdict,
     failure_summary,
+    failure_type_name,
 )
 from shogym.shared.terminate_mcp import TERMINATE_TOOL_NAME
 from shogym.task import TaskSpec
@@ -66,6 +68,7 @@ from shogym.trace import (
     terminal_event_record,
 )
 from shogym.trajectory import Step, Trajectory
+from shogym.types import EpisodeFeedback, InferenceFeedback
 from shogym.utils.uuid7 import uuid7
 
 
@@ -86,14 +89,150 @@ def _named(key: Any) -> str:
         return "<a key this schema cannot name>"
 
 
-def _json_safe(obj: Any) -> bool:
-    """True iff ``obj`` serializes to strict JSON (no NaN/Inf, only JSON types) — the same
-    contract the trace store enforces with ``allow_nan=False``."""
+# The declared outcomes this core accepts, as this module's own strings. An env's status is
+# matched against these and the match, not the env's object, is what the evidence keeps.
+_TERMINAL_STATUSES = ("ok", "finalize_error")
+
+# What the private diagnostic says when a returned envelope is refused, one fixed sentence per
+# field the refusal came from. The value that caused it is never rendered, and the field is named
+# because the row keeps nothing else of it: a reader repairing an env has only this sentence to
+# say where to look, and a sentence that names the wrong field sends them to a value that was
+# fine.
+_ENVELOPE_DIAGNOSTICS = {
+    "verdict": "finalize returned a non-dict or non-serializable verdict",
+    "status": "finalize returned an undeclared or unreadable status",
+    "envelope": "finalize returned terminal evidence that could not be read",
+}
+
+
+def _core_owned(
+    evidence: TerminalEvidence, *, source: str, confidence: Any
+) -> TerminalEvidence:
+    """The finalizer's envelope read exactly once, as plain values this module owns.
+
+    Everything after this reads the evidence again: the public payload, the durable record, the
+    trace event, the response. The envelope an env returned answers all of those with its own
+    code, and an object that answered the first read is not obliged to answer the second one the
+    same way or at all. Reading it once and keeping what that read produced is what makes the
+    later reads free of the env, and the whole read sits in front of the commit, where a refusal
+    is still an outcome this transaction can record rather than a raise mid-write that leaves the
+    durable record at ``PENDING``.
+
+    What survives the read is plain: the verdict is serialized once and read back, so it is JSON
+    values and a dict this module built, which is also what makes it safe to rebuild for the
+    durable record. The declared status is matched against :data:`_TERMINAL_STATUSES` and the
+    matching constant is kept, never the env's string. A diagnostic that is not exactly ``str``
+    and a failure that is not exactly ``dict`` are dropped rather than carried: both are private
+    fields, so losing one costs a reader detail, while carrying an env's object into the record
+    writer costs the row.
+
+    ``args`` passes through as it came. Nothing serializes or persists it, and the verifier is
+    the only thing that reads it again, so normalizing it would only turn an env's own value into
+    a fail-closed verdict for no gain in what can be written.
+
+    A verdict that is not a JSON object, a status this core does not declare, or any read that
+    refuses becomes the canonical fail-closed verdict here, before any commit. The diagnostic
+    that goes with it names the field the transaction was reading, because the returned value is
+    dropped and this sentence is the only thing left to send a reader to the right place; it
+    names the field and never renders what was in it. ``SystemExit`` and ``KeyboardInterrupt``
+    raised at the top level still propagate."""
+    reading = "verdict"
     try:
-        json.dumps(obj, allow_nan=False)
-        return True
-    except (ValueError, TypeError):
-        return False
+        verdict = json.loads(json.dumps(evidence.verdict, allow_nan=False))
+        if not isinstance(verdict, dict):
+            raise ValueError("verdict is not a JSON object")
+        reading = "status"
+        status = evidence.status
+        declared = next((known for known in _TERMINAL_STATUSES if known == status), None)
+        if declared is None:
+            raise ValueError("status is not one this core declares")
+        reading = "envelope"
+        diagnostic = evidence.diagnostic
+        failure = evidence.failure
+        return TerminalEvidence(
+            source=source,  # type: ignore[arg-type]
+            status=declared,  # type: ignore[arg-type]
+            verdict=verdict,
+            args=evidence.args,
+            diagnostic=diagnostic if type(diagnostic) is str else None,
+            failure=dict(failure) if type(failure) is dict else None,
+        )
+    except (SystemExit, KeyboardInterrupt):
+        raise
+    except BaseException:  # noqa: BLE001 — an envelope that will not be read is not committed
+        return TerminalEvidence(
+            source=source,  # type: ignore[arg-type]
+            status="finalize_error",
+            verdict=fail_closed_verdict(confidence),
+            diagnostic=_ENVELOPE_DIAGNOSTICS[reading],
+        )
+
+
+def _core_item(entry: Dict[str, Any]) -> Union[InferenceFeedback, EpisodeFeedback]:
+    """One feedback item rebuilt from its own wire form, carrying that form's values exactly.
+
+    The entry comes straight from :func:`~shogym.feedback.wire.dump_item`, which validated it
+    against the same schema the reader enforces, so this is a rebuild rather than a parse: the
+    item is core-owned from here and the verifier's object is never read again. The values are
+    placed rather than revalidated, because the only thing revalidating them would add is a
+    conversion: the wire contract admits an integer grade and the models' value type does not
+    name one, so a validating rebuild would turn a whole number into a float and the score kept
+    here, the score written to the trace and the score returned to the caller would stop being
+    the same number."""
+    if entry["level"] == "inference":
+        return InferenceFeedback.model_construct(
+            name=entry["name"], value=entry["value"], step=entry["step"]
+        )
+    return EpisodeFeedback.model_construct(name=entry["name"], value=entry["value"])
+
+
+def _detached(evidence: TerminalEvidence) -> TerminalEvidence:
+    """A copy of the terminal evidence for an env's verifier to hold.
+
+    :class:`~shogym.serve.lifecycle.TerminalEvidence` is an ordinary dataclass, so what a
+    verifier is handed it can also change, and the instance this handler is about to persist
+    cannot be a thing an env may edit: a verifier that sets ``status`` to ``ok`` on the object it
+    was given would otherwise turn a caught evaluator failure into a recorded success, with the
+    fail-closed diagnostic still beside it in the row. The verifier scores this copy, and every
+    value the transaction then selects, persists, traces and returns comes from the instance it
+    never saw.
+
+    The verdict is copied deeply, because that is the field a verifier reads into; it is plain
+    JSON by the time this runs, so copying it executes no code an env wrote. ``args`` is shared,
+    being the one field nothing reads again after verification."""
+    return TerminalEvidence(
+        source=evidence.source,
+        status=evidence.status,
+        verdict=copy.deepcopy(evidence.verdict),
+        args=evidence.args,
+        provenance=dict(evidence.provenance) if evidence.provenance is not None else None,
+        finalization_id=evidence.finalization_id,
+        diagnostic=evidence.diagnostic,
+        failure=dict(evidence.failure) if evidence.failure is not None else None,
+    )
+
+
+def _rendered(exc: BaseException) -> str:
+    """A failure's own account of itself for the private diagnostic, or its type name alone when
+    that account raises.
+
+    The diagnostic is written on the fail-closed path, and rendering the exception runs the
+    exception's code — an env's code, on the boundary where an env has just failed. Unguarded it
+    replaces the failure being recorded with a failure of the recording, inside the handler whose
+    whole job is to write the row, so the outcome is no row at all. The row outranks its own
+    prose: the message gives way and the type survives, which is the part a reader has to have.
+
+    The ordinary render is tried first and whole, so a failure that renders is rendered exactly
+    as it was before this guard existed and nothing else about the exception is read on the way
+    in. Only the fallback needs a name of its own, and it takes one from
+    :func:`~shogym.serve.lifecycle.failure_type_name`, which answers with a plain string or with
+    a fixed one."""
+    try:
+        return f"{type(exc).__name__}: {exc}"
+    except (SystemExit, KeyboardInterrupt):
+        raise
+    except BaseException:  # noqa: BLE001 — the record outranks the failure's account of itself
+        return failure_type_name(exc)
 
 
 def _wire_form(spec: TaskSpec) -> TaskSpec:
@@ -1149,6 +1288,12 @@ class ServedEpisode:
         # whose terminal call was cancelled before its verdict landed can still learn how the
         # episode ended, from the episode itself.
         self._finalization_tool: Optional[str] = None
+        # The digest of the args this terminal transaction was entered with, taken at the seal
+        # and reused by every row it writes. The args dict is the caller's and the evaluator is
+        # handed it, so digesting it again after the evaluator has run would be digesting a value
+        # an env may have changed, and doing that in the call to the durable write puts the read
+        # outside the guard the write keeps around itself.
+        self._args_digest: Optional[str] = None
         # The committed, core-owned terminal evidence (None until FINALIZED).
         self._evidence: Optional[TerminalEvidence] = None
         # Teardown is idempotent and runs exactly once (owned by the finalizer, after
@@ -2119,8 +2264,9 @@ class ServedEpisode:
         self._finalization_id = finalization_id
         self._finalization_source = source
         self._finalization_tool = tool_name
+        self._args_digest = args_digest(args)
         self._state = LifecycleState.SEALED
-        self._write_record("SEALED", source, args_digest(args))
+        self._write_record("SEALED", source, self._args_digest)
         finalization: "asyncio.Future[CallResult]" = asyncio.ensure_future(
             self._run_finalize(source, tool_name, args, finalization_id)
         )
@@ -2145,7 +2291,7 @@ class ServedEpisode:
         Fail-closed: an evaluator timeout/crash yields a ``finalize_error`` verdict
         (``correct=False``) rather than propagating, with only a private diagnostic (never
         exception text to the agent)."""
-        self._write_record("PENDING", source, args_digest(args))
+        self._write_record("PENDING", source, self._args_digest)
         confidence = args.get("confidence") if isinstance(args, dict) else None
         try:
             if source == "abort":
@@ -2185,6 +2331,9 @@ class ServedEpisode:
                     raise TypeError(
                         f"finalize must return TerminalEvidence, got {type(evidence)!r}"
                     )
+                # The env's last word, read here and not again. Everything below commits from
+                # values this module owns.
+                evidence = _core_owned(evidence, source=source, confidence=confidence)
         except (asyncio.CancelledError, asyncio.TimeoutError, Exception) as exc:
             # Fail-closed on ANY evaluator failure — including cancellation. A cancellation here
             # can only come from the *evaluator's own* awaited work being cancelled: the
@@ -2197,29 +2346,12 @@ class ServedEpisode:
                 source=source,  # type: ignore[arg-type]
                 status="finalize_error",
                 verdict=fail_closed_verdict(confidence),
-                diagnostic=f"finalize failed: {type(exc).__name__}: {exc}",
+                diagnostic=f"finalize failed: {_rendered(exc)}",
                 # The same failure, structurally, for the harness-side row. The diagnostic above
                 # stays private because it renders the failure's values; the summary carries only
                 # a type, a count and a fixed vocabulary, which is what a reader of an unscored
                 # row needs and all they may safely be told.
                 failure=failure_summary(exc),
-            )
-
-        # A verdict that isn't a JSON-object dict — a non-dict (e.g. a list, which
-        # `_sanitize_terminal`'s `dict(evidence.verdict)` would reject) or one that isn't
-        # JSON-serializable with allow_nan=False (a NaN/Inf, a non-JSON value) — would raise
-        # mid-commit: `_sanitize_terminal` at the terminal-step append (and the trace/store
-        # writes) run AFTER the episode reached FINALIZING with a PENDING record, so the raise
-        # would strand that record at PENDING and surface an exception to the client instead of
-        # the documented fail-closed result. Catch it here, before any commit, and fail closed to
-        # the canonical safe verdict so the terminal transaction always completes FINALIZED
-        # (fail-closed) and returns the safe result to the caller.
-        if not isinstance(evidence.verdict, dict) or not _json_safe(evidence.verdict):
-            evidence = TerminalEvidence(
-                source=source,  # type: ignore[arg-type]
-                status="finalize_error",
-                verdict=fail_closed_verdict(confidence),
-                diagnostic="finalize returned a non-dict or non-serializable verdict",
             )
 
         # Core stamps the non-forgeable fields — source, finalization_id, provenance — so a
@@ -2281,11 +2413,27 @@ class ServedEpisode:
                 # what it gets, and a verifier that cannot run inside it fails closed like one
                 # that raised.
                 try:
+                    # A copy for the verifier, never the instance this commits. What it scores
+                    # it can also edit, and the outcome of the transaction is not something the
+                    # thing being scored gets a second vote on.
                     feedback = await asyncio.wait_for(
-                        self._env_verify(terminated=True, evidence=evidence),
+                        self._env_verify(terminated=True, evidence=_detached(evidence)),
                         timeout=self._scoring_budget(),
                     )
-                    items = [*feedback.inference, *feedback.episode]
+                    # Inside the guard, because putting a feedback item on the wire validates it
+                    # and the item is the verifier's object: a value the wire form refuses is a
+                    # normal malformed output, and out here it would raise between the evidence
+                    # this transaction already failed closed in memory and the durable record
+                    # that says so, leaving the record at PENDING. A verifier whose feedback
+                    # cannot be recorded has failed the same way as one that raised.
+                    self._terminal_feedback = [
+                        dump_item(item) for item in (*feedback.inference, *feedback.episode)
+                    ]
+                    # Rebuilt from that wire form, so the trace row and the sidecar below
+                    # re-serialize items this module made out of plain scalars. The verifier's
+                    # own objects are read once, here, and a value that answers a second read
+                    # differently, or not at all, cannot reach a write.
+                    items = [_core_item(entry) for entry in self._terminal_feedback]
                 except BaseException as exc:  # noqa: BLE001 (verifier failure => fail closed)
                     # `BaseException`, so a `CancelledError` the verifier itself raised is
                     # contained like any other verifier failure. Let out, it cancels this
@@ -2300,7 +2448,10 @@ class ServedEpisode:
                         verdict=fail_closed_verdict(confidence),
                         provenance=evidence.provenance,
                         finalization_id=finalization_id,
-                        diagnostic="verify() raised while scoring the terminal evidence",
+                        diagnostic=(
+                            "verify() raised, or returned feedback that could not be recorded, "
+                            "while scoring the terminal evidence"
+                        ),
                         # This boundary fails closed like the evaluator's, so it owes the row the
                         # same account of what happened. A verifier defect and an evaluator defect
                         # are different repairs, and a row that names neither makes them look alike.
@@ -2308,7 +2459,7 @@ class ServedEpisode:
                     )
                     self._evidence = evidence
                     items = []
-                self._terminal_feedback = [dump_item(item) for item in items]
+                    self._terminal_feedback = []
                 # `verify` is awaited, so this transaction yields between appending the step and
                 # committing it, and the deadline's forced terminal can seal in that gap.
                 # Rechecked rather than assumed.
@@ -2325,7 +2476,7 @@ class ServedEpisode:
                 self._write_record(
                     "FAILED" if evidence.finalize_error else "FINALIZED",
                     source,
-                    args_digest(args),
+                    self._args_digest,
                     verdict=evidence.verdict,
                     provenance=evidence.provenance,
                     diagnostic=evidence.diagnostic,
@@ -2360,7 +2511,7 @@ class ServedEpisode:
                                 status=evidence.status,
                                 verdict=evidence.verdict,
                                 finalization_id=finalization_id,
-                                args_digest=args_digest(args),
+                                args_digest=self._args_digest,
                             ),
                         )
                     except Exception:  # noqa: BLE001 — trace is best-effort; never strand
