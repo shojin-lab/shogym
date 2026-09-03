@@ -429,6 +429,11 @@ class StreamState:
     ones the generation has authorized a change to a world for since that checkpoint committed.
     A replacement reads both before it claims, because the claim it then makes has to say which
     of them it put back.
+
+    ``graded_evidence`` names the object each committed score was taken out of. The score is a
+    number, and a reader that has the run's store can go from it to the verdict behind it: the
+    reference is the generation's own, and it is committed with the score rather than left in
+    the result of a call nobody kept.
     """
 
     generation_state: str
@@ -451,6 +456,7 @@ class StreamState:
     environment_call: Optional[str]
     prepared_seals: Dict[str, str]
     task_checkpoints: Dict[str, str]
+    graded_evidence: Dict[str, str]
     restoration_required: List[str]
     attempts: Dict[str, str]
     obligations: Dict[str, str]
@@ -485,13 +491,19 @@ class StreamOutcome:
 
 @dataclass(frozen=True)
 class SealAttemptInput:
-    """Ask the environment for its canonical pre-verdict submission and its local seal."""
+    """Ask the environment for its canonical pre-verdict submission and its local seal.
+
+    ``blob_root`` is where the environment installs the submission bytes it captured, so the
+    reference it returns names an object a later event may cite. A generation without a store
+    gets the reference anyway and nothing can be read back under it.
+    """
 
     attempt_id: str
     seal_id: str
     native_terminal_name: str
     canonicalization_version: str
     native_arguments: Dict[str, Any] = field(default_factory=dict)
+    blob_root: Optional[str] = None
     protocol_version: int = PROTOCOL_VERSION
 
 
@@ -515,13 +527,21 @@ class SealAttemptResult:
 
 @dataclass(frozen=True)
 class GradeAttemptInput:
-    """Grade sealed evidence, out of process, against a world nobody can still change."""
+    """Grade sealed evidence, out of process, against a world nobody can still change.
+
+    ``blob_root`` is where the environment installs the verdict it took, for the reason the
+    seal is given one: the reference the result carries is the run's own authoritative record
+    of what the score was taken from, and a reference to bytes no store holds is a name nothing
+    can resolve. A generation without a store gets the reference anyway and nothing can be read
+    back under it.
+    """
 
     attempt_id: str
     seal_id: str
     submission_digest: str
     canonical_submission_text: str
     environment_recovery_token: str
+    blob_root: Optional[str] = None
     protocol_version: int = PROTOCOL_VERSION
 
 
@@ -539,7 +559,7 @@ class GradeAttemptResult:
 
     attempt_id: str
     seal_id: str
-    score: int
+    score: float
     decode_state: str
     evidence: BlobRef
     protocol_version: int = PROTOCOL_VERSION

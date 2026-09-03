@@ -285,8 +285,8 @@ class _Lifecycle:
 
         The release of a session is the counterpart of opening it: a hook that reads a tenant out
         of a context variable to pick which resource to take must read the same one to give it
-        back. Copying the *closer's* context released whoever happened to be closing, and left
-        the opener's held."""
+        back. Copying the *closer's* context would release whoever happened to be closing and
+        leave the opener's held."""
 
         async def _run() -> Any:
             return fn(*args)
@@ -380,9 +380,7 @@ class _Lifecycle:
             return
         bound = timeout if timeout is not None else _EXIT_SECONDS
         self._thread.join(bound)
-        # A stop that asked for no wait has not timed out; it has not waited. Warning there said
-        # a hook was still running when nothing had been given a chance to finish, which is the
-        # message an unknown-env construction failure was producing with no env in existence.
+        # A stop that asked for no wait has not timed out; it has not waited.
         if bound > 0 and self._thread.is_alive():
             # Still inside a hook. Said out loud rather than dropped quietly: this lifecycle is
             # no longer tracked and nothing will wait for it again, so if it is holding a
@@ -430,7 +428,7 @@ def _forget_live_lifecycles() -> None:
     _LIVE = set()
     _LIVE_LOCK = threading.Lock()
     # And this one. A child that inherits it held by a thread that no longer exists blocks in
-    # `_env_close` for ever, which is the same fork hazard the pool had and the same repair.
+    # `_env_close` for ever.
     _ENV_CLOSE_LOCK = threading.Lock()
 
 
@@ -457,11 +455,11 @@ def _env_close(
 ) -> "_EnvClose":
     """The one close for this env, whoever asks and from wherever.
 
-    Guarded at the env and not at the call site. Every call site had its own guard, and each one
-    was right about its own path and blind to the others: a shutdown and a cancelled pull could
-    both decide, correctly by their own reading, that a build had no owner, and construct one
-    `_EnvClose` each. Two owners are two closes, because what makes a close single is the claim
-    inside one of these objects."""
+    Guarded at the env and not at the call site. A guard per call site is right about its own
+    path and blind to the others: a shutdown and a cancelled pull can both decide, correctly by
+    their own reading, that a build had no owner, and construct one `_EnvClose` each. Two owners
+    are two closes, because what makes a close single is the claim inside one of these
+    objects."""
     with _ENV_CLOSE_LOCK:
         existing = getattr(env, _ENV_CLOSE_ATTR, None)
         if isinstance(existing, _EnvClose):
@@ -560,10 +558,8 @@ class _EnvClose:
         """Close the env wherever it belongs, and tell this caller what that did.
 
         The caller's loop when the caller built it there, this lifecycle's loop when this
-        lifecycle built it. Setup cleanup used to call :meth:`here` on both, which runs
-        ``env.close()`` on whatever loop is asking: a flagged env that had bound its constructor
-        loop was closed on the caller's, which is the one thing building it off that loop was
-        meant to make impossible."""
+        lifecycle built it. :meth:`here` runs ``env.close()`` on whatever loop is asking, so a
+        flagged env that has bound its constructor loop may not be closed through it."""
         if self._owner is not None and _running_loop() is self._owner:
             await self.here()
             return
@@ -611,9 +607,9 @@ class _EnvClose:
         """The lifecycle's own half of the close, for a caller that is stopping the lifecycle.
 
         Not :attr:`outcome`. For a caller-owned env the outcome is completed by the caller's own
-        close, while the lifecycle-side watcher that was following it is still running; stopping
-        on the outcome halted that loop under it, and Python said so twice at every process exit.
-        This is the thing the loop is actually doing."""
+        close, while the lifecycle-side watcher that was following it is still running, so
+        stopping on the outcome halts that loop under it. This is the thing the loop is actually
+        doing."""
         self.close_env()
         with self._lock:
             return self._closing if self._closing is not None else self._outcome
@@ -759,8 +755,7 @@ class _SetupRollback:
         except BaseException:  # noqa: BLE001 - see below
             # `BaseException`, and the one that matters is `CancelledError`. An env's hook can
             # raise it like any other code, and this loop is nobody's caller, so one arriving
-            # here is the env's rather than an instruction. Caught as `Exception` it went past
-            # the env close below and left the env open.
+            # here is the env's rather than an instruction.
             pass
         finally:
             self._released.set()
@@ -771,9 +766,8 @@ class _SetupRollback:
                 # there is nothing left to wait for.
                 break
             await asyncio.sleep(0.01)
-        # And the lifecycle stops itself behind that close. Left to a caller continuation it was
-        # left to a coroutine that may never resume: a loop-loss rollback closed the env and then
-        # its own thread stayed alive for the life of the process.
+        # And the lifecycle stops itself behind that close. Left to a caller continuation it
+        # would be left to a coroutine that may never resume.
         self._lifecycle.stop_when(self._cleanup.watching())
 
     @property
@@ -938,8 +932,7 @@ def _discard_when_built(
     context is carried into the callback, because the close of a tenant-scoped env releases a
     tenant-scoped resource and the abandoned path is not where that should stop being true."""
     # Captured here, before the callback below runs: that callback fires in whichever thread
-    # finished the build, after the caller's context has been left behind, and the close of a
-    # tenant-scoped env releases a tenant-scoped resource.
+    # finished the build, after the caller's context has been left behind.
     context = contextvars.copy_context()
 
     def discard(finished: "concurrent.futures.Future[Any]") -> None:
@@ -993,8 +986,8 @@ def _discarded_env(
     done. The future is what a lifecycle is stopped behind.
 
     ``owner`` is the loop the env was built on, and it is not optional in the sense that matters:
-    hard-coded to ``None`` this closed a default-factory env, built on its caller's loop, on the
-    lifecycle loop instead, which is the one place a loop-bound env refuses."""
+    a default-factory env is built on its caller's loop, and closing it on the lifecycle loop
+    instead is the one place a loop-bound env refuses."""
     cleanup = _env_close(
         env,
         lifecycle,
@@ -1231,8 +1224,7 @@ class ServedEpisode:
             # Once per store directory per process, not once per episode. The no-trace store is
             # one directory shared by every session ever run on the machine, so reading it is
             # O(the machine's whole history), and the answer, "what did a process that is gone
-            # leave behind", is the same for every episode this process opens. Asked per episode
-            # it turned a suite that opens eighty of them into minutes of reading JSON (see
+            # leave behind", is the same for every episode this process opens (see
             # :meth:`FinalizationStore.recover_once`).
             try:
                 self._store.recover_once()
@@ -1273,7 +1265,7 @@ class ServedEpisode:
         if off_loop_factory:
             # No handler here, deliberately. A cancelled `_built` has already arranged the
             # discard of an env its factory is still making, and stopping the lifecycle beside
-            # that arrangement is what made it useless: marked stopped, it can no longer take the
+            # that arrangement would make it useless: marked stopped, it can no longer take the
             # discard when the build lands, so the env is built and then nothing can close it.
             # The lifecycle stops itself behind the discard, which is the same rule as everywhere
             # else here.
@@ -1338,7 +1330,7 @@ class ServedEpisode:
         env_name = env_name if env_name is not None else env.name
         # Every env method, on the loop that built the env. A flagged env may have bound its
         # constructor loop, and `load_task`, `essential_specs` and `describe` are env work like
-        # any other: run here they broke the same promise `finalize` was breaking.
+        # any other.
         async def on_env(fn: "Callable[..., Any]", *called: Any) -> Any:
             if built_on_lifecycle:
                 return await asyncio.wrap_future(lifecycle.call(fn, *called))
@@ -1385,8 +1377,7 @@ class ServedEpisode:
                 raise
             # From here the env holds a session, so every failure below owes it a release, and
             # that release goes the same way this one would have: on the lifecycle loop, never
-            # on the caller's. `env.close()` is what used to do it, and `Env.close` runs the hook
-            # inline, so a slow release on a `describe` that raised froze the whole server.
+            # on the caller's.
             began = session_id
             # The one description this episode ever asks for. Everything published about the task
             # and everything enforced on it comes off this single answer — see the snapshot the
@@ -1418,27 +1409,25 @@ class ServedEpisode:
             # told "close boom" instead of "setup boom" has been handed the wrong problem, so a
             # cleanup failure is attached to the setup one as a note rather than raised over it.
             # Arranged before anything is awaited, so a cancellation delivered part-way through
-            # cleanup cannot leave the rest of it undone. It used to: a cancel while one session
-            # close was pending re-raised at once and skipped the sessions after it, the rollback,
-            # the env close and the lifecycle's own shutdown.
+            # cleanup cannot leave the rest of it undone.
             if began is not None:
                 rollback = rollback or _SetupRollback(lifecycle, env, began, cleanup)
             disposing = asyncio.ensure_future(_disposed(opened, setup_failed))
             disposing.add_done_callback(_swallow)
             if rollback is not None:
-                # Told by the *task*, not by whoever gets to the line after the await. A caller
-                # cancelled mid-disposal used to say the sessions were closed while one of them
-                # was still closing, and the rollback then ran `Env.close` underneath it.
+                # Told by the *task*, not by whoever gets to the line after the await: a caller
+                # cancelled mid-disposal would say the sessions were closed while one of them
+                # was still closing, and the rollback would then run `Env.close` underneath it.
                 disposing.add_done_callback(lambda _f: rollback.sessions_closed())
             try:
                 await asyncio.shield(disposing)
             except BaseException as closing_failed:  # noqa: BLE001 - noted, not raised
                 if isinstance(closing_failed, asyncio.CancelledError) and _caller_cancelled():
                     # Handed back, and everything after it is *chained from the disposal* rather
-                    # than started here. Started here, the close ran before the sessions this
-                    # setup opened had finished closing, on both branches: with a rollback,
+                    # than started here. Started here, the close runs before the sessions this
+                    # setup opened have finished closing, on both branches: with a rollback,
                     # because `watching()` starts the close itself; and without one, because this
-                    # was the only line that ever would. `Env.close` releases what the constructor
+                    # is the only line that would. `Env.close` releases what the constructor
                     # made and those clients are still using it, so it goes behind them.
                     if not handed_over:
                         _closed_when_disposed(disposing, lifecycle, cleanup, rollback)
@@ -1525,6 +1514,16 @@ class ServedEpisode:
     @property
     def session_id(self) -> str:
         return self._session_id
+
+    @property
+    def env(self) -> Any:
+        """The env this episode is of.
+
+        Read only, and for a caller that has to ask the env something this layer does not
+        publish. A durable stream asks it whether it brings its own terminal, because sealing a
+        world and grading what was sealed are two steps there rather than one, and only the env
+        that owns the world knows how to take either."""
+        return self._env
 
     @property
     def seal_enabled(self) -> bool:
@@ -1684,12 +1683,10 @@ class ServedEpisode:
             if not self._seal_enabled:
                 if overtakes and self._inflight is not None and not self._inflight.done():
                     # The deadline, over a call this episode has already accepted. Dispatching a
-                    # second one here put two `_legacy_step` coroutines on the same next index:
-                    # the forced one ended the episode, then the old one landed, appended after
-                    # `end_session`, and set `_terminated` back to False over a row the stream
-                    # had already published. So this ends the episode against the operation that
-                    # is running rather than starting another beside it, and the operation is
-                    # tombstoned when it lands.
+                    # second one here would put two `_legacy_step` coroutines on the same next
+                    # index, so this ends the episode against the operation that is running
+                    # rather than starting another beside it, and the operation is tombstoned
+                    # when it lands.
                     return await self._forced_legacy_ending(tool_name)
                 # Non-seal env: the single-step path. Owned and awaited outside the lock for the
                 # same reasons the seal-enabled one is: a cancelled caller would otherwise
@@ -1729,17 +1726,13 @@ class ServedEpisode:
             if not is_horizon:
                 return result
             # The horizon finalization was begun by the dispatch itself, as part of committing
-            # the step that reached the budget (see `_begin_dispatch`). Deciding it here, in the
-            # caller's continuation, meant a caller cancelled while the horizon-reaching tool was
-            # blocked left the step committed and nobody to seal it: the episode stayed open past
-            # its budget, accepted another call, and closed as an abort rather than a horizon.
+            # the step that reached the budget (see `_begin_dispatch`). A caller cancelled while
+            # the horizon-reaching tool was blocked would otherwise leave the step committed and
+            # nobody to seal it.
             if result.tombstoned:
                 # Sealed under this call while it ran: only the deadline's forced terminal does
                 # that, and the dispatch said so. Reading `self._finalization` instead could not
-                # tell this apart, because the forced seal is exactly what populated it, so the
-                # overtaken caller was handed the deadline's own terminal result: two callers
-                # with the same terminal content, one of which ended nothing, and a stream that
-                # takes the second for an agent seal.
+                # tell this apart, because the forced seal is exactly what populated it.
                 return result
             finalization = self._finalization
             if finalization is None:
@@ -1849,9 +1842,9 @@ class ServedEpisode:
         installed itself, and a waiter that returns without looking walks straight past it.
 
         **This waiter's own cancellation is not the operation ahead failing.** Returning on it
-        let the same coroutine carry on into `_begin_dispatch` and replace `_inflight` while the
-        first operation was still inside the env: two ordinary calls in one episode at once, the
-        second committing its step over the first. A cancellation asked for against this task
+        would let the same coroutine carry on into `_begin_dispatch` and replace `_inflight` while
+        the first operation is still inside the env: two ordinary calls in one episode at once,
+        the second committing its step over the first. A cancellation asked for against this task
         goes back to its caller."""
         while True:
             inflight = self._inflight
@@ -1871,10 +1864,8 @@ class ServedEpisode:
         """Run the dispatch and, in the same operation, seal the episode it just finished.
 
         The horizon terminal is not a second decision made about a committed step; it is part of
-        committing it. Left to the caller, a cancellation between the two produced an episode
-        whose budget was spent, whose step was in the trajectory, and which nothing had ended:
-        the next call was accepted over it, and a close recorded an abort where the horizon
-        outcome belonged."""
+        committing it. Left to the caller, a cancellation between the two would produce an episode
+        whose budget was spent, whose step was in the trajectory, and which nothing had ended."""
         outcome = await runner
         async with self._lock:
             # The world may have been sealed under this call while it ran: only the deadline's
@@ -1890,22 +1881,20 @@ class ServedEpisode:
         """End a non-seal episode against the ordinary call it is still running.
 
         **Called under the lock, and it dispatches nothing.** A non-seal env has no seal
-        transaction to end an episode with, so the deadline's terminal used to be an ordinary
-        call like any other; forced past the queue it became a *second* operation on one
-        episode's next index. This ends the episode where it stands instead: what the trajectory
-        holds is what was committed, the verifier is run over exactly that, and the call still in
-        the env is tombstoned when it lands (see `_legacy_step`)."""
+        transaction to end an episode with, and the deadline's terminal dispatched as an ordinary
+        call, forced past the queue, would be a *second* operation on one episode's next index.
+        This ends the episode where it stands instead: what the trajectory holds is what was
+        committed, the verifier is run over exactly that, and the call still in the env is
+        tombstoned when it lands (see `_legacy_step`)."""
         self._terminated = True
         self._preempted = self._inflight_tool
         feedback = await self._env_verify(terminated=True)
         items = [*feedback.inference, *feedback.episode]
         self._terminal_feedback = [dump_item(item) for item in items]
-        # **No trace row.** A step row is one dispatched call, and this dispatches nothing: written
-        # at `self._step` it either duplicated the previous call's index or, when the deadline
-        # overtook the first call, invented a step 0 for a `terminate` that never ran. The trace
-        # ends at the last call that really happened, which is what it is for; the verdict is on
-        # this result and in `_terminal_feedback`, which is where a non-seal ending has always
-        # been read from.
+        # **No trace row.** A step row is one dispatched call, and this dispatches nothing. The
+        # trace ends at the last call that really happened, which is what it is for; the verdict
+        # is on this result and in `_terminal_feedback`, which is where a non-seal ending is read
+        # from.
         inband = select_inband(items, terminal=True, surface_inference=False)
         return CallResult(
             content="<episode ended by the deadline; no further tool calls are dispatched>",
@@ -2005,10 +1994,8 @@ class ServedEpisode:
         )
         feedback = await self._env_verify(terminated=terminated)
         if self._terminated or self._state is not LifecycleState.OPEN:
-            # Sealed while this was verifying. The check before the step was not enough: the
-            # verifier is awaited, and the deadline's forced terminal can seal in that gap, so
-            # this caller used to come back holding the forced terminal's own result with
-            # `tombstoned` false, as a second terminal caller over one episode.
+            # Sealed while this was verifying. The check before the step is not enough: the
+            # verifier is awaited, and the deadline's forced terminal can seal in that gap.
             return self._sealed_tombstone(), self._step
         items = [*feedback.inference, *feedback.episode]
         if self._trace_path is not None and write_trace:
@@ -2258,11 +2245,11 @@ class ServedEpisode:
                 #
                 # **Bounded, and for the same reason the evaluator is.** `verify` runs on the loop
                 # that owns the env, and on the deadline path that loop is still holding the
-                # evaluator this transaction just timed out: awaiting it there put the fail-closed
-                # answer *behind* the thing the deadline exists to stop waiting for, so the
-                # promised bound was not a bound at all. What is left of the budget is what it
-                # gets, and a verifier that cannot run inside it fails closed like one that
-                # raised.
+                # evaluator this transaction just timed out: awaiting it there would put the
+                # fail-closed answer *behind* the thing the deadline exists to stop waiting for,
+                # so the promised bound would not be a bound at all. What is left of the budget is
+                # what it gets, and a verifier that cannot run inside it fails closed like one
+                # that raised.
                 try:
                     feedback = await asyncio.wait_for(
                         self._env_verify(terminated=True, evidence=evidence),
@@ -2271,9 +2258,9 @@ class ServedEpisode:
                     items = [*feedback.inference, *feedback.episode]
                 except BaseException as exc:  # noqa: BLE001 (verifier failure => fail closed)
                     # `BaseException`, so a `CancelledError` the verifier itself raised is
-                    # contained like any other verifier failure. Let out, it cancelled this
-                    # transaction after the in-memory evidence was set and before the durable
-                    # record was replaced: an episode neither finalized nor recoverable. A
+                    # contained like any other verifier failure. Let out, it cancels this
+                    # transaction after the in-memory evidence is set and before the durable
+                    # record is replaced: an episode neither finalized nor recoverable. A
                     # cancellation asked for against this task is a different thing and goes back.
                     if isinstance(exc, asyncio.CancelledError) and _caller_cancelled():
                         raise
@@ -2292,10 +2279,9 @@ class ServedEpisode:
                     self._evidence = evidence
                     items = []
                 self._terminal_feedback = [dump_item(item) for item in items]
-                # `verify` is awaited now, so this transaction yields between appending the step
-                # and committing it, and the deadline's forced terminal can seal in that gap.
-                # Rechecked rather than assumed: two callers came back with the same abort payload
-                # and neither tombstoned, over a trajectory that had grown a second terminal.
+                # `verify` is awaited, so this transaction yields between appending the step and
+                # committing it, and the deadline's forced terminal can seal in that gap.
+                # Rechecked rather than assumed.
                 if self._finalization_id is not None and finalization_id != self._finalization_id:
                     return self._sealed_tombstone()
 
@@ -2452,11 +2438,10 @@ class ServedEpisode:
 
         The session is claimed on the caller's loop and the hook runs on the lifecycle's.
         Claiming first is what makes the later ``env.close()`` in :meth:`close` safe: the id is
-        gone from the env the instant
-        this returns, so a close that arrives while the hook is still running finds nothing of
-        this session left and cannot enter the hook a second time. That is the whole failure a
-        bounded teardown used to create: abandoning the wait left the first hook running, and
-        `close` went straight into the second.
+        gone from the env the instant this returns, so a close that arrives while the hook is
+        still running finds nothing of this session left and cannot enter the hook a second time.
+        A bounded teardown that abandons its wait leaves the first hook running, and this is what
+        keeps `close` out of a second one.
 
         A session somebody else has already claimed (a rollback that ran, an earlier close) gets
         an already-finished future, because the release it names has an owner."""
@@ -2480,8 +2465,8 @@ class ServedEpisode:
         happens, and it is allowed to have bound it in its constructor. ``finalize`` is env work
         like any other, so running it on the serving caller's loop breaks exactly the promise
         that made building it off that loop safe, and the affinity error it raises comes back as
-        a fail-closed verdict: a valid episode scored zero because the serve layer used the wrong
-        loop. An env the caller built keeps the caller's loop here, as it does everywhere else.
+        a fail-closed verdict. An env the caller built keeps the caller's loop here, as it does
+        everywhere else.
 
         The future is this loop's either way, so the deadline, the shield and the drain around it
         are unchanged."""
@@ -2519,14 +2504,13 @@ class ServedEpisode:
 
         A flagged env was told its work happens on its episode's lifecycle loop, and it is
         allowed to have bound that loop in its constructor. `load_task`, `describe`, `verify` and
-        the rest are env work like any other, and running them on the serving caller's loop broke
-        the same promise `finalize` was breaking: a fixture that checked its loop in `_load_task`
-        failed on the first dispense. An env the caller built keeps the caller's loop here, where
-        this is a direct call and costs nothing."""
+        the rest are env work like any other, so running them on the serving caller's loop breaks
+        that same promise. An env the caller built keeps the caller's loop here, where this is a
+        direct call and costs nothing."""
         if self._cleanup.owned_by_caller:
             # Off the serving loop even here. These are the env's own synchronous hooks, and one
             # that blocks blocks everything this process is serving; run inline, a `wait_for`
-            # around it could not preempt it either, so a bound over it was not a bound. The
+            # around it could not preempt it either, so a bound over it would not be a bound. The
             # context travels, as it does for every other hook.
             context = contextvars.copy_context()
             return await asyncio.to_thread(context.run, fn, *args)
@@ -2536,8 +2520,8 @@ class ServedEpisode:
         """What is left of the caller's answer deadline, not another whole one.
 
         The deadline is a promise about when an answer arrives, and the evaluator and the verifier
-        are both inside it. Given the full value each, the promise was worth twice what it said,
-        and a terminal call took the evaluator's share plus the verifier's on top."""
+        are both inside it. Given the full value each, the promise would be worth twice what it
+        says, and a terminal call would take the evaluator's share plus the verifier's on top."""
         if self._finalize_deadline is None:
             return None
         if self._answer_deadline is None:
@@ -2566,10 +2550,10 @@ class ServedEpisode:
         that hook itself.
 
         **What a second caller joins is the release, not the fact that somebody started a
-        wait.** A flag meaning "a wait has been made" let a second close skip to the env close
-        over a release still running, which is the overlap this whole design exists to prevent.
-        The release future is the shared state, so a second caller waits exactly as long as the
-        first one has left."""
+        wait.** A flag meaning "a wait has been made" would let a second close skip to the env
+        close over a release still running, which is the overlap this whole design exists to
+        prevent. The release future is the shared state, so a second caller waits exactly as long
+        as the first one has left."""
         release = self._release()
         if release.done():
             return
@@ -2593,7 +2577,7 @@ class ServedEpisode:
         except Exception:
             pass
 
-    async def close(self) -> None:
+    async def close(self, *, finalize: bool = True) -> None:
         # close() participates in the lifecycle for a seal env. If a finalization is in flight,
         # WAIT for it to commit evidence + tear down before disposing anything (so the
         # evaluator's live session isn't reclaimed mid-finalize); otherwise atomically claim an
@@ -2601,18 +2585,27 @@ class ServedEpisode:
         # residual state. For a non-seal env none of this engages (state stays OPEN with no
         # finalization), so close() is just the plain teardown below.
         #
+        # `finalize=False` is a caller saying that this episode's ending is not this episode's
+        # to decide. A durable stream is that caller: the terminal never reaches this lifecycle,
+        # so the lifecycle is still OPEN when the attempt has already been sealed, scored and
+        # acknowledged elsewhere, and the abort claimed below would be a second result for it,
+        # durably recorded and contradicting the first. What such a close still does is
+        # everything else: an in-flight finalization is waited for, sessions are disposed, and
+        # the env is torn down and released exactly as they are for a caller that owns the
+        # ending. The default is the standalone serving path, where an episode that closes
+        # without a seal did abort and the record of that is the only one there will be.
+        #
         # **One `finally`, from the first await.** Everything below can be cancelled: a
         # finalization that is shielded but joined, an MCP session's own close, the wait for the
-        # release. A cancellation at any of them used to leave this method before it had arranged
-        # the env close or the lifecycle's shutdown, so the env stayed open and its thread stayed
-        # alive. What the `finally` runs is arrangement rather than waiting, so a cancelled close
-        # still hands both to the lifecycle, and the lifecycle finishes them.
+        # release. What the `finally` runs is arrangement rather than waiting, so a cancelled
+        # close still hands the env close and the lifecycle's shutdown to the lifecycle, and the
+        # lifecycle finishes them.
         try:
             # An accepted call is using the session everything below is about to release. This
             # is not the deadline's overtake: an ordinary close waits for it, within the same
             # bound the rest of teardown gets, and only then claims an abort. Released under it,
-            # `_end_session` took the env's per-call state away while the call was still inside
-            # the tool, and the call came back tombstoned or with a dead transport.
+            # `_end_session` takes the env's per-call state away while the call is still inside
+            # the tool, and the call comes back tombstoned or with a dead transport.
             inflight = self._inflight
             if inflight is not None and not inflight.done():
                 with contextlib.suppress(Exception):
@@ -2622,9 +2615,7 @@ class ServedEpisode:
                 if not inflight.done():
                     # It has outrun the bound. From here the episode ends against it, exactly as
                     # the deadline does, and the call is tombstoned when it lands. For a non-seal
-                    # env that gate is `_terminated` and nothing else sets it: without this the
-                    # close tore the session down, returned, and the call then committed step 1
-                    # and ran `verify` against an env that was gone.
+                    # env that gate is `_terminated` and nothing else sets it.
                     async with self._lock:
                         self._preempted = self._inflight_tool
                         if not self._seal_enabled:
@@ -2633,7 +2624,7 @@ class ServedEpisode:
             if self._seal_enabled:
                 async with self._lock:
                     finalization = self._finalization
-                    if finalization is None and self._state is LifecycleState.OPEN:
+                    if finalization is None and finalize and self._state is LifecycleState.OPEN:
                         # No seal happened (a score env closed before submitting): claim an abort
                         # finalization so this close owns teardown + records a no-score verdict.
                         finalization = self._begin_finalization("abort", None, None)
@@ -2655,7 +2646,7 @@ class ServedEpisode:
 
             # Close every MCP session opened for this episode, then let the env tear down its own
             # per-session state. Disposal is one retained operation rather than a loop this
-            # caller owns: cancelled halfway it used to leave the rest open, and a session marks
+            # caller owns: cancelled halfway it would leave the rest open, and a session marks
             # itself closed before it awaits the transport, so a later close is not a retry.
             # Shielded, so this caller's cancellation abandons the wait and not the work.
             disposing = self._dispose_sessions()
@@ -2691,15 +2682,13 @@ class ServedEpisode:
         **Behind every owner, not only the finalization.** An env is owned in turn by its
         finalization while that is grading, by the drain that is still holding the evaluator after
         a deadline committed the verdict early, and by the MCP clients that are still talking to
-        it. Arranged in front of any of them, a cancelled `close()` released the session and ran
-        `_close` underneath: a correct submission came back `correct=false` because its gold
-        answer had been taken away, and a deadline path left the evaluator running against state
-        that was already gone. So this waits for each of them in turn, by hanging off the one
+        it. Arranged in front of any of them, a cancelled `close()` releases the session and runs
+        `_close` underneath it. So this waits for each of them in turn, by hanging off the one
         ahead rather than by anyone standing there, and only then closes.
 
         The sessions are one of those owners and are disposed here rather than left to the next
-        caller. A cancelled close used to skip them entirely, and `ClientMCPSession.close` marks
-        itself closed before it awaits the transport, so a second close is not a retry: the
+        caller. A cancelled close would otherwise skip them entirely, and `ClientMCPSession.close`
+        marks itself closed before it awaits the transport, so a second close is not a retry: the
         subprocess it was going to reap stays."""
         if self._teardown_arranged:
             return
@@ -2711,10 +2700,10 @@ class ServedEpisode:
 
         **Lazily, and in order, and never from a list.** The owners are created by each other: a
         deadline's finalization completes and only *then* makes the drain and the evaluator that
-        outlive it. A list built when the teardown was arranged captured those as ``None`` and
-        skipped them, and closed the env under an evaluator that had been created since. Worse,
-        naming the session disposal in that list *started* it, so the transport was being closed
-        underneath the finalizer the ordering exists to protect.
+        outlive it. A list built when the teardown is arranged captures those as ``None`` and
+        skips them, closing the env under an evaluator created since. Worse, naming the session
+        disposal in that list *starts* it, so the transport is closed underneath the finalizer the
+        ordering exists to protect.
 
         So this asks who owns the env now, waits for that one, and asks again. The disposal is
         started last, when it is genuinely the last owner, and the dispatch is asked about first,
@@ -2739,7 +2728,7 @@ class ServedEpisode:
         """Close every MCP session this episode opened, once, as an operation of its own.
 
         Retained rather than awaited inline, for the reason the env hooks are: a cancellation
-        between two of them left the rest open, and a session's own close is not retryable
+        between two of them leaves the rest open, and a session's own close is not retryable
         because it marks itself closed before it awaits the transport it is reaping. A caller
         that stays awaits this; a caller that is cancelled leaves it running and the teardown
         waits behind it."""
@@ -2768,11 +2757,11 @@ class ServedEpisode:
         """The arrangement itself: the release, then one close, then the shutdown behind it.
 
         The release is issued *here* and not only on the path that awaited it. A cancellation at
-        an earlier await jumped straight to the arrangement with the session still unclaimed, and
+        an earlier await jumps straight to the arrangement with the session still unclaimed, and
         the base `Env.close` this ends in releases any session it still finds, synchronously, on
-        whichever loop it was posted to: a three-hundred-millisecond hook ran on the serving loop
-        and stopped everything else on it. Claimed first, that close has nothing of this
-        episode's left to do."""
+        whichever loop it was posted to: a three-hundred-millisecond hook on the serving loop
+        stops everything else on it. Claimed first, that close has nothing of this episode's left
+        to do."""
         self._release()
         self._lifecycle.stop_when(self._cleanup.watching())
 

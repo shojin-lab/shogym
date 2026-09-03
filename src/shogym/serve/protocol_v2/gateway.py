@@ -57,6 +57,7 @@ from typing import (
     Dict,
     FrozenSet,
     List,
+    NamedTuple,
     Optional,
     Sequence,
     Tuple,
@@ -105,6 +106,7 @@ from shogym.serve.protocol_v2.kernel import (
     configuration_hash,
     discard_stream,
     durable_client,
+    kernel_activities,
     protocol_error_code,
     start_stream,
     stream_worker,
@@ -146,8 +148,53 @@ EpisodeOpener = Callable[[str], Awaitable[ServedEpisode]]
 #: minted where the generation is, so a composer that gates one is handed the tasks it gates.
 ReleaseFor = Callable[[Sequence[TaskItem]], ReleasePlan]
 
-# The version this gateway declares for the canonical submission its terminal captures. The
-# capture itself belongs to the environment, so the name says which gateway made the promise.
+
+class WorldRoute:
+    """Which world each attempt filed in, for an environment that ends an attempt in its own.
+
+    The pairing exists nowhere else. A generation works each task in a world of its own, this
+    gateway is what opens them, and the environment's Activities are registered on a Worker
+    before the first of those worlds exists. An environment asked for its terminal is therefore
+    handed this rather than one world, and it resolves an attempt when it seals rather than when
+    it is registered.
+
+    An attempt this process never opened a world for resolves to nothing, which is what every
+    attempt resolves to in a process that took the generation over. That is the answer the
+    environment needs: there is no world here, so either the evidence was already captured under
+    the seal id or this owner cannot capture it.
+    """
+
+    def __init__(self) -> None:
+        self._worlds: Dict[str, ServedEpisode] = {}
+
+    def record(self, attempt_id: str, episode: ServedEpisode) -> None:
+        """Say that this attempt is working in this episode's world."""
+        self._worlds[attempt_id] = episode
+
+    def __call__(self, attempt_id: str) -> Optional[Tuple[Any, str]]:
+        """The environment and session this attempt filed in, or ``None`` if not this process."""
+        episode = self._worlds.get(attempt_id)
+        return None if episode is None else (episode.env, episode.session_id)
+
+
+class EnvironmentTerminal(NamedTuple):
+    """What an environment answers when a generation asks how its attempts end.
+
+    ``configuration_digest`` is the environment's half of what the generation is. The served
+    manifest carries the instructions and the tools, and an environment may have more than that
+    deciding what a filing is worth, so what it publishes here is folded into the identity a
+    resume checks itself against.
+    """
+
+    canonicalization_version: str
+    activities: List[Any]
+    configuration_digest: Optional[str]
+    route: WorldRoute
+
+# The version a generation declares for the canonical submission its terminal captures when the
+# environment does not declare one of its own. The capture belongs to the environment, so the name
+# says which gateway made the promise, and an environment that brings its own terminal replaces
+# both the promise and the Activities that keep it (see :func:`environment_terminal`).
 CANONICALIZATION_VERSION = "shogym.gateway.1"
 
 # The version of the surface this gateway renders around an environment: the control tool it
@@ -294,9 +341,20 @@ def served_manifest(spec: TaskSpec, terminal: ToolManifest) -> Dict[str, Any]:
     }
 
 
-def _configuration_hash(spec: TaskSpec, terminal: ToolManifest) -> str:
-    """Hash what the generation is serving, so a resume can refuse a changed configuration."""
-    return sha256(canonical_json(served_manifest(spec, terminal))).hexdigest()
+def _configuration_hash(
+    spec: TaskSpec, terminal: ToolManifest, environment_digest: Optional[str] = None
+) -> str:
+    """Hash what the generation is serving, so a resume can refuse a changed configuration.
+
+    The served manifest is what a model can see: the instructions, the tools, the schemas. An
+    environment may also have settings that decide what a filing is worth without appearing in
+    any of that, and one that publishes a digest of them has it folded in here. One that
+    publishes nothing hashes exactly what it hashed before.
+    """
+    manifest = served_manifest(spec, terminal)
+    if environment_digest is not None:
+        manifest = {**manifest, "environment": environment_digest}
+    return sha256(canonical_json(manifest)).hexdigest()
 
 
 def stream_start(
@@ -308,6 +366,8 @@ def stream_start(
     release: Optional[Union[ReleasePlan, ReleaseFor]] = None,
     without_payload: Sequence[int] = (),
     evaluation_only: bool = False,
+    canonicalization_version: str = CANONICALIZATION_VERSION,
+    environment_digest: Optional[str] = None,
 ) -> StreamStart:
     """Return a generation that serves ``spec``.
 
@@ -324,6 +384,13 @@ def stream_start(
     leg's filler is what needs them. An evaluation-only generation is one that scores without
     delivering: it pins Never, and a plan that would produce an outbox is refused here rather
     than left to be noticed when a payload turns up in a transcript.
+
+    ``canonicalization_version`` and ``environment_digest`` are what the environment answered
+    when it was asked how its attempts end. The first is what the acknowledgements declare their
+    digests were taken under; the second is the environment's half of what this generation is,
+    and it goes into the configuration hash a resume checks itself against, so a generation
+    restarted under a differently configured environment is refused before it is worked rather
+    than scored against a key nobody drew for it.
 
     What comes back is a generation the stream would accept, because the same check the stream
     makes at start is made here, where the caller composing a run is the one who reads it.
@@ -359,13 +426,13 @@ def stream_start(
     )
     check_release(plan, roster, evaluation_only=evaluation_only)
     return StreamStart(
-        configuration_hash=_configuration_hash(spec, terminal),
+        configuration_hash=_configuration_hash(spec, terminal, environment_digest),
         consumer_claim_hash=claim_hash,
         initial_cursor=_opaque(),
         done_message_id=_opaque(),
         id_key_hex=secrets.token_hex(32),
         hidden_execution_id=_opaque(),
-        canonicalization_version=CANONICALIZATION_VERSION,
+        canonicalization_version=canonicalization_version,
         terminal_tool=TerminalTool(
             public_tool_name=terminal.name,
             native_terminal_name=terminal.name,
@@ -563,6 +630,7 @@ class StreamGateway:
         open_episode: Optional[EpisodeOpener] = None,
         blobs: Optional[BlobStore] = None,
         generation: Optional[StreamStart] = None,
+        environment: Optional[EnvironmentTerminal] = None,
     ) -> None:
         self._stream = stream
         # The composition this generation was started from, when this gateway is the thing that
@@ -576,6 +644,16 @@ class StreamGateway:
         self._episode: Optional[ServedEpisode] = episode
         self._world_attempt: Optional[str] = None
         self._open_episode = open_episode
+        # What the environment answered when this generation was composed: the version its
+        # acknowledgements declare their digests under, and the digest of what it is configured
+        # as. The generation's identity was built from that answer, so it is what every world
+        # opened afterwards is held to. It is ``None`` for a gateway that was never given one,
+        # which committed to nothing about an environment and so holds nothing to anything.
+        self._declared_environment = environment
+        # Where the pairing of attempt to world is written down, for the environment that seals
+        # by stopping the world an attempt worked in. It is recorded as each world opens, which
+        # is the only moment both halves of the pair are in one place.
+        self._route = WorldRoute() if environment is None else environment.route
         self._spec = spec
         self._terminal = terminal.name
         self._cursor = initial_cursor
@@ -1357,12 +1435,24 @@ class StreamGateway:
         The opener is told the attempt its world is for, and this is the only moment anything
         outside this gateway can learn it. Ordinary calls are routed here, but sealing is the
         environment's own, and an environment that seals by stopping a world it started is
-        handed an attempt ID and has to find that attempt's world from it.
+        handed an attempt ID and has to find that attempt's world from it. So the pair is
+        written into the route here, in both branches: the episode this generation was opened on
+        belongs to the first attempt as surely as an opened one belongs to the next.
+
+        A world that is not the environment this generation declared is refused instead. The
+        declaration was taken from the episode this generation was opened on and folded into
+        what the generation is, and an opener is free to answer with anything: an environment
+        configured differently scores a filing against a different hidden rule, so a task worked
+        in one would be graded under a configuration nothing committed to while the generation's
+        own identity still named the first world's. The refusal comes before the world is routed
+        or the task presented, because a world nothing can seal is better than a world sealed
+        against the wrong rule, and what was opened is let go of rather than left running.
         """
         if self._world_attempt == attempt_id:
             return
         if self._world_attempt is None and self._episode is not None:
             self._world_attempt = attempt_id
+            self._route.record(attempt_id, self._episode)
             return
         await self._close_world()
         if self._open_episode is None:
@@ -1370,8 +1460,25 @@ class StreamGateway:
                 "this generation has a task after the one its episode was opened for, and no "
                 "way to open a world for it"
             )
-        self._episode = await self._open_episode(attempt_id)
+        opened = await self._open_episode(attempt_id)
+        started_as = self._declared_environment
+        if started_as is not None:
+            declared = environment_terminal(opened)
+            if (
+                declared.canonicalization_version != started_as.canonicalization_version
+                or declared.configuration_digest != started_as.configuration_digest
+            ):
+                await _let_go(opened)
+                raise RuntimeError(
+                    "the world opened for this task is not the environment this generation was "
+                    f"started as: it declares {declared.canonicalization_version!r} configured "
+                    f"as {declared.configuration_digest!r}, and this generation was started as "
+                    f"{started_as.canonicalization_version!r} configured as "
+                    f"{started_as.configuration_digest!r}"
+                )
+        self._episode = opened
         self._world_attempt = attempt_id
+        self._route.record(attempt_id, opened)
 
     async def _close_world(self) -> None:
         """Let go of the world an attempt is done with.
@@ -1387,7 +1494,7 @@ class StreamGateway:
         """
         episode = self._episode
         if episode is not None:
-            await episode.close()
+            await _let_go(episode)
         self._episode = None
         self._world_attempt = None
 
@@ -1404,6 +1511,22 @@ class StreamGateway:
         if self._blobs is None:
             return sha256(transcript).hexdigest()
         return self._blobs.put(transcript, media_type="application/octet-stream").sha256
+
+
+async def _let_go(episode: ServedEpisode) -> None:
+    """Release one world without ending the attempt that worked in it.
+
+    An episode's own close decides an ending: a world that reaches it with its lifecycle still
+    open is read as an episode that stopped without a seal, and an abort verdict is claimed,
+    recorded durably and appended to the trace. Under this protocol that reading is never the
+    right one. A terminal becomes the stream's terminal request and reaches no lifecycle here,
+    so the attempt this world was sealed, scored and acknowledged for would get a second result
+    saying it was aborted and worth nothing, beside the one the generation committed; and an
+    attempt that was not sealed is ended by the generation rather than by the transport that was
+    serving it. Everything else the close does, from waiting for what is in flight to releasing
+    the session and tearing the env down, is what this is here for.
+    """
+    await episode.close(finalize=False)
 
 
 def _read_failure(landing: "asyncio.Future[Any]") -> None:
@@ -1478,6 +1601,7 @@ async def open_gateway(
     start: Optional[StreamStart] = None,
     open_episode: Optional[EpisodeOpener] = None,
     run_directory: Optional[Union[str, Path]] = None,
+    environment: Optional[EnvironmentTerminal] = None,
 ) -> StreamGateway:
     """Start a generation for ``episode`` and bind this transport as its one consumer.
 
@@ -1497,6 +1621,25 @@ async def open_gateway(
     seals its own worlds can record which world each attempt filed in and end that attempt in
     the world it worked in. ``episode`` is the first attempt's world, so the route a caller
     builds from the opener covers every attempt after that one.
+
+    ``environment`` is what the environment answered when it was asked how its attempts end
+    (see :func:`environment_terminal`). It carries the version this generation's acknowledgements
+    declare their digests were taken under, the digest of what the environment is, and the route
+    the worlds this gateway opens are recorded into. An environment that seals by stopping its
+    own world is refused a generation of more than one task without it, because the seal would
+    otherwise have no way to find the world each task after the first was worked in.
+
+    That answer is also what every world opened after the first is held to. It is folded into
+    what this generation is, so a later world configured differently would have its task scored
+    against a hidden rule this generation never committed to, under an identity that still names
+    the first world's configuration. The gateway refuses such a world rather than serving it.
+
+    That answer is applied to the generation a controller composed as well as to the one this
+    call composes. Asking the environment is this gateway's own job and it is done here, so a
+    composition made where the environment was not is completed rather than served as it
+    arrived: one that kept this gateway's version would have its first terminal refused by the
+    environment as a mismatch, after the world was worked, and one that carried no environment
+    digest would let a resume under a different configuration pass as the same generation.
 
     ``run_directory`` is where this generation keeps the blobs its presentations reference and
     the manifest a later owner resumes it from. The directory is made before the stream starts,
@@ -1520,13 +1663,30 @@ async def open_gateway(
     spec = episode.describe()
     terminal = terminal_manifest(spec)
     composed = start or stream_start(
-        spec, terminal, claim_hash=sha256(secrets.token_bytes(32)).hexdigest()
+        spec,
+        terminal,
+        claim_hash=sha256(secrets.token_bytes(32)).hexdigest(),
     )
+    if environment is not None:
+        composed = replace(
+            composed,
+            canonicalization_version=environment.canonicalization_version,
+            configuration_hash=_configuration_hash(
+                spec, terminal, environment.configuration_digest
+            ),
+        )
     if len(composed.tasks) > 1 and open_episode is None:
         raise ValueError(
             f"this generation has {len(composed.tasks)} tasks and one episode to serve them "
             "with; each task is worked in a world of its own, so composing more than one needs "
             "a way to open the next"
+        )
+    if len(composed.tasks) > 1 and environment is None and _seals_its_own_worlds(episode):
+        raise ValueError(
+            f"this generation has {len(composed.tasks)} tasks and its environment ends an "
+            "attempt in the world that attempt worked in; without the terminal this gateway "
+            "records those worlds into, every task after the first would be sealed against the "
+            "first task's world"
         )
     identifier = workflow_id or f"stream/{_opaque()}/1"
     blobs: Optional[FilesystemBlobStore] = None
@@ -1565,7 +1725,38 @@ async def open_gateway(
         open_episode=open_episode,
         blobs=blobs,
         generation=composed,
+        environment=environment,
     )
+
+
+def _seals_its_own_worlds(episode: ServedEpisode) -> bool:
+    """True iff this episode's environment brings its own terminal."""
+    return getattr(episode.env, "protocol_v2_terminal", None) is not None
+
+
+def environment_terminal(episode: ServedEpisode) -> EnvironmentTerminal:
+    """Ask this episode's environment how the attempts of a generation over it end.
+
+    The environment is asked rather than looked up by name. One that seals and grades for itself
+    answers with its own canonicalization version, its own Activities and a digest of what it is
+    configured as; every other one keeps the kernel's stand-ins, which compute from the
+    terminal's arguments and reach nothing. The stream is the same either way: it is the
+    environment's half of the terminal that is replaced, and the seal transaction around it that
+    is not.
+
+    The route is minted here and handed to both sides. The environment holds it because it is
+    what a seal resolves an attempt through, and the gateway holds it because opening a world is
+    the only moment an attempt and a world are in one place. Nothing is in it yet: a generation
+    that has served no task has opened no world for anything to be sealed against.
+    """
+    route = WorldRoute()
+    brings_own = getattr(episode.env, "protocol_v2_terminal", None)
+    if brings_own is None:
+        return EnvironmentTerminal(
+            CANONICALIZATION_VERSION, list(kernel_activities()), None, route
+        )
+    version, activities, digest = brings_own(route)
+    return EnvironmentTerminal(version, list(activities), digest, route)
 
 
 async def run_stdio_v2(
@@ -1590,9 +1781,15 @@ async def run_stdio_v2(
     episode = await ServedEpisode.start(env_name, task=task, trace_path=trace_path)
     stopped = False
     try:
+        environment = environment_terminal(episode)
         async with durable_client() as client:
-            async with stream_worker(client):
-                gateway = await open_gateway(client, episode, run_directory=run_directory)
+            async with stream_worker(client, activities=environment.activities):
+                gateway = await open_gateway(
+                    client,
+                    episode,
+                    run_directory=run_directory,
+                    environment=environment,
+                )
                 # This command is the controller as well as the transport, and its manifest is
                 # complete the moment it is built: one episode, one task. So it closes the
                 # queue before the model can pull, which is what makes Done reachable once
@@ -1605,4 +1802,7 @@ async def run_stdio_v2(
                     stopped = True
     finally:
         if not stopped:
-            await episode.close()
+            # Released rather than ended, like every other world this command lets go of. What
+            # became of an attempt is the generation's to say, and this is the path where there
+            # was no generation to say it or the gateway's own stop did not finish.
+            await _let_go(episode)

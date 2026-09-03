@@ -18,10 +18,17 @@ from __future__ import annotations
 
 from hashlib import sha256
 from pathlib import Path
+from typing import Optional
 
 from temporalio import activity
 
-from shogym.serve.protocol_v2 import FilesystemBlobStore, Payload, blob_ref, visible_bytes
+from shogym.serve.protocol_v2 import (
+    BlobRef,
+    FilesystemBlobStore,
+    Payload,
+    blob_ref,
+    visible_bytes,
+)
 from shogym.serve.protocol_v2.kernel.messages import (
     BlobsVerified,
     GeneratePayloadBundleInput,
@@ -67,7 +74,13 @@ async def seal_attempt_activity(request: SealAttemptInput) -> SealAttemptResult:
 
 @activity.defn(name=GRADE_ATTEMPT)
 async def grade_attempt_activity(request: GradeAttemptInput) -> GradeAttemptResult:
-    """Score the sealed evidence. An unreadable submission is a result, not a failure."""
+    """Score the sealed evidence. An unreadable submission is a result, not a failure.
+
+    The verdict goes into the run's store before the reference naming it comes back, which a
+    real grader has to do as well: the generation commits that reference beside the score, and a
+    name the store cannot produce the bytes for is not evidence of anything. A generation given
+    no store gets the reference and nothing to resolve it in.
+    """
     decode_state = "decoded" if request.canonical_submission_text else "ambiguous_zero"
     score = 1 if decode_state == "decoded" else 0
     return GradeAttemptResult(
@@ -75,8 +88,15 @@ async def grade_attempt_activity(request: GradeAttemptInput) -> GradeAttemptResu
         seal_id=request.seal_id,
         score=score,
         decode_state=decode_state,
-        evidence=blob_ref(f"{request.seal_id}:{decode_state}"),
+        evidence=_installed(request.blob_root, f"{request.seal_id}:{decode_state}"),
     )
+
+
+def _installed(blob_root: Optional[str], text: str) -> BlobRef:
+    """Return the reference that names ``text``, with those bytes where the name resolves."""
+    if blob_root is None:
+        return blob_ref(text)
+    return FilesystemBlobStore(Path(blob_root)).put(text.encode("utf-8"), media_type="text/plain")
 
 
 @activity.defn(name=GENERATE_PAYLOAD_BUNDLE)
