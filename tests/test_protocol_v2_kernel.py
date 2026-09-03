@@ -46,6 +46,7 @@ from shogym.serve.protocol_v2 import (  # noqa: E402
 from shogym.serve.protocol_v2 import Payload  # noqa: E402
 from shogym.serve.protocol_v2.kernel import (  # noqa: E402
     ConsumerClaim,
+    EnvironmentCall,
     GeneratePayloadBundleInput,
     OfferedMessage,
     SealAttemptInput,
@@ -570,6 +571,53 @@ async def test_the_generation_has_one_consumer_and_one_call_in_flight(env) -> No
         await asyncio.wait_for(started.wait(), timeout=30)
         assert await refused(caller.pull()) == "overlapping_call"
         assert (await sealing).kind == "seal_ack"
+
+
+@pytest.mark.network
+async def test_the_stream_holds_itself_for_a_call_it_will_never_see(caller: Caller) -> None:
+    """An ordinary environment call reaches a world this stream cannot see, so it decides it.
+
+    Everything else a consumer does arrives here as an Update and is serialized against every
+    other Update. An environment call is not one, and by the time its effect could be noticed
+    it has happened, so the stream is asked before it rather than told after it. The answer is
+    about the attempt at that moment, and the stream stays held until the call is given back:
+    a second writer, a resume, or a controller contends with the call itself rather than with
+    somebody's memory of when it started.
+    """
+    def environment_call(ordinal: int) -> EnvironmentCall:
+        return EnvironmentCall(call_id=oid(0x2000 + ordinal), attempt_id=ATTEMPT)
+
+    # Nothing has been offered, so no attempt is being worked on and nothing may be done to one.
+    assert await refused(caller.stream.begin_environment_call(environment_call(1))) == (
+        "invalid_attempt"
+    )
+
+    # A result the stream is holding is one nothing goes past, this call included.
+    task = await caller.pull()
+    assert await refused(caller.stream.begin_environment_call(environment_call(2))) == (
+        "outstanding_response"
+    )
+    await caller.present(task)
+
+    call = environment_call(3)
+    lease = await caller.stream.begin_environment_call(call)
+    assert lease.held is True and lease.attempt_id == ATTEMPT
+    assert await refused(caller.pull()) == "overlapping_call"
+    assert await refused(caller.seal()) == "overlapping_call"
+    assert await refused(caller.stream.close_queue()) == "overlapping_call"
+    second = environment_call(4)
+    assert await refused(caller.stream.begin_environment_call(second)) == "overlapping_call"
+    # None of them ran: the queue is still open and the cursor has not moved.
+    state = await caller.stream.stream_state()
+    assert state.queue_closed is False
+    assert state.cursor == TASK_ID
+
+    # Giving back what somebody else is holding gives back nothing, and giving back the same
+    # call twice is one release: the identity is the call, so a repeat reaches the same Update.
+    assert (await caller.stream.end_environment_call(second)).held is False
+    assert (await caller.stream.end_environment_call(call)).held is True
+    assert (await caller.stream.end_environment_call(call)).held is True
+    assert (await caller.seal()).kind == "seal_ack"
 
 
 @pytest.mark.network

@@ -147,6 +147,36 @@ class SealRequest:
 
 
 @dataclass(frozen=True)
+class EnvironmentCall:
+    """One ordinary environment call, named so the stream can hold the generation for it.
+
+    The call never reaches the stream and the world it changes is one the stream cannot see.
+    What the stream can do is decide whether that call may happen at all, and stay held while
+    it does, which is what makes the decision and the change one thing rather than two.
+    """
+
+    call_id: str
+    attempt_id: str
+    protocol_version: int = PROTOCOL_VERSION
+
+
+@dataclass(frozen=True)
+class EnvironmentLease:
+    """The stream's permission for one environment call, and what it was granted against.
+
+    ``held`` is the answer to giving one back: true when this call was the one holding the
+    generation, false when it had already been taken from it, which is what a caller reading a
+    lost answer needs to tell apart.
+    """
+
+    call_id: str
+    attempt_id: str
+    cursor: str
+    held: bool
+    protocol_version: int = PROTOCOL_VERSION
+
+
+@dataclass(frozen=True)
 class QueueClosed:
     """The controller's receipt for a closed queue."""
 

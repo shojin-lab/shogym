@@ -15,6 +15,7 @@ presentation the workflow will verify.
 from __future__ import annotations
 
 import os
+import secrets
 from contextlib import asynccontextmanager
 from dataclasses import dataclass
 from hashlib import sha256
@@ -39,6 +40,8 @@ from shogym.serve.protocol_v2.kernel.activities import kernel_activities
 from shogym.serve.protocol_v2.kernel.messages import (
     ConsumerClaim,
     ConsumerReceipt,
+    EnvironmentCall,
+    EnvironmentLease,
     OfferedMessage,
     QueueClosed,
     SealRequest,
@@ -213,9 +216,34 @@ class StreamHandle:
             id=_update_id("present", commit.attestation_id, commit),
         )
 
+    async def begin_environment_call(self, call: EnvironmentCall) -> EnvironmentLease:
+        """Take the generation for one environment call. A retry reaches the same Update."""
+        return await self.handle.execute_update(
+            StreamWorkflow.begin_environment_call, call, id=f"environment-{call.call_id}"
+        )
+
+    async def end_environment_call(self, call: EnvironmentCall) -> EnvironmentLease:
+        """Give the generation back. Releasing twice releases once."""
+        return await self.handle.execute_update(
+            StreamWorkflow.end_environment_call, call, id=f"environment-end-{call.call_id}"
+        )
+
     async def close_queue(self) -> QueueClosed:
         """Close the queue to insertion."""
         return await self.handle.execute_update(StreamWorkflow.close_queue, id="close-queue")
+
+    async def confirm_state(self) -> StreamState:
+        """Read the generation's state through the path a write takes, so it can be refused.
+
+        Every other Update here is deduplicated by an identity its caller can repeat, because
+        a lost answer has to reach the same Update rather than a second one. This one is the
+        opposite. It changes nothing, and a caller asking whether the stream still admits it
+        must not be answered with what the stream said the last time it asked, so every ask is
+        its own Update.
+        """
+        return await self.handle.execute_update(
+            StreamWorkflow.confirm_state, id=f"confirm-{secrets.token_hex(16)}"
+        )
 
     async def stream_state(self) -> StreamState:
         """Read the generation's state without changing it."""
