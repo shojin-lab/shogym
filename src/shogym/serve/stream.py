@@ -1905,8 +1905,8 @@ class TaskStream:
             sibling.** :meth:`get_task` builds the env before it reaches its first await, so for
             as long as a constructor runs no other episode can dispatch and the watchdog cannot
             enforce anyone's deadline: a factory that takes seconds delays a 50 ms heartbeat by
-            seconds. That is measurable with the AppWorld port, whose construction walks a corpus
-            and an installed interpreter. Keep a factory cheap, or run the run under the
+            seconds. A constructor that walks a data corpus on disk, or checks a provisioned
+            interpreter, is enough to measure it. Keep a factory cheap, or run the run under the
             ``off_loop_factory`` contract added by the stacked lifecycle branch, which moves the
             call onto the episode's own thread and owns what a cancelled caller leaves behind.
             This module does not offer a second mechanism for it.

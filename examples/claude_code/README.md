@@ -144,9 +144,10 @@ SHOGYM_FEEDBACK=information <the command above>   # only the env's `report` item
 SHOGYM_FEEDBACK=placebo     <the command above>   # only the env's `notice` item
 ```
 
-The last two are the arms of a matched pair, for an env that publishes both (`appworld` does).
-Each arm is its own launch and its own record: the regime is in the run directory's name, and a
-directory that holds one arm's rows refuses the other's. Give both arms the same
+The last two are the arms of a matched pair, for an env that publishes both. No bundled
+environment currently publishes both items, so these two regimes are for a custom environment
+that does. Each arm is its own launch and its own record: the regime is in the run directory's
+name, and a directory that holds one arm's rows refuses the other's. Give both arms the same
 `SHOGYM_DEADLINE` and `SHOGYM_IN_FLIGHT`, because two runs that disagree on either are two
 measurements rather than two arms of one.
 
@@ -154,7 +155,7 @@ measurements rather than two arms of one.
 command line above, they are in the agent's own environment, and the arm is then something the
 agent can read about itself before it is treated. `.mcp.json` takes an `env` block, which reaches
 this file and nothing else, and `SHOGYM_RUNS` moves the record out of the directory the agent
-works in. `src/shogym/envs/appworld/README.md` documents the whole shape, deny list included.
+works in.
 
 Concurrency is available too: `SHOGYM_IN_FLIGHT=N` (or `max_in_flight=N` in `serve.py`) serves
 several tasks at once, each named by a lease (above 1, the served tools gain a `lease` argument).

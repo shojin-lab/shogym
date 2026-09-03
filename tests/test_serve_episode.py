@@ -111,8 +111,8 @@ async def test_a_second_call_waits_for_an_abandoned_one_to_land() -> None:
     episode open to the next call while its own operation was still in the env.
 
     The handler here is a synchronous FastMCP tool, so it runs in a worker thread: cancelling the
-    coroutine that awaits it abandons the await and not the operation, which is the shape of
-    AppWorld's own ``execute`` and the reason a cancellable async substitute cannot show this."""
+    coroutine that awaits it abandons the await and not the operation, which is the reason a
+    cancellable async substitute cannot show this."""
     score_mcp.reset_block()
     ep = await ServedEpisode.start(score_env.ENV_NAME, task=0)
     try:

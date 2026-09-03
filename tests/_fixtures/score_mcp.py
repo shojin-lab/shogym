@@ -1,9 +1,10 @@
 """In-process MCP server for the score-terminal fixture env (tests only).
 
-Two tools: ``submit`` (the env's ``score`` terminal — its args are validated then the seal
-transaction runs the env's ``finalize``, so this handler is never dispatched inward for a
-sealed episode) and ``noop`` (an ordinary tool used to exercise mid-episode steps and the
-horizon path). Session state (the gold answer) is keyed by ``_session_id`` so the offline,
+Three tools: ``submit`` (the env's ``score`` terminal, whose args are validated before the seal
+transaction runs the env's ``finalize``, so this handler is never dispatched inward for a sealed
+episode), ``noop`` (an ordinary tool used to exercise mid-episode steps and the horizon path),
+and ``block`` (a synchronous tool that holds its worker thread until the test releases it, with a
+30 second fail-safe). Session state (the gold answer) is keyed by ``_session_id`` so the offline,
 deterministic ``finalize`` can grade without any network or key.
 """
 
@@ -56,9 +57,10 @@ def noop(_session_id: str) -> Dict[str, Any]:
 
 
 #: Released by a test to let `block` return. A real blocking worker rather than a cancellable
-#: async substitute: FastMCP runs a synchronous tool in a worker thread, which is the shape of
-#: AppWorld's own `execute` (a blocking HTTP call into another process). Cancelling the coroutine
-#: that awaits it abandons the await and not the operation.
+#: async substitute: FastMCP runs a synchronous tool in a worker thread, which is the shape of a
+#: real env's synchronous tool blocking on another process, as frontier_bench's `exec` does
+#: through `subprocess.run`. Cancelling the coroutine that awaits it abandons the await and not
+#: the operation.
 released = threading.Event()
 #: Set by `block` once it has actually returned, so a test can tell "still running" from "landed".
 landed = threading.Event()
@@ -69,7 +71,8 @@ mutations: list = []
 
 @server.tool
 def block(_session_id: str) -> Dict[str, Any]:
-    """An ordinary tool that does not return until a test lets it, and then mutates."""
+    """An ordinary tool that blocks until the test releases it, with a 30 second fail-safe, and
+    then mutates."""
     released.wait(timeout=30)
     mutations.append(_session_id)
     landed.set()

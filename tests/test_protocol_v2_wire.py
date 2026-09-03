@@ -89,7 +89,7 @@ VALID: Dict[Type[Any], Dict[str, Any]] = {
         "message_id": ID_A,
         "attempt_id": ID_B,
         "submission_digest": H_A,
-        "canonicalization_version": "appworld.1",
+        "canonicalization_version": "world.1",
         "protocol_version": 2,
         "kind": "seal_ack",
     },
@@ -266,10 +266,10 @@ def test_a_payload_that_is_not_an_object_is_rejected(cls: Type[Any]) -> None:
         (SealAck, "submission_digest", "a" * 63),
         (SealAck, "submission_digest", "A" * 64),
         (SealAck, "canonicalization_version", ""),
-        (SealAck, "canonicalization_version", "Appworld.1"),
-        (SealAck, "canonicalization_version", "-appworld"),
+        (SealAck, "canonicalization_version", "World.1"),
+        (SealAck, "canonicalization_version", "-world"),
         (SealAck, "canonicalization_version", "a" * 65),
-        (SealAck, "canonicalization_version", "appworld 1"),
+        (SealAck, "canonicalization_version", "world 1"),
         (SealReject, "code", "invalid_cursor"),
         (ProtocolError, "code", "unknown_code"),
         (ProtocolError, "code", ""),
@@ -442,7 +442,7 @@ GOLDEN: Tuple[Tuple[Type[Any], Dict[str, Any], bytes], ...] = (
         SealAck,
         {},
         b'{"attempt_id":"11111111111111111111111111111111",'
-        b'"canonicalization_version":"appworld.1","kind":"seal_ack",'
+        b'"canonicalization_version":"world.1","kind":"seal_ack",'
         b'"message_id":"00000000000000000000000000000000","protocol_version":2,'
         b'"submission_digest":"' + H_A.encode() + b'"}',
     ),

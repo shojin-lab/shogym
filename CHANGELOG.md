@@ -9,6 +9,18 @@ direction.
 
 ## Unreleased
 
+### `appworld`: withdrawn
+
+The `appworld` environment is gone, and with it the port, the loopback worker each world ran in,
+the empty `appworld` extra and the port's tests. `shogym.registered_envs()` no longer lists it and
+`shogym.make("appworld")` raises the unknown-environment error.
+
+The port never paid for its upkeep. It provisioned an interpreter of its own because upstream
+cannot be installed beside shogym, downloaded a pinned corpus, and ran every world in a
+subprocess, which made it the slowest and least reliable part of the suite. No planned experiment
+in this repository uses it, so it is withdrawn rather than carried through a deprecation cycle. An
+inverse of the removal commit restores the tracked tree; local caches are outside version control.
+
 ### `automationbench`: the rubric scores the live world, not a rebuilt copy of it
 
 Scoring used to serialize the session's `WorldState` and re-validate it back into a model before
