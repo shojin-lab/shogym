@@ -22,8 +22,10 @@ same pattern so shogym carries no direct-URL requirement and can be published to
 from upstream is committed to shogym.
 
 It also re-hosts the two small, ``verifiers``-free helpers from upstream's ``runner.py``
-(``strip_none_values`` + ``compute_allowed_services``) so the per-task ``WorldState`` seed and the
-``allowed_services`` gate stay **byte-identical** to a real ``auto-bench`` run.
+(``strip_none_values`` + ``compute_allowed_services``) so the per-task ``WorldState`` seed matches a
+real ``auto-bench`` run. The service gate has one deliberate divergence on top of them: a task
+allowed to read Google Sheets is also allowed to read Google Drive, because Drive's file listing is
+the world's only enumeration of spreadsheets (see :func:`allowed_services_for_task`).
 
 Importing this module triggers provisioning (a one-time network fetch if the cache is cold) and
 imports ``automationbench``, so it is only ever imported when an ``automationbench`` env is
@@ -128,6 +130,36 @@ def compute_allowed_services(
     return sorted(allowed)
 
 
+# ----- the service set a task is actually served under -----
+
+# Google Sheets publishes no list endpoint. Every one of its read routes takes the spreadsheet id
+# as a path segment, and the one endpoint anywhere in the simulated world that enumerates
+# spreadsheets is Google Drive's file listing, which returns each spreadsheet as a Drive file. So a
+# task that hands the agent a spreadsheet without also granting Drive names a resource no served
+# endpoint can return: the id appears in no response the agent can obtain, and the only way to
+# reach the spreadsheet is to guess its id.
+_SHEETS = "google_sheets"
+_DRIVE = "google_drive"
+
+
+def allowed_services_for_task(
+    initial_state: dict, assertions: List[dict], zapier_tools: List[str]
+) -> List[str]:
+    """The services a task's world is subscribed to when shogym serves it.
+
+    Upstream's set (see :func:`compute_allowed_services`) plus one rule: a task allowed to read
+    Google Sheets is allowed to read Google Drive, because Drive's file listing is the only
+    enumeration of spreadsheets the world has. Without it a spreadsheet the task depends on can be
+    opened only by guessing its id, which measures luck rather than capability.
+
+    This is a **deliberate divergence** from an upstream run, and it changes measured scores on the
+    tasks it moves."""
+    allowed = set(compute_allowed_services(initial_state, assertions, zapier_tools))
+    if _SHEETS in allowed:
+        allowed.add(_DRIVE)
+    return sorted(allowed)
+
+
 # ----- task loading (via the upstream domain datasets) -----
 
 
@@ -164,16 +196,19 @@ def available_domains() -> List[str]:
 def build_world(info: Dict[str, Any]) -> Tuple[WorldState, Dict[str, Any], List[Dict[str, Any]]]:
     """Build a task's seeded ``WorldState`` from its ``info`` dict.
 
-    Reproduces upstream ``AutomationBenchEnv.setup_state`` exactly, minus the verifiers plumbing:
-    strip HuggingFace ``None`` padding from ``initial_state`` and ``assertions``, construct the
+    Follows upstream ``AutomationBenchEnv.setup_state``, minus the verifiers plumbing: strip
+    HuggingFace ``None`` padding from ``initial_state`` and ``assertions``, construct the
     ``WorldState``, and set ``meta.allowed_services`` from the seed / assertions / tool grant.
     Returns ``(world, stripped_initial_state, stripped_assertions)`` — the latter two are what
     :func:`score_state` needs to rerun the rubric (initial state gates free/negative assertions).
+
+    The service set comes from :func:`allowed_services_for_task`, which is upstream's plus the
+    Drive-with-Sheets rule, so a spreadsheet the task depends on is listable rather than guessable.
     """
     initial_state_dict = strip_none_values(info.get("initial_state", {}))
     assertions = [strip_none_values(a) for a in info.get("assertions", [])]
     world = WorldState(**initial_state_dict)
-    world.meta.allowed_services = compute_allowed_services(
+    world.meta.allowed_services = allowed_services_for_task(
         initial_state_dict, assertions, info.get("zapier_tools", [])
     )
     return world, copy.deepcopy(initial_state_dict), assertions
@@ -261,6 +296,7 @@ __all__ = [
     "ensure_source",
     "strip_none_values",
     "compute_allowed_services",
+    "allowed_services_for_task",
     "load_domain_tasks",
     "available_domains",
     "build_world",

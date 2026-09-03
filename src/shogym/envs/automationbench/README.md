@@ -114,7 +114,12 @@ in-process against a per-session `WorldState`:
   mimicking the real SaaS API response. **All** state mutation happens here, through upstream's
   own router; the `allowed_services` gate (a task's world is "subscribed" only to services it
   seeds / asserts on / grants a tool for) is preserved, so a call to an out-of-scope service
-  fails like an unconnected account (a 401) instead of silently mutating untracked state.
+  fails like an unconnected account (a 401) instead of silently mutating untracked state. The gate
+  has one deliberate divergence from upstream: a task allowed to read Google Sheets is also allowed
+  to read Google Drive, because Sheets publishes no list endpoint and Drive's file listing is the
+  world's only enumeration of spreadsheets. Without it a spreadsheet the task depends on can be
+  opened only by guessing its id, which 105 of the 600 shipped tasks required. See
+  `undiscoverable.py` for the pool indices that were in that class.
 - `base64_encode(text)` — the Gmail body encoding helper; a local no-API utility.
 - `done()` — the env's **score terminal**. Calling it makes the serve layer validate its (empty)
   args, atomically **seal** the episode, then run the env's `finalize` hook — which scores the

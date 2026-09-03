@@ -53,6 +53,37 @@ subprocess, which made it the slowest and least reliable part of the suite. No p
 in this repository uses it, so it is withdrawn rather than carried through a deprecation cycle. An
 inverse of the removal commit restores the tracked tree; local caches are outside version control.
 
+### `automationbench`: a task that needs a spreadsheet can list the spreadsheets
+
+A task allowed to read Google Sheets is now also allowed to read Google Drive. **This changes
+measured automationbench scores.**
+
+Google Sheets publishes no list endpoint: all four of its read routes take the spreadsheet id as a
+path segment. The one endpoint anywhere in the simulated world that enumerates spreadsheets is
+Google Drive's file listing, which returns each spreadsheet as a Drive file. Which services a task
+subscribes to is decided per task from what it seeds, asserts on, and grants a tool for, and a task
+that hands the agent a spreadsheet without mentioning Drive in any of those three places locked the
+only door to its own data: the Drive call answered 401, and the id appeared in no other response.
+
+An enumeration of the shipped 600-task pool crawled every read route each task's world subscribes
+to and found 106 tasks requiring at least one id no served endpoint could return. 105 of them are
+this: a spreadsheet whose opaque author id (`ss_payroll_5104`, `ss_trext`) the request text never
+names. 99 of the 100 hr tasks are in the class, against 0 of sales, operations and finance, because
+the hr family was written to a template that grants Sheets tools and never a Drive one. What those
+tasks measured was id-guessing luck. In one archived 200-task run they took 36 calls on average
+against 23 for the rest, and 41% of their GET calls came back not-found, nearly all of them
+consecutive guesses at an id.
+
+Every seeded spreadsheet in the pool now comes back from Drive's listing, and the spreadsheet
+metadata endpoint the id opens names the worksheets inside it, so the whole chain a task depends on
+is reachable. Expect scores to rise on those 105 tasks and to be unchanged elsewhere; a run served
+before this change and one served after are not comparable on them.
+`shogym.envs.automationbench.undiscoverable.PREVIOUSLY_UNDISCOVERABLE` records the 106 pool indices
+so an earlier run can be stratified rather than read as uniform agent weakness.
+
+`adapter.allowed_services_for_task` is the service set a task is served under, and `build_world`
+uses it. `adapter.compute_allowed_services` still answers exactly what upstream's runner answers.
+
 ### `automationbench`: the rubric scores the live world, not a rebuilt copy of it
 
 Scoring used to serialize the session's `WorldState` and re-validate it back into a model before

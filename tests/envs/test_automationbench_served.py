@@ -73,6 +73,48 @@ _TASK = {
 }
 
 
+# A task shaped like the hr family: one seeded spreadsheet the request text never names, and a tool
+# grant that mentions Sheets and nothing else. Sheets publishes no list endpoint, so Drive's file
+# listing is the only place the spreadsheet id can come from.
+_SPREADSHEET_ID = "ss_headcount_999002"
+_SHEETS_TASK = {
+    "example_id": 999002,
+    "task": "test.sheets_without_drive_grant",
+    "prompt": [
+        {"role": "user", "content": "Mark the open headcount requests in the tracker as reviewed."}
+    ],
+    "answer": "",
+    "info": {
+        "zapier_tools": ["google_sheets_get_many_rows", "google_sheets_update_row"],
+        "initial_state": {
+            "google_sheets": {
+                "spreadsheets": [
+                    {
+                        "id": _SPREADSHEET_ID,
+                        "title": "Headcount Tracker",
+                        "worksheets": [
+                            {
+                                "id": "ws_open_999002",
+                                "title": "Open Requests",
+                                "rows": [{"row_id": 2, "cells": {"Role": "Analyst", "Status": ""}}],
+                            }
+                        ],
+                    }
+                ]
+            }
+        },
+        "assertions": [
+            {
+                "type": "google_sheets_row_updated",
+                "spreadsheet_id": _SPREADSHEET_ID,
+                "row_id": 2,
+                "cell_contains": {"Status": "Reviewed"},
+            }
+        ],
+    },
+}
+
+
 def _config(**over):
     cfg = {"tasks": [_TASK], "max_steps": 50}
     cfg.update(over)
@@ -265,6 +307,64 @@ async def test_service_gating_rejects_out_of_scope_calls() -> None:
         payload = json.loads(resp)
         assert payload["error"]["code"] == 401
         assert "slack" in payload["error"]["message"].lower()
+    finally:
+        await episode.close()
+
+
+async def test_a_task_that_needs_a_spreadsheet_can_list_it() -> None:
+    # The task grants Sheets tools and nothing else, and never names the spreadsheet. Drive rides
+    # along with Sheets so the id is listable, and the listing walks through to the worksheet and
+    # the row the assertion is about.
+    episode = await ServedEpisode.start(
+        "automationbench", task=0, env_config={"tasks": [_SHEETS_TASK], "max_steps": 50}
+    )
+    try:
+        assert _SPREADSHEET_ID not in episode.describe().instructions
+
+        listing = json.loads(
+            (
+                await episode.call(
+                    "api_fetch",
+                    {"method": "GET", "url": "https://www.googleapis.com/drive/v3/files"},
+                )
+            ).content
+        )
+        assert "error" not in listing
+        files = {f["id"]: f for f in listing["files"]}
+        assert _SPREADSHEET_ID in files
+        assert files[_SPREADSHEET_ID]["name"] == "Headcount Tracker"
+
+        # The id Drive handed back opens the spreadsheet, which names its worksheets.
+        meta = json.loads(
+            (
+                await episode.call(
+                    "api_fetch",
+                    {
+                        "method": "GET",
+                        "url": (
+                            "https://sheets.googleapis.com/v4/spreadsheets/" + _SPREADSHEET_ID
+                        ),
+                    },
+                )
+            ).content
+        )
+        assert [s["properties"]["sheetId"] for s in meta["sheets"]] == ["ws_open_999002"]
+
+        # And the assertion is reachable end to end: update the row, then score a full 1.0.
+        await episode.call(
+            "api_fetch",
+            {
+                "method": "PUT",
+                "url": (
+                    "https://sheets.googleapis.com/v4/spreadsheets/"
+                    + _SPREADSHEET_ID
+                    + "/values/ws_open_999002/rows/2"
+                ),
+                "body": json.dumps({"cells": {"Status": "Reviewed"}}),
+            },
+        )
+        await episode.call("done", {})
+        assert _fb(episode)["partial_credit"] == 1.0
     finally:
         await episode.close()
 

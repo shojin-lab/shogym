@@ -78,3 +78,80 @@ def test_build_world_sets_allowed_services() -> None:
     world, initial, assertions = adapter.build_world(info)
     assert set(world.meta.allowed_services) == {"salesforce", "gmail"}
     assert "salesforce" in initial
+
+
+def test_drive_is_granted_whenever_sheets_is() -> None:
+    seed = {"initial_state": {"google_sheets": {"spreadsheets": []}}, "assertions": []}
+    # Upstream's own rule leaves Drive out, so the served set is where the grant comes from.
+    assert adapter.compute_allowed_services(seed["initial_state"], [], []) == ["google_sheets"]
+    assert adapter.allowed_services_for_task(seed["initial_state"], [], []) == [
+        "google_drive",
+        "google_sheets",
+    ]
+    world, _, _ = adapter.build_world({**seed, "zapier_tools": []})
+    assert "google_drive" in world.meta.allowed_services
+
+
+def test_drive_is_not_granted_to_a_task_that_never_touches_sheets() -> None:
+    # The grant is Sheets-shaped, not a blanket subscription: nothing else pulls Drive in.
+    assert adapter.allowed_services_for_task({"gmail": {}}, [], []) == ["gmail"]
+
+
+def test_no_pool_task_needs_a_spreadsheet_id_no_endpoint_returns() -> None:
+    # Sheets' four read routes all take the spreadsheet id as a path segment, so Drive's file
+    # listing is the world's only enumeration of spreadsheets. Every seeded spreadsheet in the
+    # shipped pool has to come back from that listing, or the task names a resource the agent can
+    # only reach by guessing an opaque author string.
+    import json
+
+    tasks = adapter.load_domain_tasks("public")
+    unlistable: list[tuple[int, str]] = []
+    seen = 0
+    for index, row in enumerate(tasks):
+        info = row["info"]
+        if isinstance(info, str):
+            info = json.loads(info)
+        world, _, _ = adapter.build_world(info)
+        spreadsheets = list(world.google_sheets.spreadsheets)
+        if not spreadsheets:
+            continue
+        seen += 1
+        listing = json.loads(
+            adapter.api_fetch(world, "GET", "https://www.googleapis.com/drive/v3/files")
+        )
+        returned = {f.get("id") for f in listing.get("files", [])}
+        unlistable.extend(
+            (index, sheet.id) for sheet in spreadsheets if sheet.id not in returned
+        )
+    assert seen > 100, f"expected the pool to seed spreadsheets on many tasks, saw {seen}"
+    assert unlistable == []
+
+
+def test_recorded_undiscoverable_indices_name_the_pool_they_describe() -> None:
+    # The recorded list is a fact about the shipped pool, so it has to keep matching it: the tasks
+    # upstream's own rule leaves reading Sheets with no Drive to enumerate them, plus the one whose
+    # unreachable id is a Jira project key rather than a spreadsheet.
+    import json
+
+    from shogym.envs.automationbench.undiscoverable import PREVIOUSLY_UNDISCOVERABLE
+
+    tasks = adapter.load_domain_tasks("public")
+    sheets_without_drive = set()
+    for index, row in enumerate(tasks):
+        info = row["info"]
+        if isinstance(info, str):
+            info = json.loads(info)
+        upstream = adapter.compute_allowed_services(
+            adapter.strip_none_values(info.get("initial_state", {})),
+            [adapter.strip_none_values(a) for a in info.get("assertions", [])],
+            info.get("zapier_tools", []),
+        )
+        if "google_sheets" in upstream and "google_drive" not in upstream:
+            sheets_without_drive.add(index)
+
+    recorded = set(PREVIOUSLY_UNDISCOVERABLE)
+    assert len(PREVIOUSLY_UNDISCOVERABLE) == len(recorded) == 106
+    assert max(recorded) < len(tasks)
+    assert len(sheets_without_drive) == 105
+    assert recorded - sheets_without_drive == {375}
+    assert sheets_without_drive - recorded == set()
