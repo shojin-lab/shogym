@@ -308,6 +308,11 @@ from fastmcp import FastMCP
 from fastmcp.tools import ToolResult
 
 from shogym.core import Env
+from shogym.feedback.wire import (
+    CHANNEL_FEEDBACK_NAME,
+    NOTICE_FEEDBACK_NAME,
+    REPORT_FEEDBACK_NAME,
+)
 from shogym.serve.episode import ServedEpisode
 from shogym.serve.server import build_tool
 from shogym.shared.terminate_mcp import TERMINATE_TOOL_NAME
@@ -320,7 +325,9 @@ __all__ = [
     "EvalStream",
     "FeedbackPolicy",
     "Immediate",
+    "Information",
     "Never",
+    "Placebo",
     "Provenance",
     "ProvenanceError",
     "ProvenanceSpan",
@@ -377,6 +384,8 @@ _TASK_OVER_SILENT = json.dumps({**_TASK_OVER_FIELDS, _FEEDBACK_MEMBER: []})
 # `row.get("feedback_regime", "never")`.
 _NEVER_REGIME = "never"
 _IMMEDIATE_REGIME = "immediate"
+_INFORMATION_REGIME = "information"
+_PLACEBO_REGIME = "placebo"
 
 # The feedback level a terminal may reveal. `wire.select_inband` already draws this line for a
 # single served episode — episode-level items ride out on the terminal result, inference-level
@@ -594,7 +603,16 @@ class DispensedTask:
     """What the agent receives: enough to act, and nothing that identifies the task.
 
     Redaction is structural — there is no field the task index, the target, or the queue
-    position could be written into."""
+    position could be written into.
+
+    **What this withholds is the queue's identification of the task, and only that.** The index,
+    the position and the target are the *stream's* facts about where a task sits in a run, and
+    knowing them would let an agent read its own progress and its neighbours' off its own
+    envelope. An env's own material is a different thing and is not redacted here: instructions
+    are published verbatim above, and an env is free to name the task it is serving inside them
+    or inside a value it publishes, because that name is what the agent is working on rather than
+    a fact about the run. An env that composes a terminal payload out of the task's identity and
+    the agent's own submission is therefore consistent with this class, not in tension with it."""
 
     env: str
     # The env's own prose, exactly as the env published it. The stream never edits it — see
@@ -692,13 +710,27 @@ class ResultRow:
     beside it, and only a reconciled row has neither — but the discriminator a consumer should
     read is ``closure``, which is typed and says the same thing about the whole row.
 
-    ``feedback_regime`` names the :class:`FeedbackPolicy` the stream served this task under —
+    ``feedback_regime`` names the :class:`FeedbackPolicy` this task was **assigned** to —
     ``"never"`` for a run with no verdict channel open, and so the one thing a reader needs to
     tell an evaluation-grade row from a practice one **without joining against anything**. It is
     the row's own answer to a question the rest of the row cannot settle: a score is the same
-    number either way, and only the regime says whether the agent was told the last one. A row
+    number either way, and only the regime says which arm the task was served under. A row
     written before this member existed came from a stream that revealed nothing, so absent reads
-    as ``"never"`` and the idiom is ``row.get("feedback_regime", "never")``."""
+    as ``"never"`` and the idiom is ``row.get("feedback_regime", "never")``.
+
+    **It is the assignment and never the exposure, and the difference is the point.** This row is
+    appended and fsynced *before* the policy's answer is composed, which it has to be: the answer
+    is composed from the recorded row, and a value handed to an agent before it was durable would
+    be a verdict the record might not hold. So the regime here says which channel this task was
+    served under — the treatment assigned — and says nothing whatever about whether a value
+    reached the caller. A cancelled terminal, a task the stream ended itself (``drained``,
+    ``timeout``) and a policy that could not answer all leave a scored row stamped
+    ``information`` or ``placebo`` with nobody told.
+
+    That is the field an intention-to-treat analysis wants and the one it should use: every
+    assigned task carries one, including the tasks whose delivery failed, and no post-treatment
+    filter sits between the assignment and the estimate. What was actually delivered is not this
+    module's to say, and a design that needs it records it in the runner."""
 
     seq: int
     lease: str
@@ -710,9 +742,11 @@ class ResultRow:
     observed: List[Dict[str, Any]] = field(default_factory=list)
     diagnostic: Optional[str] = None
     extensions: Dict[str, Any] = field(default_factory=dict)
-    # Defaulted, and defaulted to the regime that has no channel: every row this module wrote
-    # before the policy existed was written by a stream that revealed nothing, and a row built
-    # without saying otherwise — `reconcile`'s, a caller's — may not read as one that did.
+    # The channel this task was ASSIGNED, never the one it was told through (see the class
+    # docstring). Defaulted, and defaulted to the regime that has no channel: every row this
+    # module wrote before the policy existed was written by a stream that revealed nothing, and a
+    # row built without saying otherwise — `reconcile`'s, a caller's — may not read as one that
+    # did.
     feedback_regime: str = _NEVER_REGIME
 
     def to_wire(self) -> Dict[str, Any]:
@@ -1690,6 +1724,84 @@ class Immediate(FeedbackPolicy):
         return published
 
 
+def _channel(published: Sequence[Dict[str, Any]], name: str) -> List[Dict[str, Any]]:
+    """The item the env filed under ``name``, renamed to the one name a revealed item carries.
+
+    Two jobs, and the second is what makes a pair of policies a pair. Selection is by name rather
+    than by position, because an env publishes what it publishes: a run whose env emitted the
+    summary numbers first and a run whose env emitted them last must open the same channel, and an
+    index would make the answer depend on an ordering nothing in the contract fixes.
+
+    **The rename is the point.** An env files its two versions under two names so the record can
+    tell them apart, but an item that reached the agent still carrying ``notice`` would announce
+    its own arm: the control could be identified from the field name without reading a byte of the
+    value. Revealed items are therefore all named :data:`CHANNEL_FEEDBACK_NAME`, so the two arms'
+    serialized answers differ in the value and in nothing else. The record is unaffected, because
+    it stores what the env published rather than what the policy revealed.
+
+    One item, not a list. An env that files two under one name has published something this
+    contract has no reading of, and the first is taken rather than both, so the shape an agent
+    sees cannot vary with a mistake upstream."""
+    for item in published:
+        if item.get("name") == name:
+            return [{**dict(item), "name": CHANNEL_FEEDBACK_NAME}]
+    return []
+
+
+@dataclass(frozen=True)
+class Information(FeedbackPolicy):
+    """One channel open: the item the env published under
+    :data:`~shogym.feedback.wire.REPORT_FEEDBACK_NAME`, and nothing beside it.
+
+    The treatment half of a matched pair (see :class:`Placebo`). Where :class:`Immediate` hands
+    back everything the row records (the summary numbers included), this hands back the single
+    item the env wrote *for the agent to read*, so what a graded ending tells the agent is
+    something the env composed rather than a list whose length and contents vary with how many
+    metrics that env happens to publish. An env with nothing under that name answers with an
+    empty member, exactly as a holding policy would.
+
+    The channel is the env's to fill and the env's to be honest about: an env that names the
+    answer in its report hands the answer over here. That is what an open channel is, and it is
+    why :class:`Never` remains the default.
+
+    What reaches the agent is named :data:`~shogym.feedback.wire.CHANNEL_FEEDBACK_NAME`, not
+    ``report``: see :func:`_channel`."""
+
+    regime: ClassVar[str] = _INFORMATION_REGIME
+    reveals: ClassVar[bool] = True
+
+    def reveal(self, published: Sequence[Dict[str, Any]]) -> Sequence[Dict[str, Any]]:
+        return _channel(published, REPORT_FEEDBACK_NAME)
+
+
+@dataclass(frozen=True)
+class Placebo(FeedbackPolicy):
+    """The same channel, filled with the env's inert stand-in: the item published under
+    :data:`~shogym.feedback.wire.NOTICE_FEEDBACK_NAME`, and nothing beside it.
+
+    The control half of the pair. It exists because "told nothing" and "told something that says
+    nothing" are different treatments, and :class:`Never` can only serve the first: a run under
+    it answers with a member-less envelope, so an agent under :class:`Information` is handed both
+    a verdict *and* a channel that a :class:`Never` agent never sees at all. This keeps the
+    channel, the member and the shape, and changes only what is in it, which is the comparison a
+    paired design is trying to make.
+
+    **The match is the env's to hold up.** Nothing here checks that the notice an env published is
+    the length of its report or that it says nothing evaluative; a policy reveals, it does not
+    author (see :class:`FeedbackPolicy`). What this side of it guarantees is that the two arms
+    differ in the value and in nothing else: one item, the same member, and the same field name,
+    because a revealed item is renamed to
+    :data:`~shogym.feedback.wire.CHANNEL_FEEDBACK_NAME` before it goes out (see
+    :func:`_channel`). An arm that announced itself in the field name would not need its value
+    read to be recognised."""
+
+    regime: ClassVar[str] = _PLACEBO_REGIME
+    reveals: ClassVar[bool] = True
+
+    def reveal(self, published: Sequence[Dict[str, Any]]) -> Sequence[Dict[str, Any]]:
+        return _channel(published, NOTICE_FEEDBACK_NAME)
+
+
 # The policies a stream may serve under, and — the point of the table — everything each one
 # decides: `(policy type, regime, reveals, reveal)`, snapshotted here at import from the classes
 # above, so there is exactly one place that says what "immediate" means and it is not an attribute
@@ -1721,13 +1833,14 @@ class Immediate(FeedbackPolicy):
 # policy comes from: it is written in this module, given a regime no other entry uses, and added
 # to this tuple. It is not subclassed downstream, because a stream cannot check a claim a
 # downstream class makes about itself, and the record's claim about the regime is exactly what a
-# reader has to be able to trust. #93 scopes launch to the two below; the third line of this tuple
-# is the whole of what a third costs.
+# reader has to be able to trust. One line of this tuple is the whole of what the next one costs.
 _Reveal = Callable[[Any, Sequence[Dict[str, Any]]], Sequence[Dict[str, Any]]]
 
 _POLICIES: Tuple[Tuple[type, str, bool, _Reveal], ...] = (
     (Never, Never.regime, Never.reveals, Never.reveal),
     (Immediate, Immediate.regime, Immediate.reveals, Immediate.reveal),
+    (Information, Information.regime, Information.reveals, Information.reveal),
+    (Placebo, Placebo.regime, Placebo.reveals, Placebo.reveal),
 )
 
 
@@ -1787,6 +1900,16 @@ class TaskStream:
             (see :func:`_close_on_owning_loop`). Nothing is moved to a worker loop, and nothing
             about the failure is swallowed — what could not be finished is attached to the
             error being raised.
+
+            **It is called on the serving loop, and a slow factory is felt by every live
+            sibling.** :meth:`get_task` builds the env before it reaches its first await, so for
+            as long as a constructor runs no other episode can dispatch and the watchdog cannot
+            enforce anyone's deadline: a factory that takes seconds delays a 50 ms heartbeat by
+            seconds. That is measurable with the AppWorld port, whose construction walks a corpus
+            and an installed interpreter. Keep a factory cheap, or run the run under the
+            ``off_loop_factory`` contract added by the stacked lifecycle branch, which moves the
+            call onto the episode's own thread and owns what a cancelled caller leaves behind.
+            This module does not offer a second mechanism for it.
         tasks: the materialised queue. Non-empty; may repeat a task index. An env key is a
             private label while the queue names one env — anything at all, ``__`` included,
             since the wire carries only the env's own tool names. Name a second env and every
@@ -1840,9 +1963,12 @@ class TaskStream:
             in-process (see :meth:`_with_timeout`). Finite and positive, for the same reason
             ``deadline`` is; ``None`` waits indefinitely.
         feedback: what a terminating call tells the agent about the task it just ended (see
-            :class:`FeedbackPolicy`). :class:`Never` — the default — answers with the fixed
+            :class:`FeedbackPolicy`). :class:`Never`, the default, answers with the fixed
             payload and opens no verdict channel; :class:`Immediate` answers with the sealed
-            row's own episode-level feedback, verbatim. Those two and nothing else: the policies
+            row's own episode-level feedback, verbatim; :class:`Information` and :class:`Placebo`
+            are a matched pair, each answering with exactly one item under one public name, so
+            two arms of a paired design differ in what that item says and in nothing else. Those
+            four and nothing else: the policies
             a stream serves under are an allow-list of exact types (see :data:`_POLICIES`), and
             the regime written into every dispense record and every result row is taken from that
             list rather than from the object passed here — so the posture a run served under is a
@@ -1913,7 +2039,8 @@ class TaskStream:
         admitted = _admitted(feedback)
         if admitted is None:
             raise ValueError(
-                f"feedback must be {Never.__name__}() or {Immediate.__name__}(), got "
+                "feedback must be one of "
+                f"{', '.join(policy.__name__ + '()' for policy, *_ in _POLICIES)}, got "
                 f"{feedback!r} ({type(feedback).__name__}); a policy decides whether a "
                 "terminating call carries the task's verdict *and* names the regime stamped on "
                 "every record this run keeps, so only a policy this module defines can be "
@@ -2912,11 +3039,15 @@ class TaskStream:
         """A stored record must have been written under the regime this stream serves.
 
         A record is read as one run. Its rows are averaged together, and the claim a mean of them
-        supports depends entirely on whether the agent was told the previous verdicts — that is
-        the difference between a benchmark number and a learning curve. So a directory holding
-        rows from both postures is a record whose parts are individually honest and whose whole
-        is not, which is precisely the failure a per-row stamp exists to make impossible: written
-        on every row, then contradicted by the row beside it.
+        supports depends entirely on which channel the run served its tasks under — that is the
+        difference between a benchmark number and a learning curve. So a directory holding rows
+        from both postures is a record whose parts are individually honest and whose whole is
+        not, which is precisely the failure a per-row stamp exists to make impossible: written on
+        every row, then contradicted by the row beside it.
+
+        What is compared is the *assignment*, and it is the right thing to compare: two runs that
+        assigned different channels are two experiments whatever each delivery did, and a stamp
+        that meant "delivered" could not be written when the row is (see :class:`ResultRow`).
 
         Only a resumed run can reach this, and that is the whole of the exposure — a stream that
         is not resuming refuses a directory holding *any* record (see
@@ -2930,7 +3061,7 @@ class TaskStream:
         raise ValueError(
             f"{self.prov_dir} holds {source} written under feedback regime {recorded!r}, but "
             f"this stream serves under {self._regime!r}; the rows of one record are read "
-            "together, and whether the agent was told each verdict is what says which claim "
+            "together, and which channel each task was served under is what says which claim "
             "their mean supports — resume under the regime the record was written with, or "
             "serve into a fresh provenance directory"
         )

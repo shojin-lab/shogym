@@ -72,7 +72,8 @@ BOTH = [TaskRef(ANSWERS, 0), TaskRef(CHOICES, 0)]
 
 
 async def test_colliding_native_names_are_registered_once_per_env(tmp_path: Path) -> None:
-    # Both envs expose `submit`, `noop` and `terminate`, and `submit` has a different schema in
+    # Both envs expose `submit`, `noop`, `block` and `terminate`, and `submit` has a different
+    # schema in
     # each. One endpoint cannot publish two schemas under one name, so both are prefixed.
     async with _stream(tmp_path, BOTH) as stream:
         advertised = {tool.name: tool for tool in stream.tools}
@@ -91,6 +92,7 @@ async def test_each_task_is_told_only_its_own_tools(tmp_path: Path) -> None:
         assert {tool["name"] for tool in first.tools} == {
             "answers__submit",
             "answers__noop",
+            "answers__block",
             "answers__terminate",
         }
 
@@ -244,7 +246,12 @@ async def test_one_env_is_joined_to_nothing_so_neither_half_is_restricted(
         prov_dir=tmp_path / "prov",
     )
     async with stream:
-        assert [tool.name for tool in stream.tools] == ["terminate", "sub__mit", "noop"]
+        assert [tool.name for tool in stream.tools] == [
+            "terminate",
+            "sub__mit",
+            "noop",
+            "block",
+        ]
         task = await stream.get_task()
         assert task is not None
         assert task.env == "single__env"
@@ -367,6 +374,7 @@ async def test_the_framing_never_names_a_tool_the_endpoint_does_not_serve(
             assert mapped == {
                 "submit": "answers__submit",
                 "noop": "answers__noop",
+                "block": "answers__block",
                 "terminate": "answers__terminate",
             }
             # Nothing the framing quotes is a name the agent cannot use: every one is either a
@@ -384,7 +392,12 @@ async def test_the_framing_never_names_a_tool_the_endpoint_does_not_serve(
 
 async def test_a_single_env_stream_is_not_prefixed(tmp_path: Path) -> None:
     async with _stream(tmp_path, [TaskRef(ANSWERS, 0)]) as stream:
-        assert {tool.name for tool in stream.tools} == {"submit", "noop", "terminate"}
+        assert {tool.name for tool in stream.tools} == {
+            "submit",
+            "noop",
+            "block",
+            "terminate",
+        }
         task = await stream.get_task()
         assert task is not None
         # Nothing was renamed, so the framing says nothing about naming and the wire an agent

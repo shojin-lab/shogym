@@ -137,6 +137,41 @@ def _wire_form(spec: TaskSpec) -> TaskSpec:
     return spec.model_copy(update={"tools": tools}) if changed else spec
 
 
+def _release_when_begun(env: Any, session_id: str, beginning: "asyncio.Future[None]") -> None:
+    """Release a session whose setup was abandoned, once that setup finishes.
+
+    Setup runs in a thread and a thread cannot be told to stop, so a cancelled ``open_env`` cannot
+    undo what its hook is in the middle of doing. What it can do is leave a note: when the hook
+    lands, end the session it opened. An env whose hook failed has nothing to release and its
+    ``end_session`` is a no-op, which is why this does not distinguish the two cases."""
+
+    def release(finished: "asyncio.Future[None]") -> None:
+        if finished.cancelled():
+            return
+        try:
+            loop = asyncio.get_running_loop()
+        except RuntimeError:
+            return
+        loop.create_task(_ended(env, session_id))
+
+    beginning.add_done_callback(release)
+
+
+async def _ended(env: Any, session_id: str) -> None:
+    """End one session off the loop, swallowing whatever it says: this is cleanup after a failure
+    that is already on its way to the caller, and a second error here would replace the first."""
+    try:
+        await asyncio.to_thread(env.end_session, session_id)
+    except Exception:
+        pass
+
+
+#: How long teardown waits for an env to release one episode's resources before going on without
+#: it. Teardown runs on the shared loop, so this is a bound on the wait rather than a kill: an env
+#: whose release has to be certain makes its own hook bounded.
+_END_SESSION_SECONDS = 60.0
+
+
 @dataclass
 class CallResult:
     """The outcome of one tool call: the tool's functional ``content`` (the observation the
@@ -287,6 +322,17 @@ class ServedEpisode:
         # A background drain+teardown task, used only on the deadline path so the caller gets
         # the fail-closed result AT the deadline while resource cleanup waits for the evaluator.
         self._drain_task: Optional["asyncio.Future[None]"] = None
+        # The one ordinary dispatch this episode owns, if there is one in flight.
+        #
+        # **Owned rather than awaited.** An ordinary tool is dispatched into the env, and for a
+        # synchronous handler FastMCP runs that in a worker thread: cancelling the coroutine that
+        # awaits it abandons the *await*, never the operation.
+        #
+        # So the operation is a task of this episode's, every caller waits on it *shielded*, and
+        # it commits its own step when it lands whether or not anybody is still listening. This
+        # is what the next ordinary call waits for (see `_settled`), which is a stronger gate
+        # than the lock because a cancellation cannot drop it.
+        self._inflight: Optional["asyncio.Future[tuple[CallResult, int]]"] = None
         # Optional finalize deadline (seconds): the evaluator is awaited up to this bound; on
         # timeout the episode fails closed to a `finalize_error` verdict. None disables it.
         self._finalize_deadline = finalize_deadline
@@ -371,7 +417,23 @@ class ServedEpisode:
                 opened.append(session)
                 for tool_config in await session.list_tools():
                     sessions[tool_config.name] = session
-            env.begin_session(session_id, task_data)
+            # Off the event loop. `_begin_session` is an env hook and some envs make it do real
+            # work: an env whose episode is a world in another process spawns it here, and a slow
+            # or wedged one would otherwise freeze every other episode this server is running,
+            # along with their watchdogs and deadlines.
+            #
+            # A thread cannot be cancelled, so a caller that gives up on this await leaves the
+            # hook running, and whatever it goes on to create (a process, a port, a directory)
+            # has nobody left to release it. The wait is therefore shielded and, if it is
+            # abandoned, the release is arranged for the moment the hook lands.
+            beginning = asyncio.ensure_future(
+                asyncio.to_thread(env.begin_session, session_id, task_data)
+            )
+            try:
+                await asyncio.shield(beginning)
+            except BaseException:
+                _release_when_begun(env, session_id, beginning)
+                raise
             # The one description this episode ever asks for. Everything published about the task
             # and everything enforced on it comes off this single answer — see the snapshot the
             # constructor takes of it.
@@ -502,6 +564,26 @@ class ServedEpisode:
         env, a score-terminal call runs the terminal transaction (validate -> seal ->
         evaluate), and after termination (legacy terminate/horizon) or after a seal, further
         calls are tombstoned with no inward dispatch."""
+        # Phase 0 (no lock): an ordinary dispatch this episode owns may still be running, left
+        # by a caller that was cancelled. Wait for it to commit before deciding anything, because
+        # every decision below reads `_step` and `_terminated`, which it is about to write.
+        #
+        # A terminal does not wait, and that asymmetry is the point. The deadline's forced
+        # terminal exists precisely for the episode whose ordinary call is not coming back: made
+        # to queue behind it, the one case a wall clock matters most is the one case it could
+        # never act on. So a terminal seals now, and the finalization it starts is what unblocks
+        # the ordinary call, by stopping the world it is waiting on.
+        # Only a *seal* env has terminals that do not dispatch. On a non-seal env `terminate` is
+        # an ordinary call like any other, and it waits like one.
+        terminal_call = self._seal_enabled and (
+            tool_name in self._score_schemas or tool_name == TERMINATE_TOOL_NAME
+        )
+        if not terminal_call:
+            await self._settled()
+
+        dispatch: Optional["asyncio.Future[tuple[CallResult, int]]"] = None
+        is_horizon = False
+        finalization: Optional["asyncio.Future[CallResult]"] = None
         # Phase 1: decide and, for a terminal call, seal + spawn the finalization — all under
         # the lock so state transitions are atomic against concurrent ingress.
         async with self._lock:
@@ -527,11 +609,12 @@ class ServedEpisode:
             args.pop("_session_id", None)
 
             if not self._seal_enabled:
-                # Non-seal env: the single-step path, entirely under the lock.
-                return await self._legacy_step(tool_name, args)
-
+                # Non-seal env: the single-step path. Owned and awaited outside the lock for the
+                # same reasons the seal-enabled one is: a cancelled caller would otherwise
+                # abandon an operation that is already in the env.
+                dispatch = self._begin_dispatch(tool_name, args, legacy=True)
             # ----- seal-enabled env -----
-            if tool_name in self._score_schemas:
+            elif tool_name in self._score_schemas:
                 # validate -> seal (evaluate happens after the lock is released)
                 invalid = self._validate_terminal_args(tool_name, args)
                 if invalid is not None:
@@ -550,30 +633,48 @@ class ServedEpisode:
                 # ``<horizon>`` step). Otherwise it's a normal mid-episode step.
                 horizon = self._env.horizon
                 is_horizon = horizon is not None and (self._step + 1) >= horizon
-                result, _ = await self._dispatch_step(
-                    tool_name, args, terminated=False, write_trace=not is_horizon
+                dispatch = self._begin_dispatch(
+                    tool_name, args, write_trace=not is_horizon
                 )
-                if not is_horizon:
-                    return result
+
+        # Phase 2 (lock released). The lock is deliberately not held across an ordinary
+        # dispatch: a blocked handler would otherwise hold the whole episode shut, including
+        # against the deadline's forced terminal, which is the one caller that has to be able to
+        # end an episode whose ordinary call has stopped answering. What keeps a *second
+        # ordinary* call out meanwhile is `_settled` above, which a cancellation cannot drop.
+        if dispatch is not None:
+            result, _ = await self._settle(dispatch)
+            if not is_horizon:
+                return result
+            async with self._lock:
+                # The world may have been sealed under this call while it ran: the deadline
+                # forces a terminal without waiting for it. Then there is no horizon terminal to
+                # begin, and this caller reads the same tombstone any post-seal call reads.
+                if self._state is not LifecycleState.OPEN or self._terminated:
+                    return self._sealed_tombstone()
                 # Horizon has no submission: finalize with source=horizon and no args, but keep
                 # the real tool name so the terminal trace row is labelled with the call that hit
                 # the budget.
                 finalization = self._begin_finalization("horizon", tool_name, None)
 
-        # Phase 2 (lock released): await the single in-flight finalization, *shielded* so a
-        # cancellation/disconnect of THIS request never cancels the evaluator or re-dispatches
-        # it. If we are cancelled the finalization keeps running to completion in the
-        # background; a later close() awaits the same future. Exactly one evaluation.
+        # Await the single in-flight finalization, *shielded* so a cancellation/disconnect of
+        # THIS request never cancels the evaluator or re-dispatches it. If we are cancelled the
+        # finalization keeps running to completion in the background; a later close() awaits the
+        # same future. Exactly one evaluation.
+        assert finalization is not None
         await asyncio.shield(finalization)
         return finalization.result()
 
     # ----- legacy (non-seal) step: dispatch, record, verify -----
 
-    async def _legacy_step(self, tool_name: str, args: Dict[str, Any]) -> CallResult:
+    async def _legacy_step(
+        self, tool_name: str, args: Dict[str, Any]
+    ) -> "tuple[CallResult, int]":
         # Prospective step: don't advance `self._step` until the call actually completes. If
-        # `call_tool` is cancelled (harness timeout) or raises, the counter stays put so the
-        # next call reuses this number — the trajectory stays contiguous, one Step per
-        # completed call.
+        # `call_tool` raises, the counter stays put so the next call reuses this number, and
+        # the trajectory stays contiguous, one Step per completed call. A *cancelled* caller does
+        # not reach this: the operation is the episode's and commits when it lands (see
+        # `_begin_dispatch`), so what the next call follows is a call that really ran.
         step = self._step + 1
         session = self._sessions.get(tool_name)
         if session is None:
@@ -620,13 +721,73 @@ class ServedEpisode:
         # in-band. v0 exposes no per-tool opt-in, so surface_inference stays False; episode
         # feedback rides out only on the terminal result.
         inband = select_inband(items, terminal=terminated, surface_inference=False)
-        return CallResult(
-            content=content,
-            meta=build_meta(inband, terminate=terminated),
-            terminated=terminated,
+        return (
+            CallResult(
+                content=content,
+                meta=build_meta(inband, terminate=terminated),
+                terminated=terminated,
+            ),
+            step,
         )
 
     # ----- seal-enabled ordinary step (mid-episode, non-terminal) -----
+
+    async def _settled(self) -> None:
+        """Wait until no ordinary dispatch this episode owns is still running.
+
+        The ingress gate for an ordinary call, and it is the lock's job done properly: an
+        ``asyncio.Lock`` is released as a cancellation unwinds, so a caller that goes away leaves
+        the episode open to the next call while its own operation is still in the env. This is a
+        future rather than a lock, and a future a cancelled caller cannot drop.
+
+        Shielded, and it never re-raises: what a waiter needs from a previous operation is that it
+        is over, not that it succeeded."""
+        while True:
+            inflight = self._inflight
+            if inflight is None or inflight.done():
+                return
+            try:
+                await asyncio.shield(inflight)
+            except BaseException:  # noqa: BLE001 (a previous caller's failure is not this one's)
+                return
+
+    def _begin_dispatch(
+        self,
+        tool_name: str,
+        args: Dict[str, Any],
+        *,
+        write_trace: bool = True,
+        legacy: bool = False,
+    ) -> "asyncio.Future[tuple[CallResult, int]]":
+        """Start the one ordinary dispatch this episode owns. **Called under the lock.**"""
+        runner = (
+            self._legacy_step(tool_name, args)
+            if legacy
+            else self._dispatch_step(
+                tool_name, args, terminated=False, write_trace=write_trace
+            )
+        )
+        dispatch: "asyncio.Future[tuple[CallResult, int]]" = asyncio.ensure_future(runner)
+        # Read whatever it ends with, so an operation whose caller went away does not leave an
+        # unretrieved exception for asyncio to complain about at collection. Nothing acts on it:
+        # the failure belongs to the caller that is still waiting, if there is one.
+        dispatch.add_done_callback(lambda done: done.cancelled() or done.exception())
+        self._inflight = dispatch
+        return dispatch
+
+    async def _settle(
+        self, dispatch: "asyncio.Future[tuple[CallResult, int]]"
+    ) -> "tuple[CallResult, int]":
+        """Await the owned dispatch, shielded, and clear it once it has actually landed.
+
+        Cleared on completion rather than in a ``finally``: a caller that is cancelled here leaves
+        the operation running and must leave it *set*, because that is what holds the next call
+        out until it has committed."""
+        try:
+            return await asyncio.shield(dispatch)
+        finally:
+            if dispatch.done() and self._inflight is dispatch:
+                self._inflight = None
 
     async def _dispatch_step(
         self,
@@ -652,6 +813,22 @@ class ServedEpisode:
         else:
             result = await session.call_tool(tool_name, args, tool_call_id=f"call-{step}")
             content = result.result
+        if self._terminated or self._state is not LifecycleState.OPEN:
+            # Sealed while this ran. Only the deadline's forced terminal does that, and it does it
+            # on an episode whose ordinary call had already stopped answering, so the terminal
+            # step is already in the trajectory and this one may not be appended after it: a
+            # trajectory whose steps are out of order is worse than one missing a call the row it
+            # belongs to was never scored on. The result is still returned, so a caller still
+            # waiting is answered rather than left.
+            return (
+                CallResult(
+                    content=content,
+                    meta=build_meta(terminate=True),
+                    terminated=True,
+                    tombstoned=True,
+                ),
+                self._step,
+            )
         self._step = step
         self._trajectory.append(
             Step(index=step, tool=tool_name, arguments=args, result=content)
@@ -1070,7 +1247,22 @@ class ServedEpisode:
             self._teardown_runs += 1
             self._state = LifecycleState.TEARING_DOWN
         try:
-            self._env.end_session(self._session_id)
+            # Off the loop and bounded, for the reason `begin_session` is: teardown runs on the
+            # shared loop and an env that waits on a wedged child would hold every other episode
+            # with it. At the bound the wait is abandoned; an env that needs its own release to be
+            # certain has to make its hook bounded too, which is why the appworld worker's close
+            # signals and reaps rather than asking politely over a socket.
+            #
+            # Abandoned, not repeated. The thread is still inside the hook when the bound expires,
+            # so re-issuing the release would put two of them on one episode's resources; an env
+            # whose hook is not safe to call twice would then be raced by this module rather than
+            # by anything a caller did.
+            await asyncio.wait_for(
+                asyncio.shield(
+                    asyncio.to_thread(self._env.end_session, self._session_id)
+                ),
+                timeout=_END_SESSION_SECONDS,
+            )
         except Exception:
             pass
         self._state = LifecycleState.CLOSED

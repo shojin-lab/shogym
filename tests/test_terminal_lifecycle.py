@@ -243,7 +243,15 @@ async def test_ingress_gate_tombstones_every_post_seal_call_but_allows_readonly(
             # Read-only methods stay allowed: describe (a tool), tools/list, resource read.
             desc = await client.call_tool("describe", {})
             assert json.loads(desc.content[0].text)["contract_version"] == 2
-            assert len(await client.list_tools()) == 4
+            # The fixture's own tools plus the reserved ones, named rather than counted: a bare
+            # count says nothing about which tool a change added or took away.
+            assert {tool.name for tool in await client.list_tools()} == {
+                "submit",
+                "noop",
+                "block",
+                "describe",
+                "terminate",
+            }
             res = await client.read_resource("shogym://task")
             assert json.loads(res[0].text)["env_name"] == "_fixture_score"
     finally:

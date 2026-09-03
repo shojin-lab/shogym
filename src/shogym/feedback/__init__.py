@@ -8,7 +8,10 @@ The value type is the existing ``float | bool | text`` from :mod:`shogym.types`.
 """
 
 from shogym.feedback.wire import (
+    CHANNEL_FEEDBACK_NAME,
     FEEDBACK_META_KEY,
+    NOTICE_FEEDBACK_NAME,
+    REPORT_FEEDBACK_NAME,
     TERMINATE_META_KEY,
     build_meta,
     dump_item,
@@ -17,7 +20,10 @@ from shogym.feedback.wire import (
 )
 
 __all__ = [
+    "CHANNEL_FEEDBACK_NAME",
     "FEEDBACK_META_KEY",
+    "NOTICE_FEEDBACK_NAME",
+    "REPORT_FEEDBACK_NAME",
     "TERMINATE_META_KEY",
     "build_meta",
     "dump_item",

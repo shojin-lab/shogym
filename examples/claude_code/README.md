@@ -87,7 +87,7 @@ ranges differ per env, and some envs need their extra installed and a key export
 ## Read the results
 
 ```
-runs/automationbench-<stamp>  (3 tasks)
+runs/automationbench-immediate-<stamp>  (3 tasks)
 
   #1   automationbench[0]  sealed        reward=1.0  success=True
   #2   automationbench[1]  sealed        reward=0.0  success=False
@@ -110,12 +110,12 @@ One row per dispensed task, and the columns are the record's own fields:
 - The last three closures carry **no score at all**, so an infrastructure failure can never be
   averaged in as a zero. `results.py` reports `scored N/M` for exactly that reason.
 
-The rows are JSONL on disk under `runs/<env>-<stamp>/`, so any reader will do:
+The rows are JSONL on disk under `runs/<env>-<regime>-<stamp>/`, so any reader will do:
 
 ```bash
 uv run python -c "
 from shogym.serve.stream import read_results
-for r in read_results('runs/automationbench-<stamp>'):
+for r in read_results('runs/automationbench-immediate-<stamp>'):
     print(r.position, r.env, r.task_idx, r.closure, r.score and r.score.reward)"
 ```
 
@@ -136,8 +136,28 @@ acknowledgement, stamps rows `feedback_regime="never"`, and refuses to resume a 
 rows were produced under any other regime. The agent is never told how it did; the harness
 cannot grade itself.
 
-Concurrency is available too: `max_in_flight=N` serves several tasks at once, each named by a
-lease (above 1, the served tools gain a `lease` argument).
+`SHOGYM_FEEDBACK` picks the regime for one launch without editing anything:
+
+```bash
+SHOGYM_FEEDBACK=never       <the command above>   # no channel at all
+SHOGYM_FEEDBACK=information <the command above>   # only the env's `report` item
+SHOGYM_FEEDBACK=placebo     <the command above>   # only the env's `notice` item
+```
+
+The last two are the arms of a matched pair, for an env that publishes both (`appworld` does).
+Each arm is its own launch and its own record: the regime is in the run directory's name, and a
+directory that holds one arm's rows refuses the other's. Give both arms the same
+`SHOGYM_DEADLINE` and `SHOGYM_IN_FLIGHT`, because two runs that disagree on either are two
+measurements rather than two arms of one.
+
+**Set them on the server rather than on the agent when the pair is the point.** Written on the
+command line above, they are in the agent's own environment, and the arm is then something the
+agent can read about itself before it is treated. `.mcp.json` takes an `env` block, which reaches
+this file and nothing else, and `SHOGYM_RUNS` moves the record out of the directory the agent
+works in. `src/shogym/envs/appworld/README.md` documents the whole shape, deny list included.
+
+Concurrency is available too: `SHOGYM_IN_FLIGHT=N` (or `max_in_flight=N` in `serve.py`) serves
+several tasks at once, each named by a lease (above 1, the served tools gain a `lease` argument).
 
 
 ## Files
@@ -150,10 +170,12 @@ lease (above 1, the served tools gain a `lease` argument).
 | `results.py` | reads the durable rows back out after the run |
 | `runs/` | one directory per run (`results.jsonl` + `dispenses.jsonl`). Gitignored. |
 
-Knobs worth knowing, all in `serve.py`: `feedback=` (the `Immediate()` default above;
-`Never()` or `EvalStream` for evaluation), `deadline=` bounds each task in seconds (an expired
-task is recorded unscored), `max_in_flight=` serves several tasks concurrently, and
-`resume=True` continues an interrupted run's directory instead of refusing it.
+Knobs worth knowing, all in `serve.py` and all settable for one launch from the environment:
+`SHOGYM_FEEDBACK` picks the regime (the `immediate` practice default above, `never` for
+evaluation, `information` / `placebo` for the two arms of a pair), `SHOGYM_DEADLINE` bounds each
+task in seconds (an expired task is recorded unscored), `SHOGYM_IN_FLIGHT` serves several tasks
+concurrently, and `SHOGYM_RUNS` puts `runs/` somewhere else, which is how a defended run keeps its
+record out of the directory the agent works in. `resume=True` in `serve.py` continues an interrupted run's directory instead of refusing it.
 
 ## The other quickstarts
 
