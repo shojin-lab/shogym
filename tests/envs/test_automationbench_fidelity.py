@@ -34,7 +34,7 @@ def test_env_is_registered() -> None:
 
 def test_upstream_sha_is_pinned() -> None:
     # The fidelity pin the port reproduces (guards against an accidental bump).
-    assert adapter.UPSTREAM_SHA == "a321764ace3cfbe42289e6a13abef2f0f4f56fad"
+    assert adapter.UPSTREAM_SHA == "6d210543b7a046f0f451c828cd2dadef774276eb"
 
 
 def test_simple_domain_loads_and_seeds() -> None:
@@ -78,3 +78,37 @@ def test_build_world_sets_allowed_services() -> None:
     world, initial, assertions = adapter.build_world(info)
     assert set(world.meta.allowed_services) == {"salesforce", "gmail"}
     assert "salesforce" in initial
+
+
+def test_every_shipped_row_carries_its_name_inside_info() -> None:
+    # The pinned upstream carries the name as `info["task_name"]` and ships no top-level `task`
+    # column at all, the combined alias included. Both halves are pinned: a row that regained the
+    # column would make the fallback live again, and a row that lost the new key would leave the
+    # name falling back to a default that names nothing.
+    import json
+
+    from shogym.envs.automationbench.env_v1 import task_name
+
+    for domain in ("public", "simple"):
+        rows = adapter.load_domain_tasks(domain)
+        assert rows, domain
+        assert all("task" not in row for row in rows), f"{domain} regained the task column"
+        for row in rows:
+            info = json.loads(row["info"]) if isinstance(row["info"], str) else row["info"]
+            assert info.get("task_name"), f"{domain} row {row.get('example_id')} has no task_name"
+        assert task_name(rows[0]) == json.loads(rows[0]["info"])["task_name"]
+
+
+def test_task_name_answers_the_same_for_a_raw_row_and_a_normalized_one() -> None:
+    # `load_domain_tasks` hands back `info` as JSON text and the env normalizes it to a mapping.
+    # The name is the same either way, so a caller reading it off a raw row is not silently
+    # answered with an empty string.
+    from shogym.envs.automationbench.env_v1 import _normalize_row, task_name
+
+    raw = adapter.load_domain_tasks("public")[0]
+    assert isinstance(raw["info"], str)
+    assert task_name(raw) == task_name(_normalize_row(raw)) == "sales.multi_hop_lookup"
+    # The fallbacks, in order: a legacy top-level column, then the caller's default.
+    assert task_name({"task": "legacy.name", "info": {}}) == "legacy.name"
+    assert task_name({"info": {}}, 7) == "7"
+    assert task_name({"info": "not json"}, "fallback") == "fallback"

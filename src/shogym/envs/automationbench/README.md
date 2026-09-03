@@ -1,7 +1,7 @@
 # `automationbench` — AutomationBench, an offline cross-app workflow env
 
 [**AutomationBench**](https://github.com/zapier/AutomationBench) (MIT, © Zapier) served through
-shogym at upstream commit `a321764`: an agent gets a natural-language instruction and carries out
+shogym at upstream commit `6d21054`: an agent gets a natural-language instruction and carries out
 a realistic cross-application business workflow over a fully **simulated** world of ~47 SaaS
 apps; scoring checks — programmatically, **end-state only** — whether the right data landed in
 the right systems. No LLM judge, no live SaaS, no network at eval time. The port is offline and
@@ -188,7 +188,7 @@ semantics (give each run its own trace file for a guaranteed 1:1 mapping).
   scores its official leaderboard on a held-out private set, so treat a number from here as an
   `api`-toolset result rather than as comparable to any published per-variant figure.
 - **Pinned upstream source.** The port provisions and imports the pinned upstream commit
-  [`a321764`](https://github.com/zapier/AutomationBench/commit/a321764ace3cfbe42289e6a13abef2f0f4f56fad),
+  [`6d21054`](https://github.com/zapier/AutomationBench/commit/6d210543b7a046f0f451c828cd2dadef774276eb),
   reusing only the `verifiers`-free pieces (simulated tools + `WorldState`, typed task defs, the
   pure rubric); upstream's `verifiers` / `anthropic` agent loop is discarded. The pin is the
   default runtime provisioner's; `AUTOMATIONBENCH_SRC` points at a local checkout whose revision

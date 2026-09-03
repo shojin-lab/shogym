@@ -131,7 +131,7 @@ class AutomationBenchEnv(Env):
         return {
             "task_idx": task_idx,
             "example_id": row.get("example_id"),
-            "name": str(row.get("task", task_idx)),
+            "name": task_name(row, task_idx),
             "prompt": row.get("prompt", []),
             "info": row["info"],  # already a dict (normalized on load)
             "domain": self._domain,
@@ -321,6 +321,33 @@ def _as_unit(value: Any) -> float:
 
 
 # ----- module-level helpers -----
+
+
+def task_name(row: Dict[str, Any], default: Any = "") -> str:
+    """What upstream calls one task row.
+
+    Upstream moved the name off the dataset row and into ``info["task_name"]``. Every dataset the
+    pinned upstream ships omits the top-level ``task`` column, the combined ``public`` alias
+    included, and every shipped row carries the new key, so the fallbacks are not for upstream
+    data. They are for a row from an older revision and for the rows a caller injects through the
+    ``tasks`` config, which is a supported path and predates the move.
+
+    A raw row straight out of :func:`adapter.load_domain_tasks` stores ``info`` as JSON text, and
+    that is read here too, so the answer is the same whether or not the row has been through
+    :func:`_normalize_row`. A caller holding raw rows should still normalize them, because
+    everything else that reads ``info`` expects a mapping; this only keeps a name from going
+    silently empty."""
+    info = row.get("info")
+    if isinstance(info, str):
+        try:
+            info = json.loads(info)
+        except ValueError:
+            info = None
+    if isinstance(info, dict):
+        name = info.get("task_name")
+        if name:
+            return str(name)
+    return str(row.get("task") or default)
 
 
 def _normalize_row(row: Dict[str, Any]) -> Dict[str, Any]:
