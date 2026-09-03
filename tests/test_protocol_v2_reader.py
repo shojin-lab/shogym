@@ -55,6 +55,7 @@ import pytest_asyncio
 from temporalio import activity
 from temporalio.api.enums.v1 import EventType
 from temporalio.client import Client, WorkflowHandle
+from temporalio.exceptions import ApplicationError
 from temporalio.testing import WorkflowEnvironment
 from temporalio.worker import Worker
 
@@ -118,6 +119,7 @@ from shogym.serve.protocol_v2.schedule import (
     EligibilityGate,
     ReleasePlan,
 )
+from tests._fixtures.history import the_activity_that_failed
 from tests._fixtures.policy_rows import registering_the_receipt
 
 #: How long an attempt of a generation that declares a deadline gets, and a deadline no test
@@ -928,6 +930,68 @@ async def test_the_rows_and_the_commitments_come_back_from_one_moment(
 
 
 @pytest.mark.network
+async def test_the_file_explains_a_row_whose_seal_failed(
+    env: WorkflowEnvironment, tmp_path: Path
+) -> None:
+    """A hole in a run is answered from this file without opening the raw history.
+
+    The printed table is twelve columns for a person reading a run at a glance, and a step name,
+    a semantic type and a line of what a grader said do not fit one. So the detail is here, the
+    note beside the file says it is, and a reader who has the hole and not the raw history can
+    do something about it.
+    """
+
+    @activity.defn(name=GRADE_ATTEMPT)
+    async def grader_that_refuses_this_task(request: GradeAttemptInput) -> GradeAttemptResult:
+        raise ApplicationError(
+            "this grader cannot score this task", type="NoRubricForThisTask", non_retryable=True
+        )
+
+    async with stream_worker(
+        env.client,
+        activities=[
+            seal_attempt_activity,
+            grader_that_refuses_this_task,
+            generate_payload_bundle_activity,
+        ],
+    ):
+        driver = await open_stream(env.client, make_start(("first", "second")))
+        task = await driver.take()
+        assert task.attempt_id is not None
+        with pytest.raises(Exception):
+            await driver.file(task.attempt_id)
+        records = await driver.records()
+        history = await driver.stream.handle.fetch_history()
+
+    path = write_records(RunRecords(root=tmp_path, workflow_id=WORKFLOW_ID, records=records))
+    lines = path.read_text(encoding="utf-8").splitlines()
+    failed, untouched = [json.loads(line) for line in lines]
+    assert list(failed) == field_names()
+    assert failed["final_failure"] == "seal_failed"
+    assert failed["failure_activity"] == GRADE_ATTEMPT
+    assert failed["failure_kind"] == "NoRubricForThisTask"
+    assert failed["failure_message"] == "this grader cannot score this task"
+    assert failed["failure_retry_state"] == "NON_RETRYABLE_FAILURE"
+    # And the step it names is the step the history says failed, by the identity the history
+    # wrote down. The pair is the way from a line in this file back to the Activity behind it,
+    # so it is checked against that rather than only for being there.
+    assert (failed["failure_activity"], failed["failure_activity_id"]) == the_activity_that_failed(
+        history
+    )
+
+    # A row nothing failed on carries the same keys and no answers, so a reader joining on them
+    # reads an absence rather than a shape that changes from row to row.
+    assert [key for key in untouched if key.startswith("failure_")] == [
+        key for key in failed if key.startswith("failure_")
+    ]
+    assert not [key for key in untouched if key.startswith("failure_") and untouched[key]]
+
+    note = (tmp_path / NOTE_FILE).read_text(encoding="utf-8")
+    assert "failure_activity" in note
+    assert "failure_retry_state" in note
+
+
+@pytest.mark.network
 async def test_a_run_directory_is_read_out_of_the_authority_the_manifest_names(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -1277,10 +1341,14 @@ def test_the_table_prints_an_unsealed_attempt_as_absent_and_never_as_nought() ->
     The floor is the case that column cannot carry alone. An attempt that ended without a
     filing scores nothing, and so does one the environment graded at nothing, so the ending is
     printed beside the number and the two rows read differently.
+
+    What is printed is also all that is printed. The explanation a row may carry for the seal
+    that ended it is for the file and not for a person reading a run at a glance, so the same
+    rows with every one of those fields filled in render to the same bytes.
     """
-    table = format_records(
-        [_record(0, "sealed"), _record(1, "planned"), _record(2, "ended")]
-    ).splitlines()
+    rows = [_record(0, "sealed"), _record(1, "planned"), _record(2, "ended")]
+    assert format_records([_explained(row) for row in rows]) == format_records(rows)
+    table = format_records(rows).splitlines()
     assert table[0].split() == [
         "task",
         "attempt",
@@ -1340,6 +1408,18 @@ def test_the_table_prints_an_unsealed_attempt_as_absent_and_never_as_nought() ->
         "platform_default",
     ]
     assert format_records([]) == "no attempts"
+
+
+def _explained(record: AttemptRecord) -> AttemptRecord:
+    """The same row with every field a failed seal can fill in filled in."""
+    return dataclasses.replace(
+        record,
+        failure_activity=GRADE_ATTEMPT,
+        failure_activity_id="1",
+        failure_kind="NoRubricForThisTask",
+        failure_message="this grader cannot score this task",
+        failure_retry_state="NON_RETRYABLE_FAILURE",
+    )
 
 
 def _record(position: int, how: str) -> AttemptRecord:

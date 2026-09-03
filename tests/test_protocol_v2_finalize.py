@@ -48,7 +48,7 @@ pytest.importorskip("temporalio")
 import pytest_asyncio  # noqa: E402
 from fastmcp import Client  # noqa: E402
 from temporalio import activity  # noqa: E402
-from temporalio.exceptions import ApplicationError  # noqa: E402
+from temporalio.exceptions import ActivityError, ApplicationError  # noqa: E402
 from temporalio.testing import WorkflowEnvironment  # noqa: E402
 
 from shogym.serve.episode import ServedEpisode  # noqa: E402
@@ -99,10 +99,14 @@ from shogym.serve.protocol_v2.kernel import (  # noqa: E402
     stream_replayer,
     stream_worker,
 )
+from shogym.serve.protocol_v2.kernel import workflow as kernel_workflow  # noqa: E402
 from shogym.serve.protocol_v2.kernel.activities import (  # noqa: E402
+    GENERATE_PAYLOAD_BUNDLE,
     GRADE_ATTEMPT,
+    SEAL_ATTEMPT,
     VERIFY_BLOBS,
 )
+from tests._fixtures.history import the_activity_that_failed  # noqa: E402
 from tests._fixtures.policy_rows import registering_the_receipt  # noqa: E402
 
 TEST_ENV = "wordle_v1"
@@ -119,6 +123,21 @@ DEADLINE_MS = 600_000
 # clock is skipped rather than waited on, and skipping past an Activity's own timeout would
 # fail that Activity instead of expiring the attempt, so this one is well inside it.
 DEADLINE_INSIDE_A_READ_MS = 20_000
+
+# The semantic types three deliberate refusals declare themselves as. None of them is the class
+# of the error that carries them, which is the whole point: an environment that refuses a task
+# names what it refuses for, and a row that reported the wrapper instead would say the same word
+# about every refusal there is.
+SEAL_KIND = "NoSealedCapture"
+REFUSED_KIND = "NoRubricForThisTask"
+RENDERER_KIND = "UnknownPayloadPolicy"
+# And a message no row is going to keep whole. What an environment raises with is its own to
+# choose and can be the whole of a transcript, so a row bounds it and says where it stopped.
+A_MESSAGE_TOO_LONG_TO_KEEP = "the grader raised with the whole of a transcript: " + "guess " * 200
+# The same, in a script whose characters are three bytes each and arranged so that the cap falls
+# in the middle of one. The bound is a size and not a count of characters, so what a row keeps
+# from this is whole characters and the mark, which lands it under the cap rather than on it.
+A_MESSAGE_TOO_LONG_IN_ANOTHER_SCRIPT = "the grader raised in another script: " + "評点" * 200
 
 
 def oid(value: int) -> str:
@@ -800,6 +819,264 @@ async def test_a_seal_whose_work_finally_failed_ends_the_attempt_it_prepared(env
 
 
 @pytest.mark.network
+@pytest.mark.parametrize(
+    "how", ["seal", "exhausted", "refused", "renderer", "oversized", "another_script"]
+)
+async def test_a_row_whose_seal_failed_names_the_step_and_what_it_failed_with(
+    env, how: str
+) -> None:
+    """A hole in a run is explained by the row that has it, and not only by a raw history.
+
+    ``seal_failed`` is one word for three Activities and every way each of them can fail. A
+    capture that could not be taken, a grader that is down, a grader that refuses this task and a
+    Worker with no renderer for the policy this generation declared are four different things to
+    do something about, and a reader holding only the ending cannot tell which happened. So the
+    row says which step the service gave up on, what it failed as, what it said, and why the
+    retries stopped. Each of the three Activities is failed here in turn, because one handler
+    catching all of them is what makes the step's own name the only thing that separates them.
+
+    What is read is the failure the durable history recorded, so this costs the run nothing: no
+    file is written, no Activity is wrapped, and the retry contract an environment declares by
+    raising non-retryably is the one it declared. The kind is that failure's own semantic type
+    where it has one, because an environment that refuses a task names what it refuses for and
+    reporting the wrapper's class would put one uninformative word on every deliberate refusal.
+
+    The message is bounded, and says so where it was cut. It is whatever an environment raised
+    with, a Query and a JSON row both carry it, and a field that could be the whole of a transcript
+    is not one a row can hold.
+    """
+
+    @activity.defn(name=SEAL_ATTEMPT)
+    async def seal_with_nothing_to_capture(request: Any) -> Any:
+        raise ApplicationError(
+            "there is nothing here to seal", type=SEAL_KIND, non_retryable=True
+        )
+
+    @activity.defn(name=GRADE_ATTEMPT)
+    async def grader_that_keeps_failing(request: Any) -> Any:
+        raise RuntimeError(f"the grader is down,\n  and this is call {activity.info().attempt}")
+
+    @activity.defn(name=GRADE_ATTEMPT)
+    async def grader_that_refuses_this_task(request: Any) -> Any:
+        raise ApplicationError(
+            "this grader cannot score this task", type=REFUSED_KIND, non_retryable=True
+        )
+
+    @activity.defn(name=GRADE_ATTEMPT)
+    async def grader_that_says_far_too_much(request: Any) -> Any:
+        raise ApplicationError(A_MESSAGE_TOO_LONG_TO_KEEP, type=REFUSED_KIND, non_retryable=True)
+
+    @activity.defn(name=GRADE_ATTEMPT)
+    async def grader_that_says_far_too_much_in_another_script(request: Any) -> Any:
+        raise ApplicationError(
+            A_MESSAGE_TOO_LONG_IN_ANOTHER_SCRIPT, type=REFUSED_KIND, non_retryable=True
+        )
+
+    @activity.defn(name=GENERATE_PAYLOAD_BUNDLE)
+    async def renderer_this_worker_does_not_have(request: Any) -> Any:
+        raise ApplicationError(
+            "this Worker renders no such policy", type=RENDERER_KIND, non_retryable=True
+        )
+
+    seal: Any = seal_attempt_activity
+    grade: Any = grade_attempt_activity
+    render: Any = generate_payload_bundle_activity
+    if how == "seal":
+        seal = seal_with_nothing_to_capture
+    elif how == "exhausted":
+        grade = grader_that_keeps_failing
+    elif how == "refused":
+        grade = grader_that_refuses_this_task
+    elif how == "oversized":
+        grade = grader_that_says_far_too_much
+    elif how == "another_script":
+        grade = grader_that_says_far_too_much_in_another_script
+    else:
+        render = renderer_this_worker_does_not_have
+
+    async with stream_worker(env.client, activities=[seal, grade, render]):
+        caller = await open_stream(env, workflow_id=f"stream/finalize/seal-said-{how}")
+        await caller.take()
+        with pytest.raises(Exception):
+            await caller.stream.seal(caller.seal_request())
+
+        state = await caller.stream.stream_state()
+        assert state.final_failures == {ATTEMPT: SEAL_FAILED}
+        [row] = await caller.stream.handle.query(StreamWorkflow.attempt_records)
+        history = await caller.stream.handle.fetch_history()
+
+    # Which step, and a handle to it in the history that recorded it. The pair is compared
+    # against the history's own answer rather than only being present, because the id is
+    # documented as the way from the row back to the Activity and a constant would satisfy
+    # anything weaker.
+    assert row.failure_activity == {
+        "seal": SEAL_ATTEMPT,
+        "renderer": GENERATE_PAYLOAD_BUNDLE,
+    }.get(how, GRADE_ATTEMPT)
+    assert (row.failure_activity, row.failure_activity_id) == the_activity_that_failed(history)
+    if how == "seal":
+        # The first Activity of the three, which fails before any result exists to check.
+        assert row.failure_kind == SEAL_KIND
+        assert row.failure_message == "there is nothing here to seal"
+        assert row.failure_retry_state == "NON_RETRYABLE_FAILURE"
+    elif how == "exhausted":
+        # An ordinary exception arrives as its own class, and what the row keeps is the last
+        # failure the service accepted: the third call, which is the one the policy gave up on.
+        # The message is one line, whatever shape it was raised in.
+        assert row.failure_kind == "RuntimeError"
+        assert row.failure_message == "the grader is down, and this is call 3"
+        assert row.failure_retry_state == "MAXIMUM_ATTEMPTS_REACHED"
+    elif how == "oversized":
+        # Cut to the cap, with the mark inside the value, so a reader is not handed a partial
+        # explanation that reads as a whole one. The mark says the harness stopped here; it is a
+        # convention rather than a proof, since a short message is kept unchanged once flattened.
+        assert row.failure_kind == REFUSED_KIND
+        assert row.failure_message is not None
+        assert row.failure_message.startswith("the grader raised with the whole of a transcript")
+        assert row.failure_message.endswith(" [truncated]")
+        assert len(row.failure_message.encode("utf-8")) == 512
+        assert row.failure_retry_state == "NON_RETRYABLE_FAILURE"
+    elif how == "another_script":
+        # The same cut in a script of three-byte characters, where the cap falls in the middle of
+        # one. Half a character is not a character, so the incomplete one is dropped and the value
+        # comes back one byte under the cap rather than on it, whole and with the mark.
+        assert row.failure_kind == REFUSED_KIND
+        assert row.failure_message is not None
+        assert row.failure_message.startswith("the grader raised in another script: 評点")
+        assert row.failure_message.endswith(" [truncated]")
+        assert len(row.failure_message.encode("utf-8")) == 511
+        assert "�" not in row.failure_message
+        assert row.failure_retry_state == "NON_RETRYABLE_FAILURE"
+    else:
+        # A deliberate refusal is reported as what it refuses for, and never as the class of the
+        # error every refusal shares.
+        expected = RENDERER_KIND if how == "renderer" else REFUSED_KIND
+        assert row.failure_kind == expected
+        assert row.failure_kind != "ApplicationError"
+        assert row.failure_retry_state == "NON_RETRYABLE_FAILURE"
+        assert row.failure_message == (
+            "this Worker renders no such policy"
+            if how == "renderer"
+            else "this grader cannot score this task"
+        )
+
+
+@pytest.mark.network
+async def test_a_row_whose_seal_ran_out_of_time_says_which_clock_ran_out(
+    env, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A failure that never reached the environment's code is still a failure a row explains.
+
+    An Activity that answered nothing has no exception of its own to report, so what the history
+    recorded is the timeout, and the row says which timeout it was: the message the service
+    writes for one is the single word, and the difference between a step that overran and a
+    Worker that was never there is the only thing worth reading. The extraction has to hold that
+    shape without an application error's fields, which is what this pins.
+    """
+    monkeypatch.setattr(kernel_workflow, "_TERMINAL_ACTIVITY_TIMEOUT", timedelta(seconds=1))
+
+    @activity.defn(name=GRADE_ATTEMPT)
+    async def grader_that_never_answers(request: Any) -> Any:
+        await asyncio.sleep(10)
+
+    async with stream_worker(
+        env.client,
+        activities=[
+            seal_attempt_activity,
+            grader_that_never_answers,
+            generate_payload_bundle_activity,
+        ],
+    ):
+        caller = await open_stream(env, workflow_id="stream/finalize/seal-ran-out-of-time")
+        await caller.take()
+        with pytest.raises(Exception):
+            await caller.stream.seal(caller.seal_request())
+
+        state = await caller.stream.stream_state()
+        assert state.final_failures == {ATTEMPT: SEAL_FAILED}
+        [row] = await caller.stream.handle.query(StreamWorkflow.attempt_records)
+
+    assert row.failure_activity == GRADE_ATTEMPT
+    assert row.failure_kind == "TimeoutError.START_TO_CLOSE"
+    assert row.failure_message == "Timeout"
+    assert row.failure_retry_state == "MAXIMUM_ATTEMPTS_REACHED"
+
+
+@pytest.mark.network
+async def test_a_history_that_recorded_a_failed_activity_replays_to_the_same_row(env) -> None:
+    """The explanation is a reading of the history and not a note taken while it happened.
+
+    Which means a generation rebuilt from that history has to arrive at the same words. This one
+    is served by a Worker with no cache, so every task replays from the beginning, and the row is
+    asked for again from a Worker that never saw the failure land.
+    """
+
+    @activity.defn(name=GRADE_ATTEMPT)
+    async def grader_that_keeps_failing(request: Any) -> Any:
+        raise RuntimeError(f"the grader is down on call {activity.info().attempt}")
+
+    activities = [
+        seal_attempt_activity,
+        grader_that_keeps_failing,
+        generate_payload_bundle_activity,
+    ]
+    async with stream_worker(env.client, activities=activities, cached_workflows=0):
+        caller = await open_stream(env, workflow_id="stream/finalize/seal-failure-replays")
+        await caller.take()
+        with pytest.raises(Exception):
+            await caller.stream.seal(caller.seal_request())
+        [recorded] = await caller.stream.handle.query(StreamWorkflow.attempt_records)
+        history = await caller.stream.handle.fetch_history()
+
+    await stream_replayer().replay_workflow(history)
+
+    async with stream_worker(env.client, activities=activities, cached_workflows=0):
+        [replayed] = await caller.stream.handle.query(StreamWorkflow.attempt_records)
+    assert replayed == recorded
+    assert recorded.failure_kind == "RuntimeError"
+    assert recorded.failure_message == "the grader is down on call 3"
+
+
+def test_a_failure_that_cannot_be_described_is_still_a_failure_that_ends_the_attempt() -> None:
+    """A description of a failure may not become a second failure in its place.
+
+    What a cause renders as is not this generation's code. The types the service's own converter
+    rebuilds are safe, but a deployment may register a converter of its own, and an object whose
+    rendering raises would take the ending with it: the row would be written by nothing, the
+    original failure would never reach the handler that finalizes, and the attempt would be left
+    prepared while the workflow task retried the same crash for ever.
+
+    So every value is read as far as it reads. What can be said is said, what cannot is absent,
+    and the ending happens either way.
+    """
+
+    class ACauseThatCannotSayWhatItIs(Exception):
+        def __str__(self) -> str:
+            raise RuntimeError("this exception will not render")
+
+    failed = ActivityError(
+        "Activity task failed",
+        scheduled_event_id=1,
+        started_event_id=2,
+        identity="a worker",
+        activity_type=GRADE_ATTEMPT,
+        activity_id="1",
+        retry_state=None,
+    )
+    failed.__cause__ = ACauseThatCannotSayWhatItIs()
+
+    attempt = kernel_workflow._Attempt(item=make_start().tasks[0])
+    kernel_workflow._note_failure(attempt, failed)
+
+    assert attempt.failure_activity == GRADE_ATTEMPT
+    assert attempt.failure_activity_id == "1"
+    # The class is still readable, so it is still reported. The message is not, so there is none.
+    assert attempt.failure_kind == "ACauseThatCannotSayWhatItIs"
+    assert attempt.failure_message is None
+    assert attempt.failure_retry_state is None
+
+
+@pytest.mark.network
 @pytest.mark.parametrize("how", ["non_retryable", "unusable"])
 async def test_a_seal_that_ended_its_attempt_leaves_the_transport_serving(env, how) -> None:
     """The filing that ended an attempt is not one the transport waits for an answer to.
@@ -901,8 +1178,23 @@ async def test_a_seal_that_ended_its_attempt_leaves_the_transport_serving(env, h
                 assert [block.text for block in faulted.content] == [
                     "Error calling tool 'terminate': Workflow update failed"
                 ]
-                # And the reason this generation could not go on stayed in this generation.
+                # And the reason this generation could not go on stayed in this generation. It is
+                # on the attempt's row, which a harness Query answers with and no tool reaches:
+                # what the words say is what an environment was grading.
                 assert not [word for word in private if word in faulted.content[0].text]
+                rows = await stream.handle.query(StreamWorkflow.attempt_records)
+                [row] = [record for record in rows if record.attempt_id == attempt]
+                assert (row.failure_kind, row.failure_message) == {
+                    "non_retryable": ("ApplicationError", "this grader cannot score this task"),
+                    "unusable": ("UnusableActivityResult", "the score is not this seal's"),
+                }[how]
+                # Which the two endings say differently, because they are different facts. A step
+                # that failed is named, with the retry state that gave up on it. A result that
+                # came back and could not be vouched for names no step and no retry state: the
+                # Activity behind it succeeded, and what is recorded is the check that refused.
+                assert row.failure_activity == (None if how == "unusable" else GRADE_ATTEMPT)
+                assert (row.failure_activity_id is None) == (how == "unusable")
+                assert (row.failure_retry_state is None) == (how == "unusable")
 
                 state = await gateway.stream_state()
                 assert state.attempts[attempt] == "final_failed"

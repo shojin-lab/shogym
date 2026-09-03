@@ -44,6 +44,36 @@ it: it passes the run directory to its episode, and it releases the world throug
 rather than closing the episode with the default `finalize=True`, which claimed an abort verdict for
 an attempt the generation had already answered for.
 
+### `serve`: a row whose seal could not go on says what stopped it
+
+An accepted terminal runs the seal and the grade, and the renderer as well when the attempt
+carries a payload obligation, and either way its batch can end the attempt wrote one word on the
+row and nothing else: `seal_failed` for an Activity that failed for good, and `seal_unusable` or
+`seal_renderer_mismatch` for one that answered with a result the seal would not commit, each with
+a score of zero. A grader that was down, a grader that refused the task, a
+Worker with no renderer for the declared policy and a score returned for another seal all read
+alike, so the only way to explain a hole in a run was to open the raw durable history.
+
+`AttemptRecord` now carries five more fields, and `records.jsonl` carries them with it:
+`failure_activity` and `failure_activity_id` name the step the service gave up on, `failure_kind`
+is the semantic type it failed as (the environment's own type for a deliberate refusal, the
+exception's class for an ordinary failure, and which timeout for one that overran),
+`failure_message` is what it said, flattened to one line and cut to 512 bytes with the cut marked
+inside the value, and `failure_retry_state` is why the retries stopped. All five are `None` on
+every row whose seal did not end it, and all five are read out of what the history already
+recorded, so a replay produces the same words and no run writes anything new.
+
+A result the seal could not vouch for fills two of the five. Its Activity succeeded, so no step
+is named and there is no retry state to report: `failure_kind` and `failure_message` are the
+semantic type of the check that refused the answer and what it found, for example
+`UnusableActivityResult`, and `IncompleteCandidateBundle` or `RendererDescriptorMismatch` for the
+checks that have their own.
+
+The twelve-column table `shogym results` prints is unchanged, and so is what a model is handed
+when its filing fails: a message an environment raised with can name what it was grading, so this
+detail travels on the harness-only Queries, `attempt_records` and the `generation_records` the
+reader uses, and in the run's own records and nowhere else.
+
 ### `serve`: the version one serving contract is retired, and protocol v2 is the only path
 
 `shogym.serve.stream` is gone, and with it `TaskStream`, `EvalStream`, `TaskRef`,
