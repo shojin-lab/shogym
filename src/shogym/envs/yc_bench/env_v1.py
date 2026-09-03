@@ -255,6 +255,43 @@ class YcBenchEnv(Env):
         verdict = mcp_server.read_verdict(req.session_id)
         return TerminalEvidence(source=req.source, status="ok", verdict=verdict)
 
+    # ----- the durable stream's terminal -----
+
+    def protocol_v2_grade(self):
+        """What this env's grader is, asked before a generation is built over it.
+
+        A generation may publish its score to the agent only where the number is the
+        environment's own. YC-Bench's is: the company finished its year solvent, read off the
+        sim's end state rather than off anything the command surface reported.
+        """
+        from shogym.envs.yc_bench.protocol_v2 import YC_BENCH_GRADE
+
+        return YC_BENCH_GRADE
+
+    def protocol_v2_terminal(self, route: Any):
+        """The version this env declares, how to seal and grade one attempt, and what it is.
+
+        A durable stream asks the env it is serving rather than being told which env it has.
+        Without this the stream's stand-ins would end a yc_bench attempt on the empty ``submit``,
+        which carries nothing to score, so a company that survived the year and one that went
+        bankrupt on the first payroll would be worth the same.
+        """
+        from shogym.envs.yc_bench.protocol_v2 import configuration_digest, yc_bench_terminal
+
+        version, activities = yc_bench_terminal(route)
+        return (
+            version,
+            activities,
+            configuration_digest(
+                task_split=self._task_split,
+                config_name=self._config_name,
+                start_date=self._start_date,
+                horizon_years=self._horizon_years,
+                company_name=self._company_name,
+                seeds=self._seeds,
+            ),
+        )
+
     def _verify(
         self,
         trajectory: Trajectory,
