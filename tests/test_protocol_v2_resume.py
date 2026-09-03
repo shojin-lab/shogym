@@ -1059,6 +1059,7 @@ def test_the_configuration_hash_covers_everything_a_resume_is_held_to() -> None:
         replace(start, canonicalization_version="kernel.2"),
         replace(start, id_key_hex="cd" * 32),
         replace(start, wait_retry_after_ms=2000),
+        replace(start, attempt_deadline_ms=600_000),
     ]
     hashes = {configuration_hash(one) for one in changed}
     assert len(hashes) == len(changed)

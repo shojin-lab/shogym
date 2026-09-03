@@ -76,6 +76,16 @@ carries the provider-turn blob and says the turn completed. The next pull is ref
 does. When the queue is closed and everything has been sealed, acknowledged, and delivered, a
 pull returns Done, and presenting Done ends the generation.
 
+An attempt nobody is going to finish is ended by the controller instead::
+
+    await stream.finalize(FinalizeRequest(attempt_id=..., reason=STEP_CAP))
+
+That mints nothing the model can read. The attempt fails finally, its capacity comes back, the
+payload it was owed is resolved without being rendered, its outcome is written at the floor, and
+the next pull moves on to whatever the schedule puts first. A generation started with
+``attempt_deadline_ms`` does the same for itself when an attempt stays active longer than that,
+on a durable timer that survives the worker that armed it.
+
 A refusal arrives as an Update failure carrying one code from the protocol's closed set. Read
 it with :func:`protocol_error_code`; anything that function returns ``None`` for is a fault
 and not a protocol answer. :meth:`StreamHandle.stream_state` is harness-only and writes
@@ -91,11 +101,20 @@ from shogym.serve.protocol_v2.kernel.activities import (
     verify_blobs_activity,
 )
 from shogym.serve.protocol_v2.kernel.messages import (
+    ABANDONED,
+    DEADLINE,
+    FINAL_FAILURE_REASONS,
+    FINAL_FAILURES,
+    SEAL_FAILED,
+    SEAL_UNUSABLE,
+    STEP_CAP,
+    AttemptFinalized,
     BlobsVerified,
     ConsumerClaim,
     ConsumerReceipt,
     EnvironmentCall,
     EnvironmentLease,
+    FinalizeRequest,
     GeneratePayloadBundleInput,
     GradeAttemptInput,
     GradeAttemptResult,
@@ -117,6 +136,7 @@ from shogym.serve.protocol_v2.kernel.messages import (
     Writer,
     assignments_for,
     configuration_hash,
+    finalize_request_identity,
     hidden_seal_id,
 )
 from shogym.serve.protocol_v2.kernel.runtime import (
@@ -137,14 +157,23 @@ from shogym.serve.protocol_v2.kernel.runtime import (
 from shogym.serve.protocol_v2.kernel.workflow import StreamProtocolError, StreamWorkflow
 
 __all__ = [
+    "ABANDONED",
+    "DEADLINE",
+    "FINAL_FAILURES",
+    "FINAL_FAILURE_REASONS",
+    "SEAL_FAILED",
+    "SEAL_UNUSABLE",
+    "STEP_CAP",
     "STREAM_TASK_QUEUE",
     "TEMPORAL_ADDRESS_ENV",
+    "AttemptFinalized",
     "BlobRef",
     "BlobsVerified",
     "ConsumerClaim",
     "ConsumerReceipt",
     "EnvironmentCall",
     "EnvironmentLease",
+    "FinalizeRequest",
     "GeneratePayloadBundleInput",
     "GradeAttemptInput",
     "GradeAttemptResult",
@@ -174,6 +203,7 @@ __all__ = [
     "durable_client",
     "generate_payload_bundle_activity",
     "grade_attempt_activity",
+    "finalize_request_identity",
     "hidden_seal_id",
     "kernel_activities",
     "protocol_error_code",

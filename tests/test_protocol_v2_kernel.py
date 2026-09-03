@@ -45,6 +45,7 @@ from shogym.serve.protocol_v2 import (  # noqa: E402
 )
 from shogym.serve.protocol_v2 import Payload  # noqa: E402
 from shogym.serve.protocol_v2.kernel import (  # noqa: E402
+    SEAL_UNUSABLE,
     STREAM_TASK_QUEUE,
     ConsumerClaim,
     EnvironmentCall,
@@ -462,14 +463,20 @@ async def test_malformed_arguments_are_rejected_without_touching_the_attempt(
 
 
 @pytest.mark.network
-@pytest.mark.parametrize("corrupted", ["seal", "grade", "grade_seal", "bundle", "bundle_filing"])
-async def test_a_result_the_seal_cannot_vouch_for_never_becomes_an_acknowledgement(
+@pytest.mark.parametrize(
+    "corrupted", ["seal", "grade", "grade_seal", "bundle", "bundle_filing", "bundle_count"]
+)
+async def test_a_result_the_seal_cannot_vouch_for_ends_the_attempt_it_prepared(
     env: WorkflowEnvironment, corrupted: str
 ) -> None:
-    """A seal stops where its batch is assembled when a result does not describe what it built.
+    """A seal whose batch is answered with a result it cannot use ends the attempt instead.
 
     An Activity that answers for another attempt, or another seal, or another filing, or that
-    records measurements of something other than the body it carries, acknowledges nothing.
+    records measurements of something other than the body it carries, acknowledges nothing. It
+    succeeded, so there is no step left for the exact filing to take again, and an attempt held
+    prepared under it would hold the generation's capacity with no way to an outcome. The
+    ending is written apart from the one a failed Activity leaves, because what a reader is
+    looking at here is work that reported success.
     """
 
     @activity.defn(name=SEAL_ATTEMPT)
@@ -501,6 +508,12 @@ async def test_a_result_the_seal_cannot_vouch_for_never_becomes_an_acknowledgeme
         # was rendered from a submission this obligation never filed.
         return await generate_payload_bundle_activity(replace(request, submission_digest="0" * 64))
 
+    @activity.defn(name=GENERATE_PAYLOAD_BUNDLE)
+    async def bundle_carrying_no_candidate(request: GeneratePayloadBundleInput) -> Any:
+        # The family this kernel builds is one candidate. A bundle carrying any other number of
+        # them leaves the obligation nothing to be materialized from and no body to check.
+        return replace(await generate_payload_bundle_activity(request), candidates=[])
+
     served = {
         "seal": [seal_of_another_attempt, grade_attempt_activity, generate_payload_bundle_activity],
         "grade": [seal_attempt_activity, score_of_another_attempt, generate_payload_bundle_activity],
@@ -515,18 +528,32 @@ async def test_a_result_the_seal_cannot_vouch_for_never_becomes_an_acknowledgeme
             grade_attempt_activity,
             bundle_built_for_another_filing,
         ],
+        "bundle_count": [
+            seal_attempt_activity,
+            grade_attempt_activity,
+            bundle_carrying_no_candidate,
+        ],
     }[corrupted]
+    fault = "IncompleteCandidateBundle" if corrupted == "bundle_count" else "UnusableActivityResult"
     async with stream_worker(env.client, activities=served):
         caller = await open_stream(env, workflow_id=f"stream/unusable/{corrupted}")
         await caller.take()
-        assert await failed(caller.seal()) == "UnusableActivityResult"
-        # The seal stopped before the transition it could not have completed truthfully: no
-        # acknowledgement was offered, no obligation was materialized, and the attempt is still
-        # the one that was being sealed.
+        assert await failed(caller.seal()) == fault
+        # The ending, and nothing else. The seal stopped before the transition it could not
+        # have completed truthfully, so no acknowledgement was offered and no obligation was
+        # materialized, and the capacity the attempt was holding is back.
         state = await caller.stream.stream_state()
-        assert state.attempts[ATTEMPT] == "sealing"
-        assert state.obligations[ATTEMPT] == "assigned"
+        assert state.attempts[ATTEMPT] == "final_failed"
+        assert state.final_failures == {ATTEMPT: SEAL_UNUSABLE}
+        assert state.capacity_in_use == 0
+        assert state.obligations[ATTEMPT] == "final_failed"
+        assert state.materialization_count == 0
         assert state.pending_message_id is None
+        assert state.offer_count == 1
+
+        # And the generation can reach Done, which is the whole of what a stranded attempt cost.
+        await caller.stream.close_queue()
+        assert (await caller.pull()).kind == "done"
 
 
 @pytest.mark.network

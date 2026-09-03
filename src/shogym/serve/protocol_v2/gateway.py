@@ -91,9 +91,11 @@ from shogym.serve.protocol_v2 import (
     require_opaque_id,
 )
 from shogym.serve.protocol_v2.kernel import (
+    STEP_CAP,
     STREAM_TASK_QUEUE,
     ConsumerClaim,
     EnvironmentCall,
+    FinalizeRequest,
     OfferedMessage,
     QueueClosed,
     SealRequest,
@@ -129,6 +131,7 @@ _LOG = logging.getLogger(__name__)
 _OPEN = "open"
 _DONE = "done"
 _ACTIVE = "active"
+_FINAL_FAILED = "final_failed"
 
 # What this transport is doing, which is a different question from what the generation is.
 _SERVING = "serving"
@@ -215,6 +218,12 @@ _WRAPPER_NOTE = (
     '\n\nCall this tool as {"attempt_id": <the attempt_id of your current task>, '
     '"arguments": {...the tool\'s own arguments...}}.'
 )
+
+# The refusals a finalization the gateway made for itself may be answered with. Both say the
+# attempt is already over, which is the state the finalization was asking for: the deadline can
+# have reached it first, and either way there is nothing left to end. Any other code is a fault
+# and is raised, because then the attempt is still open and nothing ended it.
+_ALREADY_OVER = ("invalid_attempt", "conflicting_seal")
 
 
 def _opaque() -> str:
@@ -366,6 +375,7 @@ def stream_start(
     release: Optional[Union[ReleasePlan, ReleaseFor]] = None,
     without_payload: Sequence[int] = (),
     evaluation_only: bool = False,
+    attempt_deadline_ms: int = 0,
     canonicalization_version: str = CANONICALIZATION_VERSION,
     environment_digest: Optional[str] = None,
 ) -> StreamStart:
@@ -391,6 +401,10 @@ def stream_start(
     and it goes into the configuration hash a resume checks itself against, so a generation
     restarted under a differently configured environment is refused before it is worked rather
     than scored against a key nobody drew for it.
+
+    ``attempt_deadline_ms`` is how long an attempt may stay active before the generation ends it.
+    It is off by default, because how long a run is willing to wait on one attempt is a decision
+    about that run and not about this transport.
 
     What comes back is a generation the stream would accept, because the same check the stream
     makes at start is made here, where the caller composing a run is the one who reads it.
@@ -442,6 +456,7 @@ def stream_start(
         release=plan,
         assignments=roster,
         evaluation_only=evaluation_only,
+        attempt_deadline_ms=attempt_deadline_ms,
     )
 
 
@@ -546,11 +561,18 @@ class _LeaseHeld:
     nothing else can make it land. The grant is written down before it is asked for, so one
     whose answer was lost is still given back by name, and it keeps the observation once the
     world has changed, because that observation exists nowhere else.
+
+    ``finalize`` is the ending the call that landed here owes, when it was the one that spent
+    the last of the budget. It is built once, before the release goes, and kept by value: the
+    step is spent where the world changed, so the ending is part of what this call has to
+    finish rather than something a later one could decide to do instead. A fresh request each
+    time would be a second ending rather than the same one arriving again.
     """
 
     owner: bytes
     call: EnvironmentCall
     result: Optional[ToolResult] = None
+    finalize: Optional[FinalizeRequest] = None
 
 
 @dataclass(frozen=True)
@@ -617,6 +639,11 @@ class StreamGateway:
     Two fields are not that. One call is running at a time, claimed before the first await and
     released where the operation settles, and one recovery record says what has been left open
     and which call may close it.
+
+    It also counts the environment's steps. The step budget belongs to the environment, and the
+    calls that spend it never reach the stream, so this is the only layer that can see the
+    budget run out. When it does, the attempt is ended through the stream that owns it rather
+    than inside the episode, which is what keeps the ending a fact the ledger holds.
     """
 
     def __init__(
@@ -658,6 +685,10 @@ class StreamGateway:
         self._terminal = terminal.name
         self._cursor = initial_cursor
         self._active: FrozenSet[str] = frozenset()
+        # The env's step budget, and what this attempt has spent of it. The budget is the one
+        # the contract publishes, so an env that declares none is served without a cap.
+        self._step_cap = spec.horizon
+        self._steps = 0
         self._transcript: List[bytes] = []
         self._blobs = blobs
         self._closed = False
@@ -882,13 +913,18 @@ class StreamGateway:
         routed attempt is the stream saying so, and saying so at the moment of the call rather
         than at some earlier read: the stream decides this call and holds the generation until
         it settles, so an attempt that ended in between is not one it still reaches.
+
+        The call that spends the last of the env's step budget is still an ordinary call: it is
+        dispatched, it is committed, and its observation comes back. What happens after it is
+        that the attempt is ended, so the next call to this tool is routed nowhere and the next
+        pull is what says the stream has moved on.
         """
         attempt_id, native = self._unwrap(arguments)
         owed = await self._resumed(key)
         if owed is not None:
             return owed
         episode = self._episode
-        if episode is None:  # pragma: no cover - an active attempt has a world by definition
+        if episode is None:  # pragma: no cover - an active attempt has a world by now
             raise self._refuse("invalid_attempt")
         held = _LeaseHeld(
             owner=key, call=EnvironmentCall(call_id=_opaque(), attempt_id=attempt_id)
@@ -906,10 +942,31 @@ class StreamGateway:
         # presented Payload, so a sidecar carrying it here would be a second channel that
         # no offer, presentation, or delivery count could see.
         result = ToolResult(content=observation.content)
-        landed = _LeaseHeld(owner=key, call=held.call, result=result)
+        # The step is spent where the world changed, and the attempt is ended after the
+        # generation has been given back, because ending it is an Update like any other and the
+        # stream holds itself against one while an environment call is out.
+        self._steps += 1
+        # Both of those are durable operations, and either answer can be lost. So the record
+        # holds the observation and the ending together until both have settled: a call that
+        # got no answer to its release is one whose ending has not run, and a call that got no
+        # answer to its ending must not go back to the world for a step it already spent.
+        landed = _LeaseHeld(
+            owner=key,
+            call=held.call,
+            result=result,
+            finalize=self._spent_request(attempt_id),
+        )
         self._recovery = landed
         await self._given_back(landed)
         return result
+
+    def _spent_request(self, attempt_id: str) -> Optional[FinalizeRequest]:
+        """The ending this call owes, if the step it just spent was the last one it had."""
+        if self._step_cap is None or self._steps < self._step_cap:
+            return None
+        return FinalizeRequest(
+            request_id=_opaque(), attempt_id=attempt_id, reason=STEP_CAP
+        )
 
     async def _granted(self, held: _LeaseHeld) -> None:
         """Ask the stream to hold the generation while one environment call happens.
@@ -934,7 +991,7 @@ class StreamGateway:
             raise
 
     async def _given_back(self, held: _LeaseHeld) -> None:
-        """Give the generation back for one call, or leave the record holding it.
+        """Give the generation back for one call, and finish what that call still owes.
 
         The stream holds the generation for the exact call it granted, so nothing but that call
         can end the hold. A release whose answer never comes is therefore kept rather than
@@ -944,11 +1001,19 @@ class StreamGateway:
 
         An answer settles it either way. A refusal is the stream saying it is holding nothing
         for this call, which is as decisive as the lease it hands back when it was.
+
+        The ending goes next, in that order and not the other, because it is an Update and the
+        stream refuses every one of those while it is holding a grant. The record is not closed
+        until it has landed: an ending whose answer was lost is the same ending sent again,
+        which the stream answers with the receipt it already wrote or with the refusal that
+        says the attempt is already over.
         """
         try:
             await self._sent(self._stream.end_environment_call(held.call))
         except ToolError:
             pass
+        if held.finalize is not None:
+            await self._budget_spent(held.finalize)
         self._recovery = _Idle()
 
     async def _given_back_quietly(self, held: _LeaseHeld) -> None:
@@ -1076,10 +1141,18 @@ class StreamGateway:
         the stream to be refused by it, so that refusal is made here. A gateway that has
         forgotten whose message it is refuses everything, the exact call included: the stream
         would answer the same way, and this way no world is changed before it does.
+
+        One thing left open is closed by the stream rather than by the call that opened it. A
+        filing is kept until its answer is collected, and a filing whose attempt has ended has
+        no answer to collect, so it is closed here before the owner is compared. Leaving it
+        would hold this transport against a message that does not exist, and every call, the
+        owner's own retry included, would be refused for as long as the generation ran.
         """
         state = await self._sent(self._stream.stream_state())
         self._adopt(state)
         record = self._recovery
+        if self._nothing_to_collect(record, state):
+            record = self._recovery = _Idle()
         if record.owner is not None and record.owner != key:
             raise self._refuse("outstanding_response")
         if isinstance(record, _Idle):
@@ -1087,6 +1160,7 @@ class StreamGateway:
                 raise self._refuse("outstanding_response")
             if self._closed:
                 raise self._refuse("closed_stream")
+            await self._retired(state)
             return None
         if isinstance(record, _RequestUncertain):
             return None
@@ -1118,6 +1192,48 @@ class StreamGateway:
             )
             self._recovery = record
         return await self._present(record)
+
+    def _nothing_to_collect(self, record: _Recovery, state: StreamState) -> bool:
+        """Whether a filing this gateway is holding open has nothing left to come back for.
+
+        A filing whose answer never arrived is kept because the acknowledgement it may have
+        minted is reachable through that request and through no other. An attempt that has
+        ended minted none. Either the seal committed an ending instead of an acknowledgement,
+        or something else ended the attempt before this filing reached the stream, and from
+        then on every filing for it is refused, the exact one included. So there is nothing
+        for this record to be held open for.
+
+        A message the stream is holding is the case where there is something, so that is asked
+        first: an acknowledgement is offered against an attempt the seal took and a rejection
+        against one that is still active, and neither of those is an attempt that has ended.
+        """
+        if not isinstance(record, _RequestUncertain):
+            return False
+        request = record.request
+        if not isinstance(request, SealRequest) or state.pending_message_id is not None:
+            return False
+        return state.attempts.get(request.metadata.attempt_id) == _FINAL_FAILED
+
+    async def _retired(self, state: StreamState) -> None:
+        """Close the world of an attempt the generation ended, before any new work is asked for.
+
+        A sealed attempt's world is retired as its acknowledgement is presented. An attempt the
+        generation ended instead presents nothing, so that moment never comes, and the only
+        other place the world was let go of was while preparing a task the stream had already
+        offered. That is one step too late: the ended attempt's capacity is free the moment it
+        ends, so the next pull reserves the next task and the stream is left holding it while
+        the old world is still running, and a cleanup that fails leaves it holding a task no
+        cleanup will ever release.
+
+        So the world is retired here, before the pull that could reserve anything. A cleanup
+        that fails raises before a request is built, which leaves nothing offered and the same
+        world still to close, and the call that comes back asks for it again.
+        """
+        if self._world_attempt is None:
+            return
+        if state.attempts.get(self._world_attempt) != _FINAL_FAILED:
+            return
+        await self._close_world()
 
     async def _owed(
         self, result: Any, state: StreamState, closed_at: Optional[str] = None
@@ -1172,6 +1288,22 @@ class StreamGateway:
         """Refuse a call that does not name an attempt this transport is serving."""
         if attempt_id not in self._active:
             raise self._refuse("invalid_attempt")
+
+    async def _budget_spent(self, request: FinalizeRequest) -> None:
+        """End the attempt whose step budget is spent, through the stream that owns it.
+
+        The routing handle is dropped first, so the attempt stops being one this transport
+        serves whatever the stream answers. A refusal saying it is already over is the answer
+        this was asking for and is not raised: it means the generation's own deadline reached
+        the attempt first, or this exact request landed and its answer was lost, and neither is
+        something the model may read as a tool failure.
+        """
+        self._active = self._active - {request.attempt_id}
+        try:
+            await self._stream.finalize(request)
+        except Exception as error:  # noqa: BLE001 - the code decides, and anything else is a fault
+            if protocol_error_code(error) not in _ALREADY_OVER:
+                raise
 
     # Requests, built before they are sent.
 
@@ -1414,6 +1546,8 @@ class StreamGateway:
         self._cursor = cursor
         if message.kind == "task" and message.attempt_id is not None:
             self._active = self._active | {message.attempt_id}
+            # The budget is per attempt, so the count starts where the attempt does.
+            self._steps = 0
         elif message.kind == "seal_ack" and message.attempt_id is not None:
             self._active = self._active - {message.attempt_id}
         elif message.kind == "done":
@@ -1676,9 +1810,10 @@ async def open_gateway(
 
     An episode that ends on its own horizon is refused here. Under this protocol the stream is
     what ends an attempt, and an episode that seals and grades itself when a step budget runs
-    out would end one behind the stream's back: the attempt would still be ACTIVE, nothing the
+    out would end one behind the stream's back: the attempt would still be active, nothing the
     ledger holds would say the environment had been graded, and the terminal the model went on
-    to call would seal a world that was already gone.
+    to call would seal a world that was already gone. The budget is still enforced: the gateway
+    counts the calls that spend it and ends the attempt through the stream when it is gone.
     """
     _ended_by_the_stream(episode)
     spec = episode.describe()
