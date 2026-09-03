@@ -32,6 +32,7 @@ from tests._fixtures.score_env import ENV_NAME, HORIZON
 ATTEMPT = "a" * 32
 MESSAGE = "b" * 32
 CURSOR = "c" * 32
+ACK = "d" * 32
 
 
 @dataclass
@@ -51,6 +52,7 @@ class _ScriptedStream:
     def __init__(self, task: Any) -> None:
         self._task = task
         self.finalized: List[Any] = []
+        self.sealed: List[Any] = []
         self.attempts: dict = {}
         # The grants it made per attempt, which is what the real stream counts and what a
         # gateway reads the spent budget out of.
@@ -60,6 +62,31 @@ class _ScriptedStream:
 
     async def pull(self, request: Any) -> Any:
         return self._task
+
+    async def seal(self, request: Any) -> Any:
+        """Take one filing and offer its acknowledgement, the way the real stream does.
+
+        What the seal and the grade behind it come to is the kernel's, and it is driven where the
+        kernel is. What this has to be faithful about is the shape: a filing is accepted, an
+        attempt stops being one the transport routes to, and bytes come back to be presented.
+        """
+        from shogym.serve.protocol_v2 import SealAck, visible_bytes
+        from shogym.serve.protocol_v2.kernel import OfferedMessage
+
+        self.sealed.append(request)
+        attempt_id = request.metadata.attempt_id
+        ack = SealAck(
+            message_id=ACK,
+            attempt_id=attempt_id,
+            submission_digest="d" * 64,
+            canonicalization_version="shogym.fixture.1",
+        )
+        return OfferedMessage(
+            message_id=ACK,
+            kind="seal_ack",
+            visible_text=visible_bytes(ack).decode("utf-8"),
+            attempt_id=attempt_id,
+        )
 
     async def present(self, message: Any, **blobs: Any) -> _Ack:
         return _Ack(cursor=message.message_id)
@@ -112,6 +139,8 @@ class _ScriptedStream:
         if commit.task_start_checkpoint_blob is not None:
             self.attempts[self._task.attempt_id] = "active"
             self.environment_calls[self._task.attempt_id] = 0
+        if commit.message_id == ACK:
+            self.attempts[self._task.attempt_id] = "ack_presented"
         return _Ack(cursor=commit.message_id)
 
 
@@ -241,6 +270,84 @@ async def test_an_episode_served_by_the_stream_is_ended_when_its_budget_runs_out
         assert code == "invalid_attempt"
         assert len(stream.finalized) == 1
         assert env.finalize_calls == 0
+    finally:
+        await episode.close()
+
+
+async def test_a_graded_horizon_files_the_environments_terminal_on_the_last_call() -> None:
+    """The other budget rule: the call that spends the last step is the one that ends the attempt.
+
+    An environment whose horizon is an ending its own scorer answers for is not served the floor.
+    There is no call after the last one, because the attempt was filed as that call's step
+    committed: the filing says the horizon made it, it carries nothing the agent authored, and
+    the acknowledgement comes back in the same result as the observation. What is not here is a
+    finalization: nothing floored, nothing ended without a filing.
+    """
+    pytest.importorskip("temporalio")
+    from shogym.serve.protocol_v2.gateway import (
+        CANONICALIZATION_VERSION,
+        EnvironmentTerminal,
+        StreamGateway,
+        WorldRoute,
+        terminal_manifest,
+    )
+    from shogym.serve.protocol_v2.kernel import OfferedMessage
+    from shogym.serve.protocol_v2.policy import KERNEL_STAND_IN_GRADE
+
+    env = score_env._FixtureScoreEnv()
+    episode = await ServedEpisode.open_env(
+        env, env_name=ENV_NAME, task=0, ends_on_horizon=False
+    )
+    try:
+        spec = episode.describe()
+        stream = _ScriptedStream(
+            OfferedMessage(
+                message_id=MESSAGE, kind="task", visible_text="{}", attempt_id=ATTEMPT
+            )
+        )
+        gateway = StreamGateway(
+            stream,  # type: ignore[arg-type]
+            episode,
+            spec,
+            terminal_manifest(spec),
+            initial_cursor=CURSOR,
+            environment=EnvironmentTerminal(
+                CANONICALIZATION_VERSION,
+                [],
+                None,
+                WorldRoute(),
+                KERNEL_STAND_IN_GRADE,
+                "graded",
+            ),
+        )
+        await gateway.pull({})
+        for _ in range(HORIZON - 1):
+            result = await gateway.environment(
+                "noop", {"attempt_id": ATTEMPT, "arguments": {}}
+            )
+            assert stream.sealed == []
+            assert len(result.content) == 1
+
+        # The last step. Its own observation comes back first, and the acknowledgement of the
+        # filing that step ended is the second item of the same result.
+        result = await gateway.environment("noop", {"attempt_id": ATTEMPT, "arguments": {}})
+        assert len(episode._trajectory) == HORIZON
+        assert len(result.content) == 2
+        assert json.loads(result.content[1].text)["kind"] == "seal_ack"
+
+        [filing] = stream.sealed
+        assert filing.metadata.attempt_id == ATTEMPT
+        assert filing.terminal_source == "horizon"
+        assert filing.native_arguments == {}
+        assert stream.finalized == []
+
+        # And the attempt is over: nothing this transport routes to, and one filing however
+        # many calls the model makes afterwards.
+        code = await _refused(
+            gateway.environment("noop", {"attempt_id": ATTEMPT, "arguments": {}})
+        )
+        assert code == "invalid_attempt"
+        assert len(stream.sealed) == 1
     finally:
         await episode.close()
 

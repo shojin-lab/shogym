@@ -50,6 +50,24 @@ PROTOCOL_ERROR_CODES: Tuple[str, ...] = (
 )
 
 
+# Who filed the terminal that ended an attempt. An agent's own call is one fact and a filing
+# made on its behalf when its world work ran out is another, and a reader counting endings has
+# to be able to tell them apart, so the two are named here rather than inferred from a step
+# count somebody kept.
+AGENT_FILED = "agent"
+HORIZON_FILED = "horizon"
+TERMINAL_SOURCES: Tuple[str, ...] = (AGENT_FILED, HORIZON_FILED)
+
+# What reaching the environment's step budget does to an attempt. ``floor`` is the rule for an
+# environment that says nothing: the world work is over, nothing was filed, and the attempt ends
+# at the floor with the reason on it. ``graded`` is what an environment declares when its
+# horizon is an ending its own scorer answers for: the world as it stands is the filing, and the
+# attempt is sealed and graded there rather than floored.
+FLOOR_HORIZON = "floor"
+GRADED_HORIZON = "graded"
+HORIZON_ENDINGS: Tuple[str, ...] = (FLOOR_HORIZON, GRADED_HORIZON)
+
+
 def _version(name: str, value: Any) -> None:
     if type(value) is not int or value != PROTOCOL_VERSION:
         raise WireFormatError(f"{name} must be {PROTOCOL_VERSION}")

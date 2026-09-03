@@ -927,6 +927,120 @@ async def test_a_seal_that_ended_its_attempt_leaves_the_transport_serving(env, h
                 await opened.close()
 
 
+def with_grader(activities: List[Any], grader: Any) -> List[Any]:
+    """This environment's Activities, with the one that scores replaced by ``grader``."""
+    replaced = grader.__temporal_activity_definition.name
+    kept = [fn for fn in activities if fn.__temporal_activity_definition.name != replaced]
+    return [*kept, grader]
+
+
+@pytest.mark.network
+@pytest.mark.parametrize("how", ["non_retryable", "unusable"])
+async def test_a_graded_horizon_whose_seal_ended_the_attempt_leaves_the_transport_serving(
+    env, how: str
+) -> None:
+    """The other way into that ending: the filing the horizon made rather than one the agent did.
+
+    An environment whose horizon grades is filed by this gateway as the last step commits, and
+    that filing can end the attempt the same two ways any other can. What is different is what
+    the transport is holding when it does. An agent's filing owes nothing but its own answer; a
+    horizon's is kept beside the observation of the call that owed it, which changed a world and
+    exists nowhere else.
+
+    So the record cannot simply be dropped, and it cannot be sent again either: the attempt has
+    ended, and the exact filing repeated is a durable call that has already failed for good. Both
+    would leave the generation refusing every call it was ever asked. What is left is the
+    observation, kept for the call that landed with it, and a generation that goes on serving.
+    """
+    from shogym.serve.protocol_v2.gateway import environment_terminal
+
+    episode = await ServedEpisode.start(TEST_ENV, task=0, ends_on_horizon=False)
+    environment = environment_terminal(episode)
+    assert environment.horizon_ending == "graded"
+    scorer = {
+        fn.__temporal_activity_definition.name: fn for fn in environment.activities
+    }[GRADE_ATTEMPT]
+
+    @activity.defn(name=GRADE_ATTEMPT)
+    async def grader_that_will_not_be_retried(request: Any) -> Any:
+        raise ApplicationError("this grader cannot score this task", non_retryable=True)
+
+    @activity.defn(name=GRADE_ATTEMPT)
+    async def score_of_another_seal(request: GradeAttemptInput) -> Any:
+        return replace(await scorer(request), seal_id="0" * 64)
+
+    grader, reason = {
+        "non_retryable": (grader_that_will_not_be_retried, SEAL_FAILED),
+        "unusable": (score_of_another_seal, SEAL_UNUSABLE),
+    }[how]
+
+    worlds: List[ServedEpisode] = []
+
+    async def open_world(attempt_id: str) -> ServedEpisode:
+        started = await ServedEpisode.start(TEST_ENV, task=0, ends_on_horizon=False)
+        worlds.append(started)
+        return started
+
+    async with stream_worker(
+        env.client, activities=with_grader(list(environment.activities), grader)
+    ):
+        try:
+            stream = await start_stream(
+                env.client,
+                make_start(
+                    bodies=("guess the first word", "and the second"),
+                    terminal="terminate",
+                    argument_names=(),
+                ),
+                workflow_id=f"stream/finalize/horizon-seal/{how}",
+            )
+            receipt = await stream.claim_consumer(CONSUMER)
+            # One step of budget, so the first guess is the call that files.
+            spec = episode.describe().model_copy(update={"horizon": 1})
+            gateway = StreamGateway(
+                stream,
+                episode,
+                spec,
+                terminal_manifest(spec),
+                initial_cursor=receipt.initial_cursor,
+                open_episode=open_world,
+                environment=environment,
+            )
+            first = json.loads(await gateway.pull({}))
+            attempt = first["attempt_id"]
+            guess = {"attempt_id": attempt, "arguments": {"word": "crane"}}
+
+            # The guess landed, the filing it made could not go on, and the caller is told that
+            # the call failed rather than being answered.
+            with pytest.raises(Exception):
+                await gateway.environment("guess", guess)
+
+            # The ending is settled: nothing was acknowledged, the capacity is back, and the
+            # generation is holding no message for anyone.
+            state = await gateway.stream_state()
+            assert state.attempts[attempt] == "final_failed"
+            assert state.final_failures == {attempt: reason}
+            assert state.capacity_in_use == 0
+            assert state.pending_message_id is None
+
+            # The exact call again is answered with the observation it landed with, once, rather
+            # than sending a filing that has already failed for good.
+            result = await gateway.environment("guess", guess)
+            assert len(result.content) == 1
+            assert json.loads(result.content[0].text)["valid"] is True
+
+            # And the generation serves the next task, in a world of its own.
+            second = json.loads(await gateway.pull({}))
+            assert second["kind"] == "task"
+            assert second["attempt_id"] != attempt
+            assert len(worlds) == 1
+            await gateway.aclose()
+        finally:
+            await episode.close()
+            for opened in worlds:
+                await opened.close()
+
+
 @pytest.mark.network
 async def test_an_ending_floors_every_attempt_that_was_waiting_on_it(env) -> None:
     """A stop before the outcome writes the floor over the whole of what that outcome covered.

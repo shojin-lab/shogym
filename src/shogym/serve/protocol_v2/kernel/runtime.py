@@ -475,6 +475,7 @@ class StreamHandle:
             request.public_tool_name,
             request.native_terminal_name,
             request.native_arguments,
+            request.terminal_source,
         )
         writer = self.writer
         return await self.handle.execute_update(

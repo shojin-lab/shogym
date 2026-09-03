@@ -136,6 +136,12 @@ reads those numbers off the trusted evidence (never the trajectory) into episode
 explicit `terminate` is a no-score abort (clean zero); the horizon scores whatever **partial**
 state the workspace is in.
 
+Under the durable stream the horizon does the same thing, and this env says so: it declares its
+horizon a **graded ending**. The call that spends the last of the budget is dispatched and
+answered, the server then files `done` for the attempt, and the attempt is sealed and graded on
+the partial state. The acknowledgement comes back in that call's own result and the score reaches
+the agent as the next payload; the record says the horizon filed rather than the agent.
+
 ## Tasks
 
 The public benchmark ships **600 tasks** across 6 domains (`sales`, `marketing`, `operations`,

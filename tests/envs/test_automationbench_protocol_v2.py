@@ -20,7 +20,7 @@ import pytest
 
 from tests._fixtures.upstream_gate import gate
 
-gate(
+_adapter = gate(
     "shogym.envs.automationbench.adapter",
     package="automationbench",
     extra="automationbench",
@@ -119,6 +119,92 @@ _PARTIAL_INFO: Dict[str, Any] = {
     ],
 }
 _PARTIAL_BODY = json.dumps({"Phone": "+1-555-0101", "Email": "jordan.lee@acme.test"})
+
+_SHEETS = "https://sheets.googleapis.com/v4/spreadsheets/"
+
+
+def _get(url: str, **params: Any) -> Any:
+    """One read of an endpoint, the way the recorded run made every one of its calls."""
+    arguments: Dict[str, Any] = {"method": "GET", "url": url}
+    if params:
+        arguments["params"] = json.dumps(params)
+    return ("api_fetch", arguments)
+
+
+def _sheet(name: str) -> Any:
+    """One guess at the spreadsheet the recorded run spent most of its budget looking for."""
+    return _get(_SHEETS + name)
+
+
+def _search(query: str, top_k: int) -> Any:
+    return ("api_search", {"query": query, "top_k": top_k})
+
+
+#: The action sequence of the recorded cell-1 attempt at automationbench task 156, in order.
+#: The run had a budget of 52 and spent every one of it on a read: it never found the spreadsheet
+#: the task named, never sent an email, and left the workspace exactly as it was seeded, so the
+#: rubric scored it at nothing. They are replayed against that task's own world and rubric, so
+#: what the ending is read from is the recording whole: these fifty-two calls, no state changed,
+#: no ``done`` called, and the last call reaching the horizon.
+_TASK_156_CALLS = [
+    _get("https://www.googleapis.com/drive/v3/files", pageSize=100),
+    _search("trial extension requests queue", 8),
+    _sheet("ss_trials"),
+    _sheet("ss_trial_extensions"),
+    _sheet("ss_extensions"),
+    _get("https://gmail.googleapis.com/gmail/v1/users/me/messages", maxResults=50),
+    _get("https://api.airtable.com/v0/meta/bases"),
+    _get("https://slack.com/api/conversations.list", limit=200),
+    _sheet("ss_trial_ops"),
+    _sheet("ss_queue"),
+    _sheet("ss_policy"),
+    _sheet("ss_trial_policy"),
+    _sheet("ss_trial_requests"),
+    _search("spreadsheets list all available", 10),
+    _sheet("ss_trial"),
+    _sheet("ss_trial_ext"),
+    _sheet("ss_trial_queue"),
+    _sheet("ss_trial_extension"),
+    _sheet("ss_trial_mgmt"),
+    _sheet("ss_extension_policy"),
+    _sheet("ss_requests"),
+    _sheet("ss_extension_requests"),
+    _sheet("ss_accounts"),
+    _sheet("ss_trial_ext_requests"),
+    _sheet("ss_ops"),
+    _sheet("ss_trialext"),
+    _get("https://gmail.googleapis.com/gmail/v1/users/me/messages/msg_mkt_noise_016"),
+    _sheet("ss_trial_extensions/values/Policy!A1:Z100"),
+    _sheet("ss_ext"),
+    _sheet("ss_trial_ops_queue"),
+    _sheet("zzz_definitely_not_real/values/Policy!A1:Z10"),
+    _sheet("ss_trial_extensions/values/A1:Z100"),
+    _sheet("trial_extensions"),
+    _sheet("trials"),
+    _sheet("sheet_trials"),
+    _sheet("ss_trial_extension_queue"),
+    _sheet("ss_growth"),
+    _sheet("ss_customer_success"),
+    _search("subscription trial end extend billing", 8),
+    _sheet("trial_ops"),
+    _sheet("ss_trial_ext_policy"),
+    _sheet("ss_ext_requests"),
+    _get(
+        "https://gmail.googleapis.com/gmail/v1/users/me/messages",
+        q="trial",
+        maxResults=50,
+        includeSpamTrash=True,
+    ),
+    _search("labels list mailbox", 3),
+    _sheet("ss_extension"),
+    _sheet("extensions"),
+    _sheet("Trial%20Extensions"),
+    _sheet("ss_trial_extensions_queue"),
+    _sheet("ss_te"),
+    _sheet("ss_trial_requests_queue"),
+    _get("https://api.helpscout.net/v2/mailboxes"),
+    _get("https://api.intercom.io/conversations"),
+]
 
 
 def sealing(session_id: str = "a-session") -> str:
@@ -384,4 +470,108 @@ async def _drive_the_arc(client: Any, episode: ServedEpisode, environment: Any) 
     assert payload["kind"] == "payload"
     assert payload["body"] == f"attempt {attempt}\nscore 1\nsuccess 1"
     assert json.loads(await gateway.pull({}))["kind"] == "done"
+    # And the row says the agent filed, which is what the horizon-filed row below is read against.
+    [record] = await _records(gateway)
+    assert (record.terminal_tool, record.terminal_source) == ("done", "agent")
+    await gateway.aclose()
+
+
+def _public_task(index: int) -> Dict[str, Any]:
+    """One row of the public benchmark, at the index a run selects it by.
+
+    The row carries its own deterministic noise, seeded upstream by ``example_id``, and its
+    ``info`` is stored as JSON the way the dataset stores it. Both are read here rather than
+    restated, so what this pins is the task a run at that index gets rather than a copy of it.
+    """
+    row = dict(_adapter.load_domain_tasks("public")[index])
+    info = row.get("info", {})
+    row["info"] = json.loads(info) if isinstance(info, str) else info
+    return row
+
+
+async def _records(gateway: Any) -> Any:
+    """The generation's own rows, asked of the stream this gateway is serving."""
+    from shogym.serve.protocol_v2.kernel.workflow import StreamWorkflow
+
+    return list(await gateway._stream.handle.query(StreamWorkflow.attempt_records))
+
+
+@pytest.mark.network
+async def test_a_run_that_spends_its_budget_is_graded_where_the_budget_ran_out() -> None:
+    """The recorded cell-1 attempt at task 156, replayed against this protocol.
+
+    That attempt made fifty-two environment calls, changed nothing, and never called ``done``;
+    the fifty-second call's own result carried the termination, the reward, the success flag and
+    the feedback, because the episode graded the partial state at its horizon. This environment
+    says the same thing under the durable stream, and this is where that is checked: the last
+    call is dispatched and answered, the filing is made for the attempt as its step commits, the
+    grade is the rubric's over the world the attempt left, and the honest body reaches the agent
+    on the pull after it.
+
+    The four outcomes are the recorded ones. The world was untouched, so the rubric scores it at
+    nothing and the success flag is false, and this environment says which zero that is: a filing
+    that said nothing rather than one that was read and got no credit.
+
+    It is the public benchmark's own row 156 that is played, loaded the way a run loads it, and
+    the row is named here as well as counted: an action list replayed against some other world
+    and some other rubric would stay green while the reproduction it claims to cover broke.
+    """
+    row = _public_task(156)
+    info = row["info"]
+    assert (row["example_id"], row["task"]) == (1121, "marketing.trial_extension_processing")
+    assert len(info["assertions"]) == 20
+    episode = await ServedEpisode.start("automationbench", task=156, ends_on_horizon=False)
+    running = False
+    try:
+        assert episode.describe().horizon == len(_TASK_156_CALLS)
+        assert row["prompt"][-1]["content"] in episode.describe().instructions
+        async with durable_client() as client:
+            running = True
+            environment = environment_terminal(episode)
+            assert environment.horizon_ending == "graded"
+            async with stream_worker(client, activities=environment.activities):
+                await _spend_the_budget(client, episode, environment)
+    except Exception as error:  # noqa: BLE001 - re-raised below unless the service never came up
+        if running:
+            raise
+        pytest.skip(f"the durable service is unavailable: {error}")
+    finally:
+        await episode.close()
+
+
+async def _spend_the_budget(client: Any, episode: ServedEpisode, environment: Any) -> None:
+    """Make every call the recorded attempt made, and read what the horizon came to."""
+    gateway = await open_gateway(client, episode, environment=environment)
+    await gateway.close_queue()
+    attempt = json.loads(await gateway.pull({}))["attempt_id"]
+
+    for tool, arguments in _TASK_156_CALLS[:-1]:
+        result = await gateway.environment(
+            tool, {"attempt_id": attempt, "arguments": arguments}
+        )
+        assert len(result.content) == 1
+
+    # The call that reaches the horizon. Its own observation comes back, and behind it the
+    # acknowledgement of the filing that call ended: the attempt is over, and nothing in those
+    # bytes says what it scored.
+    tool, arguments = _TASK_156_CALLS[-1]
+    result = await gateway.environment(tool, {"attempt_id": attempt, "arguments": arguments})
+    assert len(result.content) == 2
+    ack = json.loads(result.content[1].text)
+    assert ack["kind"] == "seal_ack"
+    assert ack["canonicalization_version"] == CANONICALIZATION_VERSION
+    assert "score" not in result.content[1].text
+
+    # The reward, the success flag and the feedback, on the pull after it.
+    payload = json.loads(await gateway.pull({}))
+    assert payload["kind"] == "payload"
+    assert payload["body"] == f"attempt {attempt}\nscore 0\nsuccess 0"
+    assert json.loads(await gateway.pull({}))["kind"] == "done"
+
+    [record] = await _records(gateway)
+    assert record.state == "ack_presented"
+    assert record.final_failure is None
+    assert (record.score, record.decode_state) == (0.0, "ambiguous_zero")
+    assert (record.terminal_tool, record.terminal_source) == ("done", "horizon")
+    assert record.payload_delivered is True
     await gateway.aclose()

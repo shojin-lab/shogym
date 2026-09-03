@@ -125,6 +125,20 @@ class WordleV1Env(Env):
 
         return WORDLE_GRADE
 
+    def protocol_v2_horizon_ending(self) -> str:
+        """What spending the guess budget does to an attempt over this env.
+
+        It grades. Six guesses is the game rather than a guard on a run: the prompt promises
+        six tries, the score is the board those tries built, and a v1 episode of this env ends
+        on the sixth guess and verifies it there rather than waiting for a seventh call. So the
+        board a sixth guess leaves is a filing like any other, read by the same grader an
+        explicit ``terminate`` would be read by. Ending such an attempt at the floor instead
+        would make the play worth nothing on the move this env's own prompt asked for.
+        """
+        from shogym.serve.protocol_v2 import GRADED_HORIZON
+
+        return GRADED_HORIZON
+
     def protocol_v2_terminal(self, route: Any):
         """The version this env declares, how to seal and grade one attempt, and what it is.
 

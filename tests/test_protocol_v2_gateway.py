@@ -56,14 +56,17 @@ from shogym.serve.protocol_v2.gateway import (  # noqa: E402
     declared_argument_names,
     durable_client,
     environment_grade,
+    environment_horizon_ending,
     environment_terminal,
     open_gateway,
+    served_manifest,
     stream_start,
     stream_worker,
     terminal_manifest,
     wrapped_manifests,
 )
 from shogym.serve.protocol_v2.gateway import (  # noqa: E402
+    _check_graded_horizon,
     _configuration_hash,
     _Idle,
     _LeaseHeld,
@@ -462,6 +465,25 @@ def make_gateway(episode: ServedEpisode, stream: ScriptedStream) -> StreamGatewa
     )
 
 
+def graded_gateway(
+    episode: ServedEpisode, stream: ScriptedStream, *, horizon: int
+) -> StreamGateway:
+    """The same gateway over an environment whose horizon is a graded ending.
+
+    The budget is written down here rather than taken from the env, because what these tests are
+    about is the call that spends the last step and a horizon of one puts that call first.
+    """
+    spec = episode.describe().model_copy(update={"horizon": horizon})
+    return StreamGateway(
+        stream,  # type: ignore[arg-type]
+        episode,
+        spec,
+        terminal_manifest(spec),
+        initial_cursor=CURSOR,
+        environment=environment_terminal(episode)._replace(horizon_ending="graded"),
+    )
+
+
 async def refused(awaitable: Any) -> str:
     """Return the protocol error code a refused call carries."""
     try:
@@ -735,6 +757,105 @@ def test_a_grader_an_environment_declares_without_a_terminal_of_its_own_is_refus
     assert environment_grade(SimpleNamespace(env=object(), session_id="s")).stand_in is True
 
 
+def test_an_environment_says_what_its_horizon_does_and_the_default_is_the_floor() -> None:
+    """The declaration, and the two ways of getting it wrong.
+
+    Saying nothing is the floor, which is what every environment served so far gets: a budget
+    that runs out ends the attempt with the reason on it and files nothing. Saying the horizon
+    grades is a claim about the environment's own scorer reading the world as it stands, so an
+    environment that brings no terminal cannot make it: the filing would be the kernel's stand-in
+    over an empty submission, which is the floor with a number written on it. And a word that is
+    neither is not a third rule, it is a refusal.
+    """
+
+    class Grades:
+        def protocol_v2_horizon_ending(self) -> str:
+            return "graded"
+
+        def protocol_v2_terminal(self, route: Any) -> Any:
+            return "fixture.world.1", [], "config-7"
+
+    class Half:
+        def protocol_v2_horizon_ending(self) -> str:
+            return "graded"
+
+    class Nonsense:
+        def protocol_v2_horizon_ending(self) -> str:
+            return "whatever the model prefers"
+
+    plain = SimpleNamespace(env=object(), session_id="session-1")
+    assert environment_horizon_ending(plain) == "floor"
+    assert environment_terminal(plain).horizon_ending == "floor"
+
+    grades = SimpleNamespace(env=Grades(), session_id="session-2")
+    assert environment_horizon_ending(grades) == "graded"
+    assert environment_terminal(grades).horizon_ending == "graded"
+
+    with pytest.raises(ValueError, match="protocol_v2_terminal"):
+        environment_horizon_ending(SimpleNamespace(env=Half(), session_id="session-3"))
+    with pytest.raises(ValueError, match="ends an attempt"):
+        environment_horizon_ending(SimpleNamespace(env=Nonsense(), session_id="session-4"))
+
+
+def test_a_graded_horizon_is_part_of_what_the_generation_is(episode: ServedEpisode) -> None:
+    """A budget that files and a budget that floors are two rules to be scored under.
+
+    So the identity a resume is held to covers which one was in force. It covers it only where an
+    environment declared something other than the floor, because a generation recorded before an
+    environment could say hashed a fixed set of keys and a resume of one of those has to hash the
+    same set.
+    """
+    spec = episode.describe()
+    terminal = terminal_manifest(spec)
+    assert "horizon_ending" not in served_manifest(spec, terminal)
+    assert served_manifest(spec, terminal, "graded")["horizon_ending"] == "graded"
+    assert _configuration_hash(spec, terminal) == _configuration_hash(spec, terminal, None, "floor")
+    assert _configuration_hash(spec, terminal) != _configuration_hash(
+        spec, terminal, None, "graded"
+    )
+
+
+def test_a_graded_horizon_this_gateway_could_not_file_for_is_refused(
+    episode: ServedEpisode,
+) -> None:
+    """What the gateway has to be able to do before a generation may declare it.
+
+    The filing made at a horizon is the world the attempt left, so there is nothing for this
+    gateway to write into the call. A terminal that declares arguments is one whose filing the
+    agent authors, and an environment that publishes no budget never reaches a horizon at all.
+    Both are refused where the generation is composed rather than discovered after a budget has
+    already been spent.
+    """
+    spec = episode.describe()
+    terminal = terminal_manifest(spec)
+    graded = environment_terminal(episode)._replace(horizon_ending="graded")
+    with pytest.raises(ValueError, match="takes"):
+        _check_graded_horizon(
+            spec.model_copy(update={"horizon": 6}),
+            replace_manifest(terminal, {"answer": {"type": "string"}}),
+            graded,
+        )
+    with pytest.raises(ValueError, match="publishes no step budget"):
+        _check_graded_horizon(
+            spec.model_copy(update={"horizon": None}),
+            replace_manifest(terminal, {}),
+            graded,
+        )
+    # And the floor is held to neither, because neither is a filing it makes.
+    _check_graded_horizon(
+        spec.model_copy(update={"horizon": None}),
+        replace_manifest(terminal, {"answer": {"type": "string"}}),
+        graded._replace(horizon_ending="floor"),
+    )
+
+
+def replace_manifest(terminal: ToolManifest, properties: Dict[str, Any]) -> ToolManifest:
+    """The same terminal, declaring these arguments."""
+    return terminal.model_copy(
+        update={"input_schema": {"type": "object", "properties": properties}}
+    )
+
+
 def test_a_world_belongs_to_the_attempt_it_was_opened_for() -> None:
     """The route says which world each attempt filed in, and answers nothing for the others."""
     route = environment_terminal(SimpleNamespace(env=object(), session_id="session-1")).route
@@ -795,7 +916,9 @@ async def test_a_generation_a_controller_composed_ends_the_way_its_environment_d
         environment=environment,
     )
     assert started[0].canonicalization_version == "world.1"
-    assert started[0].configuration_hash == _configuration_hash(spec, terminal, "pulse-7")
+    assert started[0].configuration_hash == _configuration_hash(
+        spec, terminal, "pulse-7", environment.horizon_ending
+    )
     assert started[0].tasks == composed.tasks
     # The controller's own object is left as it composed it.
     assert composed.canonicalization_version == CANONICALIZATION_VERSION
@@ -2121,6 +2244,75 @@ async def test_a_result_kept_by_a_transport_the_generation_left_behind_is_not_ha
     # And nothing was thrown away over it: what is owed is still owed, to the same call.
     assert gateway._recovery is record
     assert await refused(gateway.pull({})) == "outstanding_response"
+
+
+async def test_a_horizon_filing_whose_presentation_answer_was_lost_hands_back_both_halves(
+    episode: ServedEpisode,
+) -> None:
+    """The observation and the acknowledgement it goes behind are one delivery to finish.
+
+    The call that spent the last step landed, the filing that step made was accepted, and the
+    attestation of the acknowledgement committed before its answer was lost. The same call comes
+    back for what it is owed, and what it is owed is still both halves: the observation exists
+    nowhere but in this gateway, and an agent handed the acknowledgement alone could not say
+    what its last action did to the world it was scored on.
+    """
+    stream = ScriptedStream(TASK_OFFER, ACK_OFFER)
+    gateway = graded_gateway(episode, stream, horizon=1)
+    await gateway.pull({})
+
+    stream.lose_next_ack = True
+    with pytest.raises(RuntimeError, match="the acknowledgement never arrived"):
+        await gateway.environment("guess", GUESS)
+    record = gateway._recovery
+    assert isinstance(record, _PresentationUncertain)
+
+    result = await gateway.environment("guess", GUESS)
+    assert len(result.content) == 2
+    assert json.loads(result.content[0].text)["score"] == "YXGXX"
+    assert json.loads(result.content[1].text)["kind"] == "seal_ack"
+    # The same attestation finished the trip, and nothing happened twice: one dispatch into the
+    # world, one filing, and one attempt that is over.
+    assert stream.commits[-1] is record.commit
+    assert [step.tool for step in episode._trajectory] == ["guess"]
+    assert stream.calls.count("seal") == 1
+    assert stream.attempts[ATTEMPT] == "ack_presented"
+    assert isinstance(gateway._recovery, _Idle)
+
+
+async def test_a_horizon_filing_a_replacement_refused_does_not_hand_its_observation_over(
+    episode: ServedEpisode,
+) -> None:
+    """A refusal of the filing is not proof that an ending rather than a takeover won.
+
+    The last step is spent, the environment lease is durably back, and the filing this call owes
+    goes out into a generation that now has another owner. The stream refuses it, and that
+    refusal reads exactly like the one an attempt the generation's own deadline ended would give.
+    They are not the same thing: a replacement that put the world back to its checkpoint made
+    this observation the report of a mutation that no longer happened, and handing it over would
+    tell the model about a move the authoritative generation has rolled back and can serve again.
+
+    So the observation is written down and offered the way every other kept result is, through
+    the one question a stream refuses a writer it has replaced.
+    """
+    stream = ScriptedStream(TASK_OFFER, StreamProtocolError("fenced_writer"))
+    gateway = graded_gateway(episode, stream, horizon=1)
+    await gateway.pull({})
+
+    stream.fenced = True
+    assert await refused(gateway.environment("guess", GUESS)) == "fenced_writer"
+    assert stream.confirmations == 1
+    record = gateway._recovery
+    assert isinstance(record, _ResultOwed)
+    assert json.loads(record.result.content[0].text)["score"] == "YXGXX"
+
+    # And it stays owed rather than being thrown away or handed to anything else, and the
+    # question is asked again every time somebody comes back for it.
+    assert await refused(gateway.pull({})) == "outstanding_response"
+    assert await refused(gateway.environment("guess", GUESS)) == "fenced_writer"
+    assert stream.confirmations == 2
+    assert gateway._recovery is record
+    assert [step.tool for step in episode._trajectory] == ["guess"]
 
 
 async def test_a_call_that_arrives_during_an_environment_call_waits_for_nothing(

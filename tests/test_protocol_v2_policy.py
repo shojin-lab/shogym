@@ -2356,14 +2356,14 @@ def test_wordle_scores_the_game_that_was_played() -> None:
 async def test_a_wordle_play_that_uses_every_guess_is_still_filed_and_scored(
     env: WorkflowEnvironment, found: bool
 ) -> None:
-    """The play this environment tells the agent to make is one the stream can still seal.
+    """The play this environment tells the agent to make is the one it grades.
 
-    Wordle promises six tries and asks for the terminal after them, and the terminal is a call to
-    the stream rather than a move in the world. So a play that spends all six is an attempt with
-    no world steps left and a filing still to make: it seals, the environment grades what was
-    played, and the body carries that verdict. The two ends of the game are the same arc, because
-    what is at stake is the filing rather than the score: a sixth guess that finds the word and a
-    sixth that does not both have a result this generation is supposed to commit.
+    Wordle promises six tries, and a v1 episode of it ends and verifies on the sixth guess rather
+    than waiting for a call after it. So this env declares its horizon a graded ending, and the
+    sixth guess is the whole of the ending: it is dispatched, its own board comes back, and
+    behind it the acknowledgement of the filing that guess made. The two ends of the game are the
+    same arc, because what is at stake is the filing rather than the score: a sixth guess that
+    finds the word and a sixth that does not both have a result this generation commits.
     """
     from shogym.envs.wordle.utils import load_words
     from shogym.serve.episode import ServedEpisode
@@ -2375,21 +2375,31 @@ async def test_a_wordle_play_that_uses_every_guess_is_still_filed_and_scored(
         misses = [word for word in load_words() if word != answer][:5]
         played = misses + [answer if found else "zzzzz"]
         environment = environment_terminal(episode)
+        assert environment.horizon_ending == "graded"
         async with stream_worker(env.client, activities=environment.activities):
             gateway = await open_gateway(env.client, episode, environment=environment)
             await gateway.close_queue()
             task = json.loads(await gateway.pull({}))
             attempt = task["attempt_id"]
-            for word in played:
+            for word in played[:-1]:
                 result = await gateway.environment(
                     "guess", {"attempt_id": attempt, "arguments": {"word": word}}
                 )
                 assert json.loads(result.content[0].text)["valid"] is True
+                assert len(result.content) == 1
 
-            # The sixth guess spent the last of the world budget and the attempt is still the
-            # attempt, which is what leaves the filing this environment asks for possible.
-            ack = json.loads(await gateway.terminal({"attempt_id": attempt, "arguments": {}}))
+            # The sixth guess spends the last of the budget and files with it. Its own board is
+            # the first item of the result and the acknowledgement is the second, and nothing in
+            # those bytes says what the play scored.
+            result = await gateway.environment(
+                "guess", {"attempt_id": attempt, "arguments": {"word": played[-1]}}
+            )
+            assert json.loads(result.content[0].text)["valid"] is True
+            assert len(result.content) == 2
+            ack = json.loads(result.content[1].text)
             assert ack["kind"] == "seal_ack"
+            assert "score" not in result.content[1].text
+
             payload = json.loads(await gateway.pull({}))
             assert payload["kind"] == "payload"
             # And what it says is the game's own result, from the grader this generation was

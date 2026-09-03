@@ -69,11 +69,16 @@ import jsonschema
 from fastmcp import FastMCP
 from fastmcp.exceptions import ToolError
 from fastmcp.tools import ToolResult
+from mcp.types import TextContent
 from temporalio.client import Client
 from temporalio.service import RPCError
 
 from shogym.serve.episode import ServedEpisode
 from shogym.serve.protocol_v2 import (
+    FLOOR_HORIZON,
+    GRADED_HORIZON,
+    HORIZON_ENDINGS,
+    HORIZON_FILED,
     IMMEDIATE,
     NEVER,
     Assignment,
@@ -224,6 +229,12 @@ class EnvironmentTerminal(NamedTuple):
     ``grade`` is what its grader is. An environment that brings its own terminal brings its own
     verdict with it, and one that does not is scored by a stand-in that reaches no world, so this
     is the fact a generation checks before it may promise an agent the score.
+
+    ``horizon_ending`` is what spending the environment's step budget does. The default is the
+    floor: the world work is over, nothing was filed, and the attempt ends with the reason on it.
+    An environment whose horizon is an ending its own scorer answers for declares that instead,
+    and then running out of steps is a filing of the world as it stands rather than an attempt
+    nobody finished.
     """
 
     canonicalization_version: str
@@ -231,6 +242,7 @@ class EnvironmentTerminal(NamedTuple):
     configuration_digest: Optional[str]
     route: WorldRoute
     grade: GradeIdentity = KERNEL_STAND_IN_GRADE
+    horizon_ending: str = FLOOR_HORIZON
 
 # The version a generation declares for the canonical submission its terminal captures when the
 # environment does not declare one of its own. The capture belongs to the environment, so the name
@@ -262,6 +274,10 @@ _WRAPPER_NOTE = (
 # have reached it first, and either way there is nothing left to end. Any other code is a fault
 # and is raised, because then the attempt is still open and nothing ended it.
 _ALREADY_OVER = ("invalid_attempt", "conflicting_seal")
+
+# What a call that reached no world landed with. A horizon filing carries back whatever the call
+# that owed it landed with, and a call this transport refused a step to landed with nothing.
+_EMPTY_RESULT = ToolResult(content=[])
 
 
 def _opaque() -> str:
@@ -343,7 +359,9 @@ def declared_argument_names(schema: Dict[str, Any]) -> List[str]:
     return sorted(required) if required else sorted(properties)
 
 
-def served_manifest(spec: TaskSpec, terminal: ToolManifest) -> Dict[str, Any]:
+def served_manifest(
+    spec: TaskSpec, terminal: ToolManifest, horizon_ending: str = FLOOR_HORIZON
+) -> Dict[str, Any]:
     """Return everything this gateway serves, in the words it serves it in.
 
     What a resume has to serve identically is what the model could read and call, and what the
@@ -358,8 +376,17 @@ def served_manifest(spec: TaskSpec, terminal: ToolManifest) -> Dict[str, Any]:
     the manifest and this renderer together, and the renderer says which version of itself made
     it. A tool this gateway does not serve is not here at all: nothing about it reaches the
     model or the stream, so two generations that differ only there are serving the same thing.
+
+    What the horizon does is here where an environment declares something other than the floor.
+    A budget that ends an attempt at the floor and one that files the world as it stands are two
+    different rules to be scored under, so the identity has to cover which was in force. It is
+    written only where it is declared, because a generation recorded before an environment could
+    say hashed exactly the keys below and reopening one of those under an added key would refuse
+    every resume of it over a rule that has not changed.
     """
+    declared = {} if horizon_ending == FLOOR_HORIZON else {"horizon_ending": horizon_ending}
     return {
+        **declared,
         "env_name": spec.env_name,
         "task_id": spec.task_id,
         "contract_version": spec.contract_version,
@@ -389,7 +416,10 @@ def served_manifest(spec: TaskSpec, terminal: ToolManifest) -> Dict[str, Any]:
 
 
 def _configuration_hash(
-    spec: TaskSpec, terminal: ToolManifest, environment_digest: Optional[str] = None
+    spec: TaskSpec,
+    terminal: ToolManifest,
+    environment_digest: Optional[str] = None,
+    horizon_ending: str = FLOOR_HORIZON,
 ) -> str:
     """Hash what the generation is serving, so a resume can refuse a changed configuration.
 
@@ -398,7 +428,7 @@ def _configuration_hash(
     any of that, and one that publishes a digest of them has it folded in here. One that
     publishes nothing hashes exactly what it hashed before.
     """
-    manifest = served_manifest(spec, terminal)
+    manifest = served_manifest(spec, terminal, horizon_ending)
     if environment_digest is not None:
         manifest = {**manifest, "environment": environment_digest}
     return sha256(canonical_json(manifest)).hexdigest()
@@ -662,6 +692,25 @@ def _stamped(row: Assignment, creates_obligations: bool) -> PayloadDisposition:
     )
 
 
+def _landed(record: Union["_Offered", "_PresentationUncertain"]) -> Any:
+    """Return what the call that produced this delivery hands back.
+
+    A message the model asked for is its own answer, and the bytes go back as they are. A
+    message that came of some other call goes back behind what that call landed with, in one
+    result with the observation first: what happened in the world, and then the record saying the
+    attempt it happened in has been filed. The bytes are the offered ones either way, in one text
+    item, never re-rendered.
+    """
+    if record.alongside is None:
+        return record.message.visible_text
+    return ToolResult(
+        content=[
+            *record.alongside.content,
+            TextContent(type="text", text=record.message.visible_text),
+        ]
+    )
+
+
 def _call_key(tool_name: str, arguments: Dict[str, Any]) -> bytes:
     """Name one call by exactly what it asked for.
 
@@ -713,11 +762,19 @@ class _Offered:
     A commit names the stream as it was before the event, so one built a second time describes
     a stream that has already moved and attests nothing about the delivery it was meant to
     attest. It is fixed once here and repeated afterwards.
+
+    ``alongside`` is what this delivery travels with, where the message is one this gateway
+    asked for on the model's behalf rather than one the model called for. The horizon filing is
+    the case: the call that made it was an environment call, the observation it landed with
+    exists nowhere else, and the acknowledgement goes back in the same result. So the two are
+    carried together from here to the commit, and a delivery interrupted anywhere between still
+    hands back both halves.
     """
 
     owner: bytes
     message: OfferedMessage
     commit: PresentationCommit
+    alongside: Optional[ToolResult] = None
 
 
 @dataclass(frozen=True)
@@ -731,6 +788,7 @@ class _PresentationUncertain:
     owner: bytes
     message: OfferedMessage
     commit: PresentationCommit
+    alongside: Optional[ToolResult] = None
 
 
 @dataclass(frozen=True)
@@ -752,6 +810,25 @@ class _PresentationRefused:
 
     owner: bytes
     message: OfferedMessage
+    alongside: Optional[ToolResult] = None
+
+
+@dataclass(frozen=True)
+class _HorizonOwed:
+    """A filing this gateway owes on an attempt's behalf, and what the call that owes it landed
+    with.
+
+    The call is the environment call that spent the last of the budget. It changed a world, its
+    observation exists nowhere else, and the attempt has no world work left, so the filing and
+    the observation are one thing this call still has to finish. The request is frozen here
+    before it is sent, for the reason every other request is: the acknowledgement it may mint is
+    reachable through that request and through no other, and the same one sent again is a retry
+    rather than a second filing.
+    """
+
+    owner: bytes
+    request: SealRequest
+    result: ToolResult
 
 
 @dataclass(frozen=True)
@@ -795,6 +872,7 @@ _Recovery = Union[
     _Idle,
     _RequestUncertain,
     _LeaseHeld,
+    _HorizonOwed,
     _Offered,
     _PresentationUncertain,
     _PresentationRefused,
@@ -843,6 +921,14 @@ class StreamGateway:
     every one of those calls and counts them, and a gateway built over a generation somebody
     else was serving reads that count with the rest of what it routes by. A budget a process
     keeps is a budget the next process starts over.
+
+    Which ending that is, the environment decides. Its default is the floor: the attempt is
+    ended with the reason on it and nothing is filed, which is the honest answer for a budget
+    that is a guard rather than a rule of the task. An environment whose horizon is an ending
+    its own scorer answers for declares that instead, and then the call that spends the last
+    step is the last call: this gateway files that environment's terminal for the attempt, the
+    stream seals and grades it, and the acknowledgement goes back with the observation the call
+    landed with. Nothing waits for a terminal the agent has no step left to reach.
     """
 
     def __init__(
@@ -891,6 +977,12 @@ class StreamGateway:
         # reason they start empty: what this gateway has not been told yet, it does not know.
         self._step_cap = spec.horizon
         self._spent: Dict[str, int] = {}
+        # What running the budget out does. The environment says, and it says it once, when the
+        # generation is composed; a gateway given no answer serves the floor, which is what an
+        # environment that never declared one gets.
+        self._horizon_ending = (
+            FLOOR_HORIZON if environment is None else environment.horizon_ending
+        )
         # The ending each attempt that ran out of steps owes, composed by the call that found no
         # budget left and kept until that ending has landed.
         self._endings: Dict[str, FinalizeRequest] = {}
@@ -1127,6 +1219,11 @@ class StreamGateway:
         ungraded, on the move its own contract told the agent to make. So spending the last of
         the budget leaves the attempt terminal-call-only, and the call after that is the one with
         nothing behind it: it reaches no world, ends the attempt, and is refused.
+
+        That is the floor, and it is what an environment gets by saying nothing. Where the
+        environment declared its horizon a graded ending there is no call after: this one files
+        the environment's terminal for the attempt as soon as its own step is committed, and the
+        acknowledgement the stream mints comes back beside the observation.
         """
         attempt_id, native = self._unwrap(arguments)
         owed = await self._resumed(key)
@@ -1136,6 +1233,14 @@ class StreamGateway:
         if overspent is not None:
             await self._budget_spent(overspent)
             raise self._refuse("invalid_attempt")
+        stranded = self._horizon_request(attempt_id)
+        if stranded is not None:
+            # Nothing this transport was serving reaches here: the filing goes out with the call
+            # that spends the last step. What does is a generation taken over from a process that
+            # spent the budget and did not file, where the count came back from the stream and
+            # the attempt is still open. It is finished before anything else, and this call gets
+            # the acknowledgement, because there is no world work left for it to have done.
+            return await self._horizon_sealed(_HorizonOwed(key, stranded, _EMPTY_RESULT))
         episode = self._episode
         if episode is None:  # pragma: no cover - an active attempt has a world by now
             raise self._refuse("invalid_attempt")
@@ -1165,7 +1270,13 @@ class StreamGateway:
         landed = _LeaseHeld(owner=key, call=held.call, result=result)
         self._recovery = landed
         await self._given_back(landed)
-        return result
+        # And the filing this call owes, if that step was the last one. It goes after the grant
+        # is back, because the stream holds the generation for the call it granted and would
+        # refuse a filing sent while it does.
+        spent = self._horizon_request(attempt_id)
+        if spent is None:
+            return result
+        return await self._horizon_sealed(_HorizonOwed(key, spent, result))
 
     def _overspent_request(self, attempt_id: str) -> Optional[FinalizeRequest]:
         """The ending this call owes, if there is no step left for it to spend.
@@ -1187,10 +1298,12 @@ class StreamGateway:
         reading it here has just refreshed it. So a replacement transport over a generation that
         already spent its budget refuses on its first call rather than on its horizon-plus-first,
         and the declared horizon stays a bound on the attempt rather than on the process.
+
+        None of this is the answer where the environment declared its horizon a graded ending.
+        Such an attempt was filed as its last step committed, so there is no call with nothing
+        behind it to refuse, and nothing to floor.
         """
-        if self._step_cap is None or self._spent.get(attempt_id, 0) < self._step_cap:
-            return None
-        if attempt_id not in self._active:
+        if self._horizon_ending != FLOOR_HORIZON or not self._out_of_budget(attempt_id):
             return None
         ending = self._endings.get(attempt_id)
         if ending is None:
@@ -1199,6 +1312,66 @@ class StreamGateway:
             )
             self._endings[attempt_id] = ending
         return ending
+
+    def _out_of_budget(self, attempt_id: str) -> bool:
+        """Whether this attempt is one this transport is serving with no step left to spend."""
+        if self._step_cap is None or self._spent.get(attempt_id, 0) < self._step_cap:
+            return False
+        return attempt_id in self._active
+
+    def _horizon_request(self, attempt_id: str) -> Optional[SealRequest]:
+        """The filing this attempt owes because its world work is over, under a graded horizon.
+
+        The filing carries no arguments. What the environment reads at its own horizon is the
+        world the attempt left, which is where it stands when the last step is committed, and a
+        generation whose terminal wanted arguments was refused a graded horizon before it served
+        anything. So there is nothing here that an agent authored and nothing this gateway had
+        to invent: the call names the attempt, says the horizon made it, and stops.
+
+        It is composed once per call that owes one and written into the recovery record by the
+        caller, which is what fixes the cursor it carries and what a retry of that call resends.
+        A filing composed now and sent after something else moved the stream would be refused for
+        a cursor it no longer has, so nothing composes one while a call still owes the last.
+        """
+        if self._horizon_ending != GRADED_HORIZON or not self._out_of_budget(attempt_id):
+            return None
+        return SealRequest(
+            metadata=self._terminal_metadata(attempt_id),
+            public_tool_name=self._terminal,
+            native_terminal_name=self._terminal,
+            terminal_source=HORIZON_FILED,
+        )
+
+    async def _horizon_sealed(self, record: _HorizonOwed) -> ToolResult:
+        """File the terminal this attempt's horizon owes, and hand back both halves of the call.
+
+        The record is installed before the filing goes, for the reason every other request is
+        written down before it is sent: the acknowledgement it may mint is reachable through
+        that request and through no other, the observation the call landed with exists nowhere
+        else, and a fault anywhere in here leaves the one call that can still finish both.
+
+        A refusal is different from a fault, and it is not raised as one. It says the stream did
+        not take this filing and never will: the generation's own deadline reached the attempt
+        first, or a filing under this request already landed and was presented. Either way the
+        attempt is not this transport's to end any more, and the call that made it is still owed
+        the observation it landed with.
+
+        Which is not the same as being free to hand it over. A refusal is also what a transport
+        the generation has been taken from is answered with, and a replacement that put the world
+        back to the checkpoint made this observation the report of a mutation that no longer
+        happened. Reading the refusal itself cannot tell those apart: an ending that won and a
+        restoration that won both refuse this filing. So what is owed is written down and handed
+        over the way every other kept result is, through a question this stream refuses a writer
+        it has replaced.
+        """
+        self._recovery = record
+        try:
+            offered = await self._sent(self._stream.seal(record.request))
+        except ToolError:
+            owed = _ResultOwed(owner=record.owner, result=record.result)
+            self._recovery = owed
+            return await self._owed(owed.result)
+        return await self._deliver(offered, record.owner, alongside=record.result)
 
     async def _granted(self, held: _LeaseHeld) -> None:
         """Ask the stream to hold the generation while one environment call happens.
@@ -1396,6 +1569,20 @@ class StreamGateway:
             if record.result is None:
                 return None
             return await self._owed(record.result, state)
+        if isinstance(record, _HorizonOwed):
+            if self._filing_settled(record.request, state):
+                # The filing did not fail to be decided: it was decided, and what it committed
+                # was the ending rather than an acknowledgement. Sending it again would ask the
+                # stream a question it has already answered for good, and every call that is not
+                # this one would go on being refused for as long as the generation ran. So what
+                # is left is the observation the call landed with, kept the way every other
+                # result this gateway holds is kept.
+                self._recovery = _ResultOwed(owner=record.owner, result=record.result)
+                return await self._owed(record.result, state)
+            # A filing this gateway owes on the attempt's behalf, sent again as itself. The
+            # stream reserves what a request offered for that request, so the retry reaches the
+            # acknowledgement the first one may already have minted rather than filing twice.
+            return await self._horizon_sealed(record)
         if isinstance(record, _ResultOwed):
             return await self._owed(record.result, state, closed_at=record.closed_at)
         if isinstance(record, _PresentationRefused):
@@ -1413,27 +1600,36 @@ class StreamGateway:
                 owner=record.owner,
                 message=record.message,
                 commit=await self._attestation(record.message),
+                alongside=record.alongside,
             )
             self._recovery = record
         return await self._present(record)
 
     def _nothing_to_collect(self, record: _Recovery, state: StreamState) -> bool:
-        """Whether a filing this gateway is holding open has nothing left to come back for.
+        """Whether a filing whose answer never arrived has nothing left to come back for.
 
-        A filing whose answer never arrived is kept because the acknowledgement it may have
-        minted is reachable through that request and through no other. An attempt that has
-        ended minted none. Either the seal committed an ending instead of an acknowledgement,
-        or something else ended the attempt before this filing reached the stream, and from
-        then on every filing for it is refused, the exact one included. So there is nothing
-        for this record to be held open for.
+        Such a record is held open against the answer, and this is the case where the answer
+        will not come and the record owes nothing else: it is dropped, and the next call is
+        served. A filing kept beside an observation is the other case and is not this one, so
+        it is asked about where it is handled rather than here.
+        """
+        if not isinstance(record, _RequestUncertain):
+            return False
+        return self._filing_settled(record.request, state)
+
+    def _filing_settled(self, request: Any, state: StreamState) -> bool:
+        """Whether the attempt this filing names has ended with no answer left to collect.
+
+        A filing is held open because the acknowledgement it may have minted is reachable
+        through that request and through no other. An attempt reported as ended minted none:
+        what the seal committed was the ending, or something else ended the attempt before the
+        filing reached the stream, and from then on every filing for it is refused, the exact
+        one included.
 
         A message the stream is holding is the case where there is something, so that is asked
         first: an acknowledgement is offered against an attempt the seal took and a rejection
         against one that is still active, and neither of those is an attempt that has ended.
         """
-        if not isinstance(record, _RequestUncertain):
-            return False
-        request = record.request
         if not isinstance(request, SealRequest) or state.pending_message_id is not None:
             return False
         return state.attempts.get(request.metadata.attempt_id) == _FINAL_FAILED
@@ -1460,7 +1656,10 @@ class StreamGateway:
         await self._close_world()
 
     async def _owed(
-        self, result: Any, state: StreamState, closed_at: Optional[str] = None
+        self,
+        result: Any,
+        state: Optional[StreamState] = None,
+        closed_at: Optional[str] = None,
     ) -> Any:
         """Hand over a result this gateway kept, once the stream says it may still be handed over.
 
@@ -1488,8 +1687,12 @@ class StreamGateway:
         authority is taken at its word that the generation is closed and standing there. A
         stream saying anything else is one whose Done these are not, and that is asked the same
         question every other kept result is.
+
+        ``state`` is the read the calling path already made, and a path that made none passes
+        nothing. The only thing read out of it here is whether the generation closed at the
+        cursor a Done was owed to, and a result that is not a Done has nothing to ask of it.
         """
-        if closed_at is not None and state.generation_state == _DONE:
+        if closed_at is not None and state is not None and state.generation_state == _DONE:
             if state.cursor == closed_at:
                 return result
         self._adopt(await self._sent(self._stream.confirm_state()))
@@ -1668,19 +1871,29 @@ class StreamGateway:
                 self._recovery = _Idle()
             raise
 
-    async def _deliver(self, message: OfferedMessage, key: bytes) -> str:
+    async def _deliver(
+        self, message: OfferedMessage, key: bytes, *, alongside: Optional[ToolResult] = None
+    ) -> Any:
         """Fix the attestation ``message`` travels under, then present it.
 
         A commit names the stream as it was before the event, so one built a second time
         describes a stream that has already moved and attests nothing about the delivery it was
         supposed to attest. It is built once, kept, and repeated.
+
+        ``alongside`` is what these bytes are delivered with, where the call being answered
+        asked for something else and this message came of it. The two travel together from here,
+        so what the attestation says is still true of exactly one delivery: the bytes were handed
+        to the transport, in the result of the call that produced them.
         """
         record = self._recovery
         if not isinstance(record, (_Offered, _PresentationUncertain)) or (
             record.message.message_id != message.message_id
         ):
             record = _Offered(
-                owner=key, message=message, commit=await self._attestation(message)
+                owner=key,
+                message=message,
+                commit=await self._attestation(message),
+                alongside=alongside,
             )
             self._recovery = record
         return await self._present(record)
@@ -1708,7 +1921,7 @@ class StreamGateway:
             stream_state_before_sha256=state.stream_state_sha256,
         )
 
-    async def _present(self, record: Union[_Offered, _PresentationUncertain]) -> str:
+    async def _present(self, record: Union[_Offered, _PresentationUncertain]) -> Any:
         """Attest that the exact offered bytes were delivered, and advance the cursor.
 
         The attestation is made as the bytes are handed to the transport, and that is the whole
@@ -1730,7 +1943,14 @@ class StreamGateway:
         """
         await self._prepared(record.message)
         self._recovery = _PresentationUncertain(
-            owner=record.owner, message=record.message, commit=record.commit
+            owner=record.owner,
+            message=record.message,
+            commit=record.commit,
+            # What these bytes are delivered with is carried into the uncertainty too. The
+            # delivery this record finishes is the same delivery, and the observation it goes
+            # behind exists nowhere else, so a record that dropped it would answer the retry
+            # with half of what the call landed with.
+            alongside=record.alongside,
         )
         try:
             ack = await self._sent(self._stream.commit_presentation(record.commit))
@@ -1743,19 +1963,20 @@ class StreamGateway:
             # the other case, and it keeps the commit: nobody knows yet whether that one was
             # applied, and the same one sent again is what finds out.
             self._recovery = _PresentationRefused(
-                owner=record.owner, message=record.message
+                owner=record.owner, message=record.message, alongside=record.alongside
             )
             raise
         self._applied(record.message, ack.cursor)
+        landed = _landed(record)
         self._recovery = _ResultOwed(
             owner=record.owner,
-            result=record.message.visible_text,
+            result=landed,
             # Done is the one message whose presentation ends the stream it was presented to, so
             # what it is owed to is recorded with the cursor it ended at rather than with a
             # promise that the stream can still be asked about it.
             closed_at=ack.cursor if record.message.kind == "done" else None,
         )
-        return record.message.visible_text
+        return landed
 
     async def _prepared(self, message: OfferedMessage) -> None:
         """Finish the world this message moves before the Presentation that reports it.
@@ -2067,11 +2288,12 @@ async def open_gateway(
     )
     _check_honest_over(composed, grade)
     if environment is not None:
+        _check_graded_horizon(spec, terminal, environment)
         composed = replace(
             composed,
             canonicalization_version=environment.canonicalization_version,
             configuration_hash=_configuration_hash(
-                spec, terminal, environment.configuration_digest
+                spec, terminal, environment.configuration_digest, environment.horizon_ending
             ),
         )
     if len(composed.tasks) > 1 and open_episode is None:
@@ -2127,6 +2349,38 @@ async def open_gateway(
         generation=composed,
         environment=environment,
     )
+
+
+def _check_graded_horizon(
+    spec: TaskSpec, terminal: ToolManifest, environment: EnvironmentTerminal
+) -> None:
+    """Refuse a graded horizon this gateway could not file for the attempt.
+
+    Two things have to hold. The environment has to publish a budget, because a horizon that
+    grades is an ending at a step count and an environment that declares none never reaches one:
+    such a generation would say its attempts are graded at the horizon and floor nothing, seal
+    nothing, and wait for a filing that only the agent can make.
+
+    And its terminal has to be one this gateway can fill in. The filing made at the horizon is
+    the attempt's world as it stands, so there is nothing for the gateway to put in the call, and
+    a terminal that declares arguments is one whose filing the agent authors. Such a call composed
+    here would carry names with nothing behind them, and the stream would reject it after the
+    budget was already spent.
+    """
+    if environment.horizon_ending != GRADED_HORIZON:
+        return
+    if spec.horizon is None:
+        raise ValueError(
+            f"env {spec.env_name!r} says its horizon is a graded ending and publishes no step "
+            "budget, so there is no horizon for an attempt over it to be graded at"
+        )
+    declared = declared_argument_names(terminal.input_schema)
+    if declared:
+        raise ValueError(
+            f"env {spec.env_name!r} says its horizon is a graded ending and its terminal "
+            f"{terminal.name!r} takes {declared}, and the filing made at a horizon is the world "
+            "the attempt left rather than arguments this gateway could write for it"
+        )
 
 
 def _check_honest_over(composed: StreamStart, grade: GradeIdentity) -> None:
@@ -2227,12 +2481,47 @@ def environment_terminal(episode: ServedEpisode) -> EnvironmentTerminal:
     # of the environment's own: an environment graded by the kernel's stand-in cannot come to
     # claim a grader by declaring one on the half of the boundary that does not produce numbers.
     grade = environment_grade(episode)
+    ending = environment_horizon_ending(episode)
     if brings_own is None:
         return EnvironmentTerminal(
-            CANONICALIZATION_VERSION, list(kernel_activities()), None, route, grade
+            CANONICALIZATION_VERSION, list(kernel_activities()), None, route, grade, ending
         )
     version, activities, digest = brings_own(route)
-    return EnvironmentTerminal(version, list(activities), digest, route, grade)
+    return EnvironmentTerminal(version, list(activities), digest, route, grade, ending)
+
+
+def environment_horizon_ending(episode: ServedEpisode) -> str:
+    """Ask this episode's environment what running out of steps does to an attempt.
+
+    An environment that says nothing gets the floor, and the default is the conservative one for
+    the reason the grade's is: a horizon that files the world as it stands commits a number
+    against a world nobody said was finished, and an environment cannot come to have its
+    unfinished attempts scored by forgetting to answer.
+
+    An environment that says its horizon is a graded ending and brings no terminal of its own is
+    refused here. The filing such a horizon makes is the environment's own seal reading the world
+    as it stands, and an environment with no seal has nothing to read it with: what would be
+    committed is the kernel's stand-in over an empty filing, which is the floor with a score
+    written on it. The refusal names the half that is missing.
+    """
+    declared = getattr(episode.env, "protocol_v2_horizon_ending", None)
+    if declared is None:
+        return FLOOR_HORIZON
+    ending = declared()
+    if ending not in HORIZON_ENDINGS:
+        raise ValueError(
+            f"this environment says its horizon ends an attempt {ending!r}, and what a "
+            f"generation is served under is one of {HORIZON_ENDINGS}"
+        )
+    if ending == GRADED_HORIZON and not _seals_its_own_worlds(episode):
+        raise ValueError(
+            "this environment says its horizon is a graded ending and brings no terminal of "
+            "its own, so the filing made at that horizon would be the kernel's stand-in over "
+            "an empty submission rather than this environment reading the world as it stands: "
+            "an environment whose horizon grades declares protocol_v2_terminal beside "
+            "protocol_v2_horizon_ending"
+        )
+    return ending
 
 
 def environment_grade(episode: ServedEpisode) -> GradeIdentity:
