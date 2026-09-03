@@ -19,7 +19,7 @@ influence. This module owns three things:
   ``finalize_error`` verdict and the evaluator is **never** re-invoked.
 
 No database, no credentials, no env-vars, no setup step — just a directory of small JSON
-files next to the trace store.
+files inside the run that produced them, or next to the trace store when there is no run.
 """
 
 from __future__ import annotations
@@ -348,8 +348,8 @@ class FinalizationStore:
     """A directory of small JSON finalization records, one per ``(session_id,
     finalization_id)``, ``fsync``'d on every transition.
 
-    Zero user setup: pass the trace directory (or accept the default under
-    ``~/.cache/shogym/sessions``). No DB, no credentials, no env-vars.
+    Zero user setup: pass the run directory, or the trace directory, or accept the default
+    under ``~/.cache/shogym/sessions``. No DB, no credentials, no env-vars.
     """
 
     def __init__(self, directory: Union[str, Path]) -> None:
@@ -361,20 +361,32 @@ class FinalizationStore:
 
     @staticmethod
     def resolve_dir(
-        session_id: str, trace_path: Optional[Union[str, Path]]
+        session_id: str,
+        trace_path: Optional[Union[str, Path]],
+        run_directory: Optional[Union[str, Path]] = None,
     ) -> Path:
-        """Where an episode's records live. Both roots are **shared across sessions** so that
+        """Where an episode's records live. Every root is **shared across sessions** so that
         startup recovery is *reachable*: a crashed prior session's record must sit in a
         directory the next process scans. Records are keyed by a globally-unique
         ``finalization_id`` (and each carries its own ``session_id``), so sharing a directory is
         safe: no per-session subdir is needed and, critically, a per-session subdir would hide
         a crashed run's record from recovery.
 
-        - **With a trace path:** ``<trace_dir>/finalizations``, next to the trace.
-        - **Without one:** a stable, zero-config fallback root (``~/.cache/shogym/sessions``, or
-          the system temp dir if that can't be created), *not* keyed by session, so a later
+        - **With a run directory:** ``<run_dir>/finalizations``, inside the run. A record is
+          what explains a hole in that run's results, and a reader who holds the run holds the
+          explanation with it rather than having to know that a separate store exists and
+          correlate by hand.
+        - **With a trace path and no run directory:** ``<trace_dir>/finalizations``, next to
+          the trace.
+        - **With neither:** a stable, zero-config fallback root (``~/.cache/shogym/sessions``,
+          or the system temp dir if that can't be created), *not* keyed by session, so a later
           episode's startup recovers dangling records from a prior crashed run there.
+
+        The run directory wins over the trace because it is the narrower home of the two: a
+        trace may be written anywhere and by several runs, and the records belong to one run.
         """
+        if run_directory is not None:
+            return Path(run_directory) / "finalizations"
         if trace_path is not None:
             return Path(trace_path).parent / "finalizations"
         return _sessions_cache_root()

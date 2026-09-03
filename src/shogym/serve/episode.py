@@ -1182,6 +1182,7 @@ class ServedEpisode:
         cleanup: Optional["_EnvClose"] = None,
         opened_context: "Optional[contextvars.Context]" = None,
         ends_on_horizon: bool = True,
+        run_directory: Optional[Union[str, Path]] = None,
     ) -> None:
         self._env = env
         self._env_name = env_name
@@ -1191,6 +1192,10 @@ class ServedEpisode:
         self._sessions = sessions  # advertised tool name -> session
         self._opened = opened  # every session opened, for teardown
         self._trace_path = Path(trace_path) if trace_path is not None else None
+        # The run this episode is part of, when it is part of one. It is where this episode's
+        # durable finalization records go, so a record it leaves about how it ended is read out
+        # of the same directory the run's results are.
+        self._run_directory = Path(run_directory) if run_directory is not None else None
         self._trajectory: Trajectory = []
         self._step = 0
         self._terminated = False
@@ -1357,12 +1362,15 @@ class ServedEpisode:
         # Optional finalize deadline (seconds): the evaluator is awaited up to this bound; on
         # timeout the episode fails closed to a `finalize_error` verdict. None disables it.
         self._finalize_deadline = finalize_deadline
-        # The durable finalization store — a local directory of fsync'd JSON records next to
-        # the trace (zero user setup). Built lazily only for a seal-enabled env.
+        # The durable finalization store — a local directory of fsync'd JSON records inside the
+        # run, or next to the trace when there is no run (zero user setup). Built lazily only
+        # for a seal-enabled env.
         self._store: Optional[FinalizationStore] = None
         if self._seal_enabled:
             self._store = FinalizationStore(
-                FinalizationStore.resolve_dir(session_id, self._trace_path)
+                FinalizationStore.resolve_dir(
+                    session_id, self._trace_path, self._run_directory
+                )
             )
             # Restart recovery, transport-independent: resolve any finalization records left
             # dangling (SEALED/PENDING) by a crashed prior run to a fail-closed verdict —
@@ -1399,6 +1407,7 @@ class ServedEpisode:
         finalize_deadline: Optional[float] = None,
         off_loop_factory: bool = False,
         ends_on_horizon: bool = True,
+        run_directory: Optional[Union[str, Path]] = None,
     ) -> "ServedEpisode":
         """Build the env, load the task instance, open the essential MCP sessions, and push
         per-episode state into the (in-process) tool servers.
@@ -1416,7 +1425,10 @@ class ServedEpisode:
         caller that has not said this one does not is a caller whose env this may not move.
 
         ``ends_on_horizon`` says whether spending the env's step budget ends the episode here.
-        A caller that ends the episode itself passes False; see the property of that name."""
+        A caller that ends the episode itself passes False; see the property of that name.
+
+        ``run_directory`` is the run this episode is part of, and it is where the durable
+        finalization records go; see :meth:`FinalizationStore.resolve_dir`."""
         lifecycle = _Lifecycle("start")
         if off_loop_factory:
             # No handler here, deliberately. A cancelled `_built` has already arranged the
@@ -1443,6 +1455,7 @@ class ServedEpisode:
             lifecycle=lifecycle,
             built_on_lifecycle=off_loop_factory,
             ends_on_horizon=ends_on_horizon,
+            run_directory=run_directory,
         )
 
     @classmethod
@@ -1458,6 +1471,7 @@ class ServedEpisode:
         built_on_lifecycle: bool = False,
         context: "Optional[contextvars.Context]" = None,
         ends_on_horizon: bool = True,
+        run_directory: Optional[Union[str, Path]] = None,
     ) -> "ServedEpisode":
         """Start an episode on an **already-constructed** env, which this episode then owns.
 
@@ -1470,6 +1484,9 @@ class ServedEpisode:
 
         ``ends_on_horizon`` says whether spending the env's step budget ends the episode here.
         A caller that ends the episode itself passes False; see the property of that name.
+
+        ``run_directory`` is the run this episode is part of, and it is where the durable
+        finalization records go; see :meth:`FinalizationStore.resolve_dir`.
         """
         opened: List[MCPSession] = []
         # The episode's own thread and loop. Built here so the setup hook and its rollback are
@@ -1562,6 +1579,7 @@ class ServedEpisode:
                 cleanup=cleanup,
                 opened_context=contextvars.copy_context(),
                 ends_on_horizon=ends_on_horizon,
+                run_directory=run_directory,
             )
             handed_over = True
             return episode
