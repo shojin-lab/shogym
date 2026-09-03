@@ -13,6 +13,7 @@ because that service downloads a test server on first use, and they skip when it
 from __future__ import annotations
 
 import json
+from pathlib import Path
 from typing import Any, AsyncIterator, Dict, List, Sequence, Tuple
 
 import pytest
@@ -21,6 +22,7 @@ pytest.importorskip("temporalio")
 
 import pytest_asyncio  # noqa: E402
 from fastmcp import Client  # noqa: E402
+from temporalio.client import WorkflowExecutionStatus  # noqa: E402
 from temporalio.testing import WorkflowEnvironment  # noqa: E402
 
 from shogym.serve.episode import ServedEpisode  # noqa: E402
@@ -43,7 +45,22 @@ from shogym.serve.protocol_v2.gateway import (  # noqa: E402
     stream_start,
     terminal_manifest,
 )
-from shogym.serve.protocol_v2.kernel import OfferedMessage, TaskItem, stream_worker  # noqa: E402
+from shogym.serve.protocol_v2.kernel import (  # noqa: E402
+    STREAM_TASK_QUEUE,
+    OfferedMessage,
+    TaskItem,
+    configuration_hash,
+    resume_run_directory,
+    start_stream,
+    stream_worker,
+)
+from shogym.serve.protocol_v2.rundir import (  # noqa: E402
+    MANIFEST_FILE,
+    ResumeRefused,
+    create_run_directory,
+    open_run_directory,
+    staged_generation,
+)
 
 from tests._fixtures import score_env, score_mcp  # noqa: E402
 
@@ -492,6 +509,179 @@ async def test_a_generation_of_more_than_one_task_needs_a_world_for_each(
     )
     with pytest.raises(ValueError, match="a world of its own"):
         await open_gateway(None, episode, start=start)  # type: ignore[arg-type]
+
+
+async def test_a_stream_that_never_started_leaves_no_generation_to_resume(
+    episode: ServedEpisode, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Opening a run is a directory and then a stream, and the manifest says the stream is there.
+
+    So the manifest is written once it is. A manifest written first would name a workflow nobody
+    had started: no owner could resume that generation, and the identical retry would be refused
+    by the manifest the dead attempt left behind. What a failed start leaves is a directory the
+    next attempt can still use.
+    """
+    root = tmp_path / "run"
+
+    async def never(*args: Any, **kwargs: Any) -> Any:
+        raise RuntimeError("the service went away before the stream existed")
+
+    monkeypatch.setattr("shogym.serve.protocol_v2.gateway.start_stream", never)
+    with pytest.raises(RuntimeError, match="before the stream existed"):
+        await open_gateway(None, episode, run_directory=root)  # type: ignore[arg-type]
+
+    assert (root / MANIFEST_FILE).exists() is False
+    with pytest.raises(ResumeRefused) as caught:
+        open_run_directory(root)
+    assert caught.value.code == "configuration_mismatch"
+
+    # The next attempt runs out of the same directory rather than being refused by it.
+    run = create_run_directory(
+        root,
+        workflow_id="stream/retried/1",
+        task_queue=STREAM_TASK_QUEUE,
+        configuration_hash="a" * 64,
+    )
+    assert open_run_directory(root).manifest == run.manifest
+
+
+@pytest.mark.network
+async def test_a_generation_no_manifest_ever_named_does_not_stay_running(
+    serving: WorkflowEnvironment,
+    episode: ServedEpisode,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A stream is started and then recorded, and a run that dies between leaves neither behind.
+
+    The identifier is minted in this call and nowhere else. A manifest that never landed
+    therefore means nothing on the disk names the authority that did start: no owner can resume
+    it, and the next attempt out of the directory mints another identifier and leaves the first
+    running with no consumer for as long as the service lives. So the name goes down before the
+    stream does, and the attempt that finds one ends what it names before starting its own.
+    """
+    root = tmp_path / "run"
+    started: List[str] = []
+
+    async def watched(*args: Any, **kwargs: Any) -> Any:
+        stream = await start_stream(*args, **kwargs)
+        started.append(kwargs["workflow_id"])
+        return stream
+
+    def dies(*args: Any, **kwargs: Any) -> Any:
+        raise RuntimeError("the machine went away before the manifest landed")
+
+    async def never(*args: Any, **kwargs: Any) -> Any:
+        raise RuntimeError("the service went away before the stream existed")
+
+    # A name written down for a stream that then failed to start. What it names does not
+    # exist, which is the state the next attempt wants it in, so it is not an error.
+    monkeypatch.setattr("shogym.serve.protocol_v2.gateway.start_stream", never)
+    with pytest.raises(RuntimeError, match="before the stream existed"):
+        await open_gateway(serving.client, episode, run_directory=root)
+    monkeypatch.undo()
+    unstarted = staged_generation(root)
+    assert unstarted is not None
+
+    monkeypatch.setattr("shogym.serve.protocol_v2.gateway.start_stream", watched)
+    monkeypatch.setattr("shogym.serve.protocol_v2.gateway.create_run_directory", dies)
+    with pytest.raises(RuntimeError, match="before the manifest landed"):
+        await open_gateway(serving.client, episode, run_directory=root)
+    monkeypatch.undo()
+
+    abandoned = started[0]
+    assert abandoned != unstarted.workflow_id
+    assert (root / MANIFEST_FILE).exists() is False
+    left = staged_generation(root)
+    assert left is not None and left.workflow_id == abandoned
+    running = await serving.client.get_workflow_handle(abandoned).describe()
+    assert running.status == WorkflowExecutionStatus.RUNNING
+
+    # The next attempt runs out of the same directory, and what the cut left is over.
+    gateway = await open_gateway(serving.client, episode, run_directory=root)
+    try:
+        manifest = open_run_directory(root).manifest
+        assert manifest.workflow_id != abandoned
+        assert staged_generation(root) is None
+        ended = await serving.client.get_workflow_handle(abandoned).describe()
+        assert ended.status == WorkflowExecutionStatus.TERMINATED
+    finally:
+        await gateway.aclose()
+
+
+async def test_a_manifest_arrives_whole_or_leaves_the_directory_as_it_was(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A publication that dies half way leaves no manifest, rather than an unusable one.
+
+    A file that is there is what says this directory holds a generation, so a torn one is the
+    worst of both: nothing can resume what it names, and the next attempt is refused by it
+    instead of running out of the directory. So the bytes are written beside the manifest and
+    renamed onto it, and this cuts the run at the rename.
+    """
+    root = tmp_path / "run"
+
+    def dies(*args: Any, **kwargs: Any) -> None:
+        raise OSError("the disk went away between the write and the rename")
+
+    monkeypatch.setattr("shogym.serve.protocol_v2.rundir.os.replace", dies)
+    with pytest.raises(OSError, match="between the write and the rename"):
+        create_run_directory(
+            root,
+            workflow_id="stream/torn/1",
+            task_queue=STREAM_TASK_QUEUE,
+            configuration_hash="b" * 64,
+        )
+    assert (root / MANIFEST_FILE).exists() is False
+    assert sorted(path.name for path in root.iterdir()) == ["blobs"]
+
+    monkeypatch.undo()
+    run = create_run_directory(
+        root,
+        workflow_id="stream/torn/1",
+        task_queue=STREAM_TASK_QUEUE,
+        configuration_hash="b" * 64,
+    )
+    assert open_run_directory(root).manifest == run.manifest
+
+
+@pytest.mark.network
+async def test_a_run_this_call_composed_can_still_be_taken_over(
+    serving: WorkflowEnvironment, episode: ServedEpisode, tmp_path: Path
+) -> None:
+    """A resume presents a composition, so the composition this call made is on what it returns.
+
+    A generation mints its own identifiers, and they are part of what a resume is held to. A
+    replacement that composed the same environment and task afresh would therefore be composed
+    for a different generation, which is what makes the composition itself the thing a later
+    owner needs. A caller that composed the run holds it already; one that let this call compose
+    reads it back from here.
+    """
+    root = tmp_path / "run"
+    gateway = await opened_run(serving, episode, root)
+    composed = gateway.generation
+    assert composed is not None
+    manifest = open_run_directory(root).manifest
+    assert configuration_hash(composed) == manifest.configuration_hash
+
+    # Composing the same environment and task again is composing another generation.
+    spec = episode.describe()
+    afresh = stream_start(spec, terminal_manifest(spec), claim_hash=CLAIM_HASH)
+    assert configuration_hash(afresh) != manifest.configuration_hash
+
+    taken = await resume_run_directory(
+        serving.client, root, start=composed, claimant_id="the-next-owner"
+    )
+    assert (await taken.stream_state()).ownership_epoch == 2
+
+
+async def opened_run(
+    environment: WorkflowEnvironment, episode: ServedEpisode, root: Path
+) -> StreamGateway:
+    """Open a generation the way a caller with no composition of its own does."""
+    return await open_gateway(
+        environment.client, episode, workflow_id="stream/composed/1", run_directory=root
+    )
 
 
 async def test_an_evaluation_only_generation_is_pinned_to_never(episode: ServedEpisode) -> None:

@@ -29,27 +29,15 @@ from typing import Any, Dict, List, Optional, Sequence
 from shogym.serve.protocol_v2 import (
     IMMEDIATE,
     PROTOCOL_VERSION,
+    SCHEDULE_VERSION,
     Assignment,
+    BlobRef,
     ReleasePlan,
     TerminalMetadata,
     assignment_id_for,
+    canonical_json,
     length_prefixed,
 )
-
-
-@dataclass(frozen=True)
-class BlobRef:
-    """A reference to an immutable content-addressed object, by the hash that names it."""
-
-    sha256: str
-    size: int
-    media_type: str
-
-
-def blob_ref(text: str, media_type: str = "text/plain") -> BlobRef:
-    """Return the reference that names ``text``'s bytes."""
-    encoded = text.encode("utf-8")
-    return BlobRef(sha256=sha256(encoded).hexdigest(), size=len(encoded), media_type=media_type)
 
 
 @dataclass(frozen=True)
@@ -97,6 +85,12 @@ class StreamStart:
     generation rather than a consequence of how it ran. An empty roster is filled in from the
     closed manifest at start, still before an offer. ``evaluation_only`` says this generation
     exists to score and not to deliver, and it is refused unless its plan is Never.
+
+    ``configuration_hash`` is the environment's half of what this generation is: the contract,
+    the instructions, the tools. The whole of it is :func:`configuration_hash`, which folds that
+    value together with the manifest, the roster, the plan, the capacity, and the versions, and
+    it is what a resume has to present. ``blob_root`` is the directory the blobs an event may
+    reference are installed in. A generation without one verifies no reference, and says so.
     """
 
     configuration_hash: str
@@ -114,7 +108,93 @@ class StreamStart:
     release: ReleasePlan = field(default_factory=lambda: IMMEDIATE)
     assignments: List[Assignment] = field(default_factory=list)
     evaluation_only: bool = False
+    blob_root: Optional[str] = None
+    schedule_version: str = SCHEDULE_VERSION
     protocol_version: int = PROTOCOL_VERSION
+
+
+def configuration_hash(start: StreamStart) -> str:
+    """Return the immutable hash of everything this generation is.
+
+    A resume presents this value and is refused when it does not match, so what goes in is
+    everything a changed value would make the running generation a different one: the two
+    versions, the environment's own configuration digest, the capacity, the closed manifest,
+    the roster the generation will serve, the release plan, and the terminal tool. The roster is
+    the derived one, because a generation started without rows gets the ones its manifest
+    implies and a hash over the empty list would not cover them.
+
+    Secrets are covered by their hashes rather than by value. What has to be true is that the
+    key changed, not that a reader of this hash can tell what it changed to.
+
+    The blob store's location is not here. Where a run keeps its bytes is deployment, and the
+    same generation moved to another directory is the same generation.
+    """
+    roster = list(start.assignments) or assignments_for(start.tasks, start.release)
+    plan = start.release
+    declared = {
+        "protocol_version": start.protocol_version,
+        "schedule_version": start.schedule_version,
+        "environment_configuration": start.configuration_hash,
+        "consumer_claim_hash": start.consumer_claim_hash,
+        "capacity": start.capacity,
+        "wait_retry_after_ms": start.wait_retry_after_ms,
+        "evaluation_only": start.evaluation_only,
+        "canonicalization_version": start.canonicalization_version,
+        "execution_ordinal": start.execution_ordinal,
+        "initial_cursor": start.initial_cursor,
+        "done_message_id": start.done_message_id,
+        "id_key_sha256": sha256(start.id_key_hex.encode("utf-8")).hexdigest(),
+        "hidden_execution_sha256": sha256(
+            start.hidden_execution_id.encode("utf-8")
+        ).hexdigest(),
+        "terminal_tool": {
+            "public_tool_name": start.terminal_tool.public_tool_name,
+            "native_terminal_name": start.terminal_tool.native_terminal_name,
+            "argument_names": list(start.terminal_tool.argument_names),
+        },
+        "manifest": [
+            {
+                "task_position": item.task_position,
+                "attempt_id": item.attempt_id,
+                "task_message_id": item.task_message_id,
+                "ack_message_id": item.ack_message_id,
+                "payload_position": item.payload_position,
+                "payload_message_id": item.payload_message_id,
+                "body_sha256": sha256(item.body.encode("utf-8")).hexdigest(),
+            }
+            for item in start.tasks
+        ],
+        "roster": [
+            {
+                "assignment_id": row.assignment_id,
+                "attempt_id": row.attempt_id,
+                "task_position": row.task_position,
+                "payload_position": row.payload_position,
+                "task_message_id": row.task_message_id,
+                "ack_message_id": row.ack_message_id,
+                "payload_message_id": row.payload_message_id,
+                "release_plan_id": row.release_plan_id,
+                "creates_payload_obligation": row.creates_payload_obligation,
+            }
+            for row in roster
+        ],
+        "release": {
+            "release_plan_id": plan.release_plan_id,
+            "predicate": plan.predicate,
+            "predicate_version": plan.predicate_version,
+            "priority": plan.priority,
+            "tie_key": plan.tie_key,
+            "gates": [
+                {
+                    "attempt_id": gate.attempt_id,
+                    "after_payload_position": gate.after_payload_position,
+                    "after_sealed_attempt_id": gate.after_sealed_attempt_id,
+                }
+                for gate in sorted(plan.gates, key=lambda gate: gate.attempt_id)
+            ],
+        },
+    }
+    return sha256(canonical_json(declared)).hexdigest()
 
 
 def assignments_for(
@@ -151,6 +231,83 @@ def assignments_for(
         )
         for item in tasks
     ]
+
+
+@dataclass(frozen=True)
+class Writer:
+    """Who is calling, in the only terms the generation checks: an epoch and a token.
+
+    Every call that can change the stream carries one. The epoch says which owner is speaking
+    and the token proves it is that owner, so a writer whose epoch has been superseded is
+    refused before it reads anything, including a writer whose call was already in flight when
+    the new owner claimed.
+    """
+
+    ownership_epoch: int
+    fencing_token: str
+    protocol_version: int = PROTOCOL_VERSION
+
+
+@dataclass(frozen=True)
+class OwnershipClaim:
+    """A claim to be the generation's writer, presented as a compare and swap.
+
+    ``previous_epoch`` is the epoch the claimant read before claiming. It is the whole of the
+    compare: a claimant that read a stale epoch loses, which is what makes two would-be owners
+    resolve to one rather than to both. ``fencing_token`` is the new owner's unguessable secret,
+    and only its hash is kept. ``configuration_hash`` is what the claimant believes it is
+    resuming, and a claim that believes something else changes nothing.
+
+    ``restored_checkpoints`` is what this claimant put back before it claimed: an attempt, and
+    the exact task-start checkpoint it materialized for that attempt. An active attempt whose
+    world the generation has since authorized a change to is continued only by a claimant that
+    says this, because the alternative is a new owner carrying on in a world nobody restored.
+    A claimant that restores nothing sends nothing, and is refused for exactly those attempts.
+    """
+
+    claimant_id: str
+    previous_epoch: int
+    fencing_token: str
+    configuration_hash: str
+    reason: str = "fresh"
+    restored_checkpoints: Dict[str, str] = field(default_factory=dict)
+    protocol_version: int = PROTOCOL_VERSION
+
+
+@dataclass(frozen=True)
+class OwnershipReceipt:
+    """What a successful claim returns: the epoch it won, and what it replaced."""
+
+    ownership_epoch: int
+    previous_epoch: int
+    fencing_token_hash: str
+    configuration_hash: str
+    claimant_id: str
+    reason: str
+    protocol_version: int = PROTOCOL_VERSION
+
+
+@dataclass(frozen=True)
+class VerifyBlobsInput:
+    """Ask the store whether it holds the exact bytes these references name."""
+
+    blob_root: str
+    references: List[str]
+    protocol_version: int = PROTOCOL_VERSION
+
+
+@dataclass(frozen=True)
+class BlobsVerified:
+    """Which references the store could produce, and which it could not.
+
+    A reference is unverified whether the object is absent or the bytes under its name hash to
+    something else. The authority treats both the same way, because neither is the object the
+    event would have been citing.
+    """
+
+    verified: List[str]
+    unverified: List[str]
+    protocol_version: int = PROTOCOL_VERSION
 
 
 @dataclass(frozen=True)
@@ -251,12 +408,37 @@ class StreamState:
     them, and only for a Payload, is one: ``payload_delivery_count`` counts the payloads whose
     bytes were handed to the transport and nothing else. What the model consumed of them is
     attested by the harness transcript rather than by any count here.
+
+    ``ownership_epoch`` is what a resume reads before it claims, so this Query is also the
+    compare half of the compare and swap. ``blob_verification`` says whether this generation
+    checks the references a presentation carries, which depends on whether it was given a store.
+
+    ``pending_origin`` and ``pending_request_id`` say which call the reserved result is owed to,
+    and ``environment_call`` names a hold the generation is still under. An owner that opened
+    neither of them knows both from here: the cursor is the one the reserved result was offered
+    against, because a reservation and an advanced cursor cannot both be true at once.
+
+    ``prepared_seals`` is the same fact for a filing that has no result yet. A seal accepted by
+    an owner that was fenced before it committed leaves its attempt prepared and reserves
+    nothing, so the request it is waiting on is named per attempt instead. The filing itself is
+    not here: the arguments a model wrote belong in the transcript that holds them, and what a
+    replacement cannot rebuild from there is the identity the call was made under.
+
+    ``task_checkpoints`` names the checkpoint each attempt would be restored from, per attempt,
+    and ``restoration_required`` names the active attempts a claim may not simply continue:
+    ones the generation has authorized a change to a world for since that checkpoint committed.
+    A replacement reads both before it claims, because the claim it then makes has to say which
+    of them it put back.
     """
 
     generation_state: str
     cursor: str
     configuration_hash: str
     stream_state_sha256: str
+    ownership_epoch: int
+    fencing_token_hash: Optional[str]
+    ownership_claims: int
+    blob_verification: str
     consumer_id: Optional[str]
     queue_closed: bool
     tasks_remaining: int
@@ -264,6 +446,12 @@ class StreamState:
     capacity_in_use: int
     pending_message_id: Optional[str]
     pending_kind: Optional[str]
+    pending_origin: Optional[str]
+    pending_request_id: Optional[str]
+    environment_call: Optional[str]
+    prepared_seals: Dict[str, str]
+    task_checkpoints: Dict[str, str]
+    restoration_required: List[str]
     attempts: Dict[str, str]
     obligations: Dict[str, str]
     release_plan_id: str

@@ -20,6 +20,7 @@ import json
 import os
 import sys
 from dataclasses import replace
+from pathlib import Path
 from types import SimpleNamespace
 from typing import Any, AsyncIterator, Dict, List, Optional
 
@@ -67,6 +68,7 @@ from shogym.serve.protocol_v2.gateway import (  # noqa: E402
     _ResultOwed,
 )
 from shogym.serve.protocol_v2.kernel import OfferedMessage, StreamProtocolError  # noqa: E402
+from shogym.serve.protocol_v2.rundir import open_run_directory  # noqa: E402
 from shogym.task import TaskSpec, ToolManifest  # noqa: E402
 
 TEST_ENV = "wordle_v1"
@@ -2614,7 +2616,18 @@ async def _drive_stdio(address: str, tmp_path: Any) -> None:
     environment["SHOGYM_TEMPORAL_ADDRESS"] = address
     transport = StdioTransport(
         command=sys.executable,
-        args=["-m", "shogym.cli", "serve", TEST_ENV, "--task", "0", "--protocol", "v2"],
+        args=[
+            "-m",
+            "shogym.cli",
+            "serve",
+            TEST_ENV,
+            "--task",
+            "0",
+            "--protocol",
+            "v2",
+            "--run-dir",
+            str(tmp_path / "run"),
+        ],
         env=environment,
         cwd=str(tmp_path),
     )
@@ -2647,6 +2660,12 @@ async def _drive_stdio(address: str, tmp_path: Any) -> None:
         closed = await client.call_tool(PULL_TOOL, {}, raise_on_error=False)
         assert closed.is_error
         assert json.loads(closed.content[0].text)["code"] == "closed_stream"
+
+    # The run directory holds what a later owner would resume from, and every presentation in
+    # that arc referenced a transcript blob the stream read before it committed anything.
+    run = open_run_directory(Path(tmp_path) / "run")
+    assert run.manifest.workflow_id.startswith("stream/")
+    assert [path for path in run.blobs.root.rglob("*") if path.is_file()]
 
 
 async def _record(client: Client, tool: str, arguments: Dict[str, Any]) -> Dict[str, Any]:

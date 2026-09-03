@@ -51,6 +51,11 @@ TIE_KEYS: Tuple[str, ...] = (BY_POSITION, BY_ATTEMPT_ID)
 
 PREDICATE_VERSION = "shogym.release.1"
 
+# The version of the schedule model as a whole: these predicates, these priorities, these tie
+# keys, and this gate. A generation that declares another one is refused rather than served by
+# code that means something else by the same words.
+SCHEDULE_VERSION = "shogym.schedule.1"
+
 TASK = "task"
 PAYLOAD = "payload"
 

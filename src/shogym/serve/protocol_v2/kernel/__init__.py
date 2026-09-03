@@ -28,6 +28,26 @@ the initial cursor, and the terminal tool::
     stream = await start_stream(client, start, workflow_id="stream/run-1/gen-1")
     await stream.claim_consumer(ConsumerClaim(consumer_id=..., claim_hash=...))
 
+Starting is a claim of ownership, and so is taking a generation over after the process that was
+serving it went away::
+
+    stream = await resume_stream(client, workflow_id="stream/run-1/gen-1",
+                                 configuration_hash=configuration_hash(start))
+
+That fences the previous writer. Its handle keeps the epoch it had, and every call it makes
+from then on is refused without touching the stream, including one that was already in flight.
+A claim that presents a different configuration hash is refused instead, and nothing moves.
+:func:`resume_run_directory` does the same from a directory, deriving that hash from the
+composition the resuming process serves rather than reading it back out of the manifest. It is
+also where a protocol v1 run is refused before anything is claimed at all.
+
+An active attempt the generation has since authorized a call to a world for is one whose world
+has moved past the checkpoint it would come back from, and taking it over means saying so. The
+claim carries ``restored_checkpoints``, the attempts this owner put back and the checkpoint it
+put each of them back from, and a claim that says nothing about such an attempt is refused with
+``invalid_attempt`` and nothing touched. What has to be named, and what to name it under, are
+``restoration_required`` and ``task_checkpoints`` in the state Query.
+
 Then the loop. A pull returns one
 :class:`~shogym.serve.protocol_v2.kernel.messages.OfferedMessage`, whose ``visible_text`` is
 the exact canonical bytes to put in front of the model. Nothing advances until the harness has
@@ -57,14 +77,16 @@ and not a protocol answer. :meth:`StreamHandle.stream_state` is harness-only and
 nothing.
 """
 
+from shogym.serve.protocol_v2 import BlobRef, blob_ref
 from shogym.serve.protocol_v2.kernel.activities import (
     generate_payload_bundle_activity,
     grade_attempt_activity,
     kernel_activities,
     seal_attempt_activity,
+    verify_blobs_activity,
 )
 from shogym.serve.protocol_v2.kernel.messages import (
-    BlobRef,
+    BlobsVerified,
     ConsumerClaim,
     ConsumerReceipt,
     EnvironmentCall,
@@ -73,6 +95,8 @@ from shogym.serve.protocol_v2.kernel.messages import (
     GradeAttemptInput,
     GradeAttemptResult,
     OfferedMessage,
+    OwnershipClaim,
+    OwnershipReceipt,
     PayloadBundle,
     PayloadCandidate,
     QueueClosed,
@@ -84,16 +108,21 @@ from shogym.serve.protocol_v2.kernel.messages import (
     StreamState,
     TaskItem,
     TerminalTool,
+    VerifyBlobsInput,
+    Writer,
     assignments_for,
-    blob_ref,
+    configuration_hash,
     hidden_seal_id,
 )
 from shogym.serve.protocol_v2.kernel.runtime import (
     STREAM_TASK_QUEUE,
     TEMPORAL_ADDRESS_ENV,
     StreamHandle,
+    discard_stream,
     durable_client,
     protocol_error_code,
+    resume_run_directory,
+    resume_stream,
     run_stream_worker,
     start_stream,
     stream_replayer,
@@ -106,6 +135,7 @@ __all__ = [
     "STREAM_TASK_QUEUE",
     "TEMPORAL_ADDRESS_ENV",
     "BlobRef",
+    "BlobsVerified",
     "ConsumerClaim",
     "ConsumerReceipt",
     "EnvironmentCall",
@@ -114,6 +144,8 @@ __all__ = [
     "GradeAttemptInput",
     "GradeAttemptResult",
     "OfferedMessage",
+    "OwnershipClaim",
+    "OwnershipReceipt",
     "PayloadBundle",
     "PayloadCandidate",
     "QueueClosed",
@@ -128,18 +160,25 @@ __all__ = [
     "StreamWorkflow",
     "TaskItem",
     "TerminalTool",
+    "VerifyBlobsInput",
+    "Writer",
     "assignments_for",
     "blob_ref",
+    "configuration_hash",
+    "discard_stream",
     "durable_client",
     "generate_payload_bundle_activity",
     "grade_attempt_activity",
     "hidden_seal_id",
     "kernel_activities",
     "protocol_error_code",
+    "resume_run_directory",
+    "resume_stream",
     "run_stream_worker",
     "seal_attempt_activity",
     "start_stream",
     "stream_replayer",
     "stream_worker",
     "temporal_home",
+    "verify_blobs_activity",
 ]

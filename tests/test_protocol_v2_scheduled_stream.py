@@ -35,6 +35,7 @@ from shogym.serve.protocol_v2 import (  # noqa: E402
     TerminalMetadata,
 )
 from shogym.serve.protocol_v2.kernel import (  # noqa: E402
+    STREAM_TASK_QUEUE,
     ConsumerClaim,
     OfferedMessage,
     SealRequest,
@@ -381,7 +382,9 @@ async def test_positions_hold_through_retries_and_waits(env) -> None:
         request = caller.pull_request()
         task = await caller.pull(request)
         replayed = await caller.stream.handle.execute_update(
-            StreamWorkflow.pull, request, id="a-second-delivery-of-one-request"
+            StreamWorkflow.pull,
+            args=[request, caller.stream.writer],
+            id="a-second-delivery-of-one-request",
         )
         assert replayed == task
 
@@ -444,9 +447,14 @@ async def test_a_generation_whose_schedule_does_not_hold_together_never_starts(e
         # An evaluation that scores without delivering cannot be given an outbox either.
         evaluating = make_start(bodies=("first.",), evaluation_only=True)
         for index, refusable in enumerate((skewed, evaluating)):
-            stream = await start_stream(
-                env.client, refusable, workflow_id=f"stream/skewed/{index}"
+            # Started without going through `start_stream`, which would claim ownership of a
+            # generation that never opened.
+            handle = await env.client.start_workflow(
+                StreamWorkflow.run,
+                refusable,
+                id=f"stream/skewed/{index}",
+                task_queue=STREAM_TASK_QUEUE,
             )
             with pytest.raises(WorkflowFailureError) as caught:
-                await stream.handle.result()
+                await handle.result()
             assert protocol_error_code(caught.value.cause) == "configuration_mismatch"
