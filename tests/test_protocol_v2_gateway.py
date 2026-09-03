@@ -2797,6 +2797,51 @@ async def test_recovery_is_one_record_however_many_calls_are_refused(
     assert world.landed == ["guess"]
 
 
+async def test_the_count_reaches_its_sink_before_the_refusal_reaches_the_model(
+    episode: ServedEpisode,
+) -> None:
+    """A harness keeping the count is told inside the call that made it.
+
+    The count is the cross-check on the transcript, and it is worth nothing to a harness that no
+    longer holds it when the run is read. A transport is not always asked to stop: one that is
+    killed after answering a call runs nothing on its way out, so there is no later moment to
+    write the number at. This is the moment there is, and the error the model will see is built
+    after it.
+    """
+    counted: List[int] = []
+    spec = episode.describe()
+    stream = ScriptedStream(TASK_OFFER)
+
+    def sink(refusals: int) -> None:
+        # Called before the refusal exists, so the gateway's own count is already this.
+        assert gateway.refusals == refusals
+        counted.append(refusals)
+
+    gateway = StreamGateway(
+        stream,  # type: ignore[arg-type]
+        episode,
+        spec,
+        terminal_manifest(spec),
+        initial_cursor=CURSOR,
+        on_refusal=sink,
+    )
+    await gateway.pull({})
+
+    # A call naming no attempt is refused by this gateway and never reaches the stream, which is
+    # the whole class of refusal this count exists for.
+    unnamed = {"arguments": {"word": "crane"}}
+    assert await refused(gateway.environment("guess", unnamed)) == "invalid_message"
+    assert counted == [1]
+    assert await refused(gateway.environment("guess", unnamed)) == "invalid_message"
+    assert counted == [1, 2] and gateway.refusals == 2
+
+    # A gateway given no sink counts for itself and tells nobody, which is the default.
+    quiet = make_gateway(episode, ScriptedStream(TASK_OFFER))
+    await quiet.pull({})
+    assert await refused(quiet.environment("guess", unnamed)) == "invalid_message"
+    assert quiet.refusals == 1
+
+
 # Stopping.
 
 

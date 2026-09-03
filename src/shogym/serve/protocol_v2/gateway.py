@@ -179,6 +179,15 @@ _Result = TypeVar("_Result")
 #: be told which world that attempt filed in. This gateway is the only thing that knows.
 EpisodeOpener = Callable[[str], Awaitable[ServedEpisode]]
 
+#: Where a harness keeps this transport's count of the refusals it has issued. A refusal advances
+#: no protocol state, so the generation has nothing to count and the model's transcript is the
+#: refusal's whole record; this count is the cross-check on that record, and it is only useful to
+#: a harness that still holds it when the run is read. It is called with the new count inside the
+#: call that issues the refusal and before the error goes back, so a transport killed the instant
+#: after a refusal has already told whoever keeps the number. Nothing this gateway decides reads
+#: it, and what it does with the number is the harness's own business.
+RefusalSink = Callable[[int], None]
+
 #: The dispositions an experiment registers, built from the roster they resolve. A row names an
 #: attempt and a payload position, and both are minted where the generation is, so a registration
 #: is given as a function of the roster rather than as a finished value: it is called with the
@@ -943,6 +952,7 @@ class StreamGateway:
         blobs: Optional[BlobStore] = None,
         generation: Optional[StreamStart] = None,
         environment: Optional[EnvironmentTerminal] = None,
+        on_refusal: Optional[RefusalSink] = None,
     ) -> None:
         self._stream = stream
         # The composition this generation was started from, when this gateway is the thing that
@@ -1003,6 +1013,9 @@ class StreamGateway:
         self._serving = _SERVING
         self._shutdown: Optional["asyncio.Future[None]"] = None
         self._refusals = 0
+        # Where the count goes as it changes, for a harness that wants it somewhere that
+        # survives this process. Without one the count lives here and nowhere else.
+        self._on_refusal = on_refusal
 
     @property
     def spec(self) -> TaskSpec:
@@ -1030,9 +1043,17 @@ class StreamGateway:
         return self._refusals
 
     def _refuse(self, code: str) -> ToolError:
-        """Count one refusal, write its code to the log, and return the error carrying it."""
+        """Count one refusal, tell whoever is keeping the count, and return the error.
+
+        The sink is called here rather than anywhere later because here is the only place the
+        count is certainly known to somebody: a transport is not always asked to stop, and one
+        that is killed after answering a call runs nothing on its way out. So the number reaches
+        the harness inside the call that made it, before the error the model will see goes back.
+        """
         self._refusals += 1
         _LOG.info("protocol v2 refusal: %s", code)
+        if self._on_refusal is not None:
+            self._on_refusal(self._refusals)
         return _refusal(code)
 
     @property
@@ -2211,6 +2232,7 @@ async def open_gateway(
     open_episode: Optional[EpisodeOpener] = None,
     run_directory: Optional[Union[str, Path]] = None,
     environment: Optional[EnvironmentTerminal] = None,
+    on_refusal: Optional[RefusalSink] = None,
 ) -> StreamGateway:
     """Start a generation for ``episode`` and bind this transport as its one consumer.
 
@@ -2268,6 +2290,13 @@ async def open_gateway(
     owner serves rather than what the directory recorded, so the directory alone is not enough
     to take a generation over: the identifiers a generation mints are its own, and a controller
     that let this call compose one has nowhere else to read them back from.
+
+    ``on_refusal`` is where this transport's count of its own refusals goes as it changes. A
+    refusal advances no protocol state, so the generation counts none of them and the model's
+    transcript is the whole record of one; the count is the cross-check on that record, and it is
+    worth nothing to a harness that no longer has it by the time the run is read. Given a sink,
+    the number reaches it inside the call that issued the refusal, which is the only moment a
+    transport that is killed rather than stopped is certain to reach.
 
     An episode that ends on its own horizon is refused here. Under this protocol the stream is
     what ends an attempt, and an episode that seals and grades itself when a step budget runs
@@ -2348,6 +2377,7 @@ async def open_gateway(
         blobs=blobs,
         generation=composed,
         environment=environment,
+        on_refusal=on_refusal,
     )
 
 

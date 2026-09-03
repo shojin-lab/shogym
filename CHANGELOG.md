@@ -9,6 +9,20 @@ direction.
 
 ## Unreleased
 
+### `serve`: a run says what it committed to deliver
+
+A generation now keeps a record of every message it committed to deliver: the kind, the attempt
+it belonged to, its place in the order, and the digest of the exact bytes. `presented_messages`
+answers with those, `generation_records` answers with them and the attempt rows from one handler
+call, and `read_records` returns them on `RunRecords.presentations`. A row is what the generation
+accepted and not what any transport handed over, so a harness that keeps the model's transcript
+reconciles the two to establish either delivery or consumption. `records.jsonl` is unchanged.
+
+`open_gateway` and `StreamGateway` take an optional `on_refusal` sink, called with the new count
+inside the call that issues a refusal. A refusal advances no protocol state, so the count is a
+harness-side audit surface and this is the only moment a transport that is killed rather than
+stopped is certain to reach.
+
 ### `serve`: the version one serving contract is retired, and protocol v2 is the only path
 
 `shogym.serve.stream` is gone, and with it `TaskStream`, `EvalStream`, `TaskRef`,
