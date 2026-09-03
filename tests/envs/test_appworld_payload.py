@@ -36,6 +36,10 @@ from shogym.envs.appworld.scorer import (
     score,
 )
 
+# Deselected from the per-push CI step with the rest of AppWorld's tests, and run by the job that
+# runs nightly and on request.
+pytestmark = pytest.mark.appworld
+
 REFERENCE = dt.date(2023, 5, 18)
 TASK = "5238afc_1"
 LEG = leg_of(TASK)

@@ -25,6 +25,10 @@ import pytest
 
 from shogym.envs.appworld import adapter, ledger, world
 
+# Deselected from the per-push CI step with the rest of AppWorld's tests, and run by the job that
+# runs nightly and on request.
+pytestmark = pytest.mark.appworld
+
 # The reference date all but a handful of the split's tasks carry, so a backlog built against it
 # is the shape the roster is mostly made of. It is what the *generator's* own properties are
 # stated at, below, and it is deliberately not what the roster is accepted against: 31 of

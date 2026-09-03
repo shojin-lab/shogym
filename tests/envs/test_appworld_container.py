@@ -26,6 +26,10 @@ import pytest
 from shogym.envs.appworld import adapter, container
 from shogym.envs.appworld.container import WORKER
 
+# Deselected from the per-push CI step with the rest of AppWorld's tests, and run by the job that
+# runs nightly and on request.
+pytestmark = pytest.mark.appworld
+
 
 def _corpus(root: Path) -> Path:
     """A derived root with the shape the real one has: shared parts and two tasks."""

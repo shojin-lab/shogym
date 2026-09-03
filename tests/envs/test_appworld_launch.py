@@ -25,6 +25,8 @@ import sys
 from pathlib import Path
 from typing import Any, Dict, List
 
+import pytest
+
 REPO = Path(__file__).resolve().parents[2]
 README = REPO / "src" / "shogym" / "envs" / "appworld" / "README.md"
 
@@ -46,6 +48,10 @@ CONFIGURED = (
 #: so the check stays offline. The appworld config's own contents are checked above, and appworld
 #: episodes are served in `test_appworld_served.py`.
 OFFLINE_ENV = "wordle_v1"
+
+# Deselected from the per-push CI step with the rest of AppWorld's tests, and run by the job that
+# runs nightly and on request.
+pytestmark = pytest.mark.appworld
 
 
 def _paired_launch() -> str:

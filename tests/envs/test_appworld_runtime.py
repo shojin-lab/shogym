@@ -23,6 +23,10 @@ import pytest
 
 from shogym.envs.appworld import adapter, world
 
+# Deselected from the per-push CI step with the rest of AppWorld's tests, and run by the job that
+# runs nightly and on request.
+pytestmark = pytest.mark.appworld
+
 
 # ----- provisioning order -----
 

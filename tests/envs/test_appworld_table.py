@@ -31,6 +31,11 @@ provisioned(adapter.ensure_corpus, package="appworld", extra="appworld")
 
 from shogym.envs.appworld import ledger, payload  # noqa: E402
 
+# The corpus these tests read is unpacked by a container, so a machine with no daemon has nothing
+# to check them against. Deselected from the per-push CI step with the rest of AppWorld's tests,
+# and run by the job that runs nightly and on request.
+pytestmark = pytest.mark.appworld
+
 
 def _backlog_at(task_id: str, root: Path) -> ledger.Backlog:
     """The backlog production would build for this task: its own seed, its own reference date."""

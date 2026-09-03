@@ -7,6 +7,12 @@ on:
   # `branches: [main]` filter here would silently skip every PR in a stack except the
   # bottom one. CI has to gate the merge, not run after it.
   pull_request:
+  # Both of these are here for the `appworld-container` job below, which runs on them and on
+  # nothing else: a push and a pull request are what it must stay out of, so that a run of it can
+  # never block a merge.
+  workflow_dispatch:
+  schedule:
+    - cron: "0 6 * * *"
 
 # Cancel superseded runs on the same ref (e.g. new pushes to a PR branch).
 concurrency:
@@ -41,15 +47,49 @@ jobs:
       # tests/envs/test_frontier_bench_served.py), so a PR cannot go red because someone else's
       # server had a bad minute. A plain `uv run pytest` still selects them.
       #
+      # `not appworld` is the same promise about this machine rather than someone else's. These
+      # are the AppWorld modules, most of this step's time, and the ones that start the worker in
+      # a container fail here on a random subset each run, while the same file passes locally
+      # every time. The `appworld-container` job below runs them, nightly and whenever somebody
+      # asks for them, where a red run blocks no merge. A plain `uv run pytest` still selects
+      # them too.
+      #
+      # The ignore is the other half of the mark. The served and table modules provision the
+      # worker image and the corpus in a container as they are *imported*, so deselecting their
+      # tests would still build both. Ignoring the files at collection is what keeps this step
+      # off Docker entirely, and the job below selects the same modules by their mark.
+      #
       # SHOGYM_REQUIRE_UPSTREAM removes the runtime-provisioned envs' escape hatch. Their test
       # modules must import a production adapter before they can collect, and a laptop with no
       # extras or no network is allowed to skip that; this runner has both, so here any failure to
       # provision and import — upstream drift, a gap in a hand-maintained extra, a corrupt
       - name: Run tests (offline, keyless)
-        run: env -u OPENAI_API_KEY SHOGYM_REQUIRE_UPSTREAM=1 uv run pytest -q -m "not network"
+        run: env -u OPENAI_API_KEY SHOGYM_REQUIRE_UPSTREAM=1 uv run pytest -q -m "not network and not appworld" --ignore-glob='tests/envs/test_appworld_*.py'
 
       - name: Lint (ruff)
         run: uv run ruff check .
 
       - name: Type check (pyright)
         run: uv run pyright
+
+  # The other half of `not appworld`: the tests the step above deselects, run on the
+  # nightly schedule and on request. The condition is what keeps this job off pushes and pull
+  # requests, so a container that closes its output at the wrong moment costs a rerun of this and
+  # never a merge. The setup is the `test` job's, because the suite it runs is the same suite.
+  appworld-container:
+    if: github.event_name != 'pull_request' && github.event_name != 'push'
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up uv
+        uses: astral-sh/setup-uv@v6
+        with:
+          enable-cache: true
+
+      - name: Install dependencies
+        run: uv sync
+
+      - name: Run the AppWorld tests
+        run: env -u OPENAI_API_KEY SHOGYM_REQUIRE_UPSTREAM=1 uv run pytest -q -m appworld

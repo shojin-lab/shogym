@@ -43,6 +43,11 @@ from shogym.envs.appworld import ledger, payload, world  # noqa: E402
 from shogym.envs.appworld.scorer import draw_key, leg_of  # noqa: E402
 from shogym.serve import ServedEpisode  # noqa: E402
 
+# Every episode here opens a world in a container of its own, and this is the module the shared
+# runner fails on. Deselected from the per-push CI step with the rest of AppWorld's tests, and run
+# by the job that runs nightly and on request.
+pytestmark = pytest.mark.appworld
+
 TASK = 0
 
 

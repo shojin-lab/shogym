@@ -230,6 +230,12 @@ markers = [
     # run still selects it, which is where a live upstream dependency is meant to be checked,
     # with a human reading the result.
     "network: needs a live third-party service; deselected from the offline suite",
+    # A test of the AppWorld environment, in this process or in its worker container. These are
+    # most of what a per-push run spends its time on, and the container ones fail on the shared CI
+    # runner on a random subset each run, with the worker closing its output, so the per-push step
+    # deselects them and a job of its own runs them nightly and on request. A plain `pytest` run
+    # still selects them.
+    "appworld: exercises the AppWorld environment; deselected from the per-push suite",
 ]
 
 [tool.ruff]
