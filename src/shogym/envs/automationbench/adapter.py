@@ -33,8 +33,10 @@ imports ``automationbench``, so it is only ever imported when an ``automationben
 from __future__ import annotations
 
 import copy
+import json
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple, Union
+from urllib.parse import unquote, urlparse
 
 from shogym.envs._upstream import ensure_package
 
@@ -194,8 +196,99 @@ def api_fetch(
     params: Optional[str] = None,
     body: Optional[str] = None,
 ) -> str:
-    """Route a REST call into ``world`` via the upstream router (mutates ``world`` in place)."""
-    return _api_fetch(world, method, url, params, body)
+    """Route a REST call into ``world`` via the upstream router (mutates ``world`` in place).
+
+    One answer is completed on the way out: the Jira project search also reports the projects the
+    task seeded (see :func:`_with_seeded_jira_projects`). Every other response is the router's own.
+    """
+    response = _api_fetch(world, method, url, params, body)
+    if str(method).strip().upper() == "GET" and _is_project_search(url):
+        return _with_seeded_jira_projects(world, params, response)
+    return response
+
+
+# ``JiraState.projects`` is a declared field that nothing reads. The project search is the only Jira
+# lookup on the served surface, and it answers out of the recorded project *actions*, so a project
+# the task seeded in that collection is invisible to lookup: the agent cannot learn its key, and a
+# key it names in a request is one it brought rather than one it found. This completes the search's
+# answer with those projects, leaving the action-log results the route already found as they were.
+_PROJECT_SEARCH_PATH = "rest/api/3/project/search"
+_ATLASSIAN_HOST_SUFFIX = ".atlassian.net"
+_JIRA_INTERNAL_PREFIX = "jira/"
+
+
+def _is_project_search(url: str) -> bool:
+    """Whether ``url`` names the Jira project search, the way the router names it.
+
+    The router parses the URL and percent-decodes each path segment, sends a path under an
+    ``.atlassian.net`` host to Jira, and routes a host-less URL by its own leading segment instead.
+    So the route is that whole path under an Atlassian host, or the internal path itself, and both
+    an encoded spelling (``project%2Fsearch``) and a path parameter (``project/search;v=1``) reach
+    it. The path's *tail* does not name it: Google Sheets takes an A1 range as its own last
+    segment, a decoded slash inside that range stays part of the range, and such a read can end in
+    these very segments while being someone else's route."""
+    parsed = urlparse(str(url))
+    path = "/".join(unquote(segment) for segment in parsed.path.split("/")).strip("/")
+    if parsed.netloc:
+        return parsed.netloc.endswith(_ATLASSIAN_HOST_SUFFIX) and path == _PROJECT_SEARCH_PATH
+    return path == _JIRA_INTERNAL_PREFIX + _PROJECT_SEARCH_PATH
+
+
+def _search_query(params: Optional[str]) -> str:
+    """The literal Jira project search filters on, from the request's params.
+
+    The route reads ``query`` and nothing else: its own ``searchByParameter`` filter is built from
+    that one field, and a caller who spells that name instead is passing an unread keyword. So an
+    empty or absent ``query`` is a search for everything, here as there."""
+    parsed: Any = params
+    if isinstance(parsed, str):
+        try:
+            parsed = json.loads(parsed)
+        except ValueError:
+            return ""
+    if not isinstance(parsed, dict):
+        return ""
+    return str(parsed.get("query") or "")
+
+
+def _with_seeded_jira_projects(world: WorldState, params: Optional[str], response: str) -> str:
+    """Add the world's own Jira projects to a project search answer.
+
+    A project matches the way Jira's own search matches, on a case-insensitive literal in its key
+    or name, and an empty query matches everything. A project the route already returned is left
+    alone, identified case-insensitively too so one key is never reported twice in two spellings,
+    and a response that is not a search result (a 401 from the service gate, say) is returned
+    untouched."""
+    seeded = [p for p in (world.jira.projects or []) if isinstance(p, dict)]
+    if not seeded:
+        return response
+    try:
+        payload = json.loads(response)
+    except ValueError:
+        return response
+    if not isinstance(payload, dict) or not isinstance(payload.get("values"), list):
+        return response
+
+    values: List[Any] = list(payload["values"])
+    seen = {
+        str(v.get("key") or v.get("project") or v.get("id")).casefold()
+        for v in values
+        if isinstance(v, dict)
+    }
+    query = _search_query(params).casefold()
+    for project in seeded:
+        record = {"id": project.get("key") or project.get("name"), **project}
+        key = str(record.get("key") or record.get("id")).casefold()
+        if key in seen:
+            continue
+        if query and not any(query in str(record.get(f, "")).casefold() for f in ("key", "name")):
+            continue
+        seen.add(key)
+        values.append(record)
+
+    payload["values"] = values
+    payload["total"] = len(values)
+    return json.dumps(payload)
 
 
 def base64_encode(text: str) -> str:

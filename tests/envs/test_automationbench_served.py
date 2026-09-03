@@ -17,16 +17,25 @@ The upstream source is provisioned lazily on first use; the module skips if it c
 from __future__ import annotations
 
 import json
+from typing import Any, Dict
+
+import pytest
 
 from tests._fixtures.upstream_gate import gate
 
-gate(
+adapter = gate(
     "shogym.envs.automationbench.adapter",
     package="automationbench",
     extra="automationbench",
 )
 
 from shogym.serve import ServedEpisode  # noqa: E402
+
+# Upstream before its 1.0.6 release advertised every Jira endpoint with `/rest/api/3` doubled: the
+# schema's base URL already ended there and the endpoint paths repeat it, so the URL `api_search`
+# handed back reached no handler and the documented search-then-call handoff could not be walked at
+# all. The release corrects the base URL, so the handoff test below runs once the pin moves to it.
+_PIN_ADVERTISING_DOUBLED_JIRA_PATHS = "a321764ace3cfbe42289e6a13abef2f0f4f56fad"
 
 # A minimal, self-contained task: a seeded Salesforce contact whose phone must be updated. The
 # assertion is initially failing (phone is +1-555-0000), so scoring is a clean 0 -> 1 signal.
@@ -69,6 +78,98 @@ _TASK = {
                 "value": "+1-555-0101",
             }
         ],
+    },
+}
+
+
+# A task with a Jira project in the world and its key named nowhere the agent can read. The project
+# search is the only Jira lookup on the served surface, so it is the only thing that can hand the
+# key over.
+_JIRA_SEARCH_URL = "https://company.atlassian.net/rest/api/3/project/search"
+_JIRA_TASK = {
+    "example_id": 999003,
+    "task": "test.jira_project_from_the_world",
+    "prompt": [{"role": "user", "content": "File a ticket for the billing page errors."}],
+    "answer": "",
+    "info": {
+        "zapier_tools": ["jira_create_issue"],
+        "initial_state": {"jira": {"projects": [{"key": "SUP", "name": "Support Issues"}]}},
+        "assertions": [
+            {
+                "type": "jira_issue_exists_with_summary",
+                "project": "SUP",
+                "summary": "Billing page errors",
+            }
+        ],
+    },
+}
+
+
+# The same world with a spreadsheet beside the Jira project, and a read of a range that decodes into
+# the Jira lookup's own path. Sheets takes an A1 range as its last path segment and a decoded slash
+# stays part of that range, so this is a successful Sheets answer whose path ends in the Jira route.
+_SHEETS_RANGE_URL = (
+    "https://sheets.googleapis.com/v4/spreadsheets/ss_patterns/values/"
+    "Pattern%20Definitions!A1%2Frest%2Fapi%2F3%2Fproject%2Fsearch"
+)
+_SHEETS_AND_JIRA_INFO: Dict[str, Any] = {
+    "zapier_tools": ["jira_create_issue", "google_sheets_lookup_row"],
+    "initial_state": {
+        "jira": {"projects": [{"key": "SUP", "name": "Support Issues"}]},
+        "google_sheets": {
+            "spreadsheets": [{"id": "ss_patterns", "title": "Escalation Patterns"}],
+            "worksheets": [
+                {
+                    "id": "ws_patterns",
+                    "spreadsheet_id": "ss_patterns",
+                    "title": "Pattern Definitions",
+                    "headers": ["pattern", "owner"],
+                }
+            ],
+            "rows": [
+                {
+                    "id": "row_1",
+                    "spreadsheet_id": "ss_patterns",
+                    "worksheet_id": "ws_patterns",
+                    "row_id": 2,
+                    "cells": {"pattern": "auth-failure", "owner": "platform"},
+                }
+            ],
+        },
+    },
+    "assertions": _JIRA_TASK["info"]["assertions"],
+}
+_SHEETS_AND_JIRA_TASK = {
+    **_JIRA_TASK,
+    "example_id": 999005,
+    "task": "test.jira_project_beside_a_spreadsheet",
+    "info": _SHEETS_AND_JIRA_INFO,
+}
+
+
+# The same world, plus the project already in the action log under a lowercase key. The route finds
+# that one itself, so the completion must recognize it as the project it holds and not report it a
+# second time in the seeded spelling.
+_JIRA_ACTION_LOG_TASK = {
+    **_JIRA_TASK,
+    "example_id": 999004,
+    "task": "test.jira_project_in_both_places",
+    "info": {
+        **_JIRA_TASK["info"],
+        "initial_state": {
+            "jira": {
+                "actions": {
+                    "project": [
+                        {
+                            "id": "jira_proj_1",
+                            "action_key": "project",
+                            "params": {"project": "sup", "project_id": "10001"},
+                        }
+                    ]
+                },
+                "projects": [{"key": "SUP", "name": "Support Issues"}],
+            }
+        },
     },
 }
 
@@ -265,6 +366,207 @@ async def test_service_gating_rejects_out_of_scope_calls() -> None:
         payload = json.loads(resp)
         assert payload["error"]["code"] == 401
         assert "slack" in payload["error"]["message"].lower()
+    finally:
+        await episode.close()
+
+
+async def test_a_seeded_jira_project_is_discoverable_through_lookup() -> None:
+    # The project search is the only Jira lookup on the served surface, and the key is named nowhere
+    # else, so a project the task seeded is discoverable only if the search reports it.
+    episode = await ServedEpisode.start(
+        "automationbench", task=0, env_config={"tasks": [_JIRA_TASK], "max_steps": 50}
+    )
+    try:
+        assert "SUP" not in episode.describe().instructions
+
+        async def search(**params) -> dict:
+            call = {"method": "GET", "url": _JIRA_SEARCH_URL}
+            if params:
+                call["params"] = json.dumps(params)
+            return json.loads((await episode.call("api_fetch", call)).content)
+
+        found = await search()
+        assert [p["key"] for p in found["values"]] == ["SUP"]
+        assert found["values"][0]["name"] == "Support Issues"
+        assert found["total"] == 1
+
+        # Jira's own search matches a literal against the key or the name, case insensitively.
+        assert [p["key"] for p in (await search(query="sup"))["values"]] == ["SUP"]
+        assert [p["key"] for p in (await search(query="Support Iss"))["values"]] == ["SUP"]
+        assert (await search(query="Marketing"))["values"] == []
+
+        # The route filters on `query` and reads no other field, so an empty one is a search for
+        # everything even when the request carries the name of the filter the route builds.
+        with_alias = await search(query="", searchByParameter="missing")
+        assert [p["key"] for p in with_alias["values"]] == ["SUP"]
+
+        # The key the search handed back is usable: it files the issue the assertion names.
+        await episode.call(
+            "api_fetch",
+            {
+                "method": "POST",
+                "url": "https://company.atlassian.net/rest/api/3/issue",
+                "body": json.dumps(
+                    {"fields": {"project": {"key": "SUP"}, "summary": "Billing page errors"}}
+                ),
+            },
+        )
+        await episode.call("done", {})
+        assert _fb(episode)["partial_credit"] == 1.0
+    finally:
+        await episode.close()
+
+
+async def test_an_encoded_spelling_of_the_search_route_is_completed_too() -> None:
+    # The router percent-decodes each path segment before it matches, so `project%2Fsearch` reaches
+    # the same handler. The completion has to follow it there, or the answer would depend on how the
+    # agent spelled the URL.
+    episode = await ServedEpisode.start(
+        "automationbench", task=0, env_config={"tasks": [_JIRA_TASK], "max_steps": 50}
+    )
+    try:
+        found = json.loads(
+            (
+                await episode.call(
+                    "api_fetch",
+                    {
+                        "method": "GET",
+                        "url": "https://company.atlassian.net/rest/api/3/project%2Fsearch",
+                    },
+                )
+            ).content
+        )
+        assert [p["key"] for p in found["values"]] == ["SUP"]
+        assert found["total"] == 1
+    finally:
+        await episode.close()
+
+
+async def test_a_path_parameter_on_the_search_route_is_completed_too() -> None:
+    # The router parses the URL before it matches, which drops a trailing path parameter, so
+    # `project/search;v=1` reaches the same handler and the completion has to reach it too.
+    episode = await ServedEpisode.start(
+        "automationbench", task=0, env_config={"tasks": [_JIRA_TASK], "max_steps": 50}
+    )
+    try:
+        found = json.loads(
+            (
+                await episode.call(
+                    "api_fetch", {"method": "GET", "url": f"{_JIRA_SEARCH_URL};v=1"}
+                )
+            ).content
+        )
+        assert [p["key"] for p in found["values"]] == ["SUP"]
+        assert found["total"] == 1
+    finally:
+        await episode.close()
+
+
+async def test_the_routers_own_bare_path_is_completed_too() -> None:
+    # A URL with no host at all is routed by its leading segment, which is how the router answers
+    # its own internal spelling of the route, so the completion follows it there too.
+    episode = await ServedEpisode.start(
+        "automationbench", task=0, env_config={"tasks": [_JIRA_TASK], "max_steps": 50}
+    )
+    try:
+        found = json.loads(
+            (
+                await episode.call(
+                    "api_fetch", {"method": "GET", "url": "jira/rest/api/3/project/search"}
+                )
+            ).content
+        )
+        assert [p["key"] for p in found["values"]] == ["SUP"]
+    finally:
+        await episode.close()
+
+
+async def test_another_service_answering_on_that_path_is_left_alone() -> None:
+    # Sheets takes an A1 range as its own last path segment and a decoded slash stays part of that
+    # range, so a successful spreadsheet read can end in the Jira lookup's path while being someone
+    # else's route. The served bytes have to be the router's own, project and `total` key included.
+    upstream_world, _, _ = adapter.build_world(_SHEETS_AND_JIRA_INFO)
+    upstream = adapter._api_fetch(upstream_world, "GET", _SHEETS_RANGE_URL, None, None)
+
+    episode = await ServedEpisode.start(
+        "automationbench", task=0, env_config={"tasks": [_SHEETS_AND_JIRA_TASK], "max_steps": 50}
+    )
+    try:
+        served = (
+            await episode.call("api_fetch", {"method": "GET", "url": _SHEETS_RANGE_URL})
+        ).content
+        assert json.loads(upstream)["values"], "the spreadsheet read has to succeed to mean anything"
+        assert served == upstream
+    finally:
+        await episode.close()
+
+
+@pytest.mark.skipif(
+    adapter.UPSTREAM_SHA == _PIN_ADVERTISING_DOUBLED_JIRA_PATHS,
+    reason="the pinned upstream advertises the Jira routes with /rest/api/3 doubled",
+)
+async def test_the_url_the_search_tool_advertises_reaches_the_completed_answer() -> None:
+    # The served instructions tell the agent to `api_search` for an endpoint and then `api_fetch`
+    # its url, so the completion is only reachable if the advertised url is the one that routes.
+    episode = await ServedEpisode.start(
+        "automationbench", task=0, env_config={"tasks": [_JIRA_TASK], "max_steps": 50}
+    )
+    try:
+        results = json.loads(
+            (
+                await episode.call(
+                    "api_search", {"query": "jira project search key", "top_k": 10}
+                )
+            ).content
+        )["results"]
+        advertised = [r for r in results if r["id"] == "jira.projects.search"]
+        assert advertised, "the project search endpoint is not among the search results"
+
+        found = json.loads(
+            (
+                await episode.call(
+                    "api_fetch",
+                    {"method": advertised[0]["method"], "url": advertised[0]["url"]},
+                )
+            ).content
+        )
+        assert [p["key"] for p in found["values"]] == ["SUP"]
+    finally:
+        await episode.close()
+
+
+async def test_a_project_the_route_found_is_not_reported_again_in_another_case() -> None:
+    # The route answers out of the action log, where the key is lowercase, while the world seeds it
+    # uppercase. That is one project, so the search must report it once.
+    episode = await ServedEpisode.start(
+        "automationbench", task=0, env_config={"tasks": [_JIRA_ACTION_LOG_TASK], "max_steps": 50}
+    )
+    try:
+        found = json.loads(
+            (
+                await episode.call("api_fetch", {"method": "GET", "url": _JIRA_SEARCH_URL})
+            ).content
+        )
+        assert [v["project"] for v in found["values"]] == ["sup"]
+        assert found["total"] == 1
+    finally:
+        await episode.close()
+
+
+async def test_jira_project_search_is_untouched_when_the_service_is_not_connected() -> None:
+    # The task subscribes to Salesforce only, so the search must still fail like an unconnected
+    # account rather than being answered out of the world.
+    episode = await ServedEpisode.start("automationbench", task=0, env_config=_config())
+    try:
+        payload = json.loads(
+            (
+                await episode.call(
+                    "api_fetch", {"method": "GET", "url": _JIRA_SEARCH_URL}
+                )
+            ).content
+        )
+        assert payload["error"]["code"] == 401
+        assert "jira" in payload["error"]["message"].lower()
     finally:
         await episode.close()
 
