@@ -2,8 +2,8 @@
 
 Point the `claude` CLI you already use at **one shogym task, served over MCP**. The agent pulls
 the work, plays it with the env's own tools, ends it with the tool that ends it, and pulls again
-until the stream says it is done. The stream seals and scores the attempt itself, into a record
-the agent never sees.
+until the stream says it is done. The stream seals and scores the attempt itself, and tells the
+agent what it scored.
 
 Three moves, and the whole quickstart is these three:
 
@@ -11,8 +11,10 @@ Three moves, and the whole quickstart is these three:
    tools, each wrapped so that a call names the attempt it belongs to.
 2. **One variable swaps the env.** `ENV = "wordle_v1"` at the top of `serve.py`. That line
    is the entire migration to any other env in the catalogue.
-3. **The stream keeps the score.** Sealing is server-side and the score stays in the stream's own
-   durable history. The agent is not told it, and neither is anything else.
+3. **The stream keeps the record and the agent is told its score.** Sealing is server-side and the
+   authoritative record stays in the stream's own durable history. The payload released against an
+   attempt reports the score honestly by default; concealing it is an experiment arm a run
+   registers.
 
 ## Prerequisites
 
@@ -120,7 +122,7 @@ other constant, and the only thing to check when you swap: task index ranges dif
 some envs need their extra installed and a key exported (see `src/shogym/envs/<env>/README.md`).
 `wordle_v1` needs neither and is the cheapest place to start.
 
-## The stream keeps the score
+## The stream keeps the record
 
 The stream seals the attempt, grades it server-side and records the outcome in its own durable
 history. `runs/<env>-<task>-<stamp>/` holds that history, beside the blobs a presentation
@@ -135,8 +137,11 @@ That prints one row per attempt, with what it filed and what it scored, and leav
 in the directory as `records.jsonl`. The file is a derived view, rebuilt every time it is asked
 for, so the history stays the record and nothing reads the file back as authority.
 
-What the agent is told is the acknowledgement and whatever payload the stream releases against the
-attempt, which commits to what was filed and says nothing about how good it was.
+What the agent is told is the acknowledgement, which commits to what was filed and nothing more,
+and then the payload the stream releases against the attempt. That payload is honest by default:
+it carries the score the seal committed and the numbers the environment published beside it. A run
+that wants to conceal or replace it registers a payload policy that says so, and the record of the
+run names the policy every attempt was served under.
 
 Runs recorded by the retired v1 serving path are still readable offline, with
 `shogym.serve.v1_runs.read_results` / `read_dispenses` / `reconcile` over their old directories.

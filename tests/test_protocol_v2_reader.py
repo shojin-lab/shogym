@@ -116,6 +116,7 @@ from shogym.serve.protocol_v2.schedule import (
     EligibilityGate,
     ReleasePlan,
 )
+from tests._fixtures.policy_rows import registering_the_receipt
 
 #: How long an attempt of a generation that declares a deadline gets, and a deadline no test
 #: here is meant to reach: the second one is armed so that a row can say a clock is running.
@@ -172,21 +173,23 @@ def make_start(
         )
         for index, body in enumerate(bodies)
     ]
-    return StreamStart(
-        configuration_hash="c" * 64,
-        consumer_claim_hash=CLAIM_HASH,
-        initial_cursor=oid(1),
-        done_message_id=oid(2),
-        id_key_hex="ab" * 32,
-        hidden_execution_id="execution-1",
-        canonicalization_version=CANONICALIZATION,
-        terminal_tool=TerminalTool(
-            public_tool_name="submit", native_terminal_name="submit", argument_names=["answer"]
-        ),
-        tasks=tasks,
-        release=release,
-        assignments=assignments_for(tasks, release, without_payload=without_payload),
-        attempt_deadline_ms=attempt_deadline_ms,
+    return registering_the_receipt(
+        StreamStart(
+            configuration_hash="c" * 64,
+            consumer_claim_hash=CLAIM_HASH,
+            initial_cursor=oid(1),
+            done_message_id=oid(2),
+            id_key_hex="ab" * 32,
+            hidden_execution_id="execution-1",
+            canonicalization_version=CANONICALIZATION,
+            terminal_tool=TerminalTool(
+                public_tool_name="submit", native_terminal_name="submit", argument_names=["answer"]
+            ),
+            tasks=tasks,
+            release=release,
+            assignments=assignments_for(tasks, release, without_payload=without_payload),
+            attempt_deadline_ms=attempt_deadline_ms,
+        )
     )
 
 
@@ -1081,6 +1084,9 @@ def test_the_table_prints_an_unsealed_attempt_as_absent_and_never_as_nought() ->
         "ending",
         "decode",
         "delivered",
+        "policy",
+        "profile",
+        "decided",
     ]
     assert table[1].split() == [
         "0",
@@ -1093,8 +1099,23 @@ def test_the_table_prints_an_unsealed_attempt_as_absent_and_never_as_nought() ->
         "task",
         "ack",
         "payload",
+        "honest-v1",
+        "ordinary",
+        "platform_default",
     ]
-    assert table[2].split() == ["1", oid(0x104), "planned", "-", "-", "-", "-", "-"]
+    assert table[2].split() == [
+        "1",
+        oid(0x104),
+        "planned",
+        "-",
+        "-",
+        "-",
+        "-",
+        "-",
+        "honest-v1",
+        "ordinary",
+        "platform_default",
+    ]
     assert table[3].split() == [
         "2",
         oid(0x108),
@@ -1104,6 +1125,9 @@ def test_the_table_prints_an_unsealed_attempt_as_absent_and_never_as_nought() ->
         "deadline",
         "-",
         "task",
+        "honest-v1",
+        "ordinary",
+        "platform_default",
     ]
     assert format_records([]) == "no attempts"
 
@@ -1133,4 +1157,8 @@ def _record(position: int, how: str) -> AttemptRecord:
         payload_delivered=sealed,
         creates_payload_obligation=True,
         payload_state={"sealed": "presented", "planned": "assigned", "ended": "final_failed"}[how],
+        payload_policy="honest-v1",
+        payload_disposition="deliver:honest-v1:honest:platform_default",
+        profile="ordinary",
+        payload_resolution_source="platform_default",
     )

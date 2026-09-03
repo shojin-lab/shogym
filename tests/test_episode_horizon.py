@@ -52,6 +52,9 @@ class _ScriptedStream:
         self._task = task
         self.finalized: List[Any] = []
         self.attempts: dict = {}
+        # The grants it made per attempt, which is what the real stream counts and what a
+        # gateway reads the spent budget out of.
+        self.environment_calls: dict = {}
         self.cursor = CURSOR
         self.held: Any = None
 
@@ -80,6 +83,11 @@ class _ScriptedStream:
         if self.attempts.get(call.attempt_id) != "active":
             raise StreamProtocolError("invalid_attempt")
         self.held = call.call_id
+        # The grant is the whole of what this stream ever learns about that world, so it is
+        # counted here the way the durable one counts it.
+        self.environment_calls[call.attempt_id] = (
+            self.environment_calls.get(call.attempt_id, 0) + 1
+        )
         return SimpleNamespace(call_id=call.call_id, attempt_id=call.attempt_id, held=True)
 
     async def end_environment_call(self, call: Any) -> Any:
@@ -91,6 +99,7 @@ class _ScriptedStream:
             cursor=self.cursor,
             generation_state="open",
             attempts=dict(self.attempts),
+            environment_calls=dict(self.environment_calls),
             stream_state_sha256="0" * 64,
             # Every message it offers is handed over, so it is never holding one for a request
             # that has not collected it.
@@ -102,6 +111,7 @@ class _ScriptedStream:
         self.cursor = commit.message_id
         if commit.task_start_checkpoint_blob is not None:
             self.attempts[self._task.attempt_id] = "active"
+            self.environment_calls[self._task.attempt_id] = 0
         return _Ack(cursor=commit.message_id)
 
 
@@ -170,12 +180,14 @@ async def test_an_episode_whose_caller_ends_it_does_not_seal_on_a_spent_budget()
 
 
 async def test_an_episode_served_by_the_stream_is_ended_when_its_budget_runs_out() -> None:
-    """The budget is spent, and the attempt ends, in the record that holds attempts.
+    """The budget runs out, and the attempt ends, in the record that holds attempts.
 
-    This is the other half of the test above. The episode decides nothing when its budget runs
-    out, and what happens instead is that the transport counting those calls tells the stream to
-    end the attempt. Nothing is sealed here and nothing is graded, so the env's world is left
-    exactly as the last call left it, and the model reads that last call's own observation.
+    This is the other half of the test above. The episode decides nothing about its budget, and
+    what happens instead is that the transport counting those calls tells the stream to end the
+    attempt. It says so on the call that has nothing left to spend rather than on the one that
+    spends the last of it: an attempt out of world calls can still be filed, and filing under
+    this protocol is a call to the stream. Nothing is sealed here and nothing is graded, so the
+    env's world is left exactly as the last call left it.
     """
     pytest.importorskip("temporalio")
     from shogym.serve.protocol_v2.gateway import StreamGateway, terminal_manifest
@@ -205,17 +217,30 @@ async def test_an_episode_served_by_the_stream_is_ended_when_its_budget_runs_out
             assert stream.finalized == []
             await gateway.environment("noop", {"attempt_id": ATTEMPT, "arguments": {}})
 
+        # The call with nothing left to spend is where the ending is. It reaches no world and is
+        # refused, and the attempt is not one this transport routes to afterwards either.
+        assert stream.finalized == []
+        assert len(episode._trajectory) == HORIZON
+        code = await _refused(
+            gateway.environment("noop", {"attempt_id": ATTEMPT, "arguments": {}})
+        )
+        assert code == "invalid_attempt"
+        assert len(episode._trajectory) == HORIZON
+
         [request] = stream.finalized
         assert request.attempt_id == ATTEMPT
         assert request.reason == "step_cap"
         # The env sealed nothing and graded nothing: the ending is not this episode's to make.
         assert env.finalize_calls == 0
         assert episode.sealed is False
-        # And the attempt is not one this transport routes to any more.
+
+        # And one ending, whatever the model does next.
         code = await _refused(
             gateway.environment("noop", {"attempt_id": ATTEMPT, "arguments": {}})
         )
         assert code == "invalid_attempt"
+        assert len(stream.finalized) == 1
+        assert env.finalize_calls == 0
     finally:
         await episode.close()
 

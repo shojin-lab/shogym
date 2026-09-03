@@ -103,6 +103,7 @@ from shogym.serve.protocol_v2.kernel.activities import (  # noqa: E402
     GRADE_ATTEMPT,
     VERIFY_BLOBS,
 )
+from tests._fixtures.policy_rows import registering_the_receipt  # noqa: E402
 
 TEST_ENV = "wordle_v1"
 TASK_BODY = "file the report"
@@ -147,28 +148,30 @@ def make_start(
         )
         for index, body in enumerate(bodies)
     ]
-    return StreamStart(
-        configuration_hash="c" * 64,
-        consumer_claim_hash=CLAIM_HASH,
-        initial_cursor=oid(1),
-        done_message_id=oid(2),
-        id_key_hex="ab" * 32,
-        hidden_execution_id="execution-1",
-        canonicalization_version="kernel.1",
-        terminal_tool=TerminalTool(
-            public_tool_name=terminal,
-            native_terminal_name=terminal,
-            argument_names=list(argument_names),
-        ),
-        tasks=tasks,
-        attempt_deadline_ms=attempt_deadline_ms,
-        blob_root=blob_root,
-        release=IMMEDIATE if release is None else release,
-        assignments=(
-            []
-            if release is None
-            else assignments_for(tasks, release, without_payload=without_payload)
-        ),
+    return registering_the_receipt(
+        StreamStart(
+            configuration_hash="c" * 64,
+            consumer_claim_hash=CLAIM_HASH,
+            initial_cursor=oid(1),
+            done_message_id=oid(2),
+            id_key_hex="ab" * 32,
+            hidden_execution_id="execution-1",
+            canonicalization_version="kernel.1",
+            terminal_tool=TerminalTool(
+                public_tool_name=terminal,
+                native_terminal_name=terminal,
+                argument_names=list(argument_names),
+            ),
+            tasks=tasks,
+            attempt_deadline_ms=attempt_deadline_ms,
+            blob_root=blob_root,
+            release=IMMEDIATE if release is None else release,
+            assignments=(
+                []
+                if release is None
+                else assignments_for(tasks, release, without_payload=without_payload)
+            ),
+        )
     )
 
 
@@ -467,8 +470,12 @@ async def test_the_step_budget_ends_the_attempt_and_the_next_pull_moves_on(env) 
     """The env's budget, counted where the calls that spend it actually pass.
 
     Nothing about the budget reaches the stream on its own: an environment call never becomes
-    an Update. So the gateway counts, and when the budget is gone it ends the attempt through
-    the stream. The model reads its last observation, and then the next task.
+    an Update. So the gateway counts, and the call that finds nothing left to spend is where the
+    attempt ends. The call that spends the last step is not that one: an attempt out of world
+    steps can still be filed, and under this protocol filing is a call to the stream rather than
+    a step in the world, so an environment that promises a fixed number of moves and a terminal
+    after them would otherwise lose every full-length attempt unsealed. The model reads its last
+    observation, files or does not, and the next pull is what says the stream has moved on.
     """
     worlds: List[ServedEpisode] = []
 
@@ -509,18 +516,31 @@ async def test_the_step_budget_ends_the_attempt_and_the_next_pull_moves_on(env) 
                 # The call that spends the last of the budget is answered like any other.
                 assert json.loads(played.content[0].text)["valid"] is True
 
+            # And the attempt is still the attempt: the budget bought world calls, and what an
+            # attempt with none left can still do is file.
+            state = await gateway.stream_state()
+            assert state.attempts[attempt] == "active"
+            assert state.final_failures == {}
+
+            # The call after that is the one with nothing to spend. It reaches no world, ends
+            # the attempt, and is refused, and so is everything addressed to that attempt after.
+            assert (
+                await refused(gateway.environment("guess", _guess(attempt, "adieu")))
+                == "invalid_attempt"
+            )
             state = await gateway.stream_state()
             assert state.attempts[attempt] == "final_failed"
             assert state.final_failures == {attempt: STEP_CAP}
             assert state.capacity_in_use == 0
             # The env was not sealed and not graded: the ending is the stream's.
             assert episode.sealed is False
-
-            # Nothing more routes to that attempt, and the next pull is the next task.
+            assert len(episode._trajectory) == 2
             assert (
                 await refused(gateway.environment("guess", _guess(attempt, "adieu")))
                 == "invalid_attempt"
             )
+
+            # The next pull is the next task.
             second = json.loads(await gateway.pull({}))
             assert second["kind"] == "task"
             assert second["attempt_id"] != attempt
@@ -535,6 +555,198 @@ async def test_the_step_budget_ends_the_attempt_and_the_next_pull_moves_on(env) 
             assert len(episode._trajectory) == 2
         finally:
             for world in worlds:
+                await world.close()
+            await episode.close()
+
+
+@pytest.mark.network
+async def test_a_replacement_transport_ends_an_attempt_whose_budget_is_already_spent(
+    env,
+) -> None:
+    """The budget belongs to the attempt, so a new transport does not hand it back.
+
+    An attempt out of world steps stays active for the filing it is still owed, which means a
+    gateway built over that generation afterwards finds work it may route to. What it must not
+    find is a budget: the calls that spent it were granted by the stream and counted there, and
+    a replacement reads that count rather than starting the attempt again at nothing.
+    """
+    async with stream_worker(env.client):
+        episode = await ServedEpisode.start(TEST_ENV, task=0, ends_on_horizon=False)
+        try:
+            stream = await start_stream(
+                env.client,
+                make_start(terminal="terminate", argument_names=()),
+                workflow_id="stream/finalize/budget-replacement",
+            )
+            receipt = await stream.claim_consumer(CONSUMER)
+            spec = episode.describe().model_copy(update={"horizon": 2})
+            gateway = StreamGateway(
+                stream,
+                episode,
+                spec,
+                terminal_manifest(spec),
+                initial_cursor=receipt.initial_cursor,
+            )
+            first = json.loads(await gateway.pull({}))
+            attempt = first["attempt_id"]
+            for word in ("crane", "slate"):
+                await gateway.environment("guess", _guess(attempt, word))
+            state = await gateway.stream_state()
+            assert state.attempts[attempt] == "active"
+            assert state.environment_calls == {attempt: 2}
+
+            # A second transport over the same generation and the same world, built the way a
+            # replacement process builds one: it kept nothing of what the first one counted.
+            replacement = StreamGateway(
+                stream,
+                episode,
+                spec,
+                terminal_manifest(spec),
+                initial_cursor=state.cursor,
+            )
+            assert (
+                await refused(replacement.environment("guess", _guess(attempt, "adieu")))
+                == "invalid_attempt"
+            )
+            # The world was not reached and the ending is the one the budget owes.
+            assert len(episode._trajectory) == 2
+            state = await gateway.stream_state()
+            assert state.attempts[attempt] == "final_failed"
+            assert state.final_failures == {attempt: STEP_CAP}
+            assert episode.sealed is False
+        finally:
+            await episode.close()
+
+
+@pytest.mark.network
+async def test_a_replacement_transport_gets_what_is_left_of_the_budget_and_no_more(
+    env,
+) -> None:
+    """Rebuilding mid-attempt buys nothing: the horizon bounds the attempt, not the process.
+
+    The gateway is replaced with steps still to spend, so it has an active route and a world to
+    reach, and every path a model has to that world runs through the count the stream keeps.
+    Rebuilding again before the last step changes nothing either: what is left is what is left,
+    and the trajectory stops at the horizon however many transports served it.
+    """
+    async with stream_worker(env.client):
+        episode = await ServedEpisode.start(TEST_ENV, task=0, ends_on_horizon=False)
+        try:
+            stream = await start_stream(
+                env.client,
+                make_start(terminal="terminate", argument_names=()),
+                workflow_id="stream/finalize/budget-remainder",
+            )
+            receipt = await stream.claim_consumer(CONSUMER)
+            spec = episode.describe().model_copy(update={"horizon": 3})
+
+            def transport(cursor: str) -> StreamGateway:
+                return StreamGateway(
+                    stream, episode, spec, terminal_manifest(spec), initial_cursor=cursor
+                )
+
+            gateway = transport(receipt.initial_cursor)
+            first = json.loads(await gateway.pull({}))
+            attempt = first["attempt_id"]
+            await gateway.environment("guess", _guess(attempt, "crane"))
+
+            # One step spent, two left, and a transport that knows about neither.
+            state = await gateway.stream_state()
+            gateway = transport(state.cursor)
+            for word in ("slate", "adieu"):
+                played = await gateway.environment("guess", _guess(attempt, word))
+                assert json.loads(played.content[0].text)["valid"] is True
+                gateway = transport((await gateway.stream_state()).cursor)
+
+            assert len(episode._trajectory) == 3
+            state = await gateway.stream_state()
+            assert state.environment_calls == {attempt: 3}
+            assert (
+                await refused(gateway.environment("guess", _guess(attempt, "bloke")))
+                == "invalid_attempt"
+            )
+            assert len(episode._trajectory) == 3
+            state = await gateway.stream_state()
+            assert state.attempts[attempt] == "final_failed"
+            assert state.final_failures == {attempt: STEP_CAP}
+        finally:
+            await episode.close()
+
+
+@pytest.mark.network
+async def test_an_owner_that_restores_the_world_restores_the_budget_with_it(env) -> None:
+    """The budget comes back exactly where the world it was spent in does.
+
+    A replacement that puts the attempt back at the checkpoint its task started from is saying
+    the calls since then did not happen to the world it is continuing, and the generation writes
+    that down: the count it holds for that attempt is what a claim restored it to. So the
+    transport that serves the restored world reads a budget as new as the world is, which is the
+    same rule as the one that refuses a replacement over a live world, read the other way.
+    """
+    restored: List[ServedEpisode] = []
+
+    async def open_world(attempt_id: str) -> ServedEpisode:
+        started = await ServedEpisode.start(TEST_ENV, task=0, ends_on_horizon=False)
+        restored.append(started)
+        return started
+
+    async with stream_worker(env.client):
+        episode = await ServedEpisode.start(TEST_ENV, task=0, ends_on_horizon=False)
+        try:
+            start = make_start(terminal="terminate", argument_names=())
+            stream = await start_stream(
+                env.client, start, workflow_id="stream/finalize/budget-restored"
+            )
+            receipt = await stream.claim_consumer(CONSUMER)
+            spec = episode.describe().model_copy(update={"horizon": 2})
+            gateway = StreamGateway(
+                stream,
+                episode,
+                spec,
+                terminal_manifest(spec),
+                initial_cursor=receipt.initial_cursor,
+            )
+            first = json.loads(await gateway.pull({}))
+            attempt = first["attempt_id"]
+            for word in ("crane", "slate"):
+                await gateway.environment("guess", _guess(attempt, word))
+            state = await gateway.stream_state()
+            assert state.environment_calls == {attempt: 2}
+            # The grants are what a claim has to say it put back, so this is the attempt the
+            # replacement below restores rather than simply continues.
+            assert state.restoration_required == [attempt]
+
+            replacement = await resume_stream(
+                env.client,
+                workflow_id=stream.handle.id,
+                configuration_hash=configuration_hash(start),
+                claimant_id="the-new-owner",
+                restored_checkpoints={attempt: state.task_checkpoints[attempt]},
+            )
+            state = await replacement.stream_state()
+            assert state.environment_calls == {}
+            world = await open_world(attempt)
+            served = StreamGateway(
+                replacement,
+                world,
+                spec,
+                terminal_manifest(spec),
+                initial_cursor=state.cursor,
+                open_episode=open_world,
+            )
+            for word in ("adieu", "bloke"):
+                played = await served.environment("guess", _guess(attempt, word))
+                assert json.loads(played.content[0].text)["valid"] is True
+            assert len(world._trajectory) == 2
+            # And the restored budget is a budget, not an exemption from one.
+            assert (
+                await refused(served.environment("guess", _guess(attempt, "irate")))
+                == "invalid_attempt"
+            )
+            state = await served.stream_state()
+            assert state.final_failures == {attempt: STEP_CAP}
+        finally:
+            for world in restored:
                 await world.close()
             await episode.close()
 
@@ -1177,12 +1389,14 @@ class Lossy:
 async def test_the_spent_budget_survives_a_lost_response_and_spends_no_second_step(
     env, lose: str, applied: bool
 ) -> None:
-    """The step cap is two durable steps, and either answer can go missing between them.
+    """The step cap is two durable operations on two calls, and either answer can go missing.
 
-    What must not happen is the world being called twice for one step, or the attempt that
-    spent its last one being left running. So the observation and the ending it owes are held
-    together until both the release and the ending have landed, and the retry sends the same
-    ending rather than composing a second one.
+    The call that spends the last step gives the generation back, and the call after it, which
+    has nothing left to spend, ends the attempt. What must not happen is the world being called
+    twice for one step, or the attempt that ran out being left running because the ending's
+    answer went missing. So the observation is held until the release has landed, the ending is
+    kept until it has, and the exact call again finishes whichever of the two was left open with
+    the same request rather than a second one.
     """
     dispatches = 0
     async with stream_worker(env.client):
@@ -1218,13 +1432,21 @@ async def test_the_spent_budget_survives_a_lost_response_and_spends_no_second_st
             first = json.loads(await gateway.pull({}))
             attempt = first["attempt_id"]
 
-            # The call that spends the last step, and the answer that never arrives.
-            with pytest.raises(Exception):
-                await gateway.environment("guess", _guess(attempt, "crane"))
+            async def until_answered(word: str) -> Any:
+                """One call, and the exact call again where its answer went missing."""
+                try:
+                    return await gateway.environment("guess", _guess(attempt, word))
+                except Exception:  # noqa: BLE001 - the retry is the subject
+                    return await gateway.environment("guess", _guess(attempt, word))
 
-            # The exact call again is the retry, and it finishes what the first one left open.
-            played = await gateway.environment("guess", _guess(attempt, "crane"))
+            # The call that spends the last step, whose release may be the lost one.
+            played = await until_answered("crane")
             assert json.loads(played.content[0].text)["valid"] is True
+
+            # And the call with nothing to spend, whose ending may be the lost one. Either way
+            # it reaches no world and the attempt is over when it has been answered.
+            with pytest.raises(Exception):
+                await until_answered("slate")
 
             state = await gateway.stream_state()
             assert dispatches == 1
@@ -1286,6 +1508,11 @@ async def test_a_world_that_will_not_close_leaves_the_next_task_unoffered(env) -
             )
             first = json.loads(await gateway.pull({}))
             await gateway.environment("guess", _guess(first["attempt_id"], "crane"))
+            # The budget is one call, so the second one is where the attempt ends.
+            assert (
+                await refused(gateway.environment("guess", _guess(first["attempt_id"], "slate")))
+                == "invalid_attempt"
+            )
             episode.close = close_that_fails_once  # type: ignore[method-assign]
 
             with pytest.raises(Exception):

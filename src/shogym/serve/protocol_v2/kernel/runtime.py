@@ -72,6 +72,7 @@ from shogym.serve.protocol_v2.kernel.messages import (
     configuration_hash,
 )
 from shogym.serve.protocol_v2.kernel.workflow import StreamWorkflow
+from shogym.serve.protocol_v2.policy import LEGACY
 from shogym.serve.protocol_v2.rundir import RunDirectory, ResumeRefused, open_run_directory
 
 TEMPORAL_ADDRESS_ENV = "SHOGYM_TEMPORAL_ADDRESS"
@@ -248,7 +249,20 @@ async def start_stream(
 
     Creation is a claim like a resume is: the returned handle carries the first epoch and the
     token that goes with it, and no call can change the stream without them.
+
+    A generation created here says what it delivers. The legacy profile is not a third answer to
+    that question: it is how a start recorded before the question existed decodes, and a run
+    created under it would resolve nothing, serve the placeholder receipt, and hold no record of
+    having decided to. The stream itself has to keep accepting it, because replaying one of those
+    histories replays its start; creating one is refused here, which is the boundary a replay
+    never crosses.
     """
+    if start.profile == LEGACY:
+        raise ValueError(
+            "a generation created now says what each of its payloads may contain, and the "
+            "legacy profile is how a history recorded before that reads rather than a shape a "
+            "new run may be created in"
+        )
     handle = await client.start_workflow(
         StreamWorkflow.run,
         start,

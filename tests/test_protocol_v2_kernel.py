@@ -74,6 +74,7 @@ from shogym.serve.protocol_v2.kernel.activities import (  # noqa: E402
     SEAL_ATTEMPT,
 )
 from shogym.serve.protocol_v2.kernel.messages import GradeAttemptInput  # noqa: E402
+from tests._fixtures.policy_rows import registering_the_receipt  # noqa: E402
 
 TASK_BODY = "file the report"
 FILING = {"answer": "42"}
@@ -131,20 +132,22 @@ def make_start(*, bodies: Any = (TASK_BODY,), capacity: int = 1, version: int = 
         )
         for index, body in enumerate(bodies)
     ]
-    return StreamStart(
-        configuration_hash="c" * 64,
-        consumer_claim_hash=CLAIM_HASH,
-        initial_cursor=oid(1),
-        done_message_id=DONE_ID,
-        id_key_hex="ab" * 32,
-        hidden_execution_id="execution-1",
-        canonicalization_version="kernel.1",
-        terminal_tool=TerminalTool(
-            public_tool_name="submit", native_terminal_name="submit", argument_names=["answer"]
-        ),
-        tasks=tasks,
-        capacity=capacity,
-        protocol_version=version,
+    return registering_the_receipt(
+        StreamStart(
+            configuration_hash="c" * 64,
+            consumer_claim_hash=CLAIM_HASH,
+            initial_cursor=oid(1),
+            done_message_id=DONE_ID,
+            id_key_hex="ab" * 32,
+            hidden_execution_id="execution-1",
+            canonicalization_version="kernel.1",
+            terminal_tool=TerminalTool(
+                public_tool_name="submit", native_terminal_name="submit", argument_names=["answer"]
+            ),
+            tasks=tasks,
+            capacity=capacity,
+            protocol_version=version,
+        )
     )
 
 

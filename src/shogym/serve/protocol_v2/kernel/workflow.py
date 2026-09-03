@@ -37,7 +37,7 @@ from the closed set and nothing else, they change no state, and they are never a
 from __future__ import annotations
 
 import asyncio
-from dataclasses import dataclass
+from dataclasses import dataclass, fields
 from datetime import timedelta
 from hashlib import sha256
 from typing import Any, Dict, List, Optional, Set, Tuple
@@ -52,6 +52,7 @@ with workflow.unsafe.imports_passed_through():
         RELEASE_AT_SEAL,
         SCHEDULE_VERSION,
         Assignment,
+        BlobRef,
         Done,
         Payload,
         PresentationAck,
@@ -71,6 +72,7 @@ with workflow.unsafe.imports_passed_through():
         order_key,
         presentation_request_identity,
         pull_request_identity,
+        require_digest,
         require_opaque_id,
         stream_message_id,
         submission_digest,
@@ -88,6 +90,7 @@ with workflow.unsafe.imports_passed_through():
         DEADLINE,
         FINAL_FAILURE_REASONS,
         SEAL_FAILED,
+        SEAL_RENDERER,
         SEAL_UNUSABLE,
         AttemptFinalized,
         AttemptRecord,
@@ -99,6 +102,7 @@ with workflow.unsafe.imports_passed_through():
         finalize_request_identity,
         GeneratePayloadBundleInput,
         GradeAttemptInput,
+        GradeAttemptResult,
         OfferedMessage,
         OwnershipClaim,
         OwnershipReceipt,
@@ -115,6 +119,30 @@ with workflow.unsafe.imports_passed_through():
         assignments_for,
         configuration_hash,
         hidden_seal_id,
+    )
+    from shogym.serve.protocol_v2.policy import (
+        DELIVER,
+        HONEST,
+        KERNEL_STAND_IN_GRADE,
+        LEGACY,
+        POLICIES,
+        PROFILES,
+        SINGLETON_SLOT,
+        GradeIdentity,
+        MatchedFamily,
+        PayloadDisposition,
+        PayloadPolicy,
+        PolicyViolation,
+        PublicGrade,
+        PublishedNumber,
+        check_dispositions,
+        check_grade_result,
+        describe_disposition,
+        descriptor_digests,
+        disposition_key,
+        policy_name_of,
+        published_grade,
+        render_body,
     )
     from shogym.serve.protocol_v2.schedule import PAYLOAD, TASK
 
@@ -199,7 +227,17 @@ class _UnusableResult(ApplicationError):
     exact filing sent again asks for the same work and is handed the same result back. That is
     why it is one type rather than a description of each way a result can be wrong, and why the
     seal that raised it ends the attempt it prepared.
+
+    ``final_failure`` is which of those endings gets written. It is one transition either way,
+    and the reason is what a reader is left with: a candidate built under something other than
+    the policy this obligation was resolved to is a run that served bodies its record does not
+    describe, and counting that as a generic unusable result would hide the one failure an
+    operator most needs to see.
     """
+
+    def __init__(self, *args: Any, final_failure: str = SEAL_UNUSABLE, **kwargs: Any) -> None:
+        super().__init__(*args, **kwargs)
+        self.final_failure = final_failure
 
 
 @dataclass
@@ -364,6 +402,19 @@ class StreamWorkflow:
             if self._release.creates_obligations
             else {}
         )
+        # What each obligation was resolved to on the branch this generation serves, which is
+        # the only branch it may resolve: a row for a slot nothing has created is refused at the
+        # start. The key keeps its branch anyway, because the fork that will create those slots
+        # is the reason two rows can share one obligation.
+        self._served: Dict[str, PayloadDisposition] = {
+            row.attempt_id: row
+            for row in start.dispositions
+            if row.branch_slot == SINGLETON_SLOT and row.kind == DELIVER
+        }
+        # The matched arms this generation's rows are cells of, by the name a row claims.
+        self._families: Dict[str, MatchedFamily] = {
+            family.family_id: family for family in start.families
+        }
         self._pending: Optional[_Pending] = None
         self._pull_requests: Dict[str, _Bound] = {}
         self._terminal_requests: Dict[str, _Bound] = {}
@@ -376,7 +427,20 @@ class StreamWorkflow:
         # Every object a committed presentation referenced, once each. A reference verified when
         # its event committed is a fact about that moment, and this is what makes it a question
         # a resume can ask again.
-        self._committed_blobs: List[str] = []
+        #
+        # The preimage of every policy this generation resolved to is in it from the start, and
+        # so is every cell of every matched family it declares. A digest names bytes, and the
+        # claim this generation makes is about the bytes: a run whose descriptor object is gone
+        # is one whose record says what its bodies were allowed to contain and cannot produce the
+        # saying, and an arm that cannot produce its counterpart's is one whose record says it
+        # was a comparison and cannot say what against. So the descriptors are required objects
+        # rather than a convenience installed beside the run, and a resume that cannot read them
+        # back exactly is refused like any other unverifiable reference.
+        self._committed_blobs: List[str] = (
+            descriptor_digests(start.dispositions, start.families)
+            if start.blob_root is not None
+            else []
+        )
         self._eligibilities: List[_Eligibility] = []
         self._issued_ids = {start.initial_cursor, start.done_message_id}
         for item in start.tasks:
@@ -406,7 +470,17 @@ class StreamWorkflow:
         The generation waits here, and while it waits it is also the only thing watching the
         clock. A stream whose attempts have no deadline waits once and creates no timer at all,
         which is what a generation that declares none should cost.
+
+        A generation created now says what each of its payloads may contain, and this is where
+        that is true of every execution rather than of the calls that go through a builder. The
+        one shape with nothing to say is a history recorded before the question existed, and a
+        replay of one runs this line: the marker separates the two, because an execution started
+        now writes it and a history recorded then has none. So the old generations keep
+        replaying and a new one cannot be created without a profile, whichever entry point
+        starts it.
         """
+        if start.profile == LEGACY and workflow.patched("profile-required-at-creation"):
+            raise StreamProtocolError("configuration_mismatch")
         while not self._done_presented:
             await self._wait_for_done_or_a_deadline()
         await workflow.wait_condition(workflow.all_handlers_finished)
@@ -546,10 +620,16 @@ class StreamWorkflow:
         roster, plan, capacity, or versions have moved is a different generation and continuing
         it under the old history would serve a configuration nobody committed to.
 
-        A resume reads the store before it swaps. Every reference a committed presentation
-        carried was verified when that presentation committed, and a resume is the moment to
-        ask again, because a history citing bytes the store can no longer produce is not one to
-        hand a new owner. The read covers what the writer being replaced commits while it is
+        Every claim reads the store before it swaps, the first one included. Every reference a
+        committed presentation carried was verified when that presentation committed, and a
+        resume is the moment to ask again, because a history citing bytes the store can no longer
+        produce is not one to hand a new owner. A creation has references of its own before it
+        has served anything: the preimage of every policy it resolved to and of every cell of
+        every matched family it declares is a required object, and a generation whose descriptor
+        was never installed is one that would serve work while its record could not say what its
+        bodies were allowed to contain or what the arm it is a leg of was a comparison against.
+        Asking at creation is what makes that a refusal to start rather than something a later
+        resume discovers. The read covers what the writer being replaced commits while it is
         running, because that is part of the same history.
 
         An active attempt is restored to active only when nothing has happened since the
@@ -570,7 +650,7 @@ class StreamWorkflow:
         ends it by name before the generation grants another one.
         """
         self._check_claim(claim)
-        if claim.reason == "resume":
+        if self._committed_blobs:
             await self._verify_committed_blobs()
             # The store was read outside this transition, so the claim is checked again on the
             # way back in. A claimant that another one overtook while this read was running
@@ -816,6 +896,12 @@ class StreamWorkflow:
         active attempt names the checkpoint it would be restored from, and the ones a claim must
         restore before it may continue them are listed apart: those are the attempts whose world
         this generation has authorized a change to since that checkpoint committed.
+
+        The count behind that list is reported too. An environment call never becomes an Update,
+        so the transport that spends an environment's step budget is the only thing that sees it
+        run out, and the grants counted here are the only durable record that they happened. A
+        transport reads the count rather than keeping one: a budget kept in a process is a budget
+        a second process starts over.
         """
         return StreamState(
             generation_state=self._generation_state,
@@ -853,6 +939,11 @@ class StreamWorkflow:
                 for key, value in self._attempts.items()
                 if value.graded_evidence is not None
             },
+            environment_calls={
+                key: value.environment_calls
+                for key, value in self._attempts.items()
+                if value.environment_calls > 0
+            },
             restoration_required=self._restoration_required(),
             attempts={key: value.state for key, value in self._attempts.items()},
             obligations={key: value.state for key, value in self._obligations.items()},
@@ -876,6 +967,16 @@ class StreamWorkflow:
             deadline_expired=[
                 key for key, value in self._attempts.items() if value.deadline_expired
             ],
+            dispositions={
+                disposition_key(row): describe_disposition(row)
+                for row in self._start.dispositions
+            },
+            profile=self._start.profile,
+            experiment_id=(
+                None
+                if self._start.provenance is None or not self._start.provenance.experiment_id
+                else self._start.provenance.experiment_id
+            ),
         )
 
     @workflow.query
@@ -912,9 +1013,27 @@ class StreamWorkflow:
         The ending comes with the score for the same reason. A floored attempt scores nothing,
         which is the number an attempt the environment graded at nothing also scores, and the
         reason is the only thing that separates them.
+
+        The policy comes with the delivery for the third time round the same argument. A payload
+        that was delivered is a different fact depending on what its body was allowed to say, and
+        a row from a generation that recorded no policy reads as the placeholder rather than as
+        an honest receipt nobody can now check.
+
+        And who decided comes with the policy, for the fourth. The same policy name is the right
+        answer for an ordinary run the platform stamped and for an experiment cell somebody
+        registered, so the name on its own cannot say whether either of the two mistakes was
+        made.
         """
         item = attempt.item
         obligation = self._obligations.get(item.attempt_id)
+        resolved = next(
+            (
+                row
+                for row in self._start.dispositions
+                if row.attempt_id == item.attempt_id and row.branch_slot == SINGLETON_SLOT
+            ),
+            None,
+        )
         return AttemptRecord(
             attempt_id=item.attempt_id,
             task_position=item.task_position,
@@ -938,6 +1057,16 @@ class StreamWorkflow:
                 item.attempt_id
             ].creates_payload_obligation,
             payload_state=None if obligation is None else obligation.state,
+            payload_policy=(
+                None
+                if obligation is None
+                else policy_name_of(None if resolved is None else resolved.policy_digest)
+            ),
+            payload_disposition=None if resolved is None else describe_disposition(resolved),
+            profile=self._start.profile,
+            payload_resolution_source=(
+                None if resolved is None else resolved.resolution_source
+            ),
         )
 
     # Pull.
@@ -1182,6 +1311,12 @@ class StreamWorkflow:
         that never happened and a step whose answer was unusable are different things to read
         afterwards. A writer that a resume fenced meanwhile commits nothing at all, and the
         attempt stays prepared for the owner that replaced it.
+
+        A candidate built under a policy other than the one this obligation was resolved to is
+        the second of those two, with a reason of its own. It is the same ending: the attempt is
+        finalized, the capacity comes back, nothing is acknowledged, and the generation goes on
+        serving. What the separate reason buys is a reader who can tell a Worker running the
+        wrong renderer from a result that was merely malformed.
         """
         try:
             return await self._seal_batch(request, attempt, identity, writer)
@@ -1191,9 +1326,9 @@ class StreamWorkflow:
             self._require_writer(writer)
             self._finalize(attempt, SEAL_FAILED)
             raise
-        except _UnusableResult:
+        except _UnusableResult as unusable:
             self._require_writer(writer)
-            self._finalize(attempt, SEAL_UNUSABLE)
+            self._finalize(attempt, unusable.final_failure)
             raise
 
     async def _seal_batch(
@@ -1240,18 +1375,24 @@ class StreamWorkflow:
             sealed.canonical_submission_text.encode("utf-8"),
         )
         attempt.finalizer_key = sealed.seal_id
-        graded = await workflow.execute_activity(
-            grade_attempt_activity,
-            GradeAttemptInput(
-                attempt_id=attempt.item.attempt_id,
-                seal_id=sealed.seal_id,
-                submission_digest=attempt.submission_digest,
-                canonical_submission_text=sealed.canonical_submission_text,
-                environment_recovery_token=sealed.environment_recovery_token,
-                blob_root=self._start.blob_root,
-            ),
-            start_to_close_timeout=_TERMINAL_ACTIVITY_TIMEOUT,
-            retry_policy=_ACTIVITY_RETRY,
+        # The result is read into a shape this generation decided on before anything is compared
+        # against it. Nothing about the wire shape is a promise: every field arrives as whatever
+        # was encoded, so a result that is not a grade is refused here, at the first line that
+        # touches it, rather than failing an activation nothing can record.
+        graded = _graded(
+            await workflow.execute_activity(
+                grade_attempt_activity,
+                GradeAttemptInput(
+                    attempt_id=attempt.item.attempt_id,
+                    seal_id=sealed.seal_id,
+                    submission_digest=attempt.submission_digest,
+                    canonical_submission_text=sealed.canonical_submission_text,
+                    environment_recovery_token=sealed.environment_recovery_token,
+                    blob_root=self._start.blob_root,
+                ),
+                start_to_close_timeout=_TERMINAL_ACTIVITY_TIMEOUT,
+                retry_policy=_ACTIVITY_RETRY,
+            )
         )
         # Each result is checked where it arrives, before the next Activity is asked for. The
         # seal ID and the digest are what make a result this filing's: the public attempt ID
@@ -1259,11 +1400,42 @@ class StreamWorkflow:
         # which obligation asked and not which filing was answered.
         if graded.attempt_id != attempt.item.attempt_id or graded.seal_id != attempt.seal_id:
             raise _unusable("the score is not this seal's")
+        # And it is the grader this generation was built over, whatever the agent is going to be
+        # told. The score is committed either way: a concealed arm's number is the outcome that
+        # arm reports and a position that owes no payload still records one, so a stand-in or
+        # another implementation substituted behind either of those would put the wrong number
+        # in the record with nothing about it visible in a body. The identity is therefore a
+        # property of the seal rather than of the exposure.
+        declared = self._start.grade or KERNEL_STAND_IN_GRADE
+        returned = graded.grade or KERNEL_STAND_IN_GRADE
+        if returned != declared:
+            raise _unusable(
+                f"this generation is graded by {declared.grader_id}/{declared.grader_version} "
+                f"and the score that came back is {returned.grader_id}/"
+                f"{returned.grader_version}'s"
+            )
+        # And the numbers are what the environment said its numbers are, before any of them is
+        # committed or printed. A result is a decoded value rather than the object a grader
+        # built: a field declared as a number comes back as one whatever was put in it, so the
+        # projection is applied to what arrived rather than to what was meant to be sent. The
+        # domains it is applied against are the ones this generation declared, which the check
+        # above has just made the same ones the result carries.
+        try:
+            check_grade_result(
+                score=graded.score,
+                components=graded.components,
+                grade=declared,
+            )
+        except PolicyViolation as violation:
+            raise _unusable(str(violation)) from violation
         # An attempt with no obligation has nothing to build, so nothing is built: neither the
         # generation under Never nor the one position a roster gave no payload asks a renderer
         # for a candidate. An absent outbox row is not an outbox row nobody reads.
         candidate: Optional[PayloadCandidate] = None
         if attempt.item.attempt_id in self._obligations:
+            disposition = self._served.get(attempt.item.attempt_id)
+            policy = _policy_of(disposition)
+            published = self._published(attempt, graded, policy, declared)
             bundle = await workflow.execute_activity(
                 generate_payload_bundle_activity,
                 GeneratePayloadBundleInput(
@@ -1272,6 +1444,9 @@ class StreamWorkflow:
                     payload_message_id=attempt.item.payload_message_id,
                     submission_digest=attempt.submission_digest,
                     canonical_submission_text=sealed.canonical_submission_text,
+                    policy_digest="" if disposition is None else (disposition.policy_digest or ""),
+                    cell="" if disposition is None else (disposition.cell or ""),
+                    public_grade=published,
                 ),
                 start_to_close_timeout=_ACTIVITY_TIMEOUT,
                 retry_policy=_ACTIVITY_RETRY,
@@ -1290,6 +1465,20 @@ class StreamWorkflow:
                 raise _unusable("the candidate bundle is not the one this obligation asked for")
             candidate = bundle.candidates[0]
             _check_candidate(attempt.item, candidate)
+            _check_echo(
+                candidate,
+                disposition,
+                policy,
+                attempt.item,
+                attempt.submission_digest,
+                published,
+            )
+            _check_family(
+                candidate,
+                None
+                if disposition is None or not disposition.family_id
+                else self._families.get(disposition.family_id),
+            )
         # Everything above was awaited, so the owner is checked again before any of it is made
         # authoritative. A seal that was in flight when a resume fenced its writer commits
         # nothing: the attempt stays prepared, and the new owner's exact retry continues it.
@@ -1297,15 +1486,15 @@ class StreamWorkflow:
         # One transition, no await inside it: the score, the bundle, the released capacity,
         # the obligation, and the acknowledgement all become authoritative together or not
         # at all. The bytes go out after this, which is what puts the seal before the Ack.
-        attempt.score = graded.score
+        attempt.score = float(graded.score)
         attempt.decode_state = graded.decode_state
         # The score and what it was taken from become authoritative together. A committed score
         # whose evidence the generation kept no name for is a headline with nothing under it, so
         # the reference is kept on the attempt and counted among the objects this history cites:
         # a claim reads the store for all of them again before it may continue the generation.
-        attempt.graded_evidence = graded.evidence.sha256
-        if graded.evidence.sha256 not in self._committed_blobs:
-            self._committed_blobs.append(graded.evidence.sha256)
+        attempt.graded_evidence = graded.evidence_sha256
+        if graded.evidence_sha256 not in self._committed_blobs:
+            self._committed_blobs.append(graded.evidence_sha256)
         self._seal_ordinal += 1
         attempt.seal_ordinal = self._seal_ordinal
         attempt.state = SEALED
@@ -1320,6 +1509,49 @@ class StreamWorkflow:
         return self._offer(
             ack, "terminal", metadata.request_id, identity, attempt.item.attempt_id
         )
+
+    def _published(
+        self,
+        attempt: _Attempt,
+        graded: _Graded,
+        policy: Optional[PayloadPolicy],
+        declared: GradeIdentity,
+    ) -> Optional[PublicGrade]:
+        """Return what the renderer for this obligation may know of the verdict, or nothing.
+
+        A policy that does not publish the grade is handed no grade. That is a property of the
+        value rather than of the renderer's conduct: there is nothing in the request for a
+        blinded body to leak, however the code on the other side is written.
+
+        A policy that does publish it is refused a stand-in. The kernel's grade is a fact about
+        the shape of a filing and says so, and a generation that told its agent that number as
+        the environment's verdict would be publishing a transport fixture. That the number came
+        from the grader this generation declared is settled before this, for every seal rather
+        than for the ones a body publishes, so what is left here is the exposure's own half.
+
+        What crosses is the attempt the authority assigned, the score, and the numbers the
+        environment declared it publishes. A number under a name that roster does not hold does
+        not cross: a name is text the grader wrote and a body prints it, so the names were fixed
+        before the run and one that was not is an ending rather than a body. The evidence
+        reference does not cross either: it names bytes a harness can resolve out of the run's
+        own store, which is a different question from what the agent is told.
+        """
+        if policy is None or policy.exposure != HONEST:
+            return None
+        if declared.stand_in:
+            raise _unusable(
+                "this obligation publishes the environment's grade and the grade that came back "
+                "is the kernel's stand-in"
+            )
+        try:
+            return published_grade(
+                attempt_id=attempt.item.attempt_id,
+                score=graded.score,
+                components=graded.components,
+                grade=declared,
+            )
+        except PolicyViolation as violation:
+            raise _unusable(str(violation)) from violation
 
     # Final failure.
 
@@ -1870,6 +2102,7 @@ def _check_start(start: StreamStart) -> None:
     if len(set(identifiers)) != len(identifiers):
         raise StreamProtocolError("invalid_message")
     _check_schedule(start)
+    _check_policy(start)
 
 
 def _roster(start: StreamStart) -> List[Assignment]:
@@ -1917,9 +2150,471 @@ def _check_schedule(start: StreamStart) -> None:
             raise StreamProtocolError("configuration_mismatch")
 
 
+def _check_policy(start: StreamStart) -> None:
+    """Refuse a generation that has not resolved what it delivers.
+
+    The refusal is where a generation is created rather than only in whatever composed it. A
+    builder is a function a caller chooses, and what stops an experiment from being served as an
+    ordinary run is not which function ran but that the generation itself carries a profile and
+    a complete set of dispositions. So the profile is checked here, the coverage is checked here,
+    and a start that resolves nothing may only be the legacy profile, which is what a history
+    recorded before any of this decodes as.
+
+    The matrix is the whole of the check. An ordinary generation delivers the honest policy
+    against every payload it owes, withholds under one of the closed platform reasons where it
+    owes none, and carries the platform's stamp on both rows. An experiment carries registered
+    rows and covers every position. Neither profile can be reached from the other by an omission,
+    and a start that mixes them is refused where the generation is created rather than trusted
+    because some builder is supposed to have produced it.
+
+    The profile itself is a word a caller wrote, so the authority behind it is checked here too.
+    An experiment names the experiment that registered these rows and an ordinary run names the
+    platform default it was stamped from, each with the digest of the rows it answered for, and
+    a generation whose label has no such authority behind it is not created.
+
+    The declared grader comes into it because honesty is a claim about a number. A generation
+    whose environment is scored by a stand-in may not resolve an obligation to a policy that
+    publishes the score, and that is refused before the first task is offered rather than
+    discovered when the first receipt goes out.
+
+    The legacy profile is the one thing here that cannot be refused. It is how a history recorded
+    before any of this decodes, and replaying such a history runs this line: refusing it would
+    refuse every resume of every generation recorded then. What is refused instead is creating
+    one, which happens where a generation is started and never during a replay.
+    """
+    if start.profile not in PROFILES:
+        raise StreamProtocolError("configuration_mismatch")
+    if start.profile == LEGACY:
+        if start.dispositions or start.provenance is not None or start.families:
+            raise StreamProtocolError("configuration_mismatch")
+        return
+    roster = _roster(start)
+    obligations = {
+        row.attempt_id: row.payload_position
+        for row in roster
+        if row.creates_payload_obligation and start.release.creates_obligations
+    }
+    silent = {
+        row.attempt_id: row.payload_position
+        for row in roster
+        if row.attempt_id not in obligations
+    }
+    try:
+        check_dispositions(
+            list(start.dispositions),
+            profile=start.profile,
+            obligations=obligations,
+            silent=silent,
+            grade=start.grade or KERNEL_STAND_IN_GRADE,
+            provenance=start.provenance,
+            families=list(start.families),
+        )
+    except PolicyViolation as error:
+        raise StreamProtocolError("configuration_mismatch") from error
+
+
 def _unusable(what: str) -> _UnusableResult:
     """Say what is wrong with an Activity result, as the failure that ends the attempt."""
     return _UnusableResult(what, type="UnusableActivityResult", non_retryable=True)
+
+
+# What a grade identity and one of its published numbers are made of, taken from the records
+# themselves so the two cannot drift apart. A result carrying a field neither of them has is
+# refused rather than quietly dropped: a Worker sending one was built against something other
+# than this protocol, and a generation that ignored the difference would be reading an identity
+# it cannot vouch for.
+_GRADE_FIELDS = frozenset(entry.name for entry in fields(GradeIdentity))
+_NUMBER_FIELDS = frozenset(entry.name for entry in fields(PublishedNumber))
+
+# How much of a result this side will read before it calls the result the problem. Every text
+# field it keeps is an identifier or a word from a closed set, every count in it is small, and
+# every roster is bounded by the policy under it, so nothing a grader legitimately returns comes
+# near these. What they stop is a field wide enough to hold something else. A string long enough
+# fills the answer to a query, so the generation would stop saying what happened to it while
+# still holding a value it took from a Worker; a roster long enough is held in memory to find out
+# that none of it was declared; and an integer wide enough is one no double can be made of, so
+# the check that would refuse it raises part way through instead, which is an activation that
+# fails rather than an attempt that ends.
+_MOST_TEXT = 1024
+_MOST_ENTRIES = 64
+_MOST_COUNT = 1_000_000
+
+
+@dataclass(frozen=True)
+class _Graded:
+    """One grade Activity result, after the generation has decided it is one.
+
+    The wire shape it was built from is permissive in every field, so this is where the result
+    stops being whatever a Worker encoded and becomes something the seal can go on with. The
+    score and the published numbers stay as they arrived: what a number is belongs to the
+    projection, which rejects a boolean that this side would have to call an integer.
+    """
+
+    attempt_id: str
+    seal_id: str
+    score: Any
+    decode_state: str
+    evidence_sha256: str
+    grade: Optional[GradeIdentity]
+    components: Dict[str, Any]
+
+
+def _graded(result: GradeAttemptResult) -> _Graded:
+    """Read one grade Activity result, or refuse a shape that is not one.
+
+    Every field this generation goes on to read is asked about here, at the first point it
+    touches the result and before any of it is compared, committed or printed. The asking is
+    this side's rather than the decoder's, and that is the whole reason the wire shape carries
+    no types: a result that failed to decode never becomes a failure the generation can record.
+    The activation itself fails, the same activation is retried for ever, nothing is written
+    about why, and queries stop being answered, so a Worker's mistake becomes a generation that
+    is neither running nor ended. Everything refused here ends the attempt with a reason
+    instead. The score and the published numbers pass through as they arrived: what a number is
+    belongs to the projection, which rejects a boolean that this side would have to call one.
+
+    The result itself is one of the things asked about. A Worker that answered with nothing at
+    all leaves the generation reading fields off it, and reading a field off nothing is the
+    failure this whole function exists to avoid.
+
+    The protocol version is read first, because it is what says the rest of the fields mean here
+    what they meant where they were written. A Worker built against an earlier protocol returns
+    an identity and numbers this side would otherwise accept, commit and publish as its own.
+
+    Sizes are bounded here for the same reason the shapes are. A value too large is not a value
+    this side can refuse cleanly further on: the refusal is written with the value in it, or the
+    check that would make it raises on the way, and either way the ending the result was owed
+    turns back into an activation nothing recorded.
+    """
+    if not isinstance(result, GradeAttemptResult):
+        raise _unusable(
+            f"a grade is a result with fields in it, and this seal was handed "
+            f"{type(result).__name__}"
+        )
+    version = _whole(result.protocol_version, "protocol_version")
+    if version != PROTOCOL_VERSION:
+        raise _unusable(
+            f"a grade is read under the protocol that asked for it, and this result was "
+            f"written under version {version}"
+        )
+    return _Graded(
+        attempt_id=_text(result.attempt_id, "attempt_id"),
+        seal_id=_text(result.seal_id, "seal_id"),
+        score=_measured(result.score, "score"),
+        decode_state=_text(result.decode_state, "decode_state"),
+        evidence_sha256=_evidence(result.evidence),
+        grade=_identity(result.grade),
+        components=_components(result),
+    )
+
+
+def _text(value: Any, field_name: str) -> str:
+    """Return one field of a result that has to be text, or refuse what came instead."""
+    if not isinstance(value, str):
+        raise _unusable(
+            f"a grade's {field_name} is text, and this result carried "
+            f"{type(value).__name__}"
+        )
+    if len(value) > _MOST_TEXT:
+        raise _unusable(
+            f"a grade's {field_name} is a name or a word from a closed set, and this result "
+            f"carried {len(value)} characters"
+        )
+    return value
+
+
+def _measured(value: Any, field_name: str) -> Any:
+    """Return one number of a result as it arrived, or refuse an integer no double can hold.
+
+    What a number is belongs to the projection, so this is not that question. It is the narrower
+    one the projection cannot ask for itself: an integer wider than a double raises where it is
+    weighed rather than failing a comparison, and a check that raises part way through is an
+    activation that fails instead of an attempt that ends.
+    """
+    if isinstance(value, int) and not isinstance(value, bool):
+        try:
+            float(value)
+        except OverflowError:
+            raise _unusable(
+                f"a grade's {field_name} is a number this side can weigh, and this result "
+                f"carried an integer of {value.bit_length()} bits"
+            ) from None
+    return value
+
+
+def _evidence(value: Any) -> str:
+    """Return the digest of what a score was taken from, or refuse a reference that is not one.
+
+    A reference arrives as the object a Worker encoded, which is a mapping rather than the class
+    it was built from, so both are read here. What the generation keeps is the digest: it is the
+    name a claim verifies the store for and the name a harness resolves the verdict under, so a
+    reference whose name is not a digest is a score with nothing under it.
+    """
+    if isinstance(value, BlobRef):
+        digest = value.sha256
+    elif isinstance(value, dict):
+        digest = value.get("sha256")
+    else:
+        raise _unusable(
+            "a grade names the evidence its score was taken from, and this result carried "
+            f"{type(value).__name__}"
+        )
+    try:
+        return require_digest(digest)  # type: ignore[arg-type]
+    except WireFormatError as error:
+        raise _unusable(f"the evidence this grade names is not a blob: {error}") from error
+
+
+def _identity(value: Any) -> Optional[GradeIdentity]:
+    """Return the grader a result says it is, or refuse a shape that is not an identity.
+
+    An absent identity is a result from before graders declared one and is read as the stand-in
+    further on, so it is not refused here. Everything else is rebuilt field by field: the
+    identity is compared against the one this generation was built over, and a comparison is
+    only as good as the thing on the other side of it being an identity at all.
+    """
+    if value is None:
+        return None
+    if isinstance(value, GradeIdentity):
+        return value
+    if not isinstance(value, dict):
+        raise _unusable(
+            f"a grade says which grader it is, and this result carried {type(value).__name__}"
+        )
+    unknown = sorted(set(value) - _GRADE_FIELDS)
+    if unknown:
+        raise _unusable(f"a grade identity has no {unknown} in it")
+    components = value.get("public_components", ())
+    if not isinstance(components, (list, tuple)):
+        raise _unusable(
+            "a grade identity's roster is a list of published numbers, and this one carried "
+            f"{type(components).__name__}"
+        )
+    if len(components) > _MOST_ENTRIES:
+        raise _unusable(
+            f"a grade identity's roster is the short list of what one grader publishes, and "
+            f"this one carried {len(components)} entries"
+        )
+    return GradeIdentity(
+        grader_id=_text(value.get("grader_id"), "grader_id"),
+        grader_version=_text(value.get("grader_version"), "grader_version"),
+        stand_in=_flag(value.get("stand_in")),
+        score_component=_text(value.get("score_component"), "score_component"),
+        score_places=_whole(value.get("score_places", 0), "score_places"),
+        public_components=tuple(_number(entry) for entry in components),
+    )
+
+
+def _number(value: Any) -> PublishedNumber:
+    """Return one entry of a declared roster, or refuse a shape that is not one."""
+    if isinstance(value, PublishedNumber):
+        return value
+    if not isinstance(value, dict):
+        raise _unusable(
+            "a published number is a name and a domain, and this roster carried "
+            f"{type(value).__name__}"
+        )
+    unknown = sorted(set(value) - _NUMBER_FIELDS)
+    if unknown:
+        raise _unusable(f"a published number has no {unknown} in it")
+    return PublishedNumber(
+        name=_text(value.get("name"), "name"),
+        minimum=_real(value.get("minimum"), "minimum"),
+        maximum=_real(value.get("maximum"), "maximum"),
+        places=_whole(value.get("places", 0), "places"),
+    )
+
+
+def _flag(value: Any) -> bool:
+    """Return a declared yes or no, or refuse what is neither."""
+    if not isinstance(value, bool):
+        raise _unusable(
+            f"a grade says whether it is a stand-in, and this result carried "
+            f"{type(value).__name__}"
+        )
+    return value
+
+
+def _whole(value: Any, field_name: str) -> int:
+    """Return a declared count, or refuse what is not one.
+
+    Every count a result carries names a version, a resolution or a position, so one wider than
+    a person would ever write is a value this side would go on to put in a refusal.
+    """
+    if isinstance(value, bool) or not isinstance(value, int):
+        raise _unusable(
+            f"a declared {field_name} is a whole number, and this result carried "
+            f"{type(value).__name__}"
+        )
+    if abs(value) > _MOST_COUNT:
+        raise _unusable(
+            f"a declared {field_name} is a small whole number, and this result carried one of "
+            f"{value.bit_length()} bits"
+        )
+    return value
+
+
+def _real(value: Any, field_name: str) -> float:
+    """Return a declared bound, or refuse what is not a number at all."""
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        raise _unusable(
+            f"a declared {field_name} is a number, and this result carried "
+            f"{type(value).__name__}"
+        )
+    return float(_measured(value, field_name))
+
+
+def _components(result: GradeAttemptResult) -> Dict[str, Any]:
+    """Return the numbers a grade says it published, or refuse a shape that is not a roster.
+
+    A result comes back as whatever was encoded rather than as the object a grader meant to
+    build, so the shape is a question this side has to ask. It is asked here rather than by the
+    decoder because a decoding failure is not a result: the generation would fail its activation
+    on every retry, record nothing about why, and answer no query while it did. A roster this is
+    not is an ending with a reason, like every other result the seal cannot vouch for.
+    """
+    published = result.public_components
+    if not isinstance(published, dict) or not all(
+        isinstance(name, str) for name in published
+    ):
+        raise _unusable(
+            "a grade publishes its numbers under names, and this result carried "
+            f"{type(published).__name__}"
+        )
+    if len(published) > _MOST_ENTRIES:
+        raise _unusable(
+            f"a grade publishes a few numbers beside its score, and this result carried "
+            f"{len(published)} of them"
+        )
+    return {
+        _text(name, "component name"): _measured(value, name)
+        for name, value in published.items()
+    }
+
+
+def _policy_of(disposition: Optional[PayloadDisposition]) -> Optional[PayloadPolicy]:
+    """Return the policy one disposition delivers under, or nothing where none was resolved.
+
+    Nothing is the legacy generation, which resolved no obligation and whose bodies are the
+    placeholder its history recorded. It is never read as a licence to publish the grade.
+    """
+    if disposition is None or disposition.kind != DELIVER:
+        return None
+    return POLICIES.get(disposition.policy_digest or "")
+
+
+def _check_echo(
+    candidate: PayloadCandidate,
+    disposition: Optional[PayloadDisposition],
+    policy: Optional[PayloadPolicy],
+    item: TaskItem,
+    submission_digest: str,
+    published: Optional[PublicGrade],
+) -> None:
+    """Hold a built candidate to the policy this obligation was resolved to, body included.
+
+    The echo is what a Worker running code this generation did not ask for cannot produce. A
+    build that never learned about policies returns a candidate with no digest and no renderer
+    version in it, so a generation that resolved an obligation to a policy sees the absence and
+    refuses, rather than serving a placeholder under an honest record.
+
+    An echo on its own is metadata about a body rather than the body, and metadata is the easy
+    half to get right: a renderer that is faulty, substituted, or half upgraded can copy the
+    requested descriptor around any bytes it likes and every field would agree. So the body is
+    built again here, out of the policy this generation resolved and the grade this generation
+    committed, and the candidate is required to be exactly that. What the Activity is left
+    deciding is nothing: it produces bytes and the authority produces the same bytes or the
+    attempt ends. The rendering is deterministic and reaches nothing, which is what lets it run
+    where the decision belongs.
+
+    A legacy generation asked for nothing and is owed nothing. Its recorded results carry no
+    echo and are read exactly as they were recorded, which is what keeps a stopped generation
+    resumable by code that has since learned to ask.
+    """
+    if disposition is None:
+        return
+    expected = "" if disposition.policy_digest is None else disposition.policy_digest
+    if policy is None:
+        raise _UnusableResult(
+            f"the obligation was resolved to a policy this build does not implement, so the "
+            f"candidate under {expected[:16]} is one nothing can vouch for",
+            type="RendererDescriptorMismatch",
+            non_retryable=True,
+            final_failure=SEAL_RENDERER,
+        )
+    actual = (candidate.policy_digest, candidate.renderer_id, candidate.renderer_version)
+    declared = (expected, policy.renderer_id, policy.renderer_version)
+    if actual != declared:
+        raise _UnusableResult(
+            f"this obligation was resolved to {policy.policy_name} rendered by "
+            f"{policy.renderer_id}/{policy.renderer_version}, and the candidate came back from "
+            f"{candidate.renderer_id or 'a build that echoed nothing'}",
+            type="RendererDescriptorMismatch",
+            non_retryable=True,
+            final_failure=SEAL_RENDERER,
+        )
+    if candidate.cell != disposition.cell:
+        raise _UnusableResult(
+            f"this obligation was assigned the cell {disposition.cell!r} and the candidate "
+            f"came back in {candidate.cell!r}",
+            type="RendererDescriptorMismatch",
+            non_retryable=True,
+            final_failure=SEAL_RENDERER,
+        )
+    try:
+        declared_body = render_body(
+            policy,
+            grade=published,
+            payload_position=item.payload_position,
+            submission_digest=submission_digest,
+        )
+    except PolicyViolation as violation:
+        raise _unusable(str(violation)) from violation
+    if candidate.body != declared_body:
+        raise _UnusableResult(
+            f"the candidate echoes {policy.policy_name} and carries a body that policy does not "
+            "render, so what the record says this agent was told and what it would be told are "
+            "two different things",
+            type="RendererDescriptorMismatch",
+            non_retryable=True,
+            final_failure=SEAL_RENDERER,
+        )
+
+
+def _check_family(candidate: PayloadCandidate, family: Optional[MatchedFamily]) -> None:
+    """Hold a candidate built for a matched arm to the shape that arm declared.
+
+    A row outside a family is measured against nothing here: what its body comes to is what its
+    policy renders, and there is no counterpart it has to be indistinguishable from. A row
+    inside one has both, because the whole of what a matched arm claims is that its cells differ
+    in what they say. A candidate longer than its family's declared count, or built in another
+    group, is a cell an agent or a harness could pick out without reading it, and serving one
+    would be running the comparison the registration says is being run while measuring something
+    else.
+
+    The count is the arm's rather than this generation's. Every leg of a matched arm declares
+    the same family and each leg resolves the cell it serves, so what holds the cells to one
+    another across legs is that each of them is held to the number the arm declared.
+    """
+    if family is None:
+        return
+    if candidate.match_group != family.match_group:
+        raise _UnusableResult(
+            f"the matched family {family.family_id} builds its cells in "
+            f"{family.match_group!r} and this candidate came back in {candidate.match_group!r}",
+            type="MatchedFamilyMismatch",
+            non_retryable=True,
+            final_failure=SEAL_RENDERER,
+        )
+    if candidate.visible_byte_count != family.visible_byte_count:
+        raise _UnusableResult(
+            f"the matched family {family.family_id} declares cells of "
+            f"{family.visible_byte_count} visible bytes and this candidate came to "
+            f"{candidate.visible_byte_count}, which is a cell that can be told from its "
+            "counterpart without being read",
+            type="MatchedFamilyMismatch",
+            non_retryable=True,
+            final_failure=SEAL_RENDERER,
+        )
 
 
 def _check_candidate(item: TaskItem, candidate: PayloadCandidate) -> None:

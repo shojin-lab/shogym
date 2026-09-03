@@ -76,6 +76,7 @@ from shogym.serve.episode import ServedEpisode
 from shogym.serve.protocol_v2 import (
     IMMEDIATE,
     NEVER,
+    Assignment,
     BlobStore,
     FilesystemBlobStore,
     ProtocolError,
@@ -113,6 +114,32 @@ from shogym.serve.protocol_v2.kernel import (
     start_stream,
     stream_worker,
 )
+from shogym.serve.protocol_v2.policy import (
+    DELIVER,
+    EXPERIMENT,
+    HONEST_V1,
+    HONEST,
+    KERNEL_STAND_IN_GRADE,
+    LEGACY,
+    NO_OBLIGATION,
+    NO_RELEASE,
+    HONEST_V1_DIGEST,
+    ORDINARY,
+    PLATFORM_DEFAULT,
+    POLICIES,
+    REGISTERED,
+    WITHHOLD,
+    GradeIdentity,
+    MatchedFamily,
+    PayloadDisposition,
+    PolicyProvenance,
+    PolicyViolation,
+    check_dispositions,
+    descriptor_digests,
+    policy_digest,
+    policy_preimage,
+    roster_digest,
+)
 from shogym.serve.protocol_v2.rundir import (
     create_run_directory,
     prepare_run_directory,
@@ -146,6 +173,12 @@ _Result = TypeVar("_Result")
 #: rather than to this transport, and an environment that seals by stopping its own world has to
 #: be told which world that attempt filed in. This gateway is the only thing that knows.
 EpisodeOpener = Callable[[str], Awaitable[ServedEpisode]]
+
+#: The dispositions an experiment registers, built from the roster they resolve. A row names an
+#: attempt and a payload position, and both are minted where the generation is, so a registration
+#: is given as a function of the roster rather than as a finished value: it is called with the
+#: rows, in order, once they exist and before anything has been served.
+DispositionsFor = Callable[[Sequence[Assignment]], Sequence[PayloadDisposition]]
 
 #: A release plan built from the queue it releases. A gate names an attempt and the attempts are
 #: minted where the generation is, so a composer that gates one is handed the tasks it gates.
@@ -187,12 +220,17 @@ class EnvironmentTerminal(NamedTuple):
     manifest carries the instructions and the tools, and an environment may have more than that
     deciding what a filing is worth, so what it publishes here is folded into the identity a
     resume checks itself against.
+
+    ``grade`` is what its grader is. An environment that brings its own terminal brings its own
+    verdict with it, and one that does not is scored by a stand-in that reaches no world, so this
+    is the fact a generation checks before it may promise an agent the score.
     """
 
     canonicalization_version: str
     activities: List[Any]
     configuration_digest: Optional[str]
     route: WorldRoute
+    grade: GradeIdentity = KERNEL_STAND_IN_GRADE
 
 # The version a generation declares for the canonical submission its terminal captures when the
 # environment does not declare one of its own. The capture belongs to the environment, so the name
@@ -378,6 +416,11 @@ def stream_start(
     attempt_deadline_ms: int = 0,
     canonicalization_version: str = CANONICALIZATION_VERSION,
     environment_digest: Optional[str] = None,
+    profile: str = ORDINARY,
+    grade: GradeIdentity = KERNEL_STAND_IN_GRADE,
+    dispositions: Optional[Union[Sequence[PayloadDisposition], DispositionsFor]] = None,
+    experiment: str = "",
+    families: Sequence[MatchedFamily] = (),
 ) -> StreamStart:
     """Return a generation that serves ``spec``.
 
@@ -405,6 +448,33 @@ def stream_start(
     ``attempt_deadline_ms`` is how long an attempt may stay active before the generation ends it.
     It is off by default, because how long a run is willing to wait on one attempt is a decision
     about that run and not about this transport.
+
+    ``profile`` is what kind of run this is, and it decides how an unspecified payload policy is
+    read. An ordinary generation stamps every obligation with the honest policy before it is
+    created and every silent position with the reason it delivers nothing, so an ordinary run
+    cannot be blinded by an omission: there is no omission left by the time the generation
+    exists. An experiment has no default at all. It is created from the dispositions it
+    registered and refused where one of its positions is uncovered, so an experiment cannot be
+    unblinded by an omission either. Both mistakes are refusals rather than quiet resolutions.
+
+    ``grade`` is what the environment said its grader is, and honesty is a claim about that
+    number. A generation over an environment scored by a stand-in cannot deliver the honest
+    policy, and asking for one is refused here rather than discovered in a receipt.
+
+    ``dispositions`` is what an experiment registered. A row names an attempt, and the attempts
+    are minted here, so a registration that names them is given as a function of the roster and
+    called with the rows once they exist, exactly as a plan that gates anything is.
+
+    ``experiment`` is which experiment registered them, and an experiment generation is not
+    built without one. A profile is a word, and this is what makes it a fact: the name goes into
+    the generation with the digest of the rows it registered, so a run cannot call itself an
+    experiment with nothing behind the label and cannot carry a registration made over other
+    answers. An ordinary generation names none and is recorded as stamped from the platform
+    default instead.
+
+    ``families`` are the matched arms those rows are cells of, where an experiment declares
+    them. Each fixes the group its cells are built in and the byte count they come to, and a
+    cell that comes back as anything else ends the attempt rather than being served.
 
     What comes back is a generation the stream would accept, because the same check the stream
     makes at start is made here, where the caller composing a run is the one who reads it.
@@ -439,6 +509,10 @@ def stream_start(
         items, plan, without_payload=[items[position].attempt_id for position in without_payload]
     )
     check_release(plan, roster, evaluation_only=evaluation_only)
+    registered = dispositions(roster) if callable(dispositions) else dispositions
+    resolved = _resolved_dispositions(
+        profile, roster, plan.creates_obligations, registered, grade, experiment, list(families)
+    )
     return StreamStart(
         configuration_hash=_configuration_hash(spec, terminal, environment_digest),
         consumer_claim_hash=claim_hash,
@@ -457,6 +531,134 @@ def stream_start(
         assignments=roster,
         evaluation_only=evaluation_only,
         attempt_deadline_ms=attempt_deadline_ms,
+        profile=profile,
+        grade=grade,
+        dispositions=resolved,
+        provenance=_provenance(profile, resolved, experiment),
+        families=list(families),
+    )
+
+
+def _provenance(
+    profile: str, rows: Sequence[PayloadDisposition], experiment: str
+) -> Optional[PolicyProvenance]:
+    """Return what entitles this generation to the profile it is being built under.
+
+    An experiment names itself and the rows it registered. An ordinary run names the platform
+    default it was stamped from and the same rows. Both are the record of who decided, and the
+    digest is what stops that record from being moved onto another set of answers.
+    """
+    if profile == EXPERIMENT:
+        return PolicyProvenance(
+            authority=REGISTERED,
+            roster_digest=roster_digest(list(rows)),
+            experiment_id=experiment,
+        )
+    return PolicyProvenance(
+        authority=PLATFORM_DEFAULT,
+        roster_digest=roster_digest(list(rows)),
+        descriptor_digest=HONEST_V1_DIGEST,
+    )
+
+
+def _resolved_dispositions(
+    profile: str,
+    roster: Sequence[Assignment],
+    creates_obligations: bool,
+    registered: Optional[Sequence[PayloadDisposition]],
+    grade: GradeIdentity,
+    experiment: str,
+    families: List[MatchedFamily],
+) -> List[PayloadDisposition]:
+    """Return one resolved disposition per roster row, or refuse to build the generation.
+
+    The two profiles differ in one way and it is the whole of the design. Under the ordinary
+    profile there is nothing to register: every row that owes a payload is stamped with the
+    honest policy and every row that owes none is stamped with the reason its roster gave, both
+    marked as the platform's conversion so a reader can see they were not chosen. A caller that
+    hands registered rows to an ordinary run is refused, because concealment is something a run
+    declares itself to be doing rather than something it passes in.
+
+    Under the experiment profile there is nothing to convert. The rows are the ones the
+    experiment registered, they are checked against the roster and against the environment's
+    grader, and a position nobody covered is a generation that does not get created.
+    """
+    if profile == ORDINARY:
+        if registered:
+            raise ValueError(
+                "an ordinary generation delivers the honest policy against every payload it "
+                "owes, so a registered disposition belongs to an experiment run rather than to "
+                "this one"
+            )
+        if experiment:
+            raise ValueError(
+                f"this generation is being built as {ORDINARY} under the experiment "
+                f"{experiment!r}, and a run an experiment registered is an {EXPERIMENT} run"
+            )
+        rows = [_stamped(row, creates_obligations) for row in roster]
+    elif profile == EXPERIMENT:
+        if registered is None:
+            raise ValueError(
+                "an experiment generation has no default policy, so it is created from the "
+                "dispositions it registered and not from an omission"
+            )
+        if not experiment:
+            raise ValueError(
+                "an experiment generation says which experiment registered it, because a "
+                "profile nothing stands behind is a word rather than a fact about the run"
+            )
+        rows = list(registered)
+    else:
+        raise ValueError(f"a generation is created as {ORDINARY} or {EXPERIMENT}, not {profile!r}")
+    obligations = {
+        row.attempt_id: row.payload_position
+        for row in roster
+        if row.creates_payload_obligation and creates_obligations
+    }
+    silent = {
+        row.attempt_id: row.payload_position
+        for row in roster
+        if row.attempt_id not in obligations
+    }
+    try:
+        check_dispositions(
+            rows,
+            profile=profile,
+            obligations=obligations,
+            silent=silent,
+            grade=grade,
+            provenance=_provenance(profile, rows, experiment),
+            families=families,
+        )
+    except PolicyViolation as error:
+        raise ValueError(str(error)) from error
+    return rows
+
+
+def _stamped(row: Assignment, creates_obligations: bool) -> PayloadDisposition:
+    """Return the disposition an ordinary run converts one roster row's silence into.
+
+    A row that owes a payload delivers the honest policy in its one cell. A row that owes none
+    withholds, under the reason the roster already implies: a plan that releases nothing, or a
+    position this generation was composed to deliver nothing against. Neither is an absence in
+    the record. What separates an ordinary run that delivers nothing from an experiment that
+    conceals is that this row says which of the two it is and who decided.
+    """
+    if creates_obligations and row.creates_payload_obligation:
+        return PayloadDisposition(
+            attempt_id=row.attempt_id,
+            payload_position=row.payload_position,
+            kind=DELIVER,
+            policy_digest=policy_digest(HONEST_V1),
+            cell=HONEST_V1.cells[0],
+            resolution_source=PLATFORM_DEFAULT,
+        )
+    return PayloadDisposition(
+        attempt_id=row.attempt_id,
+        payload_position=row.payload_position,
+        kind=WITHHOLD,
+        reason=NO_RELEASE if not creates_obligations else NO_OBLIGATION,
+        resolution_source=PLATFORM_DEFAULT,
     )
 
 
@@ -561,18 +763,11 @@ class _LeaseHeld:
     nothing else can make it land. The grant is written down before it is asked for, so one
     whose answer was lost is still given back by name, and it keeps the observation once the
     world has changed, because that observation exists nowhere else.
-
-    ``finalize`` is the ending the call that landed here owes, when it was the one that spent
-    the last of the budget. It is built once, before the release goes, and kept by value: the
-    step is spent where the world changed, so the ending is part of what this call has to
-    finish rather than something a later one could decide to do instead. A fresh request each
-    time would be a second ending rather than the same one arriving again.
     """
 
     owner: bytes
     call: EnvironmentCall
     result: Optional[ToolResult] = None
-    finalize: Optional[FinalizeRequest] = None
 
 
 @dataclass(frozen=True)
@@ -640,10 +835,14 @@ class StreamGateway:
     released where the operation settles, and one recovery record says what has been left open
     and which call may close it.
 
-    It also counts the environment's steps. The step budget belongs to the environment, and the
-    calls that spend it never reach the stream, so this is the only layer that can see the
+    It also enforces the environment's step budget. The budget belongs to the environment, and
+    the calls that spend it never reach the stream, so this is the only layer that can see the
     budget run out. When it does, the attempt is ended through the stream that owns it rather
-    than inside the episode, which is what keeps the ending a fact the ledger holds.
+    than inside the episode, which is what keeps the ending a fact the ledger holds. What has
+    been spent of the budget is not this gateway's own count, though: the stream authorizes
+    every one of those calls and counts them, and a gateway built over a generation somebody
+    else was serving reads that count with the rest of what it routes by. A budget a process
+    keeps is a budget the next process starts over.
     """
 
     def __init__(
@@ -685,10 +884,16 @@ class StreamGateway:
         self._terminal = terminal.name
         self._cursor = initial_cursor
         self._active: FrozenSet[str] = frozenset()
-        # The env's step budget, and what this attempt has spent of it. The budget is the one
-        # the contract publishes, so an env that declares none is served without a cap.
+        # The env's step budget, and what each attempt has spent of it. The budget is the one
+        # the contract publishes, so an env that declares none is served without a cap. The
+        # spending is the stream's own count of the calls it granted, refreshed from it on every
+        # call like the cursor and the active attempts are, and it starts empty for the same
+        # reason they start empty: what this gateway has not been told yet, it does not know.
         self._step_cap = spec.horizon
-        self._steps = 0
+        self._spent: Dict[str, int] = {}
+        # The ending each attempt that ran out of steps owes, composed by the call that found no
+        # budget left and kept until that ending has landed.
+        self._endings: Dict[str, FinalizeRequest] = {}
         self._transcript: List[bytes] = []
         self._blobs = blobs
         self._closed = False
@@ -915,14 +1120,22 @@ class StreamGateway:
         it settles, so an attempt that ended in between is not one it still reaches.
 
         The call that spends the last of the env's step budget is still an ordinary call: it is
-        dispatched, it is committed, and its observation comes back. What happens after it is
-        that the attempt is ended, so the next call to this tool is routed nowhere and the next
-        pull is what says the stream has moved on.
+        dispatched, it is committed, and its observation comes back, and the attempt is still
+        the attempt. The budget is how many environment actions an attempt gets, and filing is
+        not one of them: an environment that promises six moves and asks for a terminal after
+        them would otherwise have every full-length play ended without a filing, unsealed and
+        ungraded, on the move its own contract told the agent to make. So spending the last of
+        the budget leaves the attempt terminal-call-only, and the call after that is the one with
+        nothing behind it: it reaches no world, ends the attempt, and is refused.
         """
         attempt_id, native = self._unwrap(arguments)
         owed = await self._resumed(key)
         if owed is not None:
             return owed
+        overspent = self._overspent_request(attempt_id)
+        if overspent is not None:
+            await self._budget_spent(overspent)
+            raise self._refuse("invalid_attempt")
         episode = self._episode
         if episode is None:  # pragma: no cover - an active attempt has a world by now
             raise self._refuse("invalid_attempt")
@@ -942,31 +1155,50 @@ class StreamGateway:
         # presented Payload, so a sidecar carrying it here would be a second channel that
         # no offer, presentation, or delivery count could see.
         result = ToolResult(content=observation.content)
-        # The step is spent where the world changed, and the attempt is ended after the
-        # generation has been given back, because ending it is an Update like any other and the
-        # stream holds itself against one while an environment call is out.
-        self._steps += 1
-        # Both of those are durable operations, and either answer can be lost. So the record
-        # holds the observation and the ending together until both have settled: a call that
-        # got no answer to its release is one whose ending has not run, and a call that got no
-        # answer to its ending must not go back to the world for a step it already spent.
-        landed = _LeaseHeld(
-            owner=key,
-            call=held.call,
-            result=result,
-            finalize=self._spent_request(attempt_id),
-        )
+        # The step is spent where the world changed. The stream counted the grant, so this is the
+        # same step written down twice; keeping it here means the call after this one does not
+        # have to ask again before it can refuse.
+        self._spent[attempt_id] = self._spent.get(attempt_id, 0) + 1
+        # The release is a durable operation and its answer can be lost, so the record holds the
+        # observation until it has settled: a call that got no answer to its release is one
+        # nothing else can free the generation for, and the observation exists nowhere else.
+        landed = _LeaseHeld(owner=key, call=held.call, result=result)
         self._recovery = landed
         await self._given_back(landed)
         return result
 
-    def _spent_request(self, attempt_id: str) -> Optional[FinalizeRequest]:
-        """The ending this call owes, if the step it just spent was the last one it had."""
-        if self._step_cap is None or self._steps < self._step_cap:
+    def _overspent_request(self, attempt_id: str) -> Optional[FinalizeRequest]:
+        """The ending this call owes, if there is no step left for it to spend.
+
+        The ending belongs to the call that had no budget rather than to the one that spent the
+        last of it. An attempt out of environment steps is not an attempt that is over: it can
+        still be filed, and under this protocol filing is a call to the stream rather than a step
+        in the world. What is over is the world work, so the first call that would have taken a
+        step it does not have is where the attempt ends, and it takes no step to do it.
+
+        It is composed once and kept. One logical request is one ending however many times it
+        has to be sent, so the call whose ending got no answer sends that ending again rather
+        than composing a second one the stream would read as another. An attempt this transport
+        has stopped serving is owed no ending at all: the one it owed has landed, and a call
+        naming it now is refused by the stream the way every other call to an attempt that is
+        over is.
+
+        What has been spent is the stream's count and not this gateway's own, and the call
+        reading it here has just refreshed it. So a replacement transport over a generation that
+        already spent its budget refuses on its first call rather than on its horizon-plus-first,
+        and the declared horizon stays a bound on the attempt rather than on the process.
+        """
+        if self._step_cap is None or self._spent.get(attempt_id, 0) < self._step_cap:
             return None
-        return FinalizeRequest(
-            request_id=_opaque(), attempt_id=attempt_id, reason=STEP_CAP
-        )
+        if attempt_id not in self._active:
+            return None
+        ending = self._endings.get(attempt_id)
+        if ending is None:
+            ending = FinalizeRequest(
+                request_id=_opaque(), attempt_id=attempt_id, reason=STEP_CAP
+            )
+            self._endings[attempt_id] = ending
+        return ending
 
     async def _granted(self, held: _LeaseHeld) -> None:
         """Ask the stream to hold the generation while one environment call happens.
@@ -1001,19 +1233,11 @@ class StreamGateway:
 
         An answer settles it either way. A refusal is the stream saying it is holding nothing
         for this call, which is as decisive as the lease it hands back when it was.
-
-        The ending goes next, in that order and not the other, because it is an Update and the
-        stream refuses every one of those while it is holding a grant. The record is not closed
-        until it has landed: an ending whose answer was lost is the same ending sent again,
-        which the stream answers with the receipt it already wrote or with the refusal that
-        says the attempt is already over.
         """
         try:
             await self._sent(self._stream.end_environment_call(held.call))
         except ToolError:
             pass
-        if held.finalize is not None:
-            await self._budget_spent(held.finalize)
         self._recovery = _Idle()
 
     async def _given_back_quietly(self, held: _LeaseHeld) -> None:
@@ -1272,17 +1496,25 @@ class StreamGateway:
         return result
 
     def _adopt(self, state: StreamState) -> None:
-        """Take the three facts this gateway routes by out of the stream that owns them.
+        """Take the four facts this gateway routes by out of the stream that owns them.
 
         The cursor every request carries, the attempts an ordinary call may reach, and whether
         the generation is still open. An attempt is reachable exactly while the stream says it
         is active, which is the same condition under which the stream would accept work on it.
+
+        The fourth is how much of the environment's budget each attempt has spent. The stream
+        grants every call that spends one and counts the grants, which makes its count the one
+        that survives this process: a gateway built over a live generation adopts what has been
+        spent rather than deciding the attempt has spent nothing. The count is taken whole and
+        not merged, because the stream is also where a restored checkpoint says the world is
+        back where it started and the budget with it.
         """
         self._cursor = state.cursor
         self._closed = state.generation_state != _OPEN
         self._active = frozenset(
             attempt for attempt, value in state.attempts.items() if value == _ACTIVE
         )
+        self._spent = dict(state.environment_calls)
 
     def _routed(self, attempt_id: str) -> None:
         """Refuse a call that does not name an attempt this transport is serving."""
@@ -1290,20 +1522,26 @@ class StreamGateway:
             raise self._refuse("invalid_attempt")
 
     async def _budget_spent(self, request: FinalizeRequest) -> None:
-        """End the attempt whose step budget is spent, through the stream that owns it.
+        """End the attempt that has no step left, through the stream that owns it.
 
-        The routing handle is dropped first, so the attempt stops being one this transport
-        serves whatever the stream answers. A refusal saying it is already over is the answer
-        this was asking for and is not raised: it means the generation's own deadline reached
-        the attempt first, or this exact request landed and its answer was lost, and neither is
-        something the model may read as a tool failure.
+        A refusal saying it is already over is the answer this was asking for and is not raised:
+        it means the generation's own deadline reached the attempt first, or this exact request
+        landed and its answer was lost, and neither is something the model may read as a tool
+        failure.
+
+        The routing handle is dropped after the ending has settled, and not before. An ending is
+        a durable operation whose answer can go missing, and the call that owes one is the call
+        that will be made again: an attempt this transport had already stopped serving would
+        refuse that retry over the routing rather than finishing what it left open, and the
+        ending would be owed by nobody. The request is the one the first call composed, so the
+        retry is the same ending arriving again rather than a second one.
         """
-        self._active = self._active - {request.attempt_id}
         try:
             await self._stream.finalize(request)
         except Exception as error:  # noqa: BLE001 - the code decides, and anything else is a fault
             if protocol_error_code(error) not in _ALREADY_OVER:
                 raise
+        self._active = self._active - {request.attempt_id}
 
     # Requests, built before they are sent.
 
@@ -1546,8 +1784,10 @@ class StreamGateway:
         self._cursor = cursor
         if message.kind == "task" and message.attempt_id is not None:
             self._active = self._active | {message.attempt_id}
-            # The budget is per attempt, so the count starts where the attempt does.
-            self._steps = 0
+            # The budget is per attempt, so the count starts where the attempt does. The stream
+            # starts it there too, on the same Presentation, and this is that fact arriving one
+            # call early rather than a second opinion about it.
+            self._spent[message.attempt_id] = 0
         elif message.kind == "seal_ack" and message.attempt_id is not None:
             self._active = self._active - {message.attempt_id}
         elif message.kind == "done":
@@ -1818,11 +2058,14 @@ async def open_gateway(
     _ended_by_the_stream(episode)
     spec = episode.describe()
     terminal = terminal_manifest(spec)
+    grade = environment.grade if environment is not None else environment_grade(episode)
     composed = start or stream_start(
         spec,
         terminal,
         claim_hash=sha256(secrets.token_bytes(32)).hexdigest(),
+        grade=grade,
     )
+    _check_honest_over(composed, grade)
     if environment is not None:
         composed = replace(
             composed,
@@ -1850,6 +2093,7 @@ async def open_gateway(
         blobs = FilesystemBlobStore.under(run_directory)
         composed = replace(composed, blob_root=str(blobs.root))
         prepare_run_directory(run_directory)
+        install_policies(blobs, composed)
         abandoned = staged_generation(run_directory)
         if abandoned is not None:
             await discard_stream(client, workflow_id=abandoned.workflow_id)
@@ -1885,6 +2129,78 @@ async def open_gateway(
     )
 
 
+def _check_honest_over(composed: StreamStart, grade: GradeIdentity) -> None:
+    """Refuse a composition whose declared grader is not the one it is being opened over.
+
+    A controller composes a generation where the environment is not, and this call is where the
+    two meet. The composition carries the grader it was built over, that claim is inside the
+    generation's identity, and the honest body publishes what that grader produced. So the claim
+    has to be the environment's own, whole: a generation composed for one grader and opened over
+    another commits the second grader's numbers under the first one's name, and its record and
+    its bodies then describe measurements nobody took.
+
+    Equality is the check rather than compatibility, because every field of the identity is a
+    fact the record depends on: which grader, which version of it, whether its number is the
+    environment's own, which measure the headline is, and which numbers it may publish beside it.
+    A generation that resolved nothing to a policy publishing the grade is making no claim, and
+    the stand-in it was composed over is caught here as the stand-in it is.
+    """
+    if composed.profile == LEGACY:
+        # A start carrying no profile is a decoded history rather than a composition, and it
+        # claims no grader to be held to. What refuses to create one is the call that starts a
+        # generation, which is where a run created now is told to say what it delivers.
+        return
+    declared = composed.grade or KERNEL_STAND_IN_GRADE
+    if declared != grade:
+        raise ValueError(
+            f"this generation was composed over {declared.grader_id}/{declared.grader_version} "
+            f"and is being opened over {grade.grader_id}/{grade.grader_version}, and what an "
+            "honest body publishes is the grade the environment it ran in produced"
+        )
+    if not grade.stand_in:
+        return
+    for row in composed.dispositions:
+        policy = POLICIES.get(row.policy_digest or "")
+        if row.kind == DELIVER and policy is not None and policy.exposure == HONEST:
+            raise ValueError(
+                f"this generation delivers {policy.policy_name}, which publishes the "
+                f"environment's grade, and this environment is scored by {grade.grader_id}, "
+                "which is a stand-in"
+            )
+
+
+def install_policies(blobs: FilesystemBlobStore, composed: StreamStart) -> None:
+    """Install the preimage of every policy this generation names, and prove it went in.
+
+    A digest says that something was hashed. What an audit needs years later is the something,
+    so the bytes the digest names go into the run's own store beside the blobs its presentations
+    reference, and a reader with the directory can say what a body was allowed to contain
+    without this package being installed.
+
+    They are required objects rather than a convenience. The generation counts each of them
+    among the references its history cites, so a later owner reads them back before it may
+    continue the run, and a store that cannot produce one is a directory whose record says what
+    its bodies were allowed to contain and cannot produce the saying. So the write is checked
+    here as well: an object installed under a name other than the one this generation resolved
+    would satisfy nothing that reads it back.
+
+    The set covers every cell of every matched family this generation declares as well as the
+    rows it serves. A leg builds one cell of an arm and never renders the counterpart it is
+    matched against, so a directory holding only the served descriptor can say what this body
+    was allowed to contain and not what the comparison was between.
+    """
+    for digest in descriptor_digests(composed.dispositions, composed.families):
+        policy = POLICIES.get(digest)
+        if policy is None:
+            continue
+        installed = blobs.put(policy_preimage(policy), media_type="application/json")
+        if installed.sha256 != digest:
+            raise ValueError(
+                f"the preimage of {policy.policy_name} installed under {installed.sha256[:16]} "
+                f"and this generation resolved to {digest[:16]}"
+            )
+
+
 def _seals_its_own_worlds(episode: ServedEpisode) -> bool:
     """True iff this episode's environment brings its own terminal."""
     return getattr(episode.env, "protocol_v2_terminal", None) is not None
@@ -1907,12 +2223,50 @@ def environment_terminal(episode: ServedEpisode) -> EnvironmentTerminal:
     """
     route = WorldRoute()
     brings_own = getattr(episode.env, "protocol_v2_terminal", None)
+    # Asked on both branches, because the answer is refused where it does not go with a terminal
+    # of the environment's own: an environment graded by the kernel's stand-in cannot come to
+    # claim a grader by declaring one on the half of the boundary that does not produce numbers.
+    grade = environment_grade(episode)
     if brings_own is None:
         return EnvironmentTerminal(
-            CANONICALIZATION_VERSION, list(kernel_activities()), None, route
+            CANONICALIZATION_VERSION, list(kernel_activities()), None, route, grade
         )
     version, activities, digest = brings_own(route)
-    return EnvironmentTerminal(version, list(activities), digest, route)
+    return EnvironmentTerminal(version, list(activities), digest, route, grade)
+
+
+def environment_grade(episode: ServedEpisode) -> GradeIdentity:
+    """Ask this episode's environment what its grader is.
+
+    An environment that says nothing is scored by the kernel's stand-in, and that is what comes
+    back. The default is the conservative one on purpose: an environment cannot come to publish
+    its score to an agent by forgetting to answer, only by saying what its grader is.
+
+    An environment that says its grader is its own and brings no terminal of its own is refused
+    here. The two halves are one fact: an attempt over such an environment is sealed and graded
+    by the kernel's Activities, so the number a generation over it commits is a fact about the
+    shape of a filing whatever the environment declares. A generation composed over that claim
+    would be honest by its record and would fail every seal, because the identity arriving with
+    the score is the stand-in's. The refusal names the half that is missing.
+    """
+    declared = getattr(episode.env, "protocol_v2_grade", None)
+    if declared is None:
+        return KERNEL_STAND_IN_GRADE
+    grade = declared()
+    if not isinstance(grade, GradeIdentity):
+        raise ValueError(
+            f"this environment answered its grader with {type(grade).__name__}, and what a "
+            "generation is built over is a declared grade identity"
+        )
+    if not grade.stand_in and not _seals_its_own_worlds(episode):
+        raise ValueError(
+            f"this environment says it is scored by {grade.grader_id}/{grade.grader_version} "
+            "and brings no terminal of its own, so its attempts are sealed and graded by the "
+            "kernel's stand-in and no number this environment took would reach a seal: an "
+            "environment whose grade is its own declares protocol_v2_terminal beside "
+            "protocol_v2_grade"
+        )
+    return grade
 
 
 async def run_stdio_v2(

@@ -80,10 +80,12 @@ from shogym.serve.protocol_v2.kernel.activities import (  # noqa: E402
     SEAL_ATTEMPT,
     VERIFY_BLOBS,
 )
+from shogym.serve.protocol_v2.gateway import install_policies  # noqa: E402
 from shogym.serve.protocol_v2.rundir import (  # noqa: E402
     ResumeRefused,
     create_run_directory,
 )
+from tests._fixtures.policy_rows import registering_the_receipt  # noqa: E402
 
 CLAIM_HASH = "d" * 64
 BLOB = "e" * 64
@@ -101,29 +103,31 @@ def oid(value: int) -> str:
 
 def make_start(*, version: int = 2) -> StreamStart:
     """One task, every public identifier fixed before anything is served."""
-    return StreamStart(
-        configuration_hash="c" * 64,
-        consumer_claim_hash=CLAIM_HASH,
-        initial_cursor=oid(1),
-        done_message_id=DONE_ID,
-        id_key_hex="ab" * 32,
-        hidden_execution_id="execution-1",
-        canonicalization_version="kernel.1",
-        terminal_tool=TerminalTool(
-            public_tool_name="submit", native_terminal_name="submit", argument_names=["answer"]
-        ),
-        tasks=[
-            TaskItem(
-                task_position=0,
-                attempt_id=ATTEMPT,
-                task_message_id=TASK_ID,
-                ack_message_id=ACK_ID,
-                payload_position=0,
-                payload_message_id=oid(0x103),
-                body="file the report",
-            )
-        ],
-        protocol_version=version,
+    return registering_the_receipt(
+        StreamStart(
+            configuration_hash="c" * 64,
+            consumer_claim_hash=CLAIM_HASH,
+            initial_cursor=oid(1),
+            done_message_id=DONE_ID,
+            id_key_hex="ab" * 32,
+            hidden_execution_id="execution-1",
+            canonicalization_version="kernel.1",
+            terminal_tool=TerminalTool(
+                public_tool_name="submit", native_terminal_name="submit", argument_names=["answer"]
+            ),
+            tasks=[
+                TaskItem(
+                    task_position=0,
+                    attempt_id=ATTEMPT,
+                    task_message_id=TASK_ID,
+                    ack_message_id=ACK_ID,
+                    payload_position=0,
+                    payload_message_id=oid(0x103),
+                    body="file the report",
+                )
+            ],
+            protocol_version=version,
+        )
     )
 
 
@@ -783,6 +787,7 @@ async def test_a_blob_is_verified_before_an_event_may_reference_it(
     """A reference to bytes nobody installed is a reference to nothing, and is refused."""
     root = tmp_path / "run"
     start = replace(make_start(), blob_root=str(FilesystemBlobStore.under(root).root))
+    install_policies(FilesystemBlobStore.under(root), start)
     run = create_run_directory(
         root,
         workflow_id="stream/resume/blobs",
@@ -834,6 +839,7 @@ async def test_a_resume_reads_what_the_committed_events_reference(
     """
     root = tmp_path / "run"
     start = replace(make_start(), blob_root=str(FilesystemBlobStore.under(root).root))
+    install_policies(FilesystemBlobStore.under(root), start)
     run = create_run_directory(
         root,
         workflow_id="stream/resume/committed",
@@ -879,6 +885,7 @@ async def test_a_resume_reads_what_committed_while_it_was_reading(
     """
     root = tmp_path / "run"
     start = replace(make_start(), blob_root=str(FilesystemBlobStore.under(root).root))
+    install_policies(FilesystemBlobStore.under(root), start)
     run = create_run_directory(
         root,
         workflow_id="stream/resume/reading",
@@ -912,7 +919,10 @@ async def test_a_resume_reads_what_committed_while_it_was_reading(
         wait_blob = run.blobs.put(b"the transcript the wait was presented in").sha256
         await caller.present(await caller.pull(), transcript_blob=task_blob)
 
-        pause_on.append((task_blob,))
+        # The preimage of the policy this generation resolved to is a reference from the start,
+        # so it is in every set a claim reads.
+        descriptor = start.dispositions[0].policy_digest or ""
+        pause_on.append((descriptor, task_blob))
         claimant = StreamHandle(caller.stream.handle)
         claim = dict(
             configuration_hash=configuration_hash(start),
@@ -931,10 +941,19 @@ async def test_a_resume_reads_what_committed_while_it_was_reading(
         run.blobs.path_for(wait_blob).write_bytes(b"something else under that name")
         release.set()
 
-        # The first read is the task presentation's, the second is the claim's, the third is
-        # the wait presentation's, and the fourth is the claim reading what it had not read.
+        # The first read is the creating claim's, which is the descriptor and nothing else: a
+        # generation that cannot produce the bytes its own record names is refused before it
+        # serves rather than at the resume that noticed. The second is the task presentation's,
+        # the third is the resuming claim's, the fourth is the wait presentation's, and the fifth
+        # is that claim reading what it had not read.
         assert await refused(claiming) == "invalid_message"
-        assert reads == [(task_blob,), (task_blob,), (wait_blob,), (wait_blob,)]
+        assert reads == [
+            (descriptor,),
+            (task_blob,),
+            (descriptor, task_blob),
+            (wait_blob,),
+            (wait_blob,),
+        ]
         # Nothing moved, so the owner that has it still has it.
         state = await caller.stream.stream_state()
         assert (state.ownership_epoch, state.ownership_claims) == (1, 1)
@@ -944,7 +963,7 @@ async def test_a_resume_reads_what_committed_while_it_was_reading(
         run.blobs.path_for(wait_blob).write_bytes(b"the transcript the wait was presented in")
         receipt = await claimant.claim_ownership(**claim)
         assert receipt.ownership_epoch == 2
-        assert reads[-1] == (task_blob, wait_blob)
+        assert reads[-1] == (descriptor, task_blob, wait_blob)
 
 
 @pytest.mark.network
@@ -961,6 +980,7 @@ async def test_a_directory_resume_is_held_to_what_its_new_owner_serves(
     """
     root = tmp_path / "run"
     start = replace(make_start(), blob_root=str(FilesystemBlobStore.under(root).root))
+    install_policies(FilesystemBlobStore.under(root), start)
     create_run_directory(
         root,
         workflow_id="stream/resume/configuration",

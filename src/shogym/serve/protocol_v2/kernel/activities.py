@@ -1,9 +1,15 @@
-"""The Activities the stream depends on: three stand-ins, and one that is not.
+"""The Activities the stream depends on: two stand-ins, and two that are not.
 
-The seal transaction's three compute deterministically from their inputs, hold no state between
-calls, and reach no environment or grader. What is not a stand-in is their shape: each already
-carries the attempt ID, the seal ID, the hashes, the protocol version, and the blob references
-a real implementation needs, so replacing a body here does not move a boundary.
+The seal and the grade compute deterministically from their inputs, hold no state between calls,
+and reach no environment. What is not a stand-in is their shape: each already carries the attempt
+ID, the seal ID, the hashes, the protocol version, and the blob references a real implementation
+needs, so replacing a body here does not move a boundary. The grade also says what it is, because
+a generation that publishes its number to an agent has to be able to tell that the number is a
+fact about the shape of a filing rather than about the work in it.
+
+:func:`generate_payload_bundle_activity` is real. What a body may contain is a registered policy
+rather than a convention, so the request names the policy and this renders what that policy
+declares, echoing the descriptor and the renderer back with the candidate.
 
 :func:`verify_blobs_activity` is real. Verifying a reference means reading the object and
 hashing it, and the workflow may not open a file, so the read lives here and the decision the
@@ -21,6 +27,7 @@ from pathlib import Path
 from typing import Optional
 
 from temporalio import activity
+from temporalio.exceptions import ApplicationError
 
 from shogym.serve.protocol_v2 import (
     BlobRef,
@@ -28,6 +35,15 @@ from shogym.serve.protocol_v2 import (
     Payload,
     blob_ref,
     visible_bytes,
+)
+from shogym.serve.protocol_v2.policy import (
+    KERNEL_MATCH_GROUP,
+    KERNEL_STAND_IN_GRADE,
+    LEGACY_PLACEHOLDER_V1,
+    POLICIES,
+    PayloadPolicy,
+    PolicyViolation,
+    render_body,
 )
 from shogym.serve.protocol_v2.kernel.messages import (
     BlobsVerified,
@@ -47,8 +63,10 @@ GENERATE_PAYLOAD_BUNDLE = "shogym.protocol_v2.GeneratePayloadBundleActivity"
 VERIFY_BLOBS = "shogym.protocol_v2.VerifyBlobsActivity"
 
 KERNEL_CELL = "graded"
-KERNEL_MATCH_GROUP = "kernel"
-KERNEL_RENDERER = "kernel-receipt-1"
+# The renderer a request with no policy in it gets, which is the one a legacy history recorded.
+# It is read off the policy rather than repeated, so the name a build serves under and the name
+# the policy declares cannot drift apart.
+KERNEL_RENDERER = LEGACY_PLACEHOLDER_V1.renderer_id
 
 
 @activity.defn(name=SEAL_ATTEMPT)
@@ -89,6 +107,7 @@ async def grade_attempt_activity(request: GradeAttemptInput) -> GradeAttemptResu
         score=score,
         decode_state=decode_state,
         evidence=_installed(request.blob_root, f"{request.seal_id}:{decode_state}"),
+        grade=KERNEL_STAND_IN_GRADE,
     )
 
 
@@ -105,8 +124,24 @@ async def generate_payload_bundle_activity(request: GeneratePayloadBundleInput) 
 
     The measurements are the point. A family gate compares complete model-visible byte counts
     across cells, so the bundle reports the serialized result's hash and length, not the body's.
+
+    Which body is built is the request's to say and never this function's. The policy the
+    obligation was resolved to names the renderer, and a digest this build does not implement is
+    a failure it will not be retried on: a Worker that cannot render what a generation asked for
+    must not serve what it can render instead.
     """
-    body = f"receipt {request.payload_position} for {request.submission_digest[:16]}"
+    policy = _renderer_for(request.policy_digest)
+    try:
+        body = render_body(
+            policy,
+            grade=request.public_grade,
+            payload_position=request.payload_position,
+            submission_digest=request.submission_digest,
+        )
+    except PolicyViolation as violation:
+        raise ApplicationError(
+            str(violation), type="PolicyViolation", non_retryable=True
+        ) from violation
     result = Payload(
         message_id=request.payload_message_id,
         attempt_id=request.attempt_id,
@@ -114,13 +149,15 @@ async def generate_payload_bundle_activity(request: GeneratePayloadBundleInput) 
     )
     serialized = visible_bytes(result)
     candidate = PayloadCandidate(
-        cell=KERNEL_CELL,
-        renderer_id=KERNEL_RENDERER,
+        cell=request.cell or KERNEL_CELL,
+        renderer_id=policy.renderer_id,
         match_group=KERNEL_MATCH_GROUP,
         body=body,
         inner_sha256=sha256(body.encode("utf-8")).hexdigest(),
         visible_sha256=sha256(serialized).hexdigest(),
         visible_byte_count=len(serialized),
+        renderer_version="" if not request.policy_digest else policy.renderer_version,
+        policy_digest=request.policy_digest,
     )
     return PayloadBundle(
         attempt_id=request.attempt_id,
@@ -128,6 +165,26 @@ async def generate_payload_bundle_activity(request: GeneratePayloadBundleInput) 
         submission_digest=request.submission_digest,
         candidates=[candidate],
     )
+
+
+def _renderer_for(digest: str) -> PayloadPolicy:
+    """Return the policy a request names, and refuse one this build cannot render.
+
+    An empty digest is a request written before a generation carried a policy. It renders the
+    placeholder, which is the body that history recorded, so an Activity a stopped generation
+    left scheduled comes back with the bytes its own run was going to serve.
+    """
+    if not digest:
+        return LEGACY_PLACEHOLDER_V1
+    policy = POLICIES.get(digest)
+    if policy is None:
+        raise ApplicationError(
+            f"this build implements no payload policy under {digest[:16]}, and a renderer it "
+            "could substitute is not a renderer this generation asked for",
+            type="UnknownPayloadPolicy",
+            non_retryable=True,
+        )
+    return policy
 
 
 @activity.defn(name=VERIFY_BLOBS)

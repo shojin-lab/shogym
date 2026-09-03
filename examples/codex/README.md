@@ -1,9 +1,9 @@
 # Codex quickstart
 
-Point the `codex` CLI you already use at **one shogym task, served over MCP**. The agent pulls
-the work, plays it with the env's own tools, ends it with the tool that ends it, and pulls again
-until the stream says it is done. The stream seals and scores the attempt itself, into a record
-the agent never sees.
+Point the `codex` CLI you already use at **one shogym task, served over MCP**. The agent pulls the
+work, plays it with the env's own tools, ends it with the tool that ends it, and pulls again until
+the stream says it is done. The stream seals and scores the attempt itself, and tells the agent
+what it scored.
 
 Three moves, and the whole quickstart is these three:
 
@@ -11,8 +11,10 @@ Three moves, and the whole quickstart is these three:
    tools, each wrapped so that a call names the attempt it belongs to.
 2. **One variable swaps the env.** `ENV = "wordle_v1"` at the top of `serve.py`. That line
    is the entire migration to any other env in the catalogue.
-3. **The stream keeps the score.** Sealing is server-side and the score stays in the stream's own
-   durable history. The agent is not told it, and neither is anything else.
+3. **The stream keeps the record and the agent is told its score.** Sealing is server-side and the
+   authoritative record stays in the stream's own durable history. The payload released against an
+   attempt reports the score honestly by default; concealing it is an experiment arm a run
+   registers.
 
 ## Prerequisites
 
@@ -178,7 +180,7 @@ every other repo. `codex mcp remove shogym` undoes it.
 `shogym` is the server name in all three, and Codex namespaces the server's tools under it: in the
 `--json` stream each call shows up as `{"server": "shogym", "tool": "pull"}`.
 
-## The stream keeps the score
+## The stream keeps the record
 
 The stream seals the attempt, grades it server-side and records the outcome in its own durable
 history. `runs/<env>-<task>-<stamp>/` holds that history, beside the blobs a presentation

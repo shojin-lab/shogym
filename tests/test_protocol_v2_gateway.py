@@ -55,6 +55,7 @@ from shogym.serve.protocol_v2.gateway import (  # noqa: E402
     build_gateway_server,
     declared_argument_names,
     durable_client,
+    environment_grade,
     environment_terminal,
     open_gateway,
     stream_start,
@@ -72,6 +73,12 @@ from shogym.serve.protocol_v2.gateway import (  # noqa: E402
     _ResultOwed,
 )
 from shogym.serve.protocol_v2.kernel import OfferedMessage, StreamProtocolError  # noqa: E402
+from shogym.serve.protocol_v2.policy import (  # noqa: E402
+    HONEST_V1,
+    GradeIdentity,
+    policy_digest,
+    policy_preimage,
+)
 from shogym.serve.protocol_v2.rundir import open_run_directory  # noqa: E402
 from shogym.task import TaskSpec, ToolManifest  # noqa: E402
 from shogym.trace import load_traces  # noqa: E402
@@ -83,6 +90,12 @@ TEST_ENV = "wordle_v1"
 # finalization store, and a test that reads what a v2 ending leaves behind needs an env that has
 # them: an env without them has nothing to end twice.
 SCORING_ENV = score_env.ENV_NAME
+# What the doubles below say their grader is. A composition that delivers the honest body is one
+# over an environment whose score is its own, so a double that stands in for such an environment
+# says so rather than being taken for the stream's stand-in.
+DOUBLE_GRADE = GradeIdentity(
+    grader_id="double-grade", grader_version="1", stand_in=False, score_component="answer"
+)
 ATTEMPT = "00000000000000000000000000000100"
 TASK_ID = "00000000000000000000000000000101"
 ACK_ID = "00000000000000000000000000000102"
@@ -134,6 +147,9 @@ class ScriptedProjection:
         self.cursor = stream.cursor
         self.generation_state = stream.generation_state
         self.attempts = dict(stream.attempts)
+        # The grants it has made per attempt, which is the count a transport reads its spent
+        # step budget out of rather than keeping one of its own.
+        self.environment_calls = dict(stream.environment_calls)
         self.stream_state_sha256 = format(reads, "064x")
         pending = stream.pending
         self.pending_message_id = None if pending is None else pending.message_id
@@ -174,6 +190,7 @@ class ScriptedStream:
         self.cursor = CURSOR
         self.generation_state = "open"
         self.attempts: Dict[str, str] = {}
+        self.environment_calls: Dict[str, int] = {}
         self.offered: Dict[str, OfferedMessage] = {}
         self.reserved: Dict[str, OfferedMessage] = {}
         self.pending: Optional[OfferedMessage] = None
@@ -288,6 +305,11 @@ class ScriptedStream:
         if self.attempts.get(call.attempt_id) != "active":
             raise StreamProtocolError("invalid_attempt")
         self.held = call.call_id
+        # The grant is the last thing this stream learns about that world, so it is counted as
+        # the change it authorized whatever became of the call.
+        self.environment_calls[call.attempt_id] = (
+            self.environment_calls.get(call.attempt_id, 0) + 1
+        )
         if self.lose_next_grant:
             self.lose_next_grant = False
             raise RuntimeError("the grant never came back")
@@ -371,6 +393,7 @@ class ScriptedStream:
         """Move the generation the way presenting this message moves it, and no other way."""
         if message.kind == "task" and message.attempt_id is not None:
             self.attempts[message.attempt_id] = "active"
+            self.environment_calls[message.attempt_id] = 0
         elif message.kind == "seal_ack" and message.attempt_id is not None:
             self.attempts[message.attempt_id] = "ack_presented"
         elif message.kind == "done":
@@ -647,10 +670,14 @@ def test_what_the_environment_is_configured_as_is_part_of_the_configuration() ->
     """
     spec = hashing_spec()
     terminal = terminal_manifest(spec)
-    plain = stream_start(spec, terminal, claim_hash="a" * 64)
+    plain = stream_start(spec, terminal, claim_hash="a" * 64, grade=DOUBLE_GRADE)
     assert plain.configuration_hash == configuration_of(spec)
-    first = stream_start(spec, terminal, claim_hash="a" * 64, environment_digest="pulse-0")
-    second = stream_start(spec, terminal, claim_hash="a" * 64, environment_digest="pulse-1")
+    first = stream_start(
+        spec, terminal, claim_hash="a" * 64, environment_digest="pulse-0", grade=DOUBLE_GRADE
+    )
+    second = stream_start(
+        spec, terminal, claim_hash="a" * 64, environment_digest="pulse-1", grade=DOUBLE_GRADE
+    )
     assert first.configuration_hash != second.configuration_hash
     assert first.configuration_hash != plain.configuration_hash
 
@@ -683,6 +710,31 @@ def test_an_environment_is_asked_how_its_attempts_end_and_answers_with_its_own_r
     assert len(plain.activities) == 4
 
 
+def test_a_grader_an_environment_declares_without_a_terminal_of_its_own_is_refused() -> None:
+    """The grade and the terminal are one fact, so half of it is not a composition.
+
+    An environment that declares a grader and brings no terminal is sealed and graded by the
+    kernel's Activities, whose number is a fact about the shape of a filing however the
+    environment describes itself. A generation composed over that claim would stamp the honest
+    policy, pass every check that reads the declaration, and then fail every seal when the
+    stand-in's identity arrived with the score instead. The refusal is where the two halves meet
+    and it names the one that is missing.
+    """
+
+    class Half:
+        def protocol_v2_grade(self) -> Any:
+            return DOUBLE_GRADE
+
+    episode = SimpleNamespace(env=Half(), session_id="session-3")
+    with pytest.raises(ValueError, match="brings no terminal of its own"):
+        environment_grade(episode)
+    with pytest.raises(ValueError, match="protocol_v2_terminal"):
+        environment_terminal(episode)
+
+    # And the stand-in an environment that says nothing about its grader still gets.
+    assert environment_grade(SimpleNamespace(env=object(), session_id="s")).stand_in is True
+
+
 def test_a_world_belongs_to_the_attempt_it_was_opened_for() -> None:
     """The route says which world each attempt filed in, and answers nothing for the others."""
     route = environment_terminal(SimpleNamespace(env=object(), session_id="session-1")).route
@@ -707,9 +759,6 @@ async def test_a_generation_a_controller_composed_ends_the_way_its_environment_d
     """
     spec = episode.describe()
     terminal = terminal_manifest(spec)
-    composed = stream_start(spec, terminal, claim_hash="a" * 64, bodies=["one", "two"])
-    assert composed.canonicalization_version == CANONICALIZATION_VERSION
-
     monkeypatch.setattr(
         episode.env,
         "protocol_v2_terminal",
@@ -717,6 +766,13 @@ async def test_a_generation_a_controller_composed_ends_the_way_its_environment_d
         raising=False,
     )
     environment = environment_terminal(episode)
+    # Composed over the grader this environment declares. That claim is inside what the
+    # generation is and its honest bodies publish that grader's numbers, so a composition naming
+    # another one is not a composition this environment can be opened over.
+    composed = stream_start(
+        spec, terminal, claim_hash="a" * 64, bodies=["one", "two"], grade=environment.grade
+    )
+    assert composed.canonicalization_version == CANONICALIZATION_VERSION
     started: List[Any] = []
 
     class Started:
@@ -767,22 +823,24 @@ async def test_a_world_that_is_not_the_environment_the_generation_declared_is_re
     """
     first = await scoring_world()
     later = await scoring_world()
-    monkeypatch.setattr(
-        first.env,
-        "protocol_v2_terminal",
-        lambda route: ("world.1", [], "pulse-0"),
-        raising=False,
-    )
-    monkeypatch.setattr(
-        later.env,
-        "protocol_v2_terminal",
-        lambda route: ("world.1", [], "pulse-1"),
-        raising=False,
-    )
+    for world, digest in ((first, "pulse-0"), (later, "pulse-1")):
+        monkeypatch.setattr(
+            world.env,
+            "protocol_v2_terminal",
+            lambda route, digest=digest: ("world.1", [], digest),
+            raising=False,
+        )
+        monkeypatch.setattr(
+            world.env, "protocol_v2_grade", lambda: DOUBLE_GRADE, raising=False
+        )
     environment = environment_terminal(first)
     spec = first.describe()
     composed = stream_start(
-        spec, terminal_manifest(spec), claim_hash="a" * 64, bodies=["one", "two"]
+        spec,
+        terminal_manifest(spec),
+        claim_hash="a" * 64,
+        bodies=["one", "two"],
+        grade=DOUBLE_GRADE,
     )
     stream = ClaimedStream(TASK_OFFER, ACK_OFFER, SECOND_TASK_OFFER)
 
@@ -2862,8 +2920,10 @@ async def test_the_whole_arc_over_stdio(tmp_path) -> None:
         async with durable_client() as client:
             running = True
             address = client.service_client.config.target_host
-            async with stream_worker(client):
-                await _drive_stdio(address, tmp_path)
+            # No Worker here. The served process registers the Activities its own environment
+            # brings, and a second Worker on that queue with different implementations would be
+            # answering for an environment nobody asked it about.
+            await _drive_stdio(address, tmp_path)
     except Exception as error:  # noqa: BLE001 - re-raised below unless the service never came up
         if running:
             raise
@@ -2908,11 +2968,16 @@ async def _drive_stdio(address: str, tmp_path: Any) -> None:
         assert ack["kind"] == "seal_ack"
         assert ack["attempt_id"] == attempt
         assert len(ack["submission_digest"]) == 64
-        assert ack["canonicalization_version"] == "shogym.gateway.1"
+        # Wordle brings its own terminal, so the digest was taken under the version that env
+        # declares rather than under this gateway's stand-in.
+        assert ack["canonicalization_version"] == "shogym.wordle.1"
 
         payload = await _record(client, PULL_TOOL, {})
         assert payload["kind"] == "payload"
         assert payload["attempt_id"] == attempt
+        # The default is honest: the agent is told the attempt, the score the stream committed,
+        # and the numbers the env published beside it. One guess, and it was not the word.
+        assert payload["body"] == f"attempt {attempt}\nscore 0\nguesses_used 1"
 
         done = await _record(client, PULL_TOOL, {})
         assert done["kind"] == "done"
@@ -2926,6 +2991,9 @@ async def _drive_stdio(address: str, tmp_path: Any) -> None:
     run = open_run_directory(Path(tmp_path) / "run")
     assert run.manifest.workflow_id.startswith("stream/")
     assert [path for path in run.blobs.root.rglob("*") if path.is_file()]
+    # What the body was allowed to say is in there as bytes rather than as a digest naming
+    # bytes nobody kept, so the directory alone says what this run's payloads meant.
+    assert run.blobs.read(policy_digest(HONEST_V1)) == policy_preimage(HONEST_V1)
 
 
 async def _record(client: Client, tool: str, arguments: Dict[str, Any]) -> Dict[str, Any]:
@@ -3010,17 +3078,20 @@ async def test_a_cancelled_final_pull_collects_its_done_from_a_real_stream(
     try:
         async with durable_client() as client:
             running = True
-            async with stream_worker(client):
-                await _collect_a_cancelled_done(client, episode)
+            terminal = environment_terminal(episode)
+            async with stream_worker(client, activities=terminal.activities):
+                await _collect_a_cancelled_done(client, episode, terminal)
     except Exception as error:  # noqa: BLE001 - re-raised below unless the service never came up
         if running:
             raise
         pytest.skip(f"the durable service is unavailable: {error}")
 
 
-async def _collect_a_cancelled_done(client: Client, episode: ServedEpisode) -> None:
+async def _collect_a_cancelled_done(
+    client: Client, episode: ServedEpisode, terminal: Any
+) -> None:
     """Run the arc to Done, drop the caller after it lands, and ask for it again."""
-    gateway = await open_gateway(client, episode)
+    gateway = await open_gateway(client, episode, environment=terminal)
     # Done is what a generation says when it has nothing left and nothing more can arrive, so
     # the queue is closed here rather than assumed closed.
     await gateway._stream.close_queue()

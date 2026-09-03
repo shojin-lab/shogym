@@ -49,6 +49,7 @@ from shogym.serve.protocol_v2.kernel import (  # noqa: E402
     start_stream,
     stream_worker,
 )
+from tests._fixtures.policy_rows import registering_the_receipt  # noqa: E402
 
 DOSE = 12
 CLAIM_HASH = "d" * 64
@@ -84,21 +85,23 @@ def make_start(
         )
         for index, body in enumerate(bodies)
     ]
-    return StreamStart(
-        configuration_hash="c" * 64,
-        consumer_claim_hash=CLAIM_HASH,
-        initial_cursor=oid(1),
-        done_message_id=oid(2),
-        id_key_hex="ab" * 32,
-        hidden_execution_id="execution-1",
-        canonicalization_version="kernel.1",
-        terminal_tool=TerminalTool(
-            public_tool_name="submit", native_terminal_name="submit", argument_names=[]
-        ),
-        tasks=items,
-        release=release,
-        assignments=assignments_for(items, release, without_payload=without_payload),
-        evaluation_only=evaluation_only,
+    return registering_the_receipt(
+        StreamStart(
+            configuration_hash="c" * 64,
+            consumer_claim_hash=CLAIM_HASH,
+            initial_cursor=oid(1),
+            done_message_id=oid(2),
+            id_key_hex="ab" * 32,
+            hidden_execution_id="execution-1",
+            canonicalization_version="kernel.1",
+            terminal_tool=TerminalTool(
+                public_tool_name="submit", native_terminal_name="submit", argument_names=[]
+            ),
+            tasks=items,
+            release=release,
+            assignments=assignments_for(items, release, without_payload=without_payload),
+            evaluation_only=evaluation_only,
+        )
     )
 
 

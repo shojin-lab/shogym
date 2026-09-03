@@ -29,6 +29,7 @@ from temporalio.service import RPCError
 
 from shogym.serve.episode import ServedEpisode
 from shogym.serve.protocol_v2 import FilesystemBlobStore, PullRequest
+from shogym.serve.protocol_v2.gateway import install_policies
 from shogym.serve.protocol_v2.gateway import (
     durable_client,
     open_gateway,
@@ -50,6 +51,7 @@ from shogym.serve.protocol_v2.rundir import (
     create_run_directory,
     open_run_directory,
 )
+from tests._fixtures.policy_rows import registering_the_receipt
 
 TEST_ENV = "wordle_v1"
 
@@ -104,29 +106,31 @@ async def test_two_generations_serve_at_the_same_time(tmp_path: Path) -> None:
 
 def _one_task_start(root: Path) -> StreamStart:
     """One task, every public identifier fixed before anything is served."""
-    return StreamStart(
-        configuration_hash="c" * 64,
-        consumer_claim_hash=CLAIM.claim_hash,
-        initial_cursor=_oid(1),
-        done_message_id=_oid(2),
-        id_key_hex="ab" * 32,
-        hidden_execution_id="execution-1",
-        canonicalization_version="kernel.1",
-        terminal_tool=TerminalTool(
-            public_tool_name="submit", native_terminal_name="submit", argument_names=["answer"]
-        ),
-        tasks=[
-            TaskItem(
-                task_position=0,
-                attempt_id=_oid(0x100),
-                task_message_id=_oid(0x101),
-                ack_message_id=_oid(0x102),
-                payload_position=0,
-                payload_message_id=_oid(0x103),
-                body="file the report",
-            )
-        ],
-        blob_root=str(FilesystemBlobStore.under(root).root),
+    return registering_the_receipt(
+        StreamStart(
+            configuration_hash="c" * 64,
+            consumer_claim_hash=CLAIM.claim_hash,
+            initial_cursor=_oid(1),
+            done_message_id=_oid(2),
+            id_key_hex="ab" * 32,
+            hidden_execution_id="execution-1",
+            canonicalization_version="kernel.1",
+            terminal_tool=TerminalTool(
+                public_tool_name="submit", native_terminal_name="submit", argument_names=["answer"]
+            ),
+            tasks=[
+                TaskItem(
+                    task_position=0,
+                    attempt_id=_oid(0x100),
+                    task_message_id=_oid(0x101),
+                    ack_message_id=_oid(0x102),
+                    payload_position=0,
+                    payload_message_id=_oid(0x103),
+                    body="file the report",
+                )
+            ],
+            blob_root=str(FilesystemBlobStore.under(root).root),
+        )
     )
 
 
@@ -149,6 +153,7 @@ async def test_a_generation_comes_back_out_of_the_directory_that_holds_it(tmp_pa
         async with durable_client(run_directory=root) as client:
             started = True
             async with stream_worker(client, cached_workflows=0):
+                install_policies(FilesystemBlobStore.under(root), start)
                 create_run_directory(
                     root,
                     workflow_id=RESUMED,

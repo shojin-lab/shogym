@@ -157,10 +157,11 @@ semantics (each run should own its trace file for a guaranteed 1:1 mapping).
 
 That readout is for an episode whose terminal reaches the env: `shogym.evaluate`, or a
 `ServedEpisode` driven in process. A durably served episode leaves a trace of the guesses and no
-terminal row, and `verify` does not run at all. What the stream scores an attempt with is the
-kernel's stand-in terminal, which computes from the terminal call's arguments and reaches no env,
-so `check_answer` and `partial_credit` are not what a `shogym serve wordle_v1` run records. This
-env brings no terminal of its own.
+terminal row, and `verify` does not run; the stream ends the attempt on the terminal this env
+declares in `protocol_v2.py` instead. That seal captures the words the session played, into a
+write-once store on the machine that sealed them, and the grade scores those words against the
+task's target: one if the word was found within the allowed guesses and zero if it was not, with
+`guesses_used` (0 to 6) published beside the score.
 
 ## Fidelity & deviations
 
@@ -174,7 +175,8 @@ automationbench, frontier_bench) each carry their own `Fidelity & deviations` se
 | File | Role |
 |---|---|
 | `env_v1.py` | `WordleV1Env` (the env) + `WordleV1Default` (the registered `wordle_v1`, with the train/test split) and the authoritative verifier. |
-| `mcp_server.py` | The in-process FastMCP server backing the `guess` tool; holds per-episode target + guess budget keyed by session id. |
+| `mcp_server.py` | The in-process FastMCP server backing the `guess` tool; holds per-episode target + guess budget + the words played, keyed by session id. |
+| `protocol_v2.py` | The terminal a durably served attempt ends on: the seal that captures the play, the grade that scores it, and the write-once store they share. |
 | `utils.py` | `load_words`, `score_guess` (the G/Y/X scorer), `format_feedback`. |
 | `functions/` | The advisory instruction templates (`guess_v1/example/*.minijinja`) and their variable schemas. |
 | `data/words.txt` | 2,315 five-letter answers, one per line. |

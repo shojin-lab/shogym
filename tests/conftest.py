@@ -1,17 +1,18 @@
 """Test-wide fixtures.
 
-The one here is about a directory rather than about any test: the durable finalization store.
-An episode opened without a trace path resolves its store to ``~/.cache/shogym/sessions``, which
-is shared by every session ever run on the machine and never pruned, so a suite run writes its
-records into the developer's own store and every later run reads them back. That is the state
-this repository's serve layer spent a review pass diagnosing, and a suite that grows it is a
-suite that slowly poisons the machine it runs on.
+Both of the ones here are about a directory rather than about any test. An episode opened without
+a trace path resolves its finalization store to ``~/.cache/shogym/sessions``, which is shared by
+every session ever run on the machine and never pruned, so a suite run writes its records into the
+developer's own store and every later run reads them back. A suite that grows it is a suite that
+slowly poisons the machine it runs on. Wordle's sealed plays are the same kind of directory and
+get the same treatment.
 """
 
 from __future__ import annotations
 
 import pytest
 
+from shogym.envs.wordle import protocol_v2 as wordle_protocol_v2
 from shogym.serve import lifecycle
 
 
@@ -35,3 +36,20 @@ def _sessions_store(
     # tests here open an episode in a *fresh* one (a killed-stream reconciliation, the fork
     # refusals), and those children inherit nothing.
     monkeypatch.setenv(lifecycle.SESSIONS_ROOT_ENV_VAR, str(root))
+
+
+@pytest.fixture(autouse=True)
+def _wordle_seals(
+    monkeypatch: pytest.MonkeyPatch, tmp_path_factory: pytest.TempPathFactory
+) -> None:
+    """Point wordle's sealed plays at a temporary directory for every test.
+
+    A sealed play is the target and the words played against it, kept so a Worker that replaced
+    the one which sealed can still grade. The suite seals plenty of them and none is worth
+    keeping, so they go where the run that made them goes. Through the environment as well as the
+    module, because ``shogym serve`` is spawned by some of these tests and a patched function
+    reaches only this interpreter.
+    """
+    root = tmp_path_factory.mktemp("wordle-seals")
+    monkeypatch.setattr(wordle_protocol_v2, "seal_store_root", lambda: root)
+    monkeypatch.setenv(wordle_protocol_v2.SEALS_ROOT_ENV_VAR, str(root))
