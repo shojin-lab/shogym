@@ -45,6 +45,7 @@ from typing import Any, Dict, List, Optional, Set, Tuple
 from temporalio import workflow
 from temporalio.common import RetryPolicy
 from temporalio.exceptions import ActivityError, ApplicationError
+from temporalio.exceptions import TimeoutError as ActivityTimeout
 
 with workflow.unsafe.imports_passed_through():
     from shogym.serve.protocol_v2 import (
@@ -191,6 +192,12 @@ _ACTIVITY_RETRY = RetryPolicy(
     maximum_attempts=3,
 )
 
+# How much of an Activity's failure a row keeps, in bytes, and the mark left where the cap cut a
+# value short. The cap is one size for every text among them, because what is being bounded is a
+# row rather than a particular field, and no name a service reports comes anywhere near it.
+_FAILURE_TEXT_BYTES = 512
+_CUT = " [truncated]"
+
 
 class StreamProtocolError(ApplicationError):
     """A refusal carrying one code from the protocol's closed set.
@@ -223,13 +230,15 @@ class _UnusableResult(ApplicationError):
     It does reach the caller, as the generic failure of the tool call that filed. A harness
     keeping its own transcript records that failure the way it records any other, so this is a
     thing the model can see happen even though the generation minted nothing it can read. What
-    does not travel with it is why the result was unusable: that reason is this generation's,
-    and it stays in the history and the server's log.
+    does not travel with it is why the result was unusable. That reason is this generation's, and
+    it is kept where this generation keeps its own facts: the check that refused names itself in
+    ``type`` and says what it found in the message, and both are written onto the attempt's row,
+    which a harness Query answers with and the run's own records carry.
 
     The Activity that produced the result succeeded, so there is no step left to retry: the
     exact filing sent again asks for the same work and is handed the same result back. That is
-    why it is one type rather than a description of each way a result can be wrong, and why the
-    seal that raised it ends the attempt it prepared.
+    why it is one exception rather than one for each way a result can be wrong, and why the seal
+    that raised it ends the attempt it prepared.
 
     ``final_failure`` is which of those endings gets written. It is one transition either way,
     and the reason is what a reader is left with: a candidate built under something other than
@@ -279,6 +288,21 @@ class _Attempt:
     # see, and ending it under one would be deciding an effect nothing here can observe. The
     # expiry is the durable fact; the ending happens at the first moment the stream is quiet.
     deadline_expired: bool = False
+    # What the work behind an accepted terminal failed with. The ending is a class and several
+    # very different failures share it, so these five say which Activity Temporal gave up on,
+    # what it failed as, what it said, and why the retries stopped. They are read out of what
+    # the history recorded, which is why a replay produces them again, and every text among them
+    # is bounded before it is kept.
+    #
+    # A result the seal could not vouch for fills the kind and the message and leaves the other
+    # three alone. Its Activity succeeded, so naming it as the step that failed would be false
+    # and there is no retry state to report: what this generation is recording there is the
+    # check that refused the answer, not a step that never landed.
+    failure_activity: Optional[str] = None
+    failure_activity_id: Optional[str] = None
+    failure_kind: Optional[str] = None
+    failure_message: Optional[str] = None
+    failure_retry_state: Optional[str] = None
 
 
 @dataclass
@@ -1070,6 +1094,13 @@ class StreamWorkflow:
         answer for an ordinary run the platform stamped and for an experiment cell somebody
         registered, so the name on its own cannot say whether either of the two mistakes was
         made.
+
+        And for a fifth, what the work behind a filing failed with comes with the ending it
+        produced. The ending is a class, several very different failures share one, and the class
+        alone leaves a reader with a hole and nothing to look into it with. What answers it is
+        what this generation watched happen: the failure was reported to this workflow and
+        recorded in its history, so a reader holding the row can tell a grader that was down from
+        one that refused this task without holding anything else.
         """
         item = attempt.item
         obligation = self._obligations.get(item.attempt_id)
@@ -1115,6 +1146,11 @@ class StreamWorkflow:
             payload_resolution_source=(
                 None if resolved is None else resolved.resolution_source
             ),
+            failure_activity=attempt.failure_activity,
+            failure_activity_id=attempt.failure_activity_id,
+            failure_kind=attempt.failure_kind,
+            failure_message=attempt.failure_message,
+            failure_retry_state=attempt.failure_retry_state,
         )
 
     # Pull.
@@ -1368,17 +1404,27 @@ class StreamWorkflow:
         finalized, the capacity comes back, nothing is acknowledged, and the generation goes on
         serving. What the separate reason buys is a reader who can tell a Worker running the
         wrong renderer from a result that was merely malformed.
+
+        Both endings are explained on the attempt before it is ended. A filing runs the seal and
+        the grade, and the renderer as well when the attempt carries a payload obligation, and any
+        of them can be the one that failed, so the ending on its own leaves a reader with a hole
+        and no way to say which step made it. The other ending has no failed step to name, and
+        what it needs written down instead is the check that refused the answer. Either way what
+        is written is read out of what the history recorded and nothing else, so it costs no side
+        effect and a replay produces the same words.
         """
         try:
             return await self._seal_batch(request, attempt, identity, writer)
         except StreamProtocolError:
             raise
-        except ActivityError:
+        except ActivityError as error:
             self._require_writer(writer)
+            _note_failure(attempt, error)
             self._finalize(attempt, SEAL_FAILED)
             raise
         except _UnusableResult as unusable:
             self._require_writer(writer)
+            _note_unusable(attempt, unusable)
             self._finalize(attempt, unusable.final_failure)
             raise
 
@@ -2117,6 +2163,110 @@ class StreamWorkflow:
             "seal_ordinal": self._seal_ordinal,
         }
         return sha256(canonical_json(projection)).hexdigest()
+
+
+def _note_failure(attempt: _Attempt, error: ActivityError) -> None:
+    """Write on the attempt what the Activity behind its filing failed with.
+
+    Everything read here is the failure Temporal recorded, which is what makes this safe to run
+    inside a workflow: the same history hands back the same values on a replay, so a row rebuilt
+    from it says what it said the first time. The failure read is the last one the service
+    accepted: the attempt that stopped the retries, whether the retries were exhausted or the
+    failure declared itself non-retryable.
+
+    The kind is the semantic type wherever there is one. An environment that refuses a task
+    raises a non-retryable application error whose type is what it refuses for, and reporting
+    the class of the wrapper instead would put the same uninformative word on every deliberate
+    refusal. An ordinary exception arrives with its own class name in that position already,
+    because that is what the service records for one. A timeout carries which timeout instead,
+    since its message is only the word.
+
+    Every text is bounded and flattened to one line. A message is whatever an environment put in
+    an exception, this runs where a Query and a JSON row will carry it, and a field that could be
+    a megabyte of traceback is not one a row can hold.
+
+    Every value is read as far as it can be read and no further. A cause is an object a caller's
+    own failure converter may have built, so rendering one can raise, and a description that
+    raised where it is being written would replace the failure it describes and leave the attempt
+    it was meant to explain unfinished. A value whose rendering fails in the ordinary way is
+    therefore absent, and the ending is written either way. A process-control signal raised while
+    rendering one still stops the work, which is what such a signal is for.
+    """
+    cause = _as_far_as_it_reads(lambda: error.cause)
+    attempt.failure_activity = _said(lambda: error.activity_type)
+    attempt.failure_activity_id = _said(lambda: error.activity_id)
+    attempt.failure_kind = _said(lambda: _kind_of(cause))
+    attempt.failure_message = _said(lambda: _message_of(cause))
+    attempt.failure_retry_state = _said(
+        lambda: None if error.retry_state is None else error.retry_state.name
+    )
+
+
+def _kind_of(cause: Optional[BaseException]) -> Optional[str]:
+    """Return what a recorded cause failed as: its semantic type, or the class carrying it."""
+    if isinstance(cause, ApplicationError):
+        return cause.type or type(cause).__name__
+    if isinstance(cause, ActivityTimeout):
+        return "TimeoutError" if cause.type is None else f"TimeoutError.{cause.type.name}"
+    return None if cause is None else type(cause).__name__
+
+
+def _message_of(cause: Optional[BaseException]) -> Optional[str]:
+    """Return what a recorded cause said, from the failure's own message where it has one."""
+    if isinstance(cause, (ApplicationError, ActivityTimeout)):
+        return cause.message
+    return None if cause is None else str(cause)
+
+
+def _note_unusable(attempt: _Attempt, unusable: _UnusableResult) -> None:
+    """Write on the attempt why the result behind its filing could not be vouched for.
+
+    Two of the five, and deliberately not the other three. The Activity answered, so no step is
+    named as having failed and there is no retry state to report: what happened is that this
+    generation read the answer and would not commit it. The type and the message are the check
+    that refused, which is what a reader is otherwise left to guess at, since one ending covers a
+    seal for the wrong attempt, a score for another seal, a number outside what the grader
+    declared, and a candidate the obligation did not ask for.
+    """
+    attempt.failure_kind = _said(lambda: unusable.type)
+    attempt.failure_message = _said(lambda: unusable.message)
+
+
+def _said(read: Any) -> Optional[str]:
+    """Return what ``read`` says, bounded, or nothing when ordinarily it cannot be said."""
+    said = _as_far_as_it_reads(read)
+    return None if said is None else _as_far_as_it_reads(lambda: _bounded(said))
+
+
+def _as_far_as_it_reads(read: Any) -> Any:
+    """Return what ``read`` returns, or ``None`` where reading it raises an ordinary error.
+
+    A description never replaces the failure it is describing. The guard stops at ``Exception``
+    on purpose, and the claim it supports is bounded by that: a value that cannot be rendered is
+    absent, and a process-control signal raised while rendering one is not a value that failed
+    but an instruction to stop, so it goes past here as it would anywhere else.
+    """
+    try:
+        return read()
+    except Exception:  # noqa: BLE001 - an unreadable value is an absent one, not a second failure
+        return None
+
+
+def _bounded(text: str) -> str:
+    """Return ``text`` as one line no longer than the cap, marking what the cap cut off.
+
+    The cut is made on the encoded bytes so the cap is a size rather than a count of characters,
+    and the mark goes inside the value, because a reader who cannot see that the harness stopped
+    the message would read a partial explanation as a complete one. The mark is a convention and
+    not a proof: a message that was short enough to keep whole is kept unchanged once flattened,
+    ending included, so a value ending in those words is not by itself evidence of a cut.
+    """
+    flattened = " ".join(text.split())
+    encoded = flattened.encode("utf-8")
+    if len(encoded) <= _FAILURE_TEXT_BYTES:
+        return flattened
+    room = _FAILURE_TEXT_BYTES - len(_CUT.encode("utf-8"))
+    return encoded[:room].decode("utf-8", "ignore") + _CUT
 
 
 def _token_hash(token: str) -> str:

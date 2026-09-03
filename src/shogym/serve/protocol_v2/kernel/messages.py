@@ -746,6 +746,18 @@ class AttemptRecord:
     as an ordinary default, or an ordinary run blinded by something nobody registered. Neither
     question can be answered from the policy name alone, because the same name is a correct
     answer to both.
+
+    The five ``failure_`` fields are what stopped the seal that ended this attempt. An accepted
+    terminal runs the seal and the grade, and the renderer as well when the attempt carries a
+    payload obligation, and any of them can fail for good, so ``failure_activity`` and
+    ``failure_activity_id`` name which one did, ``failure_kind`` is the semantic type it failed
+    as, ``failure_message`` is a bounded line of what it said, and ``failure_retry_state`` is why
+    the retries stopped. A result the seal could not vouch for is the other ending, and it fills
+    two of the five: the Activity behind it succeeded, so there is a kind and a message and no
+    retry state, and no Activity is named as having failed. They are read out of what the durable
+    history recorded, so a row rebuilt from that history says the same thing every time, and they
+    are absent on every row whose seal did not end it. None of it is ever shown to a model: a
+    message an environment raised with can name what it was grading.
     """
 
     attempt_id: str
@@ -774,6 +786,11 @@ class AttemptRecord:
     profile: str = LEGACY
     payload_resolution_source: Optional[str] = None
     protocol_version: int = PROTOCOL_VERSION
+    failure_activity: Optional[str] = None
+    failure_activity_id: Optional[str] = None
+    failure_kind: Optional[str] = None
+    failure_message: Optional[str] = None
+    failure_retry_state: Optional[str] = None
 
 
 @dataclass(frozen=True)

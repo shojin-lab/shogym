@@ -87,6 +87,13 @@ _NOTE = """\
 
 The history is the record. Nothing reads this file back to decide anything, and an edit to it
 changes no fact about the run: delete it and the next read writes it again.
+
+A row whose seal could not go on explains itself here and not in the printed table:
+`failure_activity` and `failure_activity_id` name the step the service gave up on,
+`failure_kind` is what it failed as, `failure_message` is a bounded line of what it said, and
+`failure_retry_state` is why the retries stopped. A row ended by a result the seal could not
+vouch for names no step and no retry state, because its step succeeded: it carries the kind and
+the message alone, and those are the check that refused the answer.
 """
 
 _COLUMNS = (

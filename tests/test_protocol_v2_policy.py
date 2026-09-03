@@ -1145,6 +1145,15 @@ async def test_a_candidate_from_the_wrong_renderer_ends_the_attempt(
         assert state.materialization_count == 0
         assert state.pending_message_id is None
 
+        # And the row names the check that refused, under that check's own name rather than the
+        # one every unusable result shares. The Activity answered, so no step is named as having
+        # failed and there is no retry state: what is recorded is a result this seal read and
+        # would not commit.
+        [record] = await caller.stream.handle.query(StreamWorkflow.attempt_records)
+        assert record.failure_kind == "RendererDescriptorMismatch"
+        assert record.failure_message
+        assert (record.failure_activity, record.failure_retry_state) == (None, None)
+
         # The generation keeps serving, which is the whole of what the ending cost.
         await caller.stream.close_queue()
         assert (await caller.pull()).kind == "done"
