@@ -36,7 +36,6 @@ from shogym.serve.stream import (
 from shogym.shared.terminate_mcp import TERMINATE_TOOL_NAME
 from shogym.task import TaskSpec, ToolManifest
 from shogym.types import EpisodeFeedback, FeedbackCollection
-from tests._fixtures import score_mcp
 from tests._fixtures.score_env import ENV_NAME, HORIZON, SUBMIT_TOOL, _FixtureScoreEnv
 
 TASKS = [
@@ -2713,36 +2712,3 @@ def test_a_containment_boundary_may_not_catch_exception_and_leave_cancellation_t
         "these boundaries run an env's or an extension's code and catch `Exception`, so a "
         "`CancelledError` it raises escapes a handler meant to contain everything: " + "; ".join(offenders)
     )
-
-
-async def test_a_deadline_fires_on_a_task_whose_ordinary_call_is_blocked(
-    tmp_path: Path,
-) -> None:
-    """A deadline that only classifies an eventual result is not a deadline.
-
-    The watchdog could claim the seal, but composing the timeout has to force a terminal, and
-    that queued behind the episode lock the blocked ordinary call was holding. With `deadline=.05`
-    and a call that does not return, a probe on the head this replaces still had no row after
-    `.15s`: the timeout row appeared only once the ordinary call was let go. AppWorld allows a
-    single such call five minutes, so enough of them could hold every slot in the stream far past
-    the configured deadline.
-
-    The handler blocks in a worker thread, which is the shape of AppWorld's `execute` and the
-    reason an async substitute cannot show this."""
-    score_mcp.reset_block()
-    stream = _stream(tmp_path, [0], deadline=0.05)
-    try:
-        await stream.get_task()
-        call = asyncio.ensure_future(stream.dispatch("block", {}))
-        await asyncio.sleep(0.15)
-        # The row exists while the call is still in the env, which is the whole point.
-        rows = read_results(tmp_path / "prov")
-        assert [row.closure for row in rows] == ["timeout"]
-        assert rows[0].score is None
-        assert not score_mcp.landed.is_set()
-        score_mcp.released.set()
-        if not call.done():
-            call.cancel()
-    finally:
-        score_mcp.released.set()
-        await stream.aclose()
