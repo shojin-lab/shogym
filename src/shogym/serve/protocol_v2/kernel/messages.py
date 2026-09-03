@@ -551,6 +551,65 @@ class StreamState:
 
 
 @dataclass(frozen=True)
+class AttemptRecord:
+    """One attempt as a record: what it was assigned, what it filed, what it scored.
+
+    This is the row an analysis counts. It is harness-only for the same reason the score is: an
+    acknowledgement commits to what was filed and says nothing about how good it was, and a
+    model that could read one of these would be told.
+
+    The positions are the assignment's, so a row says where the attempt sat in its manifest
+    rather than what order a stream happened to serve. The three message identifiers are the
+    ones the manifest preallocated, and each is reported as delivered rather than as offered,
+    because an offer is a reservation and a delivery is the exact bytes handed to the transport
+    that carries them. What the model consumed of those bytes is attested by the harness
+    transcript and not by this row.
+
+    ``score`` is ``None`` until the seal that made it authoritative, and it stays ``None``
+    rather than becoming a zero: an attempt nobody has sealed has no score, which is not the
+    same fact as an attempt that scored nothing.
+
+    An attempt that ended without a filing does have one, and it is the floor. That is a third
+    fact again, and the number alone cannot say so: a floored attempt and one the environment
+    graded at nothing carry the same zero. ``final_failure`` is what tells them apart, and it
+    says which ending it was, because a run out of steps, a run out of time, a gate that can no
+    longer open and a seal whose batch could not go on are four different things to count.
+    ``deadline_expired`` is the clock on its own: an expiry the generation has recorded and not
+    yet acted on, which is what a row carries while the attempt is still holding a call to a
+    world nothing here can see.
+
+    ``creates_payload_obligation`` is the roster's own column, and ``payload_state`` is what
+    became of the obligation it promised. Without them ``payload_delivered`` being false says
+    two different things at once: a row this generation owed a payload and never delivered, and
+    a row that was never going to have one, which is what a filler is. Those are a missed
+    treatment and a structural absence, and an analysis that cannot tell them apart is counting
+    fillers as failures. A row that creates no obligation has no obligation state.
+    """
+
+    attempt_id: str
+    task_position: int
+    payload_position: int
+    state: str
+    terminal_tool: Optional[str]
+    canonicalization_version: str
+    submission_digest: Optional[str]
+    score: Optional[float]
+    decode_state: Optional[str]
+    seal_ordinal: Optional[int]
+    final_failure: Optional[str]
+    deadline_expired: bool
+    task_message_id: str
+    task_delivered: bool
+    ack_message_id: str
+    ack_delivered: bool
+    payload_message_id: str
+    payload_delivered: bool
+    creates_payload_obligation: bool
+    payload_state: Optional[str]
+    protocol_version: int = PROTOCOL_VERSION
+
+
+@dataclass(frozen=True)
 class StreamOutcome:
     """What a finished generation returns: counts, not content.
 

@@ -76,7 +76,9 @@ from shogym.serve.protocol_v2.rundir import RunDirectory, ResumeRefused, open_ru
 
 TEMPORAL_ADDRESS_ENV = "SHOGYM_TEMPORAL_ADDRESS"
 STREAM_TASK_QUEUE = "shogym-stream-v2"
-_DATABASE_FILE = "stream.sqlite"
+
+#: The file one run's embedded service keeps that run's history in.
+STREAM_DATABASE_FILE = "stream.sqlite"
 
 
 def temporal_home() -> Path:
@@ -102,10 +104,10 @@ def _stream_database(run_directory: Optional[Union[str, Path]]) -> Iterator[Path
     if run_directory is not None:
         root = Path(run_directory)
         root.mkdir(parents=True, exist_ok=True)
-        yield root / _DATABASE_FILE
+        yield root / STREAM_DATABASE_FILE
         return
     with TemporaryDirectory(prefix="shogym-stream-") as scratch:
-        yield Path(scratch) / _DATABASE_FILE
+        yield Path(scratch) / STREAM_DATABASE_FILE
 
 
 @contextmanager

@@ -144,12 +144,14 @@ the downloaded binary and share no state. Without `--run-dir` the database is a 
 process owns and deletes when it exits, and there is nothing to resume, by design: a run you might
 want to take over later is a run you gave a directory. The grade is in there too. Sealing grades
 server-side, and the outcome stays in the stream's own durable history, which is the database this
-directory holds. So a run whose score you intend to defend gets a directory the agent is not
-working in, and the deny list its quickstart names: an agent that can read the directory can read
-what the seal recorded before the stream presents it. What the stream reports is still states and
-counts rather than scores, and a reader that surfaces the score is not part of this protocol yet.
-Directories written by the retired v1 serving path stay readable offline, through
-`shogym.serve.v1_runs.read_results` / `read_dispenses` / `reconcile`.
+directory holds: `shogym results runs/wordle-0001` brings that history back up, prints one row per
+attempt, and leaves the same rows in the directory as `records.jsonl`. That file is a derived view,
+rebuilt from the history every time it is asked for, so the history stays the record and the file
+is never the authority. A run whose score you intend to defend therefore gets a directory the agent
+is not working in, and the deny list its quickstart names: an agent that can read the directory can
+read what the seal recorded before the stream presents it. Directories written by the retired v1
+serving path stay readable offline, through `shogym.serve.v1_runs.read_results` / `read_dispenses`
+/ `reconcile`.
 
 ## One episode, no harness
 

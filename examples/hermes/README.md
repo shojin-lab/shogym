@@ -271,11 +271,17 @@ needs no provider at all, which is why it is step 4 above.
 ## The stream keeps the score
 
 The stream seals the attempt, grades it server-side and records the outcome in its own durable
-history. Nothing surfaces that score where you can read it: a live generation reports states and
-counts rather than scores, and `runs/<env>-<task>-<stamp>/` holds the blobs a presentation
-referenced plus a `generation.json` manifest saying which generation lived there. A reader that
-reports the score is not part of this protocol yet, so this quickstart does not ship one and you
-should not infer a number from the run directory.
+history. `runs/<env>-<task>-<stamp>/` holds that history, beside the blobs a presentation
+referenced and a `generation.json` manifest saying which generation lived there, so the score is
+read by asking the history for it:
+
+```bash
+shogym results runs/<env>-<task>-<stamp>
+```
+
+That prints one row per attempt, with what it filed and what it scored, and leaves the same rows
+in the directory as `records.jsonl`. The file is a derived view, rebuilt every time it is asked
+for, so the history stays the record and nothing reads the file back as authority.
 
 This is the part worth keeping when the harness sounds confident. A Hermes run of the retired
 serving path ended with *"Stream exhausted. I completed 2 tasks."* while the record showed one

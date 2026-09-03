@@ -90,6 +90,7 @@ with workflow.unsafe.imports_passed_through():
         SEAL_FAILED,
         SEAL_UNUSABLE,
         AttemptFinalized,
+        AttemptRecord,
         ConsumerClaim,
         ConsumerReceipt,
         EnvironmentCall,
@@ -213,6 +214,7 @@ class _Attempt:
     environment_calls: int = 0
     terminal_request_id: Optional[str] = None
     terminal_identity: Optional[str] = None
+    terminal_tool: Optional[str] = None
     seal_id: Optional[str] = None
     submission_digest: Optional[str] = None
     canonical_submission_text: Optional[str] = None
@@ -876,6 +878,68 @@ class StreamWorkflow:
             ],
         )
 
+    @workflow.query
+    def attempt_records(self) -> List[AttemptRecord]:
+        """Report one record per attempt, for a harness and never for a model.
+
+        This is the read the analysis and the run's derived file are made of. It is a Query, so
+        it writes nothing and can be asked of a generation that is still serving as easily as of
+        one that finished, and it reads the same state the seal made authoritative rather than a
+        second copy kept beside it.
+
+        The rows come back in the order the manifest fixed, so two generations built from one
+        manifest produce two files that line up row for row.
+        """
+        ordered = sorted(
+            self._attempts.values(),
+            key=lambda attempt: (attempt.item.task_position, attempt.item.attempt_id),
+        )
+        return [self._record(attempt) for attempt in ordered]
+
+    def _record(self, attempt: _Attempt) -> AttemptRecord:
+        """Return one attempt's record, read out of the attempt and the presentations.
+
+        Presentation is read from the cursor's own history rather than from the attempt's state,
+        because the three messages belong to three different transitions and a state can only
+        say where the attempt ended up. A Payload is the case that matters: an attempt is
+        acknowledged whether or not anything was ever delivered against it.
+
+        Which is why the roster's column comes with it. A payload that was never presented is
+        two different rows depending on whether one was owed, and the obligation is where that
+        is written: a row that promised none has no obligation to be in any state, and a row
+        that promised one carries how far it got.
+
+        The ending comes with the score for the same reason. A floored attempt scores nothing,
+        which is the number an attempt the environment graded at nothing also scores, and the
+        reason is the only thing that separates them.
+        """
+        item = attempt.item
+        obligation = self._obligations.get(item.attempt_id)
+        return AttemptRecord(
+            attempt_id=item.attempt_id,
+            task_position=item.task_position,
+            payload_position=item.payload_position,
+            state=attempt.state,
+            terminal_tool=attempt.terminal_tool,
+            canonicalization_version=self._start.canonicalization_version,
+            submission_digest=attempt.submission_digest,
+            score=attempt.score,
+            decode_state=attempt.decode_state,
+            seal_ordinal=attempt.seal_ordinal,
+            final_failure=attempt.final_failure,
+            deadline_expired=attempt.deadline_expired,
+            task_message_id=item.task_message_id,
+            task_delivered=item.task_message_id in self._presented,
+            ack_message_id=item.ack_message_id,
+            ack_delivered=item.ack_message_id in self._presented,
+            payload_message_id=item.payload_message_id,
+            payload_delivered=item.payload_message_id in self._presented,
+            creates_payload_obligation=self._assignments[
+                item.attempt_id
+            ].creates_payload_obligation,
+            payload_state=None if obligation is None else obligation.state,
+        )
+
     # Pull.
 
     def _pull(self, request: PullRequest) -> OfferedMessage:
@@ -1142,6 +1206,10 @@ class StreamWorkflow:
         attempt.deadline_at = None
         attempt.terminal_request_id = metadata.request_id
         attempt.terminal_identity = identity
+        # Which tool ended it. One generation declares one terminal tool and a filing that named
+        # another was refused above, so this is kept as the fact rather than derived later from a
+        # configuration that a generation with two terminals would no longer answer for.
+        attempt.terminal_tool = request.native_terminal_name
         attempt.seal_id = hidden_seal_id(
             self._start.hidden_execution_id,
             self._start.execution_ordinal,

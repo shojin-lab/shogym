@@ -1,9 +1,10 @@
-"""The command line: one way to serve, and a bare install that still gets that far.
+"""The command line: one way to serve, one way to read, and a bare install that gets that far.
 
-Two promises are checked here. Protocol version two is the only serving path, so there is no
-flag that selects a version and the retired one cannot be asked for. And importing the package
+Three promises are checked here. Protocol version two is the only serving path, so there is no
+flag that selects a version and the retired one cannot be asked for. Importing the package
 or reading its help never pulls Temporal in: it is installed, and the import lives inside the
-subcommand's body, which is the only place it is needed.
+subcommand's body, which is the only place it is needed. And a run directory is read by naming
+it, with a directory that has nothing to read answered rather than raised.
 
 The import checks run in subprocesses. A test process that has already imported the durable
 kernel for another test would answer for itself rather than for a fresh interpreter.
@@ -11,12 +12,14 @@ kernel for another test would answer for itself rather than for a fresh interpre
 
 from __future__ import annotations
 
+import pathlib
 import subprocess
 import sys
 
 import pytest
 
-from shogym.cli import _build_parser
+from shogym.cli import _build_parser, main
+from shogym.serve.protocol_v2.rundir import create_run_directory
 
 
 def _fresh(code: str) -> subprocess.CompletedProcess:
@@ -128,3 +131,52 @@ def test_a_run_directory_is_asked_for_without_naming_a_protocol() -> None:
         "3",
         "runs/one",
     )
+
+
+def test_a_run_directory_is_read_by_naming_it() -> None:
+    """Reading takes the directory and nothing else: what to read is what the run wrote."""
+    args = _build_parser().parse_args(["results", "runs/one"])
+    assert (args.command, args.run_dir) == ("results", "runs/one")
+
+
+def test_reading_a_run_that_kept_no_history_says_so_and_writes_nothing(
+    tmp_path: pathlib.Path, capsys: pytest.CaptureFixture[str], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A run served without keeping its history has nothing to read, and that is the answer.
+
+    The command starts no service to find that out and leaves the directory as it found it, so
+    a directory that kept nothing costs a line of output rather than a download.
+    """
+    pytest.importorskip("temporalio")
+    monkeypatch.delenv("SHOGYM_TEMPORAL_ADDRESS", raising=False)
+    create_run_directory(
+        tmp_path,
+        workflow_id="stream/cli/1",
+        task_queue="shogym-stream-v2",
+        configuration_hash="c" * 64,
+    )
+    main(["results", str(tmp_path)])
+    printed = capsys.readouterr().out
+    assert printed.startswith("nothing to read:")
+    assert not (tmp_path / "records.jsonl").exists()
+
+
+def test_a_directory_that_is_not_a_run_is_refused_rather_than_reported_as_empty(
+    tmp_path: pathlib.Path, capsys: pytest.CaptureFixture[str], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A refusal is not an empty result, and something collecting runs has to tell them apart.
+
+    A mistyped path, a half written directory, and one holding the retired protocol's logs all
+    arrive here as refusals rather than as runs with nothing in them. Printing those as the
+    answer and exiting nought would let a collection step gather no records and report that it
+    had succeeded.
+    """
+    pytest.importorskip("temporalio")
+    monkeypatch.delenv("SHOGYM_TEMPORAL_ADDRESS", raising=False)
+    with pytest.raises(SystemExit) as refused:
+        main(["results", str(tmp_path / "never-a-run")])
+    assert refused.value.code == 1
+    printed = capsys.readouterr()
+    assert printed.out == ""
+    assert printed.err.startswith("cannot read ")
+    assert "never-a-run" in printed.err
