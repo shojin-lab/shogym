@@ -67,6 +67,48 @@ subprocess, which made it the slowest and least reliable part of the suite. No p
 in this repository uses it, so it is withdrawn rather than carried through a deprecation cycle. An
 inverse of the removal commit restores the tracked tree; local caches are outside version control.
 
+### `automationbench`: the pin moves to upstream 1.0.6
+
+`UPSTREAM_SHA` is now `6d21054`, the commit upstream's changelog calls the 1.0.6 release, in place
+of `a321764`. **This changes measured automationbench scores and every configuration digest**, so a
+run served at one pin and a run served at the other are not comparable, and a resumed generation
+across the move is refused rather than scored against a rule nobody drew for it.
+
+The release is titled "Bug fixes" and is mostly a fairness pass over the tasks. 110 files of the
+package changed, 5243 lines added and 1055 removed. What a served episode sees:
+
+- **Google Drive is seeded beside Google Sheets on 105 tasks**, 99 in hr and 6 in marketing. Sheets
+  publishes no list endpoint, all four of its read routes take the spreadsheet id as a path
+  segment, and Drive's file listing is the only enumeration of spreadsheets the world has. Those
+  tasks handed the agent a spreadsheet whose opaque author id the request text never named and
+  answered the Drive call with a 401, so the id could only be guessed. Every seeded spreadsheet in
+  the pool is now listable, and the metadata endpoint the id opens names the worksheets inside it.
+- **96 tasks have other initial-state changes after ignoring `google_drive`.** 20 of those overlap
+  the 105 Drive rows, so **181 unique tasks have any seed change at all**.
+- **68 tasks changed their assertions**, and 3 changed their granted tool list.
+- **105 user requests were reworded**, and the shared system prompt gained an exception to its
+  "do not narrate exclusions" instruction for workflows that require an exclusion notice.
+- **15 rubric assertion modules changed, adding 18 registered assertion handlers**, so what a given
+  end state scores can differ even where the task did not change. No assertion module was added or
+  removed.
+- **Every schema model now validates on assignment**, so a write outside a field's enum is refused
+  at the endpoint with a 422 instead of landing in the world. It does not reach an in-place
+  mutation of a container a field already holds, so this does not make a served world safe to
+  rebuild. See the amendment to the entry below.
+- The 600 rows and their `example_id` values are unchanged, and so is the count per domain.
+
+The task name moved off the dataset row into `info["task_name"]`. **Every 1.0.6 dataset omits the
+top-level `task` key**, the combined `public` alias included, and every shipped row carries the new
+one. `env_v1.task_name` reads the new location, falling back to the old column and then to a
+default; the fallbacks are for legacy rows and for the rows a caller injects through the `tasks`
+config, which is a supported path that predates the move. The per-task `name` and the configuration
+digest's per-row `task` both go through it.
+
+An enumeration of the pool at the old pin found 106 tasks requiring at least one resource id no
+served endpoint could return. `shogym.envs.automationbench.undiscoverable.PREVIOUSLY_UNDISCOVERABLE`
+records those indices so runs made at that pin can be stratified by the class rather than read as
+uniform agent weakness. It describes the old pin only and nothing in the env reads it.
+
 ### `automationbench`: the Jira project search answers from the world
 
 The search now also reports the Jira projects the task seeded. **This changes a served response, so
@@ -101,11 +143,11 @@ found those.
 
 The reachable lookup surface is wider than that one task, though. `api_search` is ungated, so every
 task can discover the project search, and 28 of the 600 pool tasks have Jira connected. At the pin
-this port carries, the URL that search advertises for the route repeats `/rest/api/3` and reaches no
-handler, so the discover-then-call sequence the served instructions describe answers 404 on all 28.
-Upstream corrected the advertised URL in its 1.0.6 release. Once the port's pin moves to that
-release, the eight tasks that hold Jira projects answer with them, the seeded one by way of the
-completion above, and the other twenty answer an empty search instead of a 404.
+this entry was written against, the URL that search advertised for the route repeated `/rest/api/3`
+and reached no handler, so the discover-then-call sequence the served instructions describe answered
+404 on all 28. Upstream corrected the advertised URL in its 1.0.6 release, and the entry above moves
+the pin there, so the eight tasks that hold Jira projects now answer with them: the seeded one by
+way of the completion above, and the other twenty answer an empty search rather than a 404.
 
 ### `automationbench`: the rubric scores the live world, not a rebuilt copy of it
 
@@ -114,11 +156,12 @@ running the rubric. It now runs the rubric against the live object the served to
 is what upstream's own runner does. **This changes measured automationbench scores.**
 
 The round trip was not a no-op in either direction. It could raise, which left the episode
-unscored: the tools mutate the model in place and pydantic validates on construction rather than
-on assignment, so a live world legitimately holds values re-validation rejects. Two shapes of that
-occur in the shipped pool. A `linkedin` company record's size field validates under one name and
-serializes under another, and the containing model forbids unknown keys, so **any** world holding
-a company could never be rebuilt. Six of the 600 public tasks seed one, and they were
+unscored: the tools mutate the model in place, and at the pin this landed on, pydantic validated on
+construction rather than on assignment, so a live world legitimately held values re-validation
+rejects. Two shapes of that occurred in the shipped pool. A `linkedin` company record's size field
+validates under one name and serializes under another, and the containing model forbids unknown
+keys, so **any** world holding a company could never be rebuilt. Six of the 600 public tasks seed
+one, and they were
 unscoreable for every agent on every run regardless of what the agent did. Separately, several endpoints
 assign a request value straight into a field narrower than `str`, so an accepted, echoed-back tool
 call could leave the world unrebuildable; 273 of 600 tasks reach at least one such endpoint.
@@ -137,8 +180,22 @@ no change at all elsewhere.
 
 `adapter.score_state` now takes the live `WorldState`. It still accepts a mapping, so callers
 written against the older signature keep working, but that path re-validates and is therefore
-lossy in both ways above; its first parameter is renamed `world_dump` -> `world`, which matters
-only to a caller passing it by keyword.
+lossy; its first parameter is renamed `world_dump` -> `world`, which matters only to a caller
+passing it by keyword.
+
+**Amended for the pin move above.** Everything to here describes the old pin `a321764`, which is
+what it was written against, and the replay numbers are not restated for the new one. Upstream
+1.0.6 closes the two rebuild failures named above, and only those: it lets LinkedIn's aliased
+fields populate by name, so all 600 seeded worlds survive a dump and a rebuild, and it sets
+`validate_assignment=True` on every schema model, so a write outside a field's enum is refused at
+the endpoint with a 422 rather than landing in a world that cannot be rebuilt.
+
+That is not every way a tool can reach one. Validating on assignment does not see an in-place
+mutation of the container an attribute already holds, and the tools reach several of those: the
+Gmail label endpoint appends each requested label straight onto a `list[str]`, so a non-string
+label is accepted, echoed back, and leaves a live world its own dump cannot revalidate. So the
+mapping compatibility path above is still lossy in both directions, and both are why scoring reads
+the live object rather than a copy.
 
 ### `automationbench`: a fail-closed finalize publishes no score
 

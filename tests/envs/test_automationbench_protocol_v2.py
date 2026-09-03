@@ -34,6 +34,7 @@ import shogym  # noqa: E402
 from examples.claude_code import serve as serve_mod  # noqa: E402
 from shogym.envs._grading import MemoryCaptures  # noqa: E402
 from shogym.envs.automationbench import mcp_server  # noqa: E402
+from shogym.envs.automationbench.env_v1 import task_name  # noqa: E402
 from shogym.envs.automationbench.protocol_v2 import (  # noqa: E402
     AUTOMATIONBENCH_GRADE,
     CANONICALIZATION_VERSION,
@@ -518,7 +519,7 @@ async def test_a_run_that_spends_its_budget_is_graded_where_the_budget_ran_out()
     """
     row = _public_task(156)
     info = row["info"]
-    assert (row["example_id"], row["task"]) == (1121, "marketing.trial_extension_processing")
+    assert (row["example_id"], task_name(row)) == (1121, "marketing.trial_extension_processing")
     assert len(info["assertions"]) == 20
     episode = await ServedEpisode.start("automationbench", task=156, ends_on_horizon=False)
     running = False

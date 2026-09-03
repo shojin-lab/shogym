@@ -40,8 +40,10 @@ from urllib.parse import unquote, urlparse
 
 from shogym.envs._upstream import ensure_package
 
-# Fidelity pin: the upstream commit this port reproduces (AutomationBench has no release tags).
-UPSTREAM_SHA = "a321764ace3cfbe42289e6a13abef2f0f4f56fad"
+# Fidelity pin: the upstream commit this port reproduces. AutomationBench cuts no git tags and
+# publishes no releases, so a release is named only in its changelog; this commit is the one whose
+# message reads "1.0.6 release. Bug fixes."
+UPSTREAM_SHA = "6d210543b7a046f0f451c828cd2dadef774276eb"
 _TARBALL_URL = f"https://github.com/zapier/AutomationBench/archive/{UPSTREAM_SHA}.tar.gz"
 
 
@@ -139,8 +141,11 @@ def load_domain_tasks(domain: str) -> List[Dict[str, Any]]:
     Delegates to the upstream ``automationbench.domains.get_domain_dataset`` — the same loader
     ``auto-bench`` uses — so deterministic per-domain noise injection (seeded by ``example_id``)
     and the HuggingFace ``Dataset`` schema normalization + JSON-string ``info`` encoding are all
-    reproduced verbatim. Each returned row has ``example_id``, ``task``, ``prompt`` (chat
-    messages), ``answer``, and ``info`` (a JSON string, exactly as the dataset stores it)."""
+    reproduced verbatim. Each returned row has ``example_id``, ``prompt`` (chat messages),
+    ``answer``, and ``info`` (a JSON string, exactly as the dataset stores it). The pinned upstream
+    carries the task's name inside ``info`` as ``task_name``; the top-level ``task`` column older
+    revisions had is absent from every shipped domain, the combined ``public`` alias included. Read
+    the name through :func:`shogym.envs.automationbench.env_v1.task_name`, which covers both."""
     from automationbench.domains import (  # lazy: pulls in `datasets`
         DOMAIN_ALIASES,
         get_combined_dataset,
@@ -314,25 +319,25 @@ def score_state(
     the state, which ``task_completed_correctly`` reads back.
 
     ``world`` is the **live** :class:`WorldState` the served tools mutated, scored as-is. That is
-    what upstream's own runner does, and a serialize/revalidate round trip in between is not a
-    no-op in either direction:
+    what upstream's own runner does, and a serialize/revalidate round trip in between is not
+    reliably a no-op. An ordinary write to a declared field does survive one; two things do not:
 
-    - It can **raise.** The tools mutate the model in place, and pydantic validates on
-      construction rather than on assignment, so a live world legitimately holds values that
-      re-validation rejects: a field whose validation alias differs from the name it dumps under
-      (rejected outright under ``extra="forbid"``), or a narrower-than-``str`` field a tool
-      assigned a value from the request. A raise here scores nothing at all.
     - It can **lose evidence.** Part of what the rubric reads is recorded by the tool layer
       *outside* the model's declared fields, so it does not survive ``model_dump``. Scoring a
-      reconstruction silently reads a world that has forgotten writes the agent made.
+      reconstruction can silently read a world that has forgotten writes the agent made.
+    - It can **raise.** A raise scores nothing at all. The pinned upstream closed the two failures
+      this port had observed, by populating aliased fields by name and by validating on assignment,
+      but not every way a tool can reach one: validating on assignment does not see an in-place
+      mutation of the container an attribute already holds, and the tools reach several of those.
+      A served world can still be one its own dump cannot rebuild.
 
     The rubric only reads the world (its handlers are pure and it caches its score on ``state``),
     and this runs on an already-sealed episode whose world is discarded immediately afterwards,
     so scoring the caller's object in place is safe and no defensive copy is taken.
 
     A mapping is still accepted, and is revalidated into a ``WorldState`` before scoring. That
-    path is **lossy** for the two reasons above and exists only so callers written against the
-    older dump-taking signature keep working; prefer passing the live object.
+    path is **lossy** for the reasons above and exists only so callers written against the older
+    dump-taking signature keep working; prefer passing the live object.
 
     Returns ``(partial_credit, task_completed_correctly)``.
     """

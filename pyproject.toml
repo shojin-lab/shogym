@@ -140,7 +140,7 @@ yc_bench = [
 # the offline tests need neither Docker nor a network.
 frontier_bench = []
 # The AutomationBench port (src/shogym/envs/automationbench). Upstream (MIT, © Zapier) is pinned to
-# commit a321764 and, on top of the PyPI direct-reference ban that rules out a git requirement for
+# commit 6d21054 and, on top of the PyPI direct-reference ban that rules out a git requirement for
 # tau2/yc-bench, cannot be resolved by pip at all: it declares `requires-python >=3.13` (shogym is
 # hard-pinned to <3.13 for tau2's `audioop`) and pulls the heavy `verifiers` / `anthropic`
 # agent-loop stack — an unsatisfiable resolve on 3.12. The env-as-center port needs none of that

@@ -8,12 +8,13 @@ the one scoring entry point the port already had, so there is no second copy of 
 drift from the one a v1 run uses.
 
 The rubric runs at the seal rather than at the grade, and that is a property of this world rather
-than a shortcut. A ``WorldState`` the served tools mutated does not survive a serialize and
-revalidate round trip: part of what the rubric reads is recorded outside the model's declared
-fields, and revalidation can reject values a live world legitimately holds. So the one moment the
+than a shortcut. The served tools can mutate a ``WorldState`` in ways a serialize and revalidate
+round trip does not preserve: part of what the rubric reads is recorded outside the model's
+declared fields, so a rebuilt copy can have forgotten writes the agent made. So the one moment the
 end state can be read is while the session is open, and what is kept under the seal id is what was
-read then. The grade is a pure projection of that record, which is what makes a retry return the
-first call's numbers rather than a second look at a world that may no longer be there.
+read then. The
+grade is a pure projection of that record, which is what makes a retry return the first call's
+numbers rather than a second look at a world that may no longer be there.
 
 The headline is ``partial_credit``: the fraction of the task's assertions the end state satisfies,
 which is the number a v1 run reports as its reward. Beside it a body may say whether every
@@ -127,8 +128,15 @@ def configuration_digest(
     different one of those is a different measurement, and it is refused rather than scored against
     a rule nobody drew for it. Each row is covered by the identifiers upstream gives it and by the
     world it seeds, which is the material a score depends on.
+
+    ``tasks`` are the env's own rows, whose ``info`` is a mapping because the env normalizes every
+    row it loads. A raw row out of :func:`adapter.load_domain_tasks` carries ``info`` as JSON text
+    instead, and digests to a different value than the same row normalized, so a caller assembling
+    rows by hand normalizes them first. The name is read through
+    :func:`~shogym.envs.automationbench.env_v1.task_name`, which answers either shape.
     """
     from shogym.envs.automationbench import adapter
+    from shogym.envs.automationbench.env_v1 import task_name
 
     return digest_of(
         {
@@ -140,7 +148,7 @@ def configuration_digest(
             "tasks": [
                 {
                     "example_id": str(row.get("example_id")),
-                    "task": str(row.get("task")),
+                    "task": task_name(row),
                     "info": row.get("info", {}),
                 }
                 for row in tasks
