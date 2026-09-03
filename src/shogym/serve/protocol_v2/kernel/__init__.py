@@ -5,10 +5,12 @@ A quickstart install still runs an episode; a durable stream needs the extra, an
 runner starts its own embedded service, so a user never installs or runs a server.
 
 What is here is the generic kernel: a typed pull, a durable seal before any acknowledgement,
-offers and presentations against a harness cursor, and a monotonic Done. The experimental
-profile is not here. There are no assignments, release plans, leg automata, payload families,
-fork, or retry scopes, and the schedule is the compatibility Immediate one: every task carries
-exactly one payload obligation, which becomes eligible when that task seals.
+offers and presentations against a harness cursor, a schedule model, and a monotonic Done. A
+generation carries an immutable assignment roster and one release plan. Immediate makes an
+obligation eligible at the seal of the attempt it belongs to, Never creates no obligation at
+all, and a plan may gate a named task on a payload being presented or on another task sealing.
+The experimental profile is not here: no leg automata, payload families, fork, or retry scopes,
+and no delayed release, blocked obligations, or end-of-queue tail policies.
 
 The Python API a gateway calls
 ------------------------------
@@ -82,6 +84,7 @@ from shogym.serve.protocol_v2.kernel.messages import (
     StreamState,
     TaskItem,
     TerminalTool,
+    assignments_for,
     blob_ref,
     hidden_seal_id,
 )
@@ -125,6 +128,7 @@ __all__ = [
     "StreamWorkflow",
     "TaskItem",
     "TerminalTool",
+    "assignments_for",
     "blob_ref",
     "durable_client",
     "generate_payload_bundle_activity",

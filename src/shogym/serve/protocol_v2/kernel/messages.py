@@ -24,9 +24,17 @@ from __future__ import annotations
 
 from dataclasses import dataclass, field
 from hashlib import sha256
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, Sequence
 
-from shogym.serve.protocol_v2 import PROTOCOL_VERSION, TerminalMetadata, length_prefixed
+from shogym.serve.protocol_v2 import (
+    IMMEDIATE,
+    PROTOCOL_VERSION,
+    Assignment,
+    ReleasePlan,
+    TerminalMetadata,
+    assignment_id_for,
+    length_prefixed,
+)
 
 
 @dataclass(frozen=True)
@@ -83,6 +91,12 @@ class StreamStart:
     operator material: the first keys the message IDs that are not preallocated, the second
     separates two executions that share a public attempt ID, and neither is ever copied into a
     model-visible message.
+
+    ``assignments`` is the generation's roster and ``release`` is its schedule. They arrive
+    together and before anything is served, which is what makes assignment a fact about the
+    generation rather than a consequence of how it ran. An empty roster is filled in from the
+    closed manifest at start, still before an offer. ``evaluation_only`` says this generation
+    exists to score and not to deliver, and it is refused unless its plan is Never.
     """
 
     configuration_hash: str
@@ -97,7 +111,46 @@ class StreamStart:
     capacity: int = 1
     wait_retry_after_ms: int = 1000
     execution_ordinal: int = 0
+    release: ReleasePlan = field(default_factory=lambda: IMMEDIATE)
+    assignments: List[Assignment] = field(default_factory=list)
+    evaluation_only: bool = False
     protocol_version: int = PROTOCOL_VERSION
+
+
+def assignments_for(
+    tasks: List[TaskItem], release: ReleasePlan, *, without_payload: Sequence[str] = ()
+) -> List[Assignment]:
+    """Return the roster a closed manifest implies under ``release``.
+
+    The manifest and the roster are different objects and stay that way: the manifest is the
+    queue a stream serves from, the roster is the set of rows an analysis counts. They are
+    built together so a row cannot name a position the queue does not have.
+
+    ``without_payload`` names the attempts this generation delivers nothing against. Their
+    tasks are served, worked, and scored like any other, and no payload obligation is created
+    for them, which is what a leg's filler needs and what the release plan cannot express.
+
+    A plan that releases nothing at all leaves every row saying so. The column is what this
+    generation does rather than what its manifest could have asked for, so a Never roster reads
+    afterwards the way it behaved: no row created a payload, because none did.
+    """
+    silent = set(without_payload)
+    return [
+        Assignment(
+            assignment_id=assignment_id_for(item.attempt_id),
+            attempt_id=item.attempt_id,
+            task_position=item.task_position,
+            payload_position=item.payload_position,
+            task_message_id=item.task_message_id,
+            ack_message_id=item.ack_message_id,
+            payload_message_id=item.payload_message_id,
+            release_plan_id=release.release_plan_id,
+            creates_payload_obligation=(
+                release.creates_obligations and item.attempt_id not in silent
+            ),
+        )
+        for item in tasks
+    ]
 
 
 @dataclass(frozen=True)
@@ -189,8 +242,15 @@ class QueueClosed:
 class StreamState:
     """What the harness may ask a live generation about itself.
 
-    This is the answer to a Query, so it writes nothing and can be asked at any time. It says
-    nothing a model could use: no queue contents, no reason for a Wait, no score.
+    This is the answer to a Query, so it writes nothing and can be asked at any time. It is
+    harness-only, which is what lets it carry the hidden Wait reasons: a model that could read
+    them would learn from a Wait exactly what the Wait record is shaped to withhold.
+
+    Assignment, release, materialization, eligibility, offer, and presentation are six counts
+    and not one. Collapsing them would make an offer look like a delivery, and only the last of
+    them, and only for a Payload, is one: ``payload_delivery_count`` counts the payloads whose
+    bytes were handed to the transport and nothing else. What the model consumed of them is
+    attested by the harness transcript rather than by any count here.
     """
 
     generation_state: str
@@ -206,9 +266,16 @@ class StreamState:
     pending_kind: Optional[str]
     attempts: Dict[str, str]
     obligations: Dict[str, str]
+    release_plan_id: str
+    release_predicate: str
+    assignment_count: int
+    materialization_count: int
+    eligibility_count: int
     offer_count: int
     presentation_count: int
+    payload_delivery_count: int
     wait_count: int
+    wait_reasons: Dict[str, int]
     protocol_version: int = PROTOCOL_VERSION
 
 
