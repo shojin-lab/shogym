@@ -58,13 +58,12 @@ DEFAULT_MAX_STEPS = 400
 
 _INSTRUCTIONS = """\
 You are operating inside a Frontier-Bench task container over a served shell. Call `describe` \
-first to read the full task instruction (it specifies the inputs under `/app/inputs/`, the \
-exact outputs to produce, and their format).
+first to read the full task instruction (it specifies where the inputs live, the exact outputs \
+to produce, and their format).
 
 Act on the container through these tools:
-- `exec(command)` — run a shell command in the container (inputs are under `/app/inputs/`; \
-write outputs under `/app` as the instruction directs). Returns JSON with `ok`, `exit_code`, \
-`stdout`, `stderr`.
+- `exec(command)` — run a shell command in the container (write outputs under `/app` as the \
+instruction directs). Returns JSON with `ok`, `exit_code`, `stdout`, `stderr`.
 - `read_file(path)` / `write_file(path, content)` — read or write a file in the container.
 
 When you have produced the required outputs, call `done`. This **ends the episode**: it seals \
@@ -180,16 +179,21 @@ class FrontierBenchEnv(Env):
             "",
             "# This run",
             f"- task: {meta.dataset_name} (index {meta.index})",
-            f"- pinned: frontier-bench {self._upstream_tag()} · {meta.digest}",
+            f"- pinned: frontier-bench {self._upstream_pin()} · {meta.digest}",
             f"- environment_mode: {meta.environment_mode}",
         ]
         return spec.model_copy(update={"instructions": "\n".join(parts)})
 
     @staticmethod
-    def _upstream_tag() -> str:
-        from shogym.envs.frontier_bench.manifest import UPSTREAM_TAG
+    def _upstream_pin() -> str:
+        """The upstream revision the footer publishes: the commit, then the recorded label.
 
-        return UPSTREAM_TAG
+        ``UPSTREAM_TAG`` is upstream's Harbor Hub dataset version and no Git ref resolves it,
+        so the short ``UPSTREAM_COMMIT`` leads (a reader can fetch it) and the tag follows in
+        parentheses as the historical label."""
+        from shogym.envs.frontier_bench.manifest import UPSTREAM_COMMIT, UPSTREAM_TAG
+
+        return f"{UPSTREAM_COMMIT[:8]} ({UPSTREAM_TAG})"
 
     # ----- finalize: the sealed terminal transaction -----
 

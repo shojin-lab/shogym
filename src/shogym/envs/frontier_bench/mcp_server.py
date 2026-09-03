@@ -261,9 +261,9 @@ def _no_session_error(tool: str) -> str:
 def exec(command: str, _session_id: str) -> str:
     """Run one shell command inside the task container and return its result.
 
-    ``command`` is a full shell command line (e.g. ``"ls /app/inputs"``,
-    ``"python3 /app/run.py"``). Returns JSON with ``ok``, ``exit_code``, ``stdout``,
-    ``stderr``. The task's inputs live under ``/app/inputs``; write outputs under ``/app``.
+    ``command`` is a full shell command line (e.g. ``"ls /app"``, ``"python3 /app/run.py"``).
+    Returns JSON with ``ok``, ``exit_code``, ``stdout``, ``stderr``. The task's own
+    instruction names where its inputs live; write outputs under ``/app``.
     """
     session = _session_for(_session_id)
     if session is None:

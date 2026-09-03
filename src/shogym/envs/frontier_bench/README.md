@@ -136,8 +136,9 @@ that onto shogym's env-as-center trio; every `docker` call funnels through a sin
 `env.describe(task_id)` resolves `task_id` (a task name or an index string; `None` → the
 configured default) and publishes that task's contract the harness reads: its real
 **`instruction.md`** (verbatim, canary comment included) plus a short provenance footer (the
-upstream task name + index, the recorded `v0.1.0` label + digest, the `environment_mode`), and
-the **tool manifest** — `exec`, `read_file`, `write_file`, `done`
+upstream task name + index, the pinned commit with the recorded label in parentheses after it,
+the digest, the `environment_mode`), and the **tool manifest** — `exec`, `read_file`,
+`write_file`, `done`
 (**`terminal_kind: score`**), plus the reserved `terminate` (`terminal_kind: abort`).
 
 ### Tools (served over MCP)
@@ -243,11 +244,11 @@ core-owned terminal evidence, so the transcript cannot influence it.
   redirects), `tasks/dataset.toml` at `eb4af26c` names the in-repo dataset
   `terminal-bench/terminal-bench-3` with no version field, and `0.1.0` appears in none of the
   vendored task files. `manifest.UPSTREAM_TAG` records it with a `v` prefix this port added.
-  The commit `eb4af26c` is the source anchor. `describe()` still stamps the recorded label in
-  each TaskSpec's provenance footer (`pinned: frontier-bench v0.1.0 · <digest>`); moving that
-  footer onto the commit changes a served string, so it is
-  [issue #136](https://github.com/shojin-lab/shogym/issues/136) rather than part of this pass.
-  The upstream digest is an OCI/packaging digest (from `harbor add`) recorded as provenance. The
+  The commit `eb4af26c` is the source anchor, and it leads each TaskSpec's provenance footer
+  with the recorded label in parentheses behind it
+  (`pinned: frontier-bench eb4af26c (v0.1.0) · <digest>`), so a reader can fetch the revision
+  the vendored files came from. The upstream digest is an OCI/packaging digest (from
+  `harbor add`) recorded as provenance. The
   recomputed content hash is an independent anchor, but `verify_vendored_integrity()` runs only in
   the offline test suite: `load_task` does not check bytes on the serve path. Re-pins are
   deliberate.
