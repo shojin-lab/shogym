@@ -9,7 +9,7 @@ Three moves, and the whole quickstart is these three:
 
 1. **One task, served.** `serve.py` publishes one MCP endpoint: `pull` plus the env's native
    tools, each wrapped so that a call names the attempt it belongs to.
-2. **One variable swaps the env.** `ENV = "automationbench"` at the top of `serve.py`. That line
+2. **One variable swaps the env.** `ENV = "wordle_v1"` at the top of `serve.py`. That line
    is the entire migration to any other env in the catalogue.
 3. **The stream keeps the score.** Sealing is server-side and the score stays in the stream's own
    durable history. The agent is not told it, and neither is anything else.
@@ -19,13 +19,13 @@ Three moves, and the whole quickstart is these three:
 - The `claude` CLI on `PATH` (`claude --version`).
 - Credentials for it: `ANTHROPIC_API_KEY`, or an OAuth session from `claude /login`.
 - [uv](https://docs.astral.sh/uv/), for the pinned Python 3.12 venv. `uv sync` at the repo root
-  installs shogym with every env extra and with the `durable` extra, which is what serving needs
-  now: the stream's history, replay and timers are Temporal's. Outside this repo that extra is
-  `pip install "shogym[durable]"` (or `uv sync --extra durable`); `import shogym` still works
-  without it, and only serving does not.
+  installs shogym with every env extra. Outside this repo the install is `pip install shogym` and
+  nothing else: the stream's history, replay and timers are Temporal's, and `temporalio` is a
+  dependency of the package rather than an extra you have to know to ask for.
 - Network, once. The first serve starts an embedded durable service and downloads its binary
-  into `~/.cache/shogym/temporal/`; set `SHOGYM_TEMPORAL_ADDRESS` to use a service you already
-  run instead. On its first run `automationbench` also fetches its pinned upstream source into
+  (about 130 MB) into `~/.cache/shogym/temporal/`, and there is nothing to configure: every serve
+  after that reuses it. Set `SHOGYM_TEMPORAL_ADDRESS` to use a service you already run instead.
+  On its first run `automationbench` also fetches its pinned upstream source into
   `~/.cache/shogym` once; after that it is fully offline and needs no key.
 
 ## Run it
@@ -109,7 +109,7 @@ SHOGYM_ENV=wordle_v1 SHOGYM_TASK=1 <the command above>
 or change the default, which is one line in `serve.py`:
 
 ```python
-ENV = os.environ.get("SHOGYM_ENV") or "automationbench"   # "wordle_v1", "hle", "yc_bench", ...
+ENV = os.environ.get("SHOGYM_ENV") or "wordle_v1"   # "wordle_v1", "hle", "yc_bench", ...
 ```
 
 `SHOGYM_ENV` wins when it is set, so the environment variable is the one to reach for while you are

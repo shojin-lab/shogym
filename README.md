@@ -4,9 +4,9 @@ A gym for running agents on tasks: bring any harness.
 
 An environment describes a task, serves its tools over MCP, and verifies the recorded trajectory
 with a pure function. A harness (Claude Code, Codex, Pi, Hermes, Prime Agent, or a plain loop)
-drives the tools; shōgym never owns the model, the prompt, or the agent loop. The core stays
-small: `pip install shogym` gets you the envs and an in-process episode, and serving one to a
-harness adds one extra (`pip install "shogym[durable]"`) and nothing you have to run yourself.
+drives the tools; shōgym never owns the model, the prompt, or the agent loop. The install is one
+line: `pip install shogym` plus an API key for your harness gets you the envs, an in-process
+episode, and a served task, with nothing you have to run yourself.
 
 It is a substrate for questions about agents on tasks. How do agents improve themselves? What
 does adding a tool change? Does an agent's self-report match an honest score?
@@ -41,7 +41,7 @@ itself).
   [Prime Agent](https://github.com/PrimeIntellect-ai/prime-agent) takes MCP as a Python-backed
   kernel skill, and `serve.py` runs over HTTP in a second shell.
 
-Each one defaults to `automationbench` at task `0`, and one launch is one episode: the stream
+Each one defaults to `wordle_v1` at task `0` (the one env that needs no extra; `SHOGYM_ENV=automationbench` needs `pip install "shogym[automationbench]"`), and one launch is one episode: the stream
 serves a single env at a single task, so three tasks are three launches. Two variables name the
 env and the task for one run, without editing a tracked file:
 
@@ -57,10 +57,12 @@ needs no extra and no key, and is the cheapest place to start.
 
 shōgym is pinned to **Python 3.12** (`requires-python = ">=3.12,<3.13"`, with a committed
 `.python-version`) because the tau2-bench port needs it. With [uv](https://docs.astral.sh/uv/),
-`uv sync` builds the 3.12 venv and `uv run …` runs against it. Serving needs the `durable` extra
-on top of the core (`uv sync --extra durable`, or `pip install "shogym[durable]"`), because the
-stream's history, replay and timers are Temporal's; `uv sync` at the repo root already includes
-it, and `import shogym` never does.
+`uv sync` builds the 3.12 venv and `uv run …` runs against it. Serving needs no extra and no
+second install: the stream's history, replay and timers are Temporal's, and `temporalio` is a
+dependency of the package. The first serve downloads a dev-server binary (about 130 MB) into
+`~/.cache/shogym/temporal` and starts it; there is nothing to configure, nothing to run
+yourself, and every serve after that reuses the binary. Set `SHOGYM_TEMPORAL_ADDRESS` to point
+at a server you already run instead, and then nothing is downloaded or started at all.
 
 ## Environments
 
@@ -135,11 +137,18 @@ the loop is `pull`, work, end the task, `pull`, and stop on `done`. There is no 
 anywhere on the wire: a task record carries an attempt id and a body, and has no field an index or
 a target could be written into.
 
-`--run-dir` is where the generation keeps the blobs its presentations reference and the manifest a
-later owner would resume it from. The score is not in there. Sealing grades server-side and the
-outcome stays in the stream's own durable history, which reports states and counts rather than
-scores; a reader that surfaces the score is not part of this protocol yet. Directories written by
-the retired v1 serving path stay readable offline, through
+`--run-dir` is where the generation keeps the blobs its presentations reference, the manifest a
+later owner would resume it from, and the embedded service's own database. All three belong to the
+run, which is what lets two `shogym serve` processes run side by side on one machine: they share
+the downloaded binary and share no state. Without `--run-dir` the database is a temporary file this
+process owns and deletes when it exits, and there is nothing to resume, by design: a run you might
+want to take over later is a run you gave a directory. The grade is in there too. Sealing grades
+server-side, and the outcome stays in the stream's own durable history, which is the database this
+directory holds. So a run whose score you intend to defend gets a directory the agent is not
+working in, and the deny list its quickstart names: an agent that can read the directory can read
+what the seal recorded before the stream presents it. What the stream reports is still states and
+counts rather than scores, and a reader that surfaces the score is not part of this protocol yet.
+Directories written by the retired v1 serving path stay readable offline, through
 `shogym.serve.v1_runs.read_results` / `read_dispenses` / `reconcile`.
 
 ## One episode, no harness

@@ -1,10 +1,16 @@
 """Reaching the stream from outside it: the service, the Worker, and the caller's handle.
 
-The service is embedded. A user installs the extra and runs; nothing here asks them to
+The service is embedded. A user installs the package and runs; nothing here asks them to
 install a server, start one, or keep one alive. The dev service is downloaded once into
-``~/.cache/shogym/temporal`` and its SQLite file lives beside it, so a stream survives the
-process that served it. ``SHOGYM_TEMPORAL_ADDRESS`` points at a server someone else runs, and
-then nothing is downloaded or started here at all.
+``~/.cache/shogym/temporal`` and every embedded service since runs that same binary.
+
+Its database is not shared. One SQLite file under the cache root would make two serving
+processes on one machine contend for one write lock, and the second one to ask would fail to
+start. So the file belongs to the run: a generation given a run directory keeps its history in
+that directory, beside the blobs and the manifest naming the same generation, and a generation
+given no directory keeps it in a directory this process owns and removes when it exits.
+``SHOGYM_TEMPORAL_ADDRESS`` points at a server someone else runs, and then nothing is
+downloaded or started here at all.
 
 :class:`StreamHandle` is the surface a gateway calls. It derives each Update ID from the
 logical request and its canonical identity, which is what makes a transport retry reach the
@@ -28,6 +34,7 @@ from contextlib import asynccontextmanager, contextmanager
 from dataclasses import dataclass
 from hashlib import sha256
 from pathlib import Path
+from tempfile import TemporaryDirectory
 from typing import Any, AsyncIterator, Dict, Iterator, Optional, Sequence, Union
 
 from temporalio.client import Client, WorkflowHandle, WorkflowUpdateFailedError
@@ -70,10 +77,32 @@ _DATABASE_FILE = "stream.sqlite"
 
 
 def temporal_home() -> Path:
-    """The directory the embedded service and its database live in."""
+    """The directory the embedded service's downloaded binary lives in.
+
+    The binary is the shared part: it is fetched once and every run after that starts it again.
+    A run's database is per run, and :func:`_stream_database` says where.
+    """
     base = os.environ.get("SHOGYM_CACHE")
     root = Path(base) if base else Path.home() / ".cache" / "shogym"
     return root / "temporal"
+
+
+@contextmanager
+def _stream_database(run_directory: Optional[Union[str, Path]]) -> Iterator[Path]:
+    """Yield the file this run's embedded service writes its history to.
+
+    A run directory holds it, so the history sits beside the blobs and the manifest that name
+    the same generation and a later owner finds all three together. Without a run directory
+    there is nothing to take over later, so the file goes in a temporary directory this process
+    owns and goes away with it.
+    """
+    if run_directory is not None:
+        root = Path(run_directory)
+        root.mkdir(parents=True, exist_ok=True)
+        yield root / _DATABASE_FILE
+        return
+    with TemporaryDirectory(prefix="shogym-stream-") as scratch:
+        yield Path(scratch) / _DATABASE_FILE
 
 
 @contextmanager
@@ -105,8 +134,19 @@ def _service_output_off_the_wire() -> Iterator[None]:
 
 
 @asynccontextmanager
-async def durable_client(*, namespace: str = "default") -> AsyncIterator[Client]:
+async def durable_client(
+    *, namespace: str = "default", run_directory: Optional[Union[str, Path]] = None
+) -> AsyncIterator[Client]:
     """Yield a client for the durable service, starting an embedded one if needed.
+
+    ``run_directory`` is the run this service serves. It is where the history goes, and passing
+    the same directory the gateway is given is what keeps two serving processes on one machine
+    out of each other's database.
+
+    It is also what a resume is opened against. A client opened without one starts an empty
+    database of its own, so it reaches no generation any other process served, and a resume it
+    is handed to answers that the workflow does not exist. Taking a run over means opening its
+    directory here first, and then resuming out of it.
 
     The download directory has to exist before the service is asked for, so it is created
     here rather than left to the first user who has never run this.
@@ -117,16 +157,17 @@ async def durable_client(*, namespace: str = "default") -> AsyncIterator[Client]
         return
     home = temporal_home()
     home.mkdir(parents=True, exist_ok=True)
-    with _service_output_off_the_wire():
-        environment = await WorkflowEnvironment.start_local(
-            namespace=namespace,
-            dev_server_database_filename=str(home / _DATABASE_FILE),
-            download_dest_dir=str(home),
-        )
-    try:
-        yield environment.client
-    finally:
-        await environment.shutdown()
+    with _stream_database(run_directory) as database:
+        with _service_output_off_the_wire():
+            environment = await WorkflowEnvironment.start_local(
+                namespace=namespace,
+                dev_server_database_filename=str(database),
+                download_dest_dir=str(home),
+            )
+        try:
+            yield environment.client
+        finally:
+            await environment.shutdown()
 
 
 # The workflow sandbox reimports every module a workflow reaches, which for `shogym` means
@@ -289,6 +330,9 @@ async def resume_run_directory(
     restored_checkpoints: Optional[Dict[str, str]] = None,
 ) -> "StreamHandle":
     """Resume the generation a run directory holds, as the composition ``start`` describes it.
+
+    ``client`` is opened against ``root``, because on an embedded service that directory is where
+    the generation's history is and a client opened anywhere else does not hold it.
 
     The directory is read before the authority is: a directory with no protocol version, with
     version one, or with a version one log beside a version two manifest is refused here, and

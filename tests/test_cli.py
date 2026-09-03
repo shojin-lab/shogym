@@ -2,8 +2,8 @@
 
 Two promises are checked here. Protocol version two is the only serving path, so there is no
 flag that selects a version and the retired one cannot be asked for. And importing the package
-or reading its help never pulls Temporal in, because a bare install does not have it: the import
-lives inside the subcommand's body, which is the only place it is needed.
+or reading its help never pulls Temporal in: it is installed, and the import lives inside the
+subcommand's body, which is the only place it is needed.
 
 The import checks run in subprocesses. A test process that has already imported the durable
 kernel for another test would answer for itself rather than for a fresh interpreter.
@@ -27,7 +27,7 @@ def _fresh(code: str) -> subprocess.CompletedProcess:
 
 
 def test_importing_the_package_does_not_import_temporal() -> None:
-    """`pip install shogym` plus a key is the quickstart install, and Temporal is not in it."""
+    """Temporal is installed, and is still imported only where serving reaches it."""
     done = _fresh("import sys, shogym; print('temporalio' in sys.modules)")
     assert done.stdout.strip() == "False"
 
@@ -46,11 +46,11 @@ def test_reading_the_help_does_not_import_temporal() -> None:
     assert done.stdout.splitlines()[-1] == "False"
 
 
-def test_an_install_without_the_durable_extra_is_told_what_to_install() -> None:
-    """The one install a user can be in the middle of, answered as an instruction.
+def test_an_install_missing_temporal_is_told_what_to_install() -> None:
+    """An install that did not finish, answered as an instruction.
 
-    Serving is the only thing the extra is for, so somebody who typed the serve subcommand wanted
-    it, and a bare import traceback is a worse answer than the command that fixes it.
+    `pip install shogym` installs Temporal, so an install without it is a broken one, and a bare
+    import traceback is a worse answer than the command that fixes it.
     """
     done = subprocess.run(
         [
@@ -70,7 +70,7 @@ def test_an_install_without_the_durable_extra_is_told_what_to_install() -> None:
         text=True,
     )
     assert done.returncode == 2
-    assert 'pip install "shogym[durable]"' in done.stderr
+    assert "pip install shogym" in done.stderr
     assert "Traceback" not in done.stderr
 
 

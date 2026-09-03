@@ -6,13 +6,14 @@ than five times over here. What a quickstart owns is the wiring: a harness confi
 server, one variable that names the env, and a prompt that describes the loop the server actually
 serves.
 
-The surface is built against ``wordle_v1`` rather than the quickstart's shipped default: it needs
+The surface is built against ``wordle_v1``, the env this quickstart ships as its default: it needs
 no extra, no key and no download, so this stays offline. Nothing here spawns the ``hermes`` CLI or
 spends a token.
 """
 
 from __future__ import annotations
 
+import importlib
 from pathlib import Path
 
 import pytest
@@ -65,6 +66,20 @@ def test_the_one_variable_names_a_registered_env() -> None:
     assert type(serve_mod.TASK) is int
 
 
+def test_the_env_it_ships_with_is_one_a_bare_install_can_serve(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The default in the file, read with the override unset.
+
+    The quickstart is an install and a key and nothing else, so the env this ships with has to be
+    one that needs no extra: an env whose upstream import is behind one fails before the server
+    is reached. ``SHOGYM_ENV`` wins when it is set, so the shipped value is what is left when it
+    is not, and this reloads the module without it rather than reading whatever the suite was
+    started with."""
+    monkeypatch.delenv("SHOGYM_ENV", raising=False)
+    assert importlib.reload(serve_mod).ENV == "wordle_v1"
+
+
 def test_prompt_drives_the_pull_loop() -> None:
     prompt = (_QUICKSTART / "PROMPT.txt").read_text()
     assert PULL_TOOL in prompt and "done" in prompt
@@ -73,10 +88,14 @@ def test_prompt_drives_the_pull_loop() -> None:
 
 
 def test_run_dirs_are_fresh_per_launch(tmp_path: Path) -> None:
-    # A generation writes its manifest once and refuses a directory that already holds one, so
-    # the quickstart must not hand out the same directory twice.
+    # A generation writes its manifest once and refuses a directory that already holds one, and
+    # the run's durable history is a file in that directory, so the quickstart must not hand out
+    # the same directory twice. Two allocations in one process are two inside one second, which
+    # is the case a name stamped in whole seconds gets wrong.
     first = serve_mod.new_run_dir(TEST_ENV, tmp_path)
+    second = serve_mod.new_run_dir(TEST_ENV, tmp_path)
     assert first.parent == tmp_path and TEST_ENV in first.name
+    assert first != second
 
 
 async def test_the_served_surface_is_the_loop_the_prompt_describes() -> None:

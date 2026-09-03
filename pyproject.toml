@@ -19,6 +19,13 @@ dependencies = [
     # advertised JSON Schema *before* it seals the episode. jsonschema is already resolved
     # transitively (via fastmcp); declaring it makes the direct import explicit.
     "jsonschema>=4.20",
+    # Serving is protocol v2, protocol v2 is durable, and Temporal owns the stream's history,
+    # its replay and its timers. A package that cannot serve an env to a harness is not this
+    # package, so this is a dependency and not an extra: `pip install shogym` plus an API key
+    # is the whole of the quickstart install. It is still imported lazily, inside the serve
+    # subcommand's body, so `import shogym` and `shogym serve --help` pull in no Temporal. The
+    # runner starts its own embedded dev server, so a user installs and runs no server.
+    "temporalio>=1.32",
 ]
 keywords = ["llm", "agents", "evaluation", "mcp", "harness", "gym", "optimization"]
 classifiers = [
@@ -37,14 +44,12 @@ shogym = "shogym.cli:main"
 
 [project.optional-dependencies]
 analysis = ["pandas>=2.2", "duckdb>=1.0"]
-# Durable serving under protocol v2 (src/shogym/serve/protocol_v2/kernel). Temporal owns the
-# stream's history, its replay, and its timers, so the durable runner needs the `temporalio`
-# client, worker, and workflow SDK. Kept optional because the quickstart must not need it:
-# `pip install shogym` plus an API key still runs an episode, and nothing on that path imports
-# `temporalio`. The runner starts its own embedded dev server (a SQLite file under
-# ~/.cache/shogym/temporal/, or SHOGYM_TEMPORAL_ADDRESS to use a server someone else runs), so
-# installing this extra is the whole of the setup.
-durable = ["temporalio>=1.32"]
+# Durable serving used to live behind this extra. `temporalio` is a plain dependency now, so
+# the extra is empty and installing it does nothing: `pip install "shogym[durable]"` installs
+# exactly what `pip install shogym` installs. It is kept for one release so a command written
+# against the old instructions still resolves rather than erroring on an unknown extra, and it
+# goes away in the next one.
+durable = []
 # The tau2-bench port (src/shogym/envs/tau2). Upstream is pinned to commit 1d244f5 but **cannot be
 # a requirement**: PyPI forbids direct (`@ git+https://`) references, and the `tau2` name on PyPI
 # belongs to an unrelated magnetochemistry library, so a plain `tau2` requirement would silently
@@ -180,10 +185,6 @@ dev = [
     "shogym[frontier_bench]",
     "shogym[automationbench]",
     "shogym[browsecomp_plus]",
-    # Not an env extra: the durable kernel's workflow code has to be type-checked and its
-    # offline tests have to import it, so `uv sync` installs it. A user who never wants
-    # Temporal never installs this group.
-    "shogym[durable]",
 ]
 
 [build-system]

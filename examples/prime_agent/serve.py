@@ -19,7 +19,7 @@ is the only quickstart carrying that duplication, so a change to the generation'
 be made here too.
 
 One launch is one episode, over one env at one task, so three tasks are three launches. Serving
-needs the durable extra (``uv sync --extra durable``, or ``pip install "shogym[durable]"``).
+runs on Temporal, which ``pip install shogym`` installs, so there is no extra to ask for.
 """
 
 from __future__ import annotations
@@ -29,6 +29,7 @@ import os
 import sys
 from datetime import datetime, timezone
 from pathlib import Path
+from secrets import token_hex
 from typing import Optional, Sequence
 
 from shogym.serve.episode import ServedEpisode
@@ -52,7 +53,7 @@ from shogym.serve.protocol_v2.gateway import (
 # envs need an extra installed and a key; see their READMEs under src/shogym/envs/.)
 # `SHOGYM_ENV` wins when it is set, so a run can swap envs without editing this file:
 #     SHOGYM_ENV=wordle_v1 <your harness command>
-ENV = os.environ.get("SHOGYM_ENV") or "automationbench"
+ENV = os.environ.get("SHOGYM_ENV") or "wordle_v1"
 
 # Which task this launch serves. One index, because one generation is one episode over one env.
 #     SHOGYM_TASK=7 <your harness command>
@@ -71,8 +72,11 @@ def new_run_dir(env: str = ENV, runs: Path = RUNS, task: int = TASK) -> Path:
 
     Fresh per launch on purpose. The manifest is written once and never rewritten, because a
     resume compares against it, so a directory that already holds one is refused rather than
-    added to."""
-    return runs / f"{env}-{task}-{datetime.now(timezone.utc):%Y%m%dT%H%M%SZ}"
+    added to. The stamp on its own does not make it fresh: it names whole seconds, so two
+    launches of one task inside one second would take one directory, and the generation's
+    durable history is a file in that directory. The token is what keeps them apart."""
+    stamp = f"{datetime.now(timezone.utc):%Y%m%dT%H%M%SZ}"
+    return runs / f"{env}-{task}-{stamp}-{token_hex(3)}"
 
 
 async def main(argv: Optional[Sequence[str]] = None) -> None:
@@ -90,7 +94,9 @@ async def main(argv: Optional[Sequence[str]] = None) -> None:
     episode = await ServedEpisode.start(ENV, task=TASK, ends_on_horizon=False)
     try:
         version, activities = environment_terminal(episode)
-        async with durable_client() as client:
+        # The run directory holds this generation's history as well as its blobs and its
+        # manifest, so a second server started beside this one has a database of its own.
+        async with durable_client(run_directory=run_dir) as client:
             async with stream_worker(client, activities=activities):
                 gateway = await open_gateway(
                     client, episode, run_directory=run_dir, canonicalization_version=version

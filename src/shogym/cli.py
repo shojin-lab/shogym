@@ -6,8 +6,8 @@ One subcommand, ``shogym serve``, runs an env as a stdio MCP server any harness 
 
 The model asks for its work with ``pull`` and its terminal call is intercepted into one seal
 transaction, so the stream decides when an attempt ends and the harness never grades itself.
-Serving needs the ``durable`` extra; it is imported inside :func:`main` rather than here, so
-``shogym --help`` and ``import shogym`` still work on a bare install.
+Serving runs on Temporal, which ``pip install shogym`` installs; the import lives inside
+:func:`main` rather than here, so reading the help costs nothing that serving costs.
 """
 
 from __future__ import annotations
@@ -44,13 +44,12 @@ def main(argv: Optional[Sequence[str]] = None) -> None:
         except ModuleNotFoundError as missing:
             if missing.name != "temporalio":
                 raise
-            # The one install a user can be in the middle of, answered as an instruction rather
-            # than as a traceback. Serving is the only thing the extra is for, so a caller who
-            # got this far wanted it.
+            # An install that is missing it is an install that did not finish, answered as the
+            # command that finishes it rather than as a traceback.
             parser.error(
-                "serving needs the durable extra, which is not installed here: "
-                'install it with `pip install "shogym[durable]"` (or `uv sync --extra durable`) '
-                "and run this again"
+                "serving needs temporalio, which this install does not have: "
+                "`pip install shogym` installs it, and installs everything else serving "
+                "needs, so run that and run this again"
             )
 
         asyncio.run(
