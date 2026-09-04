@@ -36,15 +36,10 @@ from hashlib import sha256
 from pathlib import Path
 from typing import Dict, FrozenSet, List, Optional, Tuple
 
-from examples.automationbench_cell.serve import REFUSAL_FILE, ROSTER_FILE, SERVER
+from examples.automationbench_cell.serve import REFUSAL_FILE, ROSTER_FILE, SERVED_PREFIX
 from shogym.serve.protocol_v2.errors import WireFormatError
 from shogym.serve.protocol_v2.kernel.messages import AttemptRecord, PresentedMessage
 from shogym.serve.protocol_v2.records import Task
-
-#: The prefix Claude Code namespaces this server's tools under. It is the server key in
-#: ``.mcp.json``, so a call to the env's own tools is one whose name starts with this and a call
-#: to anything else is the agent using its own affordances.
-SERVED_PREFIX = f"mcp__{SERVER}__"
 
 #: The one served tool that names no attempt. It is counted on its own, because how often an
 #: agent asked for work is a different fact from how much work it did.
