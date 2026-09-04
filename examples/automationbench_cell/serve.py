@@ -58,9 +58,25 @@ from shogym.task import TaskSpec, ToolManifest
 ENV = "automationbench"
 
 #: The key a harness namespaces this server's tools under, so they reach the model as
-#: ``mcp__curriculum__*``. It is the name the earlier cell's agent saw. A tool name is part of the
-#: prompt prefix, so it is pinned to that rather than renamed to this repo's own default.
-SERVER = "curriculum"
+#: ``mcp__shogym__*``. It is the name the recorded run's agent saw. A tool name is part of the
+#: prompt prefix, so it is pinned to that rather than renamed to whatever a transport would pick.
+SERVER = "shogym"
+
+#: How those names reach the model, and which of them this generation serves. The control tool is
+#: the gateway's and the rest are the environment's, wrapped so each call names its attempt. The
+#: list is written down because a launch compares the surface the run reported with the surface it
+#: meant to serve, and the recorded run's own list is not this one: it offered ``get_task`` where
+#: this offers ``pull``, and an abort tool this protocol does not serve at all.
+SERVED_PREFIX = f"mcp__{SERVER}__"
+SERVED_TOOLS: Tuple[str, ...] = tuple(
+    f"{SERVED_PREFIX}{name}"
+    for name in ("api_fetch", "api_search", "base64_encode", "done", "pull")
+)
+
+#: How many tasks the agent may hold at once. One is the whole of it here: a task is pulled,
+#: worked and ended before the next is asked for, and a pull beyond that is answered with a wait.
+#: The recorded run allowed eight, and its agent held one at a time.
+CAPACITY = 1
 
 #: The file the run directory holds saying which task each position was. Nothing on the wire
 #: names a task, and the records the history answers with are keyed by attempt, so this is what
@@ -81,15 +97,17 @@ REFUSAL_FILE = "refusals.json"
 #: is the honest receipt at every seal; ``never`` is a roster the agent is told nothing about.
 SCHEDULES: Dict[str, ReleasePlan] = {"immediate": IMMEDIATE, "never": NEVER}
 
-#: How the cell this one reruns drew its roster out of AutomationBench's 600 public tasks. The
-#: first seed splits the benchmark into a held-out fifth and a training pool, both re-sorted; the
-#: second shuffles the training pool into the order tasks were dispensed in. Both are written
-#: here because the order is part of the measurement: a rerun that drew its own would differ from
-#: the cell it is being compared with in the tasks as well as in the serving.
+#: How the run this cell reruns drew its roster out of AutomationBench's 600 public tasks. The
+#: first seed reconstructs the split, a held-out fifth and a training pool of 480; the second is
+#: that run's own, and it shuffles the pool into the order the queue was drawn in. The queue was
+#: then capped, so the roster is the first 200 of that order and the rest of the pool was never
+#: served. All three are written here because the tasks and their order are part of the
+#: measurement: a rerun that drew its own would differ in what was served as well as in how.
 PUBLIC_TASKS = 600
 HELDOUT_SHARE = 0.2
 SPLIT_SEED = 20260726
-STREAM_SEED = SPLIT_SEED + 1
+STREAM_SEED = 20260807
+POOL_CEILING = 200
 
 #: What names that roster on the command line. ``cell-one`` is all of it and ``cell-one:20`` is
 #: the first twenty, which is the prefix a smaller rerun works through in the same order. The
@@ -100,18 +118,20 @@ _CELL_ONE = re.compile(rf"{re.escape(CELL_ONE)}(?::(\d+))?$")
 
 
 def cell_one_stream(size: Optional[int] = None) -> List[int]:
-    """Return the task positions the cell this one reruns was served, in the order it saw them.
+    """Return the task positions the run this cell reruns queued, in the order it queued them.
 
     Recomputed from the seeds rather than read from that run's records, so the roster is a fact
-    about the split and not about one directory somebody still has. ``size`` takes a prefix,
-    which is what a shorter rerun works: the first twenty of the stream are the same twenty
-    tasks in the same order whether or not the rest follows.
+    about the split and not about one directory somebody still has. It is the queue rather than
+    the pool: the pool holds 480 and the queue was capped at 200, and the tasks past the cap were
+    never on offer. ``size`` takes a prefix, which is what a shorter rerun works: the first twenty
+    of the roster are the same twenty tasks in the same order whether or not the rest follows.
     """
     order = list(range(PUBLIC_TASKS))
     random.Random(SPLIT_SEED).shuffle(order)
     train = sorted(order[round(PUBLIC_TASKS * HELDOUT_SHARE) :])
     random.Random(STREAM_SEED).shuffle(train)
-    return train if size is None else train[:size]
+    queued = train[:POOL_CEILING]
+    return queued if size is None else queued[:size]
 
 
 def roster(text: str) -> List[int]:
@@ -210,8 +230,13 @@ def compose(
     every position is stamped with the honest policy, and under ``never`` every position is
     stamped with the reason it delivers nothing. Concealing a score that was released is an
     experiment arm, and this cell registers none.
+
+    The capacity the composition came out with is checked rather than assumed. It is what decides
+    whether a pull while a task is live is answered with work or with a wait, so it is a fact
+    about the regime this cell serves and it is recorded as one: a composition that came back
+    holding some other number would be serving a regime the run's record did not name.
     """
-    return stream_start(
+    composed = stream_start(
         spec,
         terminal,
         claim_hash=claim_hash,
@@ -220,6 +245,12 @@ def compose(
         profile=ORDINARY,
         grade=grade,
     )
+    if composed.capacity != CAPACITY:
+        raise ValueError(
+            f"this cell serves one task at a time and the composition holds capacity "
+            f"{composed.capacity}, which is a different regime than the one its record names"
+        )
+    return composed
 
 
 def record_roster(
