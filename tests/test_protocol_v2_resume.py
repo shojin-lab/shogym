@@ -1080,6 +1080,7 @@ def test_the_configuration_hash_covers_everything_a_resume_is_held_to() -> None:
         replace(start, id_key_hex="cd" * 32),
         replace(start, wait_retry_after_ms=2000),
         replace(start, attempt_deadline_ms=600_000),
+        replace(start, budget=52),
     ]
     hashes = {configuration_hash(one) for one in changed}
     assert len(hashes) == len(changed)
@@ -1087,3 +1088,8 @@ def test_the_configuration_hash_covers_everything_a_resume_is_held_to() -> None:
 
     # Where a run keeps its bytes is deployment, and the same generation moved is the same one.
     assert configuration_hash(replace(start, blob_root="/elsewhere")) == configuration_hash(start)
+
+    # A generation that declares no budget is what everything above is, and it hashes what it
+    # hashed before there was a budget to declare. The proof of that is a history this code did
+    # not write, replayed in the policy suite against the digest its own build committed.
+    assert start.budget is None

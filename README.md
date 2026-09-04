@@ -139,7 +139,10 @@ the env published beside it, so an agent under the defaults can tell how it did.
 or replacing it with something else, is a payload policy an experiment registers, and the run's own
 records name the policy every attempt was served under. There is no task index
 anywhere on the wire: a task record carries an attempt id and a body, and has no field an index or
-a target could be written into.
+a target could be written into. A run may also declare a step budget, and then every task it
+serves carries `budget` as well: one number for the whole run, the number of environment tool
+calls the attempt gets. A run that declares none serves the task record exactly as it is shown
+above.
 
 `--run-dir` is where the generation keeps the blobs its presentations reference, the manifest a
 later owner would resume it from, and the embedded service's own database. All three belong to the

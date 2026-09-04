@@ -95,6 +95,7 @@ from shogym.serve.protocol_v2 import (
     check_release,
     length_prefixed,
     require_opaque_id,
+    require_step_budget,
 )
 from shogym.serve.protocol_v2.kernel import (
     STEP_CAP,
@@ -273,6 +274,15 @@ _PULL_DESCRIPTION = (
     "pull again when you have finished with it."
 )
 
+# What the control tool says about a budget, where the generation declares one. It is appended
+# to the description rather than written into it, because the description a generation that
+# declares nothing serves is the one it served before a budget could be declared, and the model
+# reads that text out of the same manifest a resume is held to.
+_BUDGET_NOTE = (
+    " A task also carries `budget`, the whole allowance of environment tool calls that task "
+    "gets rather than what is left of it, and neither pulling nor filing spends it."
+)
+
 _WRAPPER_NOTE = (
     '\n\nCall this tool as {"attempt_id": <the attempt_id of your current task>, '
     '"arguments": {...the tool\'s own arguments...}}.'
@@ -368,8 +378,22 @@ def declared_argument_names(schema: Dict[str, Any]) -> List[str]:
     return sorted(required) if required else sorted(properties)
 
 
+def _pull_description(budget: Optional[int] = None) -> str:
+    """Return the words the control tool is served under.
+
+    A generation that declares a budget says so here, in one sentence appended to the text every
+    generation serves. Appending is the whole of the change: the description a generation that
+    declares nothing serves is the one it served before there was a budget to declare, byte for
+    byte, so its configuration hash has not moved and its resume is not refused.
+    """
+    return _PULL_DESCRIPTION if budget is None else _PULL_DESCRIPTION + _BUDGET_NOTE
+
+
 def served_manifest(
-    spec: TaskSpec, terminal: ToolManifest, horizon_ending: str = FLOOR_HORIZON
+    spec: TaskSpec,
+    terminal: ToolManifest,
+    horizon_ending: str = FLOOR_HORIZON,
+    budget: Optional[int] = None,
 ) -> Dict[str, Any]:
     """Return everything this gateway serves, in the words it serves it in.
 
@@ -392,6 +416,10 @@ def served_manifest(
     written only where it is declared, because a generation recorded before an environment could
     say hashed exactly the keys below and reopening one of those under an added key would refuse
     every resume of it over a rule that has not changed.
+
+    ``budget`` is the number this generation hands the agent on every task, and what it changes
+    here is the control tool's own description, on the same terms: the sentence is appended where
+    a generation declares a number and the text is untouched where it declares none.
     """
     declared = {} if horizon_ending == FLOOR_HORIZON else {"horizon_ending": horizon_ending}
     return {
@@ -405,7 +433,7 @@ def served_manifest(
         "canonicalization_version": CANONICALIZATION_VERSION,
         "control_tool": {
             "name": PULL_TOOL,
-            "description": _PULL_DESCRIPTION,
+            "description": _pull_description(budget),
             "schema": _PULL_SCHEMA,
         },
         "terminal": {
@@ -429,6 +457,7 @@ def _configuration_hash(
     terminal: ToolManifest,
     environment_digest: Optional[str] = None,
     horizon_ending: str = FLOOR_HORIZON,
+    budget: Optional[int] = None,
 ) -> str:
     """Hash what the generation is serving, so a resume can refuse a changed configuration.
 
@@ -437,7 +466,7 @@ def _configuration_hash(
     any of that, and one that publishes a digest of them has it folded in here. One that
     publishes nothing hashes exactly what it hashed before.
     """
-    manifest = served_manifest(spec, terminal, horizon_ending)
+    manifest = served_manifest(spec, terminal, horizon_ending, budget)
     if environment_digest is not None:
         manifest = {**manifest, "environment": environment_digest}
     return sha256(canonical_json(manifest)).hexdigest()
@@ -460,6 +489,7 @@ def stream_start(
     dispositions: Optional[Union[Sequence[PayloadDisposition], DispositionsFor]] = None,
     experiment: str = "",
     families: Sequence[MatchedFamily] = (),
+    budget: Optional[int] = None,
 ) -> StreamStart:
     """Return a generation that serves ``spec``.
 
@@ -515,9 +545,16 @@ def stream_start(
     them. Each fixes the group its cells are built in and the byte count they come to, and a
     cell that comes back as anything else ends the attempt rather than being served.
 
+    ``budget`` is what this generation tells the agent it may spend, on every task it serves. It
+    is off by default: handing the number over is a decision about the run, and a generation that
+    makes no such decision serves the task record it served before the number could be handed
+    over. Where it is declared it has to be the budget this transport enforces, and a generation
+    that says anything else is refused here.
+
     What comes back is a generation the stream would accept, because the same check the stream
     makes at start is made here, where the caller composing a run is the one who reads it.
     """
+    _check_declared_budget(spec, budget)
     items = [
         TaskItem(
             task_position=position,
@@ -553,7 +590,9 @@ def stream_start(
         profile, roster, plan.creates_obligations, registered, grade, experiment, list(families)
     )
     return StreamStart(
-        configuration_hash=_configuration_hash(spec, terminal, environment_digest),
+        configuration_hash=_configuration_hash(
+            spec, terminal, environment_digest, budget=budget
+        ),
         consumer_claim_hash=claim_hash,
         initial_cursor=_opaque(),
         done_message_id=_opaque(),
@@ -575,7 +614,38 @@ def stream_start(
         dispositions=resolved,
         provenance=_provenance(profile, resolved, experiment),
         families=list(families),
+        budget=budget,
     )
+
+
+def _check_declared_budget(spec: TaskSpec, budget: Optional[int]) -> None:
+    """Refuse a declared budget that is not the one this transport enforces.
+
+    The number on a task record is what an agent paces its work against, and the step cap this
+    transport enforces is the environment's own horizon, counted here call by call. A generation
+    that advertised one and enforced the other would be handing the agent a figure nothing keeps,
+    and the agent would find out by running short of world where it expected room. So the two are
+    the same number or the generation is not composed.
+
+    What a number has to be comes first, and it is the record's own rule rather than one this
+    layer keeps beside it. Equality alone would let ``True``, a float that compares equal, zero
+    and a negative through, because an environment's published horizon carries no bound of its
+    own; each of those composes a generation whose first offer cannot build the record it owes.
+    """
+    if budget is None:
+        return
+    require_step_budget("budget", budget)
+    if spec.horizon is None:
+        raise ValueError(
+            f"env {spec.env_name!r} publishes no step budget, so a generation over it has no "
+            f"number to declare on the tasks it serves, and this one declares {budget}"
+        )
+    if budget != spec.horizon:
+        raise ValueError(
+            f"this generation declares a budget of {budget} on every task it serves and env "
+            f"{spec.env_name!r} is served with {spec.horizon} environment actions to the "
+            "attempt; the number an agent reads is the step cap this transport enforces"
+        )
 
 
 def _provenance(
@@ -948,15 +1018,24 @@ class StreamGateway:
         terminal: ToolManifest,
         *,
         initial_cursor: str,
+        generation: StreamStart,
         open_episode: Optional[EpisodeOpener] = None,
         blobs: Optional[BlobStore] = None,
-        generation: Optional[StreamStart] = None,
         environment: Optional[EnvironmentTerminal] = None,
         on_refusal: Optional[RefusalSink] = None,
     ) -> None:
+        # The composition is required rather than optional, and this is why. A transport that
+        # was never told what its generation declared cannot tell that from a generation which
+        # declared nothing, and the two are served differently: the stream mints its records
+        # from the composition and this transport counts calls against the episode, so a
+        # replacement that guessed would advertise one number, enforce a second, and hand the
+        # agent a third. Every way of getting one of these has the composition already, because
+        # composing a generation returns it and resuming one is held to it, so the argument
+        # costs a caller nothing and closes the gap for all of them.
+        _check_declared_budget(spec, generation.budget)
         self._stream = stream
-        # The composition this generation was started from, when this gateway is the thing that
-        # started it. A gateway built over a stream somebody else composed does not know it.
+        # The composition this transport is serving, whether it started that generation or took
+        # one over. What it declares is what the stream's own records carry.
         self._generation = generation
         # The world the attempt in front of the model is working in, the attempt it belongs to,
         # and how the attempt after it gets one of its own. A task is a fresh world: the seal
@@ -981,11 +1060,14 @@ class StreamGateway:
         self._cursor = initial_cursor
         self._active: FrozenSet[str] = frozenset()
         # The env's step budget, and what each attempt has spent of it. The budget is the one
-        # the contract publishes, so an env that declares none is served without a cap. The
-        # spending is the stream's own count of the calls it granted, refreshed from it on every
-        # call like the cursor and the active attempts are, and it starts empty for the same
-        # reason they start empty: what this gateway has not been told yet, it does not know.
-        self._step_cap = spec.horizon
+        # the contract publishes, so an env that declares none is served without a cap. Where the
+        # generation declared a number of its own, that is the cap: it is the number every task
+        # record hands the agent, the check above has already established that the two agree, and
+        # reading it from the generation is what keeps them agreeing. The spending is the stream's
+        # own count of the calls it granted, refreshed from it on every call like the cursor and
+        # the active attempts are, and it starts empty for the same reason they start empty: what
+        # this gateway has not been told yet, it does not know.
+        self._step_cap = spec.horizon if generation.budget is None else generation.budget
         self._spent: Dict[str, int] = {}
         # What running the budget out does. The environment says, and it says it once, when the
         # generation is composed; a gateway given no answer serves the floor, which is what an
@@ -1057,15 +1139,19 @@ class StreamGateway:
         return _refusal(code)
 
     @property
-    def generation(self) -> Optional[StreamStart]:
-        """The composition this generation was started from, when this gateway started it.
+    def generation(self) -> StreamStart:
+        """The composition this transport is serving.
 
         A resume is held to what its new owner serves, so the value a later owner presents is a
         composition rather than anything the run directory recorded. Most of that composition is
         reproducible from the environment and the task, and the identifiers this generation
         minted are not, so a controller that let this call compose the generation for it needs
-        the composition back to be able to take the generation over later. It is ``None`` for a
-        gateway handed a stream somebody else composed, which is the only other way to build one.
+        the composition back to be able to take the generation over later.
+
+        Every gateway has one. A transport handed a stream somebody else composed is handed that
+        somebody's composition with it, because what the generation declares decides what this
+        gateway advertises and what it enforces, and a transport that had to guess at either
+        would serve a surface the generation never hashed.
         """
         return self._generation
 
@@ -2184,6 +2270,11 @@ def build_gateway_server(gateway: StreamGateway, *, name: Optional[str] = None) 
     filing included, because the wrapper is where that schema is nested and nothing below it
     looks there. What happens to a call the gateway accepts is the gateway's: it runs each one
     to the end whatever becomes of the caller waiting on it.
+
+    The control tool is advertised in the words the generation hashed, which is why the
+    description is taken from the composition the gateway holds rather than from the constant.
+    Every gateway holds one, and what it holds was checked against the episode it serves over
+    before it was built, so the surface served here is the surface that generation hashed.
     """
     spec = gateway.spec
     served = wrapped_manifests(spec, terminal_manifest(spec))
@@ -2206,7 +2297,9 @@ def build_gateway_server(gateway: StreamGateway, *, name: Optional[str] = None) 
     server.add_tool(
         build_tool(
             ToolManifest(
-                name=PULL_TOOL, description=_PULL_DESCRIPTION, input_schema=_PULL_SCHEMA
+                name=PULL_TOOL,
+                description=_pull_description(gateway.generation.budget),
+                input_schema=_PULL_SCHEMA,
             ),
             dispatch,
         )
@@ -2298,6 +2391,11 @@ async def open_gateway(
     the number reaches it inside the call that issued the refusal, which is the only moment a
     transport that is killed rather than stopped is certain to reach.
 
+    A composed generation whose declared budget is not this episode's is refused here, for the
+    reason a composition is refused at the moment it is made: a controller composes where the
+    episode is not, this call is where the two meet, and a number the agent reads that nothing
+    enforces is worse than no number at all.
+
     An episode that ends on its own horizon is refused here. Under this protocol the stream is
     what ends an attempt, and an episode that seals and grades itself when a step budget runs
     out would end one behind the stream's back: the attempt would still be active, nothing the
@@ -2316,13 +2414,18 @@ async def open_gateway(
         grade=grade,
     )
     _check_honest_over(composed, grade)
+    _check_declared_budget(spec, composed.budget)
     if environment is not None:
         _check_graded_horizon(spec, terminal, environment)
         composed = replace(
             composed,
             canonicalization_version=environment.canonicalization_version,
             configuration_hash=_configuration_hash(
-                spec, terminal, environment.configuration_digest, environment.horizon_ending
+                spec,
+                terminal,
+                environment.configuration_digest,
+                environment.horizon_ending,
+                composed.budget,
             ),
         )
     if len(composed.tasks) > 1 and open_episode is None:

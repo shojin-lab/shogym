@@ -57,6 +57,7 @@ from shogym.serve.protocol_v2.records import (
     decode_terminal_result,
     mcp_text_content,
     require_opaque_id,
+    require_step_budget,
     visible_bytes,
 )
 from shogym.serve.protocol_v2.schedule import (
@@ -139,6 +140,7 @@ __all__ = [
     "pull_request_identity",
     "require_digest",
     "require_opaque_id",
+    "require_step_budget",
     "stream_message_id",
     "submission_digest",
     "terminal_request_identity",

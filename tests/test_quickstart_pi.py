@@ -15,6 +15,7 @@ from __future__ import annotations
 
 import importlib
 import json
+from hashlib import sha256
 import re
 from pathlib import Path
 
@@ -28,6 +29,7 @@ from fastmcp import Client  # noqa: E402
 from examples.pi import serve as serve_mod  # noqa: E402
 from shogym.serve.episode import ServedEpisode  # noqa: E402
 from shogym.serve.protocol_v2.gateway import (  # noqa: E402
+    stream_start,
     PULL_TOOL,
     StreamGateway,
     build_gateway_server,
@@ -83,7 +85,9 @@ def test_the_env_it_ships_with_is_one_a_bare_install_can_serve(
 
 def test_prompt_drives_the_pull_loop_under_the_bridge_prefix() -> None:
     prompt = (_QUICKSTART / "PROMPT.txt").read_text()
-    server_key = next(iter(json.loads((_QUICKSTART / ".pi" / "mcp.json").read_text())["mcpServers"]))
+    server_key = next(
+        iter(json.loads((_QUICKSTART / ".pi" / "mcp.json").read_text())["mcpServers"])
+    )
     # The bridge renames every served tool `mcp_<server>_<tool>`, so the prompt has to ask for
     # the prefixed name, not the wire name.
     assert f"mcp_{server_key}_{PULL_TOOL}" in prompt and "done" in prompt
@@ -111,12 +115,19 @@ async def test_the_served_surface_is_the_loop_the_prompt_describes() -> None:
     episode = await ServedEpisode.start(TEST_ENV, task=0, ends_on_horizon=False)
     try:
         spec = episode.describe()
+        start = stream_start(
+            spec,
+            terminal_manifest(spec),
+            claim_hash=sha256(b"a claim").hexdigest(),
+            evaluation_only=True,
+        )
         gateway = StreamGateway(
             None,  # type: ignore[arg-type]  # listing tools reaches no stream
             episode,
             spec,
             terminal_manifest(spec),
             initial_cursor="0" * 32,
+            generation=start,
         )
         async with Client(build_gateway_server(gateway, name="shogym")) as client:
             schemas = {tool.name: tool.inputSchema for tool in await client.list_tools()}

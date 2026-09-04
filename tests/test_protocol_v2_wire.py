@@ -131,6 +131,13 @@ VALID: Dict[Type[Any], Dict[str, Any]] = {
 }
 CASES = tuple(VALID.items())
 FIELD_CASES = tuple((cls, name) for cls, wire in CASES for name in wire)
+DECLARED_FIELDS = tuple(
+    (cls, field.name) for cls in VALID for field in dataclasses.fields(cls)
+)
+
+# The task record's second exact encoding: the same class and the same kind, carrying the budget
+# the generation that offered it declared.
+BUDGETED_TASK: Dict[str, Any] = {**VALID[Task], "budget": 52}
 
 
 def wire(cls: Type[Any], **overrides: Any) -> Dict[str, Any]:
@@ -327,10 +334,13 @@ def test_the_error_code_set_is_closed() -> None:
     assert len(PROTOCOL_ERROR_CODES) == 15
 
 
-@pytest.mark.parametrize("cls,name", FIELD_CASES)
+@pytest.mark.parametrize("cls,name", DECLARED_FIELDS)
 def test_every_field_carries_a_rule(cls: Type[Any], name: str) -> None:
     """A field is checked by name or fixed by a string default. A new field with neither would
-    otherwise be accepted unvalidated, which is the one way this layer could go quiet."""
+    otherwise be accepted unvalidated, which is the one way this layer could go quiet.
+
+    The fields are read off the classes rather than off the fixtures, because a field a record
+    may leave out is one no complete fixture has to carry."""
     default = cls.__dataclass_fields__[name].default
     assert isinstance(default, str) or name in records_module._CHECKS
 
@@ -349,6 +359,89 @@ def test_a_record_is_frozen() -> None:
     task = Task.from_wire(VALID[Task])
     with pytest.raises(dataclasses.FrozenInstanceError):
         task.body = "something else"  # type: ignore[misc]
+
+
+# ----- the one key a record may leave out -----
+
+
+def test_the_budget_is_the_only_key_a_record_may_leave_out() -> None:
+    """The exception is one name on one record, and this is the whole of it.
+
+    Every other fixture above is complete for its class, which is what makes the missing-field
+    test a statement about the whole wire rather than about the payloads someone wrote down."""
+    assert records_module._OMISSIBLE == frozenset({"budget"})
+    for cls, name in DECLARED_FIELDS:
+        assert name in VALID[cls] or (cls, name) == (Task, "budget")
+
+
+def test_a_declared_budget_is_a_second_exact_encoding() -> None:
+    task = Task.from_wire(BUDGETED_TASK)
+    assert task.budget == 52
+    assert task.to_wire() == BUDGETED_TASK
+    assert Task.from_wire(task.to_wire()) == task
+    assert type(decode_pull_result(BUDGETED_TASK)) is Task
+
+
+def test_a_task_that_declares_no_budget_is_the_record_it_was() -> None:
+    """Absence is the key's absence. A generation that declares nothing serves the bytes it
+    served before there was a budget to declare, so the key is gone rather than empty."""
+    task = Task.from_wire(VALID[Task])
+    assert task.budget is None
+    assert "budget" not in task.to_wire()
+    assert canonical_bytes(task) == canonical_bytes(Task.from_wire(VALID[Task]))
+    assert b"budget" not in canonical_bytes(task)
+
+
+def test_a_budget_is_left_out_rather_than_sent_empty() -> None:
+    with pytest.raises(WireFormatError):
+        Task.from_wire({**VALID[Task], "budget": None})
+    with pytest.raises(WireFormatError):
+        Task(message_id=ID_A, attempt_id=ID_B, body="Reconcile the ledger.", budget=0)
+
+
+@pytest.mark.parametrize("value", [0, -1, True, False, "52", 2.0, 9007199254740992, [52]])
+def test_an_out_of_range_budget_is_rejected(value: Any) -> None:
+    with pytest.raises(WireFormatError):
+        Task.from_wire({**VALID[Task], "budget": value})
+
+
+@pytest.mark.parametrize("value", [1, 52, 9007199254740991])
+def test_a_boundary_budget_is_accepted(value: int) -> None:
+    assert Task.from_wire({**VALID[Task], "budget": value}).budget == value
+
+
+# The same rejection matrix the five-key form gets, run against the six-key one. The decoder has
+# no separate branch for the budgeted shape, so this is a statement that it did not grow one.
+BUDGETED_REQUIRED = tuple(name for name in BUDGETED_TASK if name != "budget")
+
+
+@pytest.mark.parametrize("name", BUDGETED_REQUIRED)
+def test_a_missing_field_is_rejected_in_the_budgeted_form(name: str) -> None:
+    payload = dict(BUDGETED_TASK)
+    del payload[name]
+    with pytest.raises(WireFormatError):
+        Task.from_wire(payload)
+
+
+@pytest.mark.parametrize("name", tuple(BUDGETED_TASK))
+def test_a_mistyped_field_is_rejected_in_the_budgeted_form(name: str) -> None:
+    with pytest.raises(WireFormatError):
+        Task.from_wire({**BUDGETED_TASK, name: _wrong_type(BUDGETED_TASK[name])})
+
+
+@pytest.mark.parametrize("version", [1, 3, "2", 2.0, None])
+def test_a_wrong_version_is_rejected_in_the_budgeted_form(version: Any) -> None:
+    with pytest.raises(WireFormatError):
+        Task.from_wire({**BUDGETED_TASK, "protocol_version": version})
+
+
+def test_an_unknown_field_is_rejected_in_the_budgeted_form() -> None:
+    with pytest.raises(WireFormatError):
+        Task.from_wire({**BUDGETED_TASK, "hint": "hurry"})
+    with pytest.raises(WireFormatError):
+        Task.from_wire({**BUDGETED_TASK, 7: "hurry"})
+    with pytest.raises(WireFormatError):
+        Task.from_wire({**BUDGETED_TASK, "kind": "payload"})
 
 
 # ----- the unions -----
@@ -432,6 +525,13 @@ GOLDEN: Tuple[Tuple[Type[Any], Dict[str, Any], bytes], ...] = (
         '"message_id":"00000000000000000000000000000000","protocol_version":2}'.encode("utf-8"),
     ),
     (
+        Task,
+        {"budget": 52},
+        b'{"attempt_id":"11111111111111111111111111111111","body":"Reconcile the ledger.",'
+        b'"budget":52,"kind":"task","message_id":"00000000000000000000000000000000",'
+        b'"protocol_version":2}',
+    ),
+    (
         SealReject,
         {},
         b'{"attempt_id":"11111111111111111111111111111111",'
@@ -480,9 +580,12 @@ def test_a_record_serializes_to_its_pinned_bytes(
     assert canonical_bytes(cls.from_wire(wire(cls, **overrides))) == expected
 
 
-def test_the_field_order_a_payload_arrives_in_does_not_reach_the_bytes() -> None:
-    forward = Task.from_wire(VALID[Task])
-    reversed_payload = dict(reversed(list(VALID[Task].items())))
+@pytest.mark.parametrize("payload", [VALID[Task], BUDGETED_TASK])
+def test_the_field_order_a_payload_arrives_in_does_not_reach_the_bytes(
+    payload: Dict[str, Any],
+) -> None:
+    forward = Task.from_wire(payload)
+    reversed_payload = dict(reversed(list(payload.items())))
     assert canonical_bytes(Task.from_wire(reversed_payload)) == canonical_bytes(forward)
 
 

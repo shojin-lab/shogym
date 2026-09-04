@@ -3,13 +3,21 @@
 A record is a frozen dataclass whose constructor validates every field, so an instance that
 exists is already well formed and can be serialized without a second check. :meth:`from_wire`
 is the decoder's half of the same rule: the payload must be a mapping whose key set is exactly
-the record's, and every value must already have the type and the range its field requires.
-Nothing is coerced, defaulted, or dropped, so a payload that means something slightly
-different from what this protocol declares is refused instead of quietly repaired.
+the record's, less any name in :data:`_OMISSIBLE` it leaves out, and every value must already
+have the type and the range its field requires. No value that is there is coerced, and none is
+dropped, so a payload that means something slightly different from what this protocol declares
+is refused instead of quietly repaired. The one thing that is defaulted is an omissible name a
+payload does not carry: it takes its field's default and is left out again on the way back, so
+the absence survives the round trip rather than becoming a value.
 
 Two conventions carry the validation. A field name has one meaning across every record here,
 so its rule hangs off the name in :data:`_CHECKS`. And a field declared with a string default
 is fixed on the wire, which is what makes ``kind`` a discriminator rather than a suggestion.
+
+One key is exempt from the exact key set, and it is named in :data:`_OMISSIBLE` rather than
+inferred from a type: a generation that declares no step budget serves the task record it
+served before there was one to declare, byte for byte, so the key is left out rather than sent
+empty.
 """
 
 from __future__ import annotations
@@ -28,6 +36,9 @@ _OPAQUE_ID = re.compile(r"[0-9a-f]{32}")
 _SHA256_HEX = re.compile(r"[0-9a-f]{64}")
 _CANONICALIZATION_VERSION = re.compile(r"[a-z0-9][a-z0-9._-]{0,63}")
 _RETRY_AFTER_MS_MAX = 4294967295
+# The largest integer canonical JSON will write. A record refuses a number above it here rather
+# than serializing well and failing when its bytes are taken.
+_SAFE_INTEGER_MAX = 9007199254740991
 
 # The complete code set. A code outside it is not a protocol error of an unknown sort, it is a
 # malformed record.
@@ -101,6 +112,11 @@ def _retry_after_ms(name: str, value: Any) -> None:
         raise WireFormatError(f"{name} must be an integer from 0 through {_RETRY_AFTER_MS_MAX}")
 
 
+def _step_budget(name: str, value: Any) -> None:
+    if type(value) is not int or not 1 <= value <= _SAFE_INTEGER_MAX:
+        raise WireFormatError(f"{name} must be an integer from 1 through {_SAFE_INTEGER_MAX}")
+
+
 def _canonicalization_version(name: str, value: Any) -> None:
     if not isinstance(value, str) or _CANONICALIZATION_VERSION.fullmatch(value) is None:
         raise WireFormatError(f"{name} must match [a-z0-9][a-z0-9._-]{{0,63}}")
@@ -126,6 +142,7 @@ _CHECKS: Dict[str, Callable[[str, Any], None]] = {
     "cursor_before": _opaque_id,
     "cursor": _opaque_id,
     "body": _scalar_string,
+    "budget": _step_budget,
     "retry_after_ms": _retry_after_ms,
     "code": _protocol_error_code,
     "canonicalization_version": _canonicalization_version,
@@ -140,6 +157,13 @@ _CHECKS: Dict[str, Callable[[str, Any], None]] = {
 }
 
 
+# The names a record may leave out, and the whole of them. ``budget`` is here because the number
+# of environment actions an attempt gets is a thing a generation may not have declared, and one
+# that declared none has to serve the bytes it served before the key existed. Absence is the
+# omission of the key: a name here is never sent with an empty value.
+_OMISSIBLE = frozenset({"budget"})
+
+
 def _fields(record: Any) -> Tuple[Any, ...]:
     return dataclasses.fields(record)
 
@@ -150,6 +174,8 @@ def _validate(record: Any) -> None:
         if isinstance(field.default, str):
             if value != field.default:
                 raise WireFormatError(f"{field.name} must be {field.default!r}")
+        elif value is None and field.name in _OMISSIBLE:
+            continue
         else:
             _CHECKS[field.name](field.name, value)
 
@@ -161,10 +187,17 @@ def _decode(cls: Any, payload: Any) -> Any:
     unknown = sorted(repr(key) for key in payload if key not in names)
     if unknown:
         raise WireFormatError(f"a {cls.__name__} payload has no field {', '.join(unknown)}")
-    missing = [name for name in names if name not in payload]
+    missing = [name for name in names if name not in payload and name not in _OMISSIBLE]
     if missing:
         raise WireFormatError(f"a {cls.__name__} payload is missing {', '.join(missing)}")
-    return cls(**{name: payload[name] for name in names})
+    empty = [
+        name for name in names if name in _OMISSIBLE and name in payload and payload[name] is None
+    ]
+    if empty:
+        raise WireFormatError(
+            f"a {cls.__name__} payload leaves out {', '.join(empty)} rather than sending it empty"
+        )
+    return cls(**{name: payload[name] for name in names if name in payload})
 
 
 _R = TypeVar("_R", bound="_Record")
@@ -182,8 +215,13 @@ class _Record:
         return cast(_R, _decode(cls, payload))
 
     def to_wire(self) -> Dict[str, Any]:
-        """Return this record as a JSON object, field for field."""
-        return {field.name: getattr(self, field.name) for field in _fields(self)}
+        """Return this record as a JSON object, field for field, less any omissible name this
+        record does not carry."""
+        return {
+            field.name: getattr(self, field.name)
+            for field in _fields(self)
+            if getattr(self, field.name) is not None or field.name not in _OMISSIBLE
+        }
 
 
 @dataclass(frozen=True)
@@ -207,6 +245,12 @@ class Task(_Record):
     ``body`` is what the renderer produced and nothing else. There is no field a queue
     position, a target, a cell, a regime, a branch, or a lease could be written into, so the
     redaction is structural rather than a rule someone has to keep applying.
+
+    ``budget`` is how many environment actions the attempt gets, and the record carries it only
+    where the generation declared one. It is that generation's single number, identical on every
+    task it serves and drawn from what the environment publishes rather than from anything about
+    this attempt, so it tells an agent what the work in its hands is allowed to spend and nothing
+    about where that work sits in a queue.
     """
 
     message_id: str
@@ -214,6 +258,7 @@ class Task(_Record):
     body: str
     protocol_version: int = PROTOCOL_VERSION
     kind: str = "task"
+    budget: Optional[int] = None
 
 
 @dataclass(frozen=True)
@@ -423,3 +468,14 @@ def mcp_text_content(result: Union[PullResult, TerminalResult]) -> Tuple[Dict[st
 def require_opaque_id(name: str, value: Any) -> None:
     """Raise unless ``value`` is an opaque ID, for callers outside a record constructor."""
     _opaque_id(name, value)
+
+
+def require_step_budget(name: str, value: Any) -> None:
+    """Raise unless ``value`` is a step budget, for callers outside a record constructor.
+
+    A generation declares the number long before a task record carries it, and the layers in
+    between compose, hash and start on it. They hold it to this rule rather than to one of their
+    own, so a number a record would refuse is refused where it is declared instead of surviving
+    as far as the first offer.
+    """
+    _step_budget(name, value)

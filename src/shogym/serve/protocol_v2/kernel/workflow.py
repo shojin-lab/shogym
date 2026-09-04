@@ -76,6 +76,7 @@ with workflow.unsafe.imports_passed_through():
         pull_request_identity,
         require_digest,
         require_opaque_id,
+        require_step_budget,
         stream_message_id,
         submission_digest,
         terminal_request_identity,
@@ -1263,6 +1264,7 @@ class StreamWorkflow:
             message_id=item.task_message_id,
             attempt_id=attempt_id,
             body=item.body,
+            budget=self._start.budget,
         )
         return self._offer(result, "pull", request_id, identity, attempt_id)
 
@@ -2302,6 +2304,11 @@ def _check_start(start: StreamStart) -> None:
         raise StreamProtocolError("invalid_message")
     identifiers = [start.initial_cursor, start.done_message_id]
     try:
+        # A declared budget goes on every task this generation offers, so a number no task
+        # record would carry fails here rather than at the first offer, which is after the
+        # generation has started and a consumer is already bound to it.
+        if start.budget is not None:
+            require_step_budget("budget", start.budget)
         require_opaque_id("initial_cursor", start.initial_cursor)
         require_opaque_id("done_message_id", start.done_message_id)
         for item in start.tasks:

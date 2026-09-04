@@ -98,6 +98,14 @@ GOLDEN_TASK = (
     '{"attempt_id":"00000000000000000000000000000100","body":"file the report",'
     '"kind":"task","message_id":"00000000000000000000000000000101","protocol_version":2}'
 )
+GOLDEN_BUDGETED_TASK = (
+    '{"attempt_id":"00000000000000000000000000000100","body":"file the report","budget":52,'
+    '"kind":"task","message_id":"00000000000000000000000000000101","protocol_version":2}'
+)
+GOLDEN_SECOND_BUDGETED_TASK = (
+    '{"attempt_id":"00000000000000000000000000000104","body":"file the report","budget":52,'
+    '"kind":"task","message_id":"00000000000000000000000000000105","protocol_version":2}'
+)
 GOLDEN_ACK = (
     '{"attempt_id":"00000000000000000000000000000100","canonicalization_version":"kernel.1",'
     '"kind":"seal_ack","message_id":"00000000000000000000000000000102","protocol_version":2,'
@@ -118,7 +126,13 @@ def oid(value: int) -> str:
     return f"{value:032x}"
 
 
-def make_start(*, bodies: Any = (TASK_BODY,), capacity: int = 1, version: int = 2) -> StreamStart:
+def make_start(
+    *,
+    bodies: Any = (TASK_BODY,),
+    capacity: int = 1,
+    version: int = 2,
+    budget: Optional[int] = None,
+) -> StreamStart:
     """A generation whose every public identifier is fixed before it serves anything."""
     tasks = [
         TaskItem(
@@ -146,6 +160,7 @@ def make_start(*, bodies: Any = (TASK_BODY,), capacity: int = 1, version: int = 
             ),
             tasks=tasks,
             capacity=capacity,
+            budget=budget,
             protocol_version=version,
         )
     )
@@ -306,6 +321,33 @@ async def test_one_task_from_offer_to_done(caller: Caller) -> None:
     assert outcome.sealed == 1
     assert outcome.payloads_delivered == 1
     assert outcome.cursor == DONE_ID
+
+
+@pytest.mark.network
+async def test_a_declared_budget_rides_every_task_the_generation_offers(env) -> None:
+    """The budget is the generation's, so it is the same number on every task and it is minted
+    once. A retry replays the bytes that were minted rather than building the record again, which
+    is the property that would break if the offer site read the budget from anywhere else."""
+    async with stream_worker(env.client):
+        caller = await open_stream(
+            env,
+            make_start(bodies=(TASK_BODY, TASK_BODY), capacity=2, budget=52),
+            workflow_id="stream/budget/1",
+        )
+        request = caller.pull_request()
+        first = await caller.pull(request)
+        assert first.visible_text == GOLDEN_BUDGETED_TASK
+
+        replayed = await caller.stream.handle.execute_update(
+            StreamWorkflow.pull,
+            args=[request, caller.stream.writer],
+            id="replay-of-the-budgeted-pull",
+        )
+        assert replayed == first
+
+        await caller.present(first)
+        second = await caller.pull()
+        assert second.visible_text == GOLDEN_SECOND_BUDGETED_TASK
 
 
 @pytest.mark.network
@@ -698,6 +740,27 @@ async def test_a_version_one_generation_never_starts(env) -> None:
         with pytest.raises(WorkflowFailureError) as caught:
             await handle.result()
         assert protocol_error_code(caught.value.cause) == "unsupported_version"
+
+
+@pytest.mark.network
+@pytest.mark.parametrize("budget", [0, -1, 2**53])
+async def test_a_generation_declaring_a_budget_no_task_could_carry_never_starts(
+    env, budget: Any
+) -> None:
+    """The declaration rides every task this generation would offer, so a number no record could
+    carry fails the generation rather than its first offer, which is after a consumer is bound
+    and the run has begun. Nothing between whoever composed the start and here is obliged to
+    have checked it, so the kernel checks it for itself."""
+    async with stream_worker(env.client):
+        handle = await env.client.start_workflow(
+            StreamWorkflow.run,
+            make_start(budget=budget),
+            id=f"stream/test/budget-{budget!r}",
+            task_queue=STREAM_TASK_QUEUE,
+        )
+        with pytest.raises(WorkflowFailureError) as caught:
+            await handle.result()
+        assert protocol_error_code(caught.value.cause) == "invalid_message"
 
 
 async def test_a_quickstart_install_never_imports_temporal() -> None:

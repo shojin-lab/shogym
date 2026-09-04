@@ -39,6 +39,7 @@ from temporalio.testing import WorkflowEnvironment  # noqa: E402
 from shogym.serve.protocol_v2 import (  # noqa: E402
     Payload,
     PullRequest,
+    Task,
     TerminalMetadata,
     visible_bytes,
 )
@@ -1576,8 +1577,9 @@ async def test_a_history_recorded_before_policies_replays_to_what_it_recorded() 
     every open stream, and checks the three facts that make the branch worth keeping. The start
     decodes as a generation that resolved nothing. The configuration hash the current formula
     takes over it is the one the old code committed into that history, so a resume of such a run
-    still presents what it presented. And the body it recorded is the placeholder receipt, which
-    is what its records name it.
+    still presents what it presented. The task it recorded is the five-key record that build
+    minted, decoded by today's reader and declaring no budget. And the body it recorded is the
+    placeholder receipt, which is what its records name it.
     """
     recorded = json.loads(
         (Path(__file__).parent / "_fixtures" / "recorded_before_policies.json").read_text()
@@ -1588,6 +1590,7 @@ async def test_a_history_recorded_before_policies_replays_to_what_it_recorded() 
         started.input.payloads[0], StreamStart
     )
     assert (start.profile, start.dispositions, start.provenance) == (LEGACY, [], None)
+    assert start.budget is None
     assert policy_name_of(None) == "legacy-placeholder-v1"
 
     committed = [
@@ -1598,6 +1601,13 @@ async def test_a_history_recorded_before_policies_replays_to_what_it_recorded() 
         )
     ]
     assert configuration_hash(start) == committed[0]["configuration_hash"]
+
+    [offered] = [row["visible_text"] for row in committed if row.get("kind") == "task"]
+    assert offered == (
+        '{"attempt_id":"00000000000000000000000000000100","body":"the one task",'
+        '"kind":"task","message_id":"00000000000000000000000000000101","protocol_version":2}'
+    )
+    assert Task.from_wire(json.loads(offered)).budget is None
 
     [served] = [row["visible_text"] for row in committed if row.get("kind") == "payload"]
     assert json.loads(served)["body"] == f"receipt 0 for {DIGEST[:16]}"

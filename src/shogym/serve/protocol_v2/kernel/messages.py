@@ -151,6 +151,12 @@ class StreamStart:
     to a policy that publishes the score only where that grader is the environment's own, so the
     claim is carried here and checked at start rather than being a property of whichever builder
     composed the generation.
+
+    ``budget`` is how many environment actions this generation gives an attempt, where it has
+    declared a number to hand over. It is one number for the generation, so it is here rather
+    than on a task, and every task offered under it carries it. A generation that declares none
+    serves a task record without the key, which is what a generation composed before there was a
+    budget to declare serves.
     """
 
     configuration_hash: str
@@ -175,6 +181,7 @@ class StreamStart:
     dispositions: List[PayloadDisposition] = field(default_factory=list)
     provenance: Optional[PolicyProvenance] = None
     families: List[MatchedFamily] = field(default_factory=list)
+    budget: Optional[int] = None
     schedule_version: str = SCHEDULE_VERSION
     protocol_version: int = PROTOCOL_VERSION
 
@@ -199,7 +206,10 @@ def configuration_hash(start: StreamStart) -> str:
     A history recorded before a policy was a fact about a generation hashed exactly these keys,
     and adding one to what it presents would refuse every resume of it, so the legacy profile
     hashes what it always hashed and a generation that names a profile hashes its dispositions
-    along with everything else. Each of those names its policy by the digest of the policy's
+    along with everything else. What a generation tells an agent it may spend is here on the same
+    terms: a declared budget is a number on every task the generation serves, so it is part of
+    what a resume has to serve identically, and a generation that declared none hashes exactly
+    what it hashed before there was one to declare. Each of those names its policy by the digest of the policy's
     preimage, so what a body was allowed to say is inside the identity a resume is held to,
     along with the authority that decided it and the matched families its rows are cells of.
 
@@ -277,6 +287,8 @@ def configuration_hash(start: StreamStart) -> str:
             ],
         },
     }
+    if start.budget is not None:
+        declared["budget"] = start.budget
     if start.profile != LEGACY:
         declared["profile"] = start.profile
         declared["grade"] = (

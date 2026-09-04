@@ -14,6 +14,7 @@ spends a token.
 from __future__ import annotations
 
 import importlib
+from hashlib import sha256
 from pathlib import Path
 
 import pytest
@@ -30,6 +31,7 @@ from fastmcp import Client  # noqa: E402
 from examples.hermes import serve as serve_mod  # noqa: E402
 from shogym.serve.episode import ServedEpisode  # noqa: E402
 from shogym.serve.protocol_v2.gateway import (  # noqa: E402
+    stream_start,
     PULL_TOOL,
     StreamGateway,
     build_gateway_server,
@@ -107,12 +109,19 @@ async def test_the_served_surface_is_the_loop_the_prompt_describes() -> None:
     episode = await ServedEpisode.start(TEST_ENV, task=0, ends_on_horizon=False)
     try:
         spec = episode.describe()
+        start = stream_start(
+            spec,
+            terminal_manifest(spec),
+            claim_hash=sha256(b"a claim").hexdigest(),
+            evaluation_only=True,
+        )
         gateway = StreamGateway(
             None,  # type: ignore[arg-type]  # listing tools reaches no stream
             episode,
             spec,
             terminal_manifest(spec),
             initial_cursor="0" * 32,
+            generation=start,
         )
         async with Client(build_gateway_server(gateway, name="shogym")) as client:
             schemas = {tool.name: tool.inputSchema for tool in await client.list_tools()}
