@@ -129,10 +129,12 @@ json.loads(await shogym_stream.pull())                    # eventually {"kind": 
 
 A `wait` record means nothing is ready yet, so pull again shortly. A `seal_reject` means the
 terminal's own arguments were malformed; the task is still open, so the agent can correct them and
-file again. There is no queue to inspect and no task index anywhere on the wire: a task record
-carries an attempt id and a body, and has no field an index or a target could be written into. A
-run that declares a step budget serves `budget` on every task as well, one number for the whole
-run; this quickstart declares none.
+file again. There is no task index anywhere on the wire: a task record carries an attempt id and
+a body, and has no field an index or a target could be written into. There is no queue to inspect
+either, unless the run declares the `info` tool, which answers how many tasks have been handed out
+so far, how many of those have not ended yet, and how many are still to be handed out. A run that
+declares a step budget serves `budget` on every task as well, one number for the whole run; this
+quickstart declares neither.
 
 ## Swap the env
 

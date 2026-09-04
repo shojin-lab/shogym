@@ -56,6 +56,8 @@ with workflow.unsafe.imports_passed_through():
         Assignment,
         BlobRef,
         Done,
+        Info,
+        InfoRequest,
         Payload,
         PresentationAck,
         PresentationCommit,
@@ -71,9 +73,11 @@ with workflow.unsafe.imports_passed_through():
         canonical_json,
         check_release,
         eligible_tasks,
+        info_request_identity,
         order_key,
         presentation_request_identity,
         pull_request_identity,
+        require_declaration,
         require_digest,
         require_opaque_id,
         require_step_budget,
@@ -447,6 +451,14 @@ class StreamWorkflow:
         self._pending: Optional[_Pending] = None
         self._pull_requests: Dict[str, _Bound] = {}
         self._terminal_requests: Dict[str, _Bound] = {}
+        # The info tool's own reservations, kept apart from the pull's so that a reservation is
+        # scoped to the tool that made it: the same request ID names one reservation under each
+        # tool rather than one across both. Neither map is what stops a caller collecting the
+        # other tool's bytes, and neither is meant to be. Both handlers compare the identity
+        # bound to a request ID before they hand anything back, and the two identities are taken
+        # under different domain tags, so a request ID reused across the tools is a conflict
+        # under one map and two separate reservations under these.
+        self._info_requests: Dict[str, _Bound] = {}
         self._finalize_requests: Dict[str, _BoundFinalization] = {}
         self._attestations: Dict[str, PresentationAck] = {}
         self._attestation_identities: Dict[str, str] = {}
@@ -764,6 +776,24 @@ class StreamWorkflow:
             self._release_lock(ticket)
 
     @workflow.update
+    async def info(self, request: InfoRequest, writer: Writer) -> OfferedMessage:
+        """Answer how much of this generation's queue there is, where it declared the tool.
+
+        It is an Update and not a Query, and everything about how it behaves follows from that.
+        The counts are read inside the transition that mints the record, so what the agent is
+        told describes the stream that told it; the answer is offered like a pull's, so a retry
+        of the same request gets the same bytes rather than a fresh reading; and a presentation
+        commits it, so what the agent was told is in the ledger beside every other message it
+        read. A Query would have none of those and could be answered by a transport the stream
+        has already fenced.
+        """
+        ticket = self._take_lock(writer)
+        try:
+            return self._info(request)
+        finally:
+            self._release_lock(ticket)
+
+    @workflow.update
     async def seal_attempt(self, request: SealRequest, writer: Writer) -> OfferedMessage:
         """End an attempt, or say why the filing was not one this tool accepts.
 
@@ -1036,8 +1066,8 @@ class StreamWorkflow:
         bytes were committed to get there, which is the other half of the one question a harness
         asks after an episode: are the bytes in its own transcript the bytes this generation
         stands behind. Kinds the records have no column for are here for that reason, because a
-        Wait, a SealReject and the Done are committed the same way, and a reconciliation blind to
-        them would pass a run that lost one.
+        Wait, a SealReject, an Info answer and the Done are committed the same way, and a
+        reconciliation blind to them would pass a run that lost one.
 
         Commitment is the whole of what this answers. It is accepted before the transport has a
         result to hand anybody, so a message counted here can be one whose bytes never left: an
@@ -1311,6 +1341,115 @@ class StreamWorkflow:
     def _capacity_in_use(self) -> int:
         occupied = (TASK_OFFERED, ACTIVE, SEALING)
         return sum(1 for attempt in self._attempts.values() if attempt.state in occupied)
+
+    # Info.
+
+    def _info(self, request: InfoRequest) -> OfferedMessage:
+        """Reserve one answer for one info request, on the terms a pull is reserved under.
+
+        A generation that did not declare the tool has nothing to answer with and refuses the
+        call as the malformed thing it is. The refusal is here and not only where the tool is
+        advertised, because this Update is reachable by anything holding the generation's writer,
+        and what a generation serves is the generation's own fact rather than whichever
+        transport happens to be in front of it.
+
+        Everything after that is the pull's rule, and for the pull's reasons: a retry of the same
+        request is answered from what that request reserved, the same ID carrying anything else
+        is a conflict, a request made from a stale cursor is refused, and a second request while
+        one answer is outstanding does not overtake it.
+
+        A prepared seal is the one thing owed that reserves no result, and it is refused here
+        along with the ones that do. A filing accepted by an owner that was then replaced leaves
+        its attempt sealing, and the only thing that can still finish it is that exact request,
+        which names the cursor it was made at. An answer minted here would be presented, the
+        cursor would move, and that request would be refused for a stale cursor before it reached
+        the filing it prepared, while a filing rebuilt at the new cursor is a different identity
+        and therefore a second filing for an attempt that already has one. Nothing could then
+        seal the attempt, finalize it, or let the generation reach Done. The question is worth
+        less than the attempt, so it waits.
+        """
+        if not self._start.info:
+            raise StreamProtocolError("invalid_message")
+        identity = info_request_identity(request)
+        bound = self._info_requests.get(request.request_id)
+        if bound is not None:
+            if bound.identity != identity:
+                raise StreamProtocolError("request_conflict")
+            if bound.message.message_id in self._presented:
+                raise StreamProtocolError("already_presented")
+            return bound.message
+        if request.last_presented_cursor != self._cursor:
+            raise StreamProtocolError("invalid_cursor")
+        if self._pending is not None:
+            raise StreamProtocolError("outstanding_response")
+        if any(attempt.state == SEALING for attempt in self._attempts.values()):
+            raise StreamProtocolError("outstanding_response")
+        remaining, consumed, in_flight = self._queue_counts()
+        answer = Info(
+            message_id=self._mint_message_id(),
+            remaining=remaining,
+            consumed=consumed,
+            in_flight=in_flight,
+        )
+        return self._offer(answer, "info", request.request_id, identity, None)
+
+    def _queue_counts(self) -> Tuple[int, int, int]:
+        """How much of the queue there is: remaining, consumed, and in flight.
+
+        The three are defined here and nowhere else. Every other statement of them, in this
+        module and outside it, says what this says.
+
+        ``remaining`` is the attempts still to be handed out, which is PLANNED and only PLANNED:
+        not handed out yet, and still able to be. An attempt a gate is holding back is planned,
+        so it counts as still to come rather than as withheld.
+
+        ``consumed`` is the attempts handed out so far, whatever became of them: TASK_OFFERED,
+        ACTIVE, SEALING, SEALED, ACK_PRESENTED, and a FINAL_FAILED attempt that was offered
+        before it ended. Handing out is the offer, so an attempt whose task was reserved counts
+        from that moment even if the presentation of it never committed.
+
+        ``in_flight`` is the ones among those that have not ended, which is TASK_OFFERED, ACTIVE
+        and SEALING: exactly the attempts occupying capacity. Sealing releases capacity, so a
+        sealed attempt whose acknowledgement is still to be presented is consumed and not in
+        flight.
+
+        So ``in_flight`` is inside ``consumed`` rather than beside it, and the three are not a
+        partition of anything. What they leave out is the attempts this generation ended before
+        ever handing them out: they were never handed out, so they are not consumed, and they can
+        never be handed out now, so they are not remaining. Two mechanisms take an attempt there,
+        and both write an ending over a PLANNED attempt: a controller finalizing one, and the
+        cascade that floors every one whose gate can no longer open. Either can reach any number
+        of attempts. A deadline and a spent step budget reach none of them, because each ends an
+        attempt that was handed over already and leaves it consumed, although either can be the
+        ending the cascade then follows from.
+
+        The arithmetic, with the roster ``N`` and the never-handed-out endings ``U``, is
+        ``remaining + consumed + U == N`` and ``in_flight <= consumed``. So ``remaining`` plus
+        ``consumed`` is ``N`` wherever ``U`` is zero, which is every generation that has not
+        ended an attempt before handing it out, and is short of ``N`` by ``U`` everywhere else.
+        The three together need not sum to ``N``: they sum to ``N - U + in_flight``, which can
+        fall below the roster, meet it, or pass it, so the sum of the three is not in general the
+        roster.
+
+        None of the three is a Wait's reason, and no record carries one. That is a fact about the
+        fields rather than a guarantee about what can be worked out from them, and the difference
+        matters here: a generation publishes its capacity in the control tool's own description,
+        so an agent holding ``in_flight`` equal to that capacity has been told what a Wait it then
+        receives is for, and one holding ``in_flight`` below it with ``remaining`` above zero has
+        been told that something is gating the queue. A generation that declares this tool has
+        decided to publish counts that carry that much.
+
+        Whether an attempt was handed out is read from the offers this generation made, because
+        that is where the fact is: an ending overwrites the state an attempt was in and leaves
+        the offer that reserved its task exactly where it was.
+        """
+        handed_out = {
+            offer.attempt_id
+            for offer in self._offers
+            if offer.kind == "task" and offer.attempt_id is not None
+        }
+        remaining = sum(1 for attempt in self._attempts.values() if attempt.state == PLANNED)
+        return remaining, len(handed_out), self._capacity_in_use()
 
     # Seal.
 
@@ -2102,9 +2241,17 @@ class StreamWorkflow:
                 wait_reason=wait_reason,
             )
         )
-        bindings = self._pull_requests if origin == "pull" else self._terminal_requests
+        bindings = self._bound_by(origin)
         bindings[request_id] = _Bound(identity=identity, message=message)
         return message
+
+    def _bound_by(self, origin: str) -> Dict[str, _Bound]:
+        """The reservations one tool's requests are answered out of."""
+        if origin == "pull":
+            return self._pull_requests
+        if origin == "info":
+            return self._info_requests
+        return self._terminal_requests
 
     def _mint_message_id(self) -> str:
         """Take the next ID from the keyed stream, for a message no manifest could count."""
@@ -2313,6 +2460,13 @@ def _check_start(start: StreamStart) -> None:
         # comparison against one lets a boolean, a float and an oversized integer through, and
         # each of them is a generation whose capacity is not the number it says it is.
         require_step_budget("capacity", start.capacity)
+        # Whether the info tool is served is a yes or a no, and everything downstream reads it
+        # as one: the manifest writes the tool or leaves it out, the hash writes the key or
+        # leaves it out, and this workflow answers the call or refuses it. Anything else is
+        # normalized by truthiness into one of the two, so a generation composed with a number
+        # or a string would serve one surface and be identified as another without anything
+        # having said which was meant.
+        require_declaration("info", start.info)
         require_opaque_id("initial_cursor", start.initial_cursor)
         require_opaque_id("done_message_id", start.done_message_id)
         for item in start.tasks:

@@ -59,6 +59,7 @@ from shogym.serve.protocol_v2 import (  # noqa: E402
     RELEASE_AT_SEAL,
     EligibilityGate,
     PresentationCommit,
+    InfoRequest,
     PullRequest,
     ReleasePlan,
     TerminalMetadata,
@@ -153,6 +154,7 @@ def make_start(
     release: Optional[ReleasePlan] = None,
     without_payload: Any = (),
     blob_root: Optional[str] = None,
+    info: bool = False,
 ) -> StreamStart:
     """A generation whose every public identifier is fixed before it serves anything."""
     tasks = [
@@ -183,6 +185,7 @@ def make_start(
             ),
             tasks=tasks,
             attempt_deadline_ms=attempt_deadline_ms,
+            info=info,
             blob_root=blob_root,
             release=IMMEDIATE if release is None else release,
             assignments=(
@@ -261,6 +264,14 @@ class Caller:
         message = await self.pull()
         await self.present(message)
         return message
+
+    async def counts(self) -> Dict[str, int]:
+        """Ask what the queue looks like and present the answer, which is what an agent does."""
+        answer = await self.stream.info(
+            InfoRequest(request_id=self.next_id(), last_presented_cursor=self.cursor)
+        )
+        await self.present(answer)
+        return json.loads(answer.visible_text)
 
 
 async def refused(awaitable: Any) -> str:
@@ -1407,6 +1418,39 @@ async def test_an_ending_floors_every_attempt_that_was_waiting_on_it(env) -> Non
         done = await caller.pull()
         assert done.kind == "done"
         assert state.pending_message_id is None
+
+
+@pytest.mark.network
+async def test_a_gate_that_can_no_longer_open_leaves_attempts_the_counts_do_not_hold(env) -> None:
+    """The two attempts floored behind A were never handed out and never will be.
+
+    They are not remaining, because nothing will ever serve them, and they are not consumed,
+    because nobody was ever given them. So the three counts stop accounting for the roster, and
+    the difference is exactly the attempts that ended without being handed over.
+    """
+    async with stream_worker(env.client):
+        caller = await open_stream(
+            env,
+            make_start(
+                bodies=LEG_BODIES,
+                release=LEG_PLAN,
+                without_payload=LEG_WITHOUT_PAYLOAD,
+                info=True,
+            ),
+            workflow_id="stream/finalize/leg-counts",
+        )
+        first = await caller.take()
+        assert first.attempt_id == ATTEMPT
+        counted = await caller.counts()
+        assert (counted["remaining"], counted["consumed"], counted["in_flight"]) == (2, 1, 1)
+
+        receipt = await caller.finalize(ABANDONED)
+        assert sorted(receipt.also_finalized) == [oid(0x104), oid(0x108)]
+        counted = await caller.counts()
+        assert (counted["remaining"], counted["consumed"], counted["in_flight"]) == (0, 1, 0)
+        state = await caller.stream.stream_state()
+        assert len(state.attempts) == 3
+        assert counted["remaining"] + counted["consumed"] + 2 == len(state.attempts)
 
 
 @pytest.mark.network

@@ -21,6 +21,7 @@ import os
 import sys
 from contextlib import asynccontextmanager
 from dataclasses import replace
+from hashlib import sha256
 from pathlib import Path
 from types import SimpleNamespace
 from typing import Any, AsyncIterator, Dict, List, Optional
@@ -37,8 +38,11 @@ from temporalio.service import RPCError, RPCStatusCode  # noqa: E402
 
 from shogym.serve.episode import ServedEpisode  # noqa: E402
 from shogym.serve.protocol_v2 import gateway as gateway_module  # noqa: E402
+from shogym.serve.protocol_v2 import records as records_module  # noqa: E402
 from shogym.serve.protocol_v2 import (  # noqa: E402
     Done,
+    Info,
+    InfoRequest,
     Payload,
     PresentationAck,
     PresentationCommit,
@@ -50,6 +54,7 @@ from shogym.serve.protocol_v2 import (  # noqa: E402
 )
 from shogym.serve.protocol_v2.gateway import (  # noqa: E402
     CANONICALIZATION_VERSION,
+    INFO_TOOL,
     PULL_TOOL,
     EnvironmentTerminal,
     GatewayClosed,
@@ -152,6 +157,8 @@ SECOND_ACK_OFFER = offered(
     SECOND_ATTEMPT,
 )
 DONE_OFFER = offered(Done(message_id=DONE_ID))
+INFO_ID = "00000000000000000000000000000003"
+INFO_OFFER = offered(Info(message_id=INFO_ID, remaining=4, consumed=2, in_flight=1))
 
 
 class ScriptedProjection:
@@ -272,6 +279,10 @@ class ScriptedStream:
     async def pull(self, request: Any) -> Any:
         self.requests.append(request)
         return await self._next("pull", request.request_id)
+
+    async def info(self, request: Any) -> Any:
+        self.requests.append(request)
+        return await self._next("info", request.request_id)
 
     async def seal(self, request: Any) -> Any:
         self.requests.append(request)
@@ -472,7 +483,7 @@ async def scoring_world(trace_path: Optional[Path] = None) -> ServedEpisode:
 
 
 def composition(
-    spec: TaskSpec, *, budget: Optional[int] = None, capacity: int = 1
+    spec: TaskSpec, *, budget: Optional[int] = None, capacity: int = 1, info: bool = False
 ) -> StreamStart:
     """The generation a transport in these tests is serving.
 
@@ -488,11 +499,14 @@ def composition(
         claim_hash="c" * 64,
         budget=budget,
         capacity=capacity,
+        info=info,
         evaluation_only=True,
     )
 
 
-def make_gateway(episode: ServedEpisode, stream: ScriptedStream) -> StreamGateway:
+def make_gateway(
+    episode: ServedEpisode, stream: ScriptedStream, *, info: bool = False
+) -> StreamGateway:
     spec = episode.describe()
     return StreamGateway(
         stream,  # type: ignore[arg-type]
@@ -500,7 +514,7 @@ def make_gateway(episode: ServedEpisode, stream: ScriptedStream) -> StreamGatewa
         spec,
         terminal_manifest(spec),
         initial_cursor=CURSOR,
-        generation=composition(spec),
+        generation=composition(spec, info=info),
     )
 
 
@@ -904,6 +918,100 @@ def test_a_declared_budget_is_said_in_the_words_the_generation_hashed() -> None:
         spec
     )
     assert _configuration_hash(spec, terminal, None, "floor", None) == configuration_of(spec)
+
+
+def test_a_generation_that_declares_no_info_tool_serves_what_it_always_served() -> None:
+    """No tool, no words about one, and the same digest a build without one produced.
+
+    The digest is a literal for the reason the budget's and the capacity's are: a generation
+    composed without the tool has to hash to what a build from before there was a tool to declare
+    produced, or every run recorded by one of those is refused its resume over a tool nobody
+    served.
+    """
+    spec = hashing_spec()
+    terminal = terminal_manifest(spec)
+    composed = stream_start(spec, terminal, claim_hash="a" * 64, evaluation_only=True)
+    assert composed.info is False
+    assert "info_tool" not in served_manifest(spec, terminal)
+    assert configuration_of(spec) == (
+        "e05450155cce9a1f8d2bfd0e9ea0027605853c2cafaea3760d572f9c1c83ae45"
+    )
+    assert _configuration_hash(spec, terminal, None, "floor", None, 1, False) == (
+        configuration_of(spec)
+    )
+
+
+def test_a_declared_info_tool_is_named_in_the_manifest_the_generation_hashed() -> None:
+    """A second tool is a second entry rather than a sentence, and it moves the digest.
+
+    What is written is what the model can read and call: the name it is served under, the words
+    it is served in, and the closed empty object it takes. A resume is held to all three, so a
+    replacement serving other words for the same tool is refused rather than quietly serving a
+    surface this generation never hashed.
+    """
+    spec = hashing_spec()
+    terminal = terminal_manifest(spec)
+    declared = served_manifest(spec, terminal, info=True)["info_tool"]
+    assert declared == {
+        "name": "info",
+        "description": (
+            "Ask how much work there is. Takes no arguments, and is answered between delivered "
+            "results, while the run is open and nothing is owed: asking while an earlier call is "
+            "still owed a result, or after the run is done, is refused. The result is one JSON "
+            "record with three counts: `consumed`, how many tasks have been handed out so far; "
+            "`in_flight`, how many of those have not ended yet; and `remaining`, how many are "
+            "still to be handed out. `in_flight` counts tasks `consumed` counts too, and a run "
+            "can end a task it never handed out, so the three need not add up to the whole run. "
+            "They are totals for the run and name no task. `remaining` reaching zero does not "
+            "mean the run is over: a payload may still be owed and a task may still be running, "
+            "so stop when `pull` answers with done."
+        ),
+        "schema": {"type": "object", "properties": {}, "additionalProperties": False},
+    }
+    # The control tool is left exactly as it was: this is a tool beside `pull`, not a change to it.
+    assert (
+        served_manifest(spec, terminal, info=True)["control_tool"]
+        == served_manifest(spec, terminal)["control_tool"]
+    )
+    assert _configuration_hash(spec, terminal, None, "floor", None, 1, True) != (
+        configuration_of(spec)
+    )
+    assert stream_start(
+        spec, terminal, claim_hash="a" * 64, evaluation_only=True, info=True
+    ).configuration_hash == _configuration_hash(spec, terminal, None, "floor", None, 1, True)
+
+
+def test_the_four_ways_a_budget_and_an_info_tool_can_be_declared_are_four_generations() -> None:
+    """Two declarations that are made apart are hashed apart, so a generation that declared one
+    of them is not a generation that declared the other or both."""
+    spec = hashing_spec()
+    terminal = terminal_manifest(spec)
+    digests = {
+        _configuration_hash(spec, terminal, None, "floor", budget, 1, info)
+        for budget in (None, spec.horizon)
+        for info in (False, True)
+    }
+    assert len(digests) == 4
+    assert configuration_of(spec) in digests
+
+
+@pytest.mark.parametrize("info", [1, 0, None, "yes", "", [], [1], 1.0])
+def test_an_info_declaration_that_is_not_a_yes_or_a_no_is_refused_where_it_is_declared(
+    info: Any,
+) -> None:
+    """The declaration decides which tools are served and which keys are hashed, and each of
+    those reads it as one of two. Anything else would be turned into one of them by every reader
+    separately, so a generation would serve one surface and be identified as another with nothing
+    having said which was meant."""
+    spec = hashing_spec()
+    with pytest.raises(ValueError, match="info must be true or false"):
+        stream_start(
+            spec,
+            terminal_manifest(spec),
+            claim_hash="a" * 64,
+            info=info,
+            evaluation_only=True,
+        )
 
 
 def test_a_generation_that_declares_no_capacity_serves_what_it_always_served() -> None:
@@ -1735,14 +1843,131 @@ async def test_the_control_tool_is_advertised_in_the_words_the_generation_hashed
     assert "up to 8 tasks" in held[PULL_TOOL]
 
 
-async def test_a_native_tool_named_pull_is_refused_at_construction(
+async def test_the_info_tool_is_served_only_where_the_generation_declares_it(
     episode: ServedEpisode,
 ) -> None:
-    """Two tools of one name cannot both be reachable, and the control tool would lose."""
+    """A tool this gateway does not serve is not advertised, so a generation that declares
+    nothing offers the tool set it offered before there was a second tool to offer."""
+    spec = episode.describe()
+    terminal = terminal_manifest(spec)
+    plain = build_gateway_server(make_gateway(episode, ScriptedStream()))
+    async with Client(plain) as client:
+        assert {tool.name for tool in await client.list_tools()} == {
+            PULL_TOOL,
+            "guess",
+            "terminate",
+        }
+
+    declared = StreamGateway(
+        ScriptedStream(),  # type: ignore[arg-type]
+        episode,
+        spec,
+        terminal,
+        initial_cursor=CURSOR,
+        generation=composition(spec, info=True),
+    )
+    async with Client(build_gateway_server(declared)) as client:
+        tools = {tool.name: tool for tool in await client.list_tools()}
+    assert set(tools) == {PULL_TOOL, INFO_TOOL, "guess", "terminate"}
+    # What is advertised is what was hashed, both the words and the shape of the call.
+    served = served_manifest(spec, terminal, info=True)["info_tool"]
+    assert tools[INFO_TOOL].description == served["description"]
+    assert tools[INFO_TOOL].inputSchema == served["schema"]
+
+
+async def test_the_info_tool_answers_the_way_a_pull_does(episode: ServedEpisode) -> None:
+    """The answer is minted by the stream, delivered as the exact bytes it minted, and attested.
+
+    It is the pull's path with the pull's guarantees, which is what puts the counts an agent was
+    told inside the ledger rather than beside it: one text item, the offered bytes unchanged, one
+    presentation committed for them, and the cursor moved to the message they went as.
+    """
+    stream = ScriptedStream(INFO_OFFER)
+    gateway = StreamGateway(
+        stream,  # type: ignore[arg-type]
+        episode,
+        episode.describe(),
+        terminal_manifest(episode.describe()),
+        initial_cursor=CURSOR,
+        generation=composition(episode.describe(), info=True),
+    )
+    async with Client(build_gateway_server(gateway)) as client:
+        result = await client.call_tool(INFO_TOOL, {})
+    assert [item.text for item in result.content] == [INFO_OFFER.visible_text]
+    assert json.loads(INFO_OFFER.visible_text) == {
+        "protocol_version": 2,
+        "kind": "info",
+        "message_id": INFO_ID,
+        "remaining": 4,
+        "consumed": 2,
+        "in_flight": 1,
+    }
+    assert stream.calls == ["info", "present"]
+    assert isinstance(stream.requests[0], InfoRequest)
+    assert stream.requests[0].last_presented_cursor == CURSOR
+    [commit] = stream.commits
+    assert commit.message_id == INFO_ID
+    assert commit.visible_bytes_sha256 == (
+        sha256(INFO_OFFER.visible_text.encode("utf-8")).hexdigest()
+    )
+    # An answer is not a task and not a completed turn, so it carries neither blob.
+    assert commit.task_start_checkpoint_blob is None
+    assert commit.provider_turn_blob is None
+    assert commit.completed_turn is False
+    assert gateway.cursor == INFO_ID
+
+
+async def test_an_info_call_that_carries_an_argument_never_reaches_the_stream(
+    episode: ServedEpisode,
+) -> None:
+    """The model's own call carries nothing, so an argument is a call this protocol does not
+    define rather than a value to ignore."""
+    stream = ScriptedStream(INFO_OFFER)
+    gateway = StreamGateway(
+        stream,  # type: ignore[arg-type]
+        episode,
+        episode.describe(),
+        terminal_manifest(episode.describe()),
+        initial_cursor=CURSOR,
+        generation=composition(episode.describe(), info=True),
+    )
+    assert await refused(gateway.info({"cursor": CURSOR})) == "invalid_message"
+    assert stream.calls == []
+
+
+async def test_the_info_tool_is_refused_once_the_generation_is_closed(
+    episode: ServedEpisode,
+) -> None:
+    """Done closes the generation, and a closed generation with nothing owed answers nothing."""
+    stream = ScriptedStream(DONE_OFFER)
+    gateway = StreamGateway(
+        stream,  # type: ignore[arg-type]
+        episode,
+        episode.describe(),
+        terminal_manifest(episode.describe()),
+        initial_cursor=CURSOR,
+        generation=composition(episode.describe(), info=True),
+    )
+    assert json.loads(await gateway.pull({}))["kind"] == "done"
+    assert await refused(gateway.info({})) == "closed_stream"
+    assert stream.calls == ["pull", "present"]
+
+
+@pytest.mark.parametrize("reserved", [PULL_TOOL, INFO_TOOL])
+async def test_a_native_tool_named_after_a_control_tool_is_refused_at_construction(
+    episode: ServedEpisode, reserved: str
+) -> None:
+    """Two tools of one name cannot both be reachable, and the control tool would lose.
+
+    Both names are refused whatever this generation declares. Which names the protocol keeps for
+    itself is a fact about the protocol, so an environment that could be served under one
+    generation and refused under the next would be one whose surface depended on a decision about
+    the run rather than on what the environment is.
+    """
     gateway = make_gateway(episode, ScriptedStream())
     spec = gateway.spec
-    spec.tools[0] = spec.tools[0].model_copy(update={"name": PULL_TOOL})
-    with pytest.raises(ValueError, match="collides with the stream control tool"):
+    spec.tools[0] = spec.tools[0].model_copy(update={"name": reserved})
+    with pytest.raises(ValueError, match="collides with a stream control tool"):
         build_gateway_server(gateway)
 
 
@@ -1870,10 +2095,12 @@ async def test_a_result_is_delivered_verbatim_and_attested(episode: ServedEpisod
 async def test_every_result_crosses_the_boundary_as_one_text_item(
     episode: ServedEpisode,
 ) -> None:
-    """Task, Wait, Payload, Done, SealAck, SealReject: one text item each, and nothing beside.
+    """Every kind the model can be shown: one text item each, and nothing beside.
 
     The rule is about what the transport delivers, so every kind goes through the real server
-    rather than through a return value the server would still have to render.
+    rather than through a return value the server would still have to render. The list is the
+    presentable kinds of the wire module, so a kind added there without being served here fails
+    rather than going unnoticed.
     """
     wait = offered(Wait(message_id="0" * 31 + "3", retry_after_ms=1000))
     reject = offered(
@@ -1882,8 +2109,11 @@ async def test_every_result_crosses_the_boundary_as_one_text_item(
     payload = offered(
         Payload(message_id="0" * 31 + "5", attempt_id=ATTEMPT, body="receipt 0"), ATTEMPT
     )
-    order = (TASK_OFFER, wait, reject, ACK_OFFER, payload, DONE_OFFER)
-    gateway = make_gateway(episode, ScriptedStream(*order))
+    order = (TASK_OFFER, wait, reject, ACK_OFFER, payload, INFO_OFFER, DONE_OFFER)
+    assert {message.kind for message in order} == {
+        cls.__dataclass_fields__["kind"].default for cls in records_module._PRESENTABLE
+    }
+    gateway = make_gateway(episode, ScriptedStream(*order), info=True)
     server = build_gateway_server(gateway)
     filing = {"attempt_id": ATTEMPT, "arguments": {}}
     async with Client(server) as client:
@@ -1893,6 +2123,7 @@ async def test_every_result_crosses_the_boundary_as_one_text_item(
             await client.call_tool("terminate", filing),
             await client.call_tool("terminate", filing),
             await client.call_tool(PULL_TOOL, {}),
+            await client.call_tool(INFO_TOOL, {}),
             await client.call_tool(PULL_TOOL, {}),
         ]
     for answer, message in zip(answers, order):
@@ -3299,6 +3530,7 @@ MESSAGES = {
     "seal_reject": offered(
         SealReject(message_id="0" * 31 + "f", attempt_id=ATTEMPT, body="missing word"), ATTEMPT
     ),
+    "info": INFO_OFFER,
 }
 
 
@@ -3316,14 +3548,20 @@ async def test_a_call_cut_between_the_offer_and_the_presentation_still_delivers(
     message = MESSAGES[kind]
     filing = kind in ("seal_ack", "seal_reject")
     stream = ScriptedStream(*(([TASK_OFFER] if filing else []) + [message]))
-    gateway = make_gateway(episode, stream)
+    gateway = make_gateway(episode, stream, info=kind == "info")
+
+    def asking() -> Any:
+        """The call this kind is the answer to, made again exactly as it was made."""
+        if filing:
+            return gateway.terminal(FILING)
+        return gateway.info({}) if kind == "info" else gateway.pull({})
+
     if filing:
         await gateway.pull({})
     presentations = stream.calls.count("present")
 
     stream.commit_gate = asyncio.Event()
-    call = gateway.terminal(FILING) if filing else gateway.pull({})
-    handler = asyncio.create_task(call)
+    handler = asyncio.create_task(asking())
     await asyncio.sleep(0.01)
     handler.cancel()
     with pytest.raises(asyncio.CancelledError):
@@ -3341,7 +3579,7 @@ async def test_a_call_cut_between_the_offer_and_the_presentation_still_delivers(
     assert record.result == message.visible_text
     assert await refused(gateway.environment("guess", GUESS)) == "outstanding_response"
 
-    again = await (gateway.terminal(FILING) if filing else gateway.pull({}))
+    again = await asking()
     assert again == message.visible_text
     assert stream.calls.count("present") == presentations + 1
     assert isinstance(gateway._recovery, _Idle)

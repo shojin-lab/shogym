@@ -157,6 +157,12 @@ class StreamStart:
     than on a task, and every task offered under it carries it. A generation that declares none
     serves a task record without the key, which is what a generation composed before there was a
     budget to declare serves.
+
+    ``info`` is whether this generation answers the tool that says how much of its queue is left.
+    It is off by default, because telling an agent how much work there is is a decision about the
+    run, and a generation that makes no such decision has no such tool: nothing about it is
+    served, nothing about it is hashed, and the counts stay where they have always been, which is
+    with the harness.
     """
 
     configuration_hash: str
@@ -182,6 +188,7 @@ class StreamStart:
     provenance: Optional[PolicyProvenance] = None
     families: List[MatchedFamily] = field(default_factory=list)
     budget: Optional[int] = None
+    info: bool = False
     schedule_version: str = SCHEDULE_VERSION
     protocol_version: int = PROTOCOL_VERSION
 
@@ -209,7 +216,10 @@ def configuration_hash(start: StreamStart) -> str:
     along with everything else. What a generation tells an agent it may spend is here on the same
     terms: a declared budget is a number on every task the generation serves, so it is part of
     what a resume has to serve identically, and a generation that declared none hashes exactly
-    what it hashed before there was one to declare. Each of those names its policy by the digest of the policy's
+    what it hashed before there was one to declare. A declared info tool is here on those terms
+    too: it is a tool the agent may call and an answer the generation mints, so a replacement
+    serving it where the original did not is serving something else. Each of those names its
+    policy by the digest of the policy's
     preimage, so what a body was allowed to say is inside the identity a resume is held to,
     along with the authority that decided it and the matched families its rows are cells of.
 
@@ -289,6 +299,8 @@ def configuration_hash(start: StreamStart) -> str:
     }
     if start.budget is not None:
         declared["budget"] = start.budget
+    if start.info:
+        declared["info"] = True
     if start.profile != LEGACY:
         declared["profile"] = start.profile
         declared["grade"] = (
@@ -484,9 +496,9 @@ class ConsumerReceipt:
 class OfferedMessage:
     """One offered protocol result: the exact bytes, and enough to route them.
 
-    ``visible_text`` is the canonical encoding of a Task, Payload, Wait, Done, SealAck, or
-    SealReject. A harness presents those bytes and attests to their hash; it does not rebuild
-    them from ``kind`` and ``message_id``.
+    ``visible_text`` is the canonical encoding of a Task, Payload, Wait, Done, SealAck,
+    SealReject, or Info. A harness presents those bytes and attests to their hash; it does not
+    rebuild them from ``kind`` and ``message_id``.
     """
 
     message_id: str
@@ -601,7 +613,10 @@ class StreamState:
 
     This is the answer to a Query, so it writes nothing and can be asked at any time. It is
     harness-only, which is what lets it carry the hidden Wait reasons: a model that could read
-    them would learn from a Wait exactly what the Wait record is shaped to withhold.
+    them would learn from a Wait exactly what the Wait record is shaped to withhold. A generation
+    that declares the info tool publishes three of these counts and no more, and it publishes
+    them through a record the stream mints rather than through this read: the reasons, the
+    identifiers and everything else here stay where they are.
 
     Assignment, release, materialization, eligibility, offer, and presentation are six counts
     and not one. Collapsing them would make an offer look like a delivery, and only the last of
@@ -824,9 +839,10 @@ class PresentedMessage:
 
     An attempt's record says which of its three messages were committed, and that is the fact an
     analysis counts. This says which bytes each of them was, and it says it for every kind rather
-    than for those three: a Wait, a SealReject and the Done that ends the generation are
-    committed under the same attestation, and a harness reconciling its own transcript against
-    what was committed would report a run as whole while its own record was missing one.
+    than for those three: a Wait, a SealReject, an Info answer and the Done that ends the
+    generation are committed under the same attestation, and a harness reconciling its own
+    transcript against what was committed would report a run as whole while its own record was
+    missing one.
 
     ``visible_bytes_sha256`` is the digest the presentation was verified against. It is the whole
     of what a reconciliation needs and less than the bytes themselves: it does not say what the

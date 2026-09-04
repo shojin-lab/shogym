@@ -2,7 +2,7 @@
 
 Three properties are under test. A record is exactly what the protocol declares or it is
 refused, so every missing, extra, mistyped, out-of-range, and wrong-version field is rejected
-and the two result unions do not accept each other's members. A record has one serialization,
+and the three result unions do not accept each other's members. A record has one serialization,
 pinned here by byte fixtures rather than by round-tripping through the same code that produced
 them. And every identity is a function of its declared inputs alone, so the submission digest
 cannot move when a verdict does, and the message ID stream says nothing about its ordinal.
@@ -23,6 +23,8 @@ from shogym.serve.protocol_v2 import (
     HORIZON_FILED,
     PROTOCOL_ERROR_CODES,
     Done,
+    Info,
+    InfoRequest,
     Payload,
     PresentationAck,
     PresentationCommit,
@@ -36,8 +38,10 @@ from shogym.serve.protocol_v2 import (
     WireFormatError,
     canonical_bytes,
     canonical_json,
+    decode_info_result,
     decode_pull_result,
     decode_terminal_result,
+    info_request_identity,
     mcp_text_content,
     presentation_request_identity,
     pull_request_identity,
@@ -65,6 +69,7 @@ UNICODE_BODY = "π ≥ 3, 日本語, \U0001f600"
 
 VALID: Dict[Type[Any], Dict[str, Any]] = {
     PullRequest: {"request_id": ID_E, "last_presented_cursor": ID_D, "protocol_version": 2},
+    InfoRequest: {"request_id": ID_E, "last_presented_cursor": ID_D, "protocol_version": 2},
     Task: {
         "message_id": ID_A,
         "attempt_id": ID_B,
@@ -86,6 +91,14 @@ VALID: Dict[Type[Any], Dict[str, Any]] = {
         "kind": "wait",
     },
     Done: {"message_id": ID_A, "protocol_version": 2, "kind": "done"},
+    Info: {
+        "message_id": ID_A,
+        "remaining": 7,
+        "consumed": 3,
+        "in_flight": 1,
+        "protocol_version": 2,
+        "kind": "info",
+    },
     SealAck: {
         "message_id": ID_A,
         "attempt_id": ID_B,
@@ -292,6 +305,15 @@ def test_a_payload_that_is_not_an_object_is_rejected(cls: Type[Any]) -> None:
         (PresentationCommit, "completed_turn", 1),
         (PresentationAck, "cursor", "0" * 31),
         (PresentationAck, "stream_state_sha256", "z" * 64),
+        (InfoRequest, "request_id", "0" * 31),
+        (InfoRequest, "last_presented_cursor", "F" * 32),
+        (Info, "kind", "wait"),
+        (Info, "remaining", -1),
+        (Info, "consumed", True),
+        (Info, "in_flight", 1.0),
+        (Info, "remaining", 9007199254740992),
+        (Info, "consumed", "3"),
+        (Info, "in_flight", None),
     ],
 )
 def test_an_out_of_range_value_is_rejected(cls: Type[Any], name: str, value: Any) -> None:
@@ -301,6 +323,8 @@ def test_an_out_of_range_value_is_rejected(cls: Type[Any], name: str, value: Any
 
 def test_a_boundary_value_is_accepted() -> None:
     assert Wait.from_wire(wire(Wait, retry_after_ms=0)).retry_after_ms == 0
+    assert Info.from_wire(wire(Info, remaining=0, consumed=0, in_flight=0)).remaining == 0
+    assert Info.from_wire(wire(Info, consumed=9007199254740991)).consumed == 9007199254740991
     assert SealAck.from_wire(wire(SealAck, canonicalization_version="a")) is not None
     assert SealAck.from_wire(wire(SealAck, canonicalization_version="a" + "z" * 63)) is not None
     assert PresentationCommit.from_wire(wire(PresentationCommit, provider_turn_blob=None))
@@ -457,16 +481,32 @@ def test_a_terminal_result_decodes_to_its_own_class(cls: Type[Any]) -> None:
     assert type(decode_terminal_result(VALID[cls])) is cls
 
 
-@pytest.mark.parametrize("cls", [SealAck, SealReject, ProtocolError, PresentationAck])
+def test_an_info_result_decodes_to_its_own_class() -> None:
+    assert type(decode_info_result(VALID[Info])) is Info
+
+
+@pytest.mark.parametrize("cls", [SealAck, SealReject, ProtocolError, PresentationAck, Info])
 def test_a_pull_result_refuses_the_other_unions(cls: Type[Any]) -> None:
     with pytest.raises(WireFormatError):
         decode_pull_result(VALID[cls])
 
 
-@pytest.mark.parametrize("cls", [Task, Payload, Wait, Done, ProtocolError, PresentationAck])
+@pytest.mark.parametrize(
+    "cls", [Task, Payload, Wait, Done, ProtocolError, PresentationAck, Info]
+)
 def test_a_terminal_result_refuses_the_other_unions(cls: Type[Any]) -> None:
     with pytest.raises(WireFormatError):
         decode_terminal_result(VALID[cls])
+
+
+@pytest.mark.parametrize(
+    "cls", [Task, Payload, Wait, Done, SealAck, SealReject, ProtocolError, PresentationAck]
+)
+def test_an_info_result_refuses_the_other_unions(cls: Type[Any]) -> None:
+    """The info answer is the result of its own tool, so nothing a pull can offer decodes as one
+    and it does not decode as any of them."""
+    with pytest.raises(WireFormatError):
+        decode_info_result(VALID[cls])
 
 
 @pytest.mark.parametrize("payload", [{"kind": "ack"}, {"kind": 7}, {}, [], "task"])
@@ -483,7 +523,7 @@ def test_a_record_refuses_a_sibling_payload() -> None:
 # ----- serialization -----
 
 
-@pytest.mark.parametrize("cls", [Task, Payload, Wait, Done, SealAck, SealReject])
+@pytest.mark.parametrize("cls", [Task, Payload, Wait, Done, SealAck, SealReject, Info])
 def test_a_result_is_exactly_one_text_item(cls: Type[Any]) -> None:
     result = cls.from_wire(VALID[cls])
     items = mcp_text_content(result)
@@ -494,7 +534,15 @@ def test_a_result_is_exactly_one_text_item(cls: Type[Any]) -> None:
 
 
 @pytest.mark.parametrize(
-    "cls", [PullRequest, TerminalMetadata, ProtocolError, PresentationCommit, PresentationAck]
+    "cls",
+    [
+        PullRequest,
+        InfoRequest,
+        TerminalMetadata,
+        ProtocolError,
+        PresentationCommit,
+        PresentationAck,
+    ],
 )
 def test_what_is_never_presented_has_no_content_item(cls: Type[Any]) -> None:
     record = cls.from_wire(VALID[cls])
@@ -559,6 +607,12 @@ GOLDEN: Tuple[Tuple[Type[Any], Dict[str, Any], bytes], ...] = (
         b'{"kind":"done","message_id":"00000000000000000000000000000000","protocol_version":2}',
     ),
     (
+        Info,
+        {},
+        b'{"consumed":3,"in_flight":1,"kind":"info",'
+        b'"message_id":"00000000000000000000000000000000","protocol_version":2,"remaining":7}',
+    ),
+    (
         ProtocolError,
         {},
         b'{"code":"invalid_cursor","kind":"protocol_error","protocol_version":2}',
@@ -592,6 +646,7 @@ def test_the_field_order_a_payload_arrives_in_does_not_reach_the_bytes(
 # ----- identities -----
 
 PULL_REQUEST = PullRequest.from_wire(VALID[PullRequest])
+INFO_REQUEST = InfoRequest.from_wire(VALID[InfoRequest])
 TERMINAL_METADATA = TerminalMetadata.from_wire(VALID[TerminalMetadata])
 PRESENTATION_COMMIT = PresentationCommit.from_wire(VALID[PresentationCommit])
 NATIVE_ARGUMENTS = {"answer": "42", "confidence": 3, "notes": None}
@@ -602,6 +657,24 @@ def test_the_pull_request_identity_is_pinned() -> None:
     assert pull_request_identity(PULL_REQUEST) == (
         "38ebf67248e9ada37ac043a26445e7012251f505a419c25988f468145b6e99c1"
     )
+
+
+def test_the_info_request_identity_is_pinned() -> None:
+    assert info_request_identity(INFO_REQUEST) == (
+        "0462b28bc7644caeb81f2ce79ff1d6f3b278de52efc5cc92cab60e06efa2ac47"
+    )
+
+
+def test_an_info_request_and_a_pull_request_of_the_same_bytes_are_different_requests() -> None:
+    """The two records carry the same fields, so only the domain tag separates the identities.
+
+    That is what the tag is for: without it one envelope would hash to one value under both
+    tools, and a preimage built for one would be a preimage for the other. It is not what keeps
+    a caller from collecting the other tool's bytes, which is the generation scoping each
+    reservation to the tool that made it and comparing the bound identity before it answers.
+    """
+    assert canonical_bytes(INFO_REQUEST) == canonical_bytes(PULL_REQUEST)
+    assert info_request_identity(INFO_REQUEST) != pull_request_identity(PULL_REQUEST)
 
 
 def test_the_terminal_request_identity_is_pinned() -> None:

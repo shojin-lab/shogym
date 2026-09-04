@@ -22,6 +22,7 @@ first use, and they skip rather than fail when it is not there.
 from __future__ import annotations
 
 import asyncio
+import json
 from dataclasses import replace
 from hashlib import sha256
 from pathlib import Path
@@ -39,6 +40,7 @@ from temporalio.testing import WorkflowEnvironment  # noqa: E402
 from shogym.serve.protocol_v2 import (  # noqa: E402
     NEVER,
     FilesystemBlobStore,
+    InfoRequest,
     PresentationCommit,
     PullRequest,
     TerminalMetadata,
@@ -101,7 +103,7 @@ def oid(value: int) -> str:
     return f"{value:032x}"
 
 
-def make_start(*, version: int = 2) -> StreamStart:
+def make_start(*, version: int = 2, info: bool = False) -> StreamStart:
     """One task, every public identifier fixed before anything is served."""
     return registering_the_receipt(
         StreamStart(
@@ -126,6 +128,7 @@ def make_start(*, version: int = 2) -> StreamStart:
                     body="file the report",
                 )
             ],
+            info=info,
             protocol_version=version,
         )
     )
@@ -148,6 +151,9 @@ class Caller:
 
     async def pull(self, request: Optional[PullRequest] = None) -> OfferedMessage:
         return await self.stream.pull(request or self.pull_request())
+
+    def info_request(self) -> InfoRequest:
+        return InfoRequest(request_id=self.next_id(), last_presented_cursor=self.cursor)
 
     async def presentation_for(
         self, message: OfferedMessage, *, transcript_blob: str = BLOB
@@ -744,6 +750,69 @@ async def test_a_new_owner_continues_a_seal_it_kept_nothing_of(env: WorkflowEnvi
 
 
 @pytest.mark.network
+async def test_a_question_about_the_queue_never_displaces_a_prepared_seal(
+    env: WorkflowEnvironment,
+) -> None:
+    """A prepared filing is continued by the exact request that prepared it, and that request
+    names the cursor it was made at. Anything that moved the cursor in between would leave that
+    filing unreachable: the exact retry is refused for a stale cursor before it reaches the
+    continuation, and a filing rebuilt at the new cursor is a different identity, which is a
+    second filing for an attempt that already has one. The attempt would stay in `sealing` for
+    good, with nothing able to seal it, finalize it or let the generation reach Done.
+
+    So the question is refused while a filing is prepared. The generation owes an answer to that
+    filing, and this is the same refusal any other call gets while something is owed.
+    """
+    started = asyncio.Event()
+    release = asyncio.Event()
+
+    @activity.defn(name=SEAL_ATTEMPT)
+    async def paused_seal(request: SealAttemptInput) -> Any:
+        started.set()
+        await release.wait()
+        return await seal_attempt_activity(request)
+
+    activities = [
+        paused_seal,
+        grade_attempt_activity,
+        generate_payload_bundle_activity,
+        verify_blobs_activity,
+    ]
+    start = make_start(info=True)
+    async with worker(env, activities):
+        first = await open_stream(env, start)
+        await first.take()
+        filing = first.seal_request()
+        sealing = asyncio.create_task(first.stream.seal(filing))
+        await asyncio.wait_for(started.wait(), timeout=30)
+
+        second = await take_over(env, first, start)
+        release.set()
+        assert await refused(sealing) == "fenced_writer"
+        before = await second.stream.stream_state()
+        assert before.attempts[ATTEMPT] == "sealing"
+        assert before.prepared_seals == {ATTEMPT: filing.metadata.request_id}
+        # A prepared seal reserves no result, so this is not the pending message the other
+        # refusal reads. It is the same fact all the same: something is owed.
+        assert before.pending_message_id is None
+
+        assert await refused(second.stream.info(second.info_request())) == "outstanding_response"
+        after = await second.stream.stream_state()
+        assert (after.cursor, after.offer_count) == (before.cursor, before.offer_count)
+
+        # So the exact filing still reaches the seal it prepared, exactly once.
+        acknowledgement = await second.stream.seal(filing)
+        assert acknowledgement.message_id == ACK_ID
+        sealed = await second.stream.stream_state()
+        assert (sealed.attempts[ATTEMPT], sealed.prepared_seals) == ("sealed", {})
+
+        # And once nothing is owed, the question is answered again.
+        await second.present(acknowledgement)
+        answer = await second.stream.info(second.info_request())
+        assert json.loads(answer.visible_text)["consumed"] == 1
+
+
+@pytest.mark.network
 async def test_an_acknowledgement_offered_before_the_cut_is_replayed_not_reissued(
     env: WorkflowEnvironment,
 ) -> None:
@@ -1081,6 +1150,7 @@ def test_the_configuration_hash_covers_everything_a_resume_is_held_to() -> None:
         replace(start, wait_retry_after_ms=2000),
         replace(start, attempt_deadline_ms=600_000),
         replace(start, budget=52),
+        replace(start, info=True),
     ]
     hashes = {configuration_hash(one) for one in changed}
     assert len(hashes) == len(changed)
@@ -1093,3 +1163,4 @@ def test_the_configuration_hash_covers_everything_a_resume_is_held_to() -> None:
     # hashed before there was a budget to declare. The proof of that is a history this code did
     # not write, replayed in the policy suite against the digest its own build committed.
     assert start.budget is None
+    assert start.info is False
