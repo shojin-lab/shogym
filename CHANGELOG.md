@@ -9,6 +9,22 @@ direction.
 
 ## Unreleased
 
+### `serve`: a generation may hand the agent its step budget
+
+`stream_start` takes `budget`, and a generation that declares one serves `budget` on every task
+record it offers: the number of ordinary environment actions the attempt may take, which is the
+step cap this transport enforces. The declaration must be a number a task record could carry and it
+is refused unless it equals the environment's own horizon, where a generation is composed, where
+`open_gateway` opens a composed one over an episode, and where a `StreamGateway` is handed the
+composition it is serving, so a transport that took a generation over cannot enforce one number
+while its records carry another. Where a budget is declared, one sentence about it is appended to
+the `pull` tool's description.
+
+`budget` is the one key on the v2 wire a record may leave out. **A generation that declares no
+budget serves the task record it served before, byte for byte, and hashes to the same
+configuration**, so every recorded history replays and every open stream resumes. No quickstart
+declares one.
+
 ### `serve`: a run says what it committed to deliver
 
 A generation now keeps a record of every message it committed to deliver: the kind, the attempt

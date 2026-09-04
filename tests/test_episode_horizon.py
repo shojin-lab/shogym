@@ -18,6 +18,7 @@ that knows what an attempt is.
 from __future__ import annotations
 
 import json
+from hashlib import sha256
 from types import SimpleNamespace
 from dataclasses import dataclass
 from typing import Any, List
@@ -25,6 +26,7 @@ from typing import Any, List
 import pytest
 
 from shogym.serve import ServedEpisode
+from shogym.serve.protocol_v2.gateway import stream_start
 
 from tests._fixtures import score_env, score_mcp
 from tests._fixtures.score_env import ENV_NAME, HORIZON
@@ -112,9 +114,7 @@ class _ScriptedStream:
         self.held = call.call_id
         # The grant is the whole of what this stream ever learns about that world, so it is
         # counted here the way the durable one counts it.
-        self.environment_calls[call.attempt_id] = (
-            self.environment_calls.get(call.attempt_id, 0) + 1
-        )
+        self.environment_calls[call.attempt_id] = self.environment_calls.get(call.attempt_id, 0) + 1
         return SimpleNamespace(call_id=call.call_id, attempt_id=call.attempt_id, held=True)
 
     async def end_environment_call(self, call: Any) -> Any:
@@ -183,9 +183,7 @@ async def test_an_episode_whose_caller_ends_it_does_not_seal_on_a_spent_budget()
     says what happened; only the decision about the episode is gone.
     """
     env = score_env._FixtureScoreEnv()
-    episode = await ServedEpisode.open_env(
-        env, env_name=ENV_NAME, task=0, ends_on_horizon=False
-    )
+    episode = await ServedEpisode.open_env(env, env_name=ENV_NAME, task=0, ends_on_horizon=False)
     try:
         assert episode.ends_on_horizon is False
         for _ in range(HORIZON):
@@ -223,16 +221,18 @@ async def test_an_episode_served_by_the_stream_is_ended_when_its_budget_runs_out
     from shogym.serve.protocol_v2.kernel import OfferedMessage
 
     env = score_env._FixtureScoreEnv()
-    episode = await ServedEpisode.open_env(
-        env, env_name=ENV_NAME, task=0, ends_on_horizon=False
-    )
+    episode = await ServedEpisode.open_env(env, env_name=ENV_NAME, task=0, ends_on_horizon=False)
     try:
         spec = episode.describe()
         assert spec.horizon == HORIZON
         stream = _ScriptedStream(
-            OfferedMessage(
-                message_id=MESSAGE, kind="task", visible_text="{}", attempt_id=ATTEMPT
-            )
+            OfferedMessage(message_id=MESSAGE, kind="task", visible_text="{}", attempt_id=ATTEMPT)
+        )
+        start = stream_start(
+            spec,
+            terminal_manifest(spec),
+            claim_hash=sha256(b"a claim").hexdigest(),
+            evaluation_only=True,
         )
         gateway = StreamGateway(
             stream,  # type: ignore[arg-type]
@@ -240,6 +240,7 @@ async def test_an_episode_served_by_the_stream_is_ended_when_its_budget_runs_out
             spec,
             terminal_manifest(spec),
             initial_cursor=CURSOR,
+            generation=start,
         )
         await gateway.pull({})
         for _ in range(HORIZON):
@@ -250,9 +251,7 @@ async def test_an_episode_served_by_the_stream_is_ended_when_its_budget_runs_out
         # refused, and the attempt is not one this transport routes to afterwards either.
         assert stream.finalized == []
         assert len(episode._trajectory) == HORIZON
-        code = await _refused(
-            gateway.environment("noop", {"attempt_id": ATTEMPT, "arguments": {}})
-        )
+        code = await _refused(gateway.environment("noop", {"attempt_id": ATTEMPT, "arguments": {}}))
         assert code == "invalid_attempt"
         assert len(episode._trajectory) == HORIZON
 
@@ -264,9 +263,7 @@ async def test_an_episode_served_by_the_stream_is_ended_when_its_budget_runs_out
         assert episode.sealed is False
 
         # And one ending, whatever the model does next.
-        code = await _refused(
-            gateway.environment("noop", {"attempt_id": ATTEMPT, "arguments": {}})
-        )
+        code = await _refused(gateway.environment("noop", {"attempt_id": ATTEMPT, "arguments": {}}))
         assert code == "invalid_attempt"
         assert len(stream.finalized) == 1
         assert env.finalize_calls == 0
@@ -295,15 +292,17 @@ async def test_a_graded_horizon_files_the_environments_terminal_on_the_last_call
     from shogym.serve.protocol_v2.policy import KERNEL_STAND_IN_GRADE
 
     env = score_env._FixtureScoreEnv()
-    episode = await ServedEpisode.open_env(
-        env, env_name=ENV_NAME, task=0, ends_on_horizon=False
-    )
+    episode = await ServedEpisode.open_env(env, env_name=ENV_NAME, task=0, ends_on_horizon=False)
     try:
         spec = episode.describe()
         stream = _ScriptedStream(
-            OfferedMessage(
-                message_id=MESSAGE, kind="task", visible_text="{}", attempt_id=ATTEMPT
-            )
+            OfferedMessage(message_id=MESSAGE, kind="task", visible_text="{}", attempt_id=ATTEMPT)
+        )
+        start = stream_start(
+            spec,
+            terminal_manifest(spec),
+            claim_hash=sha256(b"a claim").hexdigest(),
+            evaluation_only=True,
         )
         gateway = StreamGateway(
             stream,  # type: ignore[arg-type]
@@ -311,6 +310,7 @@ async def test_a_graded_horizon_files_the_environments_terminal_on_the_last_call
             spec,
             terminal_manifest(spec),
             initial_cursor=CURSOR,
+            generation=start,
             environment=EnvironmentTerminal(
                 CANONICALIZATION_VERSION,
                 [],
@@ -322,9 +322,7 @@ async def test_a_graded_horizon_files_the_environments_terminal_on_the_last_call
         )
         await gateway.pull({})
         for _ in range(HORIZON - 1):
-            result = await gateway.environment(
-                "noop", {"attempt_id": ATTEMPT, "arguments": {}}
-            )
+            result = await gateway.environment("noop", {"attempt_id": ATTEMPT, "arguments": {}})
             assert stream.sealed == []
             assert len(result.content) == 1
 
@@ -343,9 +341,7 @@ async def test_a_graded_horizon_files_the_environments_terminal_on_the_last_call
 
         # And the attempt is over: nothing this transport routes to, and one filing however
         # many calls the model makes afterwards.
-        code = await _refused(
-            gateway.environment("noop", {"attempt_id": ATTEMPT, "arguments": {}})
-        )
+        code = await _refused(gateway.environment("noop", {"attempt_id": ATTEMPT, "arguments": {}}))
         assert code == "invalid_attempt"
         assert len(stream.sealed) == 1
     finally:

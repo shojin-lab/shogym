@@ -76,7 +76,11 @@ from shogym.serve.protocol_v2.gateway import (  # noqa: E402
     _RequestUncertain,
     _ResultOwed,
 )
-from shogym.serve.protocol_v2.kernel import OfferedMessage, StreamProtocolError  # noqa: E402
+from shogym.serve.protocol_v2.kernel import (  # noqa: E402
+    OfferedMessage,
+    StreamProtocolError,
+    StreamStart,
+)
 from shogym.serve.protocol_v2.policy import (  # noqa: E402
     HONEST_V1,
     GradeIdentity,
@@ -455,6 +459,24 @@ async def scoring_world(trace_path: Optional[Path] = None) -> ServedEpisode:
     )
 
 
+def composition(spec: TaskSpec, *, budget: Optional[int] = None) -> StreamStart:
+    """The generation a transport in these tests is serving.
+
+    Every gateway is handed the composition it serves, because what that composition declares is
+    what the stream's records carry and what this transport advertises and enforces. These tests
+    drive a scripted stream rather than a durable one, so the composition is built here over the
+    same spec the transport is given, which is what a caller that composed or resumed a real one
+    would be holding.
+    """
+    return stream_start(
+        spec,
+        terminal_manifest(spec),
+        claim_hash="c" * 64,
+        budget=budget,
+        evaluation_only=True,
+    )
+
+
 def make_gateway(episode: ServedEpisode, stream: ScriptedStream) -> StreamGateway:
     spec = episode.describe()
     return StreamGateway(
@@ -463,6 +485,7 @@ def make_gateway(episode: ServedEpisode, stream: ScriptedStream) -> StreamGatewa
         spec,
         terminal_manifest(spec),
         initial_cursor=CURSOR,
+        generation=composition(spec),
     )
 
 
@@ -481,6 +504,7 @@ def graded_gateway(
         spec,
         terminal_manifest(spec),
         initial_cursor=CURSOR,
+        generation=composition(spec),
         environment=environment_terminal(episode)._replace(horizon_ending="graded"),
     )
 
@@ -816,6 +840,193 @@ def test_a_graded_horizon_is_part_of_what_the_generation_is(episode: ServedEpiso
     )
 
 
+def test_a_generation_that_declares_no_budget_serves_what_it_always_served() -> None:
+    """The two values are pinned as literals rather than recomputed from this build.
+
+    A generation composed without a budget has to serve the bytes and hash to the digest a build
+    from before there was a budget to declare produced, or every run recorded by one of those is
+    refused its resume over a number nobody handed anyone. So the digest and the task's bytes are
+    written down here as the values that build produced, and the old history that carries the
+    kernel's half of the same promise is replayed by the policy suite.
+    """
+    spec = hashing_spec()
+    terminal = terminal_manifest(spec)
+    composed = stream_start(spec, terminal, claim_hash="a" * 64, evaluation_only=True)
+    assert composed.budget is None
+    assert served_manifest(spec, terminal)["control_tool"]["description"] == (
+        gateway_module._PULL_DESCRIPTION
+    )
+    assert configuration_of(spec) == (
+        "e05450155cce9a1f8d2bfd0e9ea0027605853c2cafaea3760d572f9c1c83ae45"
+    )
+    offered = Task(
+        message_id="0" * 32,
+        attempt_id="1" * 32,
+        body="Reconcile the ledger.",
+        budget=composed.budget,
+    )
+    assert visible_bytes(offered) == (
+        b'{"attempt_id":"11111111111111111111111111111111","body":"Reconcile the ledger.",'
+        b'"kind":"task","message_id":"00000000000000000000000000000000","protocol_version":2}'
+    )
+
+
+def test_a_declared_budget_is_said_in_the_words_the_generation_hashed() -> None:
+    """The sentence is appended where a budget is declared and the text is untouched where it is
+    not, so what moves the digest is the declaration and never the presence of the feature."""
+    spec = hashing_spec()
+    terminal = terminal_manifest(spec)
+    plain = served_manifest(spec, terminal)["control_tool"]["description"]
+    budgeted = served_manifest(spec, terminal, budget=spec.horizon)["control_tool"]["description"]
+    assert budgeted == plain + (
+        " A task also carries `budget`, the whole allowance of environment tool calls that task "
+        "gets rather than what is left of it, and neither pulling nor filing spends it."
+    )
+    # One sentence, which is what is promised for it. A second would be a second thing every
+    # opted-in generation hashes and every opted-in agent reads.
+    assert budgeted[len(plain) :].count(".") == 1
+    assert _configuration_hash(spec, terminal, None, "floor", spec.horizon) != configuration_of(
+        spec
+    )
+    assert _configuration_hash(spec, terminal, None, "floor", None) == configuration_of(spec)
+
+
+def test_a_declared_budget_is_the_budget_this_transport_enforces() -> None:
+    """The number an agent reads is the step cap this transport enforces, or the generation is
+    not composed at all: an advertised budget nothing enforces is worse than no budget."""
+    spec = hashing_spec()
+    terminal = terminal_manifest(spec)
+    composed = stream_start(
+        spec, terminal, claim_hash="a" * 64, budget=spec.horizon, evaluation_only=True
+    )
+    assert composed.budget == spec.horizon
+
+    with pytest.raises(ValueError, match="step cap this transport enforces"):
+        stream_start(
+            spec, terminal, claim_hash="a" * 64, budget=spec.horizon + 1, evaluation_only=True
+        )
+
+    capless = spec.model_copy(update={"horizon": None})
+    with pytest.raises(ValueError, match="no number to declare"):
+        stream_start(
+            capless,
+            terminal_manifest(capless),
+            claim_hash="a" * 64,
+            budget=10,
+            evaluation_only=True,
+        )
+
+
+@pytest.mark.parametrize("budget", [True, 52.0, 0, -1, 2**53, "10", [10]])
+def test_a_budget_no_task_record_could_carry_is_refused_where_it_is_declared(budget: Any) -> None:
+    """The declaration is held to the record's own rule, not to a rule this layer keeps beside
+    it. Otherwise a generation composes, hashes and starts, and fails at its first offer, which
+    is after a consumer is bound to it and the run has begun."""
+    spec = hashing_spec()
+    with pytest.raises(ValueError, match="budget must be an integer"):
+        stream_start(
+            spec,
+            terminal_manifest(spec),
+            claim_hash="a" * 64,
+            budget=budget,
+            evaluation_only=True,
+        )
+
+
+@pytest.mark.parametrize("horizon,budget", [(1, True), (52, 52.0), (0, 0), (-1, -1)])
+def test_a_budget_that_compares_equal_to_the_horizon_is_still_not_a_budget(
+    horizon: int, budget: Any
+) -> None:
+    """Equality is checked second and would pass every one of these on its own: ``True`` equals
+    one, ``52.0`` equals fifty-two, and an environment's published horizon carries no bound of
+    its own, so zero and a negative reach here as numbers a task record cannot carry."""
+    spec = hashing_spec().model_copy(update={"horizon": horizon})
+    assert budget == spec.horizon
+    with pytest.raises(ValueError, match="budget must be an integer"):
+        stream_start(
+            spec,
+            terminal_manifest(spec),
+            claim_hash="a" * 64,
+            budget=budget,
+            evaluation_only=True,
+        )
+
+
+async def test_a_gateway_is_bound_to_the_budget_of_the_generation_it_holds(
+    episode: ServedEpisode,
+) -> None:
+    """A transport that takes a generation over holds the composition it resumed, and that
+    composition is what the stream's task records carry.
+
+    So the two numbers meet here as well as at composition: the cap this transport counts against
+    is the declared one, and a replacement pointed at an episode the generation was not composed
+    over is refused before it owns anything, the way a resume against a changed configuration is.
+    """
+    spec = episode.describe()
+    terminal = terminal_manifest(spec)
+    composed = stream_start(
+        spec,
+        terminal,
+        claim_hash="a" * 64,
+        budget=spec.horizon,
+        grade=environment_grade(episode),
+    )
+    resumed = StreamGateway(
+        ScriptedStream(),  # type: ignore[arg-type]
+        episode,
+        spec,
+        terminal,
+        initial_cursor=CURSOR,
+        generation=composed,
+    )
+    # What the record hands the agent and what this transport spends against are one number.
+    assert resumed._step_cap == composed.budget
+    async with Client(build_gateway_server(resumed)) as client:
+        described = {tool.name: tool.description for tool in await client.list_tools()}
+    assert (
+        described[PULL_TOOL]
+        == served_manifest(spec, terminal, budget=composed.budget)["control_tool"]["description"]
+    )
+
+    elsewhere = spec.model_copy(update={"horizon": (spec.horizon or 0) + 1})
+    with pytest.raises(ValueError, match="step cap this transport enforces"):
+        StreamGateway(
+            ScriptedStream(),  # type: ignore[arg-type]
+            episode,
+            elsewhere,
+            terminal,
+            initial_cursor=CURSOR,
+            generation=composed,
+        )
+
+
+async def test_a_composed_budget_the_episode_does_not_enforce_is_refused(
+    episode: ServedEpisode, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A controller composes where the episode is not, and this call is where the two meet.
+
+    The composition carries a number every one of its tasks will hand over and the episode
+    carries the cap this transport counts against, so a generation composed over one budget and
+    opened over another is refused before it owns anything.
+    """
+    spec = episode.describe()
+    terminal = terminal_manifest(spec)
+    composed = stream_start(
+        spec, terminal, claim_hash="a" * 64, grade=environment_grade(episode)
+    )
+
+    async def capture(client: Any, start: Any, *, workflow_id: str) -> Any:
+        raise AssertionError("a generation with an unenforceable budget is never started")
+
+    monkeypatch.setattr(gateway_module, "start_stream", capture)
+    with pytest.raises(ValueError, match="step cap this transport enforces"):
+        await open_gateway(
+            None,  # type: ignore[arg-type]
+            episode,
+            start=replace(composed, budget=(spec.horizon or 0) + 1),
+        )
+
+
 def test_a_graded_horizon_this_gateway_could_not_file_for_is_refused(
     episode: ServedEpisode,
 ) -> None:
@@ -1071,6 +1282,45 @@ async def test_pull_takes_nothing_and_every_environment_tool_is_wrapped(
     assert schemas["guess"]["properties"]["arguments"]["required"] == ["word"]
 
 
+async def test_the_control_tool_is_advertised_in_the_words_the_generation_hashed(
+    episode: ServedEpisode,
+) -> None:
+    """The model reads the description off this server and a resume is held to the one inside the
+    manifest, so a generation has to serve one text in both places.
+
+    Which text that is comes from the composition the transport holds rather than from a guess at
+    what it might be, and a transport holding a composition that declares nothing serves the words
+    it always served.
+    """
+    spec = episode.describe()
+    terminal = terminal_manifest(spec)
+    composed = stream_start(
+        spec,
+        terminal,
+        claim_hash="a" * 64,
+        budget=spec.horizon,
+        grade=environment_grade(episode),
+    )
+    budgeted = StreamGateway(
+        ScriptedStream(),  # type: ignore[arg-type]
+        episode,
+        spec,
+        terminal,
+        initial_cursor=CURSOR,
+        generation=composed,
+    )
+    async with Client(build_gateway_server(budgeted)) as client:
+        described = {tool.name: tool.description for tool in await client.list_tools()}
+    assert (
+        described[PULL_TOOL]
+        == served_manifest(spec, terminal, budget=spec.horizon)["control_tool"]["description"]
+    )
+
+    async with Client(build_gateway_server(make_gateway(episode, ScriptedStream()))) as client:
+        undeclared = {tool.name: tool.description for tool in await client.list_tools()}
+    assert undeclared[PULL_TOOL] == served_manifest(spec, terminal)["control_tool"]["description"]
+
+
 async def test_a_native_tool_named_pull_is_refused_at_construction(
     episode: ServedEpisode,
 ) -> None:
@@ -1313,6 +1563,7 @@ async def test_one_call_is_in_flight_at_a_time(episode: ServedEpisode) -> None:
         spec,
         terminal_manifest(spec),
         initial_cursor=CURSOR,
+        generation=composition(spec),
     )
     await gateway.pull({})
     playing = asyncio.create_task(gateway.environment("guess", GUESS))
@@ -1479,6 +1730,7 @@ async def test_a_terminal_filing_its_own_schema_refuses_is_never_sealed(
         spec,
         terminal_manifest(spec),
         initial_cursor=CURSOR,
+        generation=composition(spec),
     )
     server = build_gateway_server(gateway)
     async with Client(server) as client:
@@ -1522,6 +1774,7 @@ async def test_a_typed_terminal_advertises_the_wrapper_and_not_its_own_arguments
         spec,
         terminal_manifest(spec),
         initial_cursor=CURSOR,
+        generation=composition(spec),
     )
     async with Client(build_gateway_server(gateway)) as client:
         schemas = {tool.name: tool.inputSchema for tool in await client.list_tools()}
@@ -1731,6 +1984,7 @@ async def test_a_changed_filing_never_displaces_the_one_that_may_have_sealed(
         spec,
         terminal_manifest(spec),
         initial_cursor=CURSOR,
+        generation=composition(spec),
     )
     await gateway.pull({})
 
@@ -1792,6 +2046,7 @@ async def test_a_changed_filing_never_collects_what_the_first_one_was_owed(
         spec,
         terminal_manifest(spec),
         initial_cursor=CURSOR,
+        generation=composition(spec),
     )
     await gateway.pull({})
 
@@ -1887,6 +2142,7 @@ async def test_a_cancelled_call_holds_the_gateway_until_the_environment_lands(
         spec,
         terminal_manifest(spec),
         initial_cursor=CURSOR,
+        generation=composition(spec),
     )
     tool = await build_gateway_server(gateway).get_tool("guess")
     await gateway.pull({})
@@ -1973,6 +2229,7 @@ async def test_a_cancelled_environment_call_is_answered_rather_than_run_again(
         spec,
         terminal_manifest(spec),
         initial_cursor=CURSOR,
+        generation=composition(spec),
     )
     tool = await build_gateway_server(gateway).get_tool("guess")
     await gateway.pull({})
@@ -2022,6 +2279,7 @@ async def test_a_client_that_stopped_waiting_is_not_something_this_boundary_can_
         spec,
         terminal_manifest(spec),
         initial_cursor=CURSOR,
+        generation=composition(spec),
     )
     server = build_gateway_server(gateway)
     await gateway.pull({})
@@ -2091,6 +2349,7 @@ def blocking_gateway(
         spec,
         terminal_manifest(spec),
         initial_cursor=CURSOR,
+        generation=composition(spec),
     )
 
 
@@ -2711,6 +2970,7 @@ async def test_a_call_the_episode_makes_back_into_this_gateway_is_refused(
         spec,
         terminal_manifest(spec),
         initial_cursor=CURSOR,
+        generation=composition(spec),
     )
     world.gateway = gateway
     await gateway.pull({})
@@ -2824,6 +3084,7 @@ async def test_the_count_reaches_its_sink_before_the_refusal_reaches_the_model(
         spec,
         terminal_manifest(spec),
         initial_cursor=CURSOR,
+        generation=composition(spec),
         on_refusal=sink,
     )
     await gateway.pull({})

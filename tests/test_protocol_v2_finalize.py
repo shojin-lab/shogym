@@ -506,13 +506,14 @@ async def test_the_step_budget_ends_the_attempt_and_the_next_pull_moves_on(env) 
     async with stream_worker(env.client):
         episode = await ServedEpisode.start(TEST_ENV, task=0, ends_on_horizon=False)
         try:
+            start = make_start(
+                bodies=("guess the first word", "and the second"),
+                terminal="terminate",
+                argument_names=(),
+            )
             stream = await start_stream(
                 env.client,
-                make_start(
-                    bodies=("guess the first word", "and the second"),
-                    terminal="terminate",
-                    argument_names=(),
-                ),
+                start,
                 workflow_id="stream/finalize/budget",
             )
             receipt = await stream.claim_consumer(CONSUMER)
@@ -524,6 +525,7 @@ async def test_the_step_budget_ends_the_attempt_and_the_next_pull_moves_on(env) 
                 spec,
                 terminal_manifest(spec),
                 initial_cursor=receipt.initial_cursor,
+                generation=start,
                 open_episode=open_world,
             )
             first = json.loads(await gateway.pull({}))
@@ -592,9 +594,10 @@ async def test_a_replacement_transport_ends_an_attempt_whose_budget_is_already_s
     async with stream_worker(env.client):
         episode = await ServedEpisode.start(TEST_ENV, task=0, ends_on_horizon=False)
         try:
+            start = make_start(terminal="terminate", argument_names=())
             stream = await start_stream(
                 env.client,
-                make_start(terminal="terminate", argument_names=()),
+                start,
                 workflow_id="stream/finalize/budget-replacement",
             )
             receipt = await stream.claim_consumer(CONSUMER)
@@ -605,6 +608,7 @@ async def test_a_replacement_transport_ends_an_attempt_whose_budget_is_already_s
                 spec,
                 terminal_manifest(spec),
                 initial_cursor=receipt.initial_cursor,
+                generation=start,
             )
             first = json.loads(await gateway.pull({}))
             attempt = first["attempt_id"]
@@ -622,6 +626,7 @@ async def test_a_replacement_transport_ends_an_attempt_whose_budget_is_already_s
                 spec,
                 terminal_manifest(spec),
                 initial_cursor=state.cursor,
+                generation=start,
             )
             assert (
                 await refused(replacement.environment("guess", _guess(attempt, "adieu")))
@@ -651,9 +656,10 @@ async def test_a_replacement_transport_gets_what_is_left_of_the_budget_and_no_mo
     async with stream_worker(env.client):
         episode = await ServedEpisode.start(TEST_ENV, task=0, ends_on_horizon=False)
         try:
+            start = make_start(terminal="terminate", argument_names=())
             stream = await start_stream(
                 env.client,
-                make_start(terminal="terminate", argument_names=()),
+                start,
                 workflow_id="stream/finalize/budget-remainder",
             )
             receipt = await stream.claim_consumer(CONSUMER)
@@ -661,7 +667,12 @@ async def test_a_replacement_transport_gets_what_is_left_of_the_budget_and_no_mo
 
             def transport(cursor: str) -> StreamGateway:
                 return StreamGateway(
-                    stream, episode, spec, terminal_manifest(spec), initial_cursor=cursor
+                    stream,
+                    episode,
+                    spec,
+                    terminal_manifest(spec),
+                    initial_cursor=cursor,
+                    generation=start,
                 )
 
             gateway = transport(receipt.initial_cursor)
@@ -724,6 +735,7 @@ async def test_an_owner_that_restores_the_world_restores_the_budget_with_it(env)
                 spec,
                 terminal_manifest(spec),
                 initial_cursor=receipt.initial_cursor,
+                generation=start,
             )
             first = json.loads(await gateway.pull({}))
             attempt = first["attempt_id"]
@@ -751,6 +763,7 @@ async def test_an_owner_that_restores_the_world_restores_the_budget_with_it(env)
                 spec,
                 terminal_manifest(spec),
                 initial_cursor=state.cursor,
+                generation=start,
                 open_episode=open_world,
             )
             for word in ("adieu", "bloke"):
@@ -1143,13 +1156,14 @@ async def test_a_seal_that_ended_its_attempt_leaves_the_transport_serving(env, h
 
         episode.close = counted_close  # type: ignore[method-assign]
         try:
+            start = make_start(
+                bodies=("guess the first word", "and the second"),
+                terminal="terminate",
+                argument_names=(),
+            )
             stream = await start_stream(
                 env.client,
-                make_start(
-                    bodies=("guess the first word", "and the second"),
-                    terminal="terminate",
-                    argument_names=(),
-                ),
+                start,
                 workflow_id=f"stream/finalize/seal-at-the-gateway/{how}",
             )
             receipt = await stream.claim_consumer(CONSUMER)
@@ -1160,6 +1174,7 @@ async def test_a_seal_that_ended_its_attempt_leaves_the_transport_serving(env, h
                 spec,
                 terminal_manifest(spec),
                 initial_cursor=receipt.initial_cursor,
+                generation=start,
                 open_episode=open_world,
             )
             async with Client(build_gateway_server(gateway)) as client:
@@ -1277,13 +1292,14 @@ async def test_a_graded_horizon_whose_seal_ended_the_attempt_leaves_the_transpor
         env.client, activities=with_grader(list(environment.activities), grader)
     ):
         try:
+            start = make_start(
+                bodies=("guess the first word", "and the second"),
+                terminal="terminate",
+                argument_names=(),
+            )
             stream = await start_stream(
                 env.client,
-                make_start(
-                    bodies=("guess the first word", "and the second"),
-                    terminal="terminate",
-                    argument_names=(),
-                ),
+                start,
                 workflow_id=f"stream/finalize/horizon-seal/{how}",
             )
             receipt = await stream.claim_consumer(CONSUMER)
@@ -1295,6 +1311,7 @@ async def test_a_graded_horizon_whose_seal_ended_the_attempt_leaves_the_transpor
                 spec,
                 terminal_manifest(spec),
                 initial_cursor=receipt.initial_cursor,
+                generation=start,
                 open_episode=open_world,
                 environment=environment,
             )
@@ -1816,13 +1833,14 @@ async def test_the_spent_budget_survives_a_lost_response_and_spends_no_second_st
 
         episode.call = counted  # type: ignore[method-assign]
         try:
+            start = make_start(
+                bodies=("guess the first word", "and the second"),
+                terminal="terminate",
+                argument_names=(),
+            )
             stream = await start_stream(
                 env.client,
-                make_start(
-                    bodies=("guess the first word", "and the second"),
-                    terminal="terminate",
-                    argument_names=(),
-                ),
+                start,
                 workflow_id=f"stream/finalize/lost-{lose}-{applied}",
             )
             receipt = await stream.claim_consumer(CONSUMER)
@@ -1834,6 +1852,7 @@ async def test_the_spent_budget_survives_a_lost_response_and_spends_no_second_st
                 spec,
                 terminal_manifest(spec),
                 initial_cursor=receipt.initial_cursor,
+                generation=start,
             )
             first = json.loads(await gateway.pull({}))
             attempt = first["attempt_id"]
@@ -1893,13 +1912,14 @@ async def test_a_world_that_will_not_close_leaves_the_next_task_unoffered(env) -
             await closing(finalize=finalize)
 
         try:
+            start = make_start(
+                bodies=("guess the first word", "and the second"),
+                terminal="terminate",
+                argument_names=(),
+            )
             stream = await start_stream(
                 env.client,
-                make_start(
-                    bodies=("guess the first word", "and the second"),
-                    terminal="terminate",
-                    argument_names=(),
-                ),
+                start,
                 workflow_id="stream/finalize/cleanup",
             )
             receipt = await stream.claim_consumer(CONSUMER)
@@ -1910,6 +1930,7 @@ async def test_a_world_that_will_not_close_leaves_the_next_task_unoffered(env) -
                 spec,
                 terminal_manifest(spec),
                 initial_cursor=receipt.initial_cursor,
+                generation=start,
                 open_episode=open_world,
             )
             first = json.loads(await gateway.pull({}))

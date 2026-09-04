@@ -14,7 +14,7 @@ from __future__ import annotations
 
 import json
 from pathlib import Path
-from typing import Any, AsyncIterator, Dict, List, Optional, Sequence, Tuple
+from typing import Any, AsyncIterator, Dict, List, Optional, Sequence, Set, Tuple
 
 import pytest
 
@@ -32,11 +32,18 @@ from shogym.serve.protocol_v2 import (  # noqa: E402
     NEVER,
     PAYLOAD_FIRST,
     RELEASE_AT_SEAL,
+    Done,
     EligibilityGate,
+    Payload,
     ReleasePlan,
+    SealAck,
+    SealReject,
+    Task,
+    Wait,
     WireFormatError,
     check_release,
 )
+from shogym.serve.protocol_v2 import records as records_module  # noqa: E402
 from shogym.serve.protocol_v2.gateway import (  # noqa: E402
     CANONICALIZATION_VERSION,
     PULL_TOOL,
@@ -46,6 +53,7 @@ from shogym.serve.protocol_v2.gateway import (  # noqa: E402
     build_gateway_server,
     environment_terminal,
     open_gateway,
+    served_manifest,
     stream_start,
     terminal_manifest,
 )
@@ -86,6 +94,46 @@ TEST_ENV = "wordle_v1"
 FIXTURE_ENV = score_env.ENV_NAME
 DOSE = 12
 CLAIM_HASH = "d" * 64
+
+# What each kind of record the model reads is made of, written down per kind rather than as one
+# union of every name any of them may carry. A union grows every time one record gains a field
+# and stops saying anything about the others, which is the opposite of what it is here to say.
+# `budget` is the one name a task may add to its entry, and no other kind may add anything.
+PUBLIC_KEYS: Dict[str, Set[str]] = {
+    "task": {"protocol_version", "kind", "message_id", "attempt_id", "body"},
+    "payload": {"protocol_version", "kind", "message_id", "attempt_id", "body"},
+    "wait": {"protocol_version", "kind", "message_id", "retry_after_ms"},
+    "done": {"protocol_version", "kind", "message_id"},
+    "seal_ack": {
+        "protocol_version",
+        "kind",
+        "message_id",
+        "attempt_id",
+        "submission_digest",
+        "canonicalization_version",
+    },
+    "seal_reject": {"protocol_version", "kind", "message_id", "attempt_id", "body", "code"},
+}
+OPTIONAL_KEYS: Dict[str, Set[str]] = {"task": {"budget"}}
+
+# One of every record the model can be shown, so the table above is checked against the records
+# themselves and not only against the kinds one flow happens to produce. A kind that fell out of
+# the table, or a record that grew a field, fails here rather than going unnoticed until some
+# later flow serves it.
+ONE_OF_EVERY_KIND: Tuple[Any, ...] = (
+    Task(message_id="0" * 32, attempt_id="1" * 32, body="work"),
+    Task(message_id="0" * 32, attempt_id="1" * 32, body="work", budget=52),
+    Payload(message_id="0" * 32, attempt_id="1" * 32, body="a receipt"),
+    Wait(message_id="0" * 32, retry_after_ms=1000),
+    Done(message_id="0" * 32),
+    SealAck(
+        message_id="0" * 32,
+        attempt_id="1" * 32,
+        submission_digest="a" * 64,
+        canonicalization_version="world.1",
+    ),
+    SealReject(message_id="0" * 32, attempt_id="1" * 32, body="arg is required"),
+)
 
 
 @pytest_asyncio.fixture
@@ -207,6 +255,7 @@ async def opened(
     release: Any,
     open_episode: Any = wordle_world,
     terminal: Optional[EnvironmentTerminal] = None,
+    budget: Optional[int] = None,
 ) -> StreamGateway:
     """Compose a generation, bind this transport to it, and close its manifest.
 
@@ -227,6 +276,7 @@ async def opened(
         profile=ORDINARY if not served_on.grade.stand_in else EXPERIMENT,
         dispositions=None if not served_on.grade.stand_in else blinded,
         experiment="" if not served_on.grade.stand_in else "what_a_schedule_does",
+        budget=budget,
     )
     gateway = await open_gateway(
         environment.client,
@@ -243,6 +293,27 @@ async def opened(
     await gateway.close_queue()
     assert (await gateway.stream_state()).queue_closed is True
     return gateway
+
+
+def test_the_public_key_set_is_pinned_for_every_record_the_model_can_read() -> None:
+    """The table above is a claim about the wire and not about one flow's output.
+
+    A served generation shows whichever kinds its schedule produces, so a kind that dropped out
+    of the table, or one that grew a field, would go unnoticed until some later flow served it.
+    Here every presentable record is built and compared to its entry, both task encodings among
+    them, and the table is required to name exactly the kinds the wire can present.
+    """
+    presentable = {
+        cls.__dataclass_fields__["kind"].default for cls in records_module._PRESENTABLE
+    }
+    assert set(PUBLIC_KEYS) == presentable
+    assert set(OPTIONAL_KEYS) <= presentable
+    assert {record.kind for record in ONE_OF_EVERY_KIND} == presentable
+    for record in ONE_OF_EVERY_KIND:
+        allowed = PUBLIC_KEYS[record.kind] | OPTIONAL_KEYS.get(record.kind, set())
+        assert PUBLIC_KEYS[record.kind] <= set(record.to_wire()) <= allowed
+    # And the optional half is exercised rather than merely allowed: one task carries it.
+    assert any(set(record.to_wire()) > PUBLIC_KEYS[record.kind] for record in ONE_OF_EVERY_KIND)
 
 
 async def served(gateway: StreamGateway, *, limit: int = 200) -> List[Dict[str, Any]]:
@@ -285,22 +356,50 @@ async def test_a_dose_of_twelve_tasks_and_their_payloads(serving_wordle, episode
     for position in range(DOSE):
         trio = seen[position * 3 : position * 3 + 3]
         assert len({record["attempt_id"] for record in trio}) == 1
-    # Nothing the model read named a schedule, a position, or a plan.
+    # Nothing the model read named a schedule, a position, or a plan. The set is pinned per kind
+    # rather than over the union of them, so a key one record may carry is not thereby admitted on
+    # every other one. The single key a task may add is `budget`, which this generation does not
+    # declare: it is what an attempt may spend, one number for the whole generation and the same
+    # on every task it serves, so nothing about where a task sits in a line can be read off it.
     for record in seen:
-        assert set(record) <= {
-            "protocol_version",
-            "kind",
-            "message_id",
-            "attempt_id",
-            "body",
-            "submission_digest",
-            "canonicalization_version",
-        }
+        assert set(record) == PUBLIC_KEYS[record["kind"]]
 
     state = await gateway.stream_state()
     assert state.payload_delivery_count == DOSE
     assert state.assignment_count == DOSE
     assert await refused(gateway.pull({})) == "closed_stream"
+
+
+@pytest.mark.network
+async def test_a_declared_budget_reaches_the_model_on_every_task(serving_wordle, episode) -> None:
+    """The number the agent reads is the step cap this transport enforces.
+
+    A generation that declares one hands it over with the work rather than making the agent
+    discover it by running out, and it hands the same number over every time, because it is the
+    environment's own step budget and not a fact about any one task.
+    """
+    serving, terminal = serving_wordle
+    horizon = episode.describe().horizon
+    assert horizon is not None
+    gateway = await opened(
+        serving,
+        episode,
+        workflow_id="stream/gateway-budget/1",
+        bodies=("Round 0.", "Round 1."),
+        release=IMMEDIATE,
+        terminal=terminal,
+        budget=horizon,
+    )
+    seen = await served(gateway)
+    tasks = [record for record in seen if record["kind"] == "task"]
+    assert len(tasks) == 2
+    for record in tasks:
+        assert set(record) == PUBLIC_KEYS["task"] | OPTIONAL_KEYS["task"]
+        assert record["budget"] == horizon
+    # And nothing else the model read grew a key because a task did.
+    for record in seen:
+        if record["kind"] != "task":
+            assert set(record) == PUBLIC_KEYS[record["kind"]]
 
 
 @pytest.mark.network
@@ -569,6 +668,9 @@ async def test_a_world_is_retired_when_its_attempt_ends_without_a_seal() -> None
         spec,
         terminal_manifest(spec),
         initial_cursor="0" * 32,
+        generation=stream_start(
+            spec, terminal_manifest(spec), claim_hash=CLAIM_HASH, evaluation_only=True
+        ),
         open_episode=open_world,
     )
     try:
@@ -787,6 +889,83 @@ async def opened_run(
     )
 
 
+@pytest.mark.network
+async def test_a_budgeted_generation_is_taken_over_with_the_number_it_declared(
+    serving_wordle: Tuple[WorkflowEnvironment, EnvironmentTerminal],
+    episode: ServedEpisode,
+    tmp_path: Path,
+) -> None:
+    """A replacement serves the budget the generation it resumed declared, or it is not built.
+
+    This is the whole of a takeover: the generation is composed with a number, started, served
+    once, and then resumed by a second owner holding the exact composition. That owner builds the
+    transport the model talks to, and what the transport advertises and what it counts calls
+    against both come from that composition rather than from whatever episode it happens to be
+    holding. A replacement pointed at an episode the generation was not composed over is refused
+    instead of serving records that say one number while it enforces another.
+    """
+    serving, terminal = serving_wordle
+    spec = episode.describe()
+    horizon = spec.horizon
+    assert horizon is not None
+    composed = stream_start(
+        spec,
+        terminal_manifest(spec),
+        claim_hash=CLAIM_HASH,
+        budget=horizon,
+        grade=terminal.grade,
+    )
+    root = tmp_path / "run"
+    gateway = await open_gateway(
+        serving.client,
+        episode,
+        workflow_id="stream/budget-resume/1",
+        start=composed,
+        run_directory=root,
+        environment=terminal,
+    )
+    await gateway.close_queue()
+    assert json.loads(await gateway.pull({}))["budget"] == horizon
+
+    # A second owner, holding the exact composition, which is what the identity is derived from.
+    resumed = await resume_run_directory(
+        serving.client, root, start=gateway.generation, claimant_id="the-next-owner"
+    )
+    state = await resumed.stream_state()
+    assert state.ownership_epoch == 2
+
+    replacement = StreamGateway(
+        resumed,
+        episode,
+        spec,
+        terminal_manifest(spec),
+        initial_cursor=state.cursor,
+        generation=gateway.generation,
+        environment=terminal,
+    )
+    assert replacement._step_cap == horizon
+    async with Client(build_gateway_server(replacement)) as client:
+        described = {tool.name: tool.description for tool in await client.list_tools()}
+    assert (
+        described[PULL_TOOL]
+        == served_manifest(spec, terminal_manifest(spec), budget=horizon)["control_tool"][
+            "description"
+        ]
+    )
+
+    elsewhere = spec.model_copy(update={"horizon": horizon + 1})
+    with pytest.raises(ValueError, match="step cap this transport enforces"):
+        StreamGateway(
+            resumed,
+            episode,
+            elsewhere,
+            terminal_manifest(elsewhere),
+            initial_cursor=state.cursor,
+            generation=gateway.generation,
+            environment=terminal,
+        )
+
+
 async def test_an_evaluation_only_generation_is_pinned_to_never(episode: ServedEpisode) -> None:
     """A generation that scores without delivering cannot be composed with an outbox."""
     spec = episode.describe()
@@ -891,6 +1070,9 @@ async def test_the_controller_calls_are_not_tools(episode: ServedEpisode) -> Non
         spec,
         terminal_manifest(spec),
         initial_cursor="0" * 32,
+        generation=stream_start(
+            spec, terminal_manifest(spec), claim_hash=CLAIM_HASH, evaluation_only=True
+        ),
     )
     async with Client(build_gateway_server(gateway)) as client:
         assert {tool.name for tool in await client.list_tools()} == {

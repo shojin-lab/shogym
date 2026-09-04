@@ -98,7 +98,9 @@ transcript:
 A `wait` record means nothing is ready yet, so pull again shortly. A `seal_reject` means the
 terminal's own arguments were malformed; the task is still open, so the agent can correct them and
 file again. There is no queue to inspect and no task index anywhere on the wire: a task record
-carries an attempt id and a body, and has no field an index or a target could be written into.
+carries an attempt id and a body, and has no field an index or a target could be written into. A
+run that declares a step budget serves `budget` on every task as well, one number for the whole
+run; this quickstart declares none.
 
 ## Swap the env
 
