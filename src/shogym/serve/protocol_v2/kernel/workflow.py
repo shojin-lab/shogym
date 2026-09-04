@@ -2293,7 +2293,7 @@ def _check_start(start: StreamStart) -> None:
         raise StreamProtocolError("unsupported_version")
     if start.schedule_version != SCHEDULE_VERSION:
         raise StreamProtocolError("unsupported_version")
-    if start.capacity < 1 or start.wait_retry_after_ms < 0:
+    if start.wait_retry_after_ms < 0:
         raise StreamProtocolError("invalid_message")
     # Zero is the one value that turns the deadline off. A negative one is a configuration that
     # meant to declare a deadline and does not, and it fails here rather than serving an attempt
@@ -2309,6 +2309,10 @@ def _check_start(start: StreamStart) -> None:
         # generation has started and a consumer is already bound to it.
         if start.budget is not None:
             require_step_budget("budget", start.budget)
+        # How many attempts may be live at once is a count and is held to the same rule. A
+        # comparison against one lets a boolean, a float and an oversized integer through, and
+        # each of them is a generation whose capacity is not the number it says it is.
+        require_step_budget("capacity", start.capacity)
         require_opaque_id("initial_cursor", start.initial_cursor)
         require_opaque_id("done_message_id", start.done_message_id)
         for item in start.tasks:

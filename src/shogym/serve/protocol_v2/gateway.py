@@ -213,6 +213,12 @@ class WorldRoute:
     attempt resolves to in a process that took the generation over. That is the answer the
     environment needs: there is no world here, so either the evidence was already captured under
     the seal id or this owner cannot capture it.
+
+    An attempt whose world has been let go of resolves to nothing for the same reason, so the
+    pairing is forgotten as the world closes. A world is closed once the attempt that worked in
+    it is over, and by then the seal has read whatever it was going to read, so what an entry
+    left behind would answer with is a torn down environment presented as somewhere to capture
+    evidence from.
     """
 
     def __init__(self) -> None:
@@ -221,6 +227,18 @@ class WorldRoute:
     def record(self, attempt_id: str, episode: ServedEpisode) -> None:
         """Say that this attempt is working in this episode's world."""
         self._worlds[attempt_id] = episode
+
+    def forget(self, attempt_id: str, episode: ServedEpisode) -> None:
+        """Say that this world of this attempt's is gone, if it is still the one recorded.
+
+        The episode is named rather than only the attempt, because an attempt may have been
+        handed to a newer owner in this process: a replacement records the world it restored for
+        the attempt it took over, and the transport it replaced still holds the world it was
+        working in and lets go of it afterwards. That later cleanup is about its own world, so it
+        clears the pairing only where the pairing is still that world's.
+        """
+        if self._worlds.get(attempt_id) is episode:
+            del self._worlds[attempt_id]
 
     def __call__(self, attempt_id: str) -> Optional[Tuple[Any, str]]:
         """The environment and session this attempt filed in, or ``None`` if not this process."""
@@ -268,10 +286,18 @@ WRAPPER_VERSION = "shogym.gateway.wrapper.1"
 
 _PULL_SCHEMA: Dict[str, Any] = {"type": "object", "properties": {}, "additionalProperties": False}
 
-_PULL_DESCRIPTION = (
+# What every generation says about the control tool, up to the sentence that says how many tasks
+# the agent may be working on. That sentence is the one part of the text a capacity decides, so
+# the two are written as one literal per capacity below rather than assembled from pieces: the
+# text a generation at one serves is the text it served before a capacity could be declared, and
+# it stays a single literal a reader can check byte for byte.
+_PULL_OPENING = (
     "Ask the stream for your next message. Takes no arguments. The result is one JSON record: "
-    "a task to work on, a payload, a wait, or done. Work only on the task you were given, and "
-    "pull again when you have finished with it."
+    "a task to work on, a payload, a wait, or done. "
+)
+
+_PULL_DESCRIPTION = _PULL_OPENING + (
+    "Work only on the task you were given, and pull again when you have finished with it."
 )
 
 # What the control tool says about a budget, where the generation declares one. It is appended
@@ -378,15 +404,49 @@ def declared_argument_names(schema: Dict[str, Any]) -> List[str]:
     return sorted(required) if required else sorted(properties)
 
 
-def _pull_description(budget: Optional[int] = None) -> str:
+def _capacity_sentence(capacity: int) -> str:
+    """Return what a generation serving more than one task at a time says about that.
+
+    Three facts, because three is what an agent needs to work several tasks without asking: how
+    many it may hold, what a pull gets while it holds that many, and how it ends one of them. The
+    last is the one a reader of the single-task sentence would get wrong: a terminal call names
+    the attempt it ends, and an agent holding several has to name the right one.
+
+    What the middle one says is what the stream does, which is narrower than a wait. A capacity
+    that is full stops tasks being offered and stops nothing else, so a pull can still answer with
+    a payload or with anything else the schedule has ready, and the wait is what is left when
+    there is none. Saying it as a flat wait would be telling the agent to stop pulling for
+    messages it is owed. The ending is written the same way: a terminal is how the agent ends a
+    task, and it is not the only way a task ends, since a deadline or a spent budget ends one
+    without the agent doing anything.
+    """
+    return (
+        f"You may hold up to {capacity} tasks at once, so you may pull again before you have "
+        "finished the one you are working on. While you hold that many, a pull cannot return "
+        "another task, and it answers a wait when nothing else is ready for you. To end a task "
+        "yourself, call its terminal with that task's attempt_id."
+    )
+
+
+def _pull_description(budget: Optional[int] = None, capacity: int = 1) -> str:
     """Return the words the control tool is served under.
 
     A generation that declares a budget says so here, in one sentence appended to the text every
     generation serves. Appending is the whole of the change: the description a generation that
     declares nothing serves is the one it served before there was a budget to declare, byte for
     byte, so its configuration hash has not moved and its resume is not refused.
+
+    A capacity is the other way round. What it changes is the sentence about how many tasks the
+    agent works at once, because a generation that serves several would otherwise be telling the
+    agent to finish before it pulls again: the text would forbid the one thing the capacity is
+    there to allow. So the sentence is replaced rather than appended to, and a generation at one
+    serves the whole text unchanged.
     """
-    return _PULL_DESCRIPTION if budget is None else _PULL_DESCRIPTION + _BUDGET_NOTE
+    if capacity <= 1:
+        described = _PULL_DESCRIPTION
+    else:
+        described = _PULL_OPENING + _capacity_sentence(capacity)
+    return described if budget is None else described + _BUDGET_NOTE
 
 
 def served_manifest(
@@ -394,6 +454,7 @@ def served_manifest(
     terminal: ToolManifest,
     horizon_ending: str = FLOOR_HORIZON,
     budget: Optional[int] = None,
+    capacity: int = 1,
 ) -> Dict[str, Any]:
     """Return everything this gateway serves, in the words it serves it in.
 
@@ -420,6 +481,11 @@ def served_manifest(
     ``budget`` is the number this generation hands the agent on every task, and what it changes
     here is the control tool's own description, on the same terms: the sentence is appended where
     a generation declares a number and the text is untouched where it declares none.
+
+    ``capacity`` is how many tasks this generation lets the agent hold at once, and it changes the
+    same description: how many tasks to work on is a rule of the generation the model reads out of
+    that text and nowhere else, and a generation serving several under the words for one would be
+    telling the agent not to do what it is being served. A capacity of one leaves the text alone.
     """
     declared = {} if horizon_ending == FLOOR_HORIZON else {"horizon_ending": horizon_ending}
     return {
@@ -433,7 +499,7 @@ def served_manifest(
         "canonicalization_version": CANONICALIZATION_VERSION,
         "control_tool": {
             "name": PULL_TOOL,
-            "description": _pull_description(budget),
+            "description": _pull_description(budget, capacity),
             "schema": _PULL_SCHEMA,
         },
         "terminal": {
@@ -458,6 +524,7 @@ def _configuration_hash(
     environment_digest: Optional[str] = None,
     horizon_ending: str = FLOOR_HORIZON,
     budget: Optional[int] = None,
+    capacity: int = 1,
 ) -> str:
     """Hash what the generation is serving, so a resume can refuse a changed configuration.
 
@@ -466,7 +533,7 @@ def _configuration_hash(
     any of that, and one that publishes a digest of them has it folded in here. One that
     publishes nothing hashes exactly what it hashed before.
     """
-    manifest = served_manifest(spec, terminal, horizon_ending, budget)
+    manifest = served_manifest(spec, terminal, horizon_ending, budget, capacity)
     if environment_digest is not None:
         manifest = {**manifest, "environment": environment_digest}
     return sha256(canonical_json(manifest)).hexdigest()
@@ -490,6 +557,7 @@ def stream_start(
     experiment: str = "",
     families: Sequence[MatchedFamily] = (),
     budget: Optional[int] = None,
+    capacity: int = 1,
 ) -> StreamStart:
     """Return a generation that serves ``spec``.
 
@@ -551,10 +619,23 @@ def stream_start(
     over. Where it is declared it has to be the budget this transport enforces, and a generation
     that says anything else is refused here.
 
+    ``capacity`` is how many tasks this generation may have active at once, and one is the
+    default. It is one number in two places: the stream stops offering tasks while that many are
+    live, and the control tool's own description says so, because how many tasks the agent may
+    hold is a rule of the generation and the model reads the rules of the generation there. It is
+    held to the same rule as the number a task record carries, an exact whole count of at least
+    one, and a generation that says anything else is refused here rather than at start.
+
     What comes back is a generation the stream would accept, because the same check the stream
     makes at start is made here, where the caller composing a run is the one who reads it.
     """
     _check_declared_budget(spec, budget)
+    # A capacity is a count of tasks and it is held to the rule the number on a task record is
+    # held to: an exact integer of at least one, inside the range a JSON reader can carry. The
+    # check is here, before anything is minted, because every value this refuses composes a
+    # generation that either cannot start or serves the words of a generation at one while
+    # calling itself something else.
+    require_step_budget("capacity", capacity)
     items = [
         TaskItem(
             task_position=position,
@@ -591,7 +672,7 @@ def stream_start(
     )
     return StreamStart(
         configuration_hash=_configuration_hash(
-            spec, terminal, environment_digest, budget=budget
+            spec, terminal, environment_digest, budget=budget, capacity=capacity
         ),
         consumer_claim_hash=claim_hash,
         initial_cursor=_opaque(),
@@ -605,6 +686,7 @@ def stream_start(
             argument_names=declared_argument_names(terminal.input_schema),
         ),
         tasks=items,
+        capacity=capacity,
         release=plan,
         assignments=roster,
         evaluation_only=evaluation_only,
@@ -1019,6 +1101,7 @@ class StreamGateway:
         *,
         initial_cursor: str,
         generation: StreamStart,
+        world_attempt: Optional[str] = None,
         open_episode: Optional[EpisodeOpener] = None,
         blobs: Optional[BlobStore] = None,
         environment: Optional[EnvironmentTerminal] = None,
@@ -1037,13 +1120,22 @@ class StreamGateway:
         # The composition this transport is serving, whether it started that generation or took
         # one over. What it declares is what the stream's own records carry.
         self._generation = generation
-        # The world the attempt in front of the model is working in, the attempt it belongs to,
-        # and how the attempt after it gets one of its own. A task is a fresh world: the seal
-        # captures what an attempt left behind, so a second attempt in a world its predecessor
-        # worked in would file that predecessor's work. The generation's own episode belongs to
-        # nobody until the first task is presented, and it belongs to that attempt afterwards.
-        self._episode: Optional[ServedEpisode] = episode
-        self._world_attempt: Optional[str] = None
+        # The world each live attempt is working in, and how an attempt gets one of its own. A
+        # task is a fresh world: the seal captures what an attempt left behind, so a second
+        # attempt in a world its predecessor worked in would file that predecessor's work. There
+        # is one of these per live attempt rather than one for the transport, because a
+        # generation may have several attempts live at once and a call names the attempt it is
+        # for: a single current world would run an older attempt's calls in the newest world.
+        #
+        # ``episode`` is one of two things and the caller says which. Named by an attempt, it is
+        # that attempt's world and nothing else's from here: a caller handing one over knows
+        # which attempt it opened it for, and an unnamed world is one no rule here could pair
+        # correctly, so the naming is asked for rather than guessed at. Unnamed, it is the seed
+        # of a generation this transport is starting: it belongs to nobody until the first task
+        # is presented, and it is that attempt's world from then on. The named one is paired
+        # below, once the route it is paired in exists.
+        self._worlds: Dict[str, ServedEpisode] = {}
+        self._unclaimed: Optional[ServedEpisode] = episode if world_attempt is None else None
         self._open_episode = open_episode
         # What the environment answered when this generation was composed: the version its
         # acknowledgements declare their digests under, and the digest of what it is configured
@@ -1055,6 +1147,14 @@ class StreamGateway:
         # by stopping the world an attempt worked in. It is recorded as each world opens, which
         # is the only moment both halves of the pair are in one place.
         self._route = WorldRoute() if environment is None else environment.route
+        # A world handed over is written into both at once. The attempt it belongs to is a fact
+        # the caller states, and every way of asking which world an attempt is in has to get the
+        # same answer from it: the ordinary call routes through the map and the environment's own
+        # terminal resolves the route, so a pairing written in one and not the other would work
+        # the restored world and seal whatever the process before this one left behind.
+        if world_attempt is not None:
+            self._worlds[world_attempt] = episode
+            self._route.record(world_attempt, episode)
         self._spec = spec
         self._terminal = terminal.name
         self._cursor = initial_cursor
@@ -1226,11 +1326,24 @@ class StreamGateway:
 
         Closing twice closes once. The second caller waits on the same shutdown, and a caller
         that goes away does not take it with them.
+
+        A stop that failed is the exception, and it is asked for again rather than answered with
+        what went wrong the first time. What made it fail is a world this transport is still
+        holding, and a replayed failure would mean nothing here ever released it: the record of
+        the failed stop is dropped, so the next call runs the stop again over what is left. A
+        caller that was cancelled leaves the stop where it is, because that stop is still running.
         """
         if self._shutdown is None:
             self._serving = _CLOSING
             self._shutdown = asyncio.ensure_future(self._stopped())
-        await asyncio.shield(self._shutdown)
+        try:
+            await asyncio.shield(self._shutdown)
+        except BaseException:
+            shutdown = self._shutdown
+            if shutdown is not None and shutdown.done() and not shutdown.cancelled():
+                if shutdown.exception() is not None:
+                    self._shutdown = None
+            raise
 
     async def _stopped(self) -> None:
         """Run the shutdown once, whoever asked for it and however many are waiting.
@@ -1246,9 +1359,9 @@ class StreamGateway:
             await asyncio.wait([landing])
         await self._given_back_on_stop()
         self._serving = _CLOSED
-        # A generation that sealed its last attempt has already let go of the world it was in,
-        # so stopping closes the world there is one of and not the one there was.
-        await self._close_world()
+        # A generation that sealed an attempt has already let go of the world it was in, so
+        # stopping closes the worlds there are and not the ones there were.
+        await self._close_worlds()
 
     async def _given_back_on_stop(self) -> None:
         """Give back a grant this transport is still holding, and keep what it landed with."""
@@ -1280,6 +1393,11 @@ class StreamGateway:
         The call never reaches the environment from here. Sealing has to record its prepared
         state before any finalizer runs, so the environment's half of the terminal belongs
         inside the stream's transaction and not in front of it.
+
+        A filing for an attempt whose world is not here is refused before it is built, which is
+        where the routing says it belongs. Sending it would end the attempt: the environment's
+        own terminal would find no world to read, its Activity would fail, and the stream would
+        record the attempt as finally failed on a filing this transport should never have made.
         """
         attempt_id, native = self._unwrap(arguments)
         owed = await self._resumed(key)
@@ -1318,6 +1436,18 @@ class StreamGateway:
         than at some earlier read: the stream decides this call and holds the generation until
         it settles, so an attempt that ended in between is not one it still reaches.
 
+        The world is the named attempt's own, looked up rather than assumed. A generation may
+        have several attempts live at once and the model works them in whatever order it likes,
+        so the current world is not this call's world: dispatching into it would run an older
+        attempt's action in a newer attempt's environment and file it under the wrong seal. An
+        attempt with no world here is refused the way an attempt that is over is, because that is
+        what it is: every world this transport holds is the world of an attempt it is serving.
+
+        A call for an attempt already being worked when this transport was built is the exception,
+        and it is where a replacement takes over the world it was handed. Such an attempt was
+        started by the transport before this one, so no task presentation here ever paired it
+        with a world, and this call is what says which attempt the handed world is for.
+
         The call that spends the last of the env's step budget is still an ordinary call: it is
         dispatched, it is committed, and its observation comes back, and the attempt is still
         the attempt. The budget is how many environment actions an attempt gets, and filing is
@@ -1348,9 +1478,7 @@ class StreamGateway:
             # the attempt is still open. It is finished before anything else, and this call gets
             # the acknowledgement, because there is no world work left for it to have done.
             return await self._horizon_sealed(_HorizonOwed(key, stranded, _EMPTY_RESULT))
-        episode = self._episode
-        if episode is None:  # pragma: no cover - an active attempt has a world by now
-            raise self._refuse("invalid_attempt")
+        episode = self._world_of(attempt_id)
         held = _LeaseHeld(
             owner=key, call=EnvironmentCall(call_id=_opaque(), attempt_id=attempt_id)
         )
@@ -1360,8 +1488,12 @@ class StreamGateway:
             observation = await episode.call(tool_name, native)
         except BaseException:
             # The world's own failure is what its caller is told about. The release still goes,
-            # and one that faults too leaves the grant where this call will find it again.
+            # and one that faults too leaves the grant where this call will find it again. The
+            # release is also what lets a deadline this call outlasted be made, and the world of
+            # an attempt that ended is let go of here as surely as on the way back with an
+            # observation: a call that failed is still the call the ending happened inside.
             await self._given_back_quietly(held)
+            await self._released_quietly()
             raise
         # Only the tool's own observation goes back. Feedback under this protocol is a
         # presented Payload, so a sidecar carrying it here would be a second channel that
@@ -1382,8 +1514,60 @@ class StreamGateway:
         # refuse a filing sent while it does.
         spent = self._horizon_request(attempt_id)
         if spent is None:
-            return result
+            return await self._settled(key, result)
         return await self._horizon_sealed(_HorizonOwed(key, spent, result))
+
+    async def _released_worlds(self) -> None:
+        """Let go of what the generation ended while this transport was holding its grant.
+
+        The generation holds an attempt's deadline back while a call is in that attempt's world:
+        an ending cannot cancel what a world is already doing, so it waits for the grant to come
+        back and is made as soon as it does. That is inside the call that was holding it. The
+        attempt is over before that call answers, and the world it was working in is still
+        running, so this is where it goes: the answer may be the last thing the agent ever asks
+        for, and a world left for a call that never comes is a world nothing releases until this
+        transport stops.
+
+        Only a generation that declares a deadline is asked about. It is the one ending that can
+        be made while this transport is inside a call: the step cap is this transport's own and
+        closes its world where it makes it, and a seal is a call the model has not made yet. A
+        generation that declares no deadline is served exactly as it was, with no read here.
+
+        The read is a query. What it decides is whether a world may be let go of, which is the
+        same question every other retirement asks, and the answer a generation gives about its own
+        attempts is not one a writer has to be asked for. It is one read, so the ending the
+        generation has not applied yet is not in it: that world is retired by the next call, the
+        way every ending this transport is not inside is.
+        """
+        if not self._generation.attempt_deadline_ms:
+            return
+        await self._retired(await self._sent(self._stream.stream_state()))
+
+    async def _released_quietly(self) -> None:
+        """Let go of those worlds where the caller is already being told about something else.
+
+        A call whose world failed is told about that failure and about nothing else, so a cleanup
+        that fails here does not become the answer: what it could not close stays mapped, and the
+        call that comes back retires it before it asks for anything.
+        """
+        try:
+            await self._released_worlds()
+        except Exception:
+            pass
+
+    async def _settled(self, key: bytes, result: ToolResult) -> ToolResult:
+        """Hand back what an ordinary call landed with, once what it ended has been let go of.
+
+        The observation is written down before the question is asked, so a cleanup that fails
+        leaves it for the call that comes back rather than losing it to a world that would not
+        stop. A generation with no deadline writes nothing down and asks nothing, which is the
+        call it made before there were worlds to let go of here.
+        """
+        if not self._generation.attempt_deadline_ms:
+            return result
+        self._recovery = _ResultOwed(owner=key, result=result)
+        await self._released_worlds()
+        return result
 
     def _overspent_request(self, attempt_id: str) -> Optional[FinalizeRequest]:
         """The ending this call owes, if there is no step left for it to spend.
@@ -1477,7 +1661,10 @@ class StreamGateway:
         except ToolError:
             owed = _ResultOwed(owner=record.owner, result=record.result)
             self._recovery = owed
-            return await self._owed(owed.result)
+            # The refusal says the attempt is over, so the world it was working in is over with
+            # it. The question this hands over through is the one that answers where the
+            # generation is, and the world goes on the strength of that answer.
+            return await self._handed_over(owed.result)
         return await self._deliver(offered, record.owner, alongside=record.result)
 
     async def _granted(self, held: _LeaseHeld) -> None:
@@ -1674,8 +1861,20 @@ class StreamGateway:
             # what it landed with; one that never reached the world starts over.
             await self._given_back(record)
             if record.result is None:
+                # A call that never reached the world starts over, and it starts over against a
+                # generation the release may just have moved: the ending an attempt's deadline
+                # owed is made as the grant goes back. So what that ending freed is let go of
+                # before this call is allowed to ask for a world again, out of the state this
+                # call arrived with and out of the one the release left behind.
+                await self._retired(state)
+                await self._released_worlds()
                 return None
-            return await self._owed(record.result, state)
+            # Giving the grant back is what lets the generation end an attempt whose deadline
+            # fell due while the world was being called, so what this hands over is handed over
+            # the way every other kept result is: the observation is written down first, so a
+            # cleanup that fails leaves it for the call that comes back rather than losing it.
+            self._recovery = _ResultOwed(owner=record.owner, result=record.result)
+            return await self._handed_over(record.result, state)
         if isinstance(record, _HorizonOwed):
             if self._filing_settled(record.request, state):
                 # The filing did not fail to be decided: it was decided, and what it committed
@@ -1685,13 +1884,13 @@ class StreamGateway:
                 # is left is the observation the call landed with, kept the way every other
                 # result this gateway holds is kept.
                 self._recovery = _ResultOwed(owner=record.owner, result=record.result)
-                return await self._owed(record.result, state)
+                return await self._handed_over(record.result, state)
             # A filing this gateway owes on the attempt's behalf, sent again as itself. The
             # stream reserves what a request offered for that request, so the retry reaches the
             # acknowledgement the first one may already have minted rather than filing twice.
             return await self._horizon_sealed(record)
         if isinstance(record, _ResultOwed):
-            return await self._owed(record.result, state, closed_at=record.closed_at)
+            return await self._handed_over(record.result, state, closed_at=record.closed_at)
         if isinstance(record, _PresentationRefused):
             if state.pending_message_id != record.message.message_id:
                 # The message this gateway was keeping is not the one the stream is holding, so
@@ -1742,25 +1941,67 @@ class StreamGateway:
         return state.attempts.get(request.metadata.attempt_id) == _FINAL_FAILED
 
     async def _retired(self, state: StreamState) -> None:
-        """Close the world of an attempt the generation ended, before any new work is asked for.
+        """Close the worlds of the attempts the generation ended, before new work is asked for.
 
         A sealed attempt's world is retired as its acknowledgement is presented. An attempt the
-        generation ended instead presents nothing, so that moment never comes, and the only
-        other place the world was let go of was while preparing a task the stream had already
-        offered. That is one step too late: the ended attempt's capacity is free the moment it
-        ends, so the next pull reserves the next task and the stream is left holding it while
-        the old world is still running, and a cleanup that fails leaves it holding a task no
-        cleanup will ever release.
+        generation ended instead presents nothing, so that moment never comes: the ending is a
+        fact about the generation, and the first this transport can hear of one is the state it
+        reads at the top of every call. A deadline is that ending, and so is the step cap.
 
-        So the world is retired here, before the pull that could reserve anything. A cleanup
-        that fails raises before a request is built, which leaves nothing offered and the same
-        world still to close, and the call that comes back asks for it again.
+        The world is retired here, before the pull that could reserve anything. The ended
+        attempt's capacity is free the moment it ends, so a pull made first would reserve the
+        next task while the old world was still running, and a cleanup that fails would leave the
+        stream holding a task no cleanup will ever release. A cleanup that fails here raises
+        before a request is built, which leaves nothing offered and the same world still to
+        close, and the call that comes back asks for it again.
+
+        Every world this transport holds is asked about rather than one, because more than one
+        attempt may be live and a deadline reaches whichever of them ran out of time. Each of
+        them is tried whatever the others do, for the reason a stop tries each of them: a world
+        whose close keeps failing would otherwise be the last one ever attempted, and every ended
+        world behind it would stay running for as long as this transport did.
         """
-        if self._world_attempt is None:
-            return
-        if state.attempts.get(self._world_attempt) != _FINAL_FAILED:
-            return
-        await self._close_world()
+        ended = [
+            attempt_id
+            for attempt_id in self._worlds
+            if state.attempts.get(attempt_id) == _FINAL_FAILED
+        ]
+        self._raise_failures(await self._closed_each(ended))
+
+    async def _handed_over(
+        self,
+        result: Any,
+        state: Optional[StreamState] = None,
+        closed_at: Optional[str] = None,
+    ) -> Any:
+        """Hand over a kept result, and retire what the generation ended while it was owed.
+
+        A kept result is handed over by the call that comes back for it, and that call is the
+        only entry this transport is certain to get: an agent given the observation it was owed
+        may be finished with the attempt it came from. So the ending that happened while the
+        result was outstanding is acted on here as well as where a call finds nothing owed. A
+        graded horizon whose filing finally failed is the case this exists for: the attempt is
+        over, the world it was working in is not, and only this call knows the observation exists
+        to be handed over at all.
+
+        The order is the one the ownership question fixes. The result goes through the check that
+        a replacement has not taken the generation over, and the worlds are let go of after it
+        answers: a transport that has been replaced hands nothing over, and it does not tear down
+        a world on the way to finding out. What that check answers with is what the retirement
+        reads, rather than the older state the calling path arrived with: an ending that lands
+        while the confirmation is in flight is in the one and not the other, and it is exactly the
+        ending this is here to act on.
+
+        A cleanup that fails raises instead of the result, and what is kept keeps it: every path
+        that reaches here has written the observation into the recovery record first, so the call
+        that comes back asks for the cleanup again and hands over the same observation when it
+        works.
+        """
+        confirmed = await self._confirmed(state, closed_at)
+        settled = confirmed if confirmed is not None else state
+        if settled is not None:
+            await self._retired(settled)
+        return result
 
     async def _owed(
         self,
@@ -1799,11 +2040,29 @@ class StreamGateway:
         nothing. The only thing read out of it here is whether the generation closed at the
         cursor a Done was owed to, and a result that is not a Done has nothing to ask of it.
         """
+        await self._confirmed(state, closed_at)
+        return result
+
+    async def _confirmed(
+        self, state: Optional[StreamState], closed_at: Optional[str]
+    ) -> Optional[StreamState]:
+        """Ask the stream whether this transport may still hand anything over, and where it is.
+
+        The question and its answer are one thing, so the answer is handed back rather than
+        thrown away: it is the freshest word this transport will get about the generation, and
+        what is decided after a hand-over, which world is over and may be let go of, has to be
+        decided from it. The read the calling path made before it is older by exactly the time
+        the confirmation took, which is the window an ending falls in.
+
+        A Done that closed the generation is answered by nobody, for the reason :meth:`_owed`
+        gives, and there is nothing to hand back.
+        """
         if closed_at is not None and state is not None and state.generation_state == _DONE:
             if state.cursor == closed_at:
-                return result
-        self._adopt(await self._sent(self._stream.confirm_state()))
-        return result
+                return None
+        confirmed = await self._sent(self._stream.confirm_state())
+        self._adopt(confirmed)
+        return confirmed
 
     def _adopt(self, state: StreamState) -> None:
         """Take the four facts this gateway routes by out of the stream that owns them.
@@ -1827,9 +2086,30 @@ class StreamGateway:
         self._spent = dict(state.environment_calls)
 
     def _routed(self, attempt_id: str) -> None:
-        """Refuse a call that does not name an attempt this transport is serving."""
+        """Refuse a call that does not name an attempt this transport is serving.
+
+        Two things make it one. The generation says the attempt is active, and this transport
+        holds the world that attempt is working in. The second is as much a part of it as the
+        first: a filing ends an attempt, and one sent for an attempt whose world is somewhere
+        else would end it here, on the strength of an environment that never read the world it
+        was ending. So the refusal is made here rather than left to the seal to fail on.
+        """
         if attempt_id not in self._active:
             raise self._refuse("invalid_attempt")
+        self._world_of(attempt_id)
+
+    def _world_of(self, attempt_id: str) -> ServedEpisode:
+        """The world this attempt is being worked in here, or the refusal that there is none.
+
+        Every world this transport holds is the world of an attempt it is serving: one it opened
+        for a task it presented, or one it was handed under that attempt's name. An attempt with
+        neither is one whose world is somewhere this process cannot reach, and the answer to it
+        is the answer an attempt that is over gets.
+        """
+        episode = self._worlds.get(attempt_id)
+        if episode is None:
+            raise self._refuse("invalid_attempt")
+        return episode
 
     async def _budget_spent(self, request: FinalizeRequest) -> None:
         """End the attempt that has no step left, through the stream that owns it.
@@ -1838,6 +2118,12 @@ class StreamGateway:
         it means the generation's own deadline reached the attempt first, or this exact request
         landed and its answer was lost, and neither is something the model may read as a tool
         failure.
+
+        The world goes with the attempt, here rather than at whatever call comes next. The
+        attempt is over the moment the ending lands, so what is left running is a world nothing
+        may still do anything to, and a generation whose agent stops calling would hold it for as
+        long as this transport stood. A cleanup that fails keeps the world where the next call
+        will find it, exactly as every other cleanup here does.
 
         The routing handle is dropped after the ending has settled, and not before. An ending is
         a durable operation whose answer can go missing, and the call that owes one is the call
@@ -1851,6 +2137,7 @@ class StreamGateway:
         except Exception as error:  # noqa: BLE001 - the code decides, and anything else is a fault
             if protocol_error_code(error) not in _ALREADY_OVER:
                 raise
+        await self._close_world(request.attempt_id)
         self._active = self._active - {request.attempt_id}
 
     # Requests, built before they are sent.
@@ -2099,8 +2386,9 @@ class StreamGateway:
         elif message.kind == "seal_ack" and message.attempt_id is not None:
             # The attempt is sealed, so nothing may still be done to it, and the world it was
             # working in is what was sealed. A SealReject leaves the attempt where it was and
-            # deliberately does not reach this branch.
-            await self._close_world()
+            # deliberately does not reach this branch. What closes is the sealed attempt's own
+            # world: another attempt may be live beside it and still working in its own.
+            await self._close_world(message.attempt_id)
 
     def _applied(self, message: OfferedMessage, cursor: str) -> None:
         """Move this transport the way presenting ``message`` moved the stream.
@@ -2129,10 +2417,12 @@ class StreamGateway:
         nothing has filed in yet: the seal captures what an attempt left behind, and a second
         attempt in the same world would be filing the first attempt's work a second time.
 
-        So the world of an attempt that is over is retired here rather than inherited. A seal
-        retires it as it is acknowledged, but a seal is not the only way an attempt ends: one
-        the generation itself finalized, on a step cap or a deadline, presents nothing at all,
-        and the only place that shows is the next task arriving under a different attempt.
+        Nothing is closed here. A task being presented says a new attempt has started and says
+        nothing about the attempts already live: a generation at a capacity above one may have
+        several, each still working in a world of its own, and closing the last one opened would
+        take the world out from under whichever of them is still using it. A world is closed
+        where its own attempt ends, which is the seal it is acknowledged by, the ending the
+        generation made for it, or this transport stopping.
 
         The opener is told the attempt its world is for, and this is the only moment anything
         outside this gateway can learn it. Ordinary calls are routed here, but sealing is the
@@ -2150,13 +2440,10 @@ class StreamGateway:
         or the task presented, because a world nothing can seal is better than a world sealed
         against the wrong rule, and what was opened is let go of rather than left running.
         """
-        if self._world_attempt == attempt_id:
+        if attempt_id in self._worlds:
             return
-        if self._world_attempt is None and self._episode is not None:
-            self._world_attempt = attempt_id
-            self._route.record(attempt_id, self._episode)
+        if self._claimed(attempt_id) is not None:
             return
-        await self._close_world()
         if self._open_episode is None:
             raise RuntimeError(
                 "this generation has a task after the one its episode was opened for, and no "
@@ -2179,27 +2466,102 @@ class StreamGateway:
                     f"{started_as.canonicalization_version!r} configured as "
                     f"{started_as.configuration_digest!r}"
                 )
-        self._episode = opened
-        self._world_attempt = attempt_id
+        self._worlds[attempt_id] = opened
         self._route.record(attempt_id, opened)
 
-    async def _close_world(self) -> None:
-        """Let go of the world an attempt is done with.
+    def _claimed(self, attempt_id: str) -> Optional[ServedEpisode]:
+        """Give the attempt whose task is being presented the seed this transport was built on.
+
+        The seed of a generation belongs to nobody: a generation that has served no task has no
+        attempt for a world to have been opened for. The first task presented here is what claims
+        it, and the pair is written into the route with it, exactly as an opened world's is: an
+        environment that seals by stopping the world an attempt worked in has to be able to find
+        that world, and the generation's own episode is the first attempt's world as surely as an
+        opened one is the next attempt's.
+
+        A presentation is the only thing that claims it. A world handed over for an attempt that
+        was already being worked arrives named by that attempt and is never here to be claimed, so
+        nothing this transport serves can take a world that is another attempt's, and no task
+        starting here can inherit one an attempt before it worked in.
+        """
+        claimed = self._unclaimed
+        if claimed is None:
+            return None
+        self._worlds[attempt_id] = claimed
+        self._route.record(attempt_id, claimed)
+        self._unclaimed = None
+        return claimed
+
+    async def _close_world(self, attempt_id: str) -> None:
+        """Let go of the world one attempt is done with.
 
         Sealing is what makes the submission, so nothing this transport can still do to that
         world would be part of it. An environment that seals by stopping its own world has
         already stopped it; closing here is what releases everything the serving process was
         holding for it, and it is the same call the process that opened the episode would make.
 
+        The world is named by its attempt, so what closes is that attempt's own and nothing
+        else's. A generation may have several live at once, and the one being let go of is over
+        while the others are still being worked.
+
         The reference is dropped after the close returns rather than before it. A cleanup that
         failed is one something can still reach, and closing an episode twice is the episode's
-        own business, so the call that comes back for this message asks for it again.
+        own business, so the call that comes back for this message asks for it again. What is
+        dropped is the routing as well as the reference: an attempt whose world is gone is an
+        attempt with no world here, and that is the answer a seal and an ordinary call both need.
         """
-        episode = self._episode
+        episode = self._worlds.get(attempt_id)
         if episode is not None:
             await _let_go(episode)
-        self._episode = None
-        self._world_attempt = None
+            self._route.forget(attempt_id, episode)
+        self._worlds.pop(attempt_id, None)
+
+    async def _closed_each(self, attempt_ids: Sequence[str]) -> List[Exception]:
+        """Let go of each of these worlds, whatever the others do, and report what failed.
+
+        A world is a process outside this one and any of them may refuse to stop. Stopping at the
+        first refusal would strand every world behind it: the one that failed is kept for the call
+        that comes back, and a world that never had a close attempted is a world nothing is coming
+        back for, because the caller that would have retried it never learns it is there.
+        """
+        failures: List[Exception] = []
+        for attempt_id in attempt_ids:
+            try:
+                await self._close_world(attempt_id)
+            except Exception as error:  # noqa: BLE001 - every world is tried and all of it raised
+                failures.append(error)
+        return failures
+
+    def _raise_failures(self, failures: Sequence[Exception]) -> None:
+        """Raise what a best-effort cleanup could not do, all of it.
+
+        One failure is raised as itself, so a caller waiting for the reason a world would not stop
+        reads that reason. Several are raised together: a cleanup that reported one and dropped
+        the rest would be the same silence in a smaller place.
+        """
+        if len(failures) == 1:
+            raise failures[0]
+        if failures:
+            raise ExceptionGroup(
+                "this transport could not let go of every world it was holding", list(failures)
+            )
+
+    async def _close_worlds(self) -> None:
+        """Let go of every world this transport still holds, in the order they were opened.
+
+        The seed this generation was opened on is one of them even where no task was ever
+        presented: it belongs to nobody until an attempt claims it, and a stop that walked away
+        from it would leave the world of a generation that never served a task running.
+        """
+        failures: List[Exception] = []
+        unclaimed = self._unclaimed
+        if unclaimed is not None:
+            try:
+                await _let_go(unclaimed)
+                self._unclaimed = None
+            except Exception as error:  # noqa: BLE001 - every world is tried and all of it raised
+                failures.append(error)
+        self._raise_failures(failures + await self._closed_each(list(self._worlds)))
 
     def _install_transcript(self, text: str) -> str:
         """Install everything presented so far, with ``text`` appended, and return its hash.
@@ -2298,7 +2660,9 @@ def build_gateway_server(gateway: StreamGateway, *, name: Optional[str] = None) 
         build_tool(
             ToolManifest(
                 name=PULL_TOOL,
-                description=_pull_description(gateway.generation.budget),
+                description=_pull_description(
+                    gateway.generation.budget, gateway.generation.capacity
+                ),
                 input_schema=_PULL_SCHEMA,
             ),
             dispatch,
@@ -2426,6 +2790,7 @@ async def open_gateway(
                 environment.configuration_digest,
                 environment.horizon_ending,
                 composed.budget,
+                composed.capacity,
             ),
         )
     if len(composed.tasks) > 1 and open_episode is None:

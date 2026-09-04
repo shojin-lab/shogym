@@ -763,6 +763,30 @@ async def test_a_generation_declaring_a_budget_no_task_could_carry_never_starts(
         assert protocol_error_code(caught.value.cause) == "invalid_message"
 
 
+@pytest.mark.network
+@pytest.mark.parametrize("capacity", [0, -1, 2**53])
+async def test_a_generation_whose_capacity_is_not_a_count_never_starts(env, capacity: Any) -> None:
+    """How many attempts may be live at once decides what every pull can be answered with, so a
+    value that is not a count fails the generation rather than serving one. Nothing between
+    whoever composed the start and here is obliged to have checked it, so the kernel checks it for
+    itself, and it checks the whole rule: a comparison against one admits an integer too large for
+    a reader to carry as well as the values below it.
+
+    A boolean and a float are refused where the generation is composed rather than here. They do
+    not survive the trip: a start crosses into the workflow as JSON and comes back with the type
+    its field declares, so what arrives here is already a whole number."""
+    async with stream_worker(env.client):
+        handle = await env.client.start_workflow(
+            StreamWorkflow.run,
+            make_start(capacity=capacity),
+            id=f"stream/test/capacity-{capacity!r}",
+            task_queue=STREAM_TASK_QUEUE,
+        )
+        with pytest.raises(WorkflowFailureError) as caught:
+            await handle.result()
+        assert protocol_error_code(caught.value.cause) == "invalid_message"
+
+
 async def test_a_quickstart_install_never_imports_temporal() -> None:
     """Importing shogym must not pull in Temporal. Serving is what reaches it."""
     probe = "import shogym, sys; assert 'temporalio' not in sys.modules, sorted(sys.modules)"

@@ -9,6 +9,52 @@ direction.
 
 ## Unreleased
 
+### `serve`: a generation may serve several tasks at once
+
+`stream_start` takes `capacity`, how many tasks the generation lets the agent hold at once, and it
+defaults to one. It is held to the rule a count is held to, an exact integer of at least one, where
+the generation is composed and again where the kernel starts it. The gateway now holds one world
+per live attempt and runs every environment call in the world of the attempt that call names, so an
+agent holding several tasks works each of them where it started. A call naming an attempt this
+transport holds no world for is refused with `invalid_attempt` before the stream is asked for a
+step, rather than run in whichever world was opened last, and a terminal filing for such an attempt
+is refused the same way rather than sent: filing one would end that attempt on an environment that
+read no world.
+
+A world is let go of when its attempt's seal is acknowledged, when the generation ends the attempt
+itself on a deadline or a step cap, or when the transport stops, and the pairing of attempt to
+world is dropped as the world closes. The call that finds an attempt out of budget closes that
+attempt's world before it answers. So does a call whose attempt's deadline fell due while it was
+inside that attempt's world, which is where a generation makes the ending it had to hold back, and
+so does the call that comes back for an observation a lost answer or a failed graded-horizon filing
+left owed: what the generation ended while a result was outstanding is read out of the same
+question that result is handed over through, and a call that failed in the world is held to the
+same rule as one that came back with an observation. Each of those calls makes one read after its
+release, so an ending the generation has not applied by the time of that read is retired by the
+next call or by the stop, which is what happens to every ending made while no call is in a world.
+Retiring ended worlds and stopping both try every world they were asked to close even when one of
+them refuses, keep the ones that failed, raise all of the failures together, and can be asked again
+to finish them.
+
+`StreamGateway` takes `world_attempt`. A transport replacing another mid attempt is handed the
+world that attempt is working in, and this is where it says which attempt that is: the pairing goes
+into the route an environment's own terminal resolves as well as into this transport's own map, so
+the world an ordinary call reaches and the world a seal captures are the same world. A handed world
+belongs to that attempt alone, no other attempt's call or filing can reach it, and no task starting
+here inherits it. A world stops being routed when the owner that recorded it lets it go, so a
+predecessor clearing up after the world it was holding does not unpair the one a replacement
+restored. Without the name the episode is the seed of a generation this transport is starting, and
+only the first task presented here may claim it.
+
+The `pull` tool's description says what a capacity above one allows: how many tasks may be held,
+that while that many are held a pull cannot return another task and answers a wait when nothing
+else is ready, and that the agent ends a task by calling its terminal with that task's
+`attempt_id`.
+
+**A generation composed without a capacity serves what it always served: the same description, the
+same configuration hash, one task at a time, and the same calls in the same order**, so every
+recorded history replays and every open stream resumes. No quickstart declares one.
+
 ### `serve`: a generation may hand the agent its step budget
 
 `stream_start` takes `budget`, and a generation that declares one serves `budget` on every task
