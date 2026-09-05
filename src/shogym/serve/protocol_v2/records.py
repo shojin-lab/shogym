@@ -117,6 +117,13 @@ def _step_budget(name: str, value: Any) -> None:
         raise WireFormatError(f"{name} must be an integer from 1 through {_SAFE_INTEGER_MAX}")
 
 
+def _count(name: str, value: Any) -> None:
+    """A tally of attempts. Zero is a count and a budget is not, which is why this is its own
+    rule: a queue with nothing left in it answers with zero rather than declining to answer."""
+    if type(value) is not int or not 0 <= value <= _SAFE_INTEGER_MAX:
+        raise WireFormatError(f"{name} must be an integer from 0 through {_SAFE_INTEGER_MAX}")
+
+
 def _canonicalization_version(name: str, value: Any) -> None:
     if not isinstance(value, str) or _CANONICALIZATION_VERSION.fullmatch(value) is None:
         raise WireFormatError(f"{name} must match [a-z0-9][a-z0-9._-]{{0,63}}")
@@ -143,6 +150,9 @@ _CHECKS: Dict[str, Callable[[str, Any], None]] = {
     "cursor": _opaque_id,
     "body": _scalar_string,
     "budget": _step_budget,
+    "remaining": _count,
+    "consumed": _count,
+    "in_flight": _count,
     "retry_after_ms": _retry_after_ms,
     "code": _protocol_error_code,
     "canonicalization_version": _canonicalization_version,
@@ -239,12 +249,31 @@ class PullRequest(_Record):
 
 
 @dataclass(frozen=True)
+class InfoRequest(_Record):
+    """The envelope the harness puts around the model's ``info()``.
+
+    It carries what a pull request carries and it is not one. The model's own call takes no
+    arguments here either, so the request ID and the cursor are the harness's; and the two are
+    separate records because a reservation is answered to the request that made it, and one tool
+    answering the other's retry would hand a caller bytes it never asked for.
+    """
+
+    request_id: str
+    last_presented_cursor: str
+    protocol_version: int = PROTOCOL_VERSION
+
+
+@dataclass(frozen=True)
 class Task(_Record):
     """A work order, and the whole of one.
 
     ``body`` is what the renderer produced and nothing else. There is no field a queue
     position, a target, a cell, a regime, a branch, or a lease could be written into, so the
-    redaction is structural rather than a rule someone has to keep applying.
+    redaction is structural rather than a rule someone has to keep applying. A generation that
+    declares the info tool answers how much of its queue is left, and it answers in a record of
+    its own: no count reaches this one, and that record names no attempt either, so neither of
+    them carries the position of the work in hand. What totals over an ordered queue let an agent
+    work out for itself is a different matter, and it is the declaration that decides it.
 
     ``budget`` is how many environment actions the attempt gets, and the record carries it only
     where the generation declared one. It is that generation's single number, identical on every
@@ -282,7 +311,9 @@ class Wait(_Record):
 
     ``retry_after_ms`` is advisory and carries no reason: a Wait for a closed timer and a Wait
     for full capacity are the same record, so nothing about the schedule leaks through the one
-    message an agent can provoke at will.
+    message an agent can provoke at will, unless the generation declares the info tool. What that
+    tool answers is three counts, asked for and answered on their own; a Wait is still the same
+    record whatever it was for.
     """
 
     message_id: str
@@ -298,6 +329,31 @@ class Done(_Record):
     message_id: str
     protocol_version: int = PROTOCOL_VERSION
     kind: str = "done"
+
+
+@dataclass(frozen=True)
+class Info(_Record):
+    """How much of the queue there is, where the generation declared the tool that asks.
+
+    ``consumed`` is how many attempts have been handed out so far, ``in_flight`` how many of
+    those have not ended yet, and ``remaining`` how many are still to be handed out. The first
+    contains the second, which is what the earlier harness these names come from meant by them,
+    so the three are not a partition and need not sum to the roster. The generation that mints
+    them defines all three, once, and the arithmetic with them is stated there rather than here.
+
+    No key here names an attempt, and no answer maps a count onto one, so this record says how
+    much work there is rather than which work is whose. It does not follow that nothing can be
+    inferred from it: totals over an ordered queue permit arithmetic, and so does reading them
+    against what the generation publishes about itself elsewhere. A generation that declares this
+    tool has decided to publish them.
+    """
+
+    message_id: str
+    remaining: int
+    consumed: int
+    in_flight: int
+    protocol_version: int = PROTOCOL_VERSION
+    kind: str = "info"
 
 
 @dataclass(frozen=True)
@@ -397,14 +453,16 @@ class PresentationAck(_Record):
 
 PullResult = Union[Task, Payload, Wait, Done]
 TerminalResult = Union[SealAck, SealReject]
+InfoResult = Info
+VisibleResult = Union[PullResult, TerminalResult, InfoResult]
 Record = Union[
     PullRequest,
+    InfoRequest,
     TerminalMetadata,
     PresentationCommit,
     PresentationAck,
     ProtocolError,
-    PullResult,
-    TerminalResult,
+    VisibleResult,
 ]
 
 _PULL_RESULTS: Dict[str, Type[_Record]] = {
@@ -417,7 +475,11 @@ _TERMINAL_RESULTS: Dict[str, Type[_Record]] = {
     "seal_ack": SealAck,
     "seal_reject": SealReject,
 }
-_PRESENTABLE = (Task, Payload, Wait, Done, SealAck, SealReject)
+# The info answer is its own union of one. It is the result of its own tool, so a pull that came
+# back with it would be a pull answered with something no pull can offer, and a table that let
+# one decode as the other would say otherwise.
+_INFO_RESULTS: Dict[str, Type[_Record]] = {"info": Info}
+_PRESENTABLE = (Task, Payload, Wait, Done, SealAck, SealReject, Info)
 
 
 def _decode_union(table: Dict[str, Type[_Record]], label: str, payload: Any) -> Any:
@@ -441,6 +503,11 @@ def decode_terminal_result(payload: Any) -> TerminalResult:
     return cast(TerminalResult, _decode_union(_TERMINAL_RESULTS, "a terminal result", payload))
 
 
+def decode_info_result(payload: Any) -> InfoResult:
+    """Return the info result ``payload`` denotes, on the same terms."""
+    return cast(InfoResult, _decode_union(_INFO_RESULTS, "an info result", payload))
+
+
 def canonical_bytes(record: Record) -> bytes:
     """Return the canonical JSON bytes of any record in this module."""
     if not isinstance(record, _Record):
@@ -448,8 +515,11 @@ def canonical_bytes(record: Record) -> bytes:
     return jcs.encode(record.to_wire())
 
 
-def visible_bytes(result: Union[PullResult, TerminalResult]) -> bytes:
-    """Return the complete bytes a pull or terminal result commits to the model transcript.
+def visible_bytes(result: VisibleResult) -> bytes:
+    """Return the complete bytes a result commits to the model transcript.
+
+    Every kind a tool of this protocol answers with is one: a pull result, a terminal result, and
+    the info answer.
 
     These are the bytes the presentation hash covers, so this is the function every later
     layer hashes rather than re-deriving the serialization for itself.
@@ -459,7 +529,7 @@ def visible_bytes(result: Union[PullResult, TerminalResult]) -> bytes:
     return canonical_bytes(result)
 
 
-def mcp_text_content(result: Union[PullResult, TerminalResult]) -> Tuple[Dict[str, str], ...]:
+def mcp_text_content(result: VisibleResult) -> Tuple[Dict[str, str], ...]:
     """Return the content items that carry ``result`` to the model: exactly one text item,
     whose text is :func:`visible_bytes`, and no structured content beside it."""
     return ({"type": "text", "text": visible_bytes(result).decode("utf-8")},)
@@ -479,3 +549,15 @@ def require_step_budget(name: str, value: Any) -> None:
     as far as the first offer.
     """
     _step_budget(name, value)
+
+
+def require_declaration(name: str, value: Any) -> None:
+    """Raise unless ``value`` says yes or no, for a thing a generation declares or does not.
+
+    No record carries one of these. What they decide is which tools are served and which keys are
+    hashed, and each of those reads the answer as one of exactly two, so a value that is neither
+    would be turned into one of them separately by every layer that read it, under a rule nobody
+    wrote down. The generation would then serve one surface and be identified as another. It is
+    refused where it is declared instead.
+    """
+    _boolean(name, value)

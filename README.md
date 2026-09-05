@@ -113,8 +113,8 @@ the score, and this process is only its transport.
 shogym serve wordle_v1 --task 17 --run-dir runs/wordle-0001 --trace ./shogym_logs/run.jsonl
 ```
 
-Two kinds of tool reach the model. `pull` takes no arguments and answers with exactly one JSON
-record, which is the whole of what the agent is told:
+Two kinds of tool reach the model, and a run may declare one more. `pull` takes no arguments and
+answers with exactly one JSON record, which is the whole of what the agent is told:
 
 ```jsonc
 {"protocol_version": 2, "kind": "task",    "message_id": "...", "attempt_id": "9f3c...", "body": "..."}
@@ -143,6 +143,22 @@ a target could be written into. A run may also declare a step budget, and then e
 serves carries `budget` as well: one number for the whole run, the number of environment tool
 calls the attempt gets. A run that declares none serves the task record exactly as it is shown
 above.
+
+A run may also declare an `info` tool beside `pull`. It takes no arguments too, and it answers
+with one more record:
+
+```jsonc
+{"protocol_version": 2, "kind": "info", "message_id": "...", "remaining": 179, "consumed": 21, "in_flight": 1}
+```
+
+`consumed` is how many tasks have been handed out so far, `in_flight` how many of those have not
+ended yet, and `remaining` how many are still to be handed out. `in_flight` counts tasks
+`consumed` counts too, and a run can end a task it never handed out, so the three need not add up
+to the whole run. They are totals and name no task. `remaining` reaching zero does not mean the
+run is over, so an agent stops when `pull` answers with done. The tool is answered between
+delivered results, while the run is open and nothing is owed. Every answer is a record the run
+keeps, beside the tasks and payloads it served. A run that declares no `info` tool has no such
+tool at all.
 
 `--run-dir` is where the generation keeps the blobs its presentations reference, the manifest a
 later owner would resume it from, and the embedded service's own database. All three belong to the

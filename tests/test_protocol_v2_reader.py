@@ -59,7 +59,7 @@ from temporalio.exceptions import ApplicationError
 from temporalio.testing import WorkflowEnvironment
 from temporalio.worker import Worker
 
-from shogym.serve.protocol_v2 import PullRequest, TerminalMetadata, blob_ref
+from shogym.serve.protocol_v2 import InfoRequest, PullRequest, TerminalMetadata, blob_ref
 from shogym.serve.protocol_v2.kernel import (
     ABANDONED,
     DEADLINE,
@@ -155,6 +155,7 @@ def make_start(
     release: ReleasePlan = IMMEDIATE,
     without_payload: Sequence[str] = (),
     attempt_deadline_ms: int = 0,
+    info: bool = False,
 ) -> StreamStart:
     """A generation whose every public identifier is fixed before it serves anything.
 
@@ -193,6 +194,7 @@ def make_start(
             release=release,
             assignments=assignments_for(tasks, release, without_payload=without_payload),
             attempt_deadline_ms=attempt_deadline_ms,
+            info=info,
         )
     )
 
@@ -222,6 +224,14 @@ class Driver:
 
     async def take(self) -> OfferedMessage:
         message = await self.offer()
+        await self.present(message)
+        return message
+
+    async def ask(self) -> OfferedMessage:
+        """Ask how much of the queue there is, and present the answer as a harness does."""
+        message = await self.stream.info(
+            InfoRequest(request_id=self.next_id(), last_presented_cursor=self.cursor)
+        )
         await self.present(message)
         return message
 
@@ -785,9 +795,11 @@ async def test_a_run_says_what_it_committed_to_deliver_and_commits_to_the_bytes(
     whole comparison: a result carrying a message's identifier under other bytes is not that
     message arriving, and nothing but the bytes can tell the two apart.
 
-    Every kind is here, not the three an attempt's row has columns for. A Wait, a SealReject and
-    the Done that ends the generation are committed the same way, and a reconciliation blind to
-    them would pass a run whose own record had lost one.
+    Every kind is here, not the three an attempt's row has columns for. A Wait, a SealReject, an
+    Info answer and the Done that ends the generation are committed the same way, and a
+    reconciliation blind to them would pass a run whose own record had lost one. This generation
+    declares no info tool, so the kinds it can show are the six below; the answer's own row is
+    read back by the test after this one.
 
     The read makes one Query, which is the other thing this checks. A reader that asked for the
     rows and then for the commitments would answer with two moments of a generation that can move
@@ -843,6 +855,52 @@ async def test_a_run_says_what_it_committed_to_deliver_and_commits_to_the_bytes(
     ]
     # The rows and the commitments are the one read and answer for the one attempt.
     assert [record.attempt_id for record in run.records] == [task.attempt_id]
+
+
+@pytest.mark.network
+async def test_what_the_agent_was_told_about_the_queue_is_among_the_commitments(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The counts an agent asked for are read back out of the run, in order, by their digest.
+
+    That is the whole point of minting them as a record and presenting it: a harness reconciling
+    its own transcript against what this generation committed finds the answer it showed the
+    model here, rather than finding a number the run has no record of.
+    """
+    monkeypatch.delenv(TEMPORAL_ADDRESS_ENV, raising=False)
+    start = make_start(("first", "second"), info=True)
+    root = a_run_directory(tmp_path, start)
+    async with durable_client(run_directory=root) as client:
+        async with stream_worker(client):
+            driver = await open_stream(client, start)
+            before = await driver.ask()
+            task = await driver.take()
+            assert task.attempt_id is not None
+            after = await driver.ask()
+
+    run = await read_records(root)
+    assert [(row.order, row.kind, row.attempt_id) for row in run.presentations] == [
+        (0, "info", None),
+        (1, "task", task.attempt_id),
+        (2, "info", None),
+    ]
+    assert [row.visible_bytes_sha256 for row in run.presentations] == [
+        sha256(message.visible_text.encode("utf-8")).hexdigest()
+        for message in (before, task, after)
+    ]
+    assert json.loads(before.visible_text)["remaining"] == 2
+    assert json.loads(after.visible_text) == {
+        "protocol_version": 2,
+        "kind": "info",
+        "message_id": after.message_id,
+        "remaining": 1,
+        "consumed": 1,
+        "in_flight": 1,
+    }
+    # An answer belongs to the generation rather than to an attempt, so no row claims it: the
+    # rows are the roster's two attempts, whatever was asked about them.
+    assert [record.attempt_id for record in run.records] == [oid(0x100), oid(0x104)]
+    assert task.attempt_id == oid(0x100)
 
 
 @pytest.mark.network

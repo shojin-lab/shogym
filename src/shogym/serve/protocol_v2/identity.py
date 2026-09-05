@@ -3,8 +3,9 @@
 Each identity is a SHA-256 over length-prefixed fields, so no field can borrow bytes from its
 neighbour and two different tuples of inputs cannot collide by rearranging the same characters.
 Each starts with its own domain tag, so a preimage built for one purpose is not a preimage for
-another. The message ID stream is keyed instead of hashed openly, because an agent that could
-recompute the next ID would learn how many messages are still coming.
+another. The message ID stream is keyed instead of hashed openly, because the ordinal an ID is
+drawn at is how many messages this generation has minted for itself so far, and an agent that
+could recompute the stream would read that count off any ID it was handed.
 """
 
 from __future__ import annotations
@@ -17,6 +18,7 @@ from shogym.serve.protocol_v2 import jcs
 from shogym.serve.protocol_v2.errors import WireFormatError
 from shogym.serve.protocol_v2.records import (
     AGENT_FILED,
+    InfoRequest,
     PresentationCommit,
     PullRequest,
     TerminalMetadata,
@@ -52,6 +54,21 @@ def pull_request_identity(request: PullRequest) -> str:
     """
     return sha256(
         length_prefixed(b"pull-request-v2") + length_prefixed(canonical_bytes(request))
+    ).hexdigest()
+
+
+def info_request_identity(request: InfoRequest) -> str:
+    """Return the canonical identity of an info request.
+
+    It is the pull request's rule under its own domain tag. The two records carry the same
+    fields, so without the tag the same envelope would hash to one value under both tools and a
+    preimage built for one would be a preimage for the other. What keeps the two tools' answers
+    apart is not this: the generation scopes a reservation to the tool that made it, and each
+    handler compares the bound identity before it hands anything back. The tag is what makes
+    these two identities different values rather than the same one used twice.
+    """
+    return sha256(
+        length_prefixed(b"info-request-v2") + length_prefixed(canonical_bytes(request))
     ).hexdigest()
 
 

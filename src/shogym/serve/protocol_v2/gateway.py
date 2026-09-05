@@ -7,7 +7,10 @@ model transcript, so this is where an offered result is delivered and attested. 
 answers Updates rather than tool calls, so this is where a tool call is turned into a request
 that is either well formed or refused before it is sent.
 
-Two kinds of tool reach the model. ``pull`` takes no arguments and returns one protocol record.
+Two kinds of tool reach the model. ``pull`` takes no arguments and returns one protocol record,
+and a generation that declares it serves ``info`` beside it, which takes no arguments either and
+returns how many of that generation's attempts have been handed out, how many of those have not
+ended, and how many are still to be handed out.
 Every environment tool is wrapped in the closed ``{attempt_id, arguments}`` object, which makes
 the attempt the routing handle and keeps a native argument name from colliding with a protocol
 field. The environment's terminal tool is wrapped like the others and then intercepted: it never
@@ -84,6 +87,7 @@ from shogym.serve.protocol_v2 import (
     Assignment,
     BlobStore,
     FilesystemBlobStore,
+    InfoRequest,
     ProtocolError,
     PullRequest,
     ReleasePlan,
@@ -94,6 +98,7 @@ from shogym.serve.protocol_v2 import (
     canonical_json,
     check_release,
     length_prefixed,
+    require_declaration,
     require_opaque_id,
     require_step_budget,
 )
@@ -156,6 +161,7 @@ from shogym.serve.server import build_tool
 from shogym.task import TaskSpec, ToolManifest
 
 PULL_TOOL = "pull"
+INFO_TOOL = "info"
 
 _LOG = logging.getLogger(__name__)
 
@@ -309,6 +315,23 @@ _BUDGET_NOTE = (
     "gets rather than what is left of it, and neither pulling nor filing spends it."
 )
 
+_INFO_SCHEMA: Dict[str, Any] = {"type": "object", "properties": {}, "additionalProperties": False}
+
+# What a generation that declares the info tool says about it. It is a literal of its own rather
+# than a sentence spliced into the control tool's, because this is a second tool with a second
+# description, and a generation that declares no such tool serves neither.
+_INFO_DESCRIPTION = (
+    "Ask how much work there is. Takes no arguments, and is answered between delivered results, "
+    "while the run is open and nothing is owed: asking while an earlier call is still owed a "
+    "result, or after the run is done, is refused. The result is one JSON record with three "
+    "counts: `consumed`, how many tasks have been handed out so far; `in_flight`, how many of "
+    "those have not ended yet; and `remaining`, how many are still to be handed out. `in_flight` "
+    "counts tasks `consumed` counts too, and a run can end a task it never handed out, so the "
+    "three need not add up to the whole run. They are totals for the run and name no task. "
+    "`remaining` reaching zero does not mean the run is over: a payload may still be owed and a "
+    "task may still be running, so stop when `pull` answers with done."
+)
+
 _WRAPPER_NOTE = (
     '\n\nCall this tool as {"attempt_id": <the attempt_id of your current task>, '
     '"arguments": {...the tool\'s own arguments...}}.'
@@ -455,6 +478,7 @@ def served_manifest(
     horizon_ending: str = FLOOR_HORIZON,
     budget: Optional[int] = None,
     capacity: int = 1,
+    info: bool = False,
 ) -> Dict[str, Any]:
     """Return everything this gateway serves, in the words it serves it in.
 
@@ -486,8 +510,22 @@ def served_manifest(
     same description: how many tasks to work on is a rule of the generation the model reads out of
     that text and nowhere else, and a generation serving several under the words for one would be
     telling the agent not to do what it is being served. A capacity of one leaves the text alone.
+
+    ``info`` is whether this generation answers how much of its queue is left. It is a second tool
+    rather than a sentence, so it is written here as one, under the rule the horizon's ending is
+    written under: a generation that declares it names the tool it serves and the words it serves
+    it in, and a generation that declares none has nothing here at all, which is what "a tool this
+    gateway does not serve is not here" means for the only other tool there is.
     """
-    declared = {} if horizon_ending == FLOOR_HORIZON else {"horizon_ending": horizon_ending}
+    declared: Dict[str, Any] = (
+        {} if horizon_ending == FLOOR_HORIZON else {"horizon_ending": horizon_ending}
+    )
+    if info:
+        declared["info_tool"] = {
+            "name": INFO_TOOL,
+            "description": _INFO_DESCRIPTION,
+            "schema": _INFO_SCHEMA,
+        }
     return {
         **declared,
         "env_name": spec.env_name,
@@ -525,6 +563,7 @@ def _configuration_hash(
     horizon_ending: str = FLOOR_HORIZON,
     budget: Optional[int] = None,
     capacity: int = 1,
+    info: bool = False,
 ) -> str:
     """Hash what the generation is serving, so a resume can refuse a changed configuration.
 
@@ -533,7 +572,7 @@ def _configuration_hash(
     any of that, and one that publishes a digest of them has it folded in here. One that
     publishes nothing hashes exactly what it hashed before.
     """
-    manifest = served_manifest(spec, terminal, horizon_ending, budget, capacity)
+    manifest = served_manifest(spec, terminal, horizon_ending, budget, capacity, info)
     if environment_digest is not None:
         manifest = {**manifest, "environment": environment_digest}
     return sha256(canonical_json(manifest)).hexdigest()
@@ -558,6 +597,7 @@ def stream_start(
     families: Sequence[MatchedFamily] = (),
     budget: Optional[int] = None,
     capacity: int = 1,
+    info: bool = False,
 ) -> StreamStart:
     """Return a generation that serves ``spec``.
 
@@ -626,6 +666,15 @@ def stream_start(
     held to the same rule as the number a task record carries, an exact whole count of at least
     one, and a generation that says anything else is refused here rather than at start.
 
+    ``info`` is whether this generation serves the tool that says how much of its queue is left,
+    and it is off by default. It says yes or no and is held to that here, for the reason the
+    capacity is held to being a count: everything downstream reads it as one of two, so anything
+    else would be turned into one of them by each of them separately rather than by a decision
+    anyone made. What that tool answers is three counts of this generation's own
+    attempts, so what a generation declares here is a decision to tell the agent how much work
+    there is; one that declares nothing serves the surface it served before there was such a tool,
+    and there is no word about it in what that generation hashes.
+
     What comes back is a generation the stream would accept, because the same check the stream
     makes at start is made here, where the caller composing a run is the one who reads it.
     """
@@ -636,6 +685,7 @@ def stream_start(
     # generation that either cannot start or serves the words of a generation at one while
     # calling itself something else.
     require_step_budget("capacity", capacity)
+    require_declaration("info", info)
     items = [
         TaskItem(
             task_position=position,
@@ -672,7 +722,7 @@ def stream_start(
     )
     return StreamStart(
         configuration_hash=_configuration_hash(
-            spec, terminal, environment_digest, budget=budget, capacity=capacity
+            spec, terminal, environment_digest, budget=budget, capacity=capacity, info=info
         ),
         consumer_claim_hash=claim_hash,
         initial_cursor=_opaque(),
@@ -697,6 +747,7 @@ def stream_start(
         provenance=_provenance(profile, resolved, experiment),
         families=list(families),
         budget=budget,
+        info=info,
     )
 
 
@@ -913,7 +964,7 @@ class _RequestUncertain:
     """
 
     owner: bytes
-    request: Union[PullRequest, SealRequest]
+    request: Union[PullRequest, InfoRequest, SealRequest]
 
 
 @dataclass(frozen=True)
@@ -1292,6 +1343,12 @@ class StreamGateway:
         operation = self._claim(key)
         return await self._accepted(operation, self._pull(key, arguments))
 
+    async def info(self, arguments: Dict[str, Any]) -> str:
+        """Return the exact bytes of the stream's answer about its own queue."""
+        key = _call_key(INFO_TOOL, arguments)
+        operation = self._claim(key)
+        return await self._accepted(operation, self._info(key, arguments))
+
     async def terminal(self, arguments: Dict[str, Any]) -> str:
         """End the attempt named in the wrapper, and return the stream's answer."""
         key = _call_key(self._terminal, arguments)
@@ -1387,6 +1444,25 @@ class StreamGateway:
         message = await self._decisive(key, self._stream.pull(request))
         return await self._deliver(message, key)
 
+    async def _info(self, key: bytes, arguments: Dict[str, Any]) -> str:
+        """Ask the stream how much of its queue there is, once it has nothing older to give.
+
+        It is the pull's own path, step for step, because the answer is the same kind of thing: a
+        record the stream minted, reserved for the request that asked, and delivered under an
+        attestation. So an answer left owed by a lost call is collected here rather than asked for
+        again, and a call that arrives while something else is owed is refused instead of taking
+        it. The model's own call carries nothing, and an argument is a call this protocol does not
+        define rather than a value to ignore.
+        """
+        if arguments:
+            raise self._refuse("invalid_message")
+        owed = await self._resumed(key)
+        if owed is not None:
+            return owed
+        request = self._info_request(key)
+        message = await self._decisive(key, self._stream.info(request))
+        return await self._deliver(message, key)
+
     async def _terminal_call(self, key: bytes, arguments: Dict[str, Any]) -> str:
         """End the attempt named in the wrapper, and return the stream's answer.
 
@@ -1410,8 +1486,10 @@ class StreamGateway:
     async def stream_state(self) -> StreamState:
         """Read the generation's state without changing it.
 
-        Harness-only, like the Query it forwards. No tool reaches this: a model that could read
-        the schedule's counts would learn from them what a Wait is shaped to withhold.
+        Harness-only, like the Query it forwards. No tool reaches this, and the one tool that
+        reaches anything like it reaches three counts the stream mints a record for: a model that
+        could read the schedule's own counts would learn from them what a Wait is shaped to
+        withhold.
         """
         return await self._stream.stream_state()
 
@@ -2162,6 +2240,23 @@ class StreamGateway:
         self._recovery = _RequestUncertain(owner=key, request=request)
         return request
 
+    def _info_request(self, key: bytes) -> InfoRequest:
+        """Return the request this info call is made under, and write it down before it is sent.
+
+        It is written down for the reason a pull's is: the stream reserves its answer for the
+        request that asked, so a call whose answer never arrives is finished by sending that same
+        request again, and every other call is refused until it is.
+        """
+        record = self._recovery
+        if isinstance(record, _RequestUncertain) and isinstance(record.request, InfoRequest):
+            return record.request
+        try:
+            request = InfoRequest(request_id=_opaque(), last_presented_cursor=self._cursor)
+        except WireFormatError as error:
+            raise self._refuse("invalid_message") from error
+        self._recovery = _RequestUncertain(owner=key, request=request)
+        return request
+
     def _seal_request(
         self, attempt_id: str, native: Dict[str, Any], key: bytes
     ) -> SealRequest:
@@ -2624,9 +2719,16 @@ def _stream_finished(error: BaseException) -> bool:
 def build_gateway_server(gateway: StreamGateway, *, name: Optional[str] = None) -> FastMCP:
     """Build the MCP server the model talks to: ``pull``, and every environment tool wrapped.
 
-    A native tool named ``pull`` is refused here rather than served: the control tool and an
-    environment tool of the same name cannot both be reached, and the one that would lose is
-    the one the whole protocol runs through.
+    A native tool named ``pull`` or ``info`` is refused here rather than served: a control tool
+    and an environment tool of the same name cannot both be reached, and the one that would lose
+    is the one the protocol runs through. Both names are refused whatever this generation
+    declares, because which names this protocol keeps for itself is a fact about the protocol,
+    and an environment that could be served under one generation and not another would be an
+    environment whose surface depended on a decision about the run.
+
+    ``info`` is served only where the generation declares it. What is advertised is what was
+    hashed, so a generation that declared nothing offers the tool set it offered before there
+    was a second tool to offer.
 
     Every wrapped call is held to the native schema this server advertised for it, the terminal
     filing included, because the wrapper is where that schema is nested and nothing below it
@@ -2641,15 +2743,18 @@ def build_gateway_server(gateway: StreamGateway, *, name: Optional[str] = None) 
     spec = gateway.spec
     served = wrapped_manifests(spec, terminal_manifest(spec))
     for manifest in spec.tools:
-        if manifest.name == PULL_TOOL:
+        if manifest.name in (PULL_TOOL, INFO_TOOL):
             raise ValueError(
-                f"env tool name {PULL_TOOL!r} collides with the stream control tool; an env "
-                f"served under protocol v2 may not expose a tool named {PULL_TOOL!r}"
+                f"env tool name {manifest.name!r} collides with a stream control tool; an env "
+                f"served under protocol v2 may not expose a tool named {PULL_TOOL!r} or "
+                f"{INFO_TOOL!r}"
             )
 
     async def dispatch(tool_name: str, arguments: Dict[str, Any]) -> ToolResult:
         if tool_name == PULL_TOOL:
             return ToolResult(content=await gateway.pull(arguments))
+        if tool_name == INFO_TOOL:
+            return ToolResult(content=await gateway.info(arguments))
         gateway.check_native_arguments(tool_name, arguments)
         if tool_name == gateway.terminal_tool:
             return ToolResult(content=await gateway.terminal(arguments))
@@ -2668,6 +2773,17 @@ def build_gateway_server(gateway: StreamGateway, *, name: Optional[str] = None) 
             dispatch,
         )
     )
+    if gateway.generation.info:
+        server.add_tool(
+            build_tool(
+                ToolManifest(
+                    name=INFO_TOOL,
+                    description=_INFO_DESCRIPTION,
+                    input_schema=_INFO_SCHEMA,
+                ),
+                dispatch,
+            )
+        )
     for manifest in served:
         server.add_tool(
             build_tool(
@@ -2760,6 +2876,11 @@ async def open_gateway(
     episode is not, this call is where the two meet, and a number the agent reads that nothing
     enforces is worse than no number at all.
 
+    Whether that generation declares the info tool is carried into the hash this call recomputes,
+    for the reason the budget is: the surface a resume is held to has to be the surface being
+    served, and a tool the model can call that the hash did not name would be a generation
+    serving one thing and identified as another.
+
     An episode that ends on its own horizon is refused here. Under this protocol the stream is
     what ends an attempt, and an episode that seals and grades itself when a step budget runs
     out would end one behind the stream's back: the attempt would still be active, nothing the
@@ -2791,6 +2912,7 @@ async def open_gateway(
                 environment.horizon_ending,
                 composed.budget,
                 composed.capacity,
+                composed.info,
             ),
         )
     if len(composed.tasks) > 1 and open_episode is None:

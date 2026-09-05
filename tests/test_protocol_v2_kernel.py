@@ -19,9 +19,11 @@ them would pin nothing.
 from __future__ import annotations
 
 import asyncio
+import json
 import subprocess
 import sys
 from dataclasses import replace
+from datetime import timedelta
 from hashlib import sha256
 from typing import Any, AsyncIterator, Dict, List, Optional
 
@@ -39,6 +41,8 @@ from temporalio.exceptions import ApplicationError  # noqa: E402
 from temporalio.testing import WorkflowEnvironment  # noqa: E402
 
 from shogym.serve.protocol_v2 import (  # noqa: E402
+    InfoRequest,
+    PresentationCommit,
     PullRequest,
     TerminalMetadata,
     visible_bytes,
@@ -49,6 +53,7 @@ from shogym.serve.protocol_v2.kernel import (  # noqa: E402
     STREAM_TASK_QUEUE,
     ConsumerClaim,
     EnvironmentCall,
+    FinalizeRequest,
     GeneratePayloadBundleInput,
     OfferedMessage,
     SealAttemptInput,
@@ -68,6 +73,7 @@ from shogym.serve.protocol_v2.kernel import (  # noqa: E402
     stream_replayer,
     stream_worker,
 )
+from shogym.serve.protocol_v2.kernel import workflow as kernel_workflow  # noqa: E402
 from shogym.serve.protocol_v2.kernel.activities import (  # noqa: E402
     GENERATE_PAYLOAD_BUNDLE,
     GRADE_ATTEMPT,
@@ -119,6 +125,12 @@ GOLDEN_PAYLOAD = (
 GOLDEN_DONE = (
     '{"kind":"done","message_id":"00000000000000000000000000000002","protocol_version":2}'
 )
+# The first message this generation mints for itself, which is the first info answer, over a
+# queue of two tasks nothing has been handed out of yet.
+GOLDEN_FIRST_INFO = (
+    '{"consumed":0,"in_flight":0,"kind":"info",'
+    '"message_id":"c08ef99c353bb06654a4752f44d1269d","protocol_version":2,"remaining":2}'
+)
 GOLDEN_REJECT_BODY = "missing answer; unknown reply"
 
 
@@ -132,6 +144,8 @@ def make_start(
     capacity: int = 1,
     version: int = 2,
     budget: Optional[int] = None,
+    info: bool = False,
+    attempt_deadline_ms: int = 0,
 ) -> StreamStart:
     """A generation whose every public identifier is fixed before it serves anything."""
     tasks = [
@@ -161,6 +175,8 @@ def make_start(
             tasks=tasks,
             capacity=capacity,
             budget=budget,
+            info=info,
+            attempt_deadline_ms=attempt_deadline_ms,
             protocol_version=version,
         )
     )
@@ -185,6 +201,20 @@ class Caller:
 
     async def pull(self, request: Optional[PullRequest] = None) -> OfferedMessage:
         return await self.stream.pull(request or self.pull_request())
+
+    def info_request(self, request_id: Optional[str] = None) -> InfoRequest:
+        return InfoRequest(
+            request_id=request_id or self.next_id(), last_presented_cursor=self.cursor
+        )
+
+    async def info(self, request: Optional[InfoRequest] = None) -> OfferedMessage:
+        return await self.stream.info(request or self.info_request())
+
+    async def counts(self) -> Dict[str, int]:
+        """Ask what the queue looks like and present the answer, which is what an agent does."""
+        answer = await self.info()
+        await self.present(answer)
+        return json.loads(answer.visible_text)
 
     async def present(self, message: OfferedMessage) -> None:
         ack = await self.stream.present(
@@ -787,6 +817,26 @@ async def test_a_generation_whose_capacity_is_not_a_count_never_starts(env, capa
         assert protocol_error_code(caught.value.cause) == "invalid_message"
 
 
+@pytest.mark.parametrize("info", [1, 0, "yes", None, [], [1], 1.0])
+async def test_a_generation_whose_info_declaration_is_not_a_yes_or_a_no_never_starts(
+    info: Any,
+) -> None:
+    """Whether the tool is served is a yes or a no wherever it is read, and the readers are the
+    manifest, the hash and this workflow. Nothing between whoever composed the start and here is
+    obliged to have checked it, so the kernel checks it for itself rather than letting each of
+    those readers settle it by truthiness.
+
+    The check is made against the start directly rather than by starting a workflow over one.
+    A declaration is the one thing among these that cannot cross the boundary at all: the field
+    is typed, and a start carrying anything else is refused by the converter before this code is
+    reached, which is a failure with no protocol answer rather than a refusal. So the value is
+    put where a composer that skipped the gateway would put it.
+    """
+    with pytest.raises(ApplicationError) as caught:
+        kernel_workflow._check_start(replace(make_start(), info=info))
+    assert protocol_error_code(caught.value) == "invalid_message"
+
+
 async def test_a_quickstart_install_never_imports_temporal() -> None:
     """Importing shogym must not pull in Temporal. Serving is what reaches it."""
     probe = "import shogym, sys; assert 'temporalio' not in sys.modules, sorted(sys.modules)"
@@ -834,3 +884,259 @@ def test_the_worker_registers_the_stream_and_every_activity_it_schedules() -> No
         "shogym.protocol_v2.GeneratePayloadBundleActivity",
         "shogym.protocol_v2.VerifyBlobsActivity",
     }
+
+
+# ----- the info tool -----
+
+
+@pytest.mark.network
+async def test_an_info_answer_is_minted_offered_and_committed_like_a_pull(env) -> None:
+    """The answer is a message of the generation's own, and it travels the way every other one
+    does: reserved for the request that asked, presented under an attestation, and left in the
+    ledger of what the agent was told."""
+    async with stream_worker(env.client):
+        caller = await open_stream(
+            env,
+            make_start(bodies=(TASK_BODY, TASK_BODY), info=True),
+            workflow_id="stream/info/committed",
+        )
+        answer = await caller.info()
+        assert answer.kind == "info"
+        assert answer.attempt_id is None
+        assert answer.visible_text == GOLDEN_FIRST_INFO
+
+        state = await caller.stream.stream_state()
+        assert state.pending_message_id == answer.message_id
+        assert state.pending_origin == "info"
+        # Asking says nothing about the queue and moves nothing in it.
+        assert state.attempts == {ATTEMPT: "planned", oid(0x104): "planned"}
+
+        await caller.present(answer)
+        assert caller.cursor == answer.message_id
+        presented = await caller.stream.handle.query(StreamWorkflow.presented_messages)
+        assert [(row.order, row.kind, row.attempt_id) for row in presented] == [(0, "info", None)]
+        assert presented[0].visible_bytes_sha256 == (
+            sha256(GOLDEN_FIRST_INFO.encode("utf-8")).hexdigest()
+        )
+        state = await caller.stream.stream_state()
+        assert state.attempts == {ATTEMPT: "planned", oid(0x104): "planned"}
+        assert state.presentation_count == 1
+
+
+@pytest.mark.network
+async def test_a_generation_that_declares_no_info_tool_has_no_answer_to_give(caller) -> None:
+    """The Update is reachable by anything holding the writer, so the refusal is the stream's
+    rather than the transport's: a tool this generation does not serve is not a call it takes."""
+    assert await refused(caller.info()) == "invalid_message"
+    assert (await caller.stream.stream_state()).offer_count == 0
+
+
+@pytest.mark.network
+async def test_a_retried_info_call_is_answered_with_the_bytes_it_reserved(env) -> None:
+    """A retry replays a reservation rather than taking a second reading, so the answer cannot
+    describe a stream that moved after the request that asked for it."""
+    async with stream_worker(env.client):
+        caller = await open_stream(
+            env,
+            make_start(bodies=(TASK_BODY, TASK_BODY), info=True),
+            workflow_id="stream/info/retry",
+        )
+        request = caller.info_request()
+        first = await caller.info(request)
+        replayed = await caller.stream.handle.execute_update(
+            StreamWorkflow.info,
+            args=[request, caller.stream.writer],
+            id="replay-of-the-info-call",
+        )
+        assert replayed == first
+
+        # The same request ID carrying anything else is a conflict, not a second answer.
+        assert (
+            await refused(
+                caller.stream.handle.execute_update(
+                    StreamWorkflow.info,
+                    args=[
+                        InfoRequest(
+                            request_id=request.request_id, last_presented_cursor=ATTEMPT
+                        ),
+                        caller.stream.writer,
+                    ],
+                    id="a-different-info-call-under-the-same-id",
+                )
+            )
+            == "request_conflict"
+        )
+        await caller.present(first)
+        assert (
+            await refused(
+                caller.stream.handle.execute_update(
+                    StreamWorkflow.info,
+                    args=[request, caller.stream.writer],
+                    id="the-info-call-whose-answer-has-been-presented",
+                )
+            )
+            == "already_presented"
+        )
+
+
+@pytest.mark.network
+async def test_neither_a_pull_nor_an_info_call_overtakes_what_the_other_is_owed(env) -> None:
+    """One answer is outstanding at a time, whichever tool asked for it."""
+    async with stream_worker(env.client):
+        caller = await open_stream(
+            env,
+            make_start(bodies=(TASK_BODY, TASK_BODY), info=True),
+            workflow_id="stream/info/overtake",
+        )
+        answer = await caller.info()
+        assert await refused(caller.pull()) == "outstanding_response"
+        await caller.present(answer)
+
+        task = await caller.pull()
+        assert await refused(caller.info()) == "outstanding_response"
+        await caller.present(task)
+
+
+@pytest.mark.network
+async def test_an_info_answer_is_held_to_the_bytes_the_stream_minted(env) -> None:
+    """The presentation attests to what was offered, so an attestation over anything else
+    commits nothing: the counts an agent was told are the counts the stream stands behind."""
+    async with stream_worker(env.client):
+        caller = await open_stream(
+            env, make_start(info=True), workflow_id="stream/info/digest"
+        )
+        answer = await caller.info()
+        state = await caller.stream.stream_state()
+        commit = PresentationCommit(
+            attestation_id=caller.next_id(),
+            cursor_before=state.cursor,
+            message_id=answer.message_id,
+            visible_bytes_sha256=sha256(b'{"remaining":0}').hexdigest(),
+            transcript_blob=TRANSCRIPT_BLOB,
+            provider_turn_blob=None,
+            task_start_checkpoint_blob=None,
+            completed_turn=False,
+            stream_state_before_sha256=state.stream_state_sha256,
+        )
+        assert await refused(caller.stream.commit_presentation(commit)) == "invalid_message"
+        # The message is still the stream's to be holding, so the honest attestation still lands.
+        await caller.present(answer)
+        assert caller.cursor == answer.message_id
+
+
+@pytest.mark.network
+async def test_the_counts_follow_the_attempts_through_the_states_they_reach(env) -> None:
+    """Handed out, still going, never handed out: one reading of each as the work moves.
+
+    `consumed` contains `in_flight` rather than sitting beside it, which is what the earlier
+    harness these names come from meant by them, so the two are read together at every step.
+    """
+    async with stream_worker(env.client):
+        caller = await open_stream(
+            env,
+            make_start(bodies=(TASK_BODY, TASK_BODY), info=True),
+            workflow_id="stream/info/states",
+        )
+        # Nothing handed out yet: two planned attempts and no work anywhere.
+        assert await caller.counts() == {
+            "protocol_version": 2,
+            "kind": "info",
+            "message_id": caller.cursor,
+            "remaining": 2,
+            "consumed": 0,
+            "in_flight": 0,
+        }
+
+        # Active: handed out, and not ended.
+        task = await caller.pull()
+        await caller.present(task)
+        assert (await caller.stream.stream_state()).attempts[ATTEMPT] == "active"
+        counted = await caller.counts()
+        assert (counted["remaining"], counted["consumed"], counted["in_flight"]) == (1, 1, 1)
+
+        # Acknowledged: handed out, and ended. The capacity came back at the seal.
+        ack = await caller.seal()
+        await caller.present(ack)
+        assert (await caller.stream.stream_state()).attempts[ATTEMPT] == "ack_presented"
+        counted = await caller.counts()
+        assert (counted["remaining"], counted["consumed"], counted["in_flight"]) == (1, 1, 0)
+
+        # An attempt ended before it was handed out is neither remaining nor consumed, so the
+        # three no longer account for the whole roster and the missing one is that attempt.
+        await caller.stream.finalize(
+            FinalizeRequest(
+                request_id=caller.next_id(), attempt_id=oid(0x104), reason="abandoned"
+            )
+        )
+        counted = await caller.counts()
+        assert (counted["remaining"], counted["consumed"], counted["in_flight"]) == (0, 1, 0)
+        state = await caller.stream.stream_state()
+        assert state.attempts[oid(0x104)] == "final_failed"
+        assert counted["remaining"] + counted["consumed"] + 1 == len(state.attempts)
+
+
+@pytest.mark.network
+async def test_an_attempt_the_generation_ended_after_handing_it_over_stays_consumed(env) -> None:
+    """A deadline ends an attempt that was handed out, so what it leaves is a consumed attempt
+    that is no longer in flight rather than one the counts forget."""
+    async with stream_worker(env.client):
+        caller = await open_stream(
+            env,
+            make_start(info=True, attempt_deadline_ms=60_000),
+            workflow_id="stream/info/deadline",
+        )
+        task = await caller.pull()
+        await caller.present(task)
+        counted = await caller.counts()
+        assert (counted["remaining"], counted["consumed"], counted["in_flight"]) == (0, 1, 1)
+
+        await env.sleep(timedelta(milliseconds=61_000))
+        counted = await caller.counts()
+        assert (counted["remaining"], counted["consumed"], counted["in_flight"]) == (0, 1, 0)
+        assert (await caller.stream.stream_state()).attempts[ATTEMPT] == "final_failed"
+
+
+@pytest.mark.network
+async def test_at_capacity_eight_in_flight_counts_every_attempt_that_is_being_worked(env) -> None:
+    """Capacity changes how many attempts can be live, not what the three names mean."""
+    async with stream_worker(env.client):
+        caller = await open_stream(
+            env,
+            make_start(bodies=tuple(TASK_BODY for _ in range(9)), capacity=8, info=True),
+            workflow_id="stream/info/capacity",
+        )
+        for held in range(1, 9):
+            await caller.present(await caller.pull())
+            counted = await caller.counts()
+            assert (counted["remaining"], counted["consumed"], counted["in_flight"]) == (
+                9 - held,
+                held,
+                held,
+            )
+        # A ninth pull is answered with a wait, and waiting is not an attempt.
+        waiting = await caller.pull()
+        assert waiting.kind == "wait"
+        await caller.present(waiting)
+        counted = await caller.counts()
+        assert (counted["remaining"], counted["consumed"], counted["in_flight"]) == (1, 8, 8)
+
+
+@pytest.mark.network
+async def test_the_info_tool_answers_between_a_seal_and_the_next_pull(env) -> None:
+    """The moment an agent asks is the moment between finishing one task and asking for the
+    next, and the tool is not tied to a pull, so that is a moment it answers in."""
+    async with stream_worker(env.client):
+        caller = await open_stream(env, make_start(info=True), workflow_id="stream/info/between")
+        task = await caller.pull()
+        await caller.present(task)
+        ack = await caller.seal()
+        await caller.present(ack)
+        counted = await caller.counts()
+        assert (counted["remaining"], counted["consumed"], counted["in_flight"]) == (0, 1, 0)
+
+        payload = await caller.pull()
+        assert payload.kind == "payload"
+        await caller.present(payload)
+        await caller.stream.close_queue()
+        done = await caller.pull()
+        assert done.kind == "done"

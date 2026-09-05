@@ -38,6 +38,7 @@ from shogym.serve.protocol_v2 import (  # noqa: E402
     TASK_FIRST,
     Done,
     EligibilityGate,
+    Info,
     Payload,
     ReleasePlan,
     SealAck,
@@ -51,6 +52,7 @@ from shogym.serve.protocol_v2 import gateway as gateway_module  # noqa: E402
 from shogym.serve.protocol_v2 import records as records_module  # noqa: E402
 from shogym.serve.protocol_v2.gateway import (  # noqa: E402
     CANONICALIZATION_VERSION,
+    INFO_TOOL,
     PULL_TOOL,
     EnvironmentTerminal,
     StreamGateway,
@@ -77,6 +79,7 @@ from shogym.serve.protocol_v2.kernel import (  # noqa: E402
     DEADLINE,
     STREAM_TASK_QUEUE,
     OfferedMessage,
+    StreamWorkflow,
     TaskItem,
     configuration_hash,
     kernel_activities,
@@ -105,6 +108,9 @@ CLAIM_HASH = "d" * 64
 # union of every name any of them may carry. A union grows every time one record gains a field
 # and stops saying anything about the others, which is the opposite of what it is here to say.
 # `budget` is the one name a task may add to its entry, and no other kind may add anything.
+# The counts are on the info record and nowhere else, which is what a per-kind table says and a
+# union of every name would not: a task admitting `remaining` would be a task carrying a queue
+# position, and this is the assertion that would fail.
 PUBLIC_KEYS: Dict[str, Set[str]] = {
     "task": {"protocol_version", "kind", "message_id", "attempt_id", "body"},
     "payload": {"protocol_version", "kind", "message_id", "attempt_id", "body"},
@@ -119,6 +125,7 @@ PUBLIC_KEYS: Dict[str, Set[str]] = {
         "canonicalization_version",
     },
     "seal_reject": {"protocol_version", "kind", "message_id", "attempt_id", "body", "code"},
+    "info": {"protocol_version", "kind", "message_id", "remaining", "consumed", "in_flight"},
 }
 OPTIONAL_KEYS: Dict[str, Set[str]] = {"task": {"budget"}}
 
@@ -139,6 +146,7 @@ ONE_OF_EVERY_KIND: Tuple[Any, ...] = (
         canonicalization_version="world.1",
     ),
     SealReject(message_id="0" * 32, attempt_id="1" * 32, body="arg is required"),
+    Info(message_id="0" * 32, remaining=7, consumed=3, in_flight=1),
 )
 
 
@@ -263,6 +271,7 @@ async def opened(
     terminal: Optional[EnvironmentTerminal] = None,
     budget: Optional[int] = None,
     capacity: int = 1,
+    info: bool = False,
     attempt_deadline_ms: int = 0,
 ) -> StreamGateway:
     """Compose a generation, bind this transport to it, and close its manifest.
@@ -286,6 +295,7 @@ async def opened(
         experiment="" if not served_on.grade.stand_in else "what_a_schedule_does",
         budget=budget,
         capacity=capacity,
+        info=info,
         attempt_deadline_ms=attempt_deadline_ms,
     )
     gateway = await open_gateway(
@@ -410,6 +420,85 @@ async def test_a_declared_budget_reaches_the_model_on_every_task(serving_wordle,
     for record in seen:
         if record["kind"] != "task":
             assert set(record) == PUBLIC_KEYS[record["kind"]]
+
+
+@pytest.mark.network
+async def test_a_declared_info_tool_answers_the_model_through_the_whole_stack(
+    serving_wordle, episode
+) -> None:
+    """One real generation, one real transport, and the tool the model actually calls.
+
+    Everything below this is real: a durable stream, the gateway that serves it, the MCP server
+    the model reaches it through, and a wordle world per attempt. So what is checked is the whole
+    path rather than any one layer's account of it: the tool is advertised, its answer arrives as
+    the record the stream minted, the counts move as the work does, and every answer is in the
+    ledger of what this generation committed, in the order the model was shown them.
+    """
+    serving, terminal = serving_wordle
+    gateway = await opened(
+        serving,
+        episode,
+        workflow_id="stream/gateway-info/1",
+        bodies=("Round 0.", "Round 1."),
+        release=NEVER,
+        terminal=terminal,
+        info=True,
+    )
+    server = build_gateway_server(gateway)
+    async with Client(server) as client:
+        assert INFO_TOOL in {tool.name for tool in await client.list_tools()}
+
+        async def asked() -> Dict[str, Any]:
+            answer = await client.call_tool(INFO_TOOL, {})
+            assert len(answer.content) == 1
+            return json.loads(answer.content[0].text)
+
+        async def pulled() -> Dict[str, Any]:
+            return json.loads((await client.call_tool(PULL_TOOL, {})).content[0].text)
+
+        shown = [await asked()]
+        first = await pulled()
+        shown.append(first)
+        shown.append(await asked())
+        # A call into the world is work on an attempt and not a change to the queue, so the
+        # same three numbers come back after it.
+        await client.call_tool(
+            "guess", {"attempt_id": first["attempt_id"], "arguments": {"word": "crane"}}
+        )
+        shown.append(await asked())
+        filed = json.loads(
+            (
+                await client.call_tool(
+                    gateway.terminal_tool, {"attempt_id": first["attempt_id"], "arguments": {}}
+                )
+            ).content[0].text
+        )
+        shown.append(filed)
+        shown.append(await asked())
+
+    assert [record["kind"] for record in shown] == [
+        "info",
+        "task",
+        "info",
+        "info",
+        "seal_ack",
+        "info",
+    ]
+    counts = [
+        (record["remaining"], record["consumed"], record["in_flight"])
+        for record in shown
+        if record["kind"] == "info"
+    ]
+    # Nothing handed out, one being worked on, the same one twice because asking changes
+    # nothing, and one handed out and ended after the filing.
+    assert counts == [(2, 0, 0), (1, 1, 1), (1, 1, 1), (1, 1, 0)]
+    for record in shown:
+        assert set(record) == PUBLIC_KEYS[record["kind"]]
+
+    # And every one of them is in the generation's own record of what it committed, in order.
+    presentations = await gateway._stream.handle.query(StreamWorkflow.presented_messages)
+    assert [row.kind for row in presentations] == [record["kind"] for record in shown]
+    assert [row.message_id for row in presentations] == [record["message_id"] for record in shown]
 
 
 @pytest.mark.network

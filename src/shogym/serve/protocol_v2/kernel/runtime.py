@@ -45,9 +45,11 @@ from temporalio.worker import Replayer, Worker
 from temporalio.worker.workflow_sandbox import SandboxedWorkflowRunner, SandboxRestrictions
 
 from shogym.serve.protocol_v2 import (
+    InfoRequest,
     PresentationAck,
     PresentationCommit,
     PullRequest,
+    info_request_identity,
     presentation_request_identity,
     pull_request_identity,
     terminal_request_identity,
@@ -468,6 +470,16 @@ class StreamHandle:
             id=_update_id("pull", request.request_id, request, writer),
         )
 
+    async def info(self, request: InfoRequest) -> OfferedMessage:
+        """Ask how much of the queue there is. A retry of the same request reaches the same
+        Update, and a generation that declares no info tool refuses it."""
+        writer = self.writer
+        return await self.handle.execute_update(
+            StreamWorkflow.info,
+            args=[request, writer],
+            id=_update_id("info", request.request_id, request, writer),
+        )
+
     async def seal(self, request: SealRequest) -> OfferedMessage:
         """End an attempt with a terminal call, and get its acknowledgement or refusal."""
         identity = terminal_request_identity(
@@ -594,9 +606,10 @@ def _update_id(prefix: str, request_id: str, value: Any, writer: Writer) -> str:
     The epoch is part of it because Temporal deduplicates by this ID: two owners sending the
     same logical request must not have the second one answered with the first one's refusal.
     """
-    identity = (
-        pull_request_identity(value)
-        if isinstance(value, PullRequest)
-        else presentation_request_identity(value)
-    )
+    if isinstance(value, PullRequest):
+        identity = pull_request_identity(value)
+    elif isinstance(value, InfoRequest):
+        identity = info_request_identity(value)
+    else:
+        identity = presentation_request_identity(value)
     return f"{prefix}-{writer.ownership_epoch}-{request_id}-{identity[:32]}"

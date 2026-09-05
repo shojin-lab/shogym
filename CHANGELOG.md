@@ -9,6 +9,43 @@ direction.
 
 ## Unreleased
 
+### `serve`: a generation may tell the agent how much work is left
+
+`stream_start` takes `info`, and a generation that declares it serves an `info` tool beside `pull`.
+The tool takes no arguments. Its answer is a wire record of a new kind, `info`, carrying
+`consumed`, how many attempts have been handed out so far; `in_flight`, how many of those have not
+ended yet; and `remaining`, how many are still to be handed out.
+
+The three are not a partition. `in_flight` is inside `consumed` rather than beside it, and neither
+counts an attempt the generation ended before ever handing it out, which a controller finalizing a
+planned attempt and the cascade that floors one whose gate can no longer open each produce. With
+the roster `N` and those never-handed-out endings `U`, the invariants are `remaining + consumed +
+U == N` and `in_flight <= consumed`. So `remaining` plus `consumed` is the roster wherever `U` is
+zero and short of it by `U` everywhere else, while the three together sum to `N - U + in_flight`,
+which can fall below the roster, meet it, or pass it, so it is not in general the roster.
+`remaining` reaching zero does not mean the generation is done either: a payload can still be owed
+and an attempt can still be live. The kernel defines the three once, where it computes them, and
+every other statement of them says what that one says.
+
+The answer is the stream's rather than the transport's. The counts are read inside the same
+transition that mints the record, the record is reserved for the request that asked for it so a
+retry gets the same bytes rather than a new reading, and it is delivered under the same attestation
+a pull's answer is, so what the agent was told is among the presentations a run's own records list.
+The call enters the transport's admission with every other one, so it is answered while the
+generation is open and nothing is owed: it cannot overtake an owed pull or acknowledgement, a pull
+cannot overtake it, it is refused while a filing prepared by a replaced owner is still to be
+finished, and it is refused with `closed_stream` once the generation is done.
+
+Where the tool is declared it is named in the served manifest, with the exact words and the closed
+empty schema it is registered under, and the declaration is folded into the configuration hash a
+resume is held to. **A generation composed without it serves what it always served: the same tool
+set, the same control tool description, the same bytes and the same configuration hash**, so every
+recorded history replays and every open stream resumes. No quickstart declares one.
+
+`info` joins `pull` as a name an environment served under protocol v2 may not give a tool of its
+own, whatever the generation declares. An environment that advertises a tool called `info` is now
+refused at construction rather than served.
+
 ### `serve`: a generation may serve several tasks at once
 
 `stream_start` takes `capacity`, how many tasks the generation lets the agent hold at once, and it
