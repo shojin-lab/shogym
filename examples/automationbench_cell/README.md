@@ -1,9 +1,10 @@
 # The AutomationBench cell
 
 One Claude Code session works a roster of AutomationBench tasks. It asks the server for a task,
-works it, ends it, and the score for that task comes back when it asks for the next one. The
-session runs in one container, the tasks and the answers and the scores are in another, and the
-only thing between them is the endpoint the agent connects to.
+works it, ends it, and the score for that task comes back when it asks for the next one. It may
+hold up to eight tasks at once, and it may ask how many are left. The session runs in one
+container, the tasks and the answers and the scores are in another, and the only thing between
+them is the endpoint the agent connects to.
 
 Docker must be running. `run` also needs a `CLAUDE_CODE_OAUTH_TOKEN` in the environment: the agent
 gets a fresh Claude Code home, so nothing else authenticates it, and a launch without the token
