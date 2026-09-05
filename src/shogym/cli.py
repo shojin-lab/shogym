@@ -14,6 +14,11 @@ transaction, so the stream decides when an attempt ends and the harness never gr
 That prints one row per attempt and leaves the same rows in the directory as a derived file.
 Both subcommands run on Temporal, which ``pip install shogym`` installs; the imports live inside
 :func:`main` rather than here, so reading the help costs nothing that running costs.
+
+``shogym receipts`` draws, gates and screens the task families the receipts env
+serves; it exits nonzero when a gate or a screen fails::
+
+    shogym receipts gate ledger
 """
 
 from __future__ import annotations
@@ -21,6 +26,8 @@ from __future__ import annotations
 import argparse
 import asyncio
 from typing import NoReturn, Optional, Sequence
+
+from shogym.envs.receipts import cli as receipts_cli
 
 
 def _build_parser() -> argparse.ArgumentParser:
@@ -42,6 +49,8 @@ def _build_parser() -> argparse.ArgumentParser:
 
     results = sub.add_parser("results", help="read a run directory's attempt records")
     results.add_argument("run_dir", help="a directory a stream was served with --run-dir")
+
+    receipts_cli.add_parser(sub)
     return parser
 
 
@@ -105,6 +114,8 @@ def main(argv: Optional[Sequence[str]] = None) -> None:
             parser.exit(1, f"cannot read {args.run_dir}: {refused}\n")
         print(format_records(run.records))
         print(f"wrote {write_records(run)}")
+    elif args.command == "receipts":
+        raise SystemExit(receipts_cli.run(args))
 
 
 if __name__ == "__main__":
