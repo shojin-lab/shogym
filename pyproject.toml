@@ -215,6 +215,12 @@ markers = [
     # run still selects it, which is where a live upstream dependency is meant to be checked,
     # with a human reading the result.
     "network: needs a live third-party service; deselected from the offline suite",
+    # A test that needs the local dev service rather than the time-skipping test server, because
+    # what it is about is a limit only the dev service enforces. The time-skipping server accepts
+    # Updates past the cap and takes no dynamic configuration, so the cap cannot be lowered there
+    # and a run driven past it proves nothing. These are slow and run in real time, so a plain
+    # pytest run deselects them and they are asked for by name.
+    "dev_server: needs the local dev service and its dynamic configuration; run it by name",
 ]
 
 [tool.ruff]

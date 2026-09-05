@@ -37,14 +37,16 @@ from the closed set and nothing else, they change no state, and they are never a
 from __future__ import annotations
 
 import asyncio
-from dataclasses import dataclass, fields
+import json
+from dataclasses import dataclass, fields, replace
 from datetime import timedelta
 from hashlib import sha256
 from typing import Any, Dict, List, Optional, Set, Tuple
 
 from temporalio import workflow
 from temporalio.common import RetryPolicy
-from temporalio.exceptions import ActivityError, ApplicationError
+from temporalio.api.common.v1 import Payload as WirePayload
+from temporalio.exceptions import ActivityError, ApplicationError, FailureError
 from temporalio.exceptions import TimeoutError as ActivityTimeout
 
 with workflow.unsafe.imports_passed_through():
@@ -94,6 +96,7 @@ with workflow.unsafe.imports_passed_through():
     )
     from shogym.serve.protocol_v2.kernel.messages import (
         ABANDONED,
+        CARRIER_SCHEMA_VERSION,
         DEADLINE,
         FINAL_FAILURE_REASONS,
         SEAL_FAILED,
@@ -101,6 +104,12 @@ with workflow.unsafe.imports_passed_through():
         SEAL_UNUSABLE,
         AttemptFinalized,
         AttemptRecord,
+        AnsweredUpdate,
+        CarriedAttempt,
+        CarriedAttestation,
+        CarriedBinding,
+        CarriedFinalization,
+        CarriedObligation,
         ConsumerClaim,
         ConsumerReceipt,
         EnvironmentCall,
@@ -119,6 +128,7 @@ with workflow.unsafe.imports_passed_through():
         QueueClosed,
         SealAttemptInput,
         SealRequest,
+        StreamCarry,
         StreamOutcome,
         StreamStart,
         StreamState,
@@ -128,6 +138,9 @@ with workflow.unsafe.imports_passed_through():
         assignments_for,
         configuration_hash,
         hidden_seal_id,
+        CarriedProjection,
+        pack_carrier,
+        unpack_carrier,
     )
     from shogym.serve.protocol_v2.policy import (
         DELIVER,
@@ -203,6 +216,113 @@ _ACTIVITY_RETRY = RetryPolicy(
 _FAILURE_TEXT_BYTES = 512
 _CUT = " [truncated]"
 
+# What the durable service does to bound one execution, and what this generation does about it.
+#
+# The service counts the Updates one execution accepted and refuses the next one past its cap.
+# A roster longer than that cap needs more than one execution, so the generation continues as
+# new at a quiet point well before the cap is reached, under the same workflow ID, carrying the
+# whole logical projection. The five numbers below are that decision, and the inequality under
+# them is what makes it safe rather than hopeful.
+#
+# SERVICE_UPDATE_CAP is the smallest cap a deployment this package supports may configure.
+# TURNOVER_TRIGGER is where this generation latches, counted by its own counter rather than by
+# the service's. ADMISSION_LEAD is the most the service can have admitted that this counter has
+# not seen yet. ADMISSION_RESERVE is the most this generation will accept after the latch, which
+# the admission gate enforces rather than infers. TURNOVER_MARGIN is what is left over.
+#
+# The reserve is a bound on the work that can still make the boundary quiet, and the whitelist
+# below is exactly that work: the pending message's presentation commit (1), the held grant's
+# end (1), a prepared seal's retry and the presentation of its acknowledgement (2), and a claim
+# with the confirmation that follows it, which is how an abandoned grant is recovered (2), and
+# closing the queue (1). Seven per latch, and the reserve is many times that, which is what
+# leaves room for a claim that is refused and made again.
+SERVICE_UPDATE_CAP = 2000
+TURNOVER_TRIGGER = 1700
+ADMISSION_LEAD = 10
+ADMISSION_RESERVE = 40
+TURNOVER_MARGIN = 200
+
+# How much of the reserve the operations that can be repeated may spend, and why they do not all
+# share one allowance.
+#
+# A confirmation mints a fresh identifier every time by design, and a consumer binding or a close
+# of the queue can be sent again under another. A ceiling on the total alone would let those take
+# every slot and leave none for the end of a held grant, which nothing but the caller holding it
+# can send. So they have an allowance of their own.
+#
+# An ownership claim is repeatable in the same way, and it was given that same allowance, which
+# was wrong in a way worth naming. A claim is the only thing that can recover a grant whose owner
+# went away: the world is held, the owner that held it is gone, and nothing but a new owner can
+# end the grant by name. Sharing the allowance with confirmations meant that spending it on
+# confirmations locked out the one call that could clear the hold. It has an allowance of its own
+# now, so a recovery claim is admissible whatever else has been sent.
+ADMISSION_REPEATS = 8
+ADMISSION_CLAIMS = 4
+assert ADMISSION_REPEATS + ADMISSION_CLAIMS < ADMISSION_RESERVE, (
+    "the operations that can be repeated must not be able to spend the whole reserve, or the "
+    "one call that can clear a named hold would be refused for the want of a slot"
+)
+assert (
+    TURNOVER_TRIGGER + ADMISSION_LEAD + ADMISSION_RESERVE + TURNOVER_MARGIN < SERVICE_UPDATE_CAP
+), "the trigger, the admission lead, the reserve and the margin have to fit under the cap"
+
+# The refusal an arriving Update is rejected with once the latch is set. It is not a protocol
+# error the agent is ever shown: the transport waits for the boundary and sends the same request,
+# under the same Update ID, at the execution that comes next.
+TURNOVER_PENDING = "turnover_pending"
+
+# Why a generation gave up on a boundary it had decided to take. Both are recorded where a
+# launcher can read them, because both leave the generation serving out the execution it is in
+# and therefore able to reach the service cap the boundary existed to avoid.
+#
+# CARRIER_TOO_LARGE is the profile being outside what this package supports: the projection would
+# not fit in one payload. ADMISSION_EXHAUSTED is the other way a boundary becomes unreachable,
+# and it is not about size at all. The work that clears a boundary can fail and be tried again:
+# the transport builds a fresh attestation after a presentation is refused, and every failed
+# attempt is an accepted Update. Once the reserve is spent, nothing more is admitted, and if the
+# generation is not already quiet it never will be: the thing it is holding cannot be cleared,
+# and the boundary cannot be taken. Rather than hold traffic back for a boundary that can no
+# longer happen, the generation says so and goes back to serving.
+CARRIER_TOO_LARGE = "carrier_too_large"
+ADMISSION_EXHAUSTED = "admission_exhausted"
+RECOVERY_CLAIMS_EXHAUSTED = "recovery_claims_exhausted"
+
+# The service's own limit on one payload, which is what the replaced start has to fit under.
+SERVICE_PAYLOAD_LIMIT_BYTES = 2 * 1024 * 1024
+
+# The most the replaced start may encode to before this generation refuses to hand itself on. A
+# generation over it keeps serving and records the size it measured, which is what a launcher
+# reads to say why the run stopped where it did.
+#
+# The number is set from a measurement rather than from a feeling. The supported profile is the
+# two hundred task AutomationBench roster, whose start encodes to about 600400 bytes with bodies
+# of 1625 to 2760 bytes, driven to Done under the declared workload: fifteen world calls a task,
+# a lost reply and the confirmation its recovery costs, identifiers shaped the way the transport
+# mints them, and every boundary the generation decided on along the way. What is measured is the
+# largest quiet point that roster has, which is the boundary after the last payload of the last
+# task is presented; the recorded number is beside the test that checks this ceiling still leaves
+# it the room it was chosen to leave. The ceiling sits 197152 bytes under the service's limit,
+# which is room for the command envelope around a payload whose own bytes this measures exactly,
+# and the measured profile sits well over a quarter under the ceiling, which is room for a roster
+# that grows or bodies that do.
+#
+# Both numbers matter in different directions. Too high and the service refuses the continuation
+# the generation was counting on. Too low and the generation refuses its own boundary and wedges
+# at the cap, which is the failure this whole change exists to remove, so the margin above the
+# measured profile is the one to keep honest as the profile moves.
+TURNOVER_PAYLOAD_CEILING_BYTES = 1_900_000
+assert TURNOVER_PAYLOAD_CEILING_BYTES < SERVICE_PAYLOAD_LIMIT_BYTES, (
+    "a ceiling at or above the service's own limit would let the generation submit a "
+    "continuation the service refuses"
+)
+
+# The first Activity ID, and the reason there is one. The SDK numbers Activities per execution
+# from one, so a generation that names its own IDs from a carried ordinal produces exactly the
+# strings the SDK would have produced while it has never continued, and keeps counting after it
+# has. Without it, a failure recorded after a boundary would publish an ID the same run without a
+# boundary would not.
+_FIRST_ACTIVITY_ORDINAL = 1
+
 
 class StreamProtocolError(ApplicationError):
     """A refusal carrying one code from the protocol's closed set.
@@ -220,6 +340,30 @@ class StreamProtocolError(ApplicationError):
             code,
             canonical_bytes(record).decode("utf-8"),
             type="ProtocolError",
+            non_retryable=True,
+        )
+
+
+class TurnoverPending(ApplicationError):
+    """The generation is between executions, so this Update was not admitted.
+
+    It is deliberately not a protocol refusal. The protocol's codes are a closed set of things
+    the agent's own request was wrong about, and this is not one of them: nothing the caller
+    sent is wrong and nothing about the generation has changed. What has happened is that the
+    generation has decided to continue as new and is waiting for the quiet point to do it, and
+    until then it accepts only the work that can bring the boundary about.
+
+    So this reaches the transport as its own type, the transport waits and sends the same
+    request again under the same Update ID, and the agent sees latency. A rejection costs the
+    generation nothing: the service does not count an Update it never accepted, which is what
+    makes waiting free of the very limit the generation is avoiding.
+    """
+
+    def __init__(self) -> None:
+        super().__init__(
+            "this generation is continuing as new; the same request reaches the execution that "
+            "follows",
+            type=TURNOVER_PENDING,
             non_retryable=True,
         )
 
@@ -310,11 +454,33 @@ class _Attempt:
     failure_retry_state: Optional[str] = None
 
 
+# The attempt fields one execution hands the next, taken from the carried row rather than listed
+# twice. What is not here is what a boundary does not need: the task itself, which the start
+# already carries, and the three the seal writes and nothing reads.
+_CARRIED_ATTEMPT_FIELDS = tuple(
+    row.name for row in fields(CarriedAttempt) if row.name != "attempt_id"
+)
+# The attempt fields that deliberately stay behind, so that a field added later is a choice
+# somebody made rather than a value that quietly stopped crossing.
+_UNCARRIED_ATTEMPT_FIELDS = (
+    "item",
+    "canonical_submission_text",
+    "environment_recovery_token",
+    "finalizer_key",
+    "deadline_expired",
+)
+
+
 @dataclass
 class _Obligation:
     item: TaskItem
     state: str = ASSIGNED
     candidate: Optional[PayloadCandidate] = None
+    # Whether the candidate was ever built. It is kept apart from the candidate itself because
+    # the two outlive each other by different lengths: the count of materializations is inside
+    # the projection every presentation attests against and has to hold for the life of the
+    # generation, and the bytes are needed only while an offer could still carry them.
+    materialized: bool = False
 
 
 @dataclass
@@ -392,6 +558,79 @@ class _Offer:
     attempt_id: Optional[str]
     visible_sha256: str
     wait_reason: Optional[str] = None
+
+
+# The eleven Updates a generation answers, named once so the journal can say which handler gave
+# an answer and the transport can decode it back into the type that handler returns.
+OWN = "claim_ownership"
+BIND = "claim_consumer"
+PULL = "pull"
+ASK = "info"
+SEAL = "seal_attempt"
+PRESENT = "commit_presentation"
+FINALIZE = "finalize_attempt"
+CLOSE = "close_queue"
+GRANT = "begin_environment_call"
+RELEASE = "end_environment_call"
+CONFIRM = "confirm_state"
+
+# What each of them answers with. A journal entry says which handler wrote it, and that is
+# enough to read the value back as the thing it is rather than as an untyped map.
+ANSWER_TYPES: Dict[str, Any] = {
+    OWN: OwnershipReceipt,
+    BIND: ConsumerReceipt,
+    PULL: OfferedMessage,
+    ASK: OfferedMessage,
+    SEAL: OfferedMessage,
+    PRESENT: PresentationAck,
+    FINALIZE: AttemptFinalized,
+    CLOSE: QueueClosed,
+    GRANT: EnvironmentLease,
+    RELEASE: EnvironmentLease,
+    CONFIRM: StreamState,
+}
+
+# How a journal entry says where its answer is. A value the generation keeps nowhere else is
+# written out; an answer that is one of the logical rows this generation already carries is a
+# pointer at that row, so a message offered once is stored once however many identifiers reached
+# it. The two failure kinds are apart because a protocol refusal is reproduced exactly from its
+# code and anything else is reproduced as the declared type and words it carried.
+BY_VALUE = "value"
+BY_ROW = "row"
+REFUSED = "protocol"
+FAILED = "failure"
+
+
+@dataclass
+class _Answer:
+    """What one exact Update was answered with, and where that answer is kept.
+
+    One entry per exact Update identifier, written when the handler completes and never
+    rewritten. Several identifiers may point at one logical row: a replacement owner asking for
+    the ending an earlier owner already got is a second identifier reaching one receipt, and both
+    identifiers have to keep working.
+
+    The epoch is provenance rather than a second key. The service deduplicates on the identifier
+    alone, and every identifier this runtime builds already carries its owner, so comparing the
+    epoch again would make this stricter than the thing it is standing in for.
+
+    A recipe is a second way of keeping a value, not a second kind of answer. Where an answer can
+    be made again out of what the generation's start already holds, the recipe says how and the
+    digest says which bytes it has to come out as, and the value itself is left out of the
+    carrier. Anything a recipe cannot reproduce exactly keeps its literal value, and the choice
+    is made by rebuilding at the time of writing rather than by reasoning about which offers
+    ought to be reproducible.
+    """
+
+    handler: str
+    epoch: int
+    kind: str
+    row: str = ""
+    code: str = ""
+    type_name: str = ""
+    message: str = ""
+    value: Optional[Dict[str, Any]] = None
+    recipe: str = ""
 
 
 @workflow.defn(name="ShogymStreamV2")
@@ -505,6 +744,196 @@ class StreamWorkflow:
         self._operation_ticket = 0
         self._done_presented = False
         self._draining = False
+        # What an earlier execution of this generation already did, kept as counts because the
+        # rows behind them are read as counts and nothing else. Every reader of these adds the
+        # carried number to what this execution has done since.
+        self._carried_ownership_claims = 0
+        self._carried_offers = 0
+        self._carried_eligibilities = 0
+        self._carried_wait_reasons: Dict[str, int] = {}
+        self._carried_handed_out: Set[str] = set()
+        # The Activity ordinal this generation numbers its own Activities from. The SDK would
+        # number them per execution; this counts across the chain, so an ID says which Activity
+        # of the generation it was rather than which of the execution.
+        self._activity_ordinal = _FIRST_ACTIVITY_ORDINAL
+        # The Updates this execution has accepted, and whether the generation has decided to
+        # continue as new. The counter is this generation's own: the service counts what it
+        # admitted, and only a count kept here is a fact a replay produces again.
+        self._updates = 0
+        self._post_latch = 0
+        self._post_latch_repeats = 0
+        self._post_latch_claims = 0
+        self._turnover_requested = False
+        # Whether the branch that turns this generation over is available to this execution.
+        # It is settled once, at the latch, and it is what everything the latch switches on
+        # reads: an execution the branch is unavailable to holds no traffic back and behaves
+        # exactly as it did before there was a boundary to reach.
+        self._turnover_available = False
+        # How many boundaries this generation has crossed, and the size that stopped it crossing
+        # another. Neither is configuration and neither is in any hash: the first is operational
+        # metadata and the second is what a launcher reads to say the profile was not supported.
+        self._turnovers = 0
+        # Why this generation gave up on a boundary, and the size that decided it where size is
+        # what decided it. A generation that has given up serves out the execution it is in.
+        self._turnover_refused: Optional[str] = None
+        self._turnover_refused_bytes: Optional[int] = None
+        # The store reads this generation has in flight, and how many it has finished. A claim
+        # reads the store before it may swap the epoch, and that read is an Activity with its own
+        # timeout and its own retries: a batch can legitimately take minutes without moving
+        # anything a projection would notice. Both are operational, in no hash and in no
+        # projection, and they exist so a caller held off for a boundary can tell a generation
+        # working towards one from a generation that has stopped.
+        self._verifying = 0
+        self._verification_batches = 0
+        # Every accepted Update this generation has completed, by the exact identifier it was
+        # answered under. It is the whole of what a repeated identifier is answered with, and it
+        # is kept for as long as the generation runs rather than for one execution: an owner
+        # paused with an unanswered request is still owed its answer two boundaries later, and
+        # nothing here can know when a caller has stopped asking.
+        #
+        # The service keeps the same record inside one execution and that record does not cross,
+        # so this is that record made to cross. Several identifiers may name one logical row, and
+        # every one of them keeps working.
+        self._journal: Dict[str, _Answer] = {}
+        # How many accepted handlers are running. A boundary waits for all of them, and a caller
+        # held off for that boundary has to be able to see that it is waiting for something: an
+        # owner replaced while its filing was still grading leaves work the projection no longer
+        # names anywhere, and a transport comparing projections would read that as a generation
+        # that had stopped.
+        self._unfinished = 0
+        # Whether this execution was continued from another one of the same generation. It is
+        # what makes a carrier legal, and it is also what tells the profile marker below that
+        # this is not a generation being created.
+        self._continued = workflow.info().continued_run_id is not None
+        self._restore(start.carry)
+
+    def _restore(self, carry: Optional[StreamCarry]) -> None:
+        """Take the projection an earlier execution handed over, or refuse the pair.
+
+        A carrier is legal exactly where a continuation is. An execution the service started
+        fresh may not be handed a projection, because a caller composing one could write a
+        cursor, a score, a presentation or an ownership epoch into a generation that never
+        served any of them. An execution continued from another may not be handed nothing,
+        because the generation would come back as an empty roster under a fenced writer and
+        serve the whole run again. So the two are checked against each other rather than the
+        carrier being trusted for saying it is one.
+
+        The version and the configuration identity are checked next, and for the same reason. A
+        carrier this code cannot read is refused rather than read half way, and one composed
+        against another generation is refused before any of it is believed.
+
+        A carrier that cannot be read at all is refused the same way, and reading it means all of
+        it: the decoding, and the writing of what was decoded over the state the start rebuilt. A
+        value whose shape is wrong is found in the second of those as often as the first, and what
+        either can raise is a codec's failure rather than a generation's. Left alone that would
+        fail the Workflow Task and be retried for ever on bytes that are never going to decode. So
+        the whole reading is one refusal, and the execution ends saying it could not read what it
+        was handed. The refusals raised inside it are already the answer and pass through.
+        """
+        if carry is None:
+            if self._continued:
+                raise _refuse_carrier("a continued execution was handed no carried projection")
+            return
+        if not self._continued:
+            raise _refuse_carrier(
+                "a generation started fresh was handed a carried projection, and carrying one "
+                "is legal only where an execution continues another"
+            )
+        if carry.carrier_schema_version != CARRIER_SCHEMA_VERSION:
+            raise _refuse_carrier(
+                f"the carried projection is version {carry.carrier_schema_version} and this "
+                f"code reads version {CARRIER_SCHEMA_VERSION}"
+            )
+        try:
+            projection = unpack_carrier(carry, workflow.payload_converter())
+            if projection.configuration_hash != self._configuration_hash:
+                raise _refuse_carrier(
+                    "the carried projection was composed against another generation"
+                )
+            self._apply(projection)
+        except ApplicationError:
+            raise
+        except Exception as unreadable:  # noqa: BLE001 - an unreadable carrier is refused whole
+            raise _refuse_carrier(
+                f"the carried projection could not be read: {unreadable}"
+            ) from unreadable
+
+    def _apply(self, carry: CarriedProjection) -> None:
+        """Write the carried projection over the state the start alone rebuilt.
+
+        The order is the order the fields depend on each other in: the issued identifiers are
+        derived from the hidden ordinal, so the ordinal is taken first and the identifiers are
+        rebuilt from it rather than carried. Everything else is written where it belongs.
+        """
+        self._ownership_epoch = carry.ownership_epoch
+        self._fencing_token_hash = carry.fencing_token_hash
+        self._carried_ownership_claims = carry.ownership_claims
+        self._consumer_id = carry.consumer_id
+        self._claim_epoch = carry.claim_epoch
+        self._cursor = carry.cursor
+        self._queue_closed = carry.queue_closed
+        self._seal_ordinal = carry.seal_ordinal
+        self._wait_count = carry.wait_count
+        self._carried_wait_reasons = dict(carry.wait_reasons)
+        self._carried_offers = carry.offer_count
+        self._carried_eligibilities = carry.eligibility_count
+        self._carried_handed_out = set(carry.handed_out_attempt_ids)
+        self._activity_ordinal = carry.activity_ordinal
+        self._verification_batches = carry.verification_batches
+        self._turnovers = carry.turnovers
+        for row in carry.attempts:
+            attempt = self._attempts[row.attempt_id]
+            for name in _CARRIED_ATTEMPT_FIELDS:
+                setattr(attempt, name, getattr(row, name))
+        for owed in carry.obligations:
+            obligation = self._obligations[owed.attempt_id]
+            obligation.state = owed.state
+            obligation.materialized = owed.materialized
+            obligation.candidate = owed.candidate
+        self._presented = {row.message_id: row for row in carry.presented}
+        self._committed_blobs = list(carry.committed_blobs)
+        self._pull_requests = _bindings(carry.pull_requests)
+        self._info_requests = _bindings(carry.info_requests)
+        self._terminal_requests = _bindings(carry.terminal_requests)
+        self._finalize_requests = {
+            row.request_id: _BoundFinalization(identity=row.identity, receipt=row.receipt)
+            for row in carry.finalize_requests
+        }
+        self._attestation_identities = {
+            row.attestation_id: row.identity for row in carry.attestations
+        }
+        self._attestations = {row.attestation_id: row.ack for row in carry.attestations}
+        # The journal is restored here, in the constructor, because the first Update of a fresh
+        # execution can be validated before anything else runs and it has to find its answer.
+        self._journal = {
+            row[0]: _Answer(
+                handler=row[1],
+                epoch=row[2],
+                kind=row[3],
+                row=row[4],
+                code=row[5],
+                type_name=row[6],
+                message=row[7],
+                value=row[8],
+                recipe=row[9],
+            )
+            for row in carry.journal
+        }
+        # Every recipe is rebuilt and checked here, against the digest the presentation of that
+        # message committed to. A recipe is a promise that the bytes can be made again from what
+        # the start already holds, and this is where the promise is kept rather than assumed: a
+        # carrier whose recipe does not rebuild what was presented is refused, not served.
+        for update_id, answer in self._journal.items():
+            if answer.recipe:
+                answer.value = self._rebuilt(update_id, answer)
+        # The identifiers this generation has already minted, rebuilt rather than carried. Every
+        # one of them is either preallocated by the manifest, which the start above already put
+        # in the set, or drawn from the keyed stream at an ordinal below the one reached, which
+        # is exactly what this walks. Carrying the set instead would carry a value derivable
+        # from a number, and a set has no order to serialize deterministically.
+        for ordinal in range(carry.hidden_ordinal):
+            self._issued_ids.add(stream_message_id(self._id_key, ordinal))
+        self._hidden_ordinal = carry.hidden_ordinal
 
     @workflow.run
     async def run(self, start: StreamStart) -> StreamOutcome:
@@ -522,10 +951,25 @@ class StreamWorkflow:
         replaying and a new one cannot be created without a profile, whichever entry point
         starts it.
         """
-        if start.profile == LEGACY and workflow.patched("profile-required-at-creation"):
+        if (
+            start.profile == LEGACY
+            and not self._continued
+            and workflow.patched("profile-required-at-creation")
+        ):
             raise StreamProtocolError("configuration_mismatch")
         while not self._done_presented:
             await self._wait_for_done_or_a_deadline()
+            # Every deadline that has come due is applied before a boundary is even considered.
+            # The wait above can end on the turnover term rather than on the clock, and an
+            # attempt whose deadline passed while it did would otherwise cross still active,
+            # with its ending written by the execution that came after rather than the one the
+            # clock ran in.
+            self._expire_what_is_due()
+            out_of_reach = self._boundary_is_out_of_reach()
+            if out_of_reach is not None:
+                self._give_up_on_the_boundary(out_of_reach)
+            elif self._turnover_ready():
+                self._turn_over()
         await workflow.wait_condition(workflow.all_handlers_finished)
         return StreamOutcome(
             generation_state=self._generation_state,
@@ -548,6 +992,11 @@ class StreamWorkflow:
         An expiry already recorded and not yet acted on is the other thing this waits for. It
         is applied at the top of every pass, so the wait below can end on the stream falling
         quiet as well as on the clock.
+
+        A generation that has decided to continue as new waits here for its boundary, which is
+        the third thing. The expiry is applied first, so a deadline that came due never crosses
+        unapplied, and the boundary is only ever reached from the wait rather than from inside
+        a handler.
         """
         self._end_expired()
         armed = self._armed_deadlines()
@@ -556,6 +1005,8 @@ class StreamWorkflow:
                 lambda: self._done_presented
                 or bool(self._armed_deadlines())
                 or self._expiry_can_be_applied()
+                or self._turnover_ready()
+                or self._boundary_is_out_of_reach() is not None
             )
             return
         attempt_id, deadline = min(armed.items(), key=lambda row: (row[1], row[0]))
@@ -565,7 +1016,9 @@ class StreamWorkflow:
                 await workflow.wait_condition(
                     lambda: self._done_presented
                     or self._armed_deadlines() != armed
-                    or self._expiry_can_be_applied(),
+                    or self._expiry_can_be_applied()
+                    or self._turnover_ready()
+                    or self._boundary_is_out_of_reach() is not None,
                     timeout=timedelta(milliseconds=remaining),
                 )
                 return
@@ -620,6 +1073,26 @@ class StreamWorkflow:
         attempt.deadline_expired = True
         self._end_expired()
 
+    def _expire_what_is_due(self) -> None:
+        """Record every armed deadline the clock has already passed, then act on what it can.
+
+        The timed wait records an expiry when it ends on the clock, and that is the ordinary
+        path. It is not the only one. The wait can also end on a generation deciding to continue
+        as new, and it returns then without looking at whether a deadline came due while it
+        waited: the flag would still be unset, the attempt would still be active, and a boundary
+        that only ever checked the flag would carry the whole thing across and let the next
+        execution write an ending the clock of this one had already reached.
+
+        So this asks the question the flag cannot answer: is any armed deadline at or before the
+        time this generation is at now. The order is fixed rather than incidental, because two
+        that came due together have to be recorded in the same order on a replay.
+        """
+        now = self._now_ms()
+        for attempt_id, deadline in sorted(self._armed_deadlines().items()):
+            if deadline <= now:
+                self._expire(attempt_id, deadline)
+        self._end_expired()
+
     def _end_expired(self) -> None:
         """End every attempt whose deadline has passed, once nothing is part way through.
 
@@ -647,11 +1120,375 @@ class StreamWorkflow:
                 continue
             self._finalize(attempt, DEADLINE)
 
+    # Continuing before the service's cap.
+
+    def _count_update(self, *, repeatable: bool = False, claim: bool = False) -> None:
+        """Count one accepted Update, and latch the turnover when the count says to.
+
+        This runs at the top of every handler, which is after the service accepted the Update
+        and after any validator let it through, so what it counts is exactly what the service
+        counts against its cap. A refusal raised inside a handler is counted for the same
+        reason: the service counted it too.
+
+        The service publishes a suggestion of its own, one boolean with three possible causes,
+        and this generation cannot tell which of them fired. It is taken as a second trigger
+        rather than the trigger: a count kept here is deterministic and replays, and it is the
+        one that has to be right.
+
+        The marker this code's branch is gated by is read here, once, at the moment the decision
+        is taken and never before it. Where it is read decides what an execution that predates
+        the branch does. Read at the top of the run method it would be read during every replay
+        of such a history, answered no, and remembered as no, so the generation could never
+        acquire a turnover when live traffic reached it. Read here, a history that never latched
+        never asks, and the first ask is the live Update that latches.
+
+        What the answer is used for matters as much as when it is asked. An execution whose
+        replay latches and is then told the branch is not available cannot turn over, and it
+        must not start holding traffic back either: it has no boundary to bring about, so
+        gating would leave it unable to serve and unable to continue, which is worse than the
+        cap it was trying to avoid. So the answer is kept, and everything the latch switches on
+        reads it rather than the latch.
+        """
+        self._updates += 1
+        if self._turnover_requested:
+            self._post_latch += 1
+            if repeatable:
+                self._post_latch_repeats += 1
+            if claim:
+                self._post_latch_claims += 1
+            return
+        if self._updates >= TURNOVER_TRIGGER or workflow.info().is_continue_as_new_suggested():
+            self._turnover_requested = True
+            self._turnover_available = workflow.patched(
+                "generation-continues-before-the-update-cap"
+            )
+
+    def _reaching_for_a_boundary(self) -> bool:
+        """Whether this generation is holding traffic back in order to reach a boundary.
+
+        Three things have to be true together, and the middle one is the one that is easy to
+        forget. The generation has to have decided to turn over. The branch that turns it over
+        has to be available to this execution, which an execution recorded before the branch
+        existed is told it is not. And the carrier has to still fit, because a generation that
+        has measured one too large to hand on is serving out the execution it is in.
+
+        Where any of the three fails, this generation holds nothing back and behaves exactly as
+        it did before there was a boundary to reach. That is the whole of what an execution the
+        branch is unavailable to should do: it cannot continue, so it must keep serving, and
+        gating it would leave it able to do neither.
+
+        It is also what a caller waits on. A transport rejected for a boundary reads this to
+        tell a generation working towards one from a generation that has stopped, so it says
+        the same thing to the gate and to the wait.
+        """
+        return self._turnover_available and self._turnover_refused is None
+
+    def _admit(self, progress: bool, *, repeatable: bool = False, claim: bool = False) -> None:
+        """Reject an Update that cannot bring this generation to its boundary.
+
+        Once the generation is reaching for a boundary, the only Updates worth accepting are the
+        ones that can make it quiet. Everything else is rejected here, before acceptance, which
+        the service charges nothing for: a rejected Update writes no history and spends none of
+        the cap. The transport waits and sends the same request, under the same Update ID, at
+        the execution that comes next, so the agent sees latency and never a refusal.
+
+        The reserve is a ceiling on the whole of it, and it is not the only one. Several of the
+        operations on the whitelist can be sent again and again under fresh identifiers: a
+        confirmation mints a new one every time by design, and a claim refused on a stale epoch
+        can be made once more. A ceiling on the total alone would let those spend every slot,
+        and the end of a held grant, which nothing else can send, would then be refused for the
+        want of a slot that a repeat had taken. So the repeatable ones have a small allowance of
+        their own inside the reserve, and what is left is kept for the work that is named: the
+        presentation commit of the one message that can be pending, the end of the one grant
+        that can be held, and the retry of the one seal that can be prepared.
+
+        This runs in a validator, so it is synchronous and reads without writing. Every
+        precondition it reads is read again in the handler, because state can move between the
+        two and only the handler's reading decides anything.
+        """
+        if not self._reaching_for_a_boundary():
+            return
+        if not progress or self._post_latch >= ADMISSION_RESERVE:
+            raise TurnoverPending()
+        if repeatable and self._post_latch_repeats >= ADMISSION_REPEATS:
+            raise TurnoverPending()
+        if claim and self._post_latch_claims >= ADMISSION_CLAIMS:
+            raise TurnoverPending()
+
+    def _turnover_ready(self) -> bool:
+        """Whether this generation may continue as new at this exact moment.
+
+        The boundary is stricter than either lock. Eight active attempts do not block it and a
+        deadline still in the future does not block it: the first is state and the second is an
+        absolute time that crosses and is armed again. What blocks it is anything part way
+        through, because the far side of a boundary is a fresh history that cannot finish it: a
+        message offered and not yet attested to, a grant held for a call to a world this stream
+        cannot see, a seal prepared and not committed, an expiry that came due and could not be
+        applied, and any handler still running, whose answer a boundary would strand.
+
+        Whether this execution may take the branch at all was settled once, at the latch, and is
+        read back rather than asked again. A generation that has already measured a carrier too
+        large to hand on does not measure it again either: the carrier grows with what the
+        generation serves and the ceiling does not move, so asking a second time would spend an
+        activation to reach the same answer, and asking at every quiet point would spend all of
+        them.
+        """
+        if not self._reaching_for_a_boundary():
+            return False
+        return self._at_a_boundary() and workflow.all_handlers_finished()
+
+    def _boundary_is_out_of_reach(self) -> Optional[str]:
+        """Why this generation can no longer get to the boundary it decided to take, if it cannot.
+
+        The gate bounds what is accepted after the latch, and what it bounds is attempts rather
+        than successes. The work that clears a boundary can fail and be sent again: a presentation
+        whose references the store cannot produce is refused, the transport builds a fresh
+        attestation for the same message and sends it again, and every one of those is an accepted
+        Update. Nothing about that is misbehaviour, and it is the transport's supported repair
+        path.
+
+        Once an allowance that gates the work which could clear the boundary is spent, nothing
+        that would clear it will be admitted again. If the generation is already quiet the
+        boundary is taken and this never runs. If it is not, then the thing it is holding can
+        only be cleared by an Update that will now be refused, and the boundary it is holding
+        traffic back for can never happen. That is what this recognises, and it answers with
+        which allowance it was so a launcher can say which.
+
+        A handler still running is the case that is not yet lost, and it is excluded. A claim
+        reading the store finishes on its own, without any further Update, and the generation may
+        be quiet the moment it does.
+        """
+        if not self._reaching_for_a_boundary():
+            return None
+        if not workflow.all_handlers_finished():
+            return None
+        if self._at_a_boundary():
+            return None
+        if self._post_latch >= ADMISSION_RESERVE:
+            return ADMISSION_EXHAUSTED
+        # And the same thing one allowance smaller. A claim is the only call on the whitelist
+        # that no other call can substitute for: an owner that went away leaves a grant that
+        # only its replacement can end, and only a claim installs a replacement. A claim can
+        # also fail without installing anything, because it reads the store before it swaps the
+        # epoch and a store that cannot produce what it is asked for refuses the claim. Four of
+        # those spend the claim allowance without anybody having taken the generation over, and
+        # the claim that would have succeeded once the store came back is then refused for the
+        # want of a slot. The total is nowhere near spent, so the line above does not see it.
+        #
+        # The other allowance is not here, and that is deliberate rather than an oversight. What
+        # the calls sharing it do is read the state through the write path, bind a consumer and
+        # close the queue, and none of those clears anything a boundary waits for: a pending
+        # message needs its presentation commit, a held grant needs its end, a prepared seal
+        # needs its filing, and every one of those draws on the reserve at large. So spending
+        # that allowance closes no route, and giving a boundary up because it was spent would be
+        # giving one up that was still perfectly reachable.
+        if self._post_latch_claims >= ADMISSION_CLAIMS:
+            return RECOVERY_CLAIMS_EXHAUSTED
+        return None
+
+    def _give_up_on_the_boundary(self, reason: str) -> None:
+        """Stop holding traffic back for a boundary that can no longer be reached.
+
+        This is the same ending as a carrier that will not fit, reached a different way, and it
+        behaves the same way on purpose: the generation records why, releases the gate, and goes
+        back to serving out the execution it is in. What it must not do is keep holding traffic
+        back. A generation that can neither clear what it is holding nor hand itself on would be
+        wedged where it stands, which is worse than the cap the boundary existed to avoid.
+
+        The reason is recorded where a launcher reads it, because the residual is real: this
+        generation will serve until it reaches the service cap, and a run that ends there ends
+        without the boundary that was supposed to carry it past. Which allowance ran out is part
+        of that reason, because the two say different things about the run: one is a generation
+        whose clearing work failed over and over, and the other is a generation nobody could take
+        over while the store was unreadable.
+        """
+        self._turnover_refused = reason
+
+    def _at_a_boundary(self) -> bool:
+        """Whether nothing about this generation is part way through."""
+        if self._generation_state != OPEN or self._draining or self._done_presented:
+            return False
+        if self._pending is not None or self._operation_in_flight:
+            return False
+        if self._environment_call is not None:
+            return False
+        # A deadline that has come due is not something to carry across, whether or not its
+        # expiry has been written down yet. The flag is the record of a clock that was read;
+        # the comparison beside it is the clock itself, and a boundary that trusted only the
+        # record would cross with an ending owed and let the next execution write it.
+        now = self._now_ms()
+        return not any(
+            attempt.state == SEALING
+            or attempt.deadline_expired
+            or (attempt.deadline_at is not None and attempt.deadline_at <= now)
+            for attempt in self._attempts.values()
+        )
+
+    def _turn_over(self) -> None:
+        """Hand this generation to a fresh execution, or record why it could not be handed on.
+
+        The replaced start is the original one with the projection beside it, so the identity a
+        resume is held to does not move and the seal key an environment deduplicates on does
+        not either. It is measured as the service will encode it, with the converter the service
+        was configured with, because what has to fit is the argument and not the projection
+        inside it.
+
+        A carrier that will not fit is not a fault and it is not a drain. The generation records
+        the size it measured and keeps serving: the run is outside the profile this package
+        supports, the launcher reads the marker and says so, and nothing about the refusal is
+        visible to the agent.
+        """
+        replaced = replace(self._start, carry=self._carry())
+        encoded = workflow.payload_converter().to_payloads([replaced])[0].ByteSize()
+        if encoded > TURNOVER_PAYLOAD_CEILING_BYTES:
+            self._turnover_refused = CARRIER_TOO_LARGE
+            self._turnover_refused_bytes = encoded
+            return
+        workflow.continue_as_new(replaced)
+
+    def _carry(self) -> StreamCarry:
+        """Write out everything the next execution has to find, in canonical order.
+
+        Every unordered collection here is sorted, and every ordered one keeps its order. The
+        distinction is not tidiness: this value becomes a command in a history that has to
+        replay to the same bytes, and a set serialized in the order a hash table happened to
+        hold it would not.
+
+        Three groups of things are absent, each for its own reason. What the start already says
+        is not repeated, because the start rides beside this. What a legal boundary forbids is
+        not carried, because there is none of it to carry. And the identifiers already issued
+        are not carried, because they are derivable from the ordinal that is.
+        """
+        return pack_carrier(
+            CarriedProjection(
+                configuration_hash=self._configuration_hash,
+                ownership_epoch=self._ownership_epoch,
+                fencing_token_hash=self._fencing_token_hash,
+                ownership_claims=self._ownership_claims(),
+                consumer_id=self._consumer_id,
+                claim_epoch=self._claim_epoch,
+                cursor=self._cursor,
+                queue_closed=self._queue_closed,
+                hidden_ordinal=self._hidden_ordinal,
+                seal_ordinal=self._seal_ordinal,
+                wait_count=self._wait_count,
+                wait_reasons=dict(sorted(self._wait_reason_counts().items())),
+                offer_count=self._offer_count(),
+                eligibility_count=self._eligibility_count(),
+                handed_out_attempt_ids=sorted(self._handed_out()),
+                activity_ordinal=self._activity_ordinal,
+                verification_batches=self._verification_batches,
+                attempts=[
+                    CarriedAttempt(
+                        attempt_id=attempt_id,
+                        **{name: getattr(attempt, name) for name in _CARRIED_ATTEMPT_FIELDS},
+                    )
+                    for attempt_id, attempt in sorted(self._attempts.items())
+                ],
+                obligations=[
+                    CarriedObligation(
+                        attempt_id=attempt_id,
+                        state=obligation.state,
+                        materialized=obligation.materialized,
+                        # The bytes stay only while an offer could still carry them. An obligation
+                        # that has been presented, or that ended without being rendered, will never
+                        # be offered again, and its candidate is the largest thing in here.
+                        candidate=(
+                            obligation.candidate
+                            if obligation.state in (MATERIALIZED, ELIGIBLE, OFFERED)
+                            else None
+                        ),
+                    )
+                    for attempt_id, obligation in sorted(self._obligations.items())
+                ],
+                presented=list(self._presented.values()),
+                committed_blobs=sorted(set(self._committed_blobs)),
+                pull_requests=self._carried_bindings(self._pull_requests),
+                info_requests=self._carried_bindings(self._info_requests),
+                terminal_requests=self._carried_bindings(self._terminal_requests),
+                finalize_requests=[
+                    CarriedFinalization(
+                        request_id=request_id,
+                        identity=bound.identity,
+                        receipt=bound.receipt,
+                    )
+                    for request_id, bound in sorted(self._finalize_requests.items())
+                ],
+                attestations=[
+                    CarriedAttestation(
+                        attestation_id=attestation_id,
+                        identity=identity,
+                        ack=self._attestations[attestation_id],
+                    )
+                    for attestation_id, identity in sorted(self._attestation_identities.items())
+                ],
+                journal=[
+                    [
+                        update_id,
+                        answer.handler,
+                        answer.epoch,
+                        answer.kind,
+                        answer.row,
+                        answer.code,
+                        answer.type_name,
+                        answer.message,
+                        # A recipe carries an offer instead of its bytes. The bytes are dropped
+                        # here and made again at restore out of what the start already holds,
+                        # which is what keeps a whole roster of offers from being written twice.
+                        "" if answer.recipe else answer.value,
+                        answer.recipe,
+                    ]
+                    for update_id, answer in sorted(self._journal.items())
+                ],
+                turnovers=self._turnovers + 1,
+            ),
+            workflow.payload_converter(),
+        )
+
+    def _carried_bindings(self, table: Dict[str, _Bound]) -> List[CarriedBinding]:
+        """One request table, written out with the bytes of what nobody can ask for again.
+
+        A binding answers a retry of the request that made it, and it answers with the reserved
+        bytes only while the message is unpresented. Afterwards the same request is told the
+        message has been presented, and the bytes are never read again.
+
+        At a legal boundary every bound message has been presented: a message is pending from the
+        moment it is offered until its attestation commits, and a pending message is the first
+        thing the boundary refuses. So the bytes are dropped here, and they are the largest thing
+        the table would otherwise carry: one whole task body per attempt, for the life of the
+        generation. The identity and the message's identifier stay, because those are what the
+        retry is judged on.
+        """
+        return [
+            CarriedBinding(
+                request_id=request_id,
+                identity=bound.identity,
+                message=(
+                    replace(bound.message, visible_text="")
+                    if bound.message.message_id in self._presented
+                    else bound.message
+                ),
+            )
+            for request_id, bound in sorted(table.items())
+        ]
+
+    def _next_activity_id(self) -> str:
+        """The ID for the next Activity this generation schedules, counted across the chain."""
+        ordinal = self._activity_ordinal
+        self._activity_ordinal += 1
+        return str(ordinal)
+
     # The Updates a gateway calls.
 
     @workflow.update
     async def claim_ownership(self, claim: OwnershipClaim) -> OwnershipReceipt:
         """Take the generation from whoever held it, by compare and swap on the epoch.
+
+        The exact claim sent again is answered with what it was answered with the first time,
+        whether that was a receipt or a refusal. Within one execution the service does that
+        itself; across a boundary it cannot, because its cache of an Update's outcome belongs to
+        the execution that accepted it. A claim replayed after a boundary would otherwise read
+        the epoch it already moved and be told it was fenced by itself.
 
         This is the first call a writer makes, at creation and again at every resume, and it is
         the only way an epoch moves. The compare is the epoch the claimant read: a claimant that
@@ -692,6 +1529,24 @@ class StreamWorkflow:
         changing a world this stream cannot reach and nothing here can fence it. The new owner
         ends it by name before the generation grants another one.
         """
+        self._count_update(claim=True)
+        return await self._answering(
+            OWN, claim.previous_epoch, lambda: self._claim_ownership(claim)
+        )
+
+    @claim_ownership.validator
+    def _claim_ownership_admitted(self, claim: OwnershipClaim) -> None:
+        # A claim is on the progress whitelist, and it is the one call on it that nothing else
+        # can substitute for: an environment call abandoned by an owner that went away is ended
+        # by name, and only the owner that replaces it can end it. It is repeatable, because a
+        # claim refused on a stale epoch can be made once more, so it has an allowance rather
+        # than the reserve at large. That allowance is its own and not the one confirmations
+        # share, because confirmations spending theirs must not lock out the claim a recovery
+        # depends on.
+        self._admit(True, claim=True)
+
+    async def _claim_ownership(self, claim: OwnershipClaim) -> OwnershipReceipt:
+        """Check the claim, read the store, and swap the epoch."""
         self._check_claim(claim)
         if self._committed_blobs:
             await self._verify_committed_blobs()
@@ -724,7 +1579,7 @@ class StreamWorkflow:
                 restored_attempts=restored,
             )
         )
-        return OwnershipReceipt(
+        receipt = OwnershipReceipt(
             ownership_epoch=self._ownership_epoch,
             previous_epoch=previous,
             fencing_token_hash=self._fencing_token_hash,
@@ -732,6 +1587,7 @@ class StreamWorkflow:
             claimant_id=claim.claimant_id,
             reason=claim.reason,
         )
+        return receipt
 
     @workflow.update
     async def claim_consumer(self, claim: ConsumerClaim, writer: Writer) -> ConsumerReceipt:
@@ -739,8 +1595,21 @@ class StreamWorkflow:
 
         The same claim presented twice returns the same receipt, because a lost response must
         not cost a caller its stream. A different one is refused, before any message is
-        offered and without touching state.
+        offered and without touching state. The exact Update sent again is answered from what it
+        was answered with, so a refusal stays a refusal across a boundary rather than becoming a
+        receipt because the conditions behind it moved.
         """
+        self._count_update(repeatable=True)
+        return await self._answering(
+            BIND, writer.ownership_epoch, _as_awaited(lambda: self._claim_consumer(claim, writer))
+        )
+
+    @claim_consumer.validator
+    def _claim_consumer_admitted(self, claim: ConsumerClaim, writer: Writer) -> None:
+        # Binding the consumer clears nothing a boundary is waiting for, so it waits.
+        self._admit(False, repeatable=True)
+
+    def _claim_consumer(self, claim: ConsumerClaim, writer: Writer) -> ConsumerReceipt:
         if self._generation_state != OPEN:
             raise StreamProtocolError("closed_stream")
         self._require_writer(writer)
@@ -753,12 +1622,13 @@ class StreamWorkflow:
             self._claim_epoch = 1
         elif self._consumer_id != claim.consumer_id:
             raise StreamProtocolError("consumer_conflict")
-        return ConsumerReceipt(
+        receipt = ConsumerReceipt(
             consumer_id=self._consumer_id,
             claim_epoch=self._claim_epoch,
             initial_cursor=self._start.initial_cursor,
             configuration_hash=self._configuration_hash,
         )
+        return receipt
 
     @workflow.update
     async def pull(self, request: PullRequest, writer: Writer) -> OfferedMessage:
@@ -769,11 +1639,17 @@ class StreamWorkflow:
         cursor and only when nothing is outstanding: a second request never inherits the first
         one's offer.
         """
-        ticket = self._take_lock(writer)
-        try:
-            return self._pull(request)
-        finally:
-            self._release_lock(ticket)
+        self._count_update()
+        return await self._answering(
+            PULL,
+            writer.ownership_epoch,
+            _as_awaited(lambda: self._locked(writer, self._pull, request)),
+        )
+
+    @pull.validator
+    def _pull_admitted(self, request: PullRequest, writer: Writer) -> None:
+        # A pull that selects anything reserves it, which is the opposite of a quiet point.
+        self._admit(False)
 
     @workflow.update
     async def info(self, request: InfoRequest, writer: Writer) -> OfferedMessage:
@@ -787,11 +1663,17 @@ class StreamWorkflow:
         read. A Query would have none of those and could be answered by a transport the stream
         has already fenced.
         """
-        ticket = self._take_lock(writer)
-        try:
-            return self._info(request)
-        finally:
-            self._release_lock(ticket)
+        self._count_update()
+        return await self._answering(
+            ASK,
+            writer.ownership_epoch,
+            _as_awaited(lambda: self._locked(writer, self._info, request)),
+        )
+
+    @info.validator
+    def _info_admitted(self, request: InfoRequest, writer: Writer) -> None:
+        # An answer minted here is reserved and then presented, so it waits like a pull.
+        self._admit(False)
 
     @workflow.update
     async def seal_attempt(self, request: SealRequest, writer: Writer) -> OfferedMessage:
@@ -801,11 +1683,24 @@ class StreamWorkflow:
         contains no await. The acknowledgement is built there and returned after it, so a
         crash anywhere earlier leaves a stream that has not acknowledged anything.
         """
-        ticket = self._take_lock(writer)
-        try:
-            return await self._seal(request, writer)
-        finally:
-            self._release_lock(ticket)
+        self._count_update()
+        return await self._answering(
+            SEAL,
+            writer.ownership_epoch,
+            lambda: self._locked_await(writer, self._seal, request, writer),
+        )
+
+    @seal_attempt.validator
+    def _seal_attempt_admitted(self, request: SealRequest, writer: Writer) -> None:
+        # A seal prepared and not committed is one of the things a boundary refuses to cross,
+        # and the exact filing that prepared it is the only thing that can finish it. Every
+        # other filing waits. The state read here is read again in the handler.
+        prepared = self._attempts.get(request.metadata.attempt_id)
+        self._admit(
+            prepared is not None
+            and prepared.state == SEALING
+            and prepared.terminal_request_id == request.metadata.request_id
+        )
 
     @workflow.update
     async def commit_presentation(
@@ -818,11 +1713,22 @@ class StreamWorkflow:
         here. Everything in the attestation is checked against something already held here, so
         this is a verification and not a report. The cursor advances only on the way out.
         """
-        ticket = self._take_lock(writer)
-        try:
-            return await self._commit_presentation(commit, writer)
-        finally:
-            self._release_lock(ticket)
+        self._count_update()
+        return await self._answering(
+            PRESENT,
+            writer.ownership_epoch,
+            lambda: self._locked_await(writer, self._commit_presentation, commit, writer),
+        )
+
+    @commit_presentation.validator
+    def _commit_presentation_admitted(
+        self, commit: PresentationCommit, writer: Writer
+    ) -> None:
+        # Attesting to the message this generation is holding is exactly the work that makes a
+        # boundary quiet, so it is admitted after the latch and nothing else here is.
+        self._admit(
+            self._pending is not None and self._pending.message.message_id == commit.message_id
+        )
 
     @workflow.update
     async def finalize_attempt(
@@ -836,21 +1742,32 @@ class StreamWorkflow:
         whose terminal was accepted is the seal's, whatever became of it, and an attempt with a
         result outstanding is a caller's until that result is presented.
         """
-        ticket = self._take_lock(writer)
-        try:
-            return self._finalize_requested(request)
-        finally:
-            self._release_lock(ticket)
+        self._count_update()
+        return await self._answering(
+            FINALIZE,
+            writer.ownership_epoch,
+            _as_awaited(lambda: self._locked(writer, self._finalize_requested, request)),
+        )
+
+    @finalize_attempt.validator
+    def _finalize_attempt_admitted(self, request: FinalizeRequest, writer: Writer) -> None:
+        # Ending an attempt clears nothing a boundary is waiting for, so it waits.
+        self._admit(False)
 
     @workflow.update
     async def close_queue(self, writer: Writer) -> QueueClosed:
         """Close the queue to insertion. It revokes nothing and seals nothing."""
-        ticket = self._take_lock(writer)
-        try:
-            self._queue_closed = True
-            return QueueClosed(task_count=len(self._start.tasks))
-        finally:
-            self._release_lock(ticket)
+        self._count_update(repeatable=True)
+        return await self._answering(
+            CLOSE, writer.ownership_epoch, _as_awaited(lambda: self._close(writer))
+        )
+
+    @close_queue.validator
+    def _close_queue_admitted(self, writer: Writer) -> None:
+        # Closing the queue is on the whitelist: a controller held off here would be held off
+        # for the whole boundary. Nothing stops a controller sending it again under another
+        # identifier, so it is repeatable and spends the allowance the repeats share.
+        self._admit(True, repeatable=True)
 
     @workflow.update
     async def begin_environment_call(
@@ -872,7 +1789,27 @@ class StreamWorkflow:
         Ownership is checked here like it is everywhere else, and this is the call that makes
         it reach the world: a writer that was fenced cannot change an environment either, and
         without this its only unfenced path would be the one the stream never sees.
+
+        The exact Update sent again is answered from what it was answered with, receipt or
+        refusal, rather than being granted a second time. A grant is a change to a world this
+        stream cannot see and a durable count against the attempt, so a second one for the same
+        call would leave a hold nothing out there matches. And a begin refused while something
+        was outstanding must stay refused after the thing that was outstanding has gone, or the
+        same Update ID would turn a refusal into a grant.
         """
+        self._count_update()
+        return await self._answering(
+            GRANT,
+            writer.ownership_epoch,
+            _as_awaited(lambda: self._begin_environment_call(call, writer)),
+        )
+
+    @begin_environment_call.validator
+    def _begin_environment_call_admitted(self, call: EnvironmentCall, writer: Writer) -> None:
+        # A grant holds the stream, which is the opposite of a quiet point.
+        self._admit(False)
+
+    def _begin_environment_call(self, call: EnvironmentCall, writer: Writer) -> EnvironmentLease:
         ticket = self._take_lock(writer)
         try:
             try:
@@ -909,15 +1846,24 @@ class StreamWorkflow:
         sure it holds. Only the call named in the grant releases it: a lease taken from a
         caller is not one that caller may hand on afterwards, and a writer that was fenced
         while holding one has already had the stream taken from it by the claim.
+
+        The exact Update sent again is answered with the lease it was answered with, its held
+        flag and its cursor as they were returned. Across a boundary the grant is gone by
+        construction, so an end replayed there would report that it held nothing when the
+        execution before it reported that it held the stream.
         """
-        self._require_writer(writer)
-        held = self._environment_call == call.call_id
-        if held:
-            self._environment_call = None
-            self._release_lock(self._environment_ticket)
-        return EnvironmentLease(
-            call_id=call.call_id, attempt_id=call.attempt_id, cursor=self._cursor, held=held
+        self._count_update()
+        return await self._answering(
+            RELEASE,
+            writer.ownership_epoch,
+            _as_awaited(lambda: self._end_environment_call(call, writer)),
         )
+
+    @end_environment_call.validator
+    def _end_environment_call_admitted(self, call: EnvironmentCall, writer: Writer) -> None:
+        # Ending the grant this generation is holding is what makes the boundary quiet. An end
+        # for a grant it is not holding clears nothing, so it waits.
+        self._admit(self._environment_call == call.call_id)
 
     @workflow.update
     async def confirm_state(self, writer: Writer) -> StreamState:
@@ -933,8 +1879,19 @@ class StreamWorkflow:
         It takes no lock, because what it is asked about is often something outstanding, and it
         changes nothing, so asking twice is the same as asking once.
         """
-        self._require_writer(writer)
-        return self.stream_state()
+        self._count_update(repeatable=True)
+        return await self._answering(
+            CONFIRM, writer.ownership_epoch, _as_awaited(lambda: self._confirm(writer))
+        )
+
+    @confirm_state.validator
+    def _confirm_state_admitted(self, writer: Writer) -> None:
+        # The confirmation that follows a claim is on the whitelist with the claim: an owner
+        # that has just taken the generation over reads through the write path before it hands
+        # anything on, and holding that off would hold off the recovery it is part of. It mints
+        # a fresh identifier every time by design, so it is the most repeatable call there is
+        # and it spends the allowance the repeats share rather than the reserve at large.
+        self._admit(True, repeatable=True)
 
     @workflow.query
     def stream_state(self) -> StreamState:
@@ -971,7 +1928,7 @@ class StreamWorkflow:
             stream_state_sha256=self._projection_hash(),
             ownership_epoch=self._ownership_epoch,
             fencing_token_hash=self._fencing_token_hash,
-            ownership_claims=len(self._ownership),
+            ownership_claims=self._ownership_claims(),
             blob_verification="unchecked" if self._start.blob_root is None else "required",
             consumer_id=self._consumer_id,
             queue_closed=self._queue_closed,
@@ -1012,8 +1969,8 @@ class StreamWorkflow:
             release_predicate=self._release.predicate,
             assignment_count=len(self._assignments),
             materialization_count=self._materialized(),
-            eligibility_count=len(self._eligibilities),
-            offer_count=len(self._offers),
+            eligibility_count=self._eligibility_count(),
+            offer_count=self._offer_count(),
             presentation_count=len(self._presented),
             payload_delivery_count=sum(
                 1 for message in self._presented.values() if message.kind == PAYLOAD
@@ -1038,6 +1995,53 @@ class StreamWorkflow:
                 if self._start.provenance is None or not self._start.provenance.experiment_id
                 else self._start.provenance.experiment_id
             ),
+            turnovers=self._turnovers,
+            turnover_requested=self._reaching_for_a_boundary(),
+            turnover_refused=self._turnover_refused,
+            verifying=self._verifying,
+            verification_batches=self._verification_batches,
+            unfinished_handlers=self._unfinished,
+            turnover_refused_bytes=self._turnover_refused_bytes,
+        )
+
+    @workflow.query
+    def answered_update(self, update_id: str) -> AnsweredUpdate:
+        """What one exact Update was answered with, for a caller that cannot send it again.
+
+        A transport holding an Update it already sent has two places where it cannot ask the
+        handler what became of it. One is a generation that has decided to continue as new and
+        is holding traffic back: sending again is rejected until the boundary, and the boundary
+        may be a while. The other is a generation that has finished, whose last execution accepts
+        no Update at all. Both are places where the answer exists and only the route to it is
+        missing, so this is that route.
+
+        It is a Query, so it costs the generation nothing, writes nothing, and can be asked of an
+        execution that has closed. What it needs is a Worker able to replay this generation: a
+        Query is answered by the code, not by the service alone, so a deployment with no Worker
+        for this task queue cannot answer one. That is the limit of this route, and a caller that
+        cannot get an answer is left with the failure it already had.
+        """
+        answer = self._journal.get(update_id)
+        if answer is None:
+            return AnsweredUpdate(found=False)
+        if answer.kind in (REFUSED, FAILED):
+            return AnsweredUpdate(
+                found=True,
+                kind=answer.kind,
+                handler=answer.handler,
+                code=answer.code,
+                type_name=answer.type_name,
+                message=answer.message,
+            )
+        value = answer.value
+        if answer.kind == BY_ROW:
+            value = json.loads(
+                workflow.payload_converter()
+                .to_payloads([self._row(answer)])[0]
+                .data.decode("utf-8")
+            )
+        return AnsweredUpdate(
+            found=True, kind=BY_VALUE, handler=answer.handler, value=value
         )
 
     @workflow.query
@@ -1322,17 +2326,46 @@ class StreamWorkflow:
         return "obligation_pending"
 
     def _materialized(self) -> int:
-        """How many obligations have their candidate built.
+        """How many obligations have had their candidate built.
 
-        The candidate is the materialization: it carries the renderer, the match group, the
-        hashes, and the byte count a family gate compares, so counting the obligations that
-        hold one is reading the fact rather than a tally kept beside it.
+        The fact is read off the obligation rather than off the bytes. A candidate carries the
+        renderer, the match group, the hashes and the byte count a family gate compares, and
+        while an offer could still carry it the obligation holds it; once one has been presented
+        or has ended without being rendered the bytes are of no further use and a generation
+        that crossed a boundary will not be holding them. What has to survive either way is that
+        it was built, because the count is inside the projection every presentation attests to.
         """
-        return sum(1 for o in self._obligations.values() if o.candidate is not None)
+        return sum(1 for o in self._obligations.values() if o.materialized)
+
+    def _ownership_claims(self) -> int:
+        """How many owners this generation has had, over every execution it has run in."""
+        return self._carried_ownership_claims + len(self._ownership)
+
+    def _offer_count(self) -> int:
+        """How many reservations this generation has made, over every execution."""
+        return self._carried_offers + len(self._offers)
+
+    def _eligibility_count(self) -> int:
+        """How many obligations this generation's plan has released, over every execution."""
+        return self._carried_eligibilities + len(self._eligibilities)
+
+    def _handed_out(self) -> Set[str]:
+        """Every attempt whose task this generation reserved, over every execution.
+
+        An ending overwrites the state an attempt was in and leaves the offer that reserved its
+        task exactly where it was, which is why this is read from the offers. An execution that
+        continued another holds its predecessor's as a set of identifiers rather than as rows,
+        because a count of who was handed out is the whole of what this is read for.
+        """
+        return self._carried_handed_out | {
+            offer.attempt_id
+            for offer in self._offers
+            if offer.kind == "task" and offer.attempt_id is not None
+        }
 
     def _wait_reason_counts(self) -> Dict[str, int]:
         """How many Waits each hidden reason accounts for, for the harness alone."""
-        counts: Dict[str, int] = {}
+        counts: Dict[str, int] = dict(self._carried_wait_reasons)
         for offer in self._offers:
             if offer.wait_reason is not None:
                 counts[offer.wait_reason] = counts.get(offer.wait_reason, 0) + 1
@@ -1443,13 +2476,8 @@ class StreamWorkflow:
         that is where the fact is: an ending overwrites the state an attempt was in and leaves
         the offer that reserved its task exactly where it was.
         """
-        handed_out = {
-            offer.attempt_id
-            for offer in self._offers
-            if offer.kind == "task" and offer.attempt_id is not None
-        }
         remaining = sum(1 for attempt in self._attempts.values() if attempt.state == PLANNED)
-        return remaining, len(handed_out), self._capacity_in_use()
+        return remaining, len(self._handed_out()), self._capacity_in_use()
 
     # Seal.
 
@@ -1604,6 +2632,7 @@ class StreamWorkflow:
             ),
             start_to_close_timeout=_TERMINAL_ACTIVITY_TIMEOUT,
             retry_policy=_ACTIVITY_RETRY,
+            activity_id=self._next_activity_id(),
         )
         if sealed.attempt_id != attempt.item.attempt_id or sealed.seal_id != attempt.seal_id:
             raise _unusable("the sealed submission is not the one this seal asked for")
@@ -1634,6 +2663,7 @@ class StreamWorkflow:
                 ),
                 start_to_close_timeout=_TERMINAL_ACTIVITY_TIMEOUT,
                 retry_policy=_ACTIVITY_RETRY,
+                activity_id=self._next_activity_id(),
             )
         )
         # Each result is checked where it arrives, before the next Activity is asked for. The
@@ -1692,6 +2722,7 @@ class StreamWorkflow:
                 ),
                 start_to_close_timeout=_ACTIVITY_TIMEOUT,
                 retry_policy=_ACTIVITY_RETRY,
+                activity_id=self._next_activity_id(),
             )
             if len(bundle.candidates) != 1:
                 raise _UnusableResult(
@@ -1940,6 +2971,7 @@ class StreamWorkflow:
         """
         obligation = self._obligations[item.attempt_id]
         obligation.candidate = candidate
+        obligation.materialized = True
         obligation.state = MATERIALIZED
         if self._release.predicate == RELEASE_AT_SEAL:
             self._release_obligation(obligation, "seal")
@@ -2049,7 +3081,258 @@ class StreamWorkflow:
             self._done_presented = True
             self._draining = True
 
-    # Shared machinery.
+    # What one exact Update was answered with.
+    #
+    # Two retry contracts exist and they stay apart. A retry that carries the same Update
+    # identifier is asking for the answer that identifier already got, and inside one execution
+    # the service answers it from its own record without the handler running at all. A logical
+    # retry that carries a fresh identifier reaches the handler and is judged on the state it
+    # finds, which is how a request for a message already presented is told so.
+    #
+    # A boundary destroys the first of those, because the service's record belongs to the
+    # execution that accepted the Update. So this generation keeps the same record itself, for
+    # every accepted Update it completes, and carries it. What is kept is the completed outcome:
+    # a success, an accepted protocol refusal, or an accepted failure. A validator rejection is
+    # none of those and is never kept, because the service does not keep one either and the same
+    # identifier may legitimately be validated again. Neither is an exception that fails the
+    # Workflow Task rather than the Update.
+
+    def _update_id(self) -> str:
+        """The exact Update identifier the handler now running was reached under."""
+        current = workflow.current_update_info()
+        return "" if current is None else current.id
+
+    def _replayed(self) -> Optional[_Answer]:
+        """The answer this exact identifier already got, if it got one.
+
+        The identifier is the whole of the key, deliberately. The service deduplicates on it
+        alone, and every identifier this runtime builds already names the owner that built it, so
+        asking again who is writing would make this stricter than the record it stands in for and
+        would refuse a paused owner the answer it is owed.
+        """
+        return self._journal.get(self._update_id())
+
+    def _give_back(self, answer: _Answer) -> Any:
+        """Hand back an answer this generation has already given, or raise it again."""
+        if answer.kind == REFUSED:
+            raise StreamProtocolError(answer.code)
+        if answer.kind == FAILED:
+            raise ApplicationError(answer.message, type=answer.type_name, non_retryable=True)
+        if answer.kind == BY_ROW:
+            return self._row(answer)
+        return workflow.payload_converter().from_payload(
+            _as_payload(answer.value),
+            ANSWER_TYPES[answer.handler],
+        )
+
+    def _row(self, answer: _Answer) -> Any:
+        """The logical row an answer points at, which is where the value itself is kept."""
+        if answer.handler == PRESENT:
+            return self._attestations[answer.row]
+        return self._finalize_requests[answer.row].receipt
+
+    def _remember(self, handler: str, epoch: int, answer: _Answer) -> None:
+        """Write down what this exact Update was answered with, once and never again.
+
+        The first completed outcome for an identifier is the outcome. A second write for the same
+        identifier could only come from a replay of the same handler, and a replay has to produce
+        what the history already holds.
+        """
+        self._journal.setdefault(self._update_id(), answer)
+
+    async def _answering(self, handler: str, epoch: int, body: Any) -> Any:
+        """Run one accepted handler, and keep whatever it answers with.
+
+        The capture wraps the whole body, which is what makes it complete. A refusal raised
+        before the lock is an answer; so is one raised by a table lookup that never reaches the
+        lock at all; so is a failure from the work behind a filing. Every one of those is an
+        accepted Update that the service recorded as completed, and every one of them has to be
+        reproducible on the far side of a boundary.
+
+        What is not kept is an exception that fails the Workflow Task rather than the Update. The
+        service records no outcome for those, so neither does this: they are raised on, and the
+        Task fails as it would have.
+
+        The count of unfinished handlers is kept around the same body, in a finally, because a
+        boundary waits for these and a caller waiting for the boundary has to be able to see them.
+        """
+        replayed = self._replayed()
+        if replayed is not None:
+            return self._give_back(replayed)
+        self._unfinished += 1
+        try:
+            result = await body()
+        except StreamProtocolError as refusal:
+            self._remember(handler, epoch, _Answer(handler, epoch, REFUSED, code=refusal.code))
+            raise
+        except (FailureError, asyncio.TimeoutError) as failure:
+            kind = type(failure).__name__
+            if isinstance(failure, ApplicationError) and failure.type:
+                kind = failure.type
+            said = getattr(failure, "message", None)
+            self._remember(
+                handler,
+                epoch,
+                _Answer(
+                    handler,
+                    epoch,
+                    FAILED,
+                    type_name=kind,
+                    message=_bounded(said if isinstance(said, str) else str(failure)),
+                ),
+            )
+            raise
+        finally:
+            self._unfinished -= 1
+        self._remember(handler, epoch, self._answer_for(handler, epoch, result))
+        return result
+
+    def _answer_for(self, handler: str, epoch: int, result: Any) -> _Answer:
+        """Where to keep one successful answer: at a row this generation holds, or by value.
+
+        An acknowledgement and a finalization receipt are rows this generation carries whole, so
+        those are pointed at and stored once however many identifiers reached them. An offered
+        message is not: the request table keeps the identity a fresh request is judged against
+        and drops the bytes, because the bytes are only ever owed to the exact identifier that
+        was given them. So the bytes live here, inside the packed journal, which is the one place
+        they are worth their size.
+        """
+        if handler == PRESENT:
+            return _Answer(handler, epoch, BY_ROW, row=result.attestation_id)
+        if handler == FINALIZE:
+            return _Answer(handler, epoch, BY_ROW, row=self._finalized_by(result))
+        value = _serialized(result)
+        return _Answer(handler, epoch, BY_VALUE, value=value, recipe=self._recipe(handler, value))
+
+    def _recipe(self, handler: str, value: Dict[str, Any]) -> str:
+        """A way to make this answer again from the start, or nothing if there is not one.
+
+        Only an offered task gets one. A task is the one offer built entirely out of things the
+        start already carries: the work order's body, its message identifier and the generation's
+        single budget, none of which any later call can change. An offered payload is not, because
+        the bytes it carries are built during the run and are dropped from the projection once the
+        obligation ends; an info answer is not, because it counts a queue as it stood when the
+        question was asked. Those keep their literal values.
+
+        The recipe is proved before it is used. What it would rebuild is rebuilt here and compared
+        against what the handler actually answered with, and a recipe that does not reproduce
+        those exact bytes is not written at all. So the fallback is not a judgement about which
+        offers are reproducible, it is the outcome of trying.
+        """
+        if handler != PULL or value.get("kind") != "task":
+            return ""
+        attempt_id = value.get("attempt_id")
+        if not isinstance(attempt_id, str) or attempt_id not in self._items:
+            return ""
+        recipe = f"task {attempt_id} {sha256(canonical_json(value)).hexdigest()}"
+        if self._from_recipe(recipe) != value:
+            return ""
+        return recipe
+
+    def _from_recipe(self, recipe: str) -> Optional[Dict[str, Any]]:
+        """The answer a recipe denotes, or nothing if this code cannot make it.
+
+        The task record is built exactly as the offer built it, from the same three immutable
+        things, and the offered message is composed around it the same way. Nothing here reads
+        the generation's current state, so what comes out is what went in however far the run
+        moved on afterwards.
+        """
+        parts = recipe.split(" ")
+        if len(parts) != 3 or parts[0] != "task":
+            return None
+        item = self._items.get(parts[1])
+        if item is None:
+            return None
+        return _serialized(
+            OfferedMessage(
+                message_id=item.task_message_id,
+                kind="task",
+                visible_text=visible_bytes(
+                    Task(
+                        message_id=item.task_message_id,
+                        attempt_id=item.attempt_id,
+                        body=item.body,
+                        budget=self._start.budget,
+                    )
+                ).decode("utf-8"),
+                attempt_id=item.attempt_id,
+            )
+        )
+
+    def _rebuilt(self, update_id: str, answer: _Answer) -> Dict[str, Any]:
+        """Make a carried answer again from its recipe, and refuse the carrier if it differs.
+
+        This is where the promise a recipe makes is kept. A recipe stands in for bytes a caller
+        may still be owed, so a generation that cannot reproduce those exact bytes must not come
+        up serving something else under the same identifier. It refuses the carrier instead, which
+        is the same answer this code gives to a carrier written by another generation or by a
+        version it cannot read.
+        """
+        made = self._from_recipe(answer.recipe)
+        digest = "" if made is None else sha256(canonical_json(made)).hexdigest()
+        if digest != answer.recipe.split(" ")[-1]:
+            raise _refuse_carrier(
+                f"the carried answer for {update_id} does not rebuild to the bytes it was "
+                "originally answered with"
+            )
+        assert made is not None
+        return made
+
+    def _finalized_by(self, receipt: AttemptFinalized) -> str:
+        """The logical request this receipt belongs to."""
+        for request_id, bound in self._finalize_requests.items():
+            if bound.receipt == receipt:
+                return request_id
+        raise ApplicationError(
+            "a finalization answered with a receipt no logical request holds",
+            type="JournalRowMissing",
+            non_retryable=True,
+        )
+
+    # The bodies the eleven handlers run, apart from the handlers themselves, so that what is
+    # captured is a whole handler rather than a handler minus whatever ran before the capture.
+
+    def _locked(self, writer: Writer, body: Any, *arguments: Any) -> Any:
+        """Run one body while holding the stream, and give the stream back however it ends."""
+        ticket = self._take_lock(writer)
+        try:
+            return body(*arguments)
+        finally:
+            self._release_lock(ticket)
+
+    async def _locked_await(self, writer: Writer, body: Any, *arguments: Any) -> Any:
+        """The same, for a body that awaits."""
+        ticket = self._take_lock(writer)
+        try:
+            return await body(*arguments)
+        finally:
+            self._release_lock(ticket)
+
+    def _end_environment_call(self, call: EnvironmentCall, writer: Writer) -> EnvironmentLease:
+        """Give the stream back, and say whether this call was the one holding it."""
+        self._require_writer(writer)
+        held = self._environment_call == call.call_id
+        if held:
+            self._environment_call = None
+            self._release_lock(self._environment_ticket)
+        return EnvironmentLease(
+            call_id=call.call_id, attempt_id=call.attempt_id, cursor=self._cursor, held=held
+        )
+
+    def _close(self, writer: Writer) -> QueueClosed:
+        """Close the queue to insertion."""
+        return self._locked(
+            writer, lambda: self._closed_queue()
+        )
+
+    def _closed_queue(self) -> QueueClosed:
+        self._queue_closed = True
+        return QueueClosed(task_count=len(self._start.tasks))
+
+    def _confirm(self, writer: Writer) -> StreamState:
+        """Read the state through the path a write takes, so a fenced writer is refused."""
+        self._require_writer(writer)
+        return self.stream_state()
 
     def _take_lock(self, writer: Writer) -> int:
         """Refuse a call the generation cannot accept, then hold the stream against overlap.
@@ -2200,13 +3483,27 @@ class StreamWorkflow:
             read.update(outstanding)
 
     async def _verify(self, root: str, references: List[str]) -> None:
-        """Read the store, and refuse when it cannot produce the exact bytes a name promises."""
-        verified = await workflow.execute_activity(
-            verify_blobs_activity,
-            VerifyBlobsInput(blob_root=root, references=references),
-            start_to_close_timeout=_ACTIVITY_TIMEOUT,
-            retry_policy=_ACTIVITY_RETRY,
-        )
+        """Read the store, and refuse when it cannot produce the exact bytes a name promises.
+
+        The read is counted while it is happening and again when it finishes. Neither number is
+        a fact about the generation's projection, and neither belongs in one. They are here
+        because this is the one thing that can hold a boundary open for minutes while changing
+        nothing else a caller could see: the Activity has its own timeout and its own retries,
+        and a claim that is working through them is making progress that a projection hash
+        cannot show. A caller held off for the boundary reads these and keeps waiting.
+        """
+        self._verifying += 1
+        try:
+            verified = await workflow.execute_activity(
+                verify_blobs_activity,
+                VerifyBlobsInput(blob_root=root, references=references),
+                start_to_close_timeout=_ACTIVITY_TIMEOUT,
+                retry_policy=_ACTIVITY_RETRY,
+                activity_id=self._next_activity_id(),
+            )
+        finally:
+            self._verifying -= 1
+            self._verification_batches += 1
         if verified.unverified:
             raise StreamProtocolError("invalid_message")
 
@@ -2307,11 +3604,56 @@ class StreamWorkflow:
             "obligations": {key: value.state for key, value in self._obligations.items()},
             "presented": list(self._presented),
             "materializations": self._materialized(),
-            "eligibilities": len(self._eligibilities),
-            "offers": len(self._offers),
+            "eligibilities": self._eligibility_count(),
+            "offers": self._offer_count(),
             "seal_ordinal": self._seal_ordinal,
         }
         return sha256(canonical_json(projection)).hexdigest()
+
+
+def _serialized(result: Any) -> Dict[str, Any]:
+    """One handler answer as the plain value a carrier can hold and the converter can read back."""
+    return json.loads(workflow.payload_converter().to_payloads([result])[0].data.decode("utf-8"))
+
+
+def _as_payload(value: Any) -> WirePayload:
+    """One journal value as the payload the converter reads it back out of.
+
+    The fields are set rather than passed, because this name belongs to the protocol's own
+    payload record everywhere else in this module and the one wanted here is the service's.
+    """
+    payload = WirePayload()
+    payload.metadata["encoding"] = b"json/plain"
+    payload.data = canonical_json(value)
+    return payload
+
+
+def _as_awaited(body: Any) -> Any:
+    """Present a synchronous body as one the answering wrapper can await.
+
+    Eight of the eleven handlers do their work without awaiting anything, and three await
+    Activities. The wrapper that keeps their answers should not have to know which is which.
+    """
+
+    async def awaited() -> Any:
+        return body()
+
+    return awaited
+
+
+def _refuse_carrier(complaint: str) -> ApplicationError:
+    """The failure a start whose carried projection does not belong to it is refused with.
+
+    It fails the execution rather than one call, because there is no caller yet and nothing
+    here can be repaired later: a generation restored from a projection that is not its own
+    would serve a history nobody committed to.
+    """
+    return ApplicationError(complaint, type="CarrierRefused", non_retryable=True)
+
+
+def _bindings(rows: List[CarriedBinding]) -> Dict[str, _Bound]:
+    """One carried request table, back as the map a handler answers a retry out of."""
+    return {row.request_id: _Bound(identity=row.identity, message=row.message) for row in rows}
 
 
 def _note_failure(attempt: _Attempt, error: ActivityError) -> None:

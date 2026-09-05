@@ -29,6 +29,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Dict, Optional, Union
 
+from shogym import __version__ as shogym_version
 from shogym.serve.protocol_v2.blobs import (
     FilesystemBlobStore,
     create_directory,
@@ -43,6 +44,21 @@ MANIFEST_FILE = "generation.json"
 
 # What a run writes down before it starts the stream the manifest will name.
 STARTING_FILE = "generation.starting.json"
+
+# What the process serving this run says about itself: the package version whose Worker is
+# polling this run's task queue. It is beside the manifest rather than in it, and nothing reads
+# it to decide anything: the manifest's field set is checked for exact equality, so a directory
+# with a sixth field would be refused by code that predates it, and a fact recorded for an
+# operator must not be a fact that stops a run resuming.
+#
+# What it records is a deployment invariant. A generation may run in more than one execution,
+# because it continues as new before the durable service's limits bound it, and every execution
+# of the chain decodes the projection the one before it wrote. A Worker whose package predates
+# that projection would decode the start, drop the field it does not know, and serve the roster
+# again from the beginning. Nothing in the older code could refuse it, because the refusal did
+# not exist there. What excludes it is the deployment: one Worker per run, on that run's own
+# task queue, from one package. This is where that package writes its name down.
+SERVING_FILE = "serving.json"
 
 # The logs the version one serving path appends. Their presence is what makes a directory a
 # version one run directory, whatever else is in it.
@@ -189,8 +205,29 @@ def create_run_directory(
         workflow_id=workflow_id, task_queue=task_queue, configuration_hash=configuration_hash
     )
     _publish(directory / MANIFEST_FILE, json.dumps(manifest.to_wire(), sort_keys=True) + "\n")
+    _publish(
+        directory / SERVING_FILE,
+        json.dumps(
+            {"package": "shogym", "version": shogym_version, "task_queue": task_queue},
+            sort_keys=True,
+        )
+        + "\n",
+    )
     _discard(directory / STARTING_FILE)
     return RunDirectory(root=directory, manifest=manifest)
+
+
+def serving_record(root: Union[str, Path]) -> Optional[Dict[str, Any]]:
+    """What the package that created this run directory said about itself, if it said anything.
+
+    A directory written before this record existed simply has none, which is why the answer is
+    allowed to be nothing. Nothing decides anything on it: it is what an operator reads to know
+    which package version's Worker a chain of executions was served by.
+    """
+    path = Path(root) / SERVING_FILE
+    if not path.is_file():
+        return None
+    return json.loads(path.read_text(encoding="utf-8"))
 
 
 def _publish(path: Path, payload: str) -> None:
