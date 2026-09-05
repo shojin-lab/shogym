@@ -14,21 +14,35 @@ landed and how many rows it named, and its ``_meta`` sidecar carries the termina
 flag alone, because env_v1 declares ``inband_terminal_feedback = False``. That is the
 shape of a successful filing; an abort, a failed terminal transaction, a schema
 refusal and a post-seal call each have their own, and env_v1's README lists them.
+
+A FILING SAYS SOMETHING, AND THE SCHEMA IS WHERE THAT IS WRITTEN. A call carrying
+nothing but whitespace is a call the agent can make again, not an answer, and the
+two paths this environment is served over check a terminal's arguments in two
+places: one adds a non-blank rule of its own to the schema, and the other holds the
+call to the schema alone. So the rule is in the schema, where both of them read it.
+Without it the same empty call is a correctable mistake on one path and an
+irreversible seal worth nothing on the other.
 """
 
 from __future__ import annotations
 
-from typing import Any, Dict
+from typing import Annotated, Any, Dict
 
 from fastmcp import FastMCP
+from pydantic import Field
 
 SUBMIT_TOOL_NAME = "submit_filing"
+
+#: What a filing has to be before it is one. At least one character that is not
+#: whitespace, which is the rule a served episode applies to every required string
+#: and the rule a durable generation has only if the schema states it.
+Filing = Annotated[str, Field(min_length=1, pattern=r"\S")]
 
 server: FastMCP = FastMCP(name="receipts")
 
 
 @server.tool
-def submit_filing(filing: str, _session_id: str) -> Dict[str, Any]:
+def submit_filing(filing: Filing, _session_id: str) -> Dict[str, Any]:
     """File your answer. **This ends the episode.**
 
     ``filing`` is one line per record: the record id, a comma, and the value, with
@@ -37,7 +51,9 @@ def submit_filing(filing: str, _session_id: str) -> Dict[str, Any]:
     the comma.
 
     Filing seals the episode. There is no second filing, no verdict in what this
-    returns and no further step to take, so file your best answer.
+    returns and no further step to take, so file your best answer. A filing has to
+    say something: a call carrying nothing but whitespace is refused and leaves the
+    task where it was, rather than ending it with nothing filed.
     """
     # Never reached for a sealed episode: the serve layer intercepts this score
     # terminal, validates and seals and runs the env's `finalize` instead of

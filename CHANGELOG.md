@@ -46,6 +46,47 @@ recorded history replays and every open stream resumes. No quickstart declares o
 own, whatever the generation declares. An environment that advertises a tool called `info` is now
 refused at construction rather than served.
 
+### `receipts`: the environment grades its own attempts under protocol v2
+
+`receipts_v1` declares `protocol_v2_grade` and `protocol_v2_terminal`, so a generation over it is
+scored by the environment rather than by the stream's stand-in. The stand-in computes from the
+shape of a filing, and a receipts filing always has something in it, so every attempt that filed
+at all was worth the same thing whatever it got right. What a generation commits now is
+`component_score`, the fraction of the records the filing got right, at the six places the scorer
+rounds to, and it is the number a v1 run reports for the same filing. Beside it a body may print
+`solved` and nothing else: the per-row verdicts and the corrections are the receipt's, an
+experiment decides which cell of the fork a branch is served, and the acknowledgement still says a
+filing landed and nothing about what it was worth.
+
+The seal does what a v1 episode's `finalize` does, once and under the seal id: it canonicalizes
+the filing, renders the fork through the bank's own path, and scores what the parser made, so a
+retried seal returns the first call's submission and the first call's numbers and the fork is
+rendered once however many times the filing is sent and however many seals send it at once.
+Rendering a fork is now a claim on that fork's own name, held across threads and processes and
+rechecked under it, so two seals of one filing arriving together build one set of cells and the
+second reads what the first wrote rather than rendering beside it. The three cells are kept beside
+the verdict, under the seal that ended the attempt, in the bank's own fork store: a seal id is
+minted from the hidden execution, its ordinal and the attempt together, so it names one execution
+where a public attempt id names as many as were run, and a record on disk outlives the process
+that sealed. The horizon stays the floor, because the filing at a graded horizon is one the
+gateway writes for the agent and this terminal takes the filing itself.
+
+**`submit_filing` no longer accepts a filing that says nothing.** The tool declares `filing` as a
+string of at least one character that is not whitespace, so a blank or whitespace-only call is
+refused where a call's arguments are checked and the task stays open for the agent to file again.
+A served episode already applied that rule to every required string; a durable generation checks
+the schema and nothing else, so the same empty call used to be a correctable mistake on one path
+and an irreversible seal worth nothing on the other.
+
+**The roster is now one position per sibling of every family**, so position 0 is family 0's A,
+position 1 is family 0's B, and so on. An environment could previously serve one sibling of every
+family and took which one from its configuration; a generation cannot change its environment's
+configuration between positions, and each task after the first is worked in a world of its own, so
+A and B could never sit in one generation. Which sibling a position names is now arithmetic on the
+position and the environment's configuration says nothing about it. `side` still narrows the roster
+to one sibling for a caller that wants what it always had, and an environment given no side serves
+every sibling of everything it holds, which doubles the task count such an environment reports.
+
 ### `serve`: a generation may serve several tasks at once
 
 `stream_start` takes `capacity`, how many tasks the generation lets the agent hold at once, and it

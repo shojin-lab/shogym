@@ -26,12 +26,14 @@ only thing here shaped to cross the boundary.
 
 from __future__ import annotations
 
+import fcntl
 import json
 import os
-import uuid
+import secrets
+from contextlib import contextmanager
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, Mapping, Sequence
+from typing import Any, Iterator, Mapping, Sequence
 
 from shogym.envs.receipts import streams
 from shogym.envs.receipts.protocol import (
@@ -580,13 +582,12 @@ def save_fork(fork: Fork, directory: Path, source_digest: str) -> Path:
     if path.exists():
         return path
     text = json.dumps(payload, sort_keys=True)
-    # A name no other writer can be using. The scratch file used to be named for the
-    # process, so two threads of one process shared it and the first to finish
-    # unlinked it under the second, which then failed publishing bytes it had already
-    # written. Two callers with the same filing now write two scratch files and one
-    # link wins; the loser leaves the winner's bytes in place, which is the whole
-    # point of linking rather than replacing.
-    scratch = path.with_name(f"{path.name}.{os.getpid()}.{uuid.uuid4().hex}.partial")
+    # A staging name no other writer can be using. Two writers sharing one staging name
+    # share the file behind it, so a writer could rewrite the bytes another had already
+    # linked into place, and a reader would be reading a file being written rather than a
+    # record. The claim in `fork_for` keeps them apart in this package; the name keeps
+    # them apart for any caller that reaches this door another way.
+    scratch = path.with_name(path.name + f".{os.getpid()}.{secrets.token_hex(8)}.partial")
     scratch.write_text(text, encoding="utf-8")
     try:
         os.link(scratch, path)
@@ -661,13 +662,14 @@ def fork_for(
     committed is read back rather than remade, and its digests are checked on the way
     in.
 
-    COMMITTED ONCE, not necessarily RENDERED once. There is no lock held across the
-    load and the render, so two callers arriving on one filing at the same moment
-    both render. What they cannot do is disagree: the record is published by an
-    exclusive link, the loser's bytes are dropped, and both read the winner's record
-    back through the same door before returning. Every branch of one fork therefore
-    holds one set of bytes, which is the property the chain needs; a second render
-    costs time and decides nothing.
+    Once is once under concurrency as well as over time, and that takes a claim. Two
+    seals of one filing can arrive together, from two threads of one Worker or from two
+    processes, and both would find the record absent and both would render it. What they
+    would come to is the same bytes, because a render is a function of the filing and the
+    instance, but the fork is where this environment says the cells are made once and a
+    claim is what makes that true rather than likely. The claim is a lock on the fork's
+    own name, so it is per fork rather than per store and two different filings never wait
+    on each other, and the loser reads what the winner wrote.
     """
     if directory is None:
         return render_fork(generator, instance, side, raw)
@@ -676,13 +678,39 @@ def fork_for(
     existing = load_fork(directory, task.task_id, digest, source_digest)
     if existing is not None:
         return existing
-    fresh = render_fork(generator, instance, side, raw)
-    save_fork(fresh, directory, source_digest)
-    # Read back through the same door, so what a later branch will replay is what
-    # this branch used, and a lost race resolves to the winner's bytes rather than
-    # to whatever this worker happened to hold.
-    committed = load_fork(directory, task.task_id, digest, source_digest)
+    path = fork_path(directory, task.task_id, digest, source_digest)
+    with one_writer(path):
+        # Asked again under the claim, because the answer before it was taken is the
+        # answer whoever held it has since changed.
+        existing = load_fork(directory, task.task_id, digest, source_digest)
+        if existing is not None:
+            return existing
+        fresh = render_fork(generator, instance, side, raw)
+        save_fork(fresh, directory, source_digest)
+        # Read back through the same door, so what a later branch will replay is what
+        # this branch used, and a lost race resolves to the winner's bytes rather than
+        # to whatever this worker happened to hold.
+        committed = load_fork(directory, task.task_id, digest, source_digest)
     return committed if committed is not None else fresh
+
+
+@contextmanager
+def one_writer(path: Path) -> Iterator[None]:
+    """Hold the right to render the fork this path names, for as long as rendering takes.
+
+    A file lock rather than anything in this process, because the writers to keep apart
+    are a Worker's threads and the Workers of two processes over one store, and the
+    machine takes it back from a process that died holding it. The lock has a name of its
+    own beside the record: a lock taken on the record would have to create the record to
+    take it, and the record's absence is what is being decided.
+    """
+    path.parent.mkdir(parents=True, exist_ok=True)
+    descriptor = os.open(str(path.with_name(path.name + ".claim")), os.O_CREAT | os.O_RDWR, 0o600)
+    try:
+        fcntl.flock(descriptor, fcntl.LOCK_EX)
+        yield
+    finally:
+        os.close(descriptor)
 
 
 def filing_digest(raw: object) -> str:
