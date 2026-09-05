@@ -97,18 +97,34 @@ SERVER_LOCK = "uv.lock"
 UV_VERSION = "0.11.20"
 
 #: The environment the agent's image and docker itself supply, by name. ``PWD`` is docker's, from
-#: the working directory the container is started in, and the rest are the base image's. The
-#: launch adds this cell's own two and the credential's name and nothing else, so any name in a
-#: container that is not one of these is something the agent was handed that nobody wrote down.
-#: The list is fixed because the base image is pinned by digest.
-IMAGE_ENVIRONMENT = ("HOME", "HOSTNAME", "NODE_VERSION", "PATH", "PWD", "YARN_VERSION")
+#: the working directory the container is started in, ``NODE_OPTIONS`` is this cell's recipe
+#: setting it empty as the recorded image did, and the rest are the base image's. The launch adds
+#: this cell's own two and the credential's name and nothing else, so any name in a container that
+#: is not one of these is something the agent was handed that nobody wrote down. The list is fixed
+#: because the base image is pinned by digest and the recipe beside this file is digested.
+IMAGE_ENVIRONMENT = (
+    "HOME",
+    "HOSTNAME",
+    "NODE_OPTIONS",
+    "NODE_VERSION",
+    "PATH",
+    "PWD",
+    "YARN_VERSION",
+)
 
 #: Where the agent works, and where the two directories it keeps are mounted. ``/work`` is the
-#: path the recorded cell's agent worked in, and the Claude Code home is at the container's own
-#: ``$HOME/.claude`` so that the CLI finds it without being told.
+#: path the recorded run's agent worked in, and the home is the whole of ``/root`` as that run
+#: mounted it: the CLI writes its memory under ``.claude`` and writes elsewhere in the home too,
+#: and a mount of the subtree alone would let the rest die with the container.
 WORK = "/work"
-CLAUDE_HOME = "/root/.claude"
+AGENT_HOME = "/root"
 CONFIG_MOUNT = "/cfg"
+
+#: What the file naming the endpoint is called inside that mount, which is the name the recorded
+#: run gave it. The flag names the file outright and no directory is searched, so nothing here
+#: depends on the spelling; it is still a name the agent's own shell finds in the one directory it
+#: was given, and a launch fact is adopted rather than defaulted.
+MCP_CONFIG = "claude.mcp.json"
 
 #: Where the server's own three live. The run directory is the generation's history, its blobs and
 #: its sealed grades; the cache holds the pinned benchmark source and the durable service's binary.
@@ -154,14 +170,14 @@ def agent_mounts(run_dir: Path, *, self_dir: str, home_dir: str, config_dir: str
 ]:
     """Everything the agent's container can see of this host, which is three directories.
 
-    Two of them are the agent's own and survive the run: the directory it works in and the Claude
-    Code home its memory and skills land in. The third is the file naming the endpoint, mounted
-    read only and outside the working directory so that it never becomes part of the self a later
-    run would start from.
+    Two of them are the agent's own and survive the run: the directory it works in and the home
+    its memory, its skills and everything else the CLI keeps land in. The third is the file naming
+    the endpoint, mounted read only and outside the working directory so that it never becomes
+    part of the self a later run would start from.
     """
     return [
         (run_dir / self_dir, WORK, "rw"),
-        (run_dir / home_dir, CLAUDE_HOME, "rw"),
+        (run_dir / home_dir, AGENT_HOME, "rw"),
         (run_dir / config_dir, CONFIG_MOUNT, "ro"),
     ]
 
@@ -422,6 +438,7 @@ def build_images(*, agent: str, server: str, rebuild: bool = False) -> Dict[str,
                 [
                     f"APT_SNAPSHOT={pinned.APT_SNAPSHOT}",
                     f"APT_PACKAGES={' '.join(pinned.APT_PACKAGES)}",
+                    f"CLAUDE_CODE_PACKAGE={pinned.CLI_PACKAGE}",
                     f"CLAUDE_CODE_VERSION={pinned.CLI_VERSION}",
                     f"CLAUDE_CODE_REGISTRY={pinned.CLI_REGISTRY}",
                 ],
@@ -904,14 +921,14 @@ else
   verdict 1 "a roster, history or run record is readable here: $found$deeper"
 fi
 bound=$(awk '{print $5}' /proc/self/mountinfo | grep -v -E '^(/proc|/sys|/dev)($|/)|^/etc/(resolv.conf|hostname|hosts)$|^/$' | sort -u | tr '\n' ' ')
-if [ "$bound" = "/cfg /root/.claude /work " ]; then
-  verdict 0 "the only host directories bound here are /work, /root/.claude and /cfg"
+if [ "$bound" = "/cfg /root /work " ]; then
+  verdict 0 "the only host directories bound here are /work, /root and /cfg"
 else
   verdict 1 "this container is bound to $bound"
 fi
 held=$(ls -A /cfg | tr '\n' ' ')
-named=$(jq -r '.mcpServers[].url' /cfg/.mcp.json 2>/dev/null | tr '\n' ' ')
-if [ "$held" = ".mcp.json " ] && [ "$named" = "$GATEWAY_URL " ]; then
+named=$(jq -r '.mcpServers[].url' /cfg/claude.mcp.json 2>/dev/null | tr '\n' ' ')
+if [ "$held" = "claude.mcp.json " ] && [ "$named" = "$GATEWAY_URL " ]; then
   verdict 0 "/cfg holds the endpoint this run serves and nothing else"
 else
   verdict 1 "/cfg holds $held naming $named"
@@ -1077,14 +1094,15 @@ def read_probe(output: str) -> int:
 
 __all__ = [
     "AGENT_DOCKERFILE",
+    "AGENT_HOME",
     "AGENT_IMAGE",
     "BUILD_LABEL",
     "CACHE_MOUNT",
-    "CLAUDE_HOME",
     "CONFIG_MOUNT",
     "GENERATED",
     "GRADES_MOUNT",
     "IMAGE_ENVIRONMENT",
+    "MCP_CONFIG",
     "PROBE_SCRIPT",
     "PROVISION",
     "SERVER_DOCKERFILE",
