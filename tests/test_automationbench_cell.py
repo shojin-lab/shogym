@@ -1,22 +1,28 @@
 """Guard tests for the AutomationBench cell runner: what it composes, what it reads, what it runs.
 
-Three halves, and none needs a model or a durable service. The composition is a pure function of
-the roster and the schedule, so what is checked there is that a schedule name decides what the
-agent is told and that nothing else does. The table is a pure function of three files, so what is
-checked there is the join: a score belongs to the task the roster says it does, a position nobody
-reached says so, and a tool call is counted against the attempt it named. The launch is a pair of
-commands, so what is checked there is what each container was given: the boundary this cell rests
-on is a mount list, and a mount list is something a test can read.
+Three halves. The composition is a pure function of the roster and the schedule, so what is
+checked there is that a schedule name decides what the agent is told and that nothing else does.
+The table is a pure function of three files, so what is checked there is the join: a score belongs
+to the task the roster says it does, a position nobody reached says so, and a tool call is counted
+against the attempt it named. The launch is a pair of commands, so what is checked there is what
+each container was given: the boundary this cell rests on is a mount list, and a mount list is
+something a test can read.
 
-Nothing here spawns the ``claude`` CLI or spends a token, and nothing here provisions the
-AutomationBench upstream source: the grade identity this cell composes over is a declaration and
-importing it reaches no upstream package.
+Nothing here spawns the ``claude`` CLI or spends a token. Everything but the three live checks at
+the end is offline: the grade identity this cell composes over is a declaration, importing it
+reaches no upstream package, and no other test here needs a durable service or the benchmark
+source.
 
-Two tests at the end are the exception, and they are because of what they check: neither a network
-nor an empty cache is something a fixture can answer for. So the two domains are stood up on this
-host, once with the probe run from a container joined to the server's own network stack, and once
-from a cache that starts empty. Both are skipped unless the host already holds both images,
-because a check of the boundary has no business building an image to make its point.
+Those three are live because of what they check, and each says what it needs. Two stand the run's
+two domains up on this host, once with the probe run from a container joined to the server's own
+network stack and once from a cache that starts empty, since neither a network nor an empty cache
+is something a fixture can answer for; both are skipped unless the host already holds both images,
+because a check of the boundary has no business building an image to make its point. The third
+serves this cell's own composition through a real stream: it needs the durable service and the
+benchmark source rather than the images, and it is marked ``network`` for the first of those. It
+skips where the source cannot be had, which is a tarball this machine cannot fetch or an extra it
+has not installed, and where the connection says no service answered. Every other failure in it is
+a failure, including one raised from inside the call that opens a client.
 """
 
 from __future__ import annotations
@@ -28,6 +34,8 @@ import shutil
 import signal
 import subprocess
 import tarfile
+from contextlib import AsyncExitStack
+from dataclasses import replace
 from hashlib import sha256
 from pathlib import Path
 from typing import Any, Dict, List, Optional
@@ -42,8 +50,16 @@ from examples.automationbench_cell import sandbox  # noqa: E402
 from examples.automationbench_cell import serve as cell  # noqa: E402
 from examples.automationbench_cell import table as read_back  # noqa: E402
 from shogym.envs.automationbench.protocol_v2 import AUTOMATIONBENCH_GRADE  # noqa: E402
+from shogym.serve.episode import ServedEpisode  # noqa: E402
 from shogym.serve.protocol_v2 import GRADED_HORIZON  # noqa: E402
-from shogym.serve.protocol_v2.gateway import terminal_manifest  # noqa: E402
+from shogym.serve.protocol_v2.gateway import (  # noqa: E402
+    durable_client,
+    environment_terminal,
+    open_gateway,
+    stream_worker,
+    terminal_manifest,
+)
+from shogym.serve.protocol_v2.kernel import StreamWorkflow  # noqa: E402
 from shogym.serve.protocol_v2.kernel.messages import (  # noqa: E402
     AttemptRecord,
     PresentedMessage,
@@ -56,6 +72,8 @@ from shogym.serve.protocol_v2.policy import (  # noqa: E402
     WITHHOLD,
 )
 from shogym.task import TaskSpec, ToolManifest  # noqa: E402
+
+from tests._fixtures.upstream_gate import gate  # noqa: E402
 
 #: The recorded run, as much of it as a test needs, copied out of that run's own directory. Every
 #: pin below is checked against this rather than against itself: a test that built its expectation
@@ -249,7 +267,7 @@ def test_the_roster_file_is_the_join_and_carries_no_score(tmp_path: Path) -> Non
     start = composed(["first", "second"], "never")
     attempts = [item.attempt_id for item in start.tasks]
     path = cell.record_roster(
-        tmp_path, domain="simple", schedule="never", positions=[7, 11], attempts=attempts
+        tmp_path, domain="simple", schedule="never", positions=[7, 11], served=start
     )
     written = json.loads(path.read_text())
     assert written["schedule"] == "never" and written["domain"] == "simple"
@@ -257,6 +275,26 @@ def test_the_roster_file_is_the_join_and_carries_no_score(tmp_path: Path) -> Non
     assert [entry["task"] for entry in written["tasks"]] == ["7", "11"]
     assert [entry["attempt_id"] for entry in written["tasks"]] == attempts
     assert "score" not in path.read_text()
+
+
+def test_the_roster_file_names_the_regime_the_generation_was_built_with(tmp_path: Path) -> None:
+    """The four numbers a rerun has to match, off the composition rather than off the constants.
+
+    A run directory outlives the checkout that served it, and a reader comparing two of them
+    cannot tell from the join alone how much of the queue the agent could hold, what it was told
+    it could spend, when an abandoned task ended, or whether it could ask how much was left. So
+    the generation's own values are written beside the join, which is what makes them the ones
+    that were served rather than the ones this file meant to serve.
+    """
+    start = composed(["first", "second"], "immediate")
+    path = cell.record_roster(
+        tmp_path, domain="public", schedule="immediate", positions=[7, 11], served=start
+    )
+    written = json.loads(path.read_text())
+    assert written["budget"] == start.budget == SPEC.horizon
+    assert written["capacity"] == start.capacity == cell.CAPACITY
+    assert written["attempt_deadline_ms"] == start.attempt_deadline_ms
+    assert written["info"] is start.info is True
 
 
 # ----- reading it back -----
@@ -364,7 +402,11 @@ ROSTER = {
 
 #: Which message each identifier here is one of, which is what lets the fixtures below build the
 #: bytes the history delivered and the bytes the transcript holds out of the one identifier.
-KINDS = {"a": "task", "b": "seal_ack", "c": "payload", "d": "done"}
+KINDS = {"a": "task", "b": "seal_ack", "c": "payload", "d": "done", "e": "info"}
+
+#: The kinds that name no attempt. Done ends the generation and the answer about how much work
+#: is left is a total over the run, so neither belongs to a row.
+UNATTRIBUTED = {"done", "info"}
 
 #: The three messages one sealed and paid attempt is handed.
 DELIVERED = [message_id(0, kind) for kind in ("a", "b", "c")]
@@ -391,7 +433,7 @@ def presentations(identifiers: Optional[List[str]] = None) -> List[PresentedMess
             order=order,
             kind=KINDS[identifier[1]],
             message_id=identifier,
-            attempt_id=None if KINDS[identifier[1]] == "done" else "a" * 32,
+            attempt_id=None if KINDS[identifier[1]] in UNATTRIBUTED else "a" * 32,
             visible_bytes_sha256=sha256(body(identifier).encode("utf-8")).hexdigest(),
         )
         for order, identifier in enumerate(DELIVERED if identifiers is None else identifiers)
@@ -465,6 +507,15 @@ def _message(identifier: str) -> Dict[str, Any]:
     common = {"message_id": identifier, "attempt_id": "a" * 32, "protocol_version": 2}
     if kind == "done":
         return {"message_id": identifier, "kind": kind, "protocol_version": 2}
+    if kind == "info":
+        return {
+            "message_id": identifier,
+            "kind": kind,
+            "protocol_version": 2,
+            "remaining": 199,
+            "consumed": 1,
+            "in_flight": 1,
+        }
     if kind == "seal_ack":
         return {
             **common,
@@ -572,7 +623,9 @@ def test_the_env_this_cell_serves_grades_a_spent_step_budget() -> None:
         cell.ENV, config={"tasks": [{"prompt": [], "info": {}}], "max_steps": 50}
     )
     assert env.protocol_v2_horizon_ending() == GRADED_HORIZON
-    assert env.describe().horizon == 52
+    # And the cap it publishes is the number the recorded agent was handed on every offer, so
+    # what this cell declares is that run's own figure and not a coincidence of two defaults.
+    assert env.describe().horizon == RECORDED["offer"]["budget"] == 52
 
 
 def test_the_served_names_written_down_here_are_the_ones_the_gateway_would_serve() -> None:
@@ -587,19 +640,29 @@ def test_the_served_names_written_down_here_are_the_ones_the_gateway_would_serve
     because a call to one would end the episode with no terminal request and leave an attempt
     nothing could seal, so `terminate` is on the spec and never on the wire.
 
+    The second control tool is served only where the generation declares it, so what the list is
+    checked against is what this cell's own composition declares rather than what the gateway
+    could serve: a cell that stopped asking for it would be pinned to a name nobody offered.
+
     The order the list is written in is checked rather than sorted away. It is compared against an
     init line, and the recorded line listed its server's tools in name order, so that is the order
     a faithful line here will list these in. Sorting both sides would have let the pin be written
     in any order at all, and a live run would then have reported drift against it.
     """
     import shogym
-    from shogym.serve.protocol_v2.gateway import PULL_TOOL, wrapped_manifests
+    from shogym.serve.protocol_v2.gateway import INFO_TOOL, PULL_TOOL, wrapped_manifests
 
     env = shogym.make(cell.ENV, config={"tasks": [{"prompt": [], "info": {}}], "max_steps": 50})
     spec = env.describe()
-    served = [PULL_TOOL, *(tool.name for tool in wrapped_manifests(spec, terminal_manifest(spec)))]
+    start = composed(["first"], "immediate")
+    served = [
+        PULL_TOOL,
+        *([INFO_TOOL] if start.info else []),
+        *(tool.name for tool in wrapped_manifests(spec, terminal_manifest(spec))),
+    ]
     assert RECORDED_SERVED == sorted(RECORDED_SERVED)
     assert list(cell.SERVED_TOOLS) == sorted(f"{cell.SERVED_PREFIX}{name}" for name in served)
+    assert f"{cell.SERVED_PREFIX}{INFO_TOOL}" in cell.SERVED_TOOLS
     assert "terminate" in {tool.name for tool in spec.tools}
     assert f"{cell.SERVED_PREFIX}terminate" not in cell.SERVED_TOOLS
 
@@ -714,6 +777,55 @@ def test_a_message_that_belongs_to_no_row_is_reconciled_too(tmp_path: Path) -> N
     assert rows[0][6] == "ok" and read_back.unconfirmed(rows) == 0
     assert read_back.disagreements(checked, read, counted(0), certified=True) == [
         f"missing done {message_id(0, 'd')}"
+    ]
+
+
+def test_the_answer_about_how_much_work_is_left_is_reconciled_like_any_other_message(
+    tmp_path: Path,
+) -> None:
+    """Asking how much work is left is a served call, and its answer is a delivered message.
+
+    It names no attempt, so it is on no row, and asking is neither a pull nor work on a task:
+    counting it as either would report an agent that asked twice as one that worked more. What it
+    is instead is bytes the generation committed to deliver, so it is in the comparison, and a
+    read that skipped it would call a run whole while a turn the model was shown was missing from
+    the record the harness kept.
+    """
+    task, answer = message_id(0, "a"), message_id(0, "e")
+    answered = _result(body(answer), call="v")
+    lines = [
+        {"type": "system", "subtype": "init", "session_id": "s"},
+        _assistant([_call(read_back.PULL_TOOL, {})]),
+        _result(body(task)),
+        _assistant([_call(f"{read_back.SERVED_PREFIX}info", {}, "v")]),
+        answered,
+        {"type": "result", "subtype": "success"},
+    ]
+
+    def written(path: Path, events: List[Dict[str, Any]]) -> Path:
+        path.write_text("".join(json.dumps(line) + "\n" for line in events), encoding="utf-8")
+        return path
+
+    read = read_back.read_transcript(written(tmp_path / "asked.jsonl", lines))
+    assert (read.pulls, read.tasks, read.unserved, read.per_attempt) == (1, 1, 0, {})
+
+    presented = presentations([task, answer])
+    assert [message.attempt_id for message in presented] == ["a" * 32, None]
+    checked = read_back.reconcile(presented, read)
+    assert [(check.kind, check.status) for check in checked] == [
+        ("task", read_back.MATCHED),
+        ("info", read_back.MATCHED),
+    ]
+    assert read_back.disagreements(checked, read, counted(0), certified=True) == []
+
+    # And an answer the transcript does not hold is a message the model did not receive, named
+    # by the kind it was rather than folded into the attempt the agent was working at the time.
+    lost = read_back.read_transcript(
+        written(tmp_path / "lost.jsonl", [line for line in lines if line is not answered])
+    )
+    dropped = read_back.reconcile(presented, lost)
+    assert read_back.disagreements(dropped, lost, counted(0), certified=True) == [
+        f"missing info {answer}"
     ]
 
 
@@ -952,11 +1064,91 @@ def test_the_default_schedule_is_the_regime_the_recorded_run_ran() -> None:
     assert launcher.MODEL == "claude-opus-5" and launcher.EFFORT == "xhigh"
 
 
-def test_the_generation_serves_one_task_at_a_time_and_says_so() -> None:
-    # A pull while a task is live is answered with a wait here, and the composition is checked
-    # rather than assumed: the number decides the regime, and the run's record names it.
-    assert cell.CAPACITY == 1
+def test_the_generation_lets_the_agent_hold_the_eight_that_run_could_hold() -> None:
+    # A ninth pull while eight are live is answered with a wait, and the composition is checked
+    # rather than assumed: the number decides the regime, and the run's record names it. It is
+    # the recorded harness's own cap rather than this cell's choice, so it is read from the
+    # record. That run's agent held one at a time, which is a fact about the agent and not a
+    # bound the server put on it.
+    assert cell.CAPACITY == RECORDED["cell"]["max_in_flight"] == 8
     assert composed(["first", "second"], "immediate").capacity == cell.CAPACITY
+
+
+def test_the_composition_declares_the_budget_the_capacity_and_the_tool_that_counts() -> None:
+    """The three the platform serves and this cell asks for, each against where its value is.
+
+    The budget is checked against the number the recorded agent was actually handed, which is in
+    the fixture off that run's own trace: every one of its thirty-seven offers carried 52. The
+    generation reads it off the spec rather than typing it, because the transport enforces the
+    horizon call by call and a generation that declared any other number would be handing the
+    agent a figure nothing keeps, which the gateway refuses. That is why a spec with another
+    horizon composes that horizon rather than fifty-two.
+
+    The deadline is the one value with no recorded counterpart of its own kind: that run bounded
+    the leg rather than the task, and its no-progress budget is the number standing in here.
+    """
+    start = composed(["first", "second"], "immediate")
+    assert start.budget == RECORDED["offer"]["budget"] == SPEC.horizon == 52
+    assert RECORDED["offer"]["dispenses"] == RECORDED["outcome"]["dispensed"] == 37
+    assert start.capacity == cell.CAPACITY
+    assert start.info is True
+    assert start.attempt_deadline_ms == cell.ATTEMPT_DEADLINE_MS
+    assert cell.ATTEMPT_DEADLINE_MS == RECORDED["cell"]["rollout_no_progress_s"] * 1000
+    # Read from the spec, so an env served with another cap hands the agent that one instead.
+    elsewhere = SPEC.model_copy(update={"horizon": 60})
+    assert (
+        cell.compose(
+            elsewhere,
+            terminal_manifest(elsewhere),
+            bodies=["first"],
+            release=cell.release_for("immediate"),
+            grade=AUTOMATIONBENCH_GRADE,
+            claim_hash=CLAIM,
+        ).budget
+        == 60
+    )
+    # And an env that publishes no cap has no number to hand over, which is a refusal rather
+    # than a generation whose task records carry nothing.
+    capless = SPEC.model_copy(update={"horizon": None})
+    with pytest.raises(ValueError, match="where an agent reads a number"):
+        cell.compose(
+            capless,
+            terminal_manifest(capless),
+            bodies=["first"],
+            release=cell.release_for("immediate"),
+            grade=AUTOMATIONBENCH_GRADE,
+            claim_hash=CLAIM,
+        )
+
+
+@pytest.mark.parametrize(
+    "altered,refused",
+    [
+        ({"budget": 52.0}, "where an agent reads a number"),
+        ({"capacity": 8.0}, "tasks at a time"),
+        ({"info": 1}, "how much work is left"),
+        ({"capacity": True}, "tasks at a time"),
+    ],
+)
+def test_a_declaration_of_the_right_value_and_another_type_is_not_this_cells_regime(
+    monkeypatch: pytest.MonkeyPatch, altered: Dict[str, Any], refused: str
+) -> None:
+    """The check after the composition compares types, not only values.
+
+    Eight and eight point nought are equal in Python and are not the same declaration, and neither
+    are one and True. The platform refuses each of them where a generation is built and refuses
+    them again where one is served, so none of these reaches a task record today. This check is an
+    independent statement of the regime rather than a second copy of those, and one that accepted
+    a value it was written to refuse would be worth nothing the day it was the only one left.
+    """
+    composed_start = cell.stream_start
+
+    def altered_start(*arguments: Any, **keywords: Any):
+        return replace(composed_start(*arguments, **keywords), **altered)
+
+    monkeypatch.setattr(cell, "stream_start", altered_start)
+    with pytest.raises(ValueError, match=refused):
+        composed(["first"], "immediate")
 
 
 def test_the_served_tools_reach_the_model_under_the_name_that_run_saw(tmp_path: Path) -> None:
@@ -1665,6 +1857,9 @@ def test_the_surface_the_run_started_with_is_compared_to_the_one_that_run_saw(
     and reported: a rerun that cannot hold them fixed can at least say how they differed.
     """
     served = list(cell.SERVED_TOOLS)
+    # A faithful line lists the tool that says how much work is left, because this generation
+    # serves it. A comparison that did not expect it would report every faithful run as drift.
+    assert f"{cell.SERVED_PREFIX}info" in init_line()["tools"]
     assert pinned.surface_drift(init_line(), served=served) == {}
     drifted = pinned.surface_drift(
         init_line(
@@ -1694,10 +1889,11 @@ def test_the_built_in_tools_and_the_served_ones_are_two_comparisons_and_not_one(
     """The reported array holds both surfaces, and only one of them is the CLI's.
 
     Compared as one list, every faithful run reported drift: this cell's server offers `pull`
-    where that one offered `get_task`, offers no abort at all, and had no queue tool, so four of
-    the seven names that run's model saw have no counterpart here. Read as one array those show up
-    as tools the run lost and tools it gained, which is the same false alarm the four missing
-    built-ins used to raise from the other side.
+    where that one offered `get_task` and `info` where it offered `queue_info`, and serves no
+    abort at all, so three of the seven names that run's model saw are absent here and two of
+    this cell's six are absent there. Read as one array those show up as tools the run lost and
+    tools it gained, which is the same false alarm the four missing built-ins used to raise from
+    the other side.
 
     So the built-ins are compared against the recorded build's and the served names against the
     ones this generation composes, and a run that really did lose a built-in is still caught.
@@ -1710,7 +1906,7 @@ def test_the_built_in_tools_and_the_served_ones_are_two_comparisons_and_not_one(
     drift = pinned.surface_drift(init_line(tools=recorded), served=served)
     assert "tools" not in drift
     assert drift["served"] == {
-        "missing": ["mcp__shogym__pull"],
+        "missing": ["mcp__shogym__info", "mcp__shogym__pull"],
         "added": ["mcp__shogym__get_task", "mcp__shogym__queue_info", "mcp__shogym__terminate"],
     }
     # And a built-in that really did go missing is still a built-in that went missing.
@@ -1949,9 +2145,9 @@ def test_the_record_says_which_run_this_cell_is_a_rerun_of(
     assert written["roster_ceiling"] == RECORDED["cell"]["pool_ceiling"]
     assert written["recorded_benchmark_revision"] == RECORDED["substrate"]["automationbench_rev"]
     assert written["recorded_shogym_revision"] == RECORDED["substrate"]["shogym_rev"]
-    # The capacity is this cell's own and has no recorded counterpart: that generation allowed
-    # eight. It is in the record because a reader cannot otherwise tell which of the two was served.
-    assert written["capacity"] == cell.CAPACITY == 1 != RECORDED["cell"]["max_in_flight"]
+    # The capacity is the recorded run's own, and it is in the record because a reader cannot
+    # otherwise tell how many tasks the agent could hold while it worked this roster.
+    assert written["capacity"] == cell.CAPACITY == RECORDED["cell"]["max_in_flight"]
     # The prompt this launch passed, digested here rather than taken from the record.
     served = (Path(launcher.HERE) / "PROMPT.txt").read_text(encoding="utf-8")
     assert written["prompt_sha256"] == sha256(served.encode("utf-8")).hexdigest()
@@ -1963,6 +2159,66 @@ def test_the_record_says_which_run_this_cell_is_a_rerun_of(
     assert written["recorded_benchmark_revision"] != written["benchmark_revision"]
     # An image built from the inputs this cell records is a run with nothing to report about it.
     assert record["image_drift"] == {}
+
+
+def test_the_launch_record_names_what_the_server_said_it_served(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The four the generation decided, in the record a reader opens first.
+
+    The launch record is what the example calls the launch as it resolved, and three of these
+    four were not in it: a reader could see the capacity this launcher asked for and could not
+    see the budget the agent was handed, when an abandoned task ended, or whether the queue could
+    be asked about. They are copied out of the record the serving process wrote rather than
+    restated from the constants here, because the budget is the environment's own step cap and
+    nothing out here may name it, and because a block built from the constants would say what a
+    launch meant to serve in exactly the words of what it served.
+
+    A launch whose server never wrote that record says so instead, which is the case this fixture
+    produces on its own: nothing here starts a container, so nothing here writes a roster file
+    unless the test writes one.
+    """
+    no_docker(monkeypatch)
+    run_dir = tmp_path / "cell"
+    grades = run_dir / launcher.GRADES
+    grades.mkdir(parents=True)
+    start = composed(["first", "second"], "immediate")
+    roster_file = cell.record_roster(
+        grades, domain="public", schedule="immediate", positions=[7, 11], served=start
+    )
+    launcher.launch(
+        run_dir,
+        tasks="cell-one:2",
+        domain="public",
+        schedule="immediate",
+        model="claude-opus-5",
+        effort="xhigh",
+        cache=tmp_path / "cache",
+    )
+    record = json.loads((run_dir / launcher.RUN_FILE).read_text())
+    written = json.loads(roster_file.read_text())
+    assert record["served"] == {field: written[field] for field in launcher.SERVED_FIELDS}
+    assert record["served"] == {
+        "budget": start.budget,
+        "capacity": cell.CAPACITY,
+        "attempt_deadline_ms": cell.ATTEMPT_DEADLINE_MS,
+        "info": True,
+    }
+
+    unserved = tmp_path / "unserved"
+    launcher.launch(
+        unserved,
+        tasks="cell-one:2",
+        domain="public",
+        schedule="immediate",
+        model="claude-opus-5",
+        effort="xhigh",
+        cache=tmp_path / "cache",
+    )
+    absent = json.loads((unserved / launcher.RUN_FILE).read_text())["served"]
+    assert list(absent) == ["absent"] and cell.ROSTER_FILE in str(absent["absent"])
+    # A record that says nothing about what was served is not a record saying the defaults were.
+    assert "capacity" not in absent
 
 
 def test_a_launch_on_a_build_that_is_not_the_recorded_one_starts_nothing(
@@ -2824,3 +3080,156 @@ def test_a_probe_sharing_the_servers_network_stack_is_a_probe_that_fails(tmp_pat
     assert sandbox.read_probe(done.stdout) == len(failures) > 0, done.stdout
     assert any("network namespace" in line for line in failures), done.stdout
     assert any("is this container's loopback" in line for line in failures), done.stdout
+
+
+#: One self-contained AutomationBench task, so the live check below opens its worlds without the
+#: domain datasets. What it asks for does not matter: nothing here files a submission, and what is
+#: under test is what the generation hands the agent before any work is done.
+LIVE_TASK = {
+    "prompt": [{"role": "user", "content": "Do nothing."}],
+    "info": {"zapier_tools": [], "initial_state": {}, "assertions": []},
+}
+
+
+def absent_service(error: BaseException) -> bool:
+    """Whether this is the durable service not being there, rather than a fault in reaching it.
+
+    Opening a client is not only a connection. It makes directories, moves this process's own
+    descriptors, and downloads and starts an embedded service where no address was given, and the
+    client's core raises a plain ``RuntimeError`` for the connection failing as well. So the class
+    says nothing about which happened, and a check by class alone reports a regression anywhere in
+    that setup as a machine without a service.
+
+    What an absent service does say is that the connect never reached anything: the core names the
+    call it failed and the transport error under it, and that pair is what is recognized here. A
+    refused port and an address nothing answers at both arrive as one. Everything else is this
+    repository's own fault and fails the test that asked.
+    """
+    text = str(error)
+    return "Failed client connect" in text and "tcp connect error" in text
+
+
+def test_only_a_service_that_is_not_there_is_a_reason_to_skip_the_live_check() -> None:
+    """The one skip the live check keeps, told apart from a fault wearing the same class.
+
+    This is the check the skip is worth having: the shape a missing service arrives as is
+    recognized, and a plain fault raised from inside the same call is not, so a regression in
+    opening a client is a failure rather than a machine reported as lacking a dependency.
+    """
+    refused = RuntimeError(
+        "Failed client connect: Server connection error: tonic::transport::Error(Transport, "
+        'ConnectError(ConnectError("tcp connect error", 127.0.0.1:1, Os { code: 61, kind: '
+        'ConnectionRefused, message: "Connection refused" })))'
+    )
+    assert absent_service(refused)
+    # A fault inside the client's own setup wears the same class, and is not a missing service.
+    assert not absent_service(RuntimeError("sentinel durable-client regression"))
+    assert not absent_service(RuntimeError("Failed client connect: namespace not found"))
+    assert not absent_service(OSError("cannot write the database into that directory"))
+
+
+@pytest.mark.network
+async def test_a_live_generation_hands_over_the_budget_the_places_and_the_counts(
+    tmp_path: Path,
+) -> None:
+    """The three declarations as the agent meets them, over this cell's own composition.
+
+    Everything above this reads the composition. This serves it: a real durable stream, a real
+    world per attempt, and the cell's own `compose` deciding what any of it is. So the number on
+    the task record is the one the transport enforces rather than the one the composition asked
+    for, the counts are the stream's own arithmetic over its queue, and the ninth pull is answered
+    by the rule that says how many tasks the agent may hold rather than by a sentence in a tool
+    description.
+
+    It is marked `network` because the durable service downloads its server the first time, and
+    two dependencies this host cannot be asked to have are skipped rather than failed. The
+    benchmark source goes through this repository's own import gate, which skips a tarball the
+    machine cannot fetch and an extra it does not have installed, and re-raises everything else,
+    so a regression in the adapter is a failure here. The durable service is asked about at the
+    connection and nowhere else, and only where the failure says the connect reached nothing;
+    every other error out of that call, and every error from opening an episode, composing the
+    generation, building the gateway or serving it, is a failure.
+    """
+    gate("shogym.envs.automationbench.adapter", package="automationbench", extra="automationbench")
+    config = {"tasks": [LIVE_TASK], "max_steps": 50}
+    first = await ServedEpisode.start(cell.ENV, task=0, env_config=config, ends_on_horizon=False)
+    worlds = [first]
+    stopped = False
+    try:
+        spec = first.describe()
+        environment = environment_terminal(first)
+        generation = cell.compose(
+            spec,
+            terminal_manifest(spec),
+            bodies=[f"the body of task {position}" for position in range(cell.POOL_CEILING)],
+            release=cell.release_for("immediate"),
+            grade=environment.grade,
+            claim_hash=CLAIM,
+        )
+
+        async def open_world(attempt_id: str) -> ServedEpisode:
+            opened = await ServedEpisode.start(
+                cell.ENV, task=0, env_config=config, ends_on_horizon=False
+            )
+            worlds.append(opened)
+            return opened
+
+        grades = tmp_path / "grades"
+        async with AsyncExitStack() as running:
+            try:
+                client = await running.enter_async_context(durable_client(run_directory=grades))
+            except RuntimeError as error:
+                # The only skip left. It is asked at the connection and nowhere after it, and it
+                # is asked of the failure rather than of its class, because the class this call
+                # raises for a service that is not there is the one it raises for a fault in
+                # reaching it.
+                if not absent_service(error):
+                    raise
+                pytest.skip(f"the durable service is unavailable: {error}")
+            await running.enter_async_context(
+                stream_worker(client, activities=environment.activities)
+            )
+            gateway = await open_gateway(
+                client,
+                first,
+                start=generation,
+                open_episode=open_world,
+                run_directory=grades,
+                environment=environment,
+            )
+            await gateway.close_queue()
+            # The first work order, carrying the number the agent paces itself against.
+            task = json.loads(await gateway.pull({}))
+            assert task["kind"] == "task"
+            assert task["budget"] == spec.horizon == RECORDED["offer"]["budget"] == 52
+            # One handed out, one being worked, and the rest of the roster still to come.
+            asked = json.loads(await gateway.info({}))
+            assert asked["kind"] == "info"
+            assert (asked["remaining"], asked["consumed"], asked["in_flight"]) == (199, 1, 1)
+            # Seven more, each its own attempt in a world of its own.
+            held = [json.loads(await gateway.pull({})) for _ in range(7)]
+            assert [record["kind"] for record in held] == ["task"] * 7
+            assert len({record["attempt_id"] for record in [task, *held]}) == 8
+            # The ninth is the one the capacity decides, and it waits rather than displacing a
+            # task the agent is still holding.
+            ninth = json.loads(await gateway.pull({}))
+            assert ninth["kind"] == "wait"
+            full = json.loads(await gateway.info({}))
+            assert (full["remaining"], full["consumed"], full["in_flight"]) == (192, 8, 8)
+            # And every one of them is a message the generation committed to deliver, in the
+            # order it delivered them, which is what a run is read back against.
+            presented = await gateway._stream.handle.query(StreamWorkflow.presented_messages)
+            assert [row.kind for row in presented] == [
+                "task",
+                "info",
+                *["task"] * 7,
+                "wait",
+                "info",
+            ]
+            assert [row.attempt_id for row in presented if row.kind == "info"] == [None, None]
+            await gateway.aclose()
+            stopped = True
+    finally:
+        if not stopped:
+            for world in worlds:
+                await world.close()

@@ -234,6 +234,38 @@ def write_run_file(run_dir: Path, record: Dict[str, object]) -> Path:
     return path
 
 
+#: What the generation decided and this launcher did not: the step budget every task record
+#: carries, how many tasks the agent may hold, when an attempt it stopped working on ends, and
+#: whether it may ask how much is left. The budget is the environment's own step cap and is read
+#: off the spec where the generation is composed, so out here there is no number to name; the
+#: other three would be constants this file already holds, and a record built from those would say
+#: what a launch meant to serve rather than what it served. So all four are copied out of the
+#: record the serving process wrote.
+SERVED_FIELDS = ("budget", "capacity", "attempt_deadline_ms", "info")
+
+
+def served_regime(run_dir: Path) -> Dict[str, object]:
+    """What the generation served, copied out of the record the serving process wrote.
+
+    The launch record is where a reader looks first, and three of these four were not in it: a
+    reader could see the capacity this launcher asked for and could not see the budget the agent
+    was handed, the deadline an abandoned task ended at, or whether the queue could be asked
+    about. They are here now, and they are the server's own values rather than this file's.
+
+    A launch whose server never wrote that record says so. Filling the block from the constants
+    instead would produce a record of what was meant to be served that reads exactly like a record
+    of what was.
+    """
+    path = run_dir / GRADES / ROSTER_FILE
+    try:
+        written = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return {"absent": f"no {ROSTER_FILE}, so no server wrote down what it served"}
+    if not isinstance(written, dict) or any(field not in written for field in SERVED_FIELDS):
+        return {"absent": f"{ROSTER_FILE} does not say what this generation served"}
+    return {field: written[field] for field in SERVED_FIELDS}
+
+
 def pinned_to(system_prompt: str) -> Dict[str, object]:
     """What this cell is a rerun of, named strongly enough to tell it from another cell's.
 
@@ -606,6 +638,9 @@ def launch(
                 "cli_version_recorded": pinned.CLI_VERSION,
                 "image_drift": image_drift,
                 "pinned": pinned_to(system_prompt),
+                # Read here rather than at the end, because the server writes it before it answers
+                # a call and a launch that dies mid-flight should still say what it was serving.
+                "served": served_regime(run_dir),
                 # Written before the launch and rewritten after it, so a run killed hard enough to
                 # skip the rest of this reads back as the unfinished thing it is.
                 "status": INCOMPLETE,

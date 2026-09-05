@@ -1,10 +1,12 @@
 """Serve one generation over a roster of AutomationBench tasks to Claude Code.
 
 This is the quickstart's endpoint with one thing changed: the queue is a roster rather than a
-single task. ``pull`` hands out one task at a time, every env tool is wrapped so each call names
+single task. ``pull`` hands out one task per call, every env tool is wrapped so each call names
 the attempt it belongs to, and the terminal is intercepted and sealed by the stream. What the
-agent sees is what the quickstart's agent sees, and it is not told which task it played or how
-many are left.
+agent sees is what the quickstart's agent sees, and it is never told which task it played: the
+records name attempts, and nothing on the wire names a benchmark task. How much work is left is a
+different question, and this generation answers it where it is asked, in totals over the run that
+name no task of it.
 
 It speaks either transport. Told a port it publishes over streamable HTTP, which is how the cell
 runs it: this process, the benchmark source and every grade the run commits are then in a
@@ -62,21 +64,40 @@ ENV = "automationbench"
 #: prompt prefix, so it is pinned to that rather than renamed to whatever a transport would pick.
 SERVER = "shogym"
 
-#: How those names reach the model, and which of them this generation serves. The control tool is
-#: the gateway's and the rest are the environment's, wrapped so each call names its attempt. The
-#: list is written down because a launch compares the surface the run reported with the surface it
-#: meant to serve, and the recorded run's own list is not this one: it offered ``get_task`` where
-#: this offers ``pull``, and an abort tool this protocol does not serve at all.
+#: How those names reach the model, and which of them this generation serves. Two are the
+#: gateway's, the tool that asks for work and the tool that asks how much of it is left, and the
+#: rest are the environment's, wrapped so each call names its attempt. The list is written down
+#: because a launch compares the surface the run reported with the surface it meant to serve, and
+#: the recorded run's own list is not this one: it offered ``get_task`` where this offers ``pull``,
+#: ``queue_info`` where this offers ``info``, and an abort tool this protocol does not serve at all.
 SERVED_PREFIX = f"mcp__{SERVER}__"
 SERVED_TOOLS: Tuple[str, ...] = tuple(
     f"{SERVED_PREFIX}{name}"
-    for name in ("api_fetch", "api_search", "base64_encode", "done", "pull")
+    for name in ("api_fetch", "api_search", "base64_encode", "done", "info", "pull")
 )
 
-#: How many tasks the agent may hold at once. One is the whole of it here: a task is pulled,
-#: worked and ended before the next is asked for, and a pull beyond that is answered with a wait.
-#: The recorded run allowed eight, and its agent held one at a time.
-CAPACITY = 1
+#: How many tasks the agent may hold at once. Eight is what the recorded run's harness allowed,
+#: and the agent it recorded never held two: each pull followed the ending of the task before it.
+#: Those endings were not all the agent's. Its first task ran out of its step budget, which that
+#: harness filed and scored where it stood, and the agent found out on its next call; it called
+#: the terminal on the other thirty-six. So this is room the rerun's agent may use rather than a
+#: change to what that one did, and a ninth pull while eight are live is answered with a wait.
+CAPACITY = 8
+
+#: How long an attempt may stay active before the generation ends it. What it is for is a task the
+#: agent has walked away from: an attempt nobody ends holds one of the eight places forever, and a
+#: generation that never gets its places back never reaches Done.
+#:
+#: The number is the recorded run's and the rule is not. That run had no per-attempt deadline at
+#: all. It had a leg-wide one, 7200 s with no change in its trace, its provenance, its session
+#: state or its working directory, and any of those moving started the clock again. This is an
+#: absolute age: the clock starts when the task is delivered, working the task does not reset it,
+#: and an environment call still in flight when it fires delays the ending until the stream is
+#: quiet rather than being cancelled. What it ends is floored at zero with the reason ``deadline``
+#: rather than graded on the state the agent left, which is what this env's spent budget gets, so
+#: an actively worked task that ran past two hours would be scored as an abandoned one. That did
+#: not arise in the recorded run, whose whole leg was 3775 s.
+ATTEMPT_DEADLINE_MS = 7200 * 1000
 
 #: The file the run directory holds saying which task each position was. Nothing on the wire
 #: names a task, and the records the history answers with are keyed by attempt, so this is what
@@ -231,10 +252,23 @@ def compose(
     stamped with the reason it delivers nothing. Concealing a score that was released is an
     experiment arm, and this cell registers none.
 
-    The capacity the composition came out with is checked rather than assumed. It is what decides
-    whether a pull while a task is live is answered with work or with a wait, so it is a fact
-    about the regime this cell serves and it is recorded as one: a composition that came back
-    holding some other number would be serving a regime the run's record did not name.
+    Three declarations put back what the recorded run's agent had and this protocol serves
+    separately. The budget is the number every task record carries, and it is the environment's
+    own step cap rather than one written down here: the transport enforces the horizon call by
+    call, so a figure typed beside it would be one nothing keeps. The capacity is how many tasks
+    the agent may hold, and eight is what that harness allowed. The info tool is how the agent may
+    ask how much work is left, which that harness answered with a tool of its own.
+
+    What the composition came out with is checked rather than assumed. Those three decide what
+    the agent is offered and how many tasks it may work at once, so they are facts about the
+    regime this cell serves: a composition that came back holding others would be serving a
+    regime the run's record did not name, and one over an environment that publishes no step cap
+    would serve task records with no number on them at all.
+
+    The check is by type as well as by value, which is how the platform's own declarations are
+    held. A count that equals eight and is a float, or a yes that equals True and is a one, are
+    not the declarations this cell serves, and an independent check that accepted them would be
+    agreeing with something it was written to disagree with.
     """
     composed = stream_start(
         spec,
@@ -244,11 +278,27 @@ def compose(
         release=release,
         profile=ORDINARY,
         grade=grade,
+        budget=spec.horizon,
+        capacity=CAPACITY,
+        info=True,
+        attempt_deadline_ms=ATTEMPT_DEADLINE_MS,
     )
-    if composed.capacity != CAPACITY:
+    if type(composed.budget) is not int:
         raise ValueError(
-            f"this cell serves one task at a time and the composition holds capacity "
-            f"{composed.capacity}, which is a different regime than the one its record names"
+            f"this cell hands the agent the step budget it is served with and env "
+            f"{spec.env_name!r} publishes {spec.horizon!r}, so its task records would carry "
+            f"{composed.budget!r} where an agent reads a number"
+        )
+    if type(composed.capacity) is not int or composed.capacity != CAPACITY:
+        raise ValueError(
+            f"this cell serves {CAPACITY} tasks at a time and the composition holds capacity "
+            f"{composed.capacity!r}, which is a different regime than the one its record names"
+        )
+    if composed.info is not True:
+        raise ValueError(
+            f"this cell serves the tool that says how much work is left and the composition "
+            f"holds info {composed.info!r}, which is a different regime than the one its record "
+            f"names"
         )
     return composed
 
@@ -259,7 +309,7 @@ def record_roster(
     domain: str,
     schedule: str,
     positions: List[int],
-    attempts: List[str],
+    served: StreamStart,
 ) -> Path:
     """Write down which benchmark task each attempt was, and return the path.
 
@@ -267,6 +317,12 @@ def record_roster(
     nothing on the wire names a task. So the join is written here, once, by the only party that
     knows both halves. It is a harness-side note and never an authority: no score is in it, and
     a read that could not find it would still read every score the run kept.
+
+    The regime is written beside the join, off the composition rather than off the constants
+    above it: the step budget every task record carried, how many tasks the agent could hold, the
+    deadline an abandoned one ended at, and whether it could ask how much was left. Those four
+    are what a rerun has to match, and a reader holding the numbers the generation was actually
+    built with is holding what was served rather than what this file meant to serve.
     """
     path = run_dir / ROSTER_FILE
     path.write_text(
@@ -277,9 +333,15 @@ def record_roster(
                 "schedule": schedule,
                 "release_plan_id": release_for(schedule).release_plan_id,
                 "profile": ORDINARY,
+                "budget": served.budget,
+                "capacity": served.capacity,
+                "attempt_deadline_ms": served.attempt_deadline_ms,
+                "info": served.info,
                 "tasks": [
                     {"task_position": position, "task": str(task), "attempt_id": attempt}
-                    for position, (task, attempt) in enumerate(zip(positions, attempts))
+                    for position, (task, attempt) in enumerate(
+                        zip(positions, [item.attempt_id for item in served.tasks])
+                    )
                 ],
             },
             indent=2,
@@ -404,7 +466,7 @@ async def serve(
                     domain=domain,
                     schedule=schedule,
                     positions=positions,
-                    attempts=[item.attempt_id for item in composed.tasks],
+                    served=composed,
                 )
                 # The manifest is complete the moment it is built: this roster and no more. So
                 # the queue is closed before the agent can pull, which is what makes Done
