@@ -216,8 +216,8 @@ async def _read_off_a_copy(run: RunDirectory) -> _Answer:
                 answer = await _query(client, workflow_id)
             _refuse_a_moved_history(
                 workflow_id,
-                _history_length(arrived),
-                _history_length(await _described(client, workflow_id)),
+                _where_it_was(arrived),
+                _where_it_was(await _described(client, workflow_id)),
             )
             return answer
 
@@ -368,20 +368,35 @@ def _refuse_unapplied_work(workflow_id: str, described: WorkflowExecutionDescrip
     )
 
 
-def _history_length(described: Optional[WorkflowExecutionDescription]) -> Optional[int]:
-    """How many events this generation's history holds, which is the mark a read is taken by."""
+def _where_it_was(
+    described: Optional[WorkflowExecutionDescription],
+) -> Optional[Tuple[str, int]]:
+    """Which execution this generation is in and how far it has got, as one mark.
+
+    Both halves come out of one Describe, which is what makes them one moment rather than two.
+    The pair is the mark rather than the count alone, because a generation may run in more than
+    one execution: it continues as new before the durable service's limits bound it, under the
+    same identifier, and the count starts again in the execution that follows. A count on its
+    own would fall at that boundary, and a count that fell would be read as a history going
+    backwards, which is not a thing that happens.
+    """
     if described is None:
         return None
-    return described.raw_description.workflow_execution_info.history_length
+    info = described.raw_description.workflow_execution_info
+    return info.execution.run_id, info.history_length
 
 
-def _refuse_a_moved_history(workflow_id: str, before: Optional[int], after: Optional[int]) -> None:
-    """Refuse the read whose own Worker took the history past where it found it.
+def _refuse_a_moved_history(
+    workflow_id: str, before: Optional[Tuple[str, int]], after: Optional[Tuple[str, int]]
+) -> None:
+    """Refuse the read whose own Worker took the generation past where it found it.
 
-    An event count only rises, so this is the whole of the question: the copy that answered is
-    the copy the read arrived at, or it is not. A history that grew across a read grew because
-    the Worker started for it ran work that was ready, and that work is the run's own next step
-    rather than a fact any read is entitled to produce.
+    The question is whether the copy that answered is the copy the read arrived at, and the mark
+    answers it by being equal or not. Equality rather than order is the test, and it has to be:
+    the count can rise, because the Worker started for the read ran work that was ready, and it
+    can start again in another execution, because the generation crossed a boundary while the
+    read was in it. Both mean the same thing, that the rows this read answered with are the
+    read's own next step rather than the run's.
 
     Reading again does not repair it. What moved is the step, and the owner that resumes the run
     is who decides what it comes to, so the answer is the same refusal an unapplied task gets.
@@ -389,10 +404,19 @@ def _refuse_a_moved_history(workflow_id: str, before: Optional[int], after: Opti
     if before is None or after == before:
         return
     raise ReadRefused(
-        f"reading {workflow_id} moved it: its history was {before} events before the Query and "
-        f"{after} after, so the rows this read answered with are the read's own rather than the "
-        f"run's, and this run is read once its own owner has resumed it and that work has landed"
+        f"reading {workflow_id} moved it: it was at {_mark(before)} before the Query and "
+        f"{_mark(after)} after, so the rows this read answered with are the read's own rather "
+        f"than the run's, and this run is read once its own owner has resumed it and that work "
+        f"has landed"
     )
+
+
+def _mark(where: Optional[Tuple[str, int]]) -> str:
+    """One end of the comparison, in words, for the refusal that reports it."""
+    if where is None:
+        return "no execution at all"
+    run_id, length = where
+    return f"{length} events of execution {run_id}"
 
 
 async def _query(client: Client, workflow_id: str) -> _Answer:

@@ -33,6 +33,7 @@ from shogym.serve.protocol_v2 import (
     SCHEDULE_VERSION,
     Assignment,
     BlobRef,
+    PresentationAck,
     ReleasePlan,
     TerminalMetadata,
     assignment_id_for,
@@ -106,6 +107,211 @@ class TerminalTool:
     argument_names: List[str]
 
 
+# The version of the carried projection below. A generation continued under a carrier this code
+# does not know is refused rather than served from a half-understood record, so the number moves
+# whenever a field changes meaning.
+CARRIER_SCHEMA_VERSION = 1
+
+
+@dataclass(frozen=True)
+class CarriedAttempt:
+    """One attempt's mutable state, as the next execution has to find it.
+
+    The task itself is not here. It comes from the roster the start already carries, so what
+    crosses is what the generation did to the attempt rather than what the attempt was.
+
+    Three fields the seal writes are missing on purpose: the canonical submission text, the
+    environment's recovery token, and the finalizer key. They are written when a seal is
+    prepared and never read again, and a prepared seal is one of the things a boundary refuses
+    to cross, so nothing on the far side could ask for them.
+
+    ``deadline_expired`` is missing for the other reason: an expiry that can be applied is
+    applied before the boundary is considered, so at a legal boundary there is none to carry.
+    """
+
+    attempt_id: str
+    state: str
+    task_start_checkpoint: Optional[str] = None
+    environment_calls: int = 0
+    terminal_request_id: Optional[str] = None
+    terminal_identity: Optional[str] = None
+    terminal_tool: Optional[str] = None
+    terminal_source: Optional[str] = None
+    seal_id: Optional[str] = None
+    submission_digest: Optional[str] = None
+    score: Optional[float] = None
+    decode_state: Optional[str] = None
+    graded_evidence: Optional[str] = None
+    seal_ordinal: Optional[int] = None
+    final_failure: Optional[str] = None
+    deadline_at: Optional[int] = None
+    failure_activity: Optional[str] = None
+    failure_activity_id: Optional[str] = None
+    failure_kind: Optional[str] = None
+    failure_message: Optional[str] = None
+    failure_retry_state: Optional[str] = None
+
+
+@dataclass(frozen=True)
+class CarriedObligation:
+    """One obligation's state, and its candidate while one could still be offered.
+
+    Whether the candidate was ever built is kept apart from the candidate, because the count of
+    materializations is inside the projection hash and the body is not. An obligation that has
+    been presented, or that ended without being rendered, keeps the fact and drops the bytes.
+    """
+
+    attempt_id: str
+    state: str
+    materialized: bool = False
+    candidate: Optional[PayloadCandidate] = None
+
+
+@dataclass(frozen=True)
+class CarriedBinding:
+    """One logical request, its canonical identity, and the message bound to it."""
+
+    request_id: str
+    identity: str
+    message: OfferedMessage
+
+
+@dataclass(frozen=True)
+class CarriedFinalization:
+    """One logical finalization, its identity, and the receipt it was answered with."""
+
+    request_id: str
+    identity: str
+    receipt: AttemptFinalized
+
+
+@dataclass(frozen=True)
+class CarriedAttestation:
+    """One attestation, its identity, and the acknowledgement it was answered with."""
+
+    attestation_id: str
+    identity: str
+    ack: PresentationAck
+
+
+@dataclass(frozen=True)
+class CarriedFailure:
+    """What a handler raised, kept so the same Update ID is answered the same way.
+
+    A protocol refusal is reproduced exactly: the code is the whole of it. Anything else is
+    reproduced as what a caller can read of it, which is the declared type and the message the
+    failure carried. The wrapper a failing Activity arrives in is not rebuilt: what the caller
+    decodes is an application failure under the original type and words, which is what every
+    consumer of this generation reads a fault by.
+    """
+
+    kind: str
+    code: str = ""
+    type_name: str = ""
+    message: str = ""
+
+
+@dataclass(frozen=True)
+class CarriedLease:
+    """What one exact environment Update was answered with: a lease, or a refusal."""
+
+    update_id: str
+    ownership_epoch: int
+    lease: Optional[EnvironmentLease] = None
+    failure: Optional[CarriedFailure] = None
+
+
+@dataclass(frozen=True)
+class CarriedOwnershipOutcome:
+    """What one exact ownership claim was answered with: a receipt, or a refusal."""
+
+    update_id: str
+    ownership_epoch: int
+    receipt: Optional[OwnershipReceipt] = None
+    failure: Optional[CarriedFailure] = None
+
+
+@dataclass(frozen=True)
+class CarriedConsumerOutcome:
+    """What one exact consumer claim was answered with: a receipt, or a refusal."""
+
+    update_id: str
+    ownership_epoch: int
+    receipt: Optional[ConsumerReceipt] = None
+    failure: Optional[CarriedFailure] = None
+
+
+@dataclass(frozen=True)
+class CarriedSealFailure:
+    """What one exact filing failed with, where the failure left no row behind it.
+
+    A filing whose work failed for good ends its attempt and binds no message, so the tables a
+    retry is answered from hold nothing for it. This is what answers the exact Update ID
+    instead, and it is one row per attempt because an ended attempt files nothing more.
+    """
+
+    update_id: str
+    ownership_epoch: int
+    failure: CarriedFailure
+
+
+@dataclass(frozen=True)
+class StreamCarry:
+    """The whole logical projection of a generation, as one execution hands it to the next.
+
+    The durable service bounds one execution, and a roster longer than that bound needs more
+    than one. This is what makes the second execution the same generation as the first: every
+    fact a caller, a harness or a reader can observe is either in here or derived from the start
+    that rides beside it. Nothing here is configuration, and nothing here is hashed into the
+    generation's identity.
+
+    Three invariants hold it together. It is versioned, so a carrier this code does not
+    understand is refused rather than half read. It repeats the static configuration identity,
+    so a carrier composed against another generation is refused before it is believed. And every
+    unordered set and map inside it is written in canonical sorted form, because a set
+    serialized in hash order would make the same boundary produce different bytes on a replay.
+    The lists that mean an order, the presentations above all, keep the order they mean.
+
+    What is not here is what a legal boundary forbids: there is no pending message, no held
+    grant, no operation ticket, no prepared seal and no applicable expiry to carry, and the
+    generation is open, not draining, and has not presented Done.
+    """
+
+    carrier_schema_version: int
+    configuration_hash: str
+    ownership_epoch: int
+    fencing_token_hash: Optional[str]
+    ownership_claims: int
+    consumer_id: Optional[str]
+    claim_epoch: int
+    cursor: str
+    queue_closed: bool
+    hidden_ordinal: int
+    seal_ordinal: int
+    wait_count: int
+    wait_reasons: Dict[str, int]
+    offer_count: int
+    eligibility_count: int
+    handed_out_attempt_ids: List[str]
+    activity_ordinal: int
+    attempts: List[CarriedAttempt]
+    obligations: List[CarriedObligation]
+    presented: List[PresentedMessage]
+    committed_blobs: List[str]
+    pull_requests: List[CarriedBinding]
+    info_requests: List[CarriedBinding]
+    terminal_requests: List[CarriedBinding]
+    finalize_requests: List[CarriedFinalization]
+    attestations: List[CarriedAttestation]
+    last_begin: Optional[CarriedLease] = None
+    last_end: Optional[CarriedLease] = None
+    last_ownership: Optional[CarriedOwnershipOutcome] = None
+    last_consumer: Optional[CarriedConsumerOutcome] = None
+    failed_seals: List[CarriedSealFailure] = field(default_factory=list)
+    turnovers: int = 0
+    protocol_version: int = PROTOCOL_VERSION
+
+
 @dataclass(frozen=True)
 class StreamStart:
     """Everything a generation is, fixed before it serves anything.
@@ -163,6 +369,12 @@ class StreamStart:
     run, and a generation that makes no such decision has no such tool: nothing about it is
     served, nothing about it is hashed, and the counts stay where they have always been, which is
     with the harness.
+
+    ``carry`` is the one field a running generation puts here rather than a caller. It is how one
+    execution hands the whole logical projection to the next, and it is legal only there: a fresh
+    start carrying one is refused, and a continued execution given none is refused too. It is
+    outside :func:`configuration_hash` by construction, because what the generation is has not
+    changed and every resume is held to that value.
     """
 
     configuration_hash: str
@@ -191,6 +403,7 @@ class StreamStart:
     info: bool = False
     schedule_version: str = SCHEDULE_VERSION
     protocol_version: int = PROTOCOL_VERSION
+    carry: Optional[StreamCarry] = None
 
 
 def configuration_hash(start: StreamStart) -> str:
@@ -719,6 +932,23 @@ class StreamState:
     profile: str = LEGACY
     experiment_id: Optional[str] = None
     protocol_version: int = PROTOCOL_VERSION
+    # Where the generation is in the chain of executions it has run in, whether it is on its way
+    # to another one, and the size that stopped it starting another. All three are operational:
+    # none is inside the projection a presentation attests against, and none says anything about
+    # what the generation serves.
+    #
+    # ``turnover_requested`` is what a transport waits on. A generation that has decided to
+    # continue as new rejects every arriving Update that cannot bring the boundary about, and a
+    # caller so rejected has to be able to tell a generation working towards a boundary from one
+    # that has stopped. Reading this is a Query, which costs nothing against the cap, so a call
+    # held up by a boundary can ask as often as it likes.
+    #
+    # ``turnover_refused_bytes`` is the honest end of an unsupported profile: the carrier would
+    # not fit under the ceiling, so the generation kept serving in the execution it was already
+    # in, and this is the number a launcher reports rather than guessing why the run stopped.
+    turnovers: int = 0
+    turnover_requested: bool = False
+    turnover_refused_bytes: Optional[int] = None
 
 
 @dataclass(frozen=True)
