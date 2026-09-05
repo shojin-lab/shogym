@@ -619,7 +619,9 @@ async def test_a_replacement_transport_ends_an_attempt_whose_budget_is_already_s
             assert state.environment_calls == {attempt: 2}
 
             # A second transport over the same generation and the same world, built the way a
-            # replacement process builds one: it kept nothing of what the first one counted.
+            # replacement process builds one: it kept nothing of what the first one counted, and
+            # it is told which attempt the world it was handed belongs to, because nothing it
+            # presents will ever pair the two.
             replacement = StreamGateway(
                 stream,
                 episode,
@@ -627,6 +629,7 @@ async def test_a_replacement_transport_ends_an_attempt_whose_budget_is_already_s
                 terminal_manifest(spec),
                 initial_cursor=state.cursor,
                 generation=start,
+                world_attempt=attempt,
             )
             assert (
                 await refused(replacement.environment("guess", _guess(attempt, "adieu")))
@@ -665,7 +668,8 @@ async def test_a_replacement_transport_gets_what_is_left_of_the_budget_and_no_mo
             receipt = await stream.claim_consumer(CONSUMER)
             spec = episode.describe().model_copy(update={"horizon": 3})
 
-            def transport(cursor: str) -> StreamGateway:
+            def transport(cursor: str, world_attempt: Optional[str] = None) -> StreamGateway:
+                """The transport, rebuilt. A replacement mid attempt says whose world it holds."""
                 return StreamGateway(
                     stream,
                     episode,
@@ -673,6 +677,7 @@ async def test_a_replacement_transport_gets_what_is_left_of_the_budget_and_no_mo
                     terminal_manifest(spec),
                     initial_cursor=cursor,
                     generation=start,
+                    world_attempt=world_attempt,
                 )
 
             gateway = transport(receipt.initial_cursor)
@@ -682,11 +687,11 @@ async def test_a_replacement_transport_gets_what_is_left_of_the_budget_and_no_mo
 
             # One step spent, two left, and a transport that knows about neither.
             state = await gateway.stream_state()
-            gateway = transport(state.cursor)
+            gateway = transport(state.cursor, attempt)
             for word in ("slate", "adieu"):
                 played = await gateway.environment("guess", _guess(attempt, word))
                 assert json.loads(played.content[0].text)["valid"] is True
-                gateway = transport((await gateway.stream_state()).cursor)
+                gateway = transport((await gateway.stream_state()).cursor, attempt)
 
             assert len(episode._trajectory) == 3
             state = await gateway.stream_state()
@@ -764,6 +769,7 @@ async def test_an_owner_that_restores_the_world_restores_the_budget_with_it(env)
                 terminal_manifest(spec),
                 initial_cursor=state.cursor,
                 generation=start,
+                world_attempt=attempt,
                 open_episode=open_world,
             )
             for word in ("adieu", "bloke"):
@@ -1338,6 +1344,17 @@ async def test_a_graded_horizon_whose_seal_ended_the_attempt_leaves_the_transpor
             assert len(result.content) == 1
             assert json.loads(result.content[0].text)["valid"] is True
 
+            # And that call is where the ended attempt's world goes, before anything else asks
+            # for anything. The observation it hands over may be the last thing the agent wants,
+            # so a world left for the next call is a world that may never be let go of. The
+            # session the attempt played in is gone, and so is every way of reaching it: the map
+            # an ordinary call routes through and the route a seal resolves.
+            from shogym.envs.wordle import mcp_server as wordle_server
+
+            assert wordle_server.played(episode.session_id) is None
+            assert gateway._worlds == {}
+            assert environment.route(attempt) is None
+
             # And the generation serves the next task, in a world of its own.
             second = json.loads(await gateway.pull({}))
             assert second["kind"] == "task"
@@ -1886,11 +1903,12 @@ async def test_the_spent_budget_survives_a_lost_response_and_spends_no_second_st
 
 @pytest.mark.network
 async def test_a_world_that_will_not_close_leaves_the_next_task_unoffered(env) -> None:
-    """The ended attempt's world is retired before the pull that could reserve the next one.
+    """The ended attempt's world is retired where the attempt ends, and a failure is not skipped.
 
-    Nothing presents an ending, so the acknowledgement that normally retires a world never
-    comes. Retiring it while preparing an already offered task is too late: a cleanup that
-    fails would leave the stream holding a task and the old world still running.
+    Nothing presents an ending, so the acknowledgement that normally retires a world never comes.
+    The call that spends the attempt out is what lets the world go instead, and a cleanup that
+    fails there is raised rather than swallowed: the world is kept, no task is offered, and the
+    call that comes back asks for the cleanup again before anything new is reserved.
     """
     worlds: List[ServedEpisode] = []
     cleanups = 0
@@ -1935,18 +1953,16 @@ async def test_a_world_that_will_not_close_leaves_the_next_task_unoffered(env) -
             )
             first = json.loads(await gateway.pull({}))
             await gateway.environment("guess", _guess(first["attempt_id"], "crane"))
-            # The budget is one call, so the second one is where the attempt ends.
-            assert (
-                await refused(gateway.environment("guess", _guess(first["attempt_id"], "slate")))
-                == "invalid_attempt"
-            )
             episode.close = close_that_fails_once  # type: ignore[method-assign]
 
+            # The budget is one call, so the second one is where the attempt ends and where its
+            # world is let go of. The cleanup fails, and the call that owed it says so.
             with pytest.raises(Exception):
-                await gateway.pull({})
-            # The cleanup was tried and it failed, so nothing was offered and no world opened.
+                await gateway.environment("guess", _guess(first["attempt_id"], "slate"))
             state = await gateway.stream_state()
             assert cleanups == 1
+            assert state.attempts[first["attempt_id"]] == "final_failed"
+            # Nothing was offered and no world was opened while the old one was still running.
             assert state.pending_message_id is None
             assert worlds == []
 

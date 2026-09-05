@@ -51,8 +51,10 @@ from shogym.serve.protocol_v2 import (  # noqa: E402
 from shogym.serve.protocol_v2.gateway import (  # noqa: E402
     CANONICALIZATION_VERSION,
     PULL_TOOL,
+    EnvironmentTerminal,
     GatewayClosed,
     StreamGateway,
+    WorldRoute,
     build_gateway_server,
     declared_argument_names,
     durable_client,
@@ -109,6 +111,7 @@ TASK_ID = "00000000000000000000000000000101"
 ACK_ID = "00000000000000000000000000000102"
 SECOND_ATTEMPT = "00000000000000000000000000000200"
 SECOND_TASK_ID = "00000000000000000000000000000201"
+SECOND_ACK_ID = "00000000000000000000000000000202"
 DONE_ID = "00000000000000000000000000000002"
 CURSOR = "00000000000000000000000000000001"
 
@@ -137,6 +140,15 @@ ACK_OFFER = offered(
 )
 SECOND_TASK_OFFER = offered(
     Task(message_id=SECOND_TASK_ID, attempt_id=SECOND_ATTEMPT, body="Guess the next word."),
+    SECOND_ATTEMPT,
+)
+SECOND_ACK_OFFER = offered(
+    SealAck(
+        message_id=SECOND_ACK_ID,
+        attempt_id=SECOND_ATTEMPT,
+        submission_digest="b" * 64,
+        canonicalization_version="shogym.gateway.1",
+    ),
     SECOND_ATTEMPT,
 )
 DONE_OFFER = offered(Done(message_id=DONE_ID))
@@ -459,7 +471,9 @@ async def scoring_world(trace_path: Optional[Path] = None) -> ServedEpisode:
     )
 
 
-def composition(spec: TaskSpec, *, budget: Optional[int] = None) -> StreamStart:
+def composition(
+    spec: TaskSpec, *, budget: Optional[int] = None, capacity: int = 1
+) -> StreamStart:
     """The generation a transport in these tests is serving.
 
     Every gateway is handed the composition it serves, because what that composition declares is
@@ -473,6 +487,7 @@ def composition(spec: TaskSpec, *, budget: Optional[int] = None) -> StreamStart:
         terminal_manifest(spec),
         claim_hash="c" * 64,
         budget=budget,
+        capacity=capacity,
         evaluation_only=True,
     )
 
@@ -891,6 +906,69 @@ def test_a_declared_budget_is_said_in_the_words_the_generation_hashed() -> None:
     assert _configuration_hash(spec, terminal, None, "floor", None) == configuration_of(spec)
 
 
+def test_a_generation_that_declares_no_capacity_serves_what_it_always_served() -> None:
+    """One task at a time is the default, and it is the composition every history was made under.
+
+    The values are pinned as literals for the reason the budget's are: a generation composed
+    without a capacity has to serve the bytes and hash to the digest a build from before there
+    was a capacity to declare produced, or every run recorded by one of those is refused its
+    resume over a number nobody chose.
+    """
+    spec = hashing_spec()
+    terminal = terminal_manifest(spec)
+    composed = stream_start(spec, terminal, claim_hash="a" * 64, evaluation_only=True)
+    assert composed.capacity == 1
+    assert served_manifest(spec, terminal)["control_tool"]["description"] == (
+        "Ask the stream for your next message. Takes no arguments. The result is one JSON "
+        "record: a task to work on, a payload, a wait, or done. Work only on the task you were "
+        "given, and pull again when you have finished with it."
+    )
+    assert configuration_of(spec) == (
+        "e05450155cce9a1f8d2bfd0e9ea0027605853c2cafaea3760d572f9c1c83ae45"
+    )
+    assert _configuration_hash(spec, terminal, None, "floor", None, 1) == configuration_of(spec)
+
+
+def test_a_generation_that_serves_more_than_one_task_at_a_time_says_so() -> None:
+    """What a capacity allows is a rule of the generation, and the model reads it in one place.
+
+    The words at one tell the agent to finish before pulling again, which is the opposite of what
+    a wider capacity is for, so the sentence is replaced rather than appended to. What replaces it
+    says the three things an agent holding several tasks needs: how many, what a pull gets while
+    it holds that many, and how it ends one of them. Each is written as what the stream does and
+    no wider: a full capacity stops tasks and not messages, and a terminal is how the agent ends a
+    task rather than the only way one ends. The text is what the generation hashed, so a resume of
+    one served under other words is refused.
+    """
+    spec = hashing_spec()
+    terminal = terminal_manifest(spec)
+    at_one = served_manifest(spec, terminal)["control_tool"]["description"]
+    at_eight = served_manifest(spec, terminal, capacity=8)["control_tool"]["description"]
+    shared = "Ask the stream for your next message. Takes no arguments. The result is one JSON "
+    shared += "record: a task to work on, a payload, a wait, or done. "
+    assert at_one == shared + (
+        "Work only on the task you were given, and pull again when you have finished with it."
+    )
+    assert at_eight == shared + (
+        "You may hold up to 8 tasks at once, so you may pull again before you have finished the "
+        "one you are working on. While you hold that many, a pull cannot return another task, "
+        "and it answers a wait when nothing else is ready for you. To end a task yourself, call "
+        "its terminal with that task's attempt_id."
+    )
+    # The number is the generation's own and not a word for many.
+    assert "up to 2 tasks" in served_manifest(spec, terminal, capacity=2)["control_tool"][
+        "description"
+    ]
+    # A budget still says what it says, after whichever sentence the capacity served.
+    budgeted = served_manifest(spec, terminal, budget=spec.horizon, capacity=8)["control_tool"]
+    assert budgeted["description"] == at_eight + gateway_module._BUDGET_NOTE
+    # And what the model reads is what the generation hashed.
+    assert _configuration_hash(spec, terminal, None, "floor", None, 8) != configuration_of(spec)
+    assert stream_start(
+        spec, terminal, claim_hash="a" * 64, evaluation_only=True, capacity=8
+    ).configuration_hash == _configuration_hash(spec, terminal, None, "floor", None, 8)
+
+
 def test_a_declared_budget_is_the_budget_this_transport_enforces() -> None:
     """The number an agent reads is the step cap this transport enforces, or the generation is
     not composed at all: an advertised budget nothing enforces is worse than no budget."""
@@ -931,6 +1009,42 @@ def test_a_budget_no_task_record_could_carry_is_refused_where_it_is_declared(bud
             budget=budget,
             evaluation_only=True,
         )
+
+
+@pytest.mark.parametrize("capacity", [True, False, 2.0, 1.5, 0, -1, 2**53, "2", None])
+def test_a_capacity_that_is_not_a_count_of_tasks_is_refused_where_it_is_declared(
+    capacity: Any,
+) -> None:
+    """A capacity is a count and is held to the rule a count is held to, at the point it is made.
+
+    Every one of these composes something: zero and a negative compose a generation the kernel
+    refuses at start, and ``True``, ``False`` and a float compose one that starts and then serves
+    the words of a generation at one while its records say something else. Both are worse than a
+    refusal where the number was written down.
+    """
+    spec = hashing_spec()
+    with pytest.raises(ValueError, match="capacity must be an integer"):
+        stream_start(
+            spec,
+            terminal_manifest(spec),
+            claim_hash="a" * 64,
+            capacity=capacity,
+            evaluation_only=True,
+        )
+
+
+@pytest.mark.parametrize("capacity", [1, 2, 8, 2**53 - 1])
+def test_a_capacity_that_is_a_count_of_tasks_composes(capacity: int) -> None:
+    """The rule refuses what is not a count and admits what is, one included."""
+    spec = hashing_spec()
+    composed = stream_start(
+        spec,
+        terminal_manifest(spec),
+        claim_hash="a" * 64,
+        capacity=capacity,
+        evaluation_only=True,
+    )
+    assert composed.capacity == capacity
 
 
 @pytest.mark.parametrize("horizon,budget", [(1, True), (52, 52.0), (0, 0), (-1, -1)])
@@ -1254,6 +1368,289 @@ async def test_a_world_the_stream_sealed_is_let_go_of_without_a_second_ending(
     assert [row for row in rows if row.get("terminated") or "verdict" in row] == []
 
 
+class NamedWorld:
+    """One world that says which one it is, and records what it was asked to do.
+
+    A double rather than a real episode, because what these tests read is which world served
+    which call. A real world would have to be asked about its own state to answer that, and the
+    question here is where the call went and not what the environment did with it.
+    """
+
+    def __init__(self, name: str, *, refuse_closes: int = 0) -> None:
+        self.name = name
+        self.env = object()
+        self.session_id = f"session-{name}"
+        self.ends_on_horizon = False
+        self.served: List[Dict[str, Any]] = []
+        self.closed: Optional[bool] = None
+        # How many times stopping this world fails before it works, for the worlds that do.
+        self.refuse_closes = refuse_closes
+
+    async def call(self, tool_name: str, arguments: Dict[str, Any]) -> Any:
+        self.served.append({"tool": tool_name, **arguments})
+        return SimpleNamespace(content=self.name)
+
+    async def close(self, *, finalize: bool = True) -> None:
+        if self.refuse_closes:
+            self.refuse_closes -= 1
+            raise RuntimeError(f"the world {self.name} would not stop")
+        self.closed = finalize
+
+
+def worlds_gateway(
+    spec: TaskSpec,
+    stream: ScriptedStream,
+    first: NamedWorld,
+    later: Dict[str, NamedWorld],
+    *,
+    world_attempt: Optional[str] = None,
+) -> StreamGateway:
+    """A gateway at a capacity of two, with a world of its own waiting for each attempt.
+
+    The environment is declared so the route is one this test can read: the pairing of attempt to
+    world is what a seal resolves through, and a generation serving several attempts at once has
+    more than one pairing to get right.
+
+    ``world_attempt`` is how a caller hands over a world for an attempt that is already being
+    worked, which is what a transport replacing another is given.
+    """
+
+    async def opener(attempt_id: str) -> Any:
+        return later[attempt_id]
+
+    return StreamGateway(
+        stream,  # type: ignore[arg-type]
+        first,  # type: ignore[arg-type]
+        spec,
+        terminal_manifest(spec),
+        initial_cursor=CURSOR,
+        generation=composition(spec, capacity=2),
+        world_attempt=world_attempt,
+        open_episode=opener,
+        environment=EnvironmentTerminal(
+            CANONICALIZATION_VERSION, [], None, WorldRoute(), DOUBLE_GRADE
+        ),
+    )
+
+
+async def test_two_live_attempts_are_each_worked_in_their_own_world(
+    episode: ServedEpisode,
+) -> None:
+    """A call runs in the world of the attempt it names, whatever was served most recently.
+
+    At a capacity above one the model holds several tasks and works them in whatever order it
+    likes, so the world of the newest task is not the world of the next call. A transport with
+    one current world would run the older attempt's actions in the newer attempt's environment
+    and file them under the newer attempt's seal, and nothing anywhere would say so.
+    """
+    spec = episode.describe()
+    stream = ScriptedStream(TASK_OFFER, SECOND_TASK_OFFER)
+    first, second = NamedWorld("first"), NamedWorld("second")
+    gateway = worlds_gateway(spec, stream, first, {SECOND_ATTEMPT: second})
+
+    assert json.loads(await gateway.pull({}))["attempt_id"] == ATTEMPT
+    # The second task arrives with the first attempt still live, which is what a capacity buys.
+    assert json.loads(await gateway.pull({}))["attempt_id"] == SECOND_ATTEMPT
+    assert stream.attempts == {ATTEMPT: "active", SECOND_ATTEMPT: "active"}
+
+    async def guessed(attempt_id: str, word: str) -> str:
+        wrapper = {"attempt_id": attempt_id, "arguments": {"word": word}}
+        return (await gateway.environment("guess", wrapper)).content[0].text
+
+    assert await guessed(SECOND_ATTEMPT, "crane") == "second"
+    assert await guessed(ATTEMPT, "slate") == "first"
+    assert await guessed(SECOND_ATTEMPT, "adieu") == "second"
+
+    assert first.served == [{"tool": "guess", "word": "slate"}]
+    assert second.served == [
+        {"tool": "guess", "word": "crane"},
+        {"tool": "guess", "word": "adieu"},
+    ]
+    # And each attempt's seal resolves to the world that attempt's own calls reached.
+    route = gateway._route
+    assert route(ATTEMPT) == (first.env, "session-first")
+    assert route(SECOND_ATTEMPT) == (second.env, "session-second")
+    await gateway.aclose()
+
+
+async def test_a_seal_closes_the_world_of_the_attempt_it_sealed_and_no_other(
+    episode: ServedEpisode,
+) -> None:
+    """The older attempt is sealed while the newer is still being worked, and only its world goes.
+
+    Sealing is what makes the submission, so the sealed attempt's world is let go of and its
+    pairing forgotten: an entry left behind would offer a torn down environment as somewhere to
+    capture evidence from. The attempt still being worked keeps its world and keeps working in it.
+    """
+    spec = episode.describe()
+    stream = ScriptedStream(TASK_OFFER, SECOND_TASK_OFFER, ACK_OFFER)
+    first, second = NamedWorld("first"), NamedWorld("second")
+    gateway = worlds_gateway(spec, stream, first, {SECOND_ATTEMPT: second})
+    await gateway.pull({})
+    await gateway.pull({})
+
+    filing = {"attempt_id": ATTEMPT, "arguments": {}}
+    assert json.loads(await gateway.terminal(filing))["kind"] == "seal_ack"
+    # Released rather than ended: what the attempt was worth is the generation's to say.
+    assert first.closed is False
+    assert second.closed is None
+    assert gateway._route(ATTEMPT) is None
+    assert gateway._route(SECOND_ATTEMPT) == (second.env, "session-second")
+
+    # The attempt that is still live is still worked, in the world it has been working in.
+    live = {"attempt_id": SECOND_ATTEMPT, "arguments": {"word": "crane"}}
+    assert (await gateway.environment("guess", live)).content[0].text == "second"
+    # And the sealed one is over, by the route it used to have and by the stream's own answer.
+    sealed = {"attempt_id": ATTEMPT, "arguments": {"word": "crane"}}
+    assert await refused(gateway.environment("guess", sealed)) == "invalid_attempt"
+    assert first.served == []
+    await gateway.aclose()
+
+
+async def test_a_handed_world_is_one_attempts_and_no_other_call_reaches_it(
+    episode: ServedEpisode,
+) -> None:
+    """A world handed over is named by the attempt it is for, and nothing else may take it.
+
+    The generation says two attempts are being worked and this transport was given one world, so
+    the other attempt's world is somewhere this process cannot reach. Its calls are refused rather
+    than run in the world this transport happens to be holding, and its filing is refused rather
+    than sent: a filing for an attempt whose world is not here would end that attempt on an
+    environment that read nothing. Both refusals are local, before the stream is asked for
+    anything: a granted step is the stream recording that a world changed, and a filing it accepts
+    is an attempt over for good.
+    """
+    spec = episode.describe()
+    stream = ScriptedStream()
+    stream.attempts = {ATTEMPT: "active", SECOND_ATTEMPT: "active"}
+    handed = NamedWorld("handed")
+    gateway = worlds_gateway(spec, stream, handed, {}, world_attempt=ATTEMPT)
+
+    elsewhere = {"attempt_id": SECOND_ATTEMPT, "arguments": {"word": "crane"}}
+    assert await refused(gateway.environment("guess", elsewhere)) == "invalid_attempt"
+    filing = {"attempt_id": SECOND_ATTEMPT, "arguments": {}}
+    assert await refused(gateway.terminal(filing)) == "invalid_attempt"
+    assert stream.leases == []
+    assert stream.requests == []
+    assert handed.served == []
+    assert isinstance(gateway._recovery, _Idle)
+
+    # And the attempt the world was handed over for is worked in it.
+    assert (await gateway.environment("guess", GUESS)).content[0].text == "handed"
+    assert handed.served == [{"tool": "guess", "word": "crane"}]
+    await gateway.aclose()
+
+
+async def test_a_handed_world_is_closed_when_its_attempt_ends_and_no_task_inherits_it(
+    episode: ServedEpisode,
+) -> None:
+    """The world of a handed attempt the generation ended is retired, not passed on.
+
+    An attempt the generation ended presents no acknowledgement, so what closes its world is the
+    state read at the top of the next call, exactly as for a world this transport opened. The task
+    that comes next cannot inherit it: the seal captures what an attempt left behind, so a fresh
+    attempt working in it would file the ended attempt's work as its own.
+    """
+    spec = episode.describe()
+    stream = ScriptedStream(SECOND_TASK_OFFER)
+    stream.attempts[ATTEMPT] = "final_failed"
+    handed, opened = NamedWorld("handed"), NamedWorld("opened")
+    gateway = worlds_gateway(
+        spec, stream, handed, {SECOND_ATTEMPT: opened}, world_attempt=ATTEMPT
+    )
+
+    assert json.loads(await gateway.pull({}))["attempt_id"] == SECOND_ATTEMPT
+    # Released rather than ended, and released before the pull could reserve anything.
+    assert handed.closed is False
+    wrapper = {"attempt_id": SECOND_ATTEMPT, "arguments": {"word": "crane"}}
+    assert (await gateway.environment("guess", wrapper)).content[0].text == "opened"
+    assert handed.served == []
+    await gateway.aclose()
+
+
+async def test_a_world_handed_over_mid_attempt_is_let_go_of_when_that_attempt_seals(
+    episode: ServedEpisode,
+) -> None:
+    """A replacement is handed the world its attempt is in, and the seal is what releases it.
+
+    The task that started the attempt was presented by the transport before this one, so the only
+    thing that pairs the attempt with the world it is working in is the caller handing it over
+    under that attempt's name. The pairing goes in both places at once: an ordinary call routes
+    through the one and the environment's own terminal resolves the seal through the other, and a
+    world written into one and not the other is worked here and sealed somewhere else. The
+    acknowledgement then lets go of it the way it lets go of a world this transport opened.
+    """
+    spec = episode.describe()
+    stream = ScriptedStream(ACK_OFFER)
+    stream.attempts[ATTEMPT] = "active"
+    handed = NamedWorld("handed")
+    gateway = worlds_gateway(spec, stream, handed, {}, world_attempt=ATTEMPT)
+    # What a seal resolving this attempt finds is the world it was handed.
+    assert gateway._route(ATTEMPT) == (handed.env, "session-handed")
+
+    assert json.loads(await gateway.terminal(FILING))["kind"] == "seal_ack"
+    assert handed.closed is False
+    assert gateway._route(ATTEMPT) is None
+    await gateway.aclose()
+
+
+async def two_worlds_open(gateway: StreamGateway) -> None:
+    """Present both tasks, so the transport is holding a world for each of two live attempts."""
+    assert json.loads(await gateway.pull({}))["attempt_id"] == ATTEMPT
+    assert json.loads(await gateway.pull({}))["attempt_id"] == SECOND_ATTEMPT
+
+
+async def test_a_stop_tries_every_world_when_one_of_them_will_not_close(
+    episode: ServedEpisode,
+) -> None:
+    """A world that will not stop is one world, and the stop goes on to the rest.
+
+    Each of them is a process outside this one and any of them may refuse to stop. Stopping at the
+    first refusal would strand every world behind it with nothing left to come back for them, so
+    each is tried: the ones that closed are gone and the one that failed is kept, and the stop
+    can be asked for again to finish it. What went wrong is raised once they have all been tried.
+    """
+    spec = episode.describe()
+    stream = ScriptedStream(TASK_OFFER, SECOND_TASK_OFFER)
+    stubborn, willing = NamedWorld("stubborn", refuse_closes=1), NamedWorld("willing")
+    gateway = worlds_gateway(spec, stream, stubborn, {SECOND_ATTEMPT: willing})
+    await two_worlds_open(gateway)
+
+    with pytest.raises(RuntimeError, match="stubborn would not stop"):
+        await gateway.aclose()
+    # The one behind it was closed anyway, and the one that failed is still here to be closed.
+    assert willing.closed is False
+    assert list(gateway._worlds) == [ATTEMPT]
+
+    await gateway.aclose()
+    assert stubborn.closed is False
+    assert gateway._worlds == {}
+
+
+async def test_a_stop_that_could_not_close_two_worlds_says_so_about_both(
+    episode: ServedEpisode,
+) -> None:
+    """Every failure is raised, because a stop that named one and dropped the other would be the
+    same silence in a smaller place: what is left running is what an operator has to be told."""
+    spec = episode.describe()
+    stream = ScriptedStream(TASK_OFFER, SECOND_TASK_OFFER)
+    worlds = [NamedWorld("first", refuse_closes=1), NamedWorld("second", refuse_closes=1)]
+    gateway = worlds_gateway(spec, stream, worlds[0], {SECOND_ATTEMPT: worlds[1]})
+    await two_worlds_open(gateway)
+
+    with pytest.raises(ExceptionGroup) as caught:
+        await gateway.aclose()
+    assert [str(error) for error in caught.value.exceptions] == [
+        "the world first would not stop",
+        "the world second would not stop",
+    ]
+    assert list(gateway._worlds) == [ATTEMPT, SECOND_ATTEMPT]
+
+    await gateway.aclose()
+    assert [world.closed for world in worlds] == [False, False]
+    assert gateway._worlds == {}
+
+
 async def test_pull_takes_nothing_and_every_environment_tool_is_wrapped(
     episode: ServedEpisode,
 ) -> None:
@@ -1319,6 +1716,23 @@ async def test_the_control_tool_is_advertised_in_the_words_the_generation_hashed
     async with Client(build_gateway_server(make_gateway(episode, ScriptedStream()))) as client:
         undeclared = {tool.name: tool.description for tool in await client.list_tools()}
     assert undeclared[PULL_TOOL] == served_manifest(spec, terminal)["control_tool"]["description"]
+
+    # And the same for the other thing that text says, which is how many tasks may be held.
+    several = StreamGateway(
+        ScriptedStream(),  # type: ignore[arg-type]
+        episode,
+        spec,
+        terminal,
+        initial_cursor=CURSOR,
+        generation=composition(spec, capacity=8),
+    )
+    async with Client(build_gateway_server(several)) as client:
+        held = {tool.name: tool.description for tool in await client.list_tools()}
+    assert (
+        held[PULL_TOOL]
+        == served_manifest(spec, terminal, capacity=8)["control_tool"]["description"]
+    )
+    assert "up to 8 tasks" in held[PULL_TOOL]
 
 
 async def test_a_native_tool_named_pull_is_refused_at_construction(
@@ -2573,6 +2987,46 @@ async def test_a_horizon_filing_a_replacement_refused_does_not_hand_its_observat
     assert stream.confirmations == 2
     assert gateway._recovery is record
     assert [step.tool for step in episode._trajectory] == ["guess"]
+
+
+async def test_a_horizon_filing_the_ending_refused_lets_the_world_go_with_the_observation(
+    episode: ServedEpisode,
+) -> None:
+    """The filing this call owed was refused because the attempt was already over.
+
+    A generation's own ending reached the attempt while this call was in its world, so the filing
+    the horizon owed has nothing left to end and the stream says so. What is left is the
+    observation the call landed with and the world it was made in, which is now an attempt's world
+    that nothing may still do anything to. The ending is not in the state this call arrived with,
+    because it happened after that read: it is in the answer to the question the observation is
+    handed over through, which is the one this reads the world's fate out of.
+    """
+    from shogym.envs.wordle import mcp_server as wordle_server
+
+    stream = ScriptedStream(TASK_OFFER, StreamProtocolError("conflicting_seal"))
+    gateway = graded_gateway(episode, stream, horizon=1)
+    await gateway.pull({})
+    assert gateway._route(ATTEMPT) is not None
+    played = episode.call
+
+    async def call_the_ending_lands_under(tool_name: str, arguments: Dict[str, Any]) -> Any:
+        answer = await played(tool_name, arguments)
+        # The generation ends the attempt while this call is still in its world, which is the one
+        # moment its own state and this transport's disagree.
+        stream.attempts[ATTEMPT] = "final_failed"
+        return answer
+
+    episode.call = call_the_ending_lands_under  # type: ignore[method-assign]
+
+    result = await gateway.environment("guess", GUESS)
+    # The observation is still what the call answers with.
+    assert len(result.content) == 1
+    assert json.loads(result.content[0].text)["score"] == "YXGXX"
+    # And the world it was made in went with the attempt, by both the ways one is reached.
+    assert wordle_server.played(episode.session_id) is None
+    assert gateway._worlds == {}
+    assert gateway._route(ATTEMPT) is None
+    assert stream.confirmations == 1
 
 
 async def test_a_call_that_arrives_during_an_environment_call_waits_for_nothing(

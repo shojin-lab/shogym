@@ -12,8 +12,11 @@ because that service downloads a test server on first use, and they skip when it
 
 from __future__ import annotations
 
+import asyncio
 import json
+from datetime import timedelta
 from pathlib import Path
+from types import SimpleNamespace
 from typing import Any, AsyncIterator, Dict, List, Optional, Sequence, Set, Tuple
 
 import pytest
@@ -32,6 +35,7 @@ from shogym.serve.protocol_v2 import (  # noqa: E402
     NEVER,
     PAYLOAD_FIRST,
     RELEASE_AT_SEAL,
+    TASK_FIRST,
     Done,
     EligibilityGate,
     Payload,
@@ -43,6 +47,7 @@ from shogym.serve.protocol_v2 import (  # noqa: E402
     WireFormatError,
     check_release,
 )
+from shogym.serve.protocol_v2 import gateway as gateway_module  # noqa: E402
 from shogym.serve.protocol_v2 import records as records_module  # noqa: E402
 from shogym.serve.protocol_v2.gateway import (  # noqa: E402
     CANONICALIZATION_VERSION,
@@ -69,6 +74,7 @@ from shogym.serve.protocol_v2.policy import (  # noqa: E402
 )
 from shogym.envs.wordle.protocol_v2 import WORDLE_GRADE  # noqa: E402
 from shogym.serve.protocol_v2.kernel import (  # noqa: E402
+    DEADLINE,
     STREAM_TASK_QUEUE,
     OfferedMessage,
     TaskItem,
@@ -256,6 +262,8 @@ async def opened(
     open_episode: Any = wordle_world,
     terminal: Optional[EnvironmentTerminal] = None,
     budget: Optional[int] = None,
+    capacity: int = 1,
+    attempt_deadline_ms: int = 0,
 ) -> StreamGateway:
     """Compose a generation, bind this transport to it, and close its manifest.
 
@@ -277,6 +285,8 @@ async def opened(
         dispositions=None if not served_on.grade.stand_in else blinded,
         experiment="" if not served_on.grade.stand_in else "what_a_schedule_does",
         budget=budget,
+        capacity=capacity,
+        attempt_deadline_ms=attempt_deadline_ms,
     )
     gateway = await open_gateway(
         environment.client,
@@ -536,6 +546,414 @@ async def test_a_task_is_sealed_in_the_world_its_own_calls_reached(serving) -> N
 
 
 @pytest.mark.network
+async def test_two_tasks_are_held_at_once_and_each_call_lands_in_its_own_world(serving) -> None:
+    """A capacity above one is several live attempts, each working in a world of its own.
+
+    The model holds two tasks and works them in whatever order it likes, so the world of the task
+    that arrived last is not the world of the next call. Every call names its attempt and lands in
+    that attempt's world, the seal of the older one closes that world and leaves the newer one
+    working in its own, and the generation goes on to the task after them.
+    """
+    worlds: Dict[str, ServedEpisode] = {}
+    order: List[ServedEpisode] = []
+
+    async def open_world(attempt_id: str = "") -> ServedEpisode:
+        started = await score_world()
+        order.append(started)
+        if attempt_id:
+            worlds[attempt_id] = started
+        return started
+
+    generation_world = await open_world()
+    gateway = await opened(
+        serving,
+        generation_world,
+        workflow_id="stream/gateway-two-at-once/1",
+        bodies=("Round 0.", "Round 1.", "Round 2."),
+        release=IMMEDIATE,
+        open_episode=open_world,
+        capacity=2,
+    )
+
+    async def noop(attempt_id: str) -> None:
+        wrapper = {"attempt_id": attempt_id, "arguments": {}}
+        assert json.loads((await gateway.environment("noop", wrapper)).content[0].text)["ok"]
+
+    first = json.loads(await gateway.pull({}))
+    # The second task arrives with the first attempt still live, which is what the capacity buys.
+    second = json.loads(await gateway.pull({}))
+    assert first["kind"] == second["kind"] == "task"
+    assert first["attempt_id"] != second["attempt_id"]
+    worlds[first["attempt_id"]] = generation_world
+    older, newer = worlds[first["attempt_id"]], worlds[second["attempt_id"]]
+    assert older is not newer
+    assert (await gateway.stream_state()).capacity_in_use == 2
+
+    await noop(first["attempt_id"])
+    await noop(second["attempt_id"])
+    await noop(first["attempt_id"])
+    assert len(older._trajectory) == 2
+    assert len(newer._trajectory) == 1
+
+    filing = {"attempt_id": first["attempt_id"], "arguments": {"answer": "4"}}
+    assert json.loads(await gateway.terminal(filing))["kind"] == "seal_ack"
+    # The sealed attempt's world is let go of and the live attempt's is not.
+    assert score_mcp.gold(older.session_id) == ""
+    assert score_mcp.gold(newer.session_id) == "4"
+    await noop(second["attempt_id"])
+    assert len(newer._trajectory) == 2
+
+    assert json.loads(await gateway.pull({}))["kind"] == "payload"
+    filing = {"attempt_id": second["attempt_id"], "arguments": {"answer": "4"}}
+    assert json.loads(await gateway.terminal(filing))["kind"] == "seal_ack"
+    assert score_mcp.gold(newer.session_id) == ""
+
+    # And the third task is served like any other, in a world of its own, through to Done.
+    assert json.loads(await gateway.pull({}))["kind"] == "payload"
+    third = json.loads(await gateway.pull({}))
+    assert third["kind"] == "task"
+    filing = {"attempt_id": third["attempt_id"], "arguments": {"answer": "4"}}
+    assert json.loads(await gateway.terminal(filing))["kind"] == "seal_ack"
+    assert json.loads(await gateway.pull({}))["kind"] == "payload"
+    assert json.loads(await gateway.pull({}))["kind"] == "done"
+    assert len(order) == 3
+    assert len({world.session_id for world in order}) == 3
+
+
+@pytest.mark.network
+async def test_two_live_attempts_are_sealed_and_paid_out_from_their_own_worlds(
+    serving_wordle,
+) -> None:
+    """The environment's own terminal ends each of two live attempts in the world it worked in.
+
+    A stand-in terminal reaches no world, so a generation served on one cannot tell a right route
+    from a wrong one. This one is served on wordle's, which seals by stopping the world an attempt
+    played in: what it captures, what it grades and what the agent is paid out all come from that
+    world. Two attempts are live at once, they are played differently, and they are sealed in the
+    reverse of the order they were served, so a transport with one current world would file the
+    wrong play against both of them.
+    """
+    serving, terminal = serving_wordle
+    worlds: Dict[str, ServedEpisode] = {}
+
+    async def open_world(attempt_id: str) -> ServedEpisode:
+        started = await wordle_world(attempt_id)
+        worlds[attempt_id] = started
+        return started
+
+    seed = await wordle_world("")
+    gateway = await opened(
+        serving,
+        seed,
+        workflow_id="stream/gateway-two-live-wordle/1",
+        bodies=("Round 0.", "Round 1."),
+        release=IMMEDIATE,
+        open_episode=open_world,
+        terminal=terminal,
+        capacity=2,
+    )
+
+    async def guessed(attempt_id: str, word: str) -> None:
+        wrapper = {"attempt_id": attempt_id, "arguments": {"word": word}}
+        assert json.loads((await gateway.environment("guess", wrapper)).content[0].text)["score"]
+
+    older = json.loads(await gateway.pull({}))["attempt_id"]
+    newer = json.loads(await gateway.pull({}))["attempt_id"]
+    worlds[older] = seed
+    assert worlds[older] is not worlds[newer]
+    # Played differently, so what each world holds is what says which one was read.
+    await guessed(older, "crane")
+    await guessed(newer, "slate")
+    await guessed(newer, "adieu")
+    assert (len(worlds[older]._trajectory), len(worlds[newer]._trajectory)) == (1, 2)
+    # Both are where a seal would find them, and each is its own.
+    assert terminal.route(older) is not None
+    assert terminal.route(newer) is not None
+    assert terminal.route(older) != terminal.route(newer)
+
+    # Sealed in the reverse of the order they were served.
+    sealed = {}
+    for attempt_id in (newer, older):
+        ack = json.loads(await gateway.terminal({"attempt_id": attempt_id, "arguments": {}}))
+        assert ack["kind"] == "seal_ack"
+        sealed[attempt_id] = ack["submission_digest"]
+        payload = json.loads(await gateway.pull({}))
+        assert payload["kind"] == "payload"
+        assert payload["attempt_id"] == attempt_id
+        # The receipt reports the play this attempt made in the world it made it in.
+        assert f"guesses_used {len(worlds[attempt_id]._trajectory)}" in payload["body"]
+        # And the world it was sealed in is gone, while anything still live is not.
+        assert terminal.route(attempt_id) is None
+    assert sealed[older] != sealed[newer]
+    assert json.loads(await gateway.pull({}))["kind"] == "done"
+
+
+@pytest.mark.network
+async def test_a_world_handed_to_a_replacement_is_the_world_its_seal_captures(
+    serving_wordle,
+) -> None:
+    """A transport handed a world for an attempt seals in that world, not in the one before it.
+
+    A replacement is given the world its attempt goes on working in, restored where the process
+    before it left off. Every way of asking which world that attempt is in has to answer with that
+    one: an ordinary call routes through the map this transport keeps, and an environment that
+    seals by stopping the world an attempt played in resolves the route it was registered with.
+    Two answers is the failure this is here for, and it is a silent one: the calls land in the
+    restored world while the seal captures the predecessor's, so the submission, the score and the
+    receipt all describe a world the agent was never working in.
+
+    The predecessor letting go of its own world afterwards does not undo the pairing either. It is
+    clearing up after the world it was holding, and the attempt has a newer one.
+    """
+    serving, terminal = serving_wordle
+    seed = await wordle_world("")
+    gateway = await opened(
+        serving,
+        seed,
+        workflow_id="stream/gateway-restored-world/1",
+        bodies=("Round 0.",),
+        release=IMMEDIATE,
+        terminal=terminal,
+    )
+    attempt = json.loads(await gateway.pull({}))["attempt_id"]
+    wrapper = {"attempt_id": attempt, "arguments": {"word": "crane"}}
+    assert json.loads((await gateway.environment("guess", wrapper)).content[0].text)["score"]
+    assert len(seed._trajectory) == 1
+
+    # The world a new owner restored for that attempt, played on in where the record said it was.
+    restored = await wordle_world(attempt)
+    for word in ("slate", "adieu"):
+        await restored.call("guess", {"word": word})
+    state = await gateway.stream_state()
+    replacement = StreamGateway(
+        gateway._stream,
+        restored,
+        gateway.spec,
+        terminal_manifest(gateway.spec),
+        initial_cursor=state.cursor,
+        generation=gateway.generation,
+        world_attempt=attempt,
+        environment=terminal,
+    )
+    assert terminal.route(attempt) == (restored.env, restored.session_id)
+    # And the transport it replaced lets go of the world it was holding, which is not the world
+    # this attempt is in any more.
+    await gateway.aclose()
+    assert terminal.route(attempt) == (restored.env, restored.session_id)
+
+    filing = {"attempt_id": attempt, "arguments": {}}
+    assert json.loads(await replacement.terminal(filing))["kind"] == "seal_ack"
+    payload = json.loads(await replacement.pull({}))
+    assert payload["kind"] == "payload"
+    # Two guesses is the restored world. The world the attempt started in had one.
+    assert "guesses_used 2" in payload["body"]
+    assert json.loads(await replacement.pull({}))["kind"] == "done"
+    await replacement.aclose()
+
+
+@pytest.mark.network
+async def test_a_pull_past_the_capacity_waits_and_says_nothing_about_why(serving) -> None:
+    """The tasks a generation holds out at once are its capacity, and the next pull is a Wait.
+
+    Nothing is displaced and nothing is forfeited: the attempts in hand stay live, no world is
+    opened for the task that was not served, and why the agent is waiting stays where the model
+    cannot read it.
+    """
+    order: List[ServedEpisode] = []
+
+    async def open_world(attempt_id: str = "") -> ServedEpisode:
+        started = await score_world()
+        order.append(started)
+        return started
+
+    gateway = await opened(
+        serving,
+        await open_world(),
+        workflow_id="stream/gateway-pull-past-capacity/1",
+        bodies=("Round 0.", "Round 1.", "Round 2."),
+        release=IMMEDIATE,
+        open_episode=open_world,
+        capacity=2,
+    )
+    held = [json.loads(await gateway.pull({})) for _ in range(2)]
+    assert [record["kind"] for record in held] == ["task", "task"]
+
+    waited = json.loads(await gateway.pull({}))
+    assert set(waited) == {"protocol_version", "kind", "message_id", "retry_after_ms"}
+    assert waited["kind"] == "wait"
+    assert "capacity" not in json.dumps(waited)
+
+    state = await gateway.stream_state()
+    assert state.capacity == 2
+    assert state.capacity_in_use == 2
+    # The reason is the generation's own record of it, and it is not on the wire.
+    assert state.wait_reasons == {"capacity": 1}
+    assert [state.attempts[record["attempt_id"]] for record in held] == ["active", "active"]
+    # The task the wait was answered instead of is still where it was, unserved and unstarted.
+    assert state.tasks_remaining == 1
+    # No world was opened for a task nothing served.
+    assert len(order) == 2
+    await gateway.aclose()
+
+
+@pytest.mark.network
+async def test_a_pull_at_a_full_capacity_still_answers_what_is_ready(serving) -> None:
+    """A full capacity stops tasks being offered and stops nothing else, as the words say.
+
+    The description a wider capacity serves says a pull cannot return another task while that
+    many are held, and that it answers a wait when nothing else is ready. Both halves are the
+    stream's own rule rather than a flat wait: capacity takes tasks out of what a pull may be
+    answered with and leaves everything else in, so a payload owed to an attempt already sealed is
+    served while the agent is holding its limit. A schedule that puts tasks first is where the two
+    can be told apart, because it is what leaves a payload owed while the capacity fills.
+    """
+    order: List[ServedEpisode] = []
+
+    async def open_world(attempt_id: str = "") -> ServedEpisode:
+        started = await score_world()
+        order.append(started)
+        return started
+
+    async def sealed(record: Dict[str, Any]) -> None:
+        filing = {"attempt_id": record["attempt_id"], "arguments": {"answer": "4"}}
+        assert json.loads(await gateway.terminal(filing))["kind"] == "seal_ack"
+
+    gateway = await opened(
+        serving,
+        await open_world(),
+        workflow_id="stream/gateway-full-capacity-payload/1",
+        bodies=("Round 0.", "Round 1.", "Round 2.", "Round 3."),
+        release=ReleasePlan(RELEASE_AT_SEAL, TASK_FIRST, BY_POSITION),
+        open_episode=open_world,
+        capacity=2,
+    )
+    first = json.loads(await gateway.pull({}))
+    assert json.loads(await gateway.pull({}))["kind"] == "task"
+    # One of the two is sealed, so a payload is owed, and a schedule that puts tasks first fills
+    # the capacity again before delivering it.
+    await sealed(first)
+    assert json.loads(await gateway.pull({}))["kind"] == "task"
+    state = await gateway.stream_state()
+    assert (state.capacity, state.capacity_in_use) == (2, 2)
+
+    # The capacity is full and the payload is what is ready, so the payload is what comes back.
+    owed = json.loads(await gateway.pull({}))
+    assert owed["kind"] == "payload"
+    assert owed["attempt_id"] == first["attempt_id"]
+    # And with nothing else ready, the same full capacity is a wait.
+    assert json.loads(await gateway.pull({}))["kind"] == "wait"
+    state = await gateway.stream_state()
+    assert state.wait_reasons == {"capacity": 1}
+    assert state.tasks_remaining == 1
+    await gateway.aclose()
+
+
+#: What two servings of the same queue cannot agree on, whatever else about them is the same.
+#: A generation mints its own attempt and message identifiers, and the digest a seal captures is
+#: taken over a world of that attempt's own, so all three are values one run has and the other
+#: does not. What they say about the order things happened in is kept.
+MINTED = {"message_id", "attempt_id", "submission_digest"}
+
+
+def named_identifiers(records: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    """The records with every minted value replaced by the order it was first seen in.
+
+    The same value in the same place is the same name here, so a record that named another
+    attempt, or repeated a message, is a record this does not turn into its counterpart. The
+    substitution reaches inside a body as well, because a body may quote what was minted: a
+    receipt says which attempt it is the receipt for.
+    """
+    names: Dict[str, str] = {}
+    for record in records:
+        for key, value in record.items():
+            if key in MINTED:
+                names.setdefault(value, f"#{len(names)}")
+
+    def named(value: Any) -> Any:
+        if not isinstance(value, str):
+            return value
+        for minted, name in names.items():
+            value = value.replace(minted, name)
+        return value
+
+    return [{key: named(value) for key, value in record.items()} for record in records]
+
+
+def how_it_went(state: Any) -> Dict[str, Any]:
+    """The counts and outcomes the generation ends with, without the names it minted.
+
+    A selection rather than the whole state, and these are the fields two servings of one queue
+    have to agree on: what became of every attempt and every obligation, and how many of each
+    thing the schedule did. What is left out is what a generation cannot help differing in, its
+    identifiers and its digests, and its capacity, which is the thing under test.
+    """
+    return {
+        "generation_state": state.generation_state,
+        "attempts": sorted(state.attempts.values()),
+        "obligations": sorted(state.obligations.values()),
+        "assignment_count": state.assignment_count,
+        "materialization_count": state.materialization_count,
+        "eligibility_count": state.eligibility_count,
+        "offer_count": state.offer_count,
+        "presentation_count": state.presentation_count,
+        "payload_delivery_count": state.payload_delivery_count,
+        "wait_count": state.wait_count,
+        "wait_reasons": state.wait_reasons,
+        "final_failures": state.final_failures,
+    }
+
+
+@pytest.mark.network
+async def test_a_generation_at_eight_serves_a_one_at_a_time_agent_the_way_one_does(
+    serving_wordle,
+) -> None:
+    """A capacity is a bound and not an instruction, so an agent that holds one is served as ever.
+
+    The same queue under the same plan, driven by the same loop, at a capacity of one and at a
+    capacity of eight. What the model reads is the same records in the same order, task bodies and
+    payload bodies included, and the generation ends with the same counts and the same outcome for
+    every attempt. What the wider capacity changes for this agent is only what it would have been
+    allowed to do, and the tests above are where holding several is exercised: this loop holds one
+    at a time, so what it says about routing is nothing.
+    """
+    serving, terminal = serving_wordle
+
+    async def run(capacity: int, name: str) -> Tuple[List[Dict[str, Any]], Any]:
+        gateway = await opened(
+            serving,
+            await wordle_world(""),
+            workflow_id=f"stream/gateway-capacity-{name}/1",
+            bodies=tuple(f"Round {index}." for index in range(3)),
+            release=IMMEDIATE,
+            terminal=terminal,
+            capacity=capacity,
+        )
+        try:
+            return await served(gateway), await gateway.stream_state()
+        finally:
+            await gateway.aclose()
+
+    at_one, after_one = await run(1, "one")
+    at_eight, after_eight = await run(8, "eight")
+    assert [record["kind"] for record in at_one] == [
+        "task",
+        "seal_ack",
+        "payload",
+        "task",
+        "seal_ack",
+        "payload",
+        "task",
+        "seal_ack",
+        "payload",
+        "done",
+    ]
+    assert named_identifiers(at_eight) == named_identifiers(at_one)
+    assert how_it_went(after_eight) == how_it_went(after_one)
+    # The capacity is the one thing about the two that differs, and it is on the record.
+    assert (after_one.capacity, after_eight.capacity) == (1, 8)
+
+
+@pytest.mark.network
 async def test_a_world_that_would_not_open_leaves_the_task_where_it_was(
     serving_wordle, episode
 ) -> None:
@@ -647,9 +1065,11 @@ async def test_a_world_is_retired_when_its_attempt_ends_without_a_seal() -> None
     """A world belongs to the attempt it was opened for, and a seal is not the only ending.
 
     An attempt the generation finalized for itself, on a step cap or on a deadline, presents no
-    acknowledgement: nothing about that ending arrives here as a message, and the first thing
-    this transport sees of it is the next task arriving under a different attempt. That task
-    still gets a world of its own, because the one in hand is not its.
+    acknowledgement: nothing about that ending arrives here as a message, so the first this
+    transport hears of one is the state it reads at the top of the next call. Until then the
+    world stays open, because a task presented under another attempt says nothing about the
+    attempts already live: at a capacity above one they are still being worked. The attempt the
+    state reports as ended is the one whose world is let go of, and the others keep theirs.
     """
     worlds: List[ServedEpisode] = []
     opened_for: List[str] = []
@@ -682,10 +1102,505 @@ async def test_a_world_is_retired_when_its_attempt_ends_without_a_seal() -> None
         # The world it opened was opened for the attempt that is now in front of the model,
         # which is the only place anything out here can learn that.
         assert opened_for == ["", "b" * 32]
+        # Both attempts are live, so both worlds are.
+        assert [score_mcp.gold(world.session_id) for world in worlds] == ["4", "4"]
+
+        # The generation ended the first attempt itself, and the state is where that is said.
+        await gateway._retired(
+            SimpleNamespace(attempts={"a" * 32: "final_failed", "b" * 32: "active"})
+        )
         assert score_mcp.gold(worlds[0].session_id) == ""
         assert score_mcp.gold(worlds[1].session_id) == "4"
     finally:
         await gateway.aclose()
+
+
+@pytest.mark.network
+async def test_a_deadline_closes_the_world_of_the_attempt_it_ended(serving) -> None:
+    """A deadline reaches an attempt that is still working, and the world goes with the attempt.
+
+    The generation ends the attempt itself when its time is up, and nothing about that ending is a
+    message: the next call this transport makes is where it reads it. That call is where the world
+    is let go of, before anything new is asked for, and a call naming the attempt whose world has
+    gone is refused the way a call for an attempt that is over is.
+    """
+    order: List[ServedEpisode] = []
+
+    async def open_world(attempt_id: str = "") -> ServedEpisode:
+        started = await score_world()
+        order.append(started)
+        return started
+
+    deadline_ms = 600_000
+    gateway = await opened(
+        serving,
+        await open_world(),
+        workflow_id="stream/gateway-deadline-world/1",
+        bodies=("Round 0.", "Round 1."),
+        release=IMMEDIATE,
+        open_episode=open_world,
+        attempt_deadline_ms=deadline_ms,
+    )
+    task = json.loads(await gateway.pull({}))
+    assert task["kind"] == "task"
+    world = order[0]
+    assert score_mcp.gold(world.session_id) == "4"
+
+    await serving.sleep(timedelta(milliseconds=deadline_ms + 1000))
+    wrapper = {"attempt_id": task["attempt_id"], "arguments": {}}
+    assert await refused(gateway.environment("noop", wrapper)) == "invalid_attempt"
+    assert score_mcp.gold(world.session_id) == ""
+
+    state = await gateway.stream_state()
+    assert state.attempts[task["attempt_id"]] == "final_failed"
+    assert state.final_failures == {task["attempt_id"]: DEADLINE}
+    assert state.capacity_in_use == 0
+
+    # And the generation goes on: the next task is served in a world of its own.
+    following = json.loads(await gateway.pull({}))
+    assert following["kind"] == "task"
+    assert len(order) == 2
+    assert score_mcp.gold(order[1].session_id) == "4"
+    await gateway.aclose()
+
+
+@pytest.mark.network
+async def test_a_deadline_that_reaches_several_live_attempts_closes_every_one_of_their_worlds(
+    serving,
+) -> None:
+    """A deadline is a fact about one attempt, and a generation may have several when it fires.
+
+    Two attempts are live and neither is sealed when their time runs out. The next call is where
+    this transport hears of both endings, and what it lets go of is every world whose attempt the
+    generation ended rather than the one the call happens to name. A transport that retired one
+    would leave the other running with nothing left to close it.
+    """
+    order: List[ServedEpisode] = []
+
+    async def open_world(attempt_id: str = "") -> ServedEpisode:
+        started = await score_world()
+        order.append(started)
+        return started
+
+    deadline_ms = 600_000
+    gateway = await opened(
+        serving,
+        await open_world(),
+        workflow_id="stream/gateway-deadline-two-live/1",
+        bodies=("Round 0.", "Round 1.", "Round 2."),
+        release=IMMEDIATE,
+        open_episode=open_world,
+        capacity=2,
+        attempt_deadline_ms=deadline_ms,
+    )
+    held = [json.loads(await gateway.pull({})) for _ in range(2)]
+    assert [record["kind"] for record in held] == ["task", "task"]
+    assert [score_mcp.gold(world.session_id) for world in order] == ["4", "4"]
+
+    await serving.sleep(timedelta(milliseconds=deadline_ms + 1000))
+    wrapper = {"attempt_id": held[0]["attempt_id"], "arguments": {}}
+    assert await refused(gateway.environment("noop", wrapper)) == "invalid_attempt"
+    # Both worlds went with their attempts, and not only the one this call named.
+    assert [score_mcp.gold(world.session_id) for world in order] == ["", ""]
+
+    state = await gateway.stream_state()
+    assert state.final_failures == {record["attempt_id"]: DEADLINE for record in held}
+    assert state.capacity_in_use == 0
+
+    # And the capacity the endings gave back is capacity the generation goes on serving with.
+    assert json.loads(await gateway.pull({}))["kind"] == "task"
+    assert len(order) == 3
+    assert score_mcp.gold(order[2].session_id) == "4"
+    await gateway.aclose()
+
+
+def ending_is_visible(
+    stream: Any, attempt_id: str, *, lose_first_release: Optional[str] = None
+) -> Any:
+    """The stream, answering a release only once the generation has acted on the deadline it frees.
+
+    The generation holds an expired attempt's ending back while a call is in that attempt's world,
+    because an ending cannot cancel what a world is already doing, and makes it when the grant
+    comes back. Nothing says how soon. This waits for it, so what these tests read is what the
+    transport does about an ending the release has already made rather than which of two things
+    happened first, and the residual case where the generation has not got to it yet is the one
+    the next call retires.
+
+    ``lose_first_release`` is how a release's answer goes missing, which is what leaves a call
+    holding a grant it has to give back again. ``"after"`` is a release the stream took and
+    answered into nothing, so the ending is made on the first call. ``"before"`` is one the stream
+    never saw, so the generation is still waiting for it and the ending is made on the retry.
+    """
+
+    class Waited:
+        def __init__(self) -> None:
+            self._lose = lose_first_release
+
+        def __getattr__(self, name: str) -> Any:
+            return getattr(stream, name)
+
+        async def end_environment_call(self, call: Any) -> Any:
+            if self._lose == "before":
+                self._lose = None
+                raise RuntimeError("the release never reached the stream")
+            answer = await stream.end_environment_call(call)
+            if self._lose == "after":
+                self._lose = None
+                raise RuntimeError("the release never came back")
+            for _ in range(200):
+                state = await stream.stream_state()
+                if state.attempts.get(attempt_id) == "final_failed":
+                    return answer
+                await asyncio.sleep(0.01)
+            raise AssertionError("the generation never ended the attempt whose deadline passed")
+
+    return Waited()
+
+
+@pytest.mark.network
+async def test_a_call_that_spans_its_deadline_lets_the_world_go_before_it_answers(serving) -> None:
+    """The deadline of the attempt this call is in falls due while the call is in its world.
+
+    The generation cannot end an attempt while a call is inside it, so it waits for the grant to
+    come back and ends it then, which is inside this call. By the time the observation is handed
+    to the model the attempt is over, and the world it was working in is still running: that
+    observation may be the last thing the agent ever asks this transport for, so a world left for
+    the call after it is a world nothing lets go of until the transport stops.
+    """
+    order: List[ServedEpisode] = []
+    deadline_ms = 600_000
+
+    async def open_world(attempt_id: str = "") -> Any:
+        started = await score_world()
+        order.append(started)
+        return started
+
+    gateway = await opened(
+        serving,
+        await open_world(),
+        workflow_id="stream/gateway-deadline-inside-a-call/1",
+        bodies=("Round 0.", "Round 1."),
+        release=IMMEDIATE,
+        open_episode=open_world,
+        attempt_deadline_ms=deadline_ms,
+    )
+    task = json.loads(await gateway.pull({}))
+    attempt = task["attempt_id"]
+    world = order[0]
+
+    # The clock runs out while the call is in the world, which is where the generation holds the
+    # ending back, and the release is what lets it be made.
+    async def call_that_outlasts_the_attempt(tool_name: str, arguments: Dict[str, Any]) -> Any:
+        answer = await ServedEpisode.call(world, tool_name, arguments)
+        await serving.sleep(timedelta(milliseconds=deadline_ms + 1000))
+        return answer
+
+    world.call = call_that_outlasts_the_attempt  # type: ignore[method-assign]
+    gateway._stream = ending_is_visible(gateway._stream, attempt)
+
+    played = await gateway.environment("noop", {"attempt_id": attempt, "arguments": {}})
+    # The observation the call landed with is still what it answers.
+    assert json.loads(played.content[0].text)["ok"]
+    # And the world it was made in is already gone, with the attempt it belonged to.
+    assert score_mcp.gold(world.session_id) == ""
+    assert gateway._worlds == {}
+    state = await gateway.stream_state()
+    assert state.final_failures == {attempt: DEADLINE}
+
+    # The generation goes on: the next task is served in a world of its own.
+    assert json.loads(await gateway.pull({}))["kind"] == "task"
+    assert len(order) == 2
+    await gateway.aclose()
+
+
+@pytest.mark.network
+async def test_a_landed_observation_collected_after_its_deadline_lets_the_world_go(serving) -> None:
+    """The same ending, reached by the call that comes back for an observation it never got.
+
+    A release whose answer is lost leaves the call holding what it landed with and the generation
+    still holding the grant. The call that comes back gives the grant back, and the ending that
+    was waiting on it is made then, so the observation and the ending arrive together again. What
+    this adds is where the ending is read: the state this call arrived with is older than the
+    question it hands the observation over through, and the ending is in the answer to that
+    question and not in what it arrived with.
+    """
+    order: List[ServedEpisode] = []
+    deadline_ms = 600_000
+
+    async def open_world(attempt_id: str = "") -> Any:
+        started = await score_world()
+        order.append(started)
+        return started
+
+    gateway = await opened(
+        serving,
+        await open_world(),
+        workflow_id="stream/gateway-deadline-under-a-lost-release/1",
+        bodies=("Round 0.", "Round 1."),
+        release=IMMEDIATE,
+        open_episode=open_world,
+        attempt_deadline_ms=deadline_ms,
+    )
+    task = json.loads(await gateway.pull({}))
+    attempt = task["attempt_id"]
+    world = order[0]
+
+    async def call_that_outlasts_the_attempt(tool_name: str, arguments: Dict[str, Any]) -> Any:
+        answer = await ServedEpisode.call(world, tool_name, arguments)
+        await serving.sleep(timedelta(milliseconds=deadline_ms + 1000))
+        return answer
+
+    world.call = call_that_outlasts_the_attempt  # type: ignore[method-assign]
+    gateway._stream = ending_is_visible(gateway._stream, attempt, lose_first_release="after")
+
+    wrapper = {"attempt_id": attempt, "arguments": {}}
+    with pytest.raises(RuntimeError, match="release never came back"):
+        await gateway.environment("noop", wrapper)
+    # The call is holding what it landed with, and nothing has ended yet: the grant is still out.
+    assert isinstance(gateway._recovery, gateway_module._LeaseHeld)
+    assert score_mcp.gold(world.session_id) == "4"
+
+    played = await gateway.environment("noop", wrapper)
+    assert json.loads(played.content[0].text)["ok"]
+    assert score_mcp.gold(world.session_id) == ""
+    assert gateway._worlds == {}
+    state = await gateway.stream_state()
+    assert state.final_failures == {attempt: DEADLINE}
+    await gateway.aclose()
+
+
+@pytest.mark.network
+async def test_a_call_that_fails_after_its_deadline_lets_the_world_go_all_the_same(serving) -> None:
+    """The call the ending was made inside failed, and the world it was in goes anyway.
+
+    What the caller is told about is the world's own failure, because that is the one thing this
+    call has to say and the only thing it can say truthfully. The ending is not a thing it says at
+    all: the grant went back on the way out, the generation made the ending it had been holding,
+    and an attempt that is over is no more this call's to walk away from for having failed than it
+    would have been for having worked.
+    """
+    order: List[ServedEpisode] = []
+    deadline_ms = 600_000
+
+    async def open_world(attempt_id: str = "") -> Any:
+        started = await score_world()
+        order.append(started)
+        return started
+
+    gateway = await opened(
+        serving,
+        await open_world(),
+        workflow_id="stream/gateway-deadline-under-a-failed-call/1",
+        bodies=("Round 0.", "Round 1."),
+        release=IMMEDIATE,
+        open_episode=open_world,
+        attempt_deadline_ms=deadline_ms,
+    )
+    task = json.loads(await gateway.pull({}))
+    attempt = task["attempt_id"]
+    world = order[0]
+
+    async def call_that_fails_after_the_attempt(tool_name: str, arguments: Dict[str, Any]) -> Any:
+        await serving.sleep(timedelta(milliseconds=deadline_ms + 1000))
+        raise RuntimeError("the world failed after the deadline")
+
+    world.call = call_that_fails_after_the_attempt  # type: ignore[method-assign]
+    gateway._stream = ending_is_visible(gateway._stream, attempt)
+
+    with pytest.raises(RuntimeError, match="world failed after the deadline"):
+        await gateway.environment("noop", {"attempt_id": attempt, "arguments": {}})
+    assert score_mcp.gold(world.session_id) == ""
+    assert gateway._worlds == {}
+    state = await gateway.stream_state()
+    assert state.final_failures == {attempt: DEADLINE}
+
+    # And the generation goes on, in a world of its own.
+    assert json.loads(await gateway.pull({}))["kind"] == "task"
+    assert len(order) == 2
+    await gateway.aclose()
+
+
+@pytest.mark.network
+async def test_a_lease_given_back_a_second_time_lets_go_of_what_that_release_ended(serving) -> None:
+    """A call that landed nothing comes back, gives its grant back, and finds its attempt over.
+
+    The release the generation was waiting for is the one that never reached it, so the ending is
+    made on the retry, and there is no observation to carry it out with: this call has nothing to
+    hand over and nothing to say except that the attempt it named is gone. The world that attempt
+    was working in still has to go, and it goes before this call is allowed to ask for a world
+    again, because the call that starts over is the one the ending happened under.
+    """
+    order: List[ServedEpisode] = []
+    deadline_ms = 600_000
+
+    async def open_world(attempt_id: str = "") -> Any:
+        started = await score_world()
+        order.append(started)
+        return started
+
+    gateway = await opened(
+        serving,
+        await open_world(),
+        workflow_id="stream/gateway-deadline-under-a-resultless-lease/1",
+        bodies=("Round 0.", "Round 1."),
+        release=IMMEDIATE,
+        open_episode=open_world,
+        attempt_deadline_ms=deadline_ms,
+    )
+    task = json.loads(await gateway.pull({}))
+    attempt = task["attempt_id"]
+    world = order[0]
+
+    async def call_that_fails_after_the_attempt(tool_name: str, arguments: Dict[str, Any]) -> Any:
+        await serving.sleep(timedelta(milliseconds=deadline_ms + 1000))
+        raise RuntimeError("the world failed after the deadline")
+
+    world.call = call_that_fails_after_the_attempt  # type: ignore[method-assign]
+    gateway._stream = ending_is_visible(gateway._stream, attempt, lose_first_release="before")
+
+    wrapper = {"attempt_id": attempt, "arguments": {}}
+    with pytest.raises(RuntimeError, match="world failed after the deadline"):
+        await gateway.environment("noop", wrapper)
+    # The grant never went back, so the generation is still waiting on it and nothing has ended.
+    held = gateway._recovery
+    assert isinstance(held, gateway_module._LeaseHeld)
+    assert held.result is None
+    assert score_mcp.gold(world.session_id) == "4"
+
+    # The same call again gives the grant back, and the ending that was waiting on it is made.
+    assert await refused(gateway.environment("noop", wrapper)) == "invalid_attempt"
+    assert score_mcp.gold(world.session_id) == ""
+    assert gateway._worlds == {}
+    state = await gateway.stream_state()
+    assert state.final_failures == {attempt: DEADLINE}
+    await gateway.aclose()
+
+
+@pytest.mark.network
+async def test_a_retirement_that_cannot_close_one_world_still_closes_the_others(serving) -> None:
+    """A world that will not close is one world, and the ended ones beside it are still retired.
+
+    Retirement runs at the top of every call, so a cleanup that failed is asked for again by the
+    call that comes back. Stopping at the first failure would mean the ended worlds behind it were
+    never tried at all: the same one would fail on every entry, and every other ended world would
+    stay running for as long as this transport did, with nothing that would ever reach them.
+    """
+    order: List[ServedEpisode] = []
+
+    class WillNotStopOnce:
+        """A world whose first cleanup fails. Everything else about it is the episode it wraps."""
+
+        def __init__(self, wrapped: ServedEpisode) -> None:
+            self._wrapped = wrapped
+            self._refused = False
+
+        def __getattr__(self, name: str) -> Any:
+            return getattr(self._wrapped, name)
+
+        async def close(self, *, finalize: bool = True) -> None:
+            if not self._refused:
+                self._refused = True
+                raise RuntimeError("the first world would not stop")
+            await self._wrapped.close(finalize=finalize)
+
+    async def open_world(attempt_id: str = "") -> Any:
+        started = await score_world()
+        order.append(started)
+        return WillNotStopOnce(started) if len(order) == 1 else started
+
+    deadline_ms = 600_000
+    gateway = await opened(
+        serving,
+        await open_world(),
+        workflow_id="stream/gateway-retirement-that-fails/1",
+        bodies=("Round 0.", "Round 1.", "Round 2."),
+        release=IMMEDIATE,
+        open_episode=open_world,
+        capacity=2,
+        attempt_deadline_ms=deadline_ms,
+    )
+    held = [json.loads(await gateway.pull({})) for _ in range(2)]
+    assert [record["kind"] for record in held] == ["task", "task"]
+    await serving.sleep(timedelta(milliseconds=deadline_ms + 1000))
+
+    # Both attempts have ended, and the world of the first will not go.
+    with pytest.raises(RuntimeError, match="first world would not stop"):
+        await gateway.pull({})
+    # The other was retired anyway, and nothing was offered while the first was still running.
+    assert [score_mcp.gold(world.session_id) for world in order] == ["4", ""]
+    assert (await gateway.stream_state()).pending_message_id is None
+
+    # And the call that comes back asks for the cleanup again, and then serves the next task.
+    assert json.loads(await gateway.pull({}))["kind"] == "task"
+    assert [score_mcp.gold(world.session_id) for world in order[:2]] == ["", ""]
+    assert len(order) == 3
+    await gateway.aclose()
+
+
+@pytest.mark.network
+async def test_eight_tasks_are_held_at_once_and_each_of_the_eight_worlds_stands_up(
+    serving,
+) -> None:
+    """The capacity the cell serves, with every task it allows in hand at the same time.
+
+    Eight worlds are open together, each is called into, and each call lands in the world of the
+    attempt it names. What this adds to the two-attempt tests is the number: nothing here is a
+    pair that a transport holding the newest world could get right by accident, and the ninth pull
+    is the wait that says the capacity is what it says it is.
+
+    The attempts are called different numbers of times, in an order that is neither the order they
+    were served in nor the reverse of it, and then sealed in a third order one at a time. Each seal
+    closes the world of the attempt it named and no other, so a shuffle of eight attempts onto
+    eight worlds is a shuffle this reads back, whatever it is.
+    """
+    order: List[ServedEpisode] = []
+
+    async def open_world(attempt_id: str = "") -> ServedEpisode:
+        started = await score_world()
+        order.append(started)
+        return started
+
+    gateway = await opened(
+        serving,
+        await open_world(),
+        workflow_id="stream/gateway-eight-live/1",
+        bodies=tuple(f"Round {index}." for index in range(9)),
+        release=IMMEDIATE,
+        open_episode=open_world,
+        capacity=8,
+    )
+    held = [json.loads(await gateway.pull({})) for _ in range(8)]
+    assert [record["kind"] for record in held] == ["task"] * 8
+    assert len(order) == 8
+    assert len({world.session_id for world in order}) == 8
+    assert (await gateway.stream_state()).capacity_in_use == 8
+    assert json.loads(await gateway.pull({}))["kind"] == "wait"
+
+    # How many calls each of the eight gets, interleaved so that no world is reached by being the
+    # one opened or worked in last. This env gives an attempt three world calls, so the counts
+    # repeat across eight of them; the seals below are what tell every world from every other.
+    apiece = (1, 3, 2, 3, 1, 2, 3, 1)
+    rounds = [
+        held[position]
+        for turn in range(max(apiece))
+        for position, count in enumerate(apiece)
+        if count > turn
+    ]
+    for record in rounds:
+        wrapper = {"attempt_id": record["attempt_id"], "arguments": {}}
+        assert json.loads((await gateway.environment("noop", wrapper)).content[0].text)["ok"]
+    assert [len(world._trajectory) for world in order] == list(apiece)
+
+    # And each of the eight is sealed in the world it was worked in, in a third order: after each
+    # filing exactly the worlds of the attempts filed so far are closed.
+    sealed: List[int] = []
+    for position in (5, 0, 7, 2, 6, 1, 4, 3):
+        filing = {"attempt_id": held[position]["attempt_id"], "arguments": {"answer": "4"}}
+        assert json.loads(await gateway.terminal(filing))["kind"] == "seal_ack"
+        sealed.append(position)
+        gone = [index for index, world in enumerate(order) if not score_mcp.gold(world.session_id)]
+        assert gone == sorted(sealed)
+    await gateway.aclose()
 
 
 def task_presentation(attempt_id: str) -> OfferedMessage:

@@ -213,8 +213,9 @@ async def test_an_episode_served_by_the_stream_is_ended_when_its_budget_runs_out
     what happens instead is that the transport counting those calls tells the stream to end the
     attempt. It says so on the call that has nothing left to spend rather than on the one that
     spends the last of it: an attempt out of world calls can still be filed, and filing under
-    this protocol is a call to the stream. Nothing is sealed here and nothing is graded, so the
-    env's world is left exactly as the last call left it.
+    this protocol is a call to the stream. Nothing is sealed here and nothing is graded: the world
+    is released as the attempt ends, the way it is released when a seal ends one, and the env's own
+    finalization is not run and no verdict is claimed.
     """
     pytest.importorskip("temporalio")
     from shogym.serve.protocol_v2.gateway import StreamGateway, terminal_manifest
@@ -260,7 +261,12 @@ async def test_an_episode_served_by_the_stream_is_ended_when_its_budget_runs_out
         assert request.reason == "step_cap"
         # The env sealed nothing and graded nothing: the ending is not this episode's to make.
         assert env.finalize_calls == 0
-        assert episode.sealed is False
+        assert episode.terminal_source is None
+        assert episode.terminal_feedback == []
+        # What the ending did do is let the world go, where the attempt ended rather than at
+        # whatever call came next. The lifecycle is no longer open because the world was released,
+        # which is the release every ending makes and not a verdict anything recorded.
+        assert episode.sealed is True
 
         # And one ending, whatever the model does next.
         code = await _refused(gateway.environment("noop", {"attempt_id": ATTEMPT, "arguments": {}}))
