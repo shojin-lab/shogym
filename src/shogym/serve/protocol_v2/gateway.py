@@ -122,6 +122,7 @@ from shogym.serve.protocol_v2.kernel import (
     durable_client,
     kernel_activities,
     protocol_error_code,
+    refuse_a_carried_projection,
     start_stream,
     stream_worker,
 )
@@ -2887,8 +2888,14 @@ async def open_gateway(
     ledger holds would say the environment had been graded, and the terminal the model went on
     to call would seal a world that was already gone. The budget is still enforced: the gateway
     counts the calls that spend it and ends the attempt through the stream when it is gone.
+
+    A composition that already holds a carried projection is refused here too. That value is how
+    one execution of a generation hands itself to the next, and a generation being opened has no
+    earlier execution to be handed from.
     """
     _ended_by_the_stream(episode)
+    if start is not None:
+        refuse_a_carried_projection(start)
     spec = episode.describe()
     terminal = terminal_manifest(spec)
     grade = environment.grade if environment is not None else environment_grade(episode)

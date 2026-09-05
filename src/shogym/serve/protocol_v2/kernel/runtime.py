@@ -27,15 +27,27 @@ version one run is refused before anything is claimed.
 
 from __future__ import annotations
 
+import asyncio
 import os
 import secrets
 import sys
+import time
 from contextlib import asynccontextmanager, contextmanager
 from dataclasses import dataclass
 from hashlib import sha256
 from pathlib import Path
 from tempfile import TemporaryDirectory
-from typing import Any, AsyncIterator, Dict, Iterator, Optional, Sequence, Union
+from typing import (
+    Any,
+    AsyncIterator,
+    Awaitable,
+    Callable,
+    Dict,
+    Iterator,
+    Optional,
+    Sequence,
+    Union,
+)
 
 from temporalio.client import Client, WorkflowHandle, WorkflowUpdateFailedError
 from temporalio.exceptions import ApplicationError
@@ -73,11 +85,41 @@ from shogym.serve.protocol_v2.kernel.messages import (
     Writer,
     configuration_hash,
 )
-from shogym.serve.protocol_v2.kernel.workflow import StreamWorkflow
+from shogym.serve.protocol_v2.kernel.workflow import TURNOVER_PENDING, StreamWorkflow
 from shogym.serve.protocol_v2.policy import LEGACY
 from shogym.serve.protocol_v2.rundir import RunDirectory, ResumeRefused, open_run_directory
 
 TEMPORAL_ADDRESS_ENV = "SHOGYM_TEMPORAL_ADDRESS"
+
+# How a call waits out a generation that is between executions. The generation rejects an
+# arriving Update once it has decided to continue as new and until the boundary is behind it,
+# and the wait here is what makes that decision invisible: the same request goes again, under
+# the same Update ID, and reaches whichever execution is current.
+#
+# The boundary is one activation away in the ordinary case, so the first wait is short and the
+# backoff is gentle.
+_TURNOVER_FIRST_WAIT = 0.02
+_TURNOVER_LONGEST_WAIT = 0.5
+
+# What the wait is bounded by, which is not the clock. A boundary can legitimately take a long
+# time: the grant a world call holds blocks it until that call comes back, and an agent's tool
+# call runs for as long as the agent's work does, minutes at a stretch; a claim reading the
+# store blocks it for as long as the read and its retries take. A wait bounded by elapsed time
+# would give up on all of those and hand the caller a fault where there was only work in
+# progress, which is the wedge this change exists to remove rather than a smaller version of it.
+#
+# So the bound is the boundary's own liveness. While the generation says it is latched and names
+# something it is waiting for, or while its projection is moving, the call keeps waiting: the
+# generation is making progress towards the boundary and the request will be admitted when it
+# gets there. The clock below starts only when the generation says it is latched, names nothing
+# it is waiting for, and has not moved. That is a generation that has stopped, and a call that
+# waited on it for ever would be a hang with nothing recorded anywhere.
+#
+# What a caller gets when that clock runs out is the failure it already had: the rejection, as
+# the fault it arrives as, carrying no protocol code. The transport raises it rather than
+# mapping it, and the launcher records the run incomplete, which is what a generation that
+# stopped should produce. There is no new code for the agent to see.
+_TURNOVER_STALLED_AFTER = 300.0
 STREAM_TASK_QUEUE = "shogym-stream-v2"
 
 #: The file one run's embedded service keeps that run's history in.
@@ -239,6 +281,25 @@ async def run_stream_worker(*, task_queue: str = STREAM_TASK_QUEUE) -> None:
         await stream_worker(client, task_queue=task_queue).run()
 
 
+def refuse_a_carried_projection(start: StreamStart) -> None:
+    """Refuse a generation somebody is trying to create already holding a projection.
+
+    A carried projection is how one execution of a generation hands itself to the next, and it
+    is legal exactly there. A caller composing one into a start would be creating a generation
+    that has already served: a cursor past its own beginning, scores nothing filed, messages
+    nothing presented, and an ownership epoch fencing whoever tries to use it. The generation
+    refuses that pairing itself, from inside, because the carrier is legal only where the
+    service says an execution continued another. This is the same refusal one step earlier, at
+    the two doors a caller comes in through, so the answer is a plain error the caller can read
+    rather than a workflow that fails on its first activation.
+    """
+    if start.carry is not None:
+        raise ValueError(
+            "a carried projection is how one execution of a generation hands itself to the "
+            "next, and a generation being created has no earlier execution to be handed from"
+        )
+
+
 async def start_stream(
     client: Client,
     start: StreamStart,
@@ -265,6 +326,7 @@ async def start_stream(
             "legacy profile is how a history recorded before that reads rather than a shape a "
             "new run may be created in"
         )
+    refuse_a_carried_projection(start)
     handle = await client.start_workflow(
         StreamWorkflow.run,
         start,
@@ -384,6 +446,41 @@ async def resume_run_directory(
     )
 
 
+def _still_reaching_for_a_boundary(state: StreamState, moved: Optional[str]) -> bool:
+    """Whether this generation is still working towards the boundary it decided on.
+
+    Four things say yes, and the first of them is the one that matters most often. A generation
+    that is no longer latched has either crossed its boundary or refused it, and either way the
+    request that was rejected will be admitted the moment it is sent again, so waiting is right.
+    A generation holding a message it owes, a grant for a world call, or a seal it has prepared
+    is naming the thing the boundary is waiting for, and every one of those is cleared by work
+    somebody else is doing rather than by time passing. And a projection that has moved since
+    the last look is a generation doing something, whatever it is.
+
+    What is left is a generation that says it is latched, names nothing, and is not moving. That
+    is the only shape a caller should stop waiting on.
+    """
+    if not state.turnover_requested:
+        return True
+    if state.pending_message_id is not None or state.environment_call is not None:
+        return True
+    if state.prepared_seals:
+        return True
+    return moved is None or state.stream_state_sha256 != moved
+
+
+def turnover_pending(error: BaseException) -> bool:
+    """Whether this failure says the generation was between executions when the Update arrived.
+
+    It is deliberately not something :func:`protocol_error_code` answers for. A protocol code is
+    a closed-set statement about the caller's request, and this says nothing about the request:
+    it says the generation had decided to continue as new and had not got there yet. A transport
+    that read it as a refusal would hand the agent an error where there is only latency.
+    """
+    cause = error.__cause__ if isinstance(error, WorkflowUpdateFailedError) else error
+    return isinstance(cause, ApplicationError) and cause.type == TURNOVER_PENDING
+
+
 def protocol_error_code(error: BaseException) -> Optional[str]:
     """Return the protocol error code an Update failure carries, or ``None``.
 
@@ -415,6 +512,61 @@ class StreamHandle:
             raise ValueError("this handle has not claimed the generation, so it cannot write")
         return self._writer
 
+    async def _sent(self, send: Callable[[], Awaitable[Any]]) -> Any:
+        """Send one Update, waiting out a generation that is between executions.
+
+        The durable service bounds one execution, and a generation longer than that bound
+        continues as new before it reaches the bound. While it is waiting for the quiet point
+        to do that, it rejects every arriving Update that cannot bring it there. That rejection
+        is not a protocol answer and it is never the caller's: it says the generation is between
+        executions, and the same request sent again reaches the one that comes next.
+
+        A rejection costs the generation nothing, because the service does not count an Update
+        it never accepted, so sending again is free of the very limit the generation is avoiding.
+        The Update ID does not change, which is what keeps a retry a retry: within an execution
+        the service answers a repeated ID from its own record, and across the boundary the
+        generation answers it from what it carried over.
+
+        How long this waits is the generation's business rather than a clock's. Between each
+        send it reads the state, which is a Query and therefore free, and it keeps waiting for
+        as long as that state says the generation is still working towards its boundary. A
+        boundary can take a long time and still be healthy: a grant held for a world call blocks
+        it until the agent's own tool call comes back, and a claim reading the store blocks it
+        for as long as that read and its retries take. Giving up on those would hand a caller a
+        fault where there was only work in progress.
+
+        What is not healthy is a generation that says it is latched, names nothing it is waiting
+        for, and is not moving. That is the only thing the clock below measures, and when it
+        runs out the caller gets the rejection as the fault it already arrived as. The transport
+        raises it rather than mapping it to anything, so the run is recorded incomplete and the
+        agent is shown no code it has never seen.
+        """
+        stalled_since: Optional[float] = None
+        moved: Optional[str] = None
+        wait = _TURNOVER_FIRST_WAIT
+        while True:
+            try:
+                return await send()
+            except Exception as error:
+                if not turnover_pending(error):
+                    raise
+                # A generation that cannot be read is one that is not visibly making progress,
+                # and it is answered that way rather than by handing the caller the read's own
+                # failure in place of the one it actually got.
+                try:
+                    state: Optional[StreamState] = await self.stream_state()
+                except Exception:  # noqa: BLE001 - an unreadable generation is not progress
+                    state = None
+                if state is not None and _still_reaching_for_a_boundary(state, moved):
+                    stalled_since, moved = None, state.stream_state_sha256
+                else:
+                    if stalled_since is None:
+                        stalled_since = time.monotonic()
+                    if time.monotonic() - stalled_since >= _TURNOVER_STALLED_AFTER:
+                        raise
+            await asyncio.sleep(wait)
+            wait = min(wait * 2, _TURNOVER_LONGEST_WAIT)
+
     async def claim_ownership(
         self,
         *,
@@ -442,10 +594,11 @@ class StreamHandle:
             reason=reason,
             restored_checkpoints=dict(restored_checkpoints or {}),
         )
-        receipt = await self.handle.execute_update(
-            StreamWorkflow.claim_ownership,
-            claim,
-            id=f"own-{previous_epoch}-{claimant_id}-{sha256(token.encode()).hexdigest()[:16]}",
+        update_id = f"own-{previous_epoch}-{claimant_id}-{sha256(token.encode()).hexdigest()[:16]}"
+        receipt = await self._sent(
+            lambda: self.handle.execute_update(
+                StreamWorkflow.claim_ownership, claim, id=update_id
+            )
         )
         self._writer = Writer(
             ownership_epoch=receipt.ownership_epoch, fencing_token=token
@@ -455,29 +608,35 @@ class StreamHandle:
     async def claim_consumer(self, claim: ConsumerClaim) -> ConsumerReceipt:
         """Bind this caller as the generation's one consumer."""
         writer = self.writer
-        return await self.handle.execute_update(
-            StreamWorkflow.claim_consumer,
-            args=[claim, writer],
-            id=f"claim-{writer.ownership_epoch}-{claim.consumer_id}",
+        return await self._sent(
+            lambda: self.handle.execute_update(
+                StreamWorkflow.claim_consumer,
+                args=[claim, writer],
+                id=f"claim-{writer.ownership_epoch}-{claim.consumer_id}",
+            )
         )
 
     async def pull(self, request: PullRequest) -> OfferedMessage:
         """Ask for the next message. A retry of the same request reaches the same Update."""
         writer = self.writer
-        return await self.handle.execute_update(
-            StreamWorkflow.pull,
-            args=[request, writer],
-            id=_update_id("pull", request.request_id, request, writer),
+        return await self._sent(
+            lambda: self.handle.execute_update(
+                StreamWorkflow.pull,
+                args=[request, writer],
+                id=_update_id("pull", request.request_id, request, writer),
+            )
         )
 
     async def info(self, request: InfoRequest) -> OfferedMessage:
         """Ask how much of the queue there is. A retry of the same request reaches the same
         Update, and a generation that declares no info tool refuses it."""
         writer = self.writer
-        return await self.handle.execute_update(
-            StreamWorkflow.info,
-            args=[request, writer],
-            id=_update_id("info", request.request_id, request, writer),
+        return await self._sent(
+            lambda: self.handle.execute_update(
+                StreamWorkflow.info,
+                args=[request, writer],
+                id=_update_id("info", request.request_id, request, writer),
+            )
         )
 
     async def seal(self, request: SealRequest) -> OfferedMessage:
@@ -490,37 +649,45 @@ class StreamHandle:
             request.terminal_source,
         )
         writer = self.writer
-        return await self.handle.execute_update(
-            StreamWorkflow.seal_attempt,
-            args=[request, writer],
-            id=f"seal-{writer.ownership_epoch}-{request.metadata.request_id}-{identity[:32]}",
+        return await self._sent(
+            lambda: self.handle.execute_update(
+                StreamWorkflow.seal_attempt,
+                args=[request, writer],
+                id=f"seal-{writer.ownership_epoch}-{request.metadata.request_id}-{identity[:32]}",
+            )
         )
 
     async def commit_presentation(self, commit: PresentationCommit) -> PresentationAck:
         """Attest that the exact offered bytes were handed to the transport."""
         writer = self.writer
-        return await self.handle.execute_update(
-            StreamWorkflow.commit_presentation,
-            args=[commit, writer],
-            id=_update_id("present", commit.attestation_id, commit, writer),
+        return await self._sent(
+            lambda: self.handle.execute_update(
+                StreamWorkflow.commit_presentation,
+                args=[commit, writer],
+                id=_update_id("present", commit.attestation_id, commit, writer),
+            )
         )
 
     async def begin_environment_call(self, call: EnvironmentCall) -> EnvironmentLease:
         """Take the generation for one environment call. A retry reaches the same Update."""
         writer = self.writer
-        return await self.handle.execute_update(
-            StreamWorkflow.begin_environment_call,
-            args=[call, writer],
-            id=f"environment-{writer.ownership_epoch}-{call.call_id}",
+        return await self._sent(
+            lambda: self.handle.execute_update(
+                StreamWorkflow.begin_environment_call,
+                args=[call, writer],
+                id=f"environment-{writer.ownership_epoch}-{call.call_id}",
+            )
         )
 
     async def end_environment_call(self, call: EnvironmentCall) -> EnvironmentLease:
         """Give the generation back. Releasing twice releases once."""
         writer = self.writer
-        return await self.handle.execute_update(
-            StreamWorkflow.end_environment_call,
-            args=[call, writer],
-            id=f"environment-end-{writer.ownership_epoch}-{call.call_id}",
+        return await self._sent(
+            lambda: self.handle.execute_update(
+                StreamWorkflow.end_environment_call,
+                args=[call, writer],
+                id=f"environment-end-{writer.ownership_epoch}-{call.call_id}",
+            )
         )
 
     async def finalize(self, request: FinalizeRequest) -> AttemptFinalized:
@@ -534,20 +701,24 @@ class StreamHandle:
         """
         writer = self.writer
         identity = finalize_request_identity(request)
-        return await self.handle.execute_update(
-            StreamWorkflow.finalize_attempt,
-            args=[request, writer],
-            id=f"finalize-{writer.ownership_epoch}-{request.request_id}-{identity[:32]}",
+        return await self._sent(
+            lambda: self.handle.execute_update(
+                StreamWorkflow.finalize_attempt,
+                args=[request, writer],
+                id=f"finalize-{writer.ownership_epoch}-{request.request_id}-{identity[:32]}",
+            )
         )
 
 
     async def close_queue(self) -> QueueClosed:
         """Close the queue to insertion."""
         writer = self.writer
-        return await self.handle.execute_update(
-            StreamWorkflow.close_queue,
-            args=[writer],
-            id=f"close-queue-{writer.ownership_epoch}",
+        return await self._sent(
+            lambda: self.handle.execute_update(
+                StreamWorkflow.close_queue,
+                args=[writer],
+                id=f"close-queue-{writer.ownership_epoch}",
+            )
         )
 
     async def confirm_state(self) -> StreamState:
@@ -560,10 +731,11 @@ class StreamHandle:
         its own Update.
         """
         writer = self.writer
-        return await self.handle.execute_update(
-            StreamWorkflow.confirm_state,
-            args=[writer],
-            id=f"confirm-{writer.ownership_epoch}-{secrets.token_hex(16)}",
+        update_id = f"confirm-{writer.ownership_epoch}-{secrets.token_hex(16)}"
+        return await self._sent(
+            lambda: self.handle.execute_update(
+                StreamWorkflow.confirm_state, args=[writer], id=update_id
+            )
         )
 
     async def stream_state(self) -> StreamState:
