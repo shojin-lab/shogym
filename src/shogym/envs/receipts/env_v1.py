@@ -1,10 +1,24 @@
-"""``receipts_v1``: one side of an admitted instance, served as an ordinary task.
+"""``receipts_v1``: one sibling of an admitted instance, served as an ordinary task.
 
-The environment serves task A (or task B) of a family drawn from a frozen bank: a
-clerical table and an instruction that leaves every axis of the hidden convention
+The environment serves one sibling of a family drawn from a frozen bank: a clerical
+table and an instruction that leaves every axis of the hidden convention
 undetermined. The agent files one line per record and the episode ends. Filing is
 the score terminal, so the episode is sealed before it is graded and an agent can
 never grade, read the verdict and revise.
+
+WHICH SIBLING IS A POSITION, NOT A CONFIGURATION. The roster is flat: every family
+this env holds contributes one position per sibling, in order, so an unnarrowed
+environment serves A at one position and B at the next and position p names the
+family at ``p // len(SIBLINGS)`` of what it holds and the sibling at
+``p % len(SIBLINGS)``. The quotient is a place in the admitted sequence rather than a
+draw ordinal, because admission skips ordinals, and a narrowed environment is one
+position per family and every one of them the side it names. It has to be flat for a
+run that works both siblings of a family: each task after the first is worked in a
+world of its own, a world whose configuration differs from the one the generation
+was started as is refused, and an environment that held the sibling in its
+configuration could therefore never reach the second one. What a position names is
+resolved by :func:`sibling`, and the drawn convention lives in the banked instance
+the published task identifier names rather than in anything a configuration says.
 
 The environment does not deliver a receipt, and the terminal's CONTENT returns no
 verdict: it says the filing landed and how many rows it named. The three cells of a
@@ -44,7 +58,14 @@ from shogym.envs.receipts import bank as bank_mod
 from shogym.envs.receipts import bundle as bundle_mod
 from shogym.envs.receipts.mcp_server import SUBMIT_TOOL_NAME
 from shogym.envs.receipts import streams
-from shogym.envs.receipts.protocol import Generator, Instance, NoFiling, SealedSubmission
+from shogym.envs.receipts.protocol import (
+    Filing,
+    Generator,
+    Instance,
+    NoFiling,
+    SealedSubmission,
+    Task,
+)
 from shogym.envs.receipts.receipt_ast import GRADED
 from shogym.envs.receipts.registry import (
     bank_path,
@@ -64,6 +85,14 @@ from shogym.types import EpisodeFeedback, FeedbackCollection, FunctionConfig
 #: scores zero, and records that no filing arrived rather than a wrong one.
 HORIZON = 1
 
+#: The siblings one family holds, in the order a roster serves them. A family is two
+#: of them and that is the family model rather than a setting here: `Instance` carries
+#: an a and a b, the generator declares one surface stream and one surface pool per
+#: side, and the admission checks are written over a pair. What this environment owns
+#: is which sibling a position names, and that is the whole of what `sibling` decides.
+#: A family of three would be a generator and a bank rebuilt, and this tuple after it.
+SIBLINGS = ("a", "b")
+
 DEFAULT_GENRE = "ledger"
 RECEIPTS_SPEC = MCPServerSpec(
     name="receipts",
@@ -79,6 +108,23 @@ _BASE_INSTRUCTIONS = (
     "Filing ends the episode. There is no second filing and no feedback here, so file your "
     "best answer."
 )
+
+
+def sibling(index: int) -> str:
+    """Which sibling of a family a roster position names.
+
+    The one place in this environment where an index becomes a side. Everything that serves,
+    seals, scores or renders takes the label this returns, so this function is the seam a roster
+    of more than two would move here. It is not the seam that would make one possible: a third
+    label added to :data:`SIBLINGS` would have the roster ask ``Instance.side("c")``, which
+    raises, because the instance holds an a and a b, the draw builds those two, the streams and
+    the surface pools are declared per side and the admission checks are written over a pair.
+    """
+    if not 0 <= index < len(SIBLINGS):
+        raise ValueError(
+            f"a family has {len(SIBLINGS)} siblings and there is no sibling {index}"
+        )
+    return SIBLINGS[index]
 
 
 @dataclass(frozen=True)
@@ -97,7 +143,10 @@ class ReceiptsV1Env(Env):
 
     Config (all optional, via ``shogym.make("receipts_v1", config=...)``):
       - ``genre``: which generator. Default ``"ledger"``.
-      - ``side``: ``"a"`` or ``"b"``, which sibling of the family is served.
+      - ``side``: ``"a"`` or ``"b"``, narrowing the roster to that sibling of every
+        family. Default is every sibling, which is what a run working a family as a
+        sequence of positions serves and what puts nothing about a sibling in the
+        environment's configuration.
       - ``bundle``: an admission bundle, by digest or by directory. Default is the
         genre's bundle when it has exactly one. A bundle that does not verify is a
         refusal, not a rebuild, and there is no argument that turns the refusal off:
@@ -117,7 +166,7 @@ class ReceiptsV1Env(Env):
     def __init__(
         self,
         genre: str = DEFAULT_GENRE,
-        side: str = "a",
+        side: Optional[str] = None,
         bundle: Optional[str] = None,
     ) -> None:
         self._genre = genre
@@ -128,19 +177,29 @@ class ReceiptsV1Env(Env):
             # rather than of whichever command happened to check.
             raise ValueError(f"{genre!r} is a gate exhibit and is never served")
         self._generator: Generator = load_generator(genre)
-        self._side = side.strip().lower()
-        if self._side not in ("a", "b"):
+        self._side = None if side is None else side.strip().lower()
+        if self._side is not None and self._side not in SIBLINGS:
             raise ValueError(f"a family has sides a and b, not {side!r}")
         self._served = self._open(genre, bundle)
         self._ordinals: List[int] = [i.ordinal for i in self._served.instances]
         self._built: Dict[int, Instance] = {
             i.ordinal: i for i in self._served.instances
         }
+        # The roster, flat: every family contributes one position per sibling it holds, in
+        # order, and a narrowed environment contributes the one its side names. Positions are
+        # what a generation addresses, and they are built once here rather than computed at
+        # every lookup so that what this environment serves is one list a reader can see.
+        self._roster: tuple[tuple[int, int], ...] = tuple(
+            (ordinal, index)
+            for ordinal in self._ordinals
+            for index in range(len(SIBLINGS))
+            if self._side is None or sibling(index) == self._side
+        )
         # Per-session grading state, keyed by session id, so one env instance
         # safely backs many concurrent episodes.
         self._grading_state: Dict[str, Dict[str, Any]] = {}
         self.function = FunctionConfig(example_system_template=_BASE_INSTRUCTIONS)
-        super().__init__(horizon=HORIZON, num_tasks=len(self._ordinals))
+        super().__init__(horizon=HORIZON, num_tasks=len(self._roster))
 
     def _open(self, genre: str, ref: Optional[str]) -> _Served:
         """The verified bundle this env serves. Overridden only by the development
@@ -156,6 +215,17 @@ class ReceiptsV1Env(Env):
         """
         return self._served.verified
 
+    @property
+    def seals(self) -> Path:
+        """Where the record of one ending is kept: beside the forks, under the seal.
+
+        In the fork store rather than in the bundle, which is frozen at its digest and
+        would disagree with its own manifest if anything were written inside it. A
+        source digest names a fork directory in sixteen hexadecimal characters, so this
+        name cannot be one of them.
+        """
+        return self._served.forks / "seals"
+
     def instance(self, ordinal: int) -> Instance:
         """The admitted instance at `ordinal`, as the source recomputed it.
 
@@ -168,31 +238,36 @@ class ReceiptsV1Env(Env):
             raise KeyError(f"instance {key} is not in what this env serves")
         return self._built[key]
 
-    def _ordinal_for(self, task_idx: int) -> int:
-        if not 0 <= task_idx < len(self._ordinals):
+    def _position(self, task_idx: int) -> tuple[int, int]:
+        """The family and the sibling one position names."""
+        if not 0 <= task_idx < len(self._roster):
             raise ValueError(
-                f"Task index {task_idx} is out of range for {len(self._ordinals)} tasks"
+                f"Task index {task_idx} is out of range for {len(self._roster)} tasks"
             )
-        return self._ordinals[task_idx]
+        return self._roster[task_idx]
 
     # ----- task loading -----
 
     def _load_task(self, task_idx: Optional[int]) -> Dict[str, Any]:
         if task_idx is None:
-            task_idx = int(self.np_random.integers(0, len(self._ordinals)))
-        ordinal = self._ordinal_for(task_idx)
-        task = self.instance(ordinal).side(self._side)
+            task_idx = int(self.np_random.integers(0, len(self._roster)))
+        ordinal, index = self._position(task_idx)
+        task = self.instance(ordinal).side(sibling(index))
         return {
             "task_idx": task_idx,
             "ordinal": ordinal,
+            "sibling": index,
             "genre": self._genre,
-            "side": self._side,
+            "side": sibling(index),
             "task_id": task.task_id,
             "n_rows": task.n_rows,
         }
 
     def _begin_session(self, session_id: str, task: Dict[str, Any]) -> None:
-        self._grading_state[session_id] = {"ordinal": int(task["ordinal"])}
+        self._grading_state[session_id] = {
+            "ordinal": int(task["ordinal"]),
+            "sibling": int(task["sibling"]),
+        }
 
     def _end_session(self, session_id: str) -> None:
         self._grading_state.pop(session_id, None)
@@ -209,15 +284,16 @@ class ReceiptsV1Env(Env):
         """
         spec = super().describe(task_id)
         idx = _as_index(task_id)
-        if idx is None or not 0 <= idx < len(self._ordinals):
+        if idx is None or not 0 <= idx < len(self._roster):
             # Refused rather than answered thinly. The base instructions tell the
             # agent to read a schedule and a policy extract, so a spec published
             # without one is a task that says to read something that is not there.
             raise KeyError(
                 f"{task_id!r} is not a position in what this env serves, which holds "
-                f"{len(self._ordinals)} tasks"
+                f"{len(self._roster)} tasks"
             )
-        task = self.instance(self._ordinal_for(idx)).side(self._side)
+        ordinal, index = self._position(idx)
+        task = self.instance(ordinal).side(sibling(index))
         return spec.model_copy(
             update={
                 "task_id": task.task_id,
@@ -260,13 +336,14 @@ class ReceiptsV1Env(Env):
                 diagnostic=f"a filing reached the seal without {missing}",
             )
         instance = self.instance(state["ordinal"])
-        task = instance.side(self._side)
+        side = sibling(int(state["sibling"]))
+        task = instance.side(side)
         raw = req.args.get("filing")
         # The one post-A act: canonicalize, render the three cells, check the
         # envelope, hash and commit. A retry or a resume replays the committed bytes,
         # because rendering again is how two branches of one fork come to differ.
         fork = bank_mod.fork_for(
-            self._generator, instance, self._side, raw,
+            self._generator, instance, side, raw,
             self._served.forks, self._served.digest,
         )
         canonical = self._generator.parse_and_canonicalize(task, raw)
@@ -302,11 +379,152 @@ class ReceiptsV1Env(Env):
         evidence: Optional[TerminalEvidence] = None,
     ) -> FeedbackCollection:
         instance = self.instance(int(task["ordinal"]))
-        return score_evidence(self._generator, instance, self._side, evidence,
-                              terminated=terminated)
+        return score_evidence(self._generator, instance, sibling(int(task["sibling"])),
+                              evidence, terminated=terminated)
+
+    # ----- the durable stream's terminal -----
+
+    def sealed_filing(self, session_id: str, raw: object) -> Optional[Dict[str, Any]]:
+        """What one session's filing comes to, read while the world it was made in is open.
+
+        Under the durable stream the terminal call reaches the stream rather than this
+        environment, so the filing arrives with the seal and the instance it answers is what
+        this session holds. A session this environment is not holding answers ``None``, which
+        is what a seal that arrived after the world was let go is entitled to be told: it is a
+        different fact from a filing that got no record right, and a zero there would be a
+        grade nobody took.
+
+        What comes back is the same act v1's ``finalize`` performs, in the same order and
+        through the same doors: the fork is rendered once through the bank's own path and
+        replayed thereafter, and the score is the generator's over the parser's canonical
+        reading of the filing.
+        """
+        state = self._grading_state.get(session_id)
+        if state is None:
+            return None
+        return filing_record(
+            self._generator,
+            self.instance(int(state["ordinal"])),
+            sibling(int(state["sibling"])),
+            raw,
+            forks=self._served.forks,
+            source_digest=self._served.digest,
+        )
+
+    def protocol_v2_grade(self):
+        """What this env's grader is, asked before a generation is built over it.
+
+        A generation may publish its score to the agent only where the number is the
+        environment's own. This one's is: the fraction of the records the filing got right,
+        under the convention drawn for the family the task came from.
+        """
+        from shogym.envs.receipts.protocol_v2 import RECEIPTS_GRADE
+
+        return RECEIPTS_GRADE
+
+    def protocol_v2_terminal(self, route: Any):
+        """The version this env declares, how to seal and grade one attempt, and what it is.
+
+        A durable stream asks the env it is serving rather than being told which env it has.
+        Without this the stream's stand-ins would score a receipts attempt on the shape of its
+        filing, so a table of wrong answers and a table of right ones would be worth the same
+        thing and the fraction the filing got right would reach nothing.
+
+        ``route`` says which world an attempt was worked in, and the seal asks it when it seals
+        rather than now: these Activities are registered once and a generation may serve
+        several tasks, each in a world of its own.
+
+        What a seal writes goes where this env writes its forks, under the seal that ended the
+        attempt. That is the same place the cells themselves are committed and it is outside the
+        frozen bundle, so the record of an ending outlives the process that made it and a Worker
+        that replaced the one which sealed reads what was sealed rather than reporting that
+        nothing was.
+        """
+        from shogym.envs._grading import DirectoryCaptures
+        from shogym.envs.receipts.protocol_v2 import (
+            configuration_digest,
+            receipts_terminal,
+        )
+
+        version, activities = receipts_terminal(
+            route, store=DirectoryCaptures(self.seals)
+        )
+        return (
+            version,
+            activities,
+            configuration_digest(
+                genre=self._genre,
+                side=self._side,
+                source=self._served.digest,
+                dealable=self._served.verified,
+            ),
+        )
 
 
 # ----- pure scoring, module level so it is unit-testable without a server -----
+
+
+def filing_record(
+    generator: Generator,
+    instance: Instance,
+    side: str,
+    raw: object,
+    *,
+    forks: Path,
+    source_digest: str,
+) -> Dict[str, Any]:
+    """What one filing came to: the canonical reading, the numbers, and the fork's cells.
+
+    One value, so a seal that has to be idempotent can write it once and everything after it
+    reads that record rather than the world. The fork is asked for through ``fork_for``, which
+    renders once and replays thereafter, so the cells this names are the cells any other branch
+    of the same filing holds.
+
+    The canonical filing is the lines the reading actually made, in printed order: one line per
+    record the filing named, the record identifier, a comma and the canonical value. A record
+    nobody named has no line, which is what keeps a record filed empty distinct from a record
+    left out. Nothing the scorer decided is in it, so what a digest of it commits to is the
+    agent's own act.
+    """
+    task = instance.side(side)
+    # The one atomic post-seal act, exactly as the v1 path performs it.
+    fork = bank_mod.fork_for(generator, instance, side, raw, forks, source_digest)
+    canonical = generator.parse_and_canonicalize(task, raw)
+    score, outcomes = generator.score(task, canonical)
+    filed = canonical if isinstance(canonical, SealedSubmission) else None
+    return {
+        "task_id": task.task_id,
+        "filing": canonical_lines(generator, task, canonical),
+        "component_score": float(score),
+        "solved": bool(outcomes) and score >= 1.0,
+        "rows_filed": float(filed.filed_rows) if filed is not None else 0.0,
+        "rows_omitted": float(len(filed.omissions)) if filed is not None else 0.0,
+        "no_filing": canonical.reason if isinstance(canonical, NoFiling) else None,
+        "filing_digest": fork.filing_digest,
+        "source_digest": source_digest,
+        "cells": {
+            kind: fork.agent_bytes(kind).decode("ascii") for kind in fork.digests
+        },
+        "cell_digests": dict(fork.digests),
+    }
+
+
+def canonical_lines(generator: Generator, task: Task, canonical: Filing) -> str:
+    """The parser's reading of a filing, written back out as the filing it stands for.
+
+    One line per record the filing named, in printed order, and nothing for a record it did
+    not name. A record named with an empty value keeps its line, because filing the empty band
+    and filing nothing are different acts and one option of the ``missing`` axis is the empty
+    band. A reading that named no record at all is the empty text, whatever the filing said.
+    """
+    if not isinstance(canonical, SealedSubmission):
+        return ""
+    identifiers = generator.row_identifiers(task.table)
+    return "\n".join(
+        f"{identifier},{value}"
+        for identifier, value, named in zip(identifiers, canonical.values, canonical.filed)
+        if named
+    )
 
 
 def score_evidence(
@@ -444,7 +662,7 @@ class ReceiptsDevEnv(ReceiptsV1Env):
     def __init__(
         self,
         genre: str = DEFAULT_GENRE,
-        side: str = "a",
+        side: Optional[str] = None,
         bank: Optional[str] = None,
     ) -> None:
         super().__init__(genre=genre, side=side, bundle=bank)
@@ -474,4 +692,13 @@ class ReceiptsDevEnv(ReceiptsV1Env):
         )
 
 
-__all__ = ["HORIZON", "ReceiptsDevEnv", "ReceiptsV1Env", "score_evidence"]
+__all__ = [
+    "HORIZON",
+    "SIBLINGS",
+    "ReceiptsDevEnv",
+    "ReceiptsV1Env",
+    "canonical_lines",
+    "filing_record",
+    "score_evidence",
+    "sibling",
+]
