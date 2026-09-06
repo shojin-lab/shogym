@@ -228,11 +228,39 @@ class WorldRoute:
     """
 
     def __init__(self) -> None:
-        self._worlds: Dict[str, ServedEpisode] = {}
+        self._worlds: Dict[str, Tuple[ServedEpisode, int]] = {}
 
-    def record(self, attempt_id: str, episode: ServedEpisode) -> None:
-        """Say that this attempt is working in this episode's world."""
-        self._worlds[attempt_id] = episode
+    def record(self, attempt_id: str, episode: ServedEpisode, owner: int) -> None:
+        """Say that this attempt is working in this episode's world, unless a newer owner has.
+
+        The owner is named because two transports for one generation can be alive in one process
+        at the same time, and the older of them can still be working. A replacement claims the
+        generation, restores the attempt's world and records it here; the transport it replaced
+        is fenced at the stream, but nothing fences its memory, and an answer it was still
+        waiting for can lead it to claim the world it was working in and write that here on top.
+        What being fenced at the stream costs it is narrower than it sounds: the fresh Updates it
+        sends are refused because they carry an owner the generation has replaced, while reads are
+        answered as they are for anybody and an Update it already completed is answered again from
+        what it completed with. That last one is how it gets here at all. And this pairing is not
+        the stream's to refuse: it is what the environment resolves a seal against, and the
+        replacement is using it.
+
+        So the rule the forgetting already keeps applies to the writing, and it is exactly as
+        wide as what is written down. What this compares against is the epoch of the pairing that
+        is standing, so what it prevents is an older epoch overwriting a still-recorded newer
+        pairing. An attempt with no pairing recorded is a different question, and it is answered
+        the ordinary way: there is nothing here to overwrite, the world a caller names is the only
+        one this process is holding for that attempt, and refusing it would leave a seal with
+        nowhere to look. Keeping an older epoch out for good would mean remembering owners past
+        the pairings they belonged to, which is a watermark rather than this.
+
+        The comparison is here, at the writing, rather than at the caller, because a caller that
+        gets this wrong is by definition one that does not know it has been replaced.
+        """
+        standing = self._worlds.get(attempt_id)
+        if standing is not None and standing[1] > owner:
+            return
+        self._worlds[attempt_id] = (episode, owner)
 
     def forget(self, attempt_id: str, episode: ServedEpisode) -> None:
         """Say that this world of this attempt's is gone, if it is still the one recorded.
@@ -243,13 +271,14 @@ class WorldRoute:
         working in and lets go of it afterwards. That later cleanup is about its own world, so it
         clears the pairing only where the pairing is still that world's.
         """
-        if self._worlds.get(attempt_id) is episode:
+        standing = self._worlds.get(attempt_id)
+        if standing is not None and standing[0] is episode:
             del self._worlds[attempt_id]
 
     def __call__(self, attempt_id: str) -> Optional[Tuple[Any, str]]:
         """The environment and session this attempt filed in, or ``None`` if not this process."""
-        episode = self._worlds.get(attempt_id)
-        return None if episode is None else (episode.env, episode.session_id)
+        standing = self._worlds.get(attempt_id)
+        return None if standing is None else (standing[0].env, standing[0].session_id)
 
 
 class EnvironmentTerminal(NamedTuple):
@@ -1205,7 +1234,7 @@ class StreamGateway:
         # the restored world and seal whatever the process before this one left behind.
         if world_attempt is not None:
             self._worlds[world_attempt] = episode
-            self._route.record(world_attempt, episode)
+            self._route.record(world_attempt, episode, self._owner())
         self._spec = spec
         self._terminal = terminal.name
         self._cursor = initial_cursor
@@ -2562,7 +2591,19 @@ class StreamGateway:
                     f"{started_as.configuration_digest!r}"
                 )
         self._worlds[attempt_id] = opened
-        self._route.record(attempt_id, opened)
+        self._route.record(attempt_id, opened, self._owner())
+
+    def _owner(self) -> int:
+        """Which owner of the generation this transport speaks for.
+
+        It is the epoch its writer holds, which is the only ordering two transports for one
+        generation share. A transport that has claimed nothing, and one whose stream cannot say,
+        speak for nobody and are ordered below every owner that has claimed something.
+        """
+        try:
+            return self._stream.writer.ownership_epoch
+        except (AttributeError, ValueError):
+            return 0
 
     def _claimed(self, attempt_id: str) -> Optional[ServedEpisode]:
         """Give the attempt whose task is being presented the seed this transport was built on.
@@ -2583,7 +2624,7 @@ class StreamGateway:
         if claimed is None:
             return None
         self._worlds[attempt_id] = claimed
-        self._route.record(attempt_id, claimed)
+        self._route.record(attempt_id, claimed, self._owner())
         self._unclaimed = None
         return claimed
 

@@ -87,6 +87,8 @@ from shogym.serve.protocol_v2.kernel import (  # noqa: E402
     OfferedMessage,
     StreamProtocolError,
     StreamStart,
+    configuration_hash,
+    resume_stream,
 )
 from shogym.serve.protocol_v2.policy import (  # noqa: E402
     HONEST_V1,
@@ -1294,9 +1296,62 @@ def test_a_world_belongs_to_the_attempt_it_was_opened_for() -> None:
     """The route says which world each attempt filed in, and answers nothing for the others."""
     route = environment_terminal(SimpleNamespace(env=object(), session_id="session-1")).route
     world = SimpleNamespace(env="env-a", session_id="session-a")
-    route.record("00000000000000000000000000000100", world)
+    route.record("00000000000000000000000000000100", world, 1)
     assert route("00000000000000000000000000000100") == ("env-a", "session-a")
     assert route("00000000000000000000000000000200") is None
+
+
+def test_an_older_epoch_cannot_move_a_still_recorded_newer_pairing() -> None:
+    """Two transports for one generation can be alive at once, and only the newer one may write.
+
+    A replacement claims the generation, restores the attempt's world and records it. The
+    transport it replaced is fenced at the stream, but nothing fences its memory: an answer it
+    was still waiting for can lead it to claim the world it was working in and write that here,
+    on top of the one the replacement is using. What fencing refuses is the fresh Updates it
+    sends, and not the reads it makes or the Update it already completed, which is the one that
+    leads it here. And this pairing is not the stream's: it is what the environment resolves a
+    seal against.
+
+    So the writing compares owners the way the forgetting already compares worlds. What the
+    comparison can see is the epoch of the pairing that is standing, and that is exactly what it
+    is held to here: a newer pairing that is still recorded stands, the older epoch's write does
+    nothing, and a newer owner replacing its own entry still works. An attempt with no pairing
+    recorded is a different question and is answered the ordinary way, because there is nothing
+    for an older epoch to overwrite.
+    """
+    attempt = "00000000000000000000000000000100"
+    route = environment_terminal(SimpleNamespace(env=object(), session_id="seed")).route
+    replaced = SimpleNamespace(env="env-old", session_id="old-world")
+    live = SimpleNamespace(env="env-new", session_id="live-world")
+
+    route.record(attempt, live, 2)
+    assert route(attempt) == ("env-new", "live-world")
+
+    # The owner that was replaced comes back and says where it thinks the attempt is working.
+    route.record(attempt, replaced, 1)
+    assert route(attempt) == ("env-new", "live-world")
+
+    # The owner that holds the generation may still move its own pairing, and a newer one may
+    # take it over, which is the case the comparison must not get in the way of.
+    route.record(attempt, SimpleNamespace(env="env-new", session_id="second-world"), 2)
+    assert route(attempt) == ("env-new", "second-world")
+    third = SimpleNamespace(env="env-third", session_id="third-world")
+    route.record(attempt, third, 3)
+    assert route(attempt) == ("env-third", "third-world")
+
+    # And letting go is still about the world let go of, not about the attempt alone: the older
+    # owner closing the world it was working in leaves the replacement's pairing where it is.
+    route.forget(attempt, replaced)
+    assert route(attempt) == ("env-third", "third-world")
+
+    # What the comparison is not is a memory of every owner there has been. Once the pairing it
+    # was guarding is let go of there is nothing standing to compare against, and an attempt with
+    # no world recorded is answered the ordinary way. Saying so here is what keeps the rule this
+    # test names the rule the code keeps.
+    route.forget(attempt, third)
+    assert route(attempt) is None
+    route.record(attempt, replaced, 1)
+    assert route(attempt) == ("env-old", "old-world")
 
 
 async def test_a_generation_a_controller_composed_ends_the_way_its_environment_does(
@@ -4427,3 +4482,102 @@ async def _collect_a_cancelled_done(
     # Collected, and now the closed generation is all there is to say.
     assert await refused(gateway.pull({})) == "closed_stream"
     await gateway.aclose()
+
+
+@pytest.mark.network
+async def test_a_replaced_transports_retry_leaves_the_replacements_world_where_it_is(
+    episode: ServedEpisode,
+) -> None:
+    """The schedule the owner comparison is for, driven with two real transports and one stream.
+
+    One transport loses the answer to a successful Task pull, so it holds the request as
+    uncertain and will send that exact Update again. A replacement claims the generation,
+    inherits the request left open, takes the task the first transport was owed and presents it,
+    and records the world it restored for that attempt in the route the environment resolves a
+    seal against.
+
+    Then the first transport retries. The service answers the exact Update it already answered,
+    so the retry reaches the offer rather than a refusal, and the work the transport does with
+    that offer is where the danger is: it claims the world it was opened on for the attempt
+    before the presentation that will fence it. Writing that world into the shared route would
+    leave the replacement's seal reaching a world nobody worked in.
+
+    So this drives the whole schedule rather than the route in isolation. It fails if the
+    comparison is removed, and it fails if the owner reaching the comparison is not the epoch the
+    transport speaks for, which is what a test over the route alone cannot see.
+    """
+    running = False
+    try:
+        async with durable_client() as client:
+            running = True
+            async with stream_worker(client):
+                await _two_transports_over_one_attempt(client, episode)
+    except Exception as error:  # noqa: BLE001 - re-raised below unless the service never came up
+        if running:
+            raise
+        pytest.skip(f"the durable service is unavailable: {error}")
+
+
+async def _two_transports_over_one_attempt(client: Client, episode: ServedEpisode) -> None:
+    """A lost Task answer, a replacement that restores the world, and the old transport's retry."""
+    environment = environment_terminal(episode)
+    replaced = await open_gateway(client, episode, environment=environment)
+    start = replaced._generation
+    answered = replaced._stream.pull
+
+    async def lose_the_answer(request: Any) -> Any:
+        await answered(request)
+        raise RuntimeError("the offer was lost on the way back")
+
+    setattr(replaced._stream, "pull", lose_the_answer)
+    with pytest.raises(RuntimeError, match="lost on the way back"):
+        await replaced.pull({})
+    setattr(replaced._stream, "pull", answered)
+    assert isinstance(replaced._recovery, _RequestUncertain)
+
+    # The replacement claims the generation and inherits the request the first transport left
+    # open, which is the one call that can reach the message the stream is holding for it.
+    stream = await resume_stream(
+        client,
+        workflow_id=replaced._stream.handle.id,
+        configuration_hash=configuration_hash(start),
+        claimant_id="the-replacement",
+    )
+    task = await stream.pull(replaced._recovery.request)
+    assert task.kind == "task"
+    attempt = task.attempt_id or ""
+    acknowledgement = await stream.present(
+        task,
+        attestation_id="a" * 32,
+        transcript_blob="e" * 64,
+        task_start_checkpoint_blob="e" * 64,
+    )
+    restored = await ServedEpisode.start(TEST_ENV, task=0, ends_on_horizon=False)
+    replacement = StreamGateway(
+        stream,
+        restored,
+        episode.describe(),
+        terminal_manifest(episode.describe()),
+        initial_cursor=acknowledgement.cursor,
+        generation=start,
+        world_attempt=attempt,
+        environment=environment,
+    )
+    assert environment.route(attempt) == (restored.env, restored.session_id)
+    assert stream.writer.ownership_epoch > replaced._stream.writer.ownership_epoch
+
+    # The first transport retries. It is fenced at the stream, and the pairing the replacement
+    # is using is left where it is.
+    assert await refused(replaced.pull({})) == "fenced_writer"
+    assert environment.route(attempt) == (restored.env, restored.session_id)
+    assert replacement._worlds[attempt] is restored
+    # And it did reach the writing, which is what makes this a test of the comparison rather
+    # than of a path nothing took: the old transport claimed its own world for the same attempt.
+    assert replaced._worlds[attempt] is episode
+    assert replaced._unclaimed is None
+
+    # Letting go is still the old transport's own world, so the replacement's pairing survives
+    # the transport that was replaced shutting down.
+    await replaced.aclose()
+    assert environment.route(attempt) == (restored.env, restored.session_id)
+    await replacement.aclose()
