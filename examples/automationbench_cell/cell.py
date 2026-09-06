@@ -96,10 +96,11 @@ SERVER_LOG = "server.log"
 RUN_FILE = "run.json"
 
 #: What the run's record says of itself when it is read back. A launch is complete when work
-#: crossed the boundary in both directions and the two containers were taken down afterwards, and
-#: it says why it is not when it is not: an exit code alone cannot tell a cell that served two
-#: hundred tasks from one whose agent never found the endpoint. A read holds a run this calls
-#: complete to checks it lets an incomplete one report as unavailable.
+#: crossed the boundary in both directions, the transcript holds the generation saying the queue
+#: had ended, and the two containers were taken down afterwards, and it says why it is not when it
+#: is not: an exit code alone cannot tell a cell that served two hundred tasks from one whose
+#: agent never found the endpoint, or from one that stopped asking at fifty nine. A read holds a
+#: run this calls complete to checks it lets an incomplete one report as unavailable.
 COMPLETE = "complete"
 INCOMPLETE = "incomplete"
 
@@ -454,7 +455,7 @@ def agent_command(
     )
 
 
-def unserved(run_dir: Path) -> List[str]:
+def unserved(run_dir: Path, transcript: Optional[read_back.Transcript]) -> List[str]:
     """Why this launch is not a run anybody can compare, or nothing when it is one.
 
     A launch that reached no server still exits nought. The CLI prints its opening line, fails to
@@ -475,10 +476,12 @@ def unserved(run_dir: Path) -> List[str]:
     The init line is not enough on its own to answer either. It reports the server it was
     configured with, which the recorded run's own first line reports as connected, and a
     connection is not a delivery: it is written before any pull has been made.
+
+    The transcript is passed in already read. It is the largest thing a run leaves behind and
+    every reason a launch has to look at it is decided at the same moment, so it is read once.
     """
     reasons: List[str] = []
-    transcript = run_dir / TRANSCRIPT
-    tasks = read_back.read_transcript(transcript).tasks if transcript.is_file() else 0
+    tasks = transcript.tasks if transcript is not None else 0
     if tasks == 0:
         reasons.append("no pull came back with a task, so this run served nothing")
     log = run_dir / SERVER_LOG
@@ -490,6 +493,64 @@ def unserved(run_dir: Path) -> List[str]:
     if answered == 0:
         reasons.append("the gateway answered no request, so nothing reached the measurement")
     return reasons
+
+
+def unfinished(
+    transcript: Optional[read_back.Transcript],
+    *,
+    positions: int,
+    presented_done: bool = False,
+) -> List[str]:
+    """Why this run did not reach the end of its queue, or nothing when it did.
+
+    A cell ends where the generation says there is no more work, and the record of the agent
+    having been told is the Done a pull came back with. Nothing else in a session says it. The
+    agent decides for itself when to stop asking, so a session that stopped with most of the
+    roster unreached ends exactly as one that emptied the queue does: an exit code of nought, a
+    transcript that stops, and a teardown that took two healthy containers down. Two runs were
+    filed as finished cells on those signals alone, one that wedged against a service that had
+    stopped answering and one whose agent wrote that the queue was not empty and stopped anyway.
+    Under a regime where nothing nudges the agent, its own stop is how a run ends, and the record
+    has to say that is what happened.
+
+    So the reason names which of them a run was. A run holding a fault the service never answered
+    after stopped against the service rather than at the end of the queue, and the fault's own
+    text is carried with the reason because which service said no is the first thing anybody
+    reading such a run wants. Anything else with no Done in it is an agent that stopped while
+    positions were still unreached, and how many of them there were is what says how far it got.
+
+    A refusal is neither. It is the protocol saying no to one call, which a healthy run can meet
+    and go on from, so no code read out of the transcript is a failure on its own. It is not the
+    service coming back either: the calls that follow a failed one are refused for overlapping
+    with it, so the refusals a wedged run ends in are the failure rather than the recovery from
+    it, and the fault they came of is what the reason names.
+
+    ``presented_done`` is the one thing here nobody has at the end of a launch. A Done the
+    generation presented and this transcript does not hold is a run whose agent may never have
+    been told, which is a lost message rather than a decision it made, but saying so means reading
+    what the generation committed to deliver, and that is a read of the durable history rather
+    than of the run directory. So a launch never passes it, and the branch is for a caller that
+    has reconciled the two records and knows.
+    """
+    if transcript is None:
+        return ["there is no transcript, so nothing says this run was told its queue had ended"]
+    if transcript.done_count:
+        return []
+    if transcript.unresolved_faults:
+        return [
+            f"this run stopped against the service rather than at the end of its queue, with "
+            f"{transcript.unresolved_faults} service faults carrying no protocol code and nothing "
+            f"served after them: {transcript.faults[-1]}"
+        ]
+    if presented_done:
+        return [
+            "the generation presented a done this transcript does not hold, so nothing says the "
+            "agent was told its queue had ended"
+        ]
+    return [
+        f"the agent stopped with {max(positions - transcript.tasks, 0)} of {positions} positions "
+        f"unreached, and no done came back to say the queue was empty"
+    ]
 
 
 def certifies(run_dir: Path) -> bool:
@@ -535,9 +596,11 @@ def launch(
     started from, what each image was built from, and the CLI build, so that a launch nobody could
     pin is still a launch somebody can read back.
 
-    The record ends by saying whether this is a run at all. A cell whose agent never reached the
-    endpoint exits nought with an empty transcript, and a pilot reading exit codes would file it
-    beside a cell that served two hundred.
+    The record ends by saying whether this is a run at all, and whether it is a finished one. A
+    cell whose agent never reached the endpoint exits nought with an empty transcript, and a pilot
+    reading exit codes would file it beside a cell that served two hundred. So does a cell whose
+    agent stopped asking with most of the roster unreached, which is why the end of the queue is
+    read out of the transcript rather than assumed from a quiet ending.
     """
     positions = roster(tasks)
     # These are read here for their refusals. A misspelled roster, an unknown schedule, a CLI that
@@ -662,16 +725,26 @@ def launch(
     # it is read out of the transcript's first line and compared to the recorded one here.
     init = pinned.init_event(run_dir / TRANSCRIPT)
     drift = pinned.surface_drift(init, served=SERVED_TOOLS)
+    transcript = run_dir / TRANSCRIPT
+    read = read_back.read_transcript(transcript) if transcript.is_file() else None
+    reached = read.tasks if read is not None else 0
     if stopped is not None:
         reasons = [str(stopped)]
     elif returncode:
         reasons = [f"the agent exited {returncode}"]
     else:
-        reasons = unserved(run_dir)
+        # Whether work crossed the boundary is asked before how far the run got, because a launch
+        # that served nothing has not stopped early: it has not started.
+        reasons = unserved(run_dir, read) or unfinished(read, positions=len(positions))
     reasons += cleanup
     record["exit_code"] = returncode
     record["init"] = init
     record["drift"] = drift
+    # How far the run got, beside the roster it was over. The turnovers the generation counted are
+    # not here: they live in the stream's own state, and reading that means standing a worker up
+    # to answer a Query, which is what the read does and what a launch finishing up does not.
+    record["positions_reached"] = reached
+    record["positions_unreached"] = max(len(positions) - reached, 0)
     record["status"] = INCOMPLETE if reasons else COMPLETE
     record["reason"] = reasons
     write_run_file(run_dir, record)

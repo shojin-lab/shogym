@@ -46,5 +46,9 @@ cell-<schedule>-<stamp>-<token>/
   run.json             the launch as it resolved, and whether it is a run at all
 ```
 
+A run counts as complete only when the transcript holds the server telling the agent there is no
+more work, so a session that stopped asking while tasks were left is recorded as incomplete, with
+the reason it stopped and how many places it never reached.
+
 Only `self/`, `home/` and `cfg/` were ever inside the agent's container. `grades/cell.json` says
 which benchmark task each attempt was, and `table` reads the scores back through it.

@@ -39,7 +39,7 @@ from typing import Dict, FrozenSet, List, Optional, Tuple
 from examples.automationbench_cell.serve import REFUSAL_FILE, ROSTER_FILE, SERVED_PREFIX
 from shogym.serve.protocol_v2.errors import WireFormatError
 from shogym.serve.protocol_v2.kernel.messages import AttemptRecord, PresentedMessage
-from shogym.serve.protocol_v2.records import Task
+from shogym.serve.protocol_v2.records import Done, Task
 
 #: The served tool that asks for work. It names no attempt, and it is counted on its own, because
 #: how often an agent asked for work is a different fact from how much work it did. The tool that
@@ -65,7 +65,20 @@ MATCHED = "matched"
 MISMATCHED = "mismatched"
 MISSING = "missing"
 
-_COLUMNS = ("task", "position", "attempt", "score", "ending", "payload", "seen", "calls")
+#: How much of one fault's own text is kept. A fault is whatever the harness put on the error
+#: channel rather than a record with fields, so the text is the whole of it, and it is kept short
+#: because a session that ended against a service that had stopped answering ends in a great many
+#: of them and what a reader wants of one is which service said no.
+FAULT_TEXT = 200
+
+#: How the harness marks a call it refused itself. Claude Code wraps its own tool failures in this
+#: tag: arguments that would not parse, a name it does not know, a file it could not open. Such a
+#: call never left the session, so its error is the agent's own and says nothing about whether the
+#: service on the other side of the boundary was answering. What the service failed comes back
+#: unwrapped, as the text the transport put on the error channel.
+LOCAL_ERROR = "<tool_use_error>"
+
+_COLUMNS =("task", "position", "attempt", "score", "ending", "payload", "seen", "calls")
 
 
 @dataclass(frozen=True)
@@ -91,6 +104,24 @@ class Transcript:
     writing one is not receiving work: the request can be refused, redirected or answered with an
     error, and the call stands in the transcript either way. So the tasks a run actually served
     are counted off the results those calls came back with.
+
+    ``done_count`` is how many of those results were the record that ends the queue. It is the
+    only place a session says the agent was told there is no more work: an agent decides for
+    itself when to stop asking, so a session that stopped with the queue half served ends exactly
+    as one that emptied it does.
+
+    ``faults`` is what came back on the error channel from a served tool carrying no protocol code
+    and no mark of the harness's own, in the order it came back. The three are different facts. A
+    refusal is the protocol saying no to one call. A fault is the service failing to answer one at
+    all. An error the harness marked as its own is the agent's call never having left the session,
+    which is a mistake the agent made rather than anything about the service, and those are kept
+    apart in ``local_errors``.
+
+    ``unresolved_faults`` is how many faults stand with nothing served answered after them. It is
+    not a count of what the transcript ends in, because a service that has stopped answering does
+    not go quiet: the calls that follow a failed one are refused for overlapping with it, so the
+    run ends in refusals with the fault that caused them further up. A served answer is what
+    resolves a fault, and nothing else is.
     """
 
     per_attempt: Dict[str, int]
@@ -99,6 +130,10 @@ class Transcript:
     unserved: int
     handed: Tuple[Handed, ...]
     refusals: Tuple[str, ...]
+    done_count: int
+    faults: Tuple[str, ...]
+    local_errors: Tuple[str, ...]
+    unresolved_faults: int
 
 
 @dataclass(frozen=True)
@@ -160,6 +195,24 @@ def read_transcript(transcript: Path) -> Transcript:
     An error result is a refusal or a fault rather than a message, so it is read for the refusal
     code it carries. That code is the only record of a refusal there is: it advances no protocol
     state, so nothing in the generation counts it, and this transcript is where the model saw it.
+    An error carrying no code is one of two other things. It is a fault, a service that would not
+    answer, unless the harness marked it as its own refusal of the call, which it does by wrapping
+    it. A call the harness would not make never reached the service: a malformed argument list is
+    the agent writing a bad call, and reading one as a service failure would put the agent's own
+    mistake on the other side of the boundary. So a fault is an error result from a served tool
+    that carries no protocol code and no such mark, and it is kept as the text it came as rather
+    than counted, because a run that ended in these ended against something and the text is what
+    says what.
+
+    Faults stay unresolved until something is served after them. A service that has failed a call
+    does not go quiet: the next calls are refused for overlapping with the one it never finished,
+    so a run that ended against it ends in refusals rather than in the fault that caused them. A
+    refusal is therefore not evidence that the service came back, and neither is an error the
+    harness raised without asking it. Only a served answer is.
+
+    The record that ends the queue is counted where a task is, off the results a pull came back
+    with. It is what says the agent was told there is no more work, and it is the one thing a
+    session that stopped early does not hold.
 
     It is read a line at a time rather than all at once. A session that worked a whole roster with
     partial messages on writes a transcript far larger than the run it describes, and every launch
@@ -168,11 +221,15 @@ def read_transcript(transcript: Path) -> Transcript:
     per_attempt: Dict[str, int] = {}
     pulls = 0
     tasks = 0
+    done_count = 0
     unserved = 0
     served: Dict[str, str] = {}
     asked: set = set()
     handed: List[Handed] = []
     refusals: List[str] = []
+    faults: List[str] = []
+    local_errors: List[str] = []
+    unresolved = 0
     with Path(transcript).open(encoding="utf-8", errors="replace") as stream:
         for raw in stream:
             line = raw.strip()
@@ -196,12 +253,24 @@ def read_transcript(transcript: Path) -> Transcript:
                     texts = _result_texts(block.get("content"))
                     if block.get("is_error"):
                         asked.discard(call)
-                        refusals.extend(_refusal_codes(texts))
+                        codes = _refusal_codes(texts)
+                        if codes:
+                            # The refusals that follow a failed call are what a service that has
+                            # stopped answering says, so they leave the fault standing.
+                            refusals.extend(codes)
+                        elif _is_local(texts):
+                            local_errors.append(_fault_text(texts))
+                        else:
+                            faults.append(_fault_text(texts))
+                            unresolved += 1
                         continue
+                    unresolved = 0
                     if call in asked:
                         asked.discard(call)
                         if any(_is_task(text) for text in texts):
                             tasks += 1
+                    if served[call] == PULL_TOOL:
+                        done_count += sum(1 for text in texts if _is_done(text))
                     handed.extend(
                         Handed(
                             digest=sha256(text.encode("utf-8")).hexdigest(),
@@ -235,6 +304,10 @@ def read_transcript(transcript: Path) -> Transcript:
         unserved=unserved,
         handed=tuple(handed),
         refusals=tuple(refusals),
+        done_count=done_count,
+        faults=tuple(faults),
+        local_errors=tuple(local_errors),
+        unresolved_faults=unresolved,
     )
 
 
@@ -248,6 +321,21 @@ def _is_task(text: str) -> bool:
     """
     try:
         Task.from_wire(json.loads(text))
+    except (json.JSONDecodeError, WireFormatError):
+        return False
+    return True
+
+
+def _is_done(text: str) -> bool:
+    """Whether a result's text is the canonical bytes of the record that ends the queue.
+
+    The protocol's own decoder answers this for the reason it answers what a task is. The word
+    names a served tool as well, the one an agent ends an attempt with, and it stands in the
+    arguments the model writes to that tool and in whatever the tool answers with. None of those
+    is the generation saying there is no more work, and only the record is.
+    """
+    try:
+        Done.from_wire(json.loads(text))
     except (json.JSONDecodeError, WireFormatError):
         return False
     return True
@@ -370,6 +458,27 @@ def _refusal_codes(texts: List[str]) -> List[str]:
         found = _REFUSAL_CODE.search(text)
         codes.append(found.group(1) if found else "unnamed")
     return codes
+
+
+def _is_local(texts: List[str]) -> bool:
+    """Whether an error result is the harness refusing the call rather than the service failing it.
+
+    The harness wraps its own, and what the service answered arrives unwrapped, so the mark is
+    what tells them apart. The distinction is worth making because they say opposite things about
+    a run: an argument list that would not parse is the agent writing a bad call and hearing about
+    it at once, and the service on the other side of the boundary was never asked.
+    """
+    return any(text.strip().startswith(LOCAL_ERROR) for text in texts)
+
+
+def _fault_text(texts: List[str]) -> str:
+    """One error result as a record of the run keeps it: its text, as much as is worth holding.
+
+    The items are joined here where a message's are not. A fault carries no identifier and is
+    compared with nothing, so what it is for is being read, and a service that answered an error
+    across two items said one thing.
+    """
+    return " ".join(text.strip() for text in texts if text.strip())[:FAULT_TEXT]
 
 
 def _result_texts(content: object) -> List[str]:

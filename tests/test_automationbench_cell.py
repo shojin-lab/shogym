@@ -411,6 +411,33 @@ UNATTRIBUTED = {"done", "info"}
 #: The three messages one sealed and paid attempt is handed.
 DELIVERED = [message_id(0, kind) for kind in ("a", "b", "c")]
 
+#: What the service said when a run wedged against the durable service's cap on updates, as that
+#: run's transcript holds it. It is the text of the error and not a record: nothing on the error
+#: channel carries a protocol code unless the protocol put one there.
+CAP_FAULT = (
+    "Error calling tool 'api_fetch': The limit on the total number of distinct updates in this "
+    "workflow has been reached (2000). Make sure any duplicate updates share an Update ID so the "
+    "server can deduplicate them, and consider rejecting updates that you aren't going to "
+    "process. You can also Continue-as-New to avoid this; we recommend you check Continue-as-New "
+    "Suggested in your Workflow."
+)
+
+#: What the harness said when the agent wrote a call it could not parse, as the other run's
+#: transcript holds it. The call never left the session, so this is the agent's own mistake and
+#: not a fact about the service, and the harness marks it as its own by wrapping it.
+MALFORMED_CALL = (
+    "<tool_use_error>InputValidationError: mcp__shogym__api_fetch was called with input that "
+    'could not be parsed as JSON.\nYou sent (first 145 of 145 bytes): {"attempt_id": '
+    '"4ee0007b62f9497eae9acf51cce3a839", "arguments": {"method": "GET", "url": '
+    '"https://sheets.googleapis.com/v4/spreadsheets/ss_ideas}\nCommon causes: unescaped '
+    "backslashes in file paths, unescaped control characters, or truncated output. Retry with "
+    "valid JSON.</tool_use_error>"
+)
+
+#: What the agent's own file read said when it asked for a file that was not there. It is an error
+#: from a tool this cell never served, and a read of the transcript counts nothing off it.
+MISSING_FILE = "File does not exist. Note: your current working directory is /work."
+
 
 def counted(refusals: int) -> read_back.Counted:
     """A refusal count the server wrote, which is the ordinary state of a run that served."""
@@ -537,12 +564,46 @@ def _result(text: str, *, call: str = "u", is_error: bool = False):
     return {"type": "user", "message": {"content": [block]}}
 
 
-def _refused(code: str):
+def _refused(code: str, *, call: str = "u"):
     """One refusal, as the model saw it: the canonical protocol error on the error channel."""
     return _result(
         json.dumps({"code": code, "kind": "protocol_error", "protocol_version": 2}),
+        call=call,
         is_error=True,
     )
+
+
+def _plain_result(text: str, *, call: str = "u", is_error: bool = False):
+    """One result in the other shape a harness writes them in: the text itself, not an item list.
+
+    Both real runs wrote every error this way, so what is read out of an error is read out of this
+    shape as often as out of the other.
+    """
+    block: Dict[str, Any] = {"type": "tool_result", "tool_use_id": call, "content": text}
+    if is_error:
+        block["is_error"] = True
+    return {"type": "user", "message": {"content": [block]}}
+
+
+def _faulted(text: str, *, call: str = "u"):
+    """One fault, as the model saw it: an error the protocol never named, and its text.
+
+    This is what a call against a service that has stopped answering comes back as. It carries no
+    code, because nothing on the protocol's side decided it, and no mark of the harness's own,
+    because the harness made the call and the service is what failed it.
+    """
+    return _plain_result(text, call=call, is_error=True)
+
+
+def _own_error(text: str, *, call: str = "u"):
+    """One error the session raised without asking the service, as the model saw it."""
+    return _plain_result(text, call=call, is_error=True)
+
+
+def stream(path: Path, lines: List[Dict[str, Any]]) -> Path:
+    """Write one transcript, a line to an event, and return where it was written."""
+    path.write_text("".join(json.dumps(line) + "\n" for line in lines), encoding="utf-8")
+    return path
 
 
 def test_calls_are_counted_against_the_attempt_they_named(tmp_path: Path) -> None:
@@ -846,6 +907,106 @@ def test_a_refusal_is_read_out_of_the_transcript_and_checked_against_the_count(
     assert read_back.disagreements(checked, read, counted(3), certified=True) == [
         "the server refused 3 calls and this transcript holds 2"
     ]
+
+
+def test_the_end_of_the_queue_and_a_service_that_stopped_answering_are_read_apart(
+    tmp_path: Path,
+) -> None:
+    """Three ways a served call comes back, told apart by what its result carries.
+
+    The record that ends the queue is a record and not a word: the tool an agent ends an attempt
+    with is called done too, and neither the arguments it writes there nor the acknowledgement it
+    gets back says anything about how much work is left. A refusal carries the code that names it
+    and is the protocol saying no to one call. An error carrying no code and no mark of the
+    harness's own is neither, and it is what a run that ended against a service that had stopped
+    answering is made of.
+    """
+    lines = [
+        init_line(),
+        _assistant([_call(read_back.PULL_TOOL, {}, call="p1")]),
+        _result(body(message_id(0, "a")), call="p1"),
+        _assistant([_call(f"{read_back.SERVED_PREFIX}done", {"attempt_id": "a" * 32}, "s1")]),
+        _result(body(message_id(0, "b")), call="s1"),
+        _assistant([_call(read_back.PULL_TOOL, {}, call="p2")]),
+        _refused("outstanding_response", call="p2"),
+        _assistant([_call(read_back.PULL_TOOL, {}, call="p3")]),
+        _faulted("MCP error -32603: the update limit was reached", call="p3"),
+        _assistant([_call(read_back.PULL_TOOL, {}, call="p4")]),
+        _result(body(message_id(1, "d")), call="p4"),
+        {"type": "result", "subtype": "success"},
+    ]
+    read = read_back.read_transcript(stream(tmp_path / "ended.jsonl", lines))
+    assert (read.pulls, read.tasks, read.done_count) == (4, 1, 1)
+    # The seal is a served call and its acknowledgement is a message, and neither is the queue
+    # ending: a run counted off the tool's name would call every finished attempt the end of one.
+    assert read.per_attempt == {"a" * 32: 1}
+    # A code the protocol names is a refusal, and an error without one is the whole of a fault.
+    assert read.refusals == ("outstanding_response",)
+    assert read.faults == ("MCP error -32603: the update limit was reached",)
+    # The service answered after the fault, and an answer is what resolves one.
+    assert read.unresolved_faults == 0
+
+
+def test_a_fault_stands_until_something_is_served_and_a_refusal_is_not_that(
+    tmp_path: Path,
+) -> None:
+    """What resolves a fault, asked of the two things that follow one.
+
+    A served answer resolves it: the service failed a call and went on answering, which is a run
+    that met a fault rather than one that ended against it. A refusal does not, because it is what
+    a service with a call it never finished says to the calls that come after: reading one as
+    recovery would lose every wedged run whose agent kept asking.
+    """
+    lines = [
+        init_line(),
+        _assistant([_call(read_back.PULL_TOOL, {}, call="p1")]),
+        _faulted(CAP_FAULT, call="p1"),
+        _assistant([_call(read_back.PULL_TOOL, {}, call="p2")]),
+        _refused("outstanding_response", call="p2"),
+        _assistant([_call(read_back.PULL_TOOL, {}, call="p3")]),
+        _result(body(message_id(0, "a")), call="p3"),
+        _assistant([_call(read_back.PULL_TOOL, {}, call="p4")]),
+        _faulted(CAP_FAULT, call="p4"),
+        _assistant([_call(read_back.PULL_TOOL, {}, call="p5")]),
+        _refused("outstanding_response", call="p5"),
+        {"type": "result", "subtype": "success"},
+    ]
+    read = read_back.read_transcript(stream(tmp_path / "wedged.jsonl", lines))
+    # Two faults, and the one the served task came after is the one that is answered for.
+    assert len(read.faults) == 2 and read.unresolved_faults == 1
+    assert read.refusals == ("outstanding_response", "outstanding_response")
+    assert read.done_count == 0
+
+
+def test_an_error_the_session_raised_itself_is_not_the_service_failing(tmp_path: Path) -> None:
+    """The agent's own bad call, in both shapes a result carries its text in.
+
+    An argument list that would not parse is refused by the harness before the call leaves the
+    session, so the service was never asked and nothing about it can be read out of the answer.
+    Counting one as a fault would file an agent that wrote a bad call as a run that ended against
+    its service. Nor is it recovery: a service holding a call it never finished is wedged whether
+    or not the agent wrote a bad one next.
+    """
+    lines = [
+        init_line(),
+        _assistant([_call(read_back.PULL_TOOL, {}, call="p1")]),
+        _faulted(CAP_FAULT, call="p1"),
+        _assistant([_call(f"{read_back.SERVED_PREFIX}api_fetch", {}, "f1")]),
+        _own_error(MALFORMED_CALL, call="f1"),
+        # The same error in the shape the harness writes results in when it writes items.
+        _assistant([_call(f"{read_back.SERVED_PREFIX}api_fetch", {}, "f2")]),
+        _result(MALFORMED_CALL, call="f2", is_error=True),
+        # And one from a tool this cell never served, which is not this read's to count at all.
+        _assistant([_call("Read", {"file_path": "/work/notes.md"}, "r1")]),
+        _own_error(MISSING_FILE, call="r1"),
+        {"type": "result", "subtype": "success"},
+    ]
+    read = read_back.read_transcript(stream(tmp_path / "own.jsonl", lines))
+    assert read.faults == (CAP_FAULT[: read_back.FAULT_TEXT],)
+    assert read.local_errors == (MALFORMED_CALL[: read_back.FAULT_TEXT],) * 2
+    assert read.refusals == ()
+    # The service failed a call and nothing has answered one since, whatever the agent did next.
+    assert read.unresolved_faults == 1
 
 
 def test_a_finished_run_with_no_refusal_count_is_a_run_that_disagrees(tmp_path: Path) -> None:
@@ -2008,6 +2169,7 @@ def no_docker(
     pulled: bool = True,
     answered: bool = True,
     served: bool = True,
+    told: bool = True,
 ) -> List[List[str]]:
     """Answer for the daemon, and return the list every command a launch runs lands in.
 
@@ -2017,7 +2179,10 @@ def no_docker(
     ``pulled`` and ``served`` are the two halves of whether the run happened: what the agent's
     transcript records asking for, and what the server's log records answering. ``answered`` is
     the difference between the two halves of the first: a pull the model wrote, and a pull that
-    came back with a task.
+    came back with a task. ``told`` is whether the session ends the way a finished cell ends, with
+    a pull the generation answered by saying there is no more work; a launch whose fixture leaves
+    that out is a session that stopped on its own, which is what a run is not allowed to be
+    recorded as finished on.
     """
     ran: List[List[str]] = []
     monkeypatch.setattr(pinned, "resolve_cli_version", lambda command=(): version)
@@ -2049,6 +2214,10 @@ def no_docker(
                 lines.append(_assistant([_call(read_back.PULL_TOOL, {})]))
             if pulled and answered:
                 lines.append(_result(body(message_id(0, "a"))))
+            if pulled and answered and told:
+                # The last pull of a finished cell, and what the generation answered it with.
+                lines.append(_assistant([_call(read_back.PULL_TOOL, {}, call="last")]))
+                lines.append(_result(body(message_id(1, "d")), call="last"))
             for line in lines:
                 kwargs["stdout"].write(json.dumps(line).encode() + b"\n")
         return subprocess.CompletedProcess(argv, 0)
@@ -2533,6 +2702,197 @@ def test_a_pull_that_came_back_with_nothing_is_not_a_run_that_served_anything(
     assert written["reason"] == ["no pull came back with a task, so this run served nothing"]
     read = read_back.read_transcript(run_dir / launcher.TRANSCRIPT)
     assert read.pulls == 1 and read.tasks == 0
+
+
+def test_a_run_told_its_queue_had_ended_is_the_one_the_record_calls_finished(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """What a finished cell holds that a session which merely ended does not.
+
+    The generation decides when there is no more work and says so in the record a pull comes back
+    with, so that record is what a complete run is complete on. The record carries how far the run
+    got beside it, because a reader comparing two cells wants the roster it was over and the
+    places it reached, and neither is an exit code.
+    """
+    no_docker(monkeypatch)
+    run_dir = tmp_path / "cell"
+    assert (
+        launcher.launch(
+            run_dir,
+            tasks="cell-one:1",
+            domain="public",
+            schedule="immediate",
+            model="claude-opus-5",
+            effort="xhigh",
+            cache=tmp_path / "cache",
+        )
+        == 0
+    )
+    written = json.loads((run_dir / launcher.RUN_FILE).read_text())
+    assert written["status"] == launcher.COMPLETE and written["reason"] == []
+    assert written["positions_reached"] == 1 and written["positions_unreached"] == 0
+
+
+def test_an_agent_that_stopped_with_positions_unreached_is_not_a_finished_run(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The failure a night's run was filed as a success on.
+
+    Nothing nudges the agent here, so its own stop is how the session ends, and the session ends
+    the same way whether the queue emptied or the agent decided it had done enough: the process
+    exits nought, the transcript stops, both containers come down clean and the gateway's log is
+    full of answered requests. Every signal the record used to read said finished. So the record
+    reads the one thing that separates them, and says how many places went unreached when it is
+    missing.
+    """
+    no_docker(monkeypatch, told=False)
+    run_dir = tmp_path / "cell"
+    assert (
+        launcher.launch(
+            run_dir,
+            tasks="cell-one:2",
+            domain="public",
+            schedule="immediate",
+            model="claude-opus-5",
+            effort="xhigh",
+            cache=tmp_path / "cache",
+        )
+        == 1
+    )
+    written = json.loads((run_dir / launcher.RUN_FILE).read_text())
+    # Everything that used to say the run succeeded still says it, which is the point.
+    assert written["exit_code"] == 0 and written["drift"] == {}
+    assert written["status"] == launcher.INCOMPLETE
+    assert written["reason"] == [
+        "the agent stopped with 1 of 2 positions unreached, and no done came back to say the "
+        "queue was empty"
+    ]
+    assert written["positions_reached"] == 1 and written["positions_unreached"] == 1
+
+
+def test_a_run_that_ended_against_a_service_that_stopped_answering_names_the_faults(
+    tmp_path: Path,
+) -> None:
+    """The other failure, which was filed as a success on the same signals.
+
+    The shape is the wedged run's own, which is not a run of faults at the end of a transcript.
+    The service reached its cap on updates and failed the call, every call after that overlapped
+    the one it never finished and was refused for it, and the session ends in those refusals with
+    the fault that caused them further up. A rule that asked what the transcript ended in would
+    read the last refusal and call this an agent that stopped asking.
+    """
+    wedged = [
+        init_line(),
+        _assistant([_call(read_back.PULL_TOOL, {}, call="p1")]),
+        _result(body(message_id(0, "a")), call="p1"),
+        _assistant([_call(f"{read_back.SERVED_PREFIX}api_fetch", {}, "f1")]),
+        _faulted(CAP_FAULT, call="f1"),
+        _assistant([_call(f"{read_back.SERVED_PREFIX}api_fetch", {}, "f2")]),
+        _refused("outstanding_response", call="f2"),
+        _assistant([_call(f"{read_back.SERVED_PREFIX}api_fetch", {}, "f3")]),
+        _faulted(CAP_FAULT, call="f3"),
+        _assistant([_call(f"{read_back.SERVED_PREFIX}info", {}, "i1")]),
+        _refused("outstanding_response", call="i1"),
+        _assistant([_call("Read", {"file_path": "/work/notes.md"}, "r1")]),
+        _own_error(MISSING_FILE, call="r1"),
+        _assistant([_call(read_back.PULL_TOOL, {}, call="p2")]),
+        _refused("outstanding_response", call="p2"),
+        {"type": "result", "subtype": "success"},
+    ]
+    read = read_back.read_transcript(stream(tmp_path / "wedged.jsonl", wedged))
+    # The transcript ends in a refusal and the run still stopped against the service.
+    assert read.unresolved_faults == 2 and len(read.refusals) == 3
+    assert launcher.unfinished(read, positions=200) == [
+        "this run stopped against the service rather than at the end of its queue, with 2 service "
+        f"faults carrying no protocol code and nothing served after them: "
+        f"{CAP_FAULT[: read_back.FAULT_TEXT]}"
+    ]
+    # The reason carries what the service said, so the cap that ended the run is in the record.
+    assert "the total number of distinct updates" in launcher.unfinished(read, positions=200)[0]
+
+
+def test_a_done_the_transcript_lost_is_not_read_as_a_stop_the_agent_chose(tmp_path: Path) -> None:
+    """A message that did not arrive and a decision the agent made are different endings.
+
+    The generation commits every message it presents, so a Done in that record and not in this one
+    is a run whose agent may never have been told there was no more work. Naming it as the agent
+    stopping would put a choice on a session that was not given the chance to make one.
+    """
+    read = read_back.read_transcript(transcript(tmp_path / "lost.jsonl"))
+    assert read.done_count == 0
+    assert launcher.unfinished(read, positions=2, presented_done=True) == [
+        "the generation presented a done this transcript does not hold, so nothing says the "
+        "agent was told its queue had ended"
+    ]
+    # Nobody has read the generation's own record at the moment a launch finishes, so the same
+    # transcript reads there as what it looks like on its own: an agent that stopped asking.
+    assert launcher.unfinished(read, positions=2) == [
+        "the agent stopped with 1 of 2 positions unreached, and no done came back to say the "
+        "queue was empty"
+    ]
+
+
+def test_one_refusal_in_a_run_that_reached_the_end_of_its_queue_is_not_a_failure(
+    tmp_path: Path,
+) -> None:
+    """A refusal is the protocol saying no to one call, and a healthy run goes on from it.
+
+    An outstanding call answered while another was in flight is the ordinary case, and a rule that
+    read any code as a failure would file a whole cell as broken over one of them.
+    """
+    healthy = [
+        init_line(),
+        _assistant([_call(read_back.PULL_TOOL, {}, call="p1")]),
+        _result(body(message_id(0, "a")), call="p1"),
+        _assistant([_call(read_back.PULL_TOOL, {}, call="p2")]),
+        _refused("outstanding_response", call="p2"),
+        _assistant([_call(read_back.PULL_TOOL, {}, call="p3")]),
+        _result(body(message_id(1, "d")), call="p3"),
+        {"type": "result", "subtype": "success"},
+    ]
+    read = read_back.read_transcript(stream(tmp_path / "healthy.jsonl", healthy))
+    assert read.refusals == ("outstanding_response",) and read.faults == ()
+    assert launcher.unfinished(read, positions=1) == []
+
+
+def test_an_agent_that_stopped_because_it_decided_to_is_recorded_as_having_decided_to(
+    tmp_path: Path,
+) -> None:
+    """The night's run in the shape it had: work done, two mistakes of its own, and a stop.
+
+    The session says out loud that the queue is not empty. Nothing the service did ended it: the
+    two errors in it are the agent's, one call it wrote badly enough that the harness would not
+    make it and one file it asked for that was not there, and it went on working after both. So
+    the count of what it never reached is the only honest thing to record about how it ended.
+    """
+    stopped = [init_line()]
+    for position in range(2):
+        stopped.append(_assistant([_call(read_back.PULL_TOOL, {}, call=f"p{position}")]))
+        stopped.append(_result(body(message_id(position, "a")), call=f"p{position}"))
+    stopped += [
+        _assistant([_call(f"{read_back.SERVED_PREFIX}api_fetch", {}, "f1")]),
+        _own_error(MALFORMED_CALL, call="f1"),
+        _assistant([_call("Read", {"file_path": "/work/notes.md"}, "r1")]),
+        _own_error(MISSING_FILE, call="r1"),
+        _assistant([_call(read_back.PULL_TOOL, {}, call="p2")]),
+        _result(body(message_id(2, "a")), call="p2"),
+        {
+            "type": "assistant",
+            "message": {
+                "content": [{"type": "text", "text": "the queue is not empty, I stopped here"}]
+            },
+        },
+        {"type": "result", "subtype": "success"},
+    ]
+    read = read_back.read_transcript(stream(tmp_path / "stopped.jsonl", stopped))
+    assert (read.tasks, read.done_count, read.unresolved_faults) == (3, 0, 0)
+    # The one the harness refused is the agent's own and is kept as such; the one from a tool this
+    # cell never served is not this read's to count at all.
+    assert read.faults == () and len(read.local_errors) == 1
+    assert launcher.unfinished(read, positions=200) == [
+        "the agent stopped with 197 of 200 positions unreached, and no done came back to say the "
+        "queue was empty"
+    ]
 
 
 def test_a_pull_answered_with_an_error_or_a_record_that_is_not_a_task_served_nothing(
