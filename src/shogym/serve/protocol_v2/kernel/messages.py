@@ -22,6 +22,9 @@ committed to.
 
 from __future__ import annotations
 
+import base64
+import json
+import lzma
 from dataclasses import dataclass, field
 from hashlib import sha256
 from typing import Any, Dict, List, Optional, Sequence
@@ -33,12 +36,16 @@ from shogym.serve.protocol_v2 import (
     SCHEDULE_VERSION,
     Assignment,
     BlobRef,
+    PresentationAck,
     ReleasePlan,
     TerminalMetadata,
     assignment_id_for,
     canonical_json,
     length_prefixed,
 )
+from temporalio.api.common.v1 import Payload
+
+from shogym.serve.protocol_v2.errors import WireFormatError
 from shogym.serve.protocol_v2.policy import (
     LEGACY,
     GradeIdentity,
@@ -106,6 +113,314 @@ class TerminalTool:
     argument_names: List[str]
 
 
+# The version of the carried projection below. A generation continued under a carrier this code
+# does not know is refused rather than served from a half-understood record, so the number moves
+# whenever a field changes meaning.
+CARRIER_SCHEMA_VERSION = 6
+
+
+@dataclass(frozen=True)
+class CarriedAttempt:
+    """One attempt's mutable state, as the next execution has to find it.
+
+    The task itself is not here. It comes from the roster the start already carries, so what
+    crosses is what the generation did to the attempt rather than what the attempt was.
+
+    Three fields the seal writes are missing on purpose: the canonical submission text, the
+    environment's recovery token, and the finalizer key. They are written when a seal is
+    prepared and never read again, and a prepared seal is one of the things a boundary refuses
+    to cross, so nothing on the far side could ask for them.
+
+    ``deadline_expired`` is missing for the other reason: an expiry that can be applied is
+    applied before the boundary is considered, so at a legal boundary there is none to carry.
+    """
+
+    attempt_id: str
+    state: str
+    task_start_checkpoint: Optional[str] = None
+    environment_calls: int = 0
+    terminal_request_id: Optional[str] = None
+    terminal_identity: Optional[str] = None
+    terminal_tool: Optional[str] = None
+    terminal_source: Optional[str] = None
+    seal_id: Optional[str] = None
+    submission_digest: Optional[str] = None
+    score: Optional[float] = None
+    decode_state: Optional[str] = None
+    graded_evidence: Optional[str] = None
+    seal_ordinal: Optional[int] = None
+    final_failure: Optional[str] = None
+    deadline_at: Optional[int] = None
+    failure_activity: Optional[str] = None
+    failure_activity_id: Optional[str] = None
+    failure_kind: Optional[str] = None
+    failure_message: Optional[str] = None
+    failure_retry_state: Optional[str] = None
+
+
+@dataclass(frozen=True)
+class CarriedObligation:
+    """One obligation's state, and its candidate while one could still be offered.
+
+    Whether the candidate was ever built is kept apart from the candidate, because the count of
+    materializations is inside the projection hash and the body is not. An obligation that has
+    been presented, or that ended without being rendered, keeps the fact and drops the bytes.
+    """
+
+    attempt_id: str
+    state: str
+    materialized: bool = False
+    candidate: Optional[PayloadCandidate] = None
+
+
+@dataclass(frozen=True)
+class CarriedBinding:
+    """One logical request, its canonical identity, and the message bound to it."""
+
+    request_id: str
+    identity: str
+    message: OfferedMessage
+
+
+@dataclass(frozen=True)
+class CarriedFinalization:
+    """One logical finalization, its identity, and the receipt it was answered with."""
+
+    request_id: str
+    identity: str
+    receipt: AttemptFinalized
+
+
+@dataclass(frozen=True)
+class CarriedAttestation:
+    """One attestation, its identity, and the acknowledgement it was answered with."""
+
+    attestation_id: str
+    identity: str
+    ack: PresentationAck
+
+
+# How a generation's carried projection is written into one string, and the version that says
+# which way. Written out as it stands it runs to several megabytes on a long roster, and a
+# continuation is one payload. So three things happen to it, in order, and none of them loses
+# anything.
+#
+# First the structure is shared. The projection repeats itself enormously: a confirmation records
+# a whole state reading and two hundred of them differ in a handful of entries, a world call
+# records a lease whose attempt and cursor are two of a few hundred distinct strings, and one
+# offered message reached under several identifiers is one value. Sharing writes each distinct
+# value once and refers to it by number.
+#
+# Then it is written as canonical JSON, so two runs of one generation write the same bytes.
+# Then it is packed and text-encoded, because a payload is JSON.
+#
+# The packer is LZMA over a window that covers the whole value, and the window is the reason. What
+# is left after sharing is a few megabytes of rows that rhyme with rows written hundreds of
+# thousands of bytes earlier: the same handler names, the same shapes, the same hexadecimal
+# alphabet. Deflate looks back thirty two kilobytes and cannot see any of it; this looks back over
+# all of it, and on the supported roster's largest carrier it writes half the bytes deflate does.
+# The settings are named here rather than taken from a default, because they are part of what the
+# encoding version means: raw LZMA2, the third preset, and a dictionary of eight mebibytes, which
+# is twice the largest value the supported profile produces and keeps the window covering the
+# whole of it as a roster grows. The third preset is chosen over the sixth for what it costs: the
+# same margin to within half a percent, a tenth of the time, and a bounded encoder that a Worker
+# crossing several boundaries at once can afford.
+#
+# What is shared is written once and read back as its own object. Two occurrences of one value do
+# not become one object on the way back: a historical state reading and the live table it was a
+# reading of must not be able to change each other.
+CARRIER_ENCODING = "shared.canonical-json.lzma.base64.v1"
+_CARRIER_FILTERS = [{"id": lzma.FILTER_LZMA2, "preset": 3, "dict_size": 8 << 20}]
+
+
+def _shared(value: Any) -> List[Any]:
+    """Write one JSON value as a list of distinct nodes, each referring to the ones inside it.
+
+    A node is a dictionary, a list, or a scalar. Scalars are keyed by their type together with
+    their exact written form rather than by equality, because equality merges values a reader
+    would have to be able to tell apart: a boolean equals an integer, and a negative zero equals a
+    positive one, and neither pair may become one node.
+    """
+    nodes: List[Any] = []
+    seen: Dict[Any, int] = {}
+
+    def walk(node: Any) -> int:
+        if isinstance(node, dict):
+            shape: Any = ("d", tuple((walk(key), walk(item)) for key, item in sorted(node.items())))
+        elif isinstance(node, list):
+            shape = ("l", tuple(walk(item) for item in node))
+        else:
+            shape = ("s", type(node).__name__, repr(node))
+        if shape not in seen:
+            seen[shape] = len(nodes)
+            nodes.append(
+                [shape[0], list(shape[1])] if shape[0] != "s" else ["s", type(node).__name__, node]
+            )
+        return seen[shape]
+
+    root = walk(value)
+    return [root, nodes]
+
+
+def _unshared(written: List[Any]) -> Any:
+    """Read back what :func:`_shared` wrote, giving every occurrence its own containers.
+
+    Sharing is how the bytes are written, not how the value is held. A dictionary that appears in
+    two places is built twice here, so that a historical reading and a live table restored from
+    one carrier cannot change one another by being the same object. Scalars are immutable and are
+    handed back as they are.
+    """
+    root, nodes = written
+
+    def build(index: int) -> Any:
+        tag = nodes[index][0]
+        if tag == "s":
+            return nodes[index][2]
+        if tag == "d":
+            return {build(key): build(item) for key, item in nodes[index][1]}
+        return [build(item) for item in nodes[index][1]]
+
+    return build(root)
+
+
+def pack_carrier(projection: Any, converter: Any) -> "StreamCarry":
+    """Write one projection as the string a continuation carries."""
+    value = json.loads(converter.to_payloads([projection])[0].data.decode("utf-8"))
+    raw = json.dumps(
+        _shared(value), sort_keys=True, separators=(",", ":"), ensure_ascii=False
+    ).encode("utf-8")
+    return StreamCarry(
+        carrier_schema_version=CARRIER_SCHEMA_VERSION,
+        encoding=CARRIER_ENCODING,
+        data=base64.b64encode(
+            lzma.compress(raw, format=lzma.FORMAT_RAW, filters=_CARRIER_FILTERS)
+        ).decode("ascii"),
+    )
+
+
+def unpack_carrier(carry: "StreamCarry", converter: Any) -> "CarriedProjection":
+    """Read back what :func:`pack_carrier` wrote, or refuse a writing this code cannot read."""
+    if carry.encoding != CARRIER_ENCODING:
+        raise WireFormatError(
+            f"this generation's projection is written as {carry.encoding!r} and this code reads "
+            f"{CARRIER_ENCODING!r}"
+        )
+    written = json.loads(
+        lzma.decompress(
+            base64.b64decode(carry.data.encode("ascii")),
+            format=lzma.FORMAT_RAW,
+            filters=_CARRIER_FILTERS,
+        )
+    )
+    payload = Payload()
+    payload.metadata["encoding"] = b"json/plain"
+    payload.data = json.dumps(
+        _unshared(written), sort_keys=True, separators=(",", ":"), ensure_ascii=False
+    ).encode("utf-8")
+    return converter.from_payload(payload, CarriedProjection)
+
+
+@dataclass(frozen=True)
+class AnsweredUpdate:
+    """What one exact Update was answered with, read back through a Query.
+
+    A transport that cannot reach a generation's handler still has to be able to find out what an
+    Update it already sent was answered with. That happens where the generation has decided to
+    continue as new and is holding traffic back, and where the generation has finished and its
+    last execution accepts nothing further. Neither is a place to send the request again, and
+    both are places where the answer already exists.
+
+    So this is the answer as a value a caller can decode, with the row it came from already
+    resolved. ``found`` is false for an identifier this generation never answered, which is the
+    ordinary case for a request that never arrived and is not an error.
+    """
+
+    found: bool
+    kind: str = ""
+    handler: str = ""
+    code: str = ""
+    type_name: str = ""
+    message: str = ""
+    value: Optional[Dict[str, Any]] = None
+    protocol_version: int = PROTOCOL_VERSION
+
+
+@dataclass(frozen=True)
+class StreamCarry:
+    """The projection a continuation carries, written as one string.
+
+    What is inside it is :class:`CarriedProjection`. What is here is how it is written, so that
+    the writing can change under a version without every reader of the projection changing with
+    it, and so that a writing this code cannot read is refused rather than half understood.
+    """
+
+    carrier_schema_version: int
+    encoding: str
+    data: str
+    protocol_version: int = PROTOCOL_VERSION
+
+
+@dataclass(frozen=True)
+class CarriedProjection:
+    """The whole logical projection of a generation, as one execution hands it to the next.
+
+    The durable service bounds one execution, and a roster longer than that bound needs more
+    than one. This is what makes the second execution the same generation as the first: every
+    fact a caller, a harness or a reader can observe is either in here or derived from the start
+    that rides beside it. Nothing here is configuration, and nothing here is hashed into the
+    generation's identity.
+
+    Three invariants hold it together. It is versioned, and the version is the holder's rather
+    than a second one here: one version says both how the string is written and what shape is
+    inside it, so there is no way to read a projection whose version was never checked. It
+    repeats the static configuration identity, so a carrier composed against another generation
+    is refused before it is believed. And every unordered set and map inside it is written in
+    canonical sorted form, because a set serialized in hash order would make the same boundary
+    produce different bytes on a replay. The lists that mean an order, the presentations above
+    all, keep the order they mean.
+
+    What is not here is what a legal boundary forbids: there is no pending message, no held
+    grant, no operation ticket, no prepared seal and no applicable expiry to carry, and the
+    generation is open, not draining, and has not presented Done.
+    """
+
+    configuration_hash: str
+    ownership_epoch: int
+    fencing_token_hash: Optional[str]
+    ownership_claims: int
+    consumer_id: Optional[str]
+    claim_epoch: int
+    cursor: str
+    queue_closed: bool
+    hidden_ordinal: int
+    seal_ordinal: int
+    wait_count: int
+    wait_reasons: Dict[str, int]
+    offer_count: int
+    eligibility_count: int
+    handed_out_attempt_ids: List[str]
+    activity_ordinal: int
+    verification_batches: int
+    attempts: List[CarriedAttempt]
+    obligations: List[CarriedObligation]
+    presented: List[PresentedMessage]
+    committed_blobs: List[str]
+    pull_requests: List[CarriedBinding]
+    info_requests: List[CarriedBinding]
+    terminal_requests: List[CarriedBinding]
+    finalize_requests: List[CarriedFinalization]
+    attestations: List[CarriedAttestation]
+    # Every accepted Update this generation has completed, keyed by the exact identifier it was
+    # answered under. It is packed rather than written out, because the same information as
+    # literal rows runs past the size one continuation may be.
+    # Every accepted Update this generation has completed, by the exact identifier it was
+    # answered under, as rows rather than as a packed string: the whole projection is packed
+    # together, so packing this again inside it would only hide it from the sharing.
+    journal: List[List[Any]] = field(default_factory=list)
+    turnovers: int = 0
+    protocol_version: int = PROTOCOL_VERSION
+
+
 @dataclass(frozen=True)
 class StreamStart:
     """Everything a generation is, fixed before it serves anything.
@@ -163,6 +478,12 @@ class StreamStart:
     run, and a generation that makes no such decision has no such tool: nothing about it is
     served, nothing about it is hashed, and the counts stay where they have always been, which is
     with the harness.
+
+    ``carry`` is the one field a running generation puts here rather than a caller. It is how one
+    execution hands the whole logical projection to the next, and it is legal only there: a fresh
+    start carrying one is refused, and a continued execution given none is refused too. It is
+    outside :func:`configuration_hash` by construction, because what the generation is has not
+    changed and every resume is held to that value.
     """
 
     configuration_hash: str
@@ -191,6 +512,7 @@ class StreamStart:
     info: bool = False
     schedule_version: str = SCHEDULE_VERSION
     protocol_version: int = PROTOCOL_VERSION
+    carry: Optional[StreamCarry] = None
 
 
 def configuration_hash(start: StreamStart) -> str:
@@ -719,6 +1041,47 @@ class StreamState:
     profile: str = LEGACY
     experiment_id: Optional[str] = None
     protocol_version: int = PROTOCOL_VERSION
+    # Where the generation is in the chain of executions it has run in, whether it is on its way
+    # to another one, and the size that stopped it starting another. All three are operational:
+    # none is inside the projection a presentation attests against, and none says anything about
+    # what the generation serves.
+    #
+    # ``turnover_requested`` is what a transport waits on. A generation that has decided to
+    # continue as new rejects every arriving Update that cannot bring the boundary about, and a
+    # caller so rejected has to be able to tell a generation working towards a boundary from one
+    # that has stopped. Reading this is a Query, which costs nothing against the cap, so a call
+    # held up by a boundary can ask as often as it likes.
+    #
+    # ``turnover_refused_bytes`` is the honest end of an unsupported profile: the carrier would
+    # not fit under the ceiling, so the generation kept serving in the execution it was already
+    # in, and this is the number a launcher reports rather than guessing why the run stopped.
+    turnovers: int = 0
+    turnover_requested: bool = False
+    # Why this generation gave up on a boundary, where it did. A carrier that would not fit is
+    # one way; a boundary whose clearing work spent the reserve before it succeeded is the other.
+    # Both leave the generation serving out the execution it is in, so both can end at the
+    # service cap, and this is what a launcher reports that by rather than guessing.
+    turnover_refused: Optional[str] = None
+    turnover_refused_bytes: Optional[int] = None
+    # The store reads this generation has in flight, and how many it has finished. An ownership
+    # claim reads the store before it may swap the epoch, and that read is an Activity with its
+    # own timeout and its own retries, so a claim can hold a boundary open for minutes while
+    # moving nothing else a caller could see. These say that is what is happening.
+    #
+    # Neither is inside the projection a presentation attests to. They differ from each other in
+    # what a boundary does to them. The count of finished reads is a count of what the generation
+    # has done, like the offers and the eligibilities beside it, so it crosses: a generation that
+    # has read the store twice has read it twice whichever execution is answering. The reads in
+    # flight cannot cross, because a legal boundary has no handler running and therefore no read
+    # in flight, so it is zero on both sides of one.
+    verifying: int = 0
+    verification_batches: int = 0
+    # How many accepted handlers are running. A boundary waits for every one of them, and this is
+    # how a caller held off for that boundary can see that it is waiting for something. The
+    # projection cannot show it: an owner replaced while its filing was still grading leaves work
+    # that no attempt state, pending message or grant names any more. Operational, like the four
+    # above, and in no hash.
+    unfinished_handlers: int = 0
 
 
 @dataclass(frozen=True)
