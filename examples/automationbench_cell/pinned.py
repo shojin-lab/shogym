@@ -201,6 +201,13 @@ CLI_SKILLS: Tuple[str, ...] = (
 
 #: How a harness names a tool it was given by an MCP server, which is what tells the two halves of
 #: the reported surface apart.
+#:
+#: What follows this mark is the served name, so the served name is part of the recorded surface
+#: rather than a setting beside it: a surface reported under one word and compared with a list
+#: built under another reports every name on both sides, which is what a changed word is. The
+#: model reads that word on every call, and a run that changed it changed what the model read.
+#: A launch of this cell compares its own reported surface with its own list and finds no such
+#: difference; the comparison that finds it is the one against the recorded run's own line.
 SERVED_MARK = "mcp__"
 
 #: What a redacted environment says in place of a credential. The run's record has to say which

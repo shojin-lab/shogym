@@ -34,8 +34,9 @@ import re
 from dataclasses import dataclass
 from hashlib import sha256
 from pathlib import Path
-from typing import Dict, FrozenSet, List, Optional, Tuple
+from typing import Any, Dict, FrozenSet, List, Mapping, Optional, Tuple
 
+from examples.automationbench_cell.pinned import SERVED_MARK
 from examples.automationbench_cell.serve import REFUSAL_FILE, ROSTER_FILE, SERVED_PREFIX
 from shogym.serve.protocol_v2.errors import WireFormatError
 from shogym.serve.protocol_v2.kernel.messages import AttemptRecord, PresentedMessage
@@ -46,6 +47,10 @@ from shogym.serve.protocol_v2.records import Done, Task
 #: says how much work is left names no attempt either, and asking is neither a pull nor work on a
 #: task, so it is counted as neither; the answer it comes back with is a presented message like
 #: any other and is reconciled as one.
+#:
+#: This is the name a launch under today's served name writes. A read of an older run reads that
+#: run's own name out of its record, because the name is the front of every call in its
+#: transcript and a run served under another word wrote another word there.
 PULL_TOOL = f"{SERVED_PREFIX}pull"
 
 #: How a message names itself inside a result the agent was handed. Every record this protocol
@@ -164,7 +169,67 @@ def read_roster(run_dir: Path) -> Dict[str, object]:
     return json.loads((Path(run_dir) / ROSTER_FILE).read_text(encoding="utf-8"))
 
 
-def read_transcript(transcript: Path) -> Transcript:
+#: What closes the server's key inside a served name. The mark opens the key and this closes it,
+#: so a served name is the mark, the word the server was known by, this, and the tool's own name.
+_KEY_END = "__"
+
+
+def _under(name: str) -> str:
+    """Return the front tools served under ``name`` reach a model as."""
+    return f"{SERVED_MARK}{name}{_KEY_END}"
+
+
+def _mark_of(name: str) -> Optional[str]:
+    """Return the served front one tool name carries, or nothing where it carries none."""
+    if not name.startswith(SERVED_MARK):
+        return None
+    rest = name[len(SERVED_MARK) :]
+    at = rest.find(_KEY_END)
+    return None if at <= 0 else _under(rest[:at])
+
+
+def served_prefix(
+    record: Optional[Mapping[str, Any]] = None, init: Optional[Mapping[str, Any]] = None
+) -> str:
+    """Return the front the tools of one run reached its model under.
+
+    A read of a transcript tells a call to the cell's own server from a call to the agent's own
+    tools by that front, so the front has to be the one that run served rather than the one this
+    checkout serves. The two differ as soon as the served name changes, and a read that assumed
+    today's would report an archived run as having pulled nothing and worked nothing, which is a
+    false answer rather than a missing one.
+
+    The run's own record answers first, because a launch writes down what it served. Records
+    written before there was a field for it are read on the same terms: ``served_tools`` carries
+    the front in every name, the field a launch once wrote the key under is read after that, and
+    a run whose record says none of it has the harness's own first line, where the surface that
+    launch reported is listed. A run that answers nowhere is read under this checkout's own name,
+    which is the only remaining guess and the right one for a launch that has just finished.
+    """
+    if isinstance(record, Mapping):
+        name = record.get("served_name")
+        if isinstance(name, str) and name:
+            return _under(name)
+        listed = record.get("served_tools")
+        for item in listed if isinstance(listed, list) else []:
+            found = _mark_of(item) if isinstance(item, str) else None
+            if found is not None:
+                return found
+        # The key a launch wrote before the record named the served surface. It is the same word,
+        # under a name that was ambiguous with the server's container, which is why it went.
+        server = record.get("server")
+        if isinstance(server, str) and server:
+            return _under(server)
+    if isinstance(init, Mapping):
+        listed = init.get("tools")
+        for item in listed if isinstance(listed, list) else []:
+            found = _mark_of(item) if isinstance(item, str) else None
+            if found is not None:
+                return found
+    return SERVED_PREFIX
+
+
+def read_transcript(transcript: Path, *, prefix: str = SERVED_PREFIX) -> Transcript:
     """Return the calls ``transcript`` records and the message identifiers it received.
 
     The transcript is Claude Code's own stream, one JSON object to a line, and a line this does
@@ -217,7 +282,13 @@ def read_transcript(transcript: Path) -> Transcript:
     It is read a line at a time rather than all at once. A session that worked a whole roster with
     partial messages on writes a transcript far larger than the run it describes, and every launch
     reads this at the end to find out whether the agent ever asked for work.
+
+    ``prefix`` is the front the tools of the run being read were served under, which is what tells
+    the cell's own calls from the agent's own. It defaults to this checkout's, which is right for
+    a launch reading the transcript it has just written and wrong for an archived run served under
+    another word: :func:`served_prefix` reads that word out of the run's own record.
     """
+    pull_tool = f"{prefix}pull"
     per_attempt: Dict[str, int] = {}
     pulls = 0
     tasks = 0
@@ -269,7 +340,7 @@ def read_transcript(transcript: Path) -> Transcript:
                         asked.discard(call)
                         if any(_is_task(text) for text in texts):
                             tasks += 1
-                    if served[call] == PULL_TOOL:
+                    if served[call] == pull_tool:
                         done_count += sum(1 for text in texts if _is_done(text))
                     handed.extend(
                         Handed(
@@ -282,13 +353,13 @@ def read_transcript(transcript: Path) -> Transcript:
                 if event.get("type") != "assistant" or block.get("type") != "tool_use":
                     continue
                 name = str(block.get("name", ""))
-                if not name.startswith(SERVED_PREFIX):
+                if not name.startswith(prefix):
                     unserved += 1
                     continue
                 call = block.get("id")
                 if isinstance(call, str):
                     served[call] = name
-                if name == PULL_TOOL:
+                if name == pull_tool:
                     pulls += 1
                     if isinstance(call, str):
                         asked.add(call)
@@ -655,5 +726,6 @@ __all__ = [
     "read_transcript",
     "reconcile",
     "rows",
+    "served_prefix",
     "unconfirmed",
 ]

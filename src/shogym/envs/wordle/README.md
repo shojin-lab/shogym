@@ -82,7 +82,7 @@ manifest once at construction.
 - `horizon` — `6`.
 
 A harness reads this once to configure itself. When served, the same contract is also
-exposed as the `describe` tool and the `shogym://task` MCP resource.
+exposed as the `describe` tool and the `stream://task` MCP resource.
 
 ### Tools (served over MCP)
 

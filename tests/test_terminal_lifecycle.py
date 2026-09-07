@@ -39,7 +39,7 @@ from shogym.serve import (
 )
 from shogym.serve import lifecycle
 from shogym.serve.lifecycle import FinalizeRequest, args_digest, fail_closed_verdict
-from shogym.serve.server import build_server
+from shogym.serve.server import TASK_RESOURCE, build_server
 from shogym.shared.terminate_mcp import TERMINATE_TOOL_NAME
 from shogym.task import TaskSpec, ToolManifest
 from shogym.trace import load_traces
@@ -254,7 +254,7 @@ async def test_ingress_gate_tombstones_every_post_seal_call_but_allows_readonly(
                 "describe",
                 "terminate",
             }
-            res = await client.read_resource("shogym://task")
+            res = await client.read_resource(TASK_RESOURCE)
             assert json.loads(res[0].text)["env_name"] == "_fixture_score"
     finally:
         await ep.close()
