@@ -33,6 +33,7 @@ from pathlib import Path, PurePosixPath
 from typing import Dict, List, Mapping, Optional, Sequence, Tuple
 
 from examples.automationbench_cell import pinned
+from shogym.serve.server import SERVED_NAME
 
 HERE = Path(__file__).resolve().parent
 REPO = HERE.parent.parent
@@ -214,8 +215,14 @@ def names(token: str) -> Tuple[str, str, str]:
 
     A network per run is what keeps two cells on one host out of each other's endpoint: a server
     is reachable by name, and a name only resolves on the network it was started on.
+
+    The server's name is the one of the three the agent can read. It is the host in the endpoint
+    URL, the URL is in the config file mounted into the agent's container, and the agent may read
+    that file, so the server is named after what it serves rather than after who is serving it.
+    The network's name and the agent container's are the operator's: nothing the agent can read
+    holds either, and the token is the same in all three, so a run is still one thing on the host.
     """
-    return f"shogym-cell-{token}", f"shogym-cell-{token}-server", f"shogym-cell-{token}-agent"
+    return f"cell-{token}", f"{SERVED_NAME}-{token}", f"cell-{token}-agent"
 
 
 # --- docker -----------------------------------------------------------------------------------

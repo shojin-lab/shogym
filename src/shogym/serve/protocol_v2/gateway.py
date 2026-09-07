@@ -158,7 +158,7 @@ from shogym.serve.protocol_v2.rundir import (
     stage_run_directory,
     staged_generation,
 )
-from shogym.serve.server import build_tool
+from shogym.serve.server import SERVED_NAME, build_tool
 from shogym.task import TaskSpec, ToolManifest
 
 PULL_TOOL = "pull"
@@ -2781,6 +2781,11 @@ def build_gateway_server(gateway: StreamGateway, *, name: Optional[str] = None) 
     description is taken from the composition the gateway holds rather than from the constant.
     Every gateway holds one, and what it holds was checked against the episode it serves over
     before it was built, so the surface served here is the surface that generation hashed.
+
+    ``name`` is what this server calls itself, and a launcher that passes nothing gets
+    :data:`~shogym.serve.server.SERVED_NAME`. It is not derived from the episode: a harness
+    puts the server's key in front of every tool name it hands the model, so a name taken from
+    the environment would tell the model which environment it is in on every call it reads.
     """
     spec = gateway.spec
     served = wrapped_manifests(spec, terminal_manifest(spec))
@@ -2802,7 +2807,7 @@ def build_gateway_server(gateway: StreamGateway, *, name: Optional[str] = None) 
             return ToolResult(content=await gateway.terminal(arguments))
         return await gateway.environment(tool_name, arguments)
 
-    server: FastMCP = FastMCP(name=name or f"shogym:{spec.env_name}")
+    server: FastMCP = FastMCP(name=name or SERVED_NAME)
     server.add_tool(
         build_tool(
             ToolManifest(

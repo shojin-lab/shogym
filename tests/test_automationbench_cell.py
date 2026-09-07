@@ -71,6 +71,7 @@ from shogym.serve.protocol_v2.policy import (  # noqa: E402
     ORDINARY,
     WITHHOLD,
 )
+from shogym.serve.server import SERVED_NAME  # noqa: E402
 from shogym.task import TaskSpec, ToolManifest  # noqa: E402
 
 from tests._fixtures.upstream_gate import gate  # noqa: E402
@@ -614,6 +615,92 @@ def test_calls_are_counted_against_the_attempt_they_named(tmp_path: Path) -> Non
     # The agent's own affordances are counted too: whether it worked through the tools the cell
     # gave it is a fact a rerun wants beside the score.
     assert read.unserved == 1
+
+
+#: One archived run's served front, written out rather than built from this checkout's constants.
+#: What the fixture below is for is a run whose word is not the word this cell serves under today,
+#: and a fixture assembled from today's constants would move with them and prove nothing.
+ARCHIVED_PREFIX = "mcp__shogym__"
+
+
+def archived(path: Path) -> Path:
+    """An older run's stream, whose every served call is named under the older word."""
+    return stream(
+        path,
+        [
+            {"type": "system", "subtype": "init", "session_id": "s"},
+            _assistant([_call(f"{ARCHIVED_PREFIX}pull", {}, "p")]),
+            _result(body(DELIVERED[0]), call="p"),
+            _assistant(
+                [_call(f"{ARCHIVED_PREFIX}api_fetch", {"attempt_id": "a" * 32}, "f")]
+            ),
+            _assistant([_call("Bash", {"command": "ls"}, "b")]),
+            {"type": "result", "subtype": "success"},
+        ],
+    )
+
+
+def test_an_older_runs_transcript_is_read_under_the_word_that_run_served(tmp_path: Path) -> None:
+    """The front of a served name belongs to the run being read, not to the checkout reading it.
+
+    The served name changed, so an archived transcript names every served call under a word this
+    cell no longer uses. Read under today's word none of those calls is a served call: the pull
+    is not a pull, the work is not work, the run reads back as one that asked for nothing and did
+    nothing, and its own tool calls are counted as the agent's. So the word comes from the run's
+    own record, in whichever of the three shapes that record holds it.
+    """
+    path = archived(tmp_path / "archived.jsonl")
+    for written in (
+        {"served_name": "shogym"},
+        {"served_tools": [f"{ARCHIVED_PREFIX}pull", f"{ARCHIVED_PREFIX}done"]},
+        {"server": "shogym"},
+    ):
+        prefix = read_back.served_prefix(written)
+        assert prefix == ARCHIVED_PREFIX
+        read = read_back.read_transcript(path, prefix=prefix)
+        assert (read.pulls, read.tasks, read.unserved) == (1, 1, 1)
+        assert read.per_attempt == {"a" * 32: 1}
+    # A run whose record says none of it has the harness's own first line to be read from, and
+    # the recorded run's own line is one, built-ins and all.
+    assert read_back.served_prefix(None, {"tools": ["Bash", f"{ARCHIVED_PREFIX}pull"]}) == (
+        ARCHIVED_PREFIX
+    )
+    assert read_back.served_prefix(None, RECORDED["init"]) == ARCHIVED_PREFIX
+    # And under this checkout's word the same transcript reads as a run that served nothing,
+    # which is the false answer the record is there to prevent.
+    today = read_back.read_transcript(path)
+    assert (today.pulls, today.tasks, today.unserved) == (0, 0, 3)
+
+
+def test_a_run_that_says_nothing_about_its_served_name_is_read_under_this_ones(
+    tmp_path: Path,
+) -> None:
+    # The only remaining guess, and the right one for the launch that has just written the file.
+    assert read_back.served_prefix(None, None) == read_back.SERVED_PREFIX == cell.SERVED_PREFIX
+    assert read_back.served_prefix({}, {}) == cell.SERVED_PREFIX
+    assert read_back.served_prefix({"served_name": ""}, {"tools": ["Bash"]}) == cell.SERVED_PREFIX
+    read = read_back.read_transcript(transcript(tmp_path / "today.jsonl"))
+    assert (read.pulls, read.unserved) == (1, 1)
+
+
+def test_the_record_a_launch_writes_is_what_a_later_read_takes_the_word_from(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A launch writes the word down and the reader reads it back, over a real run directory."""
+    no_docker(monkeypatch)
+    run_dir = tmp_path / "cell"
+    launcher.launch(
+        run_dir,
+        tasks="cell-one:1",
+        domain="public",
+        schedule="immediate",
+        model="claude-opus-5",
+        effort="xhigh",
+        cache=tmp_path / "cache",
+    )
+    assert read_back.served_prefix(launcher.read_run_file(run_dir)) == cell.SERVED_PREFIX
+    # And a directory with no record, which is what a run interrupted before it wrote one leaves.
+    assert launcher.read_run_file(tmp_path / "nowhere") is None
 
 
 def test_a_task_record_is_a_task_whether_or_not_it_carries_a_budget(tmp_path: Path) -> None:
@@ -1312,20 +1399,22 @@ def test_a_declaration_of_the_right_value_and_another_type_is_not_this_cells_reg
         composed(["first"], "immediate")
 
 
-def test_the_served_tools_reach_the_model_under_the_name_that_run_saw(tmp_path: Path) -> None:
-    # A tool name is part of the prompt prefix, so the server key is pinned to the recorded run's.
-    # The prompt does not name it: the model meets the name in every tool it is offered.
+def test_the_served_tools_reach_the_model_under_a_name_that_says_nothing(tmp_path: Path) -> None:
+    # A tool name is part of the prompt prefix, so the key here is what the model reads on every
+    # call. The prompt does not name it: the model meets the name in every tool it is offered.
+    # It is the serving layer's own default rather than a word chosen here, and it names what the
+    # thing is from where the model sits rather than who is running it.
     url = sandbox.gateway_url("a-server")
     config = json.loads(launcher.mcp_config(tmp_path, url=url).read_text())
-    assert list(config["mcpServers"]) == [cell.SERVER] == ["shogym"]
+    assert list(config["mcpServers"]) == [cell.SERVER] == [SERVED_NAME] == ["stream"]
     served = config["mcpServers"][cell.SERVER]
     # The agent is given somewhere to connect and nothing to spawn, which is what puts the server
     # on the far side of a container rather than in the agent's own process tree.
     assert served == {"type": "http", "url": url}
     assert "command" not in served and "args" not in served and "env" not in served
-    assert read_back.SERVED_PREFIX == cell.SERVED_PREFIX == "mcp__shogym__"
-    assert read_back.PULL_TOOL == "mcp__shogym__pull"
-    assert all(name.startswith("mcp__shogym__") for name in cell.SERVED_TOOLS)
+    assert read_back.SERVED_PREFIX == cell.SERVED_PREFIX == "mcp__stream__"
+    assert read_back.PULL_TOOL == "mcp__stream__pull"
+    assert all(name.startswith("mcp__stream__") for name in cell.SERVED_TOOLS)
 
 
 def test_the_word_this_cell_used_to_serve_its_tools_under_is_gone(tmp_path: Path) -> None:
@@ -1458,9 +1547,14 @@ def test_the_pins_beside_the_command_are_the_recorded_runs_own_values() -> None:
 
     This is the test the cell did not have when it was pinned to another cell's launch: every
     constant had a test, and every one of those tests built its expectation out of the constant.
-    The build, the surface it reported, the model, the effort, the feedback regime, the server
-    key, the queue cap and the identifiers the launch record carries all have a recorded value,
-    and this is where each is compared with it.
+    The build, the surface it reported, the model, the effort, the feedback regime, the queue cap
+    and the identifiers the launch record carries all have a recorded value, and this is where
+    each is compared with it.
+
+    The name the tools are served under is the one pin here that is deliberately not the recorded
+    run's. That run served them under the platform's own name, which the model read on every call
+    and wrote into the files it kept, and a name is a thing that can be looked up. So this cell
+    serves a neutral one and the difference is stated here rather than left to be noticed.
     """
     assert pinned.CLI_VERSION == RECORDED["init"]["claude_code_version"] == "2.1.226"
     assert RECORDED["harness"]["version"].startswith(pinned.CLI_VERSION)
@@ -1472,7 +1566,8 @@ def test_the_pins_beside_the_command_are_the_recorded_runs_own_values() -> None:
     assert launcher.MODEL == RECORDED["cell"]["model"] == RECORDED["init"]["model"]
     assert launcher.EFFORT == RECORDED["cell"]["effort"]
     assert launcher.CELL_ONE_SCHEDULE == RECORDED["cell"]["rollout_feedback"]
-    assert cell.SERVER == RECORDED["substrate"]["mcp_server_name"]
+    assert cell.SERVER != RECORDED["substrate"]["mcp_server_name"] == "shogym"
+    assert cell.SERVER == SERVED_NAME == "stream"
     assert cell.POOL_CEILING == RECORDED["cell"]["pool_ceiling"]
     assert launcher.KICKOFF == RECORDED["instruction"]["kickoff"]
     work = RECORDED["work"]
@@ -2050,11 +2145,11 @@ def test_the_built_in_tools_and_the_served_ones_are_two_comparisons_and_not_one(
     """The reported array holds both surfaces, and only one of them is the CLI's.
 
     Compared as one list, every faithful run reported drift: this cell's server offers `pull`
-    where that one offered `get_task` and `info` where it offered `queue_info`, and serves no
-    abort at all, so three of the seven names that run's model saw are absent here and two of
-    this cell's six are absent there. Read as one array those show up as tools the run lost and
-    tools it gained, which is the same false alarm the four missing built-ins used to raise from
-    the other side.
+    where that one offered `get_task` and `info` where it offered `queue_info`, serves no abort
+    at all, and serves the lot under a name that says nothing about the platform where that one
+    used the platform's own. So none of the seven names that run's model saw is a name this
+    cell's model sees. Read as one array those show up as tools the run lost and tools it gained,
+    which is the same false alarm the four missing built-ins used to raise from the other side.
 
     So the built-ins are compared against the recorded build's and the served names against the
     ones this generation composes, and a run that really did lose a built-in is still caught.
@@ -2066,10 +2161,9 @@ def test_the_built_in_tools_and_the_served_ones_are_two_comparisons_and_not_one(
     assert (len(recorded), len(RECORDED_BUILTINS), len(RECORDED_SERVED)) == (40, 33, 7)
     drift = pinned.surface_drift(init_line(tools=recorded), served=served)
     assert "tools" not in drift
-    assert drift["served"] == {
-        "missing": ["mcp__shogym__info", "mcp__shogym__pull"],
-        "added": ["mcp__shogym__get_task", "mcp__shogym__queue_info", "mcp__shogym__terminate"],
-    }
+    # Every name on both sides, because the served name is part of a served name: the word in
+    # front of the tool is what a comparison of the two surfaces reads first.
+    assert drift["served"] == {"missing": served, "added": sorted(RECORDED_SERVED)}
     # And a built-in that really did go missing is still a built-in that went missing.
     lost = pinned.surface_drift(
         init_line(tools=[name for name in RECORDED_BUILTINS if name != "Bash"]), served=served
@@ -2388,6 +2482,36 @@ def test_the_launch_record_names_what_the_server_said_it_served(
     assert list(absent) == ["absent"] and cell.ROSTER_FILE in str(absent["absent"])
     # A record that says nothing about what was served is not a record saying the defaults were.
     assert "capacity" not in absent
+
+
+def test_the_record_says_which_name_the_tools_were_served_under(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A rerun that changed what the model reads says so in its own record.
+
+    The recorded run served its tools under the platform's name and this one does not, so the
+    word is a difference between the two runs. It is in the record rather than left to be
+    reconstructed from a tool name in a transcript, and the tool names are there with it because
+    the word is the front of each of them.
+    """
+    no_docker(monkeypatch)
+    run_dir = tmp_path / "cell"
+    launcher.launch(
+        run_dir,
+        tasks="cell-one:2",
+        domain="public",
+        schedule="immediate",
+        model="claude-opus-5",
+        effort="xhigh",
+        cache=tmp_path / "cache",
+    )
+    written = json.loads((run_dir / launcher.RUN_FILE).read_text())
+    assert written["served_name"] == cell.SERVER == SERVED_NAME
+    assert written["served_tools"] == list(cell.SERVED_TOOLS)
+    # The record and the file the agent read agree, which is the point of recording it.
+    config = json.loads((run_dir / launcher.CONFIG / sandbox.MCP_CONFIG).read_text())
+    assert list(config["mcpServers"]) == [written["served_name"]]
+    assert written["served_name"] != RECORDED["substrate"]["mcp_server_name"]
 
 
 def test_a_launch_on_a_build_that_is_not_the_recorded_one_starts_nothing(

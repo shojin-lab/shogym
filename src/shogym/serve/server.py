@@ -1,7 +1,7 @@
 """Wrap a :class:`ServedEpisode` in a FastMCP server.
 
 The env's essential tools (from its ``TaskSpec``) become FastMCP tools whose bodies run one
-served step; the task contract is published as the ``shogym://task`` resource and a
+served step; the task contract is published as the :data:`TASK_RESOURCE` resource and a
 ``describe`` tool. Feedback rides each tool result's ``_meta``. This is the in-process server
 :func:`shogym.evaluate` drives, and :func:`build_tool` is what the durable stream's gateway
 builds its own tools with.
@@ -21,6 +21,22 @@ from shogym.serve.episode import ServedEpisode
 from shogym.task import ToolManifest
 
 _Dispatch = Callable[[str, Dict[str, Any]], Awaitable[ToolResult]]
+
+#: What this server calls itself to whoever connects, and the one default every serving path
+#: here starts from. A harness namespaces the tools it is given under the key it knows the
+#: server by, so this word is the front of every tool name the model reads, and the model reads
+#: it thousands of times in a long session. A word that named the platform would be a search
+#: key: an agent that wanted to do better could look the platform up, and with general egress
+#: left in place nothing would stop it. So the default names what the thing is from where the
+#: model sits, a stream of tasks, and says nothing about who is running it. A launcher that
+#: wants another word passes one, and then the word it passed is part of what its run recorded.
+SERVED_NAME = "stream"
+
+#: Where the task contract is published for a client that reads resources rather than tools.
+#: The scheme is the served name for the reason the server's own name is: a URI is text the
+#: model can read, and one carrying the platform's name would say what the tool names no
+#: longer do.
+TASK_RESOURCE = f"{SERVED_NAME}://task"
 
 # Server-added control tool; an env may not expose a tool of this name (FastMCP would
 # silently replace it, so the manifest would list a tool that dispatches to the control
@@ -113,10 +129,14 @@ _build_tool = build_tool
 
 def build_server(episode: ServedEpisode, *, name: Optional[str] = None) -> FastMCP:
     """Build a FastMCP server exposing ``episode``'s tools, ``describe``, and the task
-    resource. The same object is served over stdio (`shogym serve`) or driven in-process by
-    a FastMCP ``Client`` (the tests and the example harness)."""
+    resource. The same object is served over stdio or driven in-process by a FastMCP
+    ``Client`` (the tests and the example harness).
+
+    ``name`` is what the server calls itself, and the default is :data:`SERVED_NAME` rather
+    than anything read off the episode: the env's own name is a fact about the measurement and
+    the model is not one of the parties to it."""
     spec = episode.describe()
-    server: FastMCP = FastMCP(name=name or f"shogym:{spec.env_name}")
+    server: FastMCP = FastMCP(name=name or SERVED_NAME)
     # Request-level ingress gate. Inert for a non-seal episode (always OPEN); tombstones every
     # post-seal `tools/call` (incl. unknown tools) for a seal-enabled one.
     server.add_middleware(_IngressGate(episode))
@@ -138,7 +158,7 @@ def build_server(episode: ServedEpisode, *, name: Optional[str] = None) -> FastM
         """Return the task contract (TaskSpec) as a JSON object."""
         return episode.describe().model_dump()
 
-    @server.resource("shogym://task")
+    @server.resource(TASK_RESOURCE)
     async def task_resource() -> Dict[str, Any]:
         return episode.describe().model_dump()
 

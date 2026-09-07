@@ -12,7 +12,7 @@ from fastmcp import Client, FastMCP
 import shogym
 from shogym.feedback import parse_meta
 from shogym.serve import ServedEpisode
-from shogym.serve.server import build_server
+from shogym.serve.server import TASK_RESOURCE, build_server
 
 
 def _answer(task_idx: int) -> str:
@@ -89,7 +89,7 @@ async def test_describe_tool_and_resource_agree() -> None:
     try:
         async with Client(build_server(episode)) as client:
             from_tool = (await client.call_tool("describe", {})).data
-            resource = await client.read_resource("shogym://task")
+            resource = await client.read_resource(TASK_RESOURCE)
             from_resource = json.loads(resource[0].text)
             assert from_tool["env_name"] == "wordle_v1"
             assert from_tool == from_resource

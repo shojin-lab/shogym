@@ -173,6 +173,10 @@ def mcp_config(run_dir: Path, *, url: str) -> Path:
     own. The file goes in a directory of its own, mounted read only and outside the directory the
     agent works in, so it never becomes part of a self a later run would start from. That is where
     the recorded run kept its own, under the name that run gave it.
+
+    This file is the whole of what decides the front of every tool name the model reads, and the
+    agent can read the file itself: the key is :data:`SERVER` and the URL names the container that
+    serves it, so both are the served name and neither says which platform is behind them.
     """
     directory = run_dir / CONFIG
     directory.mkdir(parents=True, exist_ok=True)
@@ -233,6 +237,23 @@ def write_run_file(run_dir: Path, record: Dict[str, object]) -> Path:
     path = run_dir / RUN_FILE
     path.write_text(json.dumps(record, indent=2, sort_keys=True) + "\n", encoding="utf-8")
     return path
+
+
+def read_run_file(run_dir: Path) -> Optional[Dict[str, Any]]:
+    """Return the record a launch wrote for itself, or nothing where the run has none.
+
+    A read of an old run is a read of what that run said about itself, and a run whose record is
+    gone or unreadable says nothing rather than saying this checkout's own values. Nothing is
+    raised: a directory a launch never finished writing is still a directory worth reading.
+    """
+    path = Path(run_dir) / RUN_FILE
+    if not path.is_file():
+        return None
+    try:
+        written = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return None
+    return written if isinstance(written, dict) else None
 
 
 #: What the generation decided and this launcher did not: the step budget every task record
@@ -666,7 +687,12 @@ def launch(
                 "tasks": tasks,
                 "task_count": len(positions),
                 "session_id": session_id,
-                "server": SERVER,
+                # The word the tools were served under, which the model read on every call it
+                # made. The recorded run served them under another one, so this is a difference
+                # between the two runs and the record says which word this one used rather than
+                # leaving a reader to work it out from a tool name in the transcript.
+                "served_name": SERVER,
+                "served_tools": list(SERVED_TOOLS),
                 "started": f"{datetime.now(timezone.utc):%Y-%m-%dT%H:%M:%SZ}",
                 "argv": started.argv,
                 "cwd": sandbox.WORK,
@@ -883,6 +909,11 @@ async def table(run_dir: Path) -> int:
     told, so an episode whose own transcript does not hold the bytes the generation delivered is
     one whose analysis would be about feedback that may never have arrived: that is a read that
     failed rather than a read with a note under it.
+
+    The transcript is read under the name that run served its tools under, taken from the run's
+    own record rather than from this checkout. The name is the front of every call the model
+    wrote, so a read of an archived run under today's word would find none of its calls and
+    report a run that pulled and worked as one that did neither.
     """
     from shogym.serve.protocol_v2.reader import (
         NothingToRead,
@@ -910,7 +941,8 @@ async def table(run_dir: Path) -> int:
         print(f"no {ROSTER_FILE} in {grades}, so there is nothing to join these rows to")
         return 0
     path = run_dir / TRANSCRIPT
-    transcript = read_back.read_transcript(path) if path.is_file() else None
+    prefix = read_back.served_prefix(read_run_file(run_dir), pinned.init_event(path))
+    transcript = read_back.read_transcript(path, prefix=prefix) if path.is_file() else None
     if transcript is None:
         print(read_back.format_table(read_back.rows(read_back.read_roster(grades), run.records)))
         print(f"\nno {TRANSCRIPT} here, so nothing says what the model was shown")

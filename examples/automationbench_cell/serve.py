@@ -53,6 +53,7 @@ from shogym.serve.protocol_v2.gateway import (
 from shogym.serve.protocol_v2.kernel.messages import StreamStart
 from shogym.serve.protocol_v2.policy import GradeIdentity, ORDINARY
 from shogym.serve.protocol_v2.schedule import IMMEDIATE, NEVER, ReleasePlan
+from shogym.serve.server import SERVED_NAME
 from shogym.task import TaskSpec, ToolManifest
 
 #: The environment this cell is over. The cell is a rerun of one recorded on AutomationBench, so
@@ -60,9 +61,16 @@ from shogym.task import TaskSpec, ToolManifest
 ENV = "automationbench"
 
 #: The key a harness namespaces this server's tools under, so they reach the model as
-#: ``mcp__shogym__*``. It is the name the recorded run's agent saw. A tool name is part of the
-#: prompt prefix, so it is pinned to that rather than renamed to whatever a transport would pick.
-SERVER = "shogym"
+#: ``mcp__stream__*``. It is the serving layer's own default rather than a word chosen here, so
+#: one launcher's agent and another's read the same front on every tool name.
+#:
+#: The recorded run served these tools under the platform's name, and this is a difference from
+#: it. The name is text the model reads on every call and writes into everything it keeps: the
+#: recorded run's agent named its own memory files after the platform, which is a name it could
+#: have looked up, and the run kept general egress. So the word is neutral here and the launch
+#: writes down which word it served, because a rerun that changed the agent's visible surface
+#: has to say so rather than have the difference found later in a transcript.
+SERVER = SERVED_NAME
 
 #: How those names reach the model, and which of them this generation serves. Two are the
 #: gateway's, the tool that asks for work and the tool that asks how much of it is left, and the
@@ -70,6 +78,10 @@ SERVER = "shogym"
 #: because a launch compares the surface the run reported with the surface it meant to serve, and
 #: the recorded run's own list is not this one: it offered ``get_task`` where this offers ``pull``,
 #: ``queue_info`` where this offers ``info``, and an abort tool this protocol does not serve at all.
+#: The served name is part of these names, so it is part of the recorded surface too: the recorded
+#: run's line is compared with this list, and its word is not this word, so none of its seven names
+#: is one of these six. A launch of this cell is compared with this same list and reports no such
+#: difference, which is why the word it served is written into its record as well.
 SERVED_PREFIX = f"mcp__{SERVER}__"
 SERVED_TOOLS: Tuple[str, ...] = tuple(
     f"{SERVED_PREFIX}{name}"
