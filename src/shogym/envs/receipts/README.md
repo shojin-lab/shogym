@@ -119,12 +119,11 @@ agent files. Nothing here pretends otherwise.
   the only place the three cells are made. Every retry replays those blobs; nothing rerenders,
   because rerendering is how two branches of one fork come to differ.
 
-  The record is **committed once**, which is the property the chain needs, and that is not the
-  same as rendered once. Two callers arriving on one filing at the same instant both render;
-  the record is published by an exclusive link, the loser's bytes are dropped, and both read
-  the winner's record back before returning, so every branch of one fork holds one set of
-  bytes. Nothing here is durable against an abrupt host failure mid-write: a fork that was
-  never published is rendered again on the next attempt, which is the same answer.
+  Once is once under concurrency as well as over time, and that takes a claim: two seals of
+  one filing arriving together would both find the record absent and both render it, so the
+  fork is claimed on its own name, per fork rather than per store, and the loser reads what
+  the winner wrote. Nothing here is durable against an abrupt host failure mid-write: a fork
+  that was never published is rendered again on the next attempt, which is the same answer.
 
 **What "judged" means is one function**, `render.judge_cells`, and admission runs it too, at
 every sample it takes, over the whole convention space and every registered filing class on
