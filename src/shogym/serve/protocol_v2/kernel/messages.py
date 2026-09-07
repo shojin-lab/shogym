@@ -27,7 +27,7 @@ import json
 import lzma
 from dataclasses import dataclass, field
 from hashlib import sha256
-from typing import Any, Dict, List, Optional, Sequence
+from typing import Any, Dict, List, Mapping, Optional, Sequence, Tuple
 
 from shogym.serve.protocol_v2 import (
     AGENT_FILED,
@@ -45,9 +45,20 @@ from shogym.serve.protocol_v2 import (
 )
 from temporalio.api.common.v1 import Payload
 
+from shogym.serve.protocol_v2.artifact import (
+    ELIGIBLE_CELLS,
+    ReceiptContract,
+    SourceArtifactManifest,
+    check_source_artifact,
+    contract_fields,
+    mask_spans,
+    source_commitment,
+)
 from shogym.serve.protocol_v2.errors import WireFormatError
 from shogym.serve.protocol_v2.policy import (
+    ARTIFACT,
     LEGACY,
+    POLICIES,
     GradeIdentity,
     MatchedFamily,
     PayloadDisposition,
@@ -113,10 +124,213 @@ class TerminalTool:
     argument_names: List[str]
 
 
-# The version of the carried projection below. A generation continued under a carrier this code
-# does not know is refused rather than served from a half-understood record, so the number moves
+# The versions of the carried projection below. A generation continued under a carrier this code
+# does not know is refused rather than served from a half-understood record, so a number moves
 # whenever a field changes meaning.
-CARRIER_SCHEMA_VERSION = 6
+#
+# The two numbers name two dispositions rather than two stages of one. A generation that declares
+# a receipt contract carries receipt evidence from its first boundary, whether or not it has
+# captured anything yet, and writes the later number for the whole of its life. A generation that
+# declares none of that configuration and holds none of that evidence writes the earlier one and
+# stays there.
+#
+# Choosing the number from the state is not on its own the compatibility promise, because the
+# number is a label and the bytes are the record: the codec serializes the dataclass through the
+# converter and then shares and compresses the result, so a field defaulting to absent is an
+# explicit member of that JSON and one attempt with it packs to a different string from the same
+# attempt without it while both carriers report the earlier number. So the earlier number is an
+# exact serialization adapter as well: before packing it drops every member added since, on the
+# carried attempt, on any nested candidate and on the start the continuation carries, emitting the
+# member set that version already had. It is applied to genuinely legacy state alone.
+LEGACY_CARRIER_SCHEMA_VERSION = 6
+RECEIPT_CARRIER_SCHEMA_VERSION = 7
+#: Every carrier this code reads back. A generation writes one of these two and never a third.
+CARRIER_SCHEMA_VERSIONS = (LEGACY_CARRIER_SCHEMA_VERSION, RECEIPT_CARRIER_SCHEMA_VERSION)
+
+# The members this build added, named once so that the adapter below is arithmetic on the names
+# rather than a second copy of the records. The journal is deliberately absent from the list: its
+# rows carry offered messages and acknowledgement identifiers, and none of those grew a member
+# here, so there is nothing in one to drop.
+_RECEIPT_START_MEMBERS = ("receipt_contracts", "receipt_source")
+_RECEIPT_ATTEMPT_MEMBERS = (
+    "source_artifact",
+    "source_commitment",
+    "source_origin",
+    "selected_cell",
+    "selected_body_reference",
+    "selected_policy_digest",
+    "receipt_contract_id",
+    "presentation_references",
+)
+_RECEIPT_CANDIDATE_MEMBERS = (
+    "source_commitment",
+    "body_reference",
+    "resolver_id",
+    "resolver_version",
+)
+_RECEIPT_PROJECTION_MEMBERS = ("operation_failures",)
+
+
+@dataclass(frozen=True)
+class SourceOriginContext:
+    """The identity one source's seal was computed under, carried beside the source.
+
+    It is the source's validation context rather than the destination's. A seal id is minted from
+    a hidden execution id, an execution ordinal and an attempt, and the descriptor carries the
+    ordinal alone, so a reader checking an inherited source has to be told which hidden execution
+    produced it rather than assuming the start the source arrived at. For an ordinary continuation
+    the two are the same value, because continue-as-new hands the same start on; keeping the field
+    is what stops that coincidence from becoming the rule.
+    """
+
+    hidden_execution_id: str
+    execution_ordinal: int
+
+
+def origin_fields(origin: SourceOriginContext) -> Dict[str, Any]:
+    """Return one origin as the two values a carrier writes it as."""
+    return {
+        "hidden_execution_id": origin.hidden_execution_id,
+        "execution_ordinal": origin.execution_ordinal,
+    }
+
+
+def read_source_origin(value: Any) -> SourceOriginContext:
+    """Read one carried origin back, and refuse a shape that is not one.
+
+    It is read rather than decoded for the reason the descriptor beside it is. The origin is what
+    a carried seal id is recomputed from, so a member this build does not declare being dropped
+    on the way in, or an ordinal written as a float being rounded to one, would leave restore
+    comparing a value the decoder repaired against a value the start holds and finding them
+    equal.
+    """
+    if not isinstance(value, Mapping):
+        raise WireFormatError(
+            f"a source origin is written as an object, and this one is {value!r}"
+        )
+    declared = ("hidden_execution_id", "execution_ordinal")
+    if tuple(sorted(str(key) for key in value)) != tuple(sorted(declared)):
+        raise WireFormatError(
+            f"a source origin carries exactly {sorted(declared)}, and this one carries "
+            f"{sorted(str(key) for key in value)}"
+        )
+    hidden = value["hidden_execution_id"]
+    ordinal = value["execution_ordinal"]
+    if not isinstance(hidden, str) or not hidden:
+        raise WireFormatError(
+            f"a source origin names a hidden execution, and this one names {hidden!r}"
+        )
+    if isinstance(ordinal, bool) or not isinstance(ordinal, int) or ordinal < 0:
+        raise WireFormatError(
+            f"a source origin's execution ordinal is a whole number, and this one is {ordinal!r}"
+        )
+    return SourceOriginContext(hidden_execution_id=hidden, execution_ordinal=ordinal)
+
+
+# Where an operation was when it failed over evidence. Five phases, closed, because a reader
+# telling a publication that never committed from a delivery that lost its bytes afterwards is
+# reading two different runs. The last of them belongs to the fork operation, which is named here
+# so its rows have a home rather than because anything in this build writes one.
+SOURCE_PUBLICATION = "source_publication"
+OWNERSHIP_CLAIM = "ownership_claim"
+CONTINUED_FIRST_DELIVERY = "continued_first_delivery"
+PAYLOAD_OFFER = "payload_offer"
+FORK_PREPARATION = "fork_preparation"
+OPERATION_PHASES = (
+    SOURCE_PUBLICATION,
+    OWNERSHIP_CLAIM,
+    CONTINUED_FIRST_DELIVERY,
+    PAYLOAD_OFFER,
+    FORK_PREPARATION,
+)
+
+# What was wrong with the evidence. The store answers the first: a name it cannot produce the
+# exact bytes for. The other three are answered where the shape is known, by the capture that
+# holds the committed record and by the resolver that holds the contract.
+UNAVAILABLE_EVIDENCE = "unavailable_evidence"
+CORRUPT_EVIDENCE = "corrupt_evidence"
+CONTRACT_DRIFT = "contract_drift"
+WRONG_SOURCE = "wrong_source"
+OPERATION_REASONS = (UNAVAILABLE_EVIDENCE, CORRUPT_EVIDENCE, CONTRACT_DRIFT, WRONG_SOURCE)
+
+# And where it stands now. A refusal is a row of its own and stays one: a later recovery appends
+# rather than overwriting, so the sequence keeps both. Unrecoverable is the ending, written where
+# the operation that failed can never be asked again.
+REFUSED_OPERATION = "refused"
+RECOVERED_OPERATION = "recovered"
+UNRECOVERABLE_OPERATION = "unrecoverable"
+OPERATION_OUTCOMES = (REFUSED_OPERATION, RECOVERED_OPERATION, UNRECOVERABLE_OPERATION)
+
+
+@dataclass(frozen=True)
+class OperationFailure:
+    """One operation that could not produce the evidence it depended on, and what became of it.
+
+    These are rows and not fields. They are kept in commit order for the life of the generation,
+    successive refusals and recoveries of one logical operation each append, and nothing is
+    dropped at a boundary: the latest word about an attempt is the last row naming it. The
+    private Update journal does not do this job, being keyed by an Update identifier, exported
+    nowhere and read by nobody.
+
+    ``operation`` is the identity of the operation rather than of the transport call that carried
+    it: a pull's canonical request identity, an ownership claim's claim operation identity, a fork
+    preparation's preparation operation identity. That is what joins a refusal to the recovery of
+    the same logical operation across a fresh fencing token and a different Update.
+
+    ``generation`` is the generation whose operation failed, so a row a forked child inherits
+    reads as the parent's operation rather than as the child's.
+
+    The fields a pull has and a claim has not are written absent rather than invented: a claim
+    carries no logical request id and names no payload position, and the epoch it was refused
+    under is the epoch it witnessed.
+    """
+
+    operation: str
+    phase: str
+    reason: str
+    outcome: str
+    generation: str
+    refused_epoch: int
+    attempt_id: Optional[str] = None
+    payload_position: Optional[int] = None
+    references: List[str] = field(default_factory=list)
+    request_id: Optional[str] = None
+    recovered_epoch: Optional[int] = None
+    protocol_version: int = PROTOCOL_VERSION
+
+
+def ownership_claim_operation_identity(claimant_id: str, witnessed_epoch: int) -> str:
+    """Return the identity of one ownership claim, as an operation rather than as a call.
+
+    The fencing token, its hash and the transport's Update identifier are all outside it, so a
+    claim retried under a fresh token is the same operation as the claim it repeats and appends to
+    that episode rather than opening another. The witnessed epoch is inside it and the won one is
+    not, so every attempt at one swap shares an identity and the next swap's attempts do not.
+    """
+    return sha256(
+        length_prefixed(b"ownership-claim-operation-v2")
+        + length_prefixed(claimant_id.encode("utf-8"))
+        + length_prefixed(str(witnessed_epoch).encode("ascii"))
+    ).hexdigest()
+
+
+def fork_preparation_operation_identity(
+    fork_id: str, child_workflow_id: str, creation_epoch: int
+) -> str:
+    """Return the identity of one fork preparation, on the claim identity's own terms.
+
+    The epoch inside it is the one the child's first preparation was created under, captured once
+    in the child's own record and never recomputed from the epoch the child currently holds: a
+    repair that steps the epoch repeats one logical preparation rather than opening a second
+    operation nothing joins to the first, and the current epoch changes only the derived Update
+    identifier the retry is submitted under.
+    """
+    return sha256(
+        length_prefixed(b"fork-preparation-operation-v1")
+        + length_prefixed(fork_id.encode("utf-8"))
+        + length_prefixed(child_workflow_id.encode("utf-8"))
+        + length_prefixed(str(creation_epoch).encode("ascii"))
+    ).hexdigest()
 
 
 @dataclass(frozen=True)
@@ -133,6 +347,31 @@ class CarriedAttempt:
 
     ``deadline_expired`` is missing for the other reason: an expiry that can be applied is
     applied before the boundary is considered, so at a legal boundary there is none to carry.
+
+    The receipt fields are absent by default and cross together where a source was committed. The
+    descriptor is carried whole rather than by digest, because a later derivation has to read its
+    cell map and its contract with no store and no bank; ``source_commitment`` names its canonical
+    bytes; ``source_origin`` is the identity that seal was computed under; and the four beside
+    them are the selection, which lives here rather than on the obligation because an obligation
+    drops its candidate once one has been presented and a reference hung on the candidate alone
+    would be lost with it. No body crosses: what crosses is the reference.
+
+    The descriptor and the origin cross as whatever they were written as, for the reason the seal
+    result carries its own the same way. A field with a type is a field the decoder makes that
+    type of before any code of this generation runs: a carried descriptor with a member this build
+    does not declare is silently dropped there and one whose size was written as a float is
+    coerced back to a whole number, and either way what restore then checks is a record the
+    decoder repaired rather than the record that crossed. So the shape is permissive here and the
+    authority is strict: :func:`shogym.serve.protocol_v2.artifact.read_source_artifact` and
+    :func:`read_source_origin` decide what these are, at the restore that refuses the carrier.
+
+    ``presentation_references`` is the objects this attempt's own committed presentations cited,
+    in commit order. They are among what an ownership claim reads the store for, so a claim
+    refused over one of them is refused over an object this attempt requires, and a row that named
+    no attempt would leave the receipt whose evidence went missing reading as though nothing had.
+    The association is the attempt's rather than the inventory's for that reason: the flat
+    inventory says the object is required by somebody and cannot say by whom. A generation that
+    declares no receipt contract records none of them.
     """
 
     attempt_id: str
@@ -156,6 +395,14 @@ class CarriedAttempt:
     failure_kind: Optional[str] = None
     failure_message: Optional[str] = None
     failure_retry_state: Optional[str] = None
+    source_artifact: Any = None
+    source_commitment: Optional[str] = None
+    source_origin: Any = None
+    selected_cell: Optional[str] = None
+    selected_body_reference: Optional[str] = None
+    selected_policy_digest: Optional[str] = None
+    receipt_contract_id: Optional[str] = None
+    presentation_references: List[str] = field(default_factory=list)
 
 
 @dataclass(frozen=True)
@@ -283,14 +530,108 @@ def _unshared(written: List[Any]) -> Any:
     return build(root)
 
 
-def pack_carrier(projection: Any, converter: Any) -> "StreamCarry":
-    """Write one projection as the string a continuation carries."""
+def resolved_echo(candidate: "PayloadCandidate") -> bool:
+    """Say whether a candidate carries any of the values a resolved one echoes about its source.
+
+    It is the same list the carrier version is chosen from, read once rather than written out
+    twice. A route that resolves nothing asks these to be empty and the version rule reads a
+    filled one as receipt evidence, so the two questions are one question: a value that would
+    promote a legacy generation's carrier is a value the route that produced it has to refuse.
+    """
+    return any(getattr(candidate, name) for name in _RECEIPT_CANDIDATE_MEMBERS)
+
+
+def carrier_version(start: "StreamStart", projection: "CarriedProjection") -> int:
+    """Return the version one generation writes its carrier under.
+
+    Configuration decides it first: a generation that declares a receipt contract writes the later
+    number from its first boundary, before it has captured anything, because the start the
+    continuation carries holds that contract and the source it is admitted over. Evidence decides
+    it otherwise, so a projection holding a descriptor, a selection or a resolved candidate can
+    never be written as a record that had no room for one.
+    """
+    if start.receipt_contracts or start.receipt_source:
+        return RECEIPT_CARRIER_SCHEMA_VERSION
+    for row in projection.attempts:
+        if any(getattr(row, name) for name in _RECEIPT_ATTEMPT_MEMBERS):
+            return RECEIPT_CARRIER_SCHEMA_VERSION
+    for owed in projection.obligations:
+        candidate = owed.candidate
+        if candidate is not None and resolved_echo(candidate):
+            return RECEIPT_CARRIER_SCHEMA_VERSION
+    if projection.operation_failures:
+        return RECEIPT_CARRIER_SCHEMA_VERSION
+    return LEGACY_CARRIER_SCHEMA_VERSION
+
+
+def legacy_start_members(written: Dict[str, Any]) -> Dict[str, Any]:
+    """Return one encoded start as the legacy carrier version had it, members and all."""
+    return {
+        name: value for name, value in written.items() if name not in _RECEIPT_START_MEMBERS
+    }
+
+
+def legacy_projection_members(written: Dict[str, Any]) -> Dict[str, Any]:
+    """Return one encoded projection as the legacy carrier version had it.
+
+    Every other member is passed through exactly as the converter wrote it, so what comes out is
+    the document that version produced rather than a document this one rebuilt to look like it.
+    """
+    adapted = {
+        name: value
+        for name, value in written.items()
+        if name not in _RECEIPT_PROJECTION_MEMBERS
+    }
+    adapted["attempts"] = [
+        {name: value for name, value in row.items() if name not in _RECEIPT_ATTEMPT_MEMBERS}
+        for row in written.get("attempts", [])
+    ]
+    adapted["obligations"] = [
+        row
+        if row.get("candidate") is None
+        else {
+            **row,
+            "candidate": {
+                name: value
+                for name, value in row["candidate"].items()
+                if name not in _RECEIPT_CANDIDATE_MEMBERS
+            },
+        }
+        for row in written.get("obligations", [])
+    ]
+    return adapted
+
+
+def continuation_argument(start: "StreamStart", converter: Any, version: int) -> Any:
+    """Return what a continuation is handed, written as the version it declares.
+
+    A generation on the current version hands its own start over and the converter encodes it. A
+    legacy one hands over what that same encoding says minus the members this build added, so a
+    reader of that version finds the document it has always found rather than one carrying names
+    it never had. The value is a plain mapping there, and the execution that receives it decodes
+    it back into a start with those members at their defaults, which is what absent means.
+    """
+    if version != LEGACY_CARRIER_SCHEMA_VERSION:
+        return start
+    return legacy_start_members(
+        json.loads(converter.to_payloads([start])[0].data.decode("utf-8"))
+    )
+
+
+def pack_carrier(projection: Any, converter: Any, *, version: int) -> "StreamCarry":
+    """Write one projection as the string a continuation carries, under one declared version.
+
+    The version is the caller's rather than a constant read here, because what decides it is the
+    generation's configuration and evidence and neither is visible from a projection alone.
+    """
     value = json.loads(converter.to_payloads([projection])[0].data.decode("utf-8"))
+    if version == LEGACY_CARRIER_SCHEMA_VERSION:
+        value = legacy_projection_members(value)
     raw = json.dumps(
         _shared(value), sort_keys=True, separators=(",", ":"), ensure_ascii=False
     ).encode("utf-8")
     return StreamCarry(
-        carrier_schema_version=CARRIER_SCHEMA_VERSION,
+        carrier_schema_version=version,
         encoding=CARRIER_ENCODING,
         data=base64.b64encode(
             lzma.compress(raw, format=lzma.FORMAT_RAW, filters=_CARRIER_FILTERS)
@@ -418,6 +759,11 @@ class CarriedProjection:
     # together, so packing this again inside it would only hide it from the sharing.
     journal: List[List[Any]] = field(default_factory=list)
     turnovers: int = 0
+    # Every operation of this generation that could not produce the evidence it depended on, in
+    # commit order. They cross because the record of a refusal is worth nothing if a boundary can
+    # drop it: a delivery refused in one execution is recovered in another, and both rows have to
+    # be readable afterwards from one list.
+    operation_failures: List[OperationFailure] = field(default_factory=list)
     protocol_version: int = PROTOCOL_VERSION
 
 
@@ -461,6 +807,16 @@ class StreamStart:
     ``families`` are the matched arms this generation's rows are cells of, each declaring the
     group its candidates are built in and the byte count they come to, so a concealed cell and
     an informative one cannot be told apart by their shape.
+
+    ``receipt_contracts`` are the shapes this generation admits an environment's own bodies
+    under, declared beside those families and named by a row through the same column. A
+    generation may declare several: which contract a capture is validated against is the row's to
+    say, and inferring the only one stops working at the second declaration.
+    ``receipt_source`` is the bank source digest they are admitted over, which is what a
+    descriptor's bundle digest is compared against; the environment's configuration digest hashes
+    that source together with four other values, so the comparison cannot be recovered from it.
+    Both are absent on every generation that declares no contract, and both are inside the
+    configuration hash where one is declared.
 
     ``grade`` is what the environment said its grader is. A generation may resolve an obligation
     to a policy that publishes the score only where that grader is the environment's own, so the
@@ -508,6 +864,8 @@ class StreamStart:
     dispositions: List[PayloadDisposition] = field(default_factory=list)
     provenance: Optional[PolicyProvenance] = None
     families: List[MatchedFamily] = field(default_factory=list)
+    receipt_contracts: List[ReceiptContract] = field(default_factory=list)
+    receipt_source: str = ""
     budget: Optional[int] = None
     info: bool = False
     schedule_version: str = SCHEDULE_VERSION
@@ -678,6 +1036,19 @@ def configuration_hash(start: StreamStart) -> str:
             }
             for family in sorted(start.families, key=lambda family: family.family_id)
         ]
+    # And the shapes it admits an environment's own bodies under, where it admits any. They are
+    # folded in only where they are declared, on the terms the profile is: a generation composed
+    # before there was a contract to declare hashed exactly the keys above, and a formula that
+    # grew one would refuse every resume of every generation recorded under it.
+    if start.receipt_contracts:
+        declared["receipt_contracts"] = [
+            contract_fields(contract)
+            for contract in sorted(
+                start.receipt_contracts, key=lambda contract: contract.contract_id
+            )
+        ]
+    if start.receipt_source:
+        declared["receipt_source"] = start.receipt_source
     return sha256(canonical_json(declared)).hexdigest()
 
 
@@ -1085,6 +1456,46 @@ class StreamState:
 
 
 @dataclass(frozen=True)
+class SourceProvenance:
+    """What one attempt's committed source was, and which cell of it this row was served.
+
+    It is controller side and never anything an agent is shown. The whole of it is read out of
+    the descriptor the attempt already holds, so a run answers this after its world is gone, its
+    bank is unreachable and its cell store is empty: the descriptor is recorded state and not a
+    blob somebody has to resolve.
+
+    The bindings are what a later reader checks a source against. The hidden execution id is
+    deliberately not among them, as it is not in the descriptor: it is the preimage the seal ids
+    are minted from, and a row is not the place to publish it. What stands in its place is the
+    execution ordinal, which is what the seal id is recomputed with.
+
+    ``canonical_submission_sha256`` is the plain digest of the versioned canonical submission
+    text, and ``kernel_submission_digest`` is the domain separated one over the attempt, the
+    terminal name and those bytes. Two filings with identical canonical text share the first and
+    the bank's own filing digest tells them apart, so neither name stands in for the other here.
+
+    The three selection fields are absent where no selection was made, which is a state rather
+    than a gap: a position the roster gave no payload obligation captures its source, records its
+    grade and delivers nothing, and capture is never conditional on exposure.
+    """
+
+    source_commitment: str
+    bundle_digest: str
+    environment_task_id: str
+    source_attempt_id: str
+    source_seal_id: str
+    execution_ordinal: int
+    canonicalization_version: str
+    renderer_configuration: str
+    canonical_submission_sha256: str
+    kernel_submission_digest: str
+    selected_cell: Optional[str] = None
+    selected_body_reference: Optional[str] = None
+    selected_policy_digest: Optional[str] = None
+    protocol_version: int = PROTOCOL_VERSION
+
+
+@dataclass(frozen=True)
 class AttemptRecord:
     """One attempt as a record: what it was assigned, what it filed, what it scored.
 
@@ -1148,6 +1559,15 @@ class AttemptRecord:
     history recorded, so a row rebuilt from that history says the same thing every time, and they
     are absent on every row whose seal did not end it. None of it is ever shown to a model: a
     message an environment raised with can name what it was grading.
+
+    The last three are the receipt half, and they are three separate facts rather than one. A row
+    names the contract its capture is validated against from the moment the roster resolved it,
+    before anything is sealed and whether or not it will ever deliver a body, so an attempt that
+    has captured nothing yet is still one somebody expects a source from. The provenance arrives
+    with that source and holds the bindings and the selection made from it. And the visible digest
+    is the join to what was committed: the presentation row for this attempt's payload says which
+    bytes the generation stands behind, and a harness reconciling its own transcript compares
+    against that rather than against anything this row could say about the body itself.
     """
 
     attempt_id: str
@@ -1181,6 +1601,9 @@ class AttemptRecord:
     failure_kind: Optional[str] = None
     failure_message: Optional[str] = None
     failure_retry_state: Optional[str] = None
+    receipt_contract_id: Optional[str] = None
+    source_provenance: Optional[SourceProvenance] = None
+    payload_visible_sha256: Optional[str] = None
 
 
 @dataclass(frozen=True)
@@ -1230,11 +1653,16 @@ class GenerationRecords:
     second, and the pair describes a generation that never existed in either state. Asked here,
     both halves are read off the one projection, so a row and the commitments beside it are the
     same run at the same point.
+
+    The operation failures are the third list, read off that same moment for the same reason: an
+    attempt whose evidence went missing reads as delivered in one answer and as refused in
+    another, and which of the two is true is a question about one point in the run.
     """
 
     attempts: List[AttemptRecord]
     presentations: List[PresentedMessage]
     protocol_version: int = PROTOCOL_VERSION
+    operation_failures: List[OperationFailure] = field(default_factory=list)
 
 
 @dataclass(frozen=True)
@@ -1261,6 +1689,17 @@ class SealAttemptInput:
     ``blob_root`` is where the environment installs the submission bytes it captured, so the
     reference it returns names an object a later event may cite. A generation without a store
     gets the reference anyway and nothing can be read back under it.
+
+    ``execution_ordinal`` is which execution of this generation is asking. It is what a
+    descriptor carries in place of the hidden execution id, so a workflow can recompute the seal
+    id its own start implies rather than being handed the identity it is checking against. Minus
+    one is the value a caller composed before there was one to send, and no source is published
+    under it.
+
+    ``receipt_contract`` is the registered shape this generation admits an environment's own
+    bodies under. It is absent by default, and an environment given none publishes no descriptor
+    at all: a generation that declared no contract is served exactly as it was before there was
+    one to declare.
     """
 
     attempt_id: str
@@ -1269,6 +1708,8 @@ class SealAttemptInput:
     canonicalization_version: str
     native_arguments: Dict[str, Any] = field(default_factory=dict)
     blob_root: Optional[str] = None
+    execution_ordinal: int = -1
+    receipt_contract: Optional[ReceiptContract] = None
     protocol_version: int = PROTOCOL_VERSION
 
 
@@ -1279,6 +1720,24 @@ class SealAttemptResult:
     ``canonical_submission_text`` is the byte string the digest covers. It is carried inline
     because a kernel submission is small; ``canonical_submission`` names the same bytes by
     hash, which is the form a larger one takes.
+
+    ``source_artifact`` is the descriptor an environment that publishes its own bodies validated
+    and installed before it returned anything, and ``source_commitment`` is the digest of that
+    descriptor's canonical bytes, which is also the address of the blob holding them. No cell
+    body comes back here: the bodies are in the store under the references the descriptor names,
+    and a result that carried one would be handing a body to a transition that has not yet
+    decided which cell this obligation is served. Both are absent on a generation that declared
+    no contract, which is every generation recorded before there was one to declare.
+
+    Those two arrive as whatever was encoded, for the reason every field of a grade result does.
+    A field with a type is a field the decoder has to make that type of, and a descriptor missing
+    a name would fail that decoding rather than the check: the failure happens while the
+    generation is being handed the result, before any code of its own runs, so the generation
+    would fail that step again on every retry and record nothing about why. So the wire shape is
+    permissive and the authority is strict: :func:`shogym.serve.protocol_v2.artifact
+    .read_source_artifact` decides what a descriptor is, at the recorded boundary that reads it,
+    and a mapping carrying an unknown name or missing a declared one ends the attempt with a
+    reason.
     """
 
     attempt_id: str
@@ -1287,6 +1746,8 @@ class SealAttemptResult:
     canonical_submission_text: str
     canonical_submission: BlobRef
     environment_recovery_token: str
+    source_artifact: Any = None
+    source_commitment: Any = ""
     protocol_version: int = PROTOCOL_VERSION
 
 
@@ -1357,6 +1818,124 @@ class GradeAttemptResult:
 
 
 @dataclass(frozen=True)
+class SelectedSourceReference:
+    """The one committed cell an artifact obligation is served, and how to fetch it.
+
+    It is one reference and never the map. All three cells of a source travel in one envelope
+    and a store verifies any digest without knowing which cell it is, so a resolver handed the
+    map could satisfy every hash and size check while returning the cell nobody selected. What
+    crosses is therefore the entry the selection names, with the shape it has to come back in.
+
+    ``masked_body_sha256`` and ``slot_spans`` are the publication's own evidence and the
+    registered geometry it was taken under. They cross so the check that the delivered body is
+    the pair's is made against what was registered rather than against a layout the resolver
+    proposed.
+
+    ``blob_root`` is where the controller keeps the run's objects. It is deployment rather than
+    identity, which is why it is here beside the reference and nowhere inside a digest.
+    """
+
+    source_commitment: str
+    cell: str
+    contract_id: str
+    body_sha256: str
+    body_size: int
+    body_encoding: str
+    media_type: str
+    masked_body_sha256: str
+    slot_spans: Tuple[Tuple[int, int], ...]
+    blob_root: str
+
+
+def source_seal_id(origin: SourceOriginContext, attempt_id: str) -> str:
+    """Return the seal id a source published for ``attempt_id`` under one origin."""
+    return hidden_seal_id(origin.hidden_execution_id, origin.execution_ordinal, attempt_id)
+
+
+def derived_selection(
+    *,
+    source: SourceArtifactManifest,
+    origin: SourceOriginContext,
+    commitment: str,
+    cell: str,
+    policy_digest: str,
+    blob_root: str,
+) -> SelectedSourceReference:
+    """Return the one reference a derivation of this committed source resolves for ``cell``.
+
+    This is the whole of what a derivation takes: committed source evidence, the identity that
+    source was sealed under, an allowed target policy and cell, and where the run keeps its
+    objects. No live world, no canonical answer text, no environment recovery token, no second
+    seal, no grade and no render. That is what makes a candidate for either eligible cell
+    derivable long after the generation that captured the source has continued as new and the
+    world behind it is gone.
+
+    The origin is a parameter rather than a value read off whichever start is calling, and that is
+    the point of the field. A seal id is minted from a hidden execution id, an ordinal and an
+    attempt, and the descriptor carries the ordinal alone; a derivation that recomputed it from
+    its own start would be checking an inherited source against the generation it arrived at
+    rather than against the one that produced it, and would quietly accept a source no origin
+    vouches for.
+
+    Everything here refuses rather than repairs. The commitment is recomputed from the
+    descriptor's own canonical bytes, the seal id from the origin, and the cell has to be one an
+    arm may be served, declared by an artifact policy and admitted by the source's own contract.
+    The oracle is refused at the first of those: it is named by the descriptor, retained with the
+    rest, and is not a cell any derivation resolves.
+    """
+    check_source_artifact(source)
+    if commitment != source_commitment(source):
+        raise WireFormatError(
+            "a derivation names a source commitment other than the one the descriptor's own "
+            "canonical bytes hash to"
+        )
+    if source.source_seal_id != source_seal_id(origin, source.source_attempt_id):
+        raise WireFormatError(
+            f"the source for attempt {source.source_attempt_id} was sealed under another hidden "
+            "execution or another ordinal than the origin this derivation was given"
+        )
+    if source.execution_ordinal != origin.execution_ordinal:
+        raise WireFormatError(
+            f"this source names the execution ordinal {source.execution_ordinal} and its origin "
+            f"names {origin.execution_ordinal}"
+        )
+    if cell not in ELIGIBLE_CELLS:
+        raise WireFormatError(
+            f"an arm is served {sorted(ELIGIBLE_CELLS)} and this derivation asked for {cell!r}"
+        )
+    policy = POLICIES.get(policy_digest)
+    if policy is None or policy.exposure != ARTIFACT or cell not in policy.cells:
+        raise WireFormatError(
+            f"a committed cell is delivered by a policy this build implements that declares "
+            f"{cell!r}, and this derivation named {policy_digest[:16]!r}"
+        )
+    contract = source.receipt_contract
+    if (policy_digest, cell) not in contract.cells:
+        raise WireFormatError(
+            f"the contract {contract.contract_id} admits {[cell for _d, cell in contract.cells]} "
+            f"and this derivation asked for {cell!r} under a policy it does not admit"
+        )
+    if not blob_root:
+        raise WireFormatError(
+            "a committed cell is an object of the run's own store, and this derivation was given "
+            "no store to resolve it in"
+        )
+    reference = source.cells[cell]
+    return SelectedSourceReference(
+        source_commitment=commitment,
+        cell=cell,
+        contract_id=contract.contract_id,
+        body_sha256=reference.sha256,
+        body_size=reference.size,
+        body_encoding=contract.body_encoding,
+        media_type=reference.media_type,
+        masked_body_sha256=source.pair_parity.masked_body_sha256,
+        slot_spans=mask_spans(contract),
+        blob_root=blob_root,
+    )
+
+
+@dataclass(frozen=True)
 class GeneratePayloadBundleInput:
     """Build every candidate this obligation might deliver, before the acknowledgement.
 
@@ -1370,16 +1949,23 @@ class GeneratePayloadBundleInput:
     present only where the resolved policy publishes it. A blinded renderer is not given a grade
     to withhold: it is handed a request with no grade in it, so leaking one is not a discipline
     it keeps but a value it does not have.
+
+    ``selected`` is the committed cell an artifact policy resolves, and it is the whole of what
+    such a request carries about the source. The canonical submission text is empty under one and
+    the grade is absent: an artifact body is copied rather than rendered, so a route that needed
+    the filing's text would be underivable once the generation had continued and the text had
+    stopped crossing.
     """
 
     attempt_id: str
     payload_position: int
     payload_message_id: str
     submission_digest: str
-    canonical_submission_text: str
+    canonical_submission_text: str = ""
     policy_digest: str = ""
     cell: str = ""
     public_grade: Optional[PublicGrade] = None
+    selected: Optional[SelectedSourceReference] = None
     protocol_version: int = PROTOCOL_VERSION
 
 
@@ -1393,6 +1979,17 @@ class PayloadCandidate:
     asked for one refuses the candidate instead of serving whatever came back under an honest
     label. Both are empty where the request carried no policy, which is what a replayed legacy
     result looks like.
+
+    ``source_commitment``, ``body_reference`` and the two resolver fields are the same echo for a
+    body that was resolved rather than rendered: which source it came out of, which committed
+    entry was read, and which implementation read it. They are empty on every candidate a
+    renderer built from a projection, which is what a historical scalar result carries, and under
+    an artifact policy the inner hash is required to be that body reference, so the bytes that
+    came back are the bytes the source committed.
+
+    This is the candidate a generation keeps and carries, so its values are the validated ones.
+    What an Activity returns is :class:`PayloadCandidateResult`, which carries those four as they
+    were encoded; the strict reader at the seal boundary is what makes this record of one.
     """
 
     cell: str
@@ -1404,6 +2001,45 @@ class PayloadCandidate:
     visible_byte_count: int
     renderer_version: str = ""
     policy_digest: str = ""
+    source_commitment: str = ""
+    body_reference: str = ""
+    resolver_id: str = ""
+    resolver_version: str = ""
+
+
+@dataclass(frozen=True)
+class PayloadCandidateResult:
+    """One candidate as an Activity result carries it, before anything has read it.
+
+    It is the record above written for the wire, and it exists because the two boundaries want
+    opposite things. What a generation keeps and carries is typed: the values have been compared
+    against the policy this obligation was resolved to and against the source it was selected
+    from, so a carried candidate holding anything else is a record this build never wrote. What
+    comes back from a Worker has been compared against nothing yet.
+
+    So the four resolved values arrive as whatever was encoded, the way the seal result carries
+    its own descriptor. A field with a type is a field the decoder has to make that type of, and
+    a mapping written where a digest belongs would fail that decoding while the generation was
+    being handed the result, before any code of its own ran: the Workflow Task would fail on
+    every retry, the seal would never be answered, and the record would say nothing about why.
+    The nine values beside them are the ones this route inherited and they keep the types they
+    had. :func:`shogym.serve.protocol_v2.kernel.workflow._read_candidate` is what makes a
+    candidate of this, at the recorded boundary the rest of the result is checked at.
+    """
+
+    cell: str
+    renderer_id: str
+    match_group: str
+    body: str
+    inner_sha256: str
+    visible_sha256: str
+    visible_byte_count: int
+    renderer_version: str = ""
+    policy_digest: str = ""
+    source_commitment: Any = ""
+    body_reference: Any = ""
+    resolver_id: Any = ""
+    resolver_version: Any = ""
 
 
 @dataclass(frozen=True)
@@ -1418,7 +2054,7 @@ class PayloadBundle:
     attempt_id: str
     payload_position: int
     submission_digest: str
-    candidates: List[PayloadCandidate]
+    candidates: List[PayloadCandidateResult]
     protocol_version: int = PROTOCOL_VERSION
 
 

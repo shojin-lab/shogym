@@ -108,6 +108,8 @@ from shogym.serve.protocol_v2.reader import (
     RunRecords,
     format_records,
     read_records,
+    receipt_availability,
+    receipt_lifecycle,
     write_records,
 )
 from shogym.serve.protocol_v2.rundir import create_run_directory
@@ -474,6 +476,20 @@ def field_names() -> List[str]:
     return [field.name for field in dataclasses.fields(AttemptRecord)]
 
 
+def exported_keys() -> List[str]:
+    """Every key one exported line holds: the record's own fields, then the two receipt axes."""
+    return [*field_names(), "receipt_lifecycle", "receipt_availability"]
+
+
+def exported_row(record: AttemptRecord) -> Dict[str, Any]:
+    """One record as its exported line reads, for a run that recorded no operation failure."""
+    return {
+        **dataclasses.asdict(record),
+        "receipt_lifecycle": receipt_lifecycle(record),
+        "receipt_availability": receipt_availability(record, []),
+    }
+
+
 def by_id(records: List[AttemptRecord]) -> Dict[str, AttemptRecord]:
     return {record.attempt_id: record for record in records}
 
@@ -774,8 +790,8 @@ async def test_the_file_a_read_leaves_behind_holds_exactly_those_rows(
     assert path == tmp_path / RECORDS_FILE
 
     rows = [json.loads(line) for line in path.read_text(encoding="utf-8").splitlines()]
-    assert rows == [dataclasses.asdict(record) for record in records]
-    assert [list(row) for row in rows] == [field_names()] * len(records)
+    assert rows == [exported_row(record) for record in records]
+    assert [list(row) for row in rows] == [exported_keys()] * len(records)
 
     note = (tmp_path / NOTE_FILE).read_text(encoding="utf-8")
     assert "derived view" in note
@@ -1024,7 +1040,7 @@ async def test_the_file_explains_a_row_whose_seal_failed(
     path = write_records(RunRecords(root=tmp_path, workflow_id=WORKFLOW_ID, records=records))
     lines = path.read_text(encoding="utf-8").splitlines()
     failed, untouched = [json.loads(line) for line in lines]
-    assert list(failed) == field_names()
+    assert list(failed) == exported_keys()
     assert failed["final_failure"] == "seal_failed"
     assert failed["failure_activity"] == GRADE_ATTEMPT
     assert failed["failure_kind"] == "NoRubricForThisTask"
@@ -1092,7 +1108,7 @@ async def test_a_run_directory_is_read_out_of_the_authority_the_manifest_names(
     # The rows the history answered with, and none of what the file said before this.
     assert write_records(first) == forged
     rows = [json.loads(line) for line in forged.read_text(encoding="utf-8").splitlines()]
-    assert rows == [dataclasses.asdict(record) for record in served]
+    assert rows == [exported_row(record) for record in served]
 
     async with durable_client(run_directory=root) as client:
         async with stream_worker(client):

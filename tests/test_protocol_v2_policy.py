@@ -302,7 +302,13 @@ def test_a_policy_is_named_by_the_bytes_that_say_what_it_is() -> None:
     # The placeholder is how a recorded history is read and never something a new run may ask
     # for. The two concealing policies are ones a run may ask for, and only an experiment may.
     assert LEGACY_PLACEHOLDER_V1.policy_name not in SELECTABLE
-    assert set(SELECTABLE) == {"honest-v1", "blinded-receipt-v1", "placebo-receipt-v1"}
+    assert set(SELECTABLE) == {
+        "honest-v1",
+        "blinded-receipt-v1",
+        "placebo-receipt-v1",
+        "graded-receipt-artifact-v1",
+        "placebo-receipt-artifact-v1",
+    }
     # The placebo is a record of its own rather than a second name for the concealed cell: two
     # registrations are what a family's byte count is a check over, and one is not.
     assert policy_digest(PLACEBO_RECEIPT_V1) != policy_digest(BLINDED_RECEIPT_V1)

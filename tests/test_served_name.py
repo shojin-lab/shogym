@@ -503,7 +503,7 @@ async def test_no_platform_name_reaches_the_model_in_a_refusal() -> None:
     appended where a refusal is built is a name this test sees: nothing here re-encodes the
     record for itself and then checks its own encoding.
 
-    One code is reachable without a stream behind the transport, so the other fourteen are swept
+    One code is reachable without a stream behind the transport, so the other fifteen are swept
     through the same function that built the one above. The whole body is checked rather than the
     code alone, because a refusal that grew an explanatory sentence naming the platform would
     carry the name there.
@@ -523,7 +523,10 @@ async def test_no_platform_name_reaches_the_model_in_a_refusal() -> None:
     assert offences("refusal", answered) == []
     assert json.loads(answered[0])["kind"] == "protocol_error"
     bodies = {code: str(_refusal(code)) for code in sorted(PROTOCOL_ERROR_CODES)}
-    assert len(bodies) == 15
+    assert len(bodies) == 16
+    # The newest of them is the one a delivery refuses with when the bytes it depends on are gone.
+    # It is a bare token and this is where that is swept like every other refusal the model reads.
+    assert "evidence_unavailable" in bodies
     assert offences("refusals", bodies) == []
 
 

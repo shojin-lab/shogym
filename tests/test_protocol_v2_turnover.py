@@ -70,7 +70,7 @@ from shogym.serve.protocol_v2 import (  # noqa: E402
     TerminalMetadata,
 )
 from shogym.serve.protocol_v2.kernel import (  # noqa: E402
-    CARRIER_SCHEMA_VERSION,
+    CARRIER_SCHEMA_VERSIONS,
     STEP_CAP,
     STREAM_TASK_QUEUE,
     BlobsVerified,
@@ -116,6 +116,7 @@ from shogym.serve.protocol_v2.kernel.messages import (  # noqa: E402
     GradeAttemptInput,
     GradeAttemptResult,
     VerifyBlobsInput,
+    carrier_version,
     pack_carrier,
     unpack_carrier,
 )
@@ -250,7 +251,11 @@ def _a_carrier(start: StreamStart, **overrides: Any) -> StreamCarry:
     )
     if overrides:
         projection = replace(projection, **overrides)
-    return pack_carrier(projection, default_converter().payload_converter)
+    return pack_carrier(
+        projection,
+        default_converter().payload_converter,
+        version=carrier_version(start, projection),
+    )
 
 
 def _unpacked(carry: StreamCarry) -> CarriedProjection:
@@ -795,8 +800,11 @@ def test_the_carrier_packs_losslessly_and_writes_the_same_bytes_every_time() -> 
         ],
     )
     converter = default_converter().payload_converter
-    packed = pack_carrier(projection, converter)
-    assert packed == pack_carrier(projection, converter), "one projection packs to one string"
+    version = carrier_version(start, projection)
+    packed = pack_carrier(projection, converter, version=version)
+    assert packed == pack_carrier(projection, converter, version=version), (
+        "one projection packs to one string"
+    )
     assert unpack_carrier(packed, converter) == projection
     with pytest.raises(Exception, match="reads"):
         unpack_carrier(replace(packed, encoding="something-else.v9"), converter)
@@ -3961,5 +3969,5 @@ def test_a_carrier_this_code_cannot_read_is_refused_whole(
     with pytest.raises(ApplicationError, match="version"):
         generation._continued = True
         generation._restore(
-            replace(carrier, carrier_schema_version=CARRIER_SCHEMA_VERSION - 1)
+            replace(carrier, carrier_schema_version=max(CARRIER_SCHEMA_VERSIONS) + 1)
         )

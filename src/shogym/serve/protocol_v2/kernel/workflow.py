@@ -38,10 +38,10 @@ from __future__ import annotations
 
 import asyncio
 import json
-from dataclasses import dataclass, fields, replace
+from dataclasses import dataclass, field as dataclass_field, fields, replace
 from datetime import timedelta
 from hashlib import sha256
-from typing import Any, Dict, List, Optional, Set, Tuple
+from typing import Any, Dict, List, Optional, Sequence, Set, Tuple
 
 from temporalio import workflow
 from temporalio.common import RetryPolicy
@@ -88,7 +88,20 @@ with workflow.unsafe.imports_passed_through():
         terminal_request_identity,
         visible_bytes,
     )
+    from shogym.serve.protocol_v2.artifact import (
+        ELIGIBLE_CELLS,
+        ReceiptContract,
+        SourceArtifactManifest,
+        check_receipt_contracts,
+        manifest_fields,
+        mask_spans,
+        masked_body,
+        payload_wire_count,
+        read_source_artifact,
+        source_commitment,
+    )
     from shogym.serve.protocol_v2.kernel.activities import (
+        GENERATE_PAYLOAD_BUNDLE,
         generate_payload_bundle_activity,
         grade_attempt_activity,
         seal_attempt_activity,
@@ -96,12 +109,26 @@ with workflow.unsafe.imports_passed_through():
     )
     from shogym.serve.protocol_v2.kernel.messages import (
         ABANDONED,
-        CARRIER_SCHEMA_VERSION,
+        CARRIER_SCHEMA_VERSIONS,
+        CONTINUED_FIRST_DELIVERY,
+        CONTRACT_DRIFT,
+        CORRUPT_EVIDENCE,
         DEADLINE,
         FINAL_FAILURE_REASONS,
+        OPERATION_OUTCOMES,
+        OPERATION_PHASES,
+        OPERATION_REASONS,
+        OWNERSHIP_CLAIM,
+        PAYLOAD_OFFER,
+        RECOVERED_OPERATION,
+        REFUSED_OPERATION,
         SEAL_FAILED,
         SEAL_RENDERER,
         SEAL_UNUSABLE,
+        SOURCE_PUBLICATION,
+        UNAVAILABLE_EVIDENCE,
+        UNRECOVERABLE_OPERATION,
+        WRONG_SOURCE,
         AttemptFinalized,
         AttemptRecord,
         AnsweredUpdate,
@@ -121,13 +148,18 @@ with workflow.unsafe.imports_passed_through():
         GradeAttemptInput,
         GradeAttemptResult,
         OfferedMessage,
+        OperationFailure,
         OwnershipClaim,
         OwnershipReceipt,
         PayloadCandidate,
+        PayloadCandidateResult,
         PresentedMessage,
         QueueClosed,
         SealAttemptInput,
         SealRequest,
+        SelectedSourceReference,
+        SourceOriginContext,
+        SourceProvenance,
         StreamCarry,
         StreamOutcome,
         StreamStart,
@@ -136,13 +168,22 @@ with workflow.unsafe.imports_passed_through():
         VerifyBlobsInput,
         Writer,
         assignments_for,
+        carrier_version,
         configuration_hash,
+        continuation_argument,
+        derived_selection,
         hidden_seal_id,
+        origin_fields,
+        ownership_claim_operation_identity,
+        read_source_origin,
+        resolved_echo,
+        source_seal_id,
         CarriedProjection,
         pack_carrier,
         unpack_carrier,
     )
     from shogym.serve.protocol_v2.policy import (
+        ARTIFACT,
         DELIVER,
         HONEST,
         KERNEL_STAND_IN_GRADE,
@@ -188,6 +229,12 @@ PRESENTED = "presented"
 # in neither tuple and Done reads it as resolved.
 LIVE_ATTEMPT = (PLANNED, TASK_OFFERED, ACTIVE, SEALING, SEALED)
 UNFULFILLED_OBLIGATION = (ASSIGNED, MATERIALIZED, ELIGIBLE, OFFERED)
+
+# The states an obligation keeps its candidate in, which are the states an offer of it could
+# still carry one. They are what the carrier writes the bytes for and what a restore requires
+# them in: an obligation that has been presented, or that ended without being rendered, drops the
+# body and will never be offered again, and one that has not been materialized has none yet.
+_OFFERABLE_OBLIGATION = (MATERIALIZED, ELIGIBLE, OFFERED)
 
 # The analysis outcome a finalized attempt is assigned. An attempt that was ended rather than
 # filed has nothing to grade, and the floor is what the outcome is fixed at instead.
@@ -323,6 +370,21 @@ assert TURNOVER_PAYLOAD_CEILING_BYTES < SERVICE_PAYLOAD_LIMIT_BYTES, (
 # boundary would not.
 _FIRST_ACTIVITY_ORDINAL = 1
 
+# What an Activity that could not produce a receipt's evidence failed as, and which of the four
+# reasons that is. The keys are the types a capture and a resolver declare their refusals under,
+# and a failure outside this table is not an evidence failure at all: a grader that was down, a
+# world that timed out and a candidate this generation would not vouch for each end the attempt
+# with the fields that ending already carries and leave no row here.
+_EVIDENCE_REASONS: Dict[str, str] = {
+    "WrongSource": WRONG_SOURCE,
+    "ContractDrift": CONTRACT_DRIFT,
+    "ReceiptContractRefused": CONTRACT_DRIFT,
+    "CorruptEvidence": CORRUPT_EVIDENCE,
+    "PairRefused": CORRUPT_EVIDENCE,
+    "SourceArtifactRefused": CORRUPT_EVIDENCE,
+    "UnavailableEvidence": UNAVAILABLE_EVIDENCE,
+}
+
 
 class StreamProtocolError(ApplicationError):
     """A refusal carrying one code from the protocol's closed set.
@@ -452,6 +514,30 @@ class _Attempt:
     failure_kind: Optional[str] = None
     failure_message: Optional[str] = None
     failure_retry_state: Optional[str] = None
+    # The source this attempt's seal committed, and the selection made out of it. The descriptor
+    # is held whole rather than by digest, because everything a later derivation reads is inside
+    # it and nothing may have to open a store to find out what this attempt's cells were. The
+    # commitment names its canonical bytes and the origin is the identity its seal id was minted
+    # under, which is this generation's own here and is a field rather than an assumption so that
+    # an inherited source can be checked against the generation that produced it.
+    source_artifact: Optional[SourceArtifactManifest] = None
+    source_commitment: Optional[str] = None
+    source_origin: Optional[SourceOriginContext] = None
+    # Which committed cell this attempt's obligation was served, by whose policy, under which
+    # contract, and the reference the resolver was given. It lives on the attempt rather than on
+    # the obligation because an obligation keeps a candidate only while one could still be
+    # offered: a reference hung on the candidate alone would be dropped with the body at the first
+    # boundary after a presentation, and the selection has to outlive the bytes.
+    selected_cell: Optional[str] = None
+    selected_body_reference: Optional[str] = None
+    selected_policy_digest: Optional[str] = None
+    receipt_contract_id: Optional[str] = None
+    # The objects this attempt's own committed presentations cited, in commit order. A claim reads
+    # the store for every one of them, and the flat inventory it reads them out of cannot say
+    # which attempt required which object, so the association is kept here: a claim refused over a
+    # presentation reference is refused over evidence this attempt needs, and the row it leaves
+    # names it. A generation that declares no receipt contract keeps none of this.
+    presentation_references: List[str] = dataclass_field(default_factory=list)
 
 
 # The attempt fields one execution hands the next, taken from the carried row rather than listed
@@ -460,6 +546,13 @@ class _Attempt:
 _CARRIED_ATTEMPT_FIELDS = tuple(
     row.name for row in fields(CarriedAttempt) if row.name != "attempt_id"
 )
+# The two that cross as the mappings they were written as rather than as typed values. They are
+# written out here and read back by the strict readers at restore, for the reason the seal result
+# carries its own descriptor the same way: a typed carrier field is one the decoder makes that
+# type of before any code of this generation runs, so a member this build does not declare is
+# dropped there and a size written as a float is rounded there, and what restore would then check
+# is the record the decoder repaired rather than the record that crossed.
+_RAW_ATTEMPT_FIELDS = ("source_artifact", "source_origin")
 # The attempt fields that deliberately stay behind, so that a field added later is a choice
 # somebody made rather than a value that quietly stopped crossing.
 _UNCARRIED_ATTEMPT_FIELDS = (
@@ -683,9 +776,24 @@ class StreamWorkflow:
             for row in start.dispositions
             if row.branch_slot == SINGLETON_SLOT and row.kind == DELIVER
         }
+        # Every row of the branch this generation serves, delivering or withholding. The seal
+        # reads this one rather than the deliveries: which contract a capture is validated
+        # against is named in the row, and an attempt that captures and delivers nothing has a
+        # row that says so and no delivery at all.
+        self._resolved: Dict[str, PayloadDisposition] = {
+            row.attempt_id: row
+            for row in start.dispositions
+            if row.branch_slot == SINGLETON_SLOT
+        }
         # The matched arms this generation's rows are cells of, by the name a row claims.
         self._families: Dict[str, MatchedFamily] = {
             family.family_id: family for family in start.families
+        }
+        # And the receipt contracts declared beside them, in the same column a row names a family
+        # in. The two lists hold distinct names, which is checked where the generation is, so a
+        # row's column names one record or the other and never both.
+        self._contracts: Dict[str, ReceiptContract] = {
+            contract.contract_id: contract for contract in start.receipt_contracts
         }
         self._pending: Optional[_Pending] = None
         self._pull_requests: Dict[str, _Bound] = {}
@@ -719,7 +827,7 @@ class StreamWorkflow:
         # rather than a convenience installed beside the run, and a resume that cannot read them
         # back exactly is refused like any other unverifiable reference.
         self._committed_blobs: List[str] = (
-            descriptor_digests(start.dispositions, start.families)
+            descriptor_digests(start.dispositions, start.families, start.receipt_contracts)
             if start.blob_root is not None
             else []
         )
@@ -785,6 +893,25 @@ class StreamWorkflow:
         # working towards one from a generation that has stopped.
         self._verifying = 0
         self._verification_batches = 0
+        # The payload obligations whose evidence this execution has verified, keyed by attempt.
+        # It is per execution and it is never carried: a set that crossed would say an object was
+        # there in an execution that has ended, which is exactly the claim a resume exists to stop
+        # anyone making. An obligation joins it only after its own dependencies verify, at the
+        # publication that installed them or at the check that read them back, so the first offer
+        # of one in a continued execution reads the store and every offer after it is pure. A
+        # single flag would be set by the first receipt and would wave the second through
+        # unchecked, and two receipt obligations in one continued execution is the ordinary case.
+        self._verified_deliveries: Set[str] = set()
+        # Every operation of this generation that could not produce the evidence it depended on,
+        # in commit order. They are rows and not a field: a refusal and the recovery that follows
+        # it each append, so the sequence says what happened rather than only what is true now,
+        # and the latest word about an attempt is the last row naming it. They cross the boundary,
+        # and they are read out of the same query the attempts and the presentations are.
+        self._operation_failures: List[OperationFailure] = []
+        # Which generation an operation of this generation belongs to. It is the workflow's own
+        # identifier, which survives every boundary and is not the identifier of a child a fork
+        # will create, so a row a child inherits reads as the parent's operation.
+        self._generation_id = workflow.info().workflow_id
         # Every accepted Update this generation has completed, by the exact identifier it was
         # answered under. It is the whole of what a repeated identifier is answered with, and it
         # is kept for as long as the generation runs rather than for one execution: an owner
@@ -839,10 +966,10 @@ class StreamWorkflow:
                 "a generation started fresh was handed a carried projection, and carrying one "
                 "is legal only where an execution continues another"
             )
-        if carry.carrier_schema_version != CARRIER_SCHEMA_VERSION:
+        if carry.carrier_schema_version not in CARRIER_SCHEMA_VERSIONS:
             raise _refuse_carrier(
                 f"the carried projection is version {carry.carrier_schema_version} and this "
-                f"code reads version {CARRIER_SCHEMA_VERSION}"
+                f"code reads versions {list(CARRIER_SCHEMA_VERSIONS)}"
             )
         try:
             projection = unpack_carrier(carry, workflow.payload_converter())
@@ -850,7 +977,7 @@ class StreamWorkflow:
                 raise _refuse_carrier(
                     "the carried projection was composed against another generation"
                 )
-            self._apply(projection)
+            self._apply(projection, _check_carried_receipts(self._start, projection))
         except ApplicationError:
             raise
         except Exception as unreadable:  # noqa: BLE001 - an unreadable carrier is refused whole
@@ -858,12 +985,16 @@ class StreamWorkflow:
                 f"the carried projection could not be read: {unreadable}"
             ) from unreadable
 
-    def _apply(self, carry: CarriedProjection) -> None:
+    def _apply(self, carry: CarriedProjection, read: Dict[str, _CarriedSource]) -> None:
         """Write the carried projection over the state the start alone rebuilt.
 
         The order is the order the fields depend on each other in: the issued identifiers are
         derived from the hidden ordinal, so the ordinal is taken first and the identifiers are
         rebuilt from it rather than carried. Everything else is written where it belongs.
+
+        ``read`` is the descriptor and the origin the checks above read out of the mapping each
+        crossed as. They are taken from there rather than decoded again, so what is installed on
+        the attempt is exactly what was validated rather than a second reading of the same bytes.
         """
         self._ownership_epoch = carry.ownership_epoch
         self._fencing_token_hash = carry.fencing_token_hash
@@ -881,10 +1012,19 @@ class StreamWorkflow:
         self._activity_ordinal = carry.activity_ordinal
         self._verification_batches = carry.verification_batches
         self._turnovers = carry.turnovers
+        self._operation_failures = list(carry.operation_failures)
         for row in carry.attempts:
             attempt = self._attempts[row.attempt_id]
             for name in _CARRIED_ATTEMPT_FIELDS:
-                setattr(attempt, name, getattr(row, name))
+                if name in _RAW_ATTEMPT_FIELDS:
+                    continue
+                carried = getattr(row, name)
+                # A list is copied rather than adopted, so that appending to the attempt's own
+                # never reaches back into the value the carrier was read as.
+                setattr(attempt, name, list(carried) if isinstance(carried, list) else carried)
+            source = read[row.attempt_id]
+            attempt.source_artifact = source.manifest
+            attempt.source_origin = source.origin
         for owed in carry.obligations:
             obligation = self._obligations[owed.attempt_id]
             obligation.state = owed.state
@@ -1338,15 +1478,21 @@ class StreamWorkflow:
         supports, the launcher reads the marker and says so, and nothing about the refusal is
         visible to the agent.
         """
-        replaced = replace(self._start, carry=self._carry())
-        encoded = workflow.payload_converter().to_payloads([replaced])[0].ByteSize()
+        projection = self._projection()
+        version = carrier_version(self._start, projection)
+        replaced = replace(
+            self._start,
+            carry=pack_carrier(projection, workflow.payload_converter(), version=version),
+        )
+        argument = continuation_argument(replaced, workflow.payload_converter(), version)
+        encoded = workflow.payload_converter().to_payloads([argument])[0].ByteSize()
         if encoded > TURNOVER_PAYLOAD_CEILING_BYTES:
             self._turnover_refused = CARRIER_TOO_LARGE
             self._turnover_refused_bytes = encoded
             return
-        workflow.continue_as_new(replaced)
+        workflow.continue_as_new(argument)
 
-    def _carry(self) -> StreamCarry:
+    def _projection(self) -> CarriedProjection:
         """Write out everything the next execution has to find, in canonical order.
 
         Every unordered collection here is sorted, and every ordered one keeps its order. The
@@ -1358,91 +1504,101 @@ class StreamWorkflow:
         is not repeated, because the start rides beside this. What a legal boundary forbids is
         not carried, because there is none of it to carry. And the identifiers already issued
         are not carried, because they are derivable from the ordinal that is.
+
+        The value is built here and written outside, because what version it is written under is
+        a question about the generation's configuration and its evidence together, and the writer
+        answers it from both.
         """
-        return pack_carrier(
-            CarriedProjection(
-                configuration_hash=self._configuration_hash,
-                ownership_epoch=self._ownership_epoch,
-                fencing_token_hash=self._fencing_token_hash,
-                ownership_claims=self._ownership_claims(),
-                consumer_id=self._consumer_id,
-                claim_epoch=self._claim_epoch,
-                cursor=self._cursor,
-                queue_closed=self._queue_closed,
-                hidden_ordinal=self._hidden_ordinal,
-                seal_ordinal=self._seal_ordinal,
-                wait_count=self._wait_count,
-                wait_reasons=dict(sorted(self._wait_reason_counts().items())),
-                offer_count=self._offer_count(),
-                eligibility_count=self._eligibility_count(),
-                handed_out_attempt_ids=sorted(self._handed_out()),
-                activity_ordinal=self._activity_ordinal,
-                verification_batches=self._verification_batches,
-                attempts=[
-                    CarriedAttempt(
-                        attempt_id=attempt_id,
-                        **{name: getattr(attempt, name) for name in _CARRIED_ATTEMPT_FIELDS},
-                    )
-                    for attempt_id, attempt in sorted(self._attempts.items())
-                ],
-                obligations=[
-                    CarriedObligation(
-                        attempt_id=attempt_id,
-                        state=obligation.state,
-                        materialized=obligation.materialized,
-                        # The bytes stay only while an offer could still carry them. An obligation
-                        # that has been presented, or that ended without being rendered, will never
-                        # be offered again, and its candidate is the largest thing in here.
-                        candidate=(
-                            obligation.candidate
-                            if obligation.state in (MATERIALIZED, ELIGIBLE, OFFERED)
-                            else None
-                        ),
-                    )
-                    for attempt_id, obligation in sorted(self._obligations.items())
-                ],
-                presented=list(self._presented.values()),
-                committed_blobs=sorted(set(self._committed_blobs)),
-                pull_requests=self._carried_bindings(self._pull_requests),
-                info_requests=self._carried_bindings(self._info_requests),
-                terminal_requests=self._carried_bindings(self._terminal_requests),
-                finalize_requests=[
-                    CarriedFinalization(
-                        request_id=request_id,
-                        identity=bound.identity,
-                        receipt=bound.receipt,
-                    )
-                    for request_id, bound in sorted(self._finalize_requests.items())
-                ],
-                attestations=[
-                    CarriedAttestation(
-                        attestation_id=attestation_id,
-                        identity=identity,
-                        ack=self._attestations[attestation_id],
-                    )
-                    for attestation_id, identity in sorted(self._attestation_identities.items())
-                ],
-                journal=[
-                    [
-                        update_id,
-                        answer.handler,
-                        answer.epoch,
-                        answer.kind,
-                        answer.row,
-                        answer.code,
-                        answer.type_name,
-                        answer.message,
-                        # A recipe carries an offer instead of its bytes. The bytes are dropped
-                        # here and made again at restore out of what the start already holds,
-                        # which is what keeps a whole roster of offers from being written twice.
-                        "" if answer.recipe else answer.value,
-                        answer.recipe,
-                    ]
-                    for update_id, answer in sorted(self._journal.items())
-                ],
-                turnovers=self._turnovers + 1,
-            ),
-            workflow.payload_converter(),
+        return CarriedProjection(
+            configuration_hash=self._configuration_hash,
+            ownership_epoch=self._ownership_epoch,
+            fencing_token_hash=self._fencing_token_hash,
+            ownership_claims=self._ownership_claims(),
+            consumer_id=self._consumer_id,
+            claim_epoch=self._claim_epoch,
+            cursor=self._cursor,
+            queue_closed=self._queue_closed,
+            hidden_ordinal=self._hidden_ordinal,
+            seal_ordinal=self._seal_ordinal,
+            wait_count=self._wait_count,
+            wait_reasons=dict(sorted(self._wait_reason_counts().items())),
+            offer_count=self._offer_count(),
+            eligibility_count=self._eligibility_count(),
+            handed_out_attempt_ids=sorted(self._handed_out()),
+            activity_ordinal=self._activity_ordinal,
+            verification_batches=self._verification_batches,
+            attempts=[
+                CarriedAttempt(
+                    attempt_id=attempt_id,
+                    **{
+                        name: getattr(attempt, name)
+                        for name in _CARRIED_ATTEMPT_FIELDS
+                        if name not in _RAW_ATTEMPT_FIELDS
+                    },
+                    **_carried_source(attempt),
+                )
+                for attempt_id, attempt in sorted(self._attempts.items())
+            ],
+            obligations=[
+                CarriedObligation(
+                    attempt_id=attempt_id,
+                    state=obligation.state,
+                    materialized=obligation.materialized,
+                    # The bytes stay only while an offer could still carry them. An obligation
+                    # that has been presented, or that ended without being rendered, will never
+                    # be offered again, and its candidate is the largest thing in here.
+                    candidate=(
+                        obligation.candidate
+                        if obligation.state in _OFFERABLE_OBLIGATION
+                        else None
+                    ),
+                )
+                for attempt_id, obligation in sorted(self._obligations.items())
+            ],
+            presented=list(self._presented.values()),
+            committed_blobs=sorted(set(self._committed_blobs)),
+            pull_requests=self._carried_bindings(self._pull_requests),
+            info_requests=self._carried_bindings(self._info_requests),
+            terminal_requests=self._carried_bindings(self._terminal_requests),
+            finalize_requests=[
+                CarriedFinalization(
+                    request_id=request_id,
+                    identity=bound.identity,
+                    receipt=bound.receipt,
+                )
+                for request_id, bound in sorted(self._finalize_requests.items())
+            ],
+            attestations=[
+                CarriedAttestation(
+                    attestation_id=attestation_id,
+                    identity=identity,
+                    ack=self._attestations[attestation_id],
+                )
+                for attestation_id, identity in sorted(self._attestation_identities.items())
+            ],
+            journal=[
+                [
+                    update_id,
+                    answer.handler,
+                    answer.epoch,
+                    answer.kind,
+                    answer.row,
+                    answer.code,
+                    answer.type_name,
+                    answer.message,
+                    # A recipe carries an offer instead of its bytes. The bytes are dropped
+                    # here and made again at restore out of what the start already holds,
+                    # which is what keeps a whole roster of offers from being written twice.
+                    "" if answer.recipe else answer.value,
+                    answer.recipe,
+                ]
+                for update_id, answer in sorted(self._journal.items())
+            ],
+            turnovers=self._turnovers + 1,
+            # In commit order, which is the order they were appended in. Sorting them would lose
+            # the one thing the list says that a set of them would not: which refusal a recovery
+            # answered, and which of two refusals of one operation came first.
+            operation_failures=list(self._operation_failures),
         )
 
     def _carried_bindings(self, table: Dict[str, _Bound]) -> List[CarriedBinding]:
@@ -1546,10 +1702,18 @@ class StreamWorkflow:
         self._admit(True, claim=True)
 
     async def _claim_ownership(self, claim: OwnershipClaim) -> OwnershipReceipt:
-        """Check the claim, read the store, and swap the epoch."""
+        """Check the claim, read the store, and swap the epoch.
+
+        The claim is one operation whatever it takes to make it. Its identity is built from the
+        claimant and the epoch it witnessed and from nothing about the transport, so a claim
+        refused over a missing object and the claim that repeats it after a repair, under a fresh
+        fencing token and a different Update, are one operation with two rows rather than two
+        operations with one each.
+        """
         self._check_claim(claim)
+        operation = ownership_claim_operation_identity(claim.claimant_id, claim.previous_epoch)
         if self._committed_blobs:
-            await self._verify_committed_blobs()
+            await self._verify_committed_blobs(operation, claim)
             # The store was read outside this transition, so the claim is checked again on the
             # way back in. A claimant that another one overtook while this read was running
             # loses the swap it witnessed, and the swap below still has no await inside it.
@@ -1579,6 +1743,11 @@ class StreamWorkflow:
                 restored_attempts=restored,
             )
         )
+        # The swap is what recovers a claim that was refused over an object somebody has since
+        # put back. The claim certifies what it verified and nothing beyond it: neither eligible
+        # body is in the set it read, so one can succeed while a selected body is still missing,
+        # and what recovers that delivery is the delivery's own check passing.
+        self._note_recovery(operation, OWNERSHIP_CLAIM, self._ownership_epoch)
         receipt = OwnershipReceipt(
             ownership_epoch=self._ownership_epoch,
             previous_epoch=previous,
@@ -1638,12 +1807,17 @@ class StreamWorkflow:
         and an error afterwards. A new request gets a new selection, but only from a current
         cursor and only when nothing is outstanding: a second request never inherits the first
         one's offer.
+
+        It holds the stream across an await, which one entry path needs: the first offer in this
+        execution of a payload obligation whose attempt carries a committed source reads the
+        store before the bytes are reserved. Every other pull awaits nothing and behaves as it
+        did.
         """
         self._count_update()
         return await self._answering(
             PULL,
             writer.ownership_epoch,
-            _as_awaited(lambda: self._locked(writer, self._pull, request)),
+            lambda: self._locked_await(writer, self._pull, request, writer),
         )
 
     @pull.validator
@@ -2100,7 +2274,9 @@ class StreamWorkflow:
         generation nobody is serving cannot move between two questions anyway.
         """
         return GenerationRecords(
-            attempts=self.attempt_records(), presentations=self.presented_messages()
+            attempts=self.attempt_records(),
+            presentations=self.presented_messages(),
+            operation_failures=list(self._operation_failures),
         )
 
     def _record(self, attempt: _Attempt) -> AttemptRecord:
@@ -2136,9 +2312,19 @@ class StreamWorkflow:
         what this generation watched happen: the failure was reported to this workflow and
         recorded in its history, so a reader holding the row can tell a grader that was down from
         one that refused this task without holding anything else.
+
+        And for a sixth, the source comes with the selection made from it. A row saying which cell
+        it delivered and not which source that cell came out of would be a leg with no arm: the
+        commitment is what two derivations of one source share, and it is the value a reader joins
+        them by. The contract is named beside it whether or not anything has been captured, so an
+        attempt still waiting to seal is legible as one under a contract rather than as a row that
+        predates the question, and the visible digest of what was committed is named beside that,
+        which is what a harness reconciles its own transcript against.
         """
         item = attempt.item
         obligation = self._obligations.get(item.attempt_id)
+        declared = self._capture_contract(item.attempt_id)
+        presented = self._presented.get(item.payload_message_id)
         resolved = next(
             (
                 row
@@ -2186,11 +2372,27 @@ class StreamWorkflow:
             failure_kind=attempt.failure_kind,
             failure_message=attempt.failure_message,
             failure_retry_state=attempt.failure_retry_state,
+            receipt_contract_id=(
+                attempt.receipt_contract_id
+                or (None if declared is None else declared.contract_id)
+            ),
+            source_provenance=_provenance(attempt),
+            payload_visible_sha256=(
+                None if presented is None else presented.visible_bytes_sha256
+            ),
         )
 
     # Pull.
 
-    def _pull(self, request: PullRequest) -> OfferedMessage:
+    async def _pull(self, request: PullRequest, writer: Writer) -> OfferedMessage:
+        """Answer one pull, reading the store only where this execution owes a read.
+
+        A retry of a request this generation already answered is pure: the bytes were reserved
+        for it and neither a moved cursor nor a lost object changes what it is owed. So is a
+        refusal, which is what the exact-outcome journal replays. The one call that reads
+        anything is the first offer in this execution of a payload obligation whose attempt
+        carries a source, and it reads only what that obligation is about to deliver.
+        """
         identity = pull_request_identity(request)
         bound = self._pull_requests.get(request.request_id)
         if bound is not None:
@@ -2203,14 +2405,20 @@ class StreamWorkflow:
             raise StreamProtocolError("invalid_cursor")
         if self._pending is not None:
             raise StreamProtocolError("outstanding_response")
-        return self._select(request.request_id, identity)
+        return await self._select(request.request_id, identity, writer)
 
-    def _select(self, request_id: str, identity: str) -> OfferedMessage:
+    async def _select(self, request_id: str, identity: str, writer: Writer) -> OfferedMessage:
         choice = self._first_eligible()
         if choice is not None:
             kind, attempt_id = choice
             if kind == PAYLOAD:
-                return self._offer_payload(attempt_id, request_id, identity)
+                await self._require_evidence(attempt_id, writer, request_id, identity)
+                offered = self._offer_payload(attempt_id, request_id, identity)
+                # What recovers a refused delivery is this: the same pull, compared by its whole
+                # canonical identity, passing the check it was refused on and being answered.
+                # Putting the bytes back appends nothing, and neither does a claim over them.
+                self._note_recovery(identity, CONTINUED_FIRST_DELIVERY, writer.ownership_epoch)
+                return offered
             return self._offer_task(attempt_id, request_id, identity)
         if self._done_eligible():
             done = Done(message_id=self._start.done_message_id)
@@ -2582,13 +2790,21 @@ class StreamWorkflow:
         is written is read out of what the history recorded and nothing else, so it costs no side
         effect and a replay produces the same words.
         """
+        # Where the batch got to, for the row a failure leaves. The reference this seal selected
+        # exists only while the batch is running, and the recorder is out here, so what the
+        # resolver could not produce is written down as the batch reaches it rather than being
+        # recovered afterwards from state a failed seal never committed.
+        resolving: List[str] = []
         try:
-            return await self._seal_batch(request, attempt, identity, writer)
+            return await self._seal_batch(request, attempt, identity, writer, resolving)
         except StreamProtocolError:
             raise
         except ActivityError as error:
             self._require_writer(writer)
             _note_failure(attempt, error)
+            self._note_capture_failure(
+                attempt, identity, request.metadata.request_id, writer, resolving
+            )
             self._finalize(attempt, SEAL_FAILED)
             raise
         except _UnusableResult as unusable:
@@ -2598,7 +2814,12 @@ class StreamWorkflow:
             raise
 
     async def _seal_batch(
-        self, request: SealRequest, attempt: _Attempt, identity: str, writer: Writer
+        self,
+        request: SealRequest,
+        attempt: _Attempt,
+        identity: str,
+        writer: Writer,
+        resolving: List[str],
     ) -> OfferedMessage:
         metadata = request.metadata
         attempt.state = SEALING
@@ -2620,6 +2841,11 @@ class StreamWorkflow:
             self._start.execution_ordinal,
             attempt.item.attempt_id,
         )
+        # Which shape this attempt's own bodies are admitted under, where its row names one. It
+        # is read before the seal because the capture is bound to the contract at its first
+        # write: an environment given none publishes no source at all, and one given the wrong
+        # one would commit a capture nothing could later republish.
+        contract = self._capture_contract(attempt.item.attempt_id)
         sealed = await workflow.execute_activity(
             seal_attempt_activity,
             SealAttemptInput(
@@ -2629,6 +2855,8 @@ class StreamWorkflow:
                 canonicalization_version=self._start.canonicalization_version,
                 native_arguments=request.native_arguments,
                 blob_root=self._start.blob_root,
+                execution_ordinal=self._start.execution_ordinal,
+                receipt_contract=contract,
             ),
             start_to_close_timeout=_TERMINAL_ACTIVITY_TIMEOUT,
             retry_policy=_ACTIVITY_RETRY,
@@ -2646,6 +2874,11 @@ class StreamWorkflow:
             sealed.canonical_submission_text.encode("utf-8"),
         )
         attempt.finalizer_key = sealed.seal_id
+        # The source, checked against what this generation is rather than against itself. The
+        # descriptor carries the ordinal and not the hidden execution id, so the seal id it names
+        # is recomputed here from this start's own identity: a descriptor cannot hand a
+        # generation the value it is supposed to be checked against.
+        source = self._verified_source(attempt, sealed, contract)
         # The result is read into a shape this generation decided on before anything is compared
         # against it. Nothing about the wire shape is a promise: every field arrives as whatever
         # was encoded, so a result that is not a grade is refused here, at the first line that
@@ -2704,10 +2937,23 @@ class StreamWorkflow:
         # generation under Never nor the one position a roster gave no payload asks a renderer
         # for a candidate. An absent outbox row is not an outbox row nobody reads.
         candidate: Optional[PayloadCandidate] = None
+        selected: Optional[SelectedSourceReference] = None
+        disposition: Optional[PayloadDisposition] = None
         if attempt.item.attempt_id in self._obligations:
             disposition = self._served.get(attempt.item.attempt_id)
             policy = _policy_of(disposition)
             published = self._published(attempt, graded, policy, declared)
+            # Which committed cell this obligation is served, where its policy delivers one. The
+            # selection is the controller's and it is one reference: the store verifies a digest
+            # without knowing which cell it names, so a resolver handed the map could return the
+            # cell nobody selected and satisfy every hash and size check on the way back.
+            selected = self._selected(source, disposition, policy)
+            if selected is not None:
+                # The one object the resolver is about to be asked for, written down before it is
+                # asked. A payload Activity that cannot produce it fails out here, and the row
+                # that records the failure has to name the reference the operation could not
+                # produce rather than an empty list.
+                resolving.append(selected.body_sha256)
             bundle = await workflow.execute_activity(
                 generate_payload_bundle_activity,
                 GeneratePayloadBundleInput(
@@ -2715,10 +2961,13 @@ class StreamWorkflow:
                     payload_position=attempt.item.payload_position,
                     payload_message_id=attempt.item.payload_message_id,
                     submission_digest=attempt.submission_digest,
-                    canonical_submission_text=sealed.canonical_submission_text,
+                    canonical_submission_text=(
+                        "" if selected is not None else sealed.canonical_submission_text
+                    ),
                     policy_digest="" if disposition is None else (disposition.policy_digest or ""),
                     cell="" if disposition is None else (disposition.cell or ""),
                     public_grade=published,
+                    selected=selected,
                 ),
                 start_to_close_timeout=_ACTIVITY_TIMEOUT,
                 retry_policy=_ACTIVITY_RETRY,
@@ -2736,7 +2985,7 @@ class StreamWorkflow:
                 or bundle.submission_digest != attempt.submission_digest
             ):
                 raise _unusable("the candidate bundle is not the one this obligation asked for")
-            candidate = bundle.candidates[0]
+            candidate = _read_candidate(bundle.candidates[0])
             _check_candidate(attempt.item, candidate)
             _check_echo(
                 candidate,
@@ -2745,6 +2994,8 @@ class StreamWorkflow:
                 attempt.item,
                 attempt.submission_digest,
                 published,
+                selected=selected,
+                source=source,
             )
             _check_family(
                 candidate,
@@ -2768,6 +3019,7 @@ class StreamWorkflow:
         attempt.graded_evidence = graded.evidence_sha256
         if graded.evidence_sha256 not in self._committed_blobs:
             self._committed_blobs.append(graded.evidence_sha256)
+        self._commit_source(attempt, source, selected, disposition)
         self._seal_ordinal += 1
         attempt.seal_ordinal = self._seal_ordinal
         attempt.state = SEALED
@@ -2782,6 +3034,245 @@ class StreamWorkflow:
         return self._offer(
             ack, "terminal", metadata.request_id, identity, attempt.item.attempt_id
         )
+
+    def _commit_source(
+        self,
+        attempt: _Attempt,
+        source: Optional[SourceArtifactManifest],
+        selected: Optional[SelectedSourceReference],
+        disposition: Optional[PayloadDisposition],
+    ) -> None:
+        """Write the committed source and the selection onto the attempt, inside the transition.
+
+        The source outlives the candidate, so it is the attempt's state and not the obligation's.
+        The seal builds one candidate and the position may carry none at all, and a generation
+        that kept only the candidate would have a run whose record could say what one leg was told
+        and could not say what it was a leg of. So the descriptor, its commitment, the identity it
+        was sealed under and the selection made from it all become authoritative here, with the
+        score and the acknowledgement.
+
+        Two objects join the inventory a later claim reads the store for: the descriptor's own
+        canonical bytes and the canonical submission it names. The cells are not among them,
+        deliberately. Retention installs all three and keeps them; requiring them at every claim
+        would let one attempt's unselected body block another attempt's delivery, and the body a
+        delivery depends on is checked by the delivery that depends on it.
+
+        The obligation joins this execution's verified set here rather than at the offer. What
+        publication just did was install those objects and read every one of them back, in this
+        execution, which is exactly what the barrier asks of a continued one; the first offer
+        after a boundary finds an empty set and asks again.
+        """
+        if source is None:
+            return
+        attempt.source_artifact = source
+        attempt.source_commitment = source_commitment(source)
+        attempt.source_origin = SourceOriginContext(
+            hidden_execution_id=self._start.hidden_execution_id,
+            execution_ordinal=self._start.execution_ordinal,
+        )
+        attempt.receipt_contract_id = source.receipt_contract.contract_id
+        for reference in (attempt.source_commitment, source.canonical_submission.sha256):
+            if reference not in self._committed_blobs:
+                self._committed_blobs.append(reference)
+        if selected is None or disposition is None:
+            return
+        attempt.selected_cell = selected.cell
+        attempt.selected_body_reference = selected.body_sha256
+        attempt.selected_policy_digest = disposition.policy_digest
+        self._verified_deliveries.add(attempt.item.attempt_id)
+
+    def _capture_contract(self, attempt_id: str) -> Optional[ReceiptContract]:
+        """Return the contract this attempt's capture is validated against, or nothing.
+
+        A receipt-producing attempt names its contract in the same column a row names its
+        matched family in, and a withholding names one too: capture is not conditional on
+        exposure, so an attempt that captures and delivers nothing still has to say which shape
+        its source was published under. A generation that declares no contract asks for no
+        source, and its seal is the seal it always was.
+        """
+        row = self._resolved.get(attempt_id)
+        if row is None or not row.family_id:
+            return None
+        return self._contracts.get(row.family_id)
+
+    def _note_capture_failure(
+        self,
+        attempt: _Attempt,
+        identity: str,
+        request_id: str,
+        writer: Writer,
+        resolving: List[str],
+    ) -> None:
+        """Record a capture that could not produce its evidence, where that is what failed.
+
+        Only an attempt whose row names a contract has a receipt to fail at, so nothing is
+        synthesized for a legacy one, and only a failure that says something about the evidence
+        writes a row: a grader that was down and a world that timed out are the seal's own ending
+        and are described by the fields that ending already carries.
+
+        ``resolving`` is the reference the batch had asked its resolver for, where it got that
+        far. A row for the resolver's own phase names the object the operation could not produce,
+        which is the whole of what a controller has to go and repair; the publication phase names
+        none, because a seal that failed before it returned anything published no reference for
+        this generation to have lost. Neither reaches an agent: the references are controller
+        side, in this generation's own record.
+
+        The outcome is the ending rather than a refusal, because that is what it is. This runs
+        with the finalization that follows it: the attempt is over, there is no acknowledgement,
+        no delivery and no filing that could be sent again, so nothing will ever recover it.
+        """
+        if self._capture_contract(attempt.item.attempt_id) is None:
+            return
+        reason = _EVIDENCE_REASONS.get(attempt.failure_kind or "")
+        if reason is None:
+            return
+        resolver = attempt.failure_activity == GENERATE_PAYLOAD_BUNDLE
+        self._note_operation(
+            operation=identity,
+            phase=PAYLOAD_OFFER if resolver else SOURCE_PUBLICATION,
+            reason=reason,
+            outcome=UNRECOVERABLE_OPERATION,
+            refused_epoch=writer.ownership_epoch,
+            attempt_id=attempt.item.attempt_id,
+            payload_position=attempt.item.payload_position if resolver else None,
+            references=list(resolving) if resolver else None,
+            request_id=request_id,
+        )
+
+    def _verified_source(
+        self,
+        attempt: _Attempt,
+        sealed: Any,
+        contract: Optional[ReceiptContract],
+    ) -> Optional[SourceArtifactManifest]:
+        """Hold a returned source to this generation, or refuse it, before anything commits.
+
+        The bindings are checked against values this generation already holds, and never against
+        the descriptor's own. The attempt is the row's, the seal id is the one recomputed from
+        this start's hidden execution id and the ordinal it asked under, the canonical submission
+        reference is the text that came back beside it, the kernel digest is the one this
+        workflow computed itself, the grade identity is the generation's, the contract is the one
+        this generation declared, and the bundle digest is the bank source those contracts were
+        admitted over. The commitment is recomputed from the descriptor's own canonical bytes,
+        so a result naming one thing and committing to another is a refusal rather than a record.
+
+        A generation that asked for no source and was handed one is refused too. A descriptor is
+        provenance and a build that produced one unasked is a build this generation did not
+        compose, so the answer is to end the attempt rather than to keep evidence nothing
+        declared a contract for.
+
+        The descriptor arrives as whatever was encoded and is read into a typed value here, at
+        this boundary and nowhere earlier. A mapping carrying a name this build does not declare,
+        or missing one it does, is refused with a reason recorded against the attempt: a field
+        with a type on the result would have made that same shape a decoding failure instead,
+        raised while the generation was being handed the result and before any code of its own
+        ran, which the retries would reproduce for ever and the record would not explain.
+
+        Taking the descriptor's canonical bytes is inside that same guard, for that same reason.
+        The reading and the canonicalization are one boundary: a value the encoder cannot write
+        would otherwise read back cleanly and raise where the commitment is computed, which is
+        outside every recorded refusal there is, so the attempt would hang on an activation that
+        fails for ever instead of ending with the reason this method exists to record.
+        """
+        returned = sealed.source_artifact
+        if contract is None:
+            if returned is not None or sealed.source_commitment:
+                raise _unusable(
+                    "this attempt declared no receipt contract and the seal returned a source"
+                )
+            return None
+        if returned is None:
+            raise _unusable(
+                f"this attempt is captured under the contract {contract.contract_id} and the "
+                "seal returned no source at all"
+            )
+        try:
+            manifest = read_source_artifact(returned)
+            committed = source_commitment(manifest)
+        except WireFormatError as error:
+            raise _unusable(str(error)) from error
+        if sealed.source_commitment != committed:
+            raise _unusable(
+                "the seal committed to a source other than the one whose bytes it returned"
+            )
+        raw = sealed.canonical_submission_text.encode("utf-8")
+        checks = (
+            (manifest.source_attempt_id, attempt.item.attempt_id, "attempt"),
+            (manifest.source_seal_id, attempt.seal_id, "seal"),
+            (manifest.execution_ordinal, self._start.execution_ordinal, "execution"),
+            (manifest.canonical_submission.sha256, sha256(raw).hexdigest(), "submission"),
+            (manifest.canonical_submission.size, len(raw), "submission size"),
+            (manifest.kernel_submission_digest, attempt.submission_digest, "filing digest"),
+            (
+                manifest.canonicalization_version,
+                self._start.canonicalization_version,
+                "canonicalization version",
+            ),
+            (manifest.bundle_digest, self._start.receipt_source, "bank source"),
+            (manifest.receipt_contract, contract, "contract"),
+            (manifest.grade_identity, self._start.grade or KERNEL_STAND_IN_GRADE, "grader"),
+        )
+        for returned, held, what in checks:
+            if returned != held:
+                raise _unusable(
+                    f"the source this seal published names a {what} this generation is not: "
+                    f"{returned!r} against {held!r}"
+                )
+        return manifest
+
+    def _selected(
+        self,
+        source: Optional[SourceArtifactManifest],
+        disposition: Optional[PayloadDisposition],
+        policy: Optional[PayloadPolicy],
+    ) -> Optional[SelectedSourceReference]:
+        """Return the one committed cell this obligation delivers, where its policy delivers one.
+
+        The disposition, the policy's declared cell, the manifest's kind and the reference all
+        have to name the same cell, and they are made to here: the cell is the row's, the policy
+        declares it, and the reference is the manifest's own entry for that kind rather than one
+        this method chose. The oracle is never among them. It is named by the descriptor,
+        retained with the rest, and is not a cell a live arm may be assigned, so a row naming it
+        is refused before anything is resolved rather than served as a graded body.
+        """
+        if policy is None or policy.exposure != ARTIFACT or disposition is None:
+            return None
+        if source is None:
+            raise _unusable(
+                f"this obligation delivers {policy.policy_name} and its seal published no source "
+                "for it to be a cell of"
+            )
+        cell = disposition.cell or ""
+        if cell not in ELIGIBLE_CELLS or cell not in policy.cells:
+            raise _unusable(
+                f"an arm is served {sorted(ELIGIBLE_CELLS)} and this obligation was assigned "
+                f"{cell!r}"
+            )
+        if self._start.blob_root is None:
+            raise _unusable(
+                f"this obligation delivers {policy.policy_name}, whose body is an object of this "
+                "run's own store, and this generation was given no store"
+            )
+        contract = source.receipt_contract
+        if disposition.family_id != contract.contract_id:
+            raise _unusable(
+                f"this obligation names the contract {disposition.family_id!r} and its source "
+                f"was published under {contract.contract_id!r}"
+            )
+        try:
+            return derived_selection(
+                source=source,
+                origin=SourceOriginContext(
+                    hidden_execution_id=self._start.hidden_execution_id,
+                    execution_ordinal=self._start.execution_ordinal,
+                ),
+                commitment=source_commitment(source),
+                cell=cell,
+                policy_digest=disposition.policy_digest or "",
+                blob_root=self._start.blob_root,
+            )
+        except WireFormatError as error:
+            raise _unusable(str(error)) from error
 
     def _published(
         self,
@@ -3048,6 +3539,7 @@ class StreamWorkflow:
         for reference in _references(commit):
             if reference not in self._committed_blobs:
                 self._committed_blobs.append(reference)
+        self._retain_presentation_references(pending.message.attempt_id, _references(commit))
         self._cursor = commit.message_id
         self._pending = None
         ack = PresentationAck(
@@ -3058,6 +3550,30 @@ class StreamWorkflow:
         self._attestation_identities[commit.attestation_id] = identity
         self._attestations[commit.attestation_id] = ack
         return ack
+
+    def _retain_presentation_references(
+        self, attempt_id: Optional[str], references: List[str]
+    ) -> None:
+        """Keep, on the attempt, which objects its own committed presentations cited.
+
+        The inventory a claim reads is flat, so it says an object is required and cannot say by
+        whom. That is enough to refuse the claim and not enough to say whose evidence went
+        missing, and a receipt whose transcript blob has gone would otherwise read available while
+        the claim that needed it was being refused. So the association is kept here, in commit
+        order, and a shared object is named by every attempt that cited it.
+
+        A generation that declares no receipt contract keeps none of this. These names are a
+        receipt's own retained inventory, a legacy attempt has no receipt to attribute a loss to,
+        and synthesizing the list for one would move a carrier a legacy generation writes.
+        """
+        if attempt_id is None or self._capture_contract(attempt_id) is None:
+            return
+        attempt = self._attempts.get(attempt_id)
+        if attempt is None:
+            return
+        for reference in references:
+            if reference not in attempt.presentation_references:
+                attempt.presentation_references.append(reference)
 
     def _apply_presentation(
         self, kind: str, attempt_id: Optional[str], commit: PresentationCommit
@@ -3454,7 +3970,7 @@ class StreamWorkflow:
             return
         await self._verify(root, _references(commit))
 
-    async def _verify_committed_blobs(self) -> None:
+    async def _verify_committed_blobs(self, operation: str, claim: OwnershipClaim) -> None:
         """Refuse to hand the generation on over references the store can no longer produce.
 
         A presentation's references were read once, when it committed, and that read said the
@@ -3479,11 +3995,81 @@ class StreamWorkflow:
             ]
             if not outstanding:
                 return
-            await self._verify(root, outstanding)
+            missing = await self._unverified(root, outstanding)
+            if missing:
+                # The read happened outside this transition, so the claim is checked again
+                # before its failure is recorded. A claimant that another one overtook while
+                # this read was running has lost the swap it witnessed, and a row it wrote
+                # afterwards would be a stale owner's word about evidence the owner that
+                # replaced it has since verified.
+                self._check_claim(claim)
+                self._note_claim_refusal(operation, claim, missing)
+                raise StreamProtocolError("invalid_message")
             read.update(outstanding)
 
-    async def _verify(self, root: str, references: List[str]) -> None:
+    async def _require_evidence(
+        self, attempt_id: str, writer: Writer, request_id: str, identity: str
+    ) -> None:
+        """Read the store before this execution's first dependent delivery of one obligation.
+
+        What it reads is what this delivery depends on and nothing else: the descriptor that says
+        what the cells of this source are, and the one committed body about to be offered. An
+        obligation's delivery therefore never fails on another obligation's loss, and the oracle,
+        the unselected eligible cell, the canonical submission and the grade evidence are none of
+        this operation's business.
+
+        The set that remembers the answer is this execution's, so the read happens once per
+        obligation per execution and every later offer of it is pure. A read that refuses leaves
+        the obligation unmarked, which is what makes a repair recoverable: the next entry asks
+        again rather than finding a mark nothing has revisited.
+
+        The refusal is the bare token and carries nothing else. Which object was missing, which
+        cell it belonged to and which resolver looked for it are facts about this run's evidence,
+        and none of them is a thing to hand the agent. They are written into this generation's own
+        record instead, where a controller reads them, as a refused row naming the pull by its
+        complete canonical identity: a later request carrying the same id under a moved cursor is
+        a different identity and is not this operation.
+        """
+        if attempt_id in self._verified_deliveries:
+            return
+        attempt = self._attempts[attempt_id]
+        if attempt.source_artifact is None:
+            return
+        root = self._start.blob_root
+        references = [attempt.source_commitment or "", attempt.selected_body_reference or ""]
+        if root is None or not all(references):
+            self._note_delivery_refusal(
+                attempt, writer, request_id, identity, [name for name in references if name]
+            )
+            raise StreamProtocolError("evidence_unavailable")
+        missing = await self._unverified(root, references)
+        # The read happened outside this transition, so the owner is checked again on the way back
+        # in, and before either outcome is recorded rather than only before the good one. A resume
+        # that arrived while the store was being read replaced the caller that asked, and a
+        # replacement that has since repaired the body and offered the receipt must not then be
+        # overwritten by the refusal its predecessor came back with: that row would stand as the
+        # last word on an attempt whose delivery had already succeeded.
+        self._require_writer(writer)
+        if missing:
+            self._note_delivery_refusal(attempt, writer, request_id, identity, missing)
+            raise StreamProtocolError("evidence_unavailable")
+        self._verified_deliveries.add(attempt_id)
+
+    async def _verify(
+        self, root: str, references: List[str], *, code: str = "invalid_message"
+    ) -> None:
         """Read the store, and refuse when it cannot produce the exact bytes a name promises.
+
+        ``code`` is which refusal an unproduceable name is. A presentation citing bytes the store
+        cannot produce is a malformed message, because the attestation is what named them. A
+        delivery whose own committed evidence has gone is not: nothing the caller sent is wrong,
+        and what it is told is that the evidence is unavailable.
+        """
+        if await self._unverified(root, references):
+            raise StreamProtocolError(code)
+
+    async def _unverified(self, root: str, references: List[str]) -> List[str]:
+        """Read the store and return the names it cannot produce the exact bytes for.
 
         The read is counted while it is happening and again when it finishes. Neither number is
         a fact about the generation's projection, and neither belongs in one. They are here
@@ -3491,6 +4077,10 @@ class StreamWorkflow:
         nothing else a caller could see: the Activity has its own timeout and its own retries,
         and a claim that is working through them is making progress that a projection hash
         cannot show. A caller held off for the boundary reads these and keeps waiting.
+
+        What comes back is the list rather than a refusal, because the operation that asked is
+        the one that knows what a name it cannot produce means: which refusal to raise, and which
+        row to write about the objects it could not get.
         """
         self._verifying += 1
         try:
@@ -3504,8 +4094,170 @@ class StreamWorkflow:
         finally:
             self._verifying -= 1
             self._verification_batches += 1
-        if verified.unverified:
-            raise StreamProtocolError("invalid_message")
+        return list(verified.unverified)
+
+    # The rows an operation that could not get its evidence leaves behind.
+
+    def _note_operation(
+        self,
+        *,
+        operation: str,
+        phase: str,
+        reason: str,
+        outcome: str,
+        refused_epoch: int,
+        attempt_id: Optional[str] = None,
+        payload_position: Optional[int] = None,
+        references: Optional[List[str]] = None,
+        request_id: Optional[str] = None,
+        recovered_epoch: Optional[int] = None,
+    ) -> None:
+        """Append one row, in commit order, and never rewrite one that is already there."""
+        self._operation_failures.append(
+            OperationFailure(
+                operation=operation,
+                phase=phase,
+                reason=reason,
+                outcome=outcome,
+                generation=self._generation_id,
+                refused_epoch=refused_epoch,
+                attempt_id=attempt_id,
+                payload_position=payload_position,
+                references=sorted(references or []),
+                request_id=request_id,
+                recovered_epoch=recovered_epoch,
+            )
+        )
+
+    def _standing_refusals(self, operation: str) -> List[OperationFailure]:
+        """The refusals of one logical operation that nothing has answered yet.
+
+        One row per attribution rather than one for the operation: a claim over a shared
+        descriptor is refused for every sealed receipt attempt whose required set names it, and
+        each of those is its own standing refusal. The last row for an attribution is the word on
+        it, so a recovery already recorded is not recorded twice and an operation refused twice
+        recovers once.
+        """
+        latest: Dict[Optional[str], OperationFailure] = {}
+        for row in self._operation_failures:
+            if row.operation == operation:
+                latest[row.attempt_id] = row
+        return [row for row in latest.values() if row.outcome == REFUSED_OPERATION]
+
+    def _note_recovery(self, operation: str, phase: str, epoch: int) -> None:
+        """Append the recovery of one operation, where a refusal under it stands.
+
+        A recovered row is appended by one event and never by a repair: bytes going back into the
+        store append nothing. What appends it is the operation itself passing the check it was
+        refused on and completing, under the identity it was refused under, which is why the
+        identity is what these are joined by rather than the transport call or the epoch.
+        """
+        for standing in self._standing_refusals(operation):
+            self._note_operation(
+                operation=operation,
+                phase=phase,
+                reason=standing.reason,
+                outcome=RECOVERED_OPERATION,
+                refused_epoch=standing.refused_epoch,
+                attempt_id=standing.attempt_id,
+                payload_position=standing.payload_position,
+                references=list(standing.references),
+                request_id=standing.request_id,
+                recovered_epoch=epoch,
+            )
+
+    def _note_delivery_refusal(
+        self,
+        attempt: _Attempt,
+        writer: Writer,
+        request_id: str,
+        identity: str,
+        references: List[str],
+    ) -> None:
+        """Record one delivery refused because the objects it depends on are not there."""
+        self._note_operation(
+            operation=identity,
+            phase=CONTINUED_FIRST_DELIVERY,
+            reason=UNAVAILABLE_EVIDENCE,
+            outcome=REFUSED_OPERATION,
+            refused_epoch=writer.ownership_epoch,
+            attempt_id=attempt.item.attempt_id,
+            payload_position=attempt.item.payload_position,
+            references=references,
+            request_id=request_id,
+        )
+
+    def _note_claim_refusal(
+        self, operation: str, claim: OwnershipClaim, missing: List[str]
+    ) -> None:
+        """Record one claim refused over objects the store can no longer produce.
+
+        A claim carries no logical request of its own, so no request id and no payload position
+        are invented for it, and the epoch it was refused under is the epoch it witnessed.
+
+        The attribution is the whole of what is decided here. An object no attempt owns, a policy
+        or a contract descriptor, is attributed to the operation and to every sealed receipt
+        attempt whose required set names it, rather than to one of them chosen because it came
+        first. What is left over is attributed to the operation alone, which is also the shape a
+        claim refused before any receipt has sealed takes: one row, naming no attempt.
+
+        A generation that declares no receipt contract records none of this. These rows are a
+        receipt's own record of its evidence, and a generation with no receipt to lose has none:
+        its refusal is the one it always was, and its carrier stays the number it always wrote.
+        Provenance is never synthesized for a generation that has none.
+        """
+        if not self._contracts:
+            return
+        lost = set(missing)
+        named = {
+            attempt_id: sorted(self._required_by(attempt) & lost)
+            for attempt_id, attempt in sorted(self._attempts.items())
+            if self._required_by(attempt) & lost
+        }
+        for attempt_id, references in named.items():
+            self._note_operation(
+                operation=operation,
+                phase=OWNERSHIP_CLAIM,
+                reason=UNAVAILABLE_EVIDENCE,
+                outcome=REFUSED_OPERATION,
+                refused_epoch=claim.previous_epoch,
+                attempt_id=attempt_id,
+                references=references,
+            )
+        unattributed = sorted(lost.difference(*named.values()))
+        if unattributed:
+            self._note_operation(
+                operation=operation,
+                phase=OWNERSHIP_CLAIM,
+                reason=UNAVAILABLE_EVIDENCE,
+                outcome=REFUSED_OPERATION,
+                refused_epoch=claim.previous_epoch,
+                references=unattributed,
+            )
+
+    def _required_by(self, attempt: _Attempt) -> Set[str]:
+        """Every object one sealed receipt attempt's own claim depends on.
+
+        The descriptor and the canonical submission are its own, the grade evidence is what its
+        score was taken from, the presentation references are the objects its own committed
+        messages cited, and the two policy descriptors of its contract are shared with every
+        other attempt under that contract, which is why a failure on one of those names all of
+        them. The three cells are deliberately absent: a claim does not require them, and
+        requiring them would let one attempt's unselected body block another attempt's delivery.
+        """
+        if attempt.source_artifact is None or not attempt.source_commitment:
+            return set()
+        required = {
+            attempt.source_commitment,
+            attempt.source_artifact.canonical_submission.sha256,
+        }
+        if attempt.graded_evidence:
+            required.add(attempt.graded_evidence)
+        required.update(attempt.presentation_references)
+        contract = self._contracts.get(attempt.receipt_contract_id or "")
+        if contract is not None:
+            required.update(descriptor_digests([], [], [contract]))
+        return required
 
     def _offer(
         self,
@@ -3654,6 +4406,85 @@ def _refuse_carrier(complaint: str) -> ApplicationError:
 def _bindings(rows: List[CarriedBinding]) -> Dict[str, _Bound]:
     """One carried request table, back as the map a handler answers a retry out of."""
     return {row.request_id: _Bound(identity=row.identity, message=row.message) for row in rows}
+
+
+def _carried_source(attempt: _Attempt) -> Dict[str, Any]:
+    """Return one attempt's descriptor and origin as the mappings a carrier writes them as.
+
+    They are written out rather than handed over as typed values so that the far side reads them
+    back through the same strict reader the seal boundary uses. The descriptor's mapping is the
+    one its canonical bytes are taken from, so what crosses and what was committed to are the
+    same shape, and a member added on the way is a member the reader has to have declared.
+    """
+    return {
+        "source_artifact": (
+            None if attempt.source_artifact is None else manifest_fields(attempt.source_artifact)
+        ),
+        "source_origin": (
+            None if attempt.source_origin is None else origin_fields(attempt.source_origin)
+        ),
+    }
+
+
+@dataclass(frozen=True)
+class _CarriedSource:
+    """One carried attempt's descriptor and origin, after restore has read them."""
+
+    manifest: Optional[SourceArtifactManifest] = None
+    origin: Optional[SourceOriginContext] = None
+
+
+def _read_carried_source(row: CarriedAttempt) -> _CarriedSource:
+    """Read one carried attempt's raw descriptor and origin, or refuse the carrier over them.
+
+    This is the carrier's half of the boundary the seal result has. Both arrived as whatever was
+    written, and both become typed values here and nowhere earlier, so a descriptor carrying a
+    member this build does not declare is refused rather than decoded without it, and a size
+    written as a float is refused rather than rounded into agreement with the commitment.
+    """
+    try:
+        return _CarriedSource(
+            manifest=(
+                None if row.source_artifact is None else read_source_artifact(row.source_artifact)
+            ),
+            origin=(
+                None if row.source_origin is None else read_source_origin(row.source_origin)
+            ),
+        )
+    except WireFormatError as error:
+        raise _refuse_carrier(
+            f"the source carried for attempt {row.attempt_id} is not one this build reads: "
+            f"{error}"
+        ) from error
+
+
+def _provenance(attempt: _Attempt) -> Optional[SourceProvenance]:
+    """Return what one attempt's committed source was, or nothing where none was committed.
+
+    Every value is read off the descriptor the attempt is carrying rather than resolved from the
+    store, which is what makes provenance readable after the world, the bank and the cell store
+    are all gone. Nothing is recomputed here either: the commitment was taken over the
+    descriptor's own canonical bytes when the source was committed and again at every restore,
+    and a reader asking what a run came to is not the place to hash it a third time.
+    """
+    source = attempt.source_artifact
+    if source is None:
+        return None
+    return SourceProvenance(
+        source_commitment=attempt.source_commitment or "",
+        bundle_digest=source.bundle_digest,
+        environment_task_id=source.environment_task_id,
+        source_attempt_id=source.source_attempt_id,
+        source_seal_id=source.source_seal_id,
+        execution_ordinal=source.execution_ordinal,
+        canonicalization_version=source.canonicalization_version,
+        renderer_configuration=source.renderer_configuration,
+        canonical_submission_sha256=source.canonical_submission.sha256,
+        kernel_submission_digest=source.kernel_submission_digest,
+        selected_cell=attempt.selected_cell,
+        selected_body_reference=attempt.selected_body_reference,
+        selected_policy_digest=attempt.selected_policy_digest,
+    )
 
 
 def _note_failure(attempt: _Attempt, error: ActivityError) -> None:
@@ -3903,7 +4734,13 @@ def _check_policy(start: StreamStart) -> None:
     if start.profile not in PROFILES:
         raise StreamProtocolError("configuration_mismatch")
     if start.profile == LEGACY:
-        if start.dispositions or start.provenance is not None or start.families:
+        if (
+            start.dispositions
+            or start.provenance is not None
+            or start.families
+            or start.receipt_contracts
+            or start.receipt_source
+        ):
             raise StreamProtocolError("configuration_mismatch")
         return
     roster = _roster(start)
@@ -3926,9 +4763,421 @@ def _check_policy(start: StreamStart) -> None:
             grade=start.grade or KERNEL_STAND_IN_GRADE,
             provenance=start.provenance,
             families=list(start.families),
+            contract_ids=[contract.contract_id for contract in start.receipt_contracts],
+        )
+        # And the shapes it admits an environment's own bodies under, with the rows that name
+        # them. It is a second call rather than a field of the first because the record it admits
+        # is declared where the descriptor it admits is, and that module reads the roster's.
+        check_receipt_contracts(
+            list(start.receipt_contracts),
+            profile=start.profile,
+            dispositions=list(start.dispositions),
+            families=list(start.families),
+            source=start.receipt_source,
         )
     except PolicyViolation as error:
         raise StreamProtocolError("configuration_mismatch") from error
+
+
+def _check_carried_receipts(
+    start: StreamStart, projection: CarriedProjection
+) -> Dict[str, _CarriedSource]:
+    """Refuse a carried projection whose receipt evidence does not hold, before any is believed.
+
+    Every check here is pure and opens nothing. What a carrier holds is a provenance claim, and a
+    claim nothing checked is a claim: the descriptor is read out of the mapping it crossed as, its
+    own canonical bytes are hashed again, the seal id is recomputed from the identity the carrier
+    says that seal was minted under, and every binding is compared against a value this start
+    already holds rather than against another field of the same carrier.
+
+    What comes back is what was read, by attempt, so that the values the projection is applied
+    from are the values these checks were made against rather than a second decoding of the same
+    bytes.
+
+    Four things are refused whole rather than repaired, and all four are scoped to rows that
+    deliver an environment's own committed bytes. A legacy presented obligation has no selection
+    by design and has to stay readable, so none of these may be asked of one.
+
+    The inventory is checked against the whole of what this generation's later operations require
+    rather than against the two objects a source names. A claim reads the carried list and nothing
+    else, so a name dropped from it on the way across is a name no claim will ever ask the store
+    for: the descriptors a generation declaring a contract has to be able to produce are required
+    from its first boundary, before it has captured anything, and every object a sealed receipt
+    attempt's own claim depends on is required beside them.
+    """
+    contracts = {contract.contract_id: contract for contract in start.receipt_contracts}
+    resolved = {
+        row.attempt_id: row
+        for row in start.dispositions
+        if row.branch_slot == SINGLETON_SLOT
+    }
+    items = {item.attempt_id: item for item in start.tasks}
+    inventory = set(projection.committed_blobs)
+    attempts = {row.attempt_id: row for row in projection.attempts}
+    if start.receipt_contracts:
+        _require_carried(
+            inventory,
+            descriptor_digests(start.dispositions, start.families, start.receipt_contracts),
+            "this generation's declared descriptors",
+        )
+    read = {row.attempt_id: _read_carried_source(row) for row in projection.attempts}
+    for row in projection.attempts:
+        _check_carried_attempt(start, row, read[row.attempt_id], contracts, resolved, inventory)
+    for owed in projection.obligations:
+        _check_carried_candidate(owed, attempts.get(owed.attempt_id), resolved, items)
+    for failure in projection.operation_failures:
+        _check_carried_failure(failure, items)
+    return read
+
+
+def _check_carried_failure(row: OperationFailure, items: Dict[str, TaskItem]) -> None:
+    """Hold one carried operation failure to the closed vocabulary it was written in.
+
+    A row is read by a controller rather than acted on by this generation, which is exactly why
+    it is checked: a phase, a reason or an outcome outside these sets is a record nobody can
+    classify, and an attempt named by a row that is not this generation's is a row about another
+    run. Nothing here is repaired.
+    """
+    if (
+        row.phase not in OPERATION_PHASES
+        or row.reason not in OPERATION_REASONS
+        or row.outcome not in OPERATION_OUTCOMES
+    ):
+        raise _refuse_carrier(
+            f"a carried operation failure is written as {row.phase}/{row.reason}/{row.outcome}, "
+            "which is not a phase, a reason and an outcome this code declares"
+        )
+    if not row.operation or not row.generation:
+        raise _refuse_carrier("a carried operation failure names no operation or no generation")
+    if row.attempt_id is not None and row.attempt_id not in items:
+        raise _refuse_carrier(
+            f"a carried operation failure names the attempt {row.attempt_id}, which is not one "
+            "of this generation's"
+        )
+
+
+def _check_carried_attempt(
+    start: StreamStart,
+    row: CarriedAttempt,
+    read: _CarriedSource,
+    contracts: Dict[str, ReceiptContract],
+    resolved: Dict[str, PayloadDisposition],
+    inventory: Set[str],
+) -> None:
+    """Hold one carried attempt's source and selection to the generation that is restoring it.
+
+    The retained presentation references are required before the source is, because an attempt
+    keeps them from the moment it presents anything and a receipt generation reaches a boundary
+    with a task delivered and nothing captured. A row on that side of its first seal names objects
+    a later claim will read the store for, so a name dropped from the inventory on the way across
+    is one no claim will ever ask for, exactly as it would be on the far side of the seal.
+
+    The checkpoint the row names is required in both of those structures, because one transition
+    wrote it to both: the task presentation that made this attempt active cited the checkpoint,
+    which put it in the attempt's own association and in the generation's inventory together. A
+    row that goes on naming a checkpoint missing from either is state this build never wrote, and
+    the two omissions fail differently on the far side. Out of the inventory, the object is one
+    no claim will read the store for. Out of the association, the loss is one no refusal can
+    attribute, while the attempt still names the bytes a resume would be asked to restore from.
+    """
+    manifest = read.manifest
+    selection = (row.selected_cell, row.selected_body_reference, row.selected_policy_digest)
+    declared = resolved.get(row.attempt_id)
+    checkpoint = row.task_start_checkpoint
+    if (
+        checkpoint is not None
+        and declared is not None
+        and declared.family_id in contracts
+        and checkpoint not in row.presentation_references
+    ):
+        raise _refuse_carrier(
+            f"the carried attempt {row.attempt_id} would be restored from the checkpoint "
+            f"{checkpoint[:16]} and its own presentations do not name it"
+        )
+    # The objects this attempt's own committed presentations cited, whether or not it has
+    # captured anything, the checkpoint just required among them. A generation declaring no
+    # receipt contract retains none of these, so nothing about a legacy row is asked here.
+    _require_carried(
+        inventory,
+        row.presentation_references,
+        f"the presentations of attempt {row.attempt_id}",
+    )
+    if manifest is None:
+        if any(selection) or row.source_commitment or read.origin:
+            raise _refuse_carrier(
+                f"the carried attempt {row.attempt_id} holds a selection and no source for it to "
+                "be a cell of"
+            )
+        if row.receipt_contract_id:
+            raise _refuse_carrier(
+                f"the carried attempt {row.attempt_id} names a capture contract and carries no "
+                "source captured under it"
+            )
+        if (
+            row.state in (SEALED, ACK_PRESENTED)
+            and declared is not None
+            and declared.family_id in contracts
+        ):
+            raise _refuse_carrier(
+                f"the carried attempt {row.attempt_id} sealed under the receipt contract "
+                f"{declared.family_id} and carries no source"
+            )
+        return
+    commitment = row.source_commitment
+    if commitment is None:
+        raise _refuse_carrier(
+            f"the source carried for attempt {row.attempt_id} names no commitment, and a "
+            "descriptor nothing was committed over is a claim rather than evidence"
+        )
+    contract = contracts.get(row.receipt_contract_id or "")
+    if contract is None:
+        raise _refuse_carrier(
+            f"the carried attempt {row.attempt_id} names the capture contract "
+            f"{row.receipt_contract_id!r} and this generation declares {sorted(contracts)}"
+        )
+    if manifest.receipt_contract != contract:
+        raise _refuse_carrier(
+            f"the source carried for attempt {row.attempt_id} was published under a contract "
+            f"other than the {contract.contract_id} this generation declares"
+        )
+    if manifest.schema_version not in contract.manifest_schema_versions:
+        raise _refuse_carrier(
+            f"this generation admits {list(contract.manifest_schema_versions)} and the source "
+            f"carried for attempt {row.attempt_id} is written as {manifest.schema_version!r}"
+        )
+    origin = read.origin
+    if origin is None:
+        raise _refuse_carrier(
+            f"the source carried for attempt {row.attempt_id} names no origin, and the seal id "
+            "is recomputed from the identity that seal was minted under rather than assumed"
+        )
+    here = SourceOriginContext(
+        hidden_execution_id=start.hidden_execution_id,
+        execution_ordinal=start.execution_ordinal,
+    )
+    # A continuation hands the same start on, so an ordinary one carries this generation's own
+    # identity here. The field is compared rather than assumed because an inherited source is a
+    # thing a later build admits, and admitting one is a decision that has to be made rather than
+    # arrived at by a value nobody looked at.
+    if origin != here:
+        raise _refuse_carrier(
+            f"the source carried for attempt {row.attempt_id} names an origin this generation is "
+            "not, and no other origin is admitted here"
+        )
+    checks = (
+        (commitment, source_commitment(manifest), "commitment"),
+        (manifest.source_attempt_id, row.attempt_id, "attempt"),
+        (manifest.source_seal_id, row.seal_id, "seal"),
+        (manifest.source_seal_id, source_seal_id(origin, row.attempt_id), "recomputed seal"),
+        (manifest.execution_ordinal, origin.execution_ordinal, "execution ordinal"),
+        (manifest.kernel_submission_digest, row.submission_digest, "filing digest"),
+        (
+            manifest.canonicalization_version,
+            start.canonicalization_version,
+            "canonicalization version",
+        ),
+        (manifest.bundle_digest, start.receipt_source, "bank source"),
+        (manifest.grade_identity, start.grade or KERNEL_STAND_IN_GRADE, "grader"),
+    )
+    for carried, held, what in checks:
+        if carried != held:
+            raise _refuse_carrier(
+                f"the source carried for attempt {row.attempt_id} names a {what} this generation "
+                f"is not: {carried!r} against {held!r}"
+            )
+    # Which capture this row was made under, whether or not anything is delivered from it. A
+    # withholding names a contract like every other receipt-producing row, so the association is
+    # compared here rather than inside the selection below: fresh capture reads the row's own
+    # contract and validates against it, and a consumer of carried state that only compared a
+    # delivering row would admit a withheld source captured under the other declared contract.
+    if declared is None or declared.family_id != contract.contract_id:
+        raise _refuse_carrier(
+            f"the carried attempt {row.attempt_id} carries a source captured under "
+            f"{contract.contract_id!r} and its own row names "
+            f"{(declared.family_id if declared is not None else None)!r}"
+        )
+    # The grade evidence is required rather than checked where it happens to be present. A source
+    # and the object the score was taken from commit in one transition, so a carried row holding a
+    # descriptor and naming no evidence is a row this build never wrote, and reading the name as
+    # optional would quietly drop the store read a claim owes the object a score stands on.
+    if not row.graded_evidence:
+        raise _refuse_carrier(
+            f"the carried attempt {row.attempt_id} holds a committed source and names no grade "
+            "evidence, and a source is committed with the score it was taken beside"
+        )
+    _require_carried(
+        inventory,
+        [
+            commitment,
+            manifest.canonical_submission.sha256,
+            row.graded_evidence,
+            *descriptor_digests([], [], [contract]),
+        ],
+        f"the claim for attempt {row.attempt_id}",
+    )
+    if not any(selection):
+        return
+    if not all(selection):
+        raise _refuse_carrier(
+            f"the carried attempt {row.attempt_id} holds part of a selection, and a selection is "
+            "a cell, a reference and a policy together"
+        )
+    cell = row.selected_cell or ""
+    if cell not in ELIGIBLE_CELLS:
+        raise _refuse_carrier(
+            f"an arm is served {sorted(ELIGIBLE_CELLS)} and the carried attempt {row.attempt_id} "
+            f"holds a selection for {cell!r}"
+        )
+    if row.selected_body_reference != manifest.cells[cell].sha256:
+        raise _refuse_carrier(
+            f"the carried attempt {row.attempt_id} selected a reference other than its source's "
+            f"own entry for the {cell} cell"
+        )
+    if declared is None or declared.kind != DELIVER:
+        raise _refuse_carrier(
+            f"the carried attempt {row.attempt_id} holds a selection and this generation resolved "
+            "no delivery for it"
+        )
+    if (declared.policy_digest or "") != (row.selected_policy_digest or "") or declared.cell != cell:
+        raise _refuse_carrier(
+            f"the carried attempt {row.attempt_id} holds a selection this generation's own row "
+            "does not resolve"
+        )
+
+
+def _require_carried(inventory: Set[str], required: Sequence[str], what: str) -> None:
+    """Refuse a carried inventory that has lost a name a later operation will ask the store for.
+
+    A claim reads the carried list and nothing else, so an object dropped on the way across is
+    one no operation will ever check: the refusal a missing object is owed would become a
+    successful claim over evidence nobody looked for.
+    """
+    for reference in required:
+        if reference not in inventory:
+            raise _refuse_carrier(
+                f"{what} requires the object {reference[:16]} and the carried inventory does not "
+                "name it"
+            )
+
+
+def _check_carried_candidate(
+    owed: CarriedObligation,
+    row: Optional[CarriedAttempt],
+    resolved: Dict[str, PayloadDisposition],
+    items: Dict[str, TaskItem],
+) -> None:
+    """Hold one carried obligation to the selection its attempt carries, where it delivers one.
+
+    An obligation an offer could still be made from has to carry both halves of what that offer
+    is made of. The selection says which committed cell this row delivers and the candidate holds
+    the bytes, and the offer path reads the candidate without asking whether there is one, so a
+    carrier that dropped either would restore into a generation whose next pull for that position
+    has nothing to answer with and no reason to give.
+
+    There is one state where a selection stands with no candidate, and this build never produces
+    it: a gated fork child's obligation, selected against the parent's committed source and
+    unbuilt until the child builds it. No start this build admits declares a fork origin, so an
+    obligation arriving here selected and unbuilt is refused rather than admitted on the strength
+    of a state nothing here can have reached. The build that admits that origin is the build that
+    admits this, and it will have the child's own preparation record to tell the two apart by.
+
+    An obligation this generation resolves to no artifact policy is asked for one thing before it
+    is let past: that its candidate says nothing about a source. The row above it is already held
+    to that, a carried attempt naming a commitment or a selection with no descriptor being refused
+    whole, and the candidate is the other half of the same rule. Fresh capture refuses those values
+    where the result comes back, so a carrier holding them is state this build never wrote, and
+    admitting it would restore a generation whose next boundary writes the later carrier over
+    evidence nothing ever captured.
+    """
+    declared = resolved.get(owed.attempt_id)
+    policy = _policy_of(declared)
+    if policy is None or policy.exposure != ARTIFACT:
+        if owed.candidate is not None and resolved_echo(owed.candidate):
+            raise _refuse_carrier(
+                f"the candidate carried for attempt {owed.attempt_id} describes a source it "
+                "resolved and this generation resolves that obligation to no committed cell"
+            )
+        return
+    selected = None if row is None else row.selected_cell
+    if owed.state == PRESENTED and not selected:
+        raise _refuse_carrier(
+            f"the obligation for attempt {owed.attempt_id} delivered {policy.policy_name} and its "
+            "attempt holds no selection to say which cell it was"
+        )
+    candidate = owed.candidate
+    if owed.state in _OFFERABLE_OBLIGATION:
+        if not selected:
+            raise _refuse_carrier(
+                f"the obligation for attempt {owed.attempt_id} is {owed.state} under "
+                f"{policy.policy_name} and its attempt holds no selection to say which committed "
+                "cell an offer of it would carry"
+            )
+        if candidate is None:
+            raise _refuse_carrier(
+                f"the obligation for attempt {owed.attempt_id} is {owed.state} under "
+                f"{policy.policy_name} and carries no candidate, and an obligation an offer could "
+                "still be made from keeps the body that offer would carry"
+            )
+    if candidate is None:
+        return
+    if row is None or not selected:
+        raise _refuse_carrier(
+            f"the obligation for attempt {owed.attempt_id} carries a candidate for "
+            f"{policy.policy_name} and its attempt holds no selection"
+        )
+    bindings = (
+        (candidate.cell, selected, "cell"),
+        (candidate.source_commitment, row.source_commitment, "source"),
+        (candidate.body_reference, row.selected_body_reference, "reference"),
+        (candidate.inner_sha256, row.selected_body_reference, "body"),
+        (candidate.policy_digest, row.selected_policy_digest or "", "policy"),
+    )
+    for carried, held, what in bindings:
+        if carried != held:
+            raise _refuse_carrier(
+                f"the candidate carried for attempt {owed.attempt_id} names a {what} its "
+                f"attempt's selection does not: {carried!r} against {held!r}"
+            )
+    # And the identities the policy this obligation was resolved to declares. A fresh candidate is
+    # held to them where it comes back from the Activity, and a carried one is held to them here
+    # for the same reason: the renderer and the resolver are what a reader is told produced these
+    # bytes, so a carrier that could move either would move the provenance of a body that nothing
+    # else in the record contradicts.
+    implementations = (
+        (candidate.renderer_id, policy.renderer_id, "renderer"),
+        (candidate.renderer_version, policy.renderer_version, "renderer version"),
+        (candidate.resolver_id, policy.resolver_id, "resolver"),
+        (candidate.resolver_version, policy.resolver_version, "resolver version"),
+    )
+    for carried, held, what in implementations:
+        if carried != held:
+            raise _refuse_carrier(
+                f"the candidate carried for attempt {owed.attempt_id} came back from a {what} "
+                f"{policy.policy_name} does not declare: {carried!r} against {held!r}"
+            )
+    item = items.get(owed.attempt_id)
+    if item is None:
+        raise _refuse_carrier(
+            f"the obligation for attempt {owed.attempt_id} carries a candidate for a position "
+            "this generation's manifest does not hold"
+        )
+    serialized = visible_bytes(
+        Payload(
+            message_id=item.payload_message_id,
+            attempt_id=item.attempt_id,
+            body=candidate.body,
+        )
+    )
+    measured = (
+        sha256(candidate.body.encode("utf-8")).hexdigest(),
+        sha256(serialized).hexdigest(),
+        len(serialized),
+    )
+    if measured != (candidate.inner_sha256, candidate.visible_sha256, candidate.visible_byte_count):
+        raise _refuse_carrier(
+            f"the candidate carried for attempt {owed.attempt_id} does not measure to what it "
+            "says it measures to"
+        )
 
 
 def _unusable(what: str) -> _UnusableResult:
@@ -4227,6 +5476,9 @@ def _check_echo(
     item: TaskItem,
     submission_digest: str,
     published: Optional[PublicGrade],
+    *,
+    selected: Optional[SelectedSourceReference] = None,
+    source: Optional[SourceArtifactManifest] = None,
 ) -> None:
     """Hold a built candidate to the policy this obligation was resolved to, body included.
 
@@ -4244,11 +5496,20 @@ def _check_echo(
     attempt ends. The rendering is deterministic and reaches nothing, which is what lets it run
     where the decision belongs.
 
+    An artifact policy is the one that is not rebuilt, because there is nothing deterministic to
+    rebuild it from: its body is the environment's own committed bytes, and its authority is the
+    committed reference, which is why the entry comparison below is not optional.
+
     A legacy generation asked for nothing and is owed nothing. Its recorded results carry no
     echo and are read exactly as they were recorded, which is what keeps a stopped generation
-    resumable by code that has since learned to ask.
+    resumable by code that has since learned to ask. What it is still held to is being one. A
+    generation that resolved no obligation has no source for a candidate to have resolved, so
+    the four values a resolved one echoes are as empty on its result as its history says they
+    are, and a result that filled one would put provenance on an attempt that captured none and
+    carry it as the evidence that moves the whole generation to the later carrier.
     """
     if disposition is None:
+        _check_unresolved(candidate, "this generation resolved no obligation to any policy")
         return
     expected = "" if disposition.policy_digest is None else disposition.policy_digest
     if policy is None:
@@ -4278,6 +5539,10 @@ def _check_echo(
             non_retryable=True,
             final_failure=SEAL_RENDERER,
         )
+    if policy.exposure == ARTIFACT:
+        _check_resolved(candidate, policy, item, selected, source)
+        return
+    _check_unresolved(candidate, f"{policy.policy_name} renders its body from a projection")
     try:
         declared_body = render_body(
             policy,
@@ -4295,6 +5560,102 @@ def _check_echo(
             type="RendererDescriptorMismatch",
             non_retryable=True,
             final_failure=SEAL_RENDERER,
+        )
+
+
+def _check_unresolved(candidate: PayloadCandidate, route: str) -> None:
+    """Refuse a candidate that describes a source on a route where nothing resolved one.
+
+    Two routes reach here and they are one condition. A policy that renders from a projection has
+    no source to resolve, and a generation that resolved no obligation at all declared none to
+    resolve one from. What either would be admitting is provenance nobody captured, standing on
+    an attempt whose record is that it captured nothing, and read afterwards as the evidence that
+    decides which carrier the generation writes. So the values are asked to be empty here rather
+    than left to the comparisons an artifact route makes, which this route never runs.
+    """
+    if resolved_echo(candidate):
+        raise _UnusableResult(
+            f"{route}, and this candidate came back describing a source it resolved",
+            type="RendererDescriptorMismatch",
+            non_retryable=True,
+            final_failure=SEAL_RENDERER,
+        )
+
+
+def _check_resolved(
+    candidate: PayloadCandidate,
+    policy: PayloadPolicy,
+    item: TaskItem,
+    selected: Optional[SelectedSourceReference],
+    source: Optional[SourceArtifactManifest],
+) -> None:
+    """Hold a resolved candidate to the source that was committed, without rebuilding it.
+
+    Every check here is pure and every value it is made against is one this generation already
+    held. The bytes are required to hash to the committed entry for the cell that was selected,
+    which is what a candidate matching its own reported digest does not say: a body says what it
+    is and never which cell was chosen. The size and the encoding are the contract's. The mask is
+    expanded from the contract's own geometry and never from anything the candidate proposed, and
+    the masked body is compared with the hash publication took while it held both cells, which
+    makes this a consistency check on the selected body rather than a proof about the other one.
+    And the wire count is the obligation's empty-body wrapper plus the stored count of the body,
+    exactly, which is what makes two cells of one source come to one measurement.
+    """
+    if selected is None or source is None:
+        raise _unusable(
+            f"this obligation delivers {policy.policy_name} and no committed source was selected "
+            "for it"
+        )
+    contract = source.receipt_contract
+    resolver = (candidate.resolver_id, candidate.resolver_version)
+    if resolver != (policy.resolver_id, policy.resolver_version):
+        raise _UnusableResult(
+            f"{policy.policy_name} resolves its body through "
+            f"{policy.resolver_id}/{policy.resolver_version}, and this candidate came back from "
+            f"{candidate.resolver_id or 'a build that echoed nothing'}",
+            type="RendererDescriptorMismatch",
+            non_retryable=True,
+            final_failure=SEAL_RENDERER,
+        )
+    if candidate.source_commitment != selected.source_commitment:
+        raise _unusable(
+            "the candidate names a source other than the one this obligation was selected from"
+        )
+    if candidate.body_reference != selected.body_sha256:
+        raise _unusable(
+            "the candidate resolved a reference other than the committed entry for its cell"
+        )
+    if candidate.inner_sha256 != selected.body_sha256:
+        raise _unusable(
+            "the body that came back does not hash to the entry this source committed for the "
+            "cell this obligation was assigned"
+        )
+    if not candidate.body.isascii():
+        raise _unusable(
+            f"the contract {contract.contract_id} publishes {contract.body_encoding!r} bodies "
+            "and this one is not that"
+        )
+    raw = candidate.body.encode("utf-8")
+    if len(raw) != contract.body_size:
+        raise _unusable(
+            f"the contract {contract.contract_id} fixes a body at {contract.body_size} bytes and "
+            f"this one is {len(raw)}"
+        )
+    masked = sha256(masked_body(raw, mask_spans(contract))).hexdigest()
+    if masked != source.pair_parity.masked_body_sha256:
+        raise _unusable(
+            "the body that came back is not what publication masked under the slots this "
+            "contract registers"
+        )
+    expected = payload_wire_count(
+        payload_message_id=item.payload_message_id,
+        attempt_id=item.attempt_id,
+        encoded_body_bytes=source.pair_parity.encoded_body_bytes,
+    )
+    if candidate.visible_byte_count != expected:
+        raise _unusable(
+            f"this obligation's cells come to {expected} visible bytes and this candidate comes "
+            f"to {candidate.visible_byte_count}"
         )
 
 
@@ -4333,6 +5694,65 @@ def _check_family(candidate: PayloadCandidate, family: Optional[MatchedFamily]) 
             non_retryable=True,
             final_failure=SEAL_RENDERER,
         )
+
+
+def _read_candidate(returned: PayloadCandidateResult) -> PayloadCandidate:
+    """Make a candidate of what came back, at the boundary the rest of the result is read at.
+
+    The four values a resolved candidate echoes cross as whatever was encoded, so this is where
+    they become a record. A mapping or a list written where a digest or an implementation name
+    belongs is refused here with a reason recorded against the attempt: a field with a type on
+    the result would have made that same shape a decoding failure instead, raised while the
+    generation was being handed the result and before any code of its own ran, which the retries
+    would reproduce for ever and the record would not explain.
+
+    The comparisons below cannot stand in for this. An empty mapping is not a digest and is also
+    not something any of them notices: a route that renders from a projection asks these four to
+    be empty, and a value that is falsy without being text would pass that and go on to be
+    carried, where the encoder that has to write it raises with nothing recording.
+
+    A value the canonical encoding cannot write is refused for that last reason. What comes back
+    here is state that crosses a boundary, and the reading and the writing are one question: a
+    string holding a lone surrogate reads back cleanly and raises where the carrier is packed,
+    which is outside every recorded refusal there is.
+    """
+    return PayloadCandidate(
+        cell=returned.cell,
+        renderer_id=returned.renderer_id,
+        match_group=returned.match_group,
+        body=returned.body,
+        inner_sha256=returned.inner_sha256,
+        visible_sha256=returned.visible_sha256,
+        visible_byte_count=returned.visible_byte_count,
+        renderer_version=returned.renderer_version,
+        policy_digest=returned.policy_digest,
+        source_commitment=_echoed(returned.source_commitment, "source commitment"),
+        body_reference=_echoed(returned.body_reference, "body reference"),
+        resolver_id=_echoed(returned.resolver_id, "resolver id"),
+        resolver_version=_echoed(returned.resolver_version, "resolver version"),
+    )
+
+
+def _echoed(value: Any, field_name: str) -> str:
+    """Return one value a candidate echoed about the source it resolved, or refuse it."""
+    if not isinstance(value, str):
+        raise _unusable(
+            f"a candidate's {field_name} is text, and this result carried "
+            f"{type(value).__name__}"
+        )
+    if len(value) > _MOST_TEXT:
+        raise _unusable(
+            f"a candidate's {field_name} is a digest or a name, and this result carried "
+            f"{len(value)} characters"
+        )
+    try:
+        value.encode("utf-8")
+    except UnicodeEncodeError as error:
+        raise _unusable(
+            f"a candidate's {field_name} is text the record can be written in, and this result "
+            f"carried one that cannot: {error}"
+        ) from error
+    return value
 
 
 def _check_candidate(item: TaskItem, candidate: PayloadCandidate) -> None:

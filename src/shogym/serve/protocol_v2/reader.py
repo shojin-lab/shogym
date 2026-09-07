@@ -29,14 +29,29 @@ nothing, which is a refusal here. Starting a Worker to answer for it would put t
 live generation's own queue, where the first thing it would be handed is the run's own
 unfinished work.
 
-:func:`write_records` puts those rows in the run directory as JSON Lines. That file is a
-derived view and never an authority: it is rewritten from the history every time it is asked
-for, nothing here or anywhere else reads it back to decide anything, and a note beside it says
-so to whoever finds the directory later.
+:func:`write_records` puts those rows in the run directory as JSON Lines, and the generation's
+failed operations in a second file beside them, in commit order. Both are derived views and
+never an authority: they are rewritten from the history every time they are asked for, nothing
+here or anywhere else reads either back to decide anything, and a note beside them says so to
+whoever finds the directory later.
 
 A directory that holds no history is not an error to raise a traceback over. It is a directory
 with nothing to read, and it is reported as :class:`NothingToRead` with the reason in it. Every
 way a read could only answer by moving something is the other answer, :class:`ReadRefused`.
+
+A run that served committed source cells is read on two axes rather than one. What became of the
+receipt is :func:`receipt_lifecycle`, seven values tested in a fixed order with the first match
+winning, and whether the evidence behind it is still there is :func:`receipt_availability`, which
+reads beside that answer and never in place of it. One list could not carry both: a committed row
+whose objects later go missing is committed and unavailable, both of which are true, and a
+withheld row that loses a body has no selection for an unavailable predicate to be about. Exactly
+one lifecycle value matches every row a generation projects.
+
+Committed there is a protocol commitment and nothing more. Whether a model then read those bytes
+is the harness's own fact, so :func:`observed_receipt` answers it against what the harness wrote
+down: the message identity has to be the one the generation committed and the digest of the bytes
+in the transcript has to be the digest the generation stands behind. Where both hold the receipt
+was observed, and where the commitment stands alone it was committed and not observed.
 """
 
 from __future__ import annotations
@@ -49,15 +64,19 @@ from datetime import timedelta
 from dataclasses import dataclass
 from pathlib import Path
 from tempfile import TemporaryDirectory
-from typing import Any, Dict, List, Optional, Tuple, Union
+from typing import Any, Callable, Dict, List, Mapping, Optional, Sequence, Tuple, Union
 
 from temporalio.client import Client, WorkflowExecutionDescription
 from temporalio.service import RPCError, RPCStatusCode
 
 from shogym.serve.protocol_v2.kernel.messages import (
+    REFUSED_OPERATION,
+    UNRECOVERABLE_OPERATION,
     AttemptRecord,
     GenerationRecords,
+    OperationFailure,
     PresentedMessage,
+    SourceProvenance,
 )
 from shogym.serve.protocol_v2.kernel.runtime import (
     STREAM_DATABASE_FILE,
@@ -65,12 +84,20 @@ from shogym.serve.protocol_v2.kernel.runtime import (
     durable_client,
     stream_worker,
 )
-from shogym.serve.protocol_v2.kernel.workflow import StreamWorkflow
+from shogym.serve.protocol_v2.kernel.workflow import (
+    ELIGIBLE,
+    MATERIALIZED,
+    OFFERED,
+    PRESENTED,
+    StreamWorkflow,
+)
 from shogym.serve.protocol_v2.rundir import RunDirectory, open_run_directory
 
 #: The derived view a run directory holds, and the note that says it is one.
 RECORDS_FILE = "records.jsonl"
 NOTE_FILE = "records.jsonl.note"
+#: The generation's failed operations, in commit order, beside the attempts they are about.
+OPERATIONS_FILE = "operation_failures.jsonl"
 
 # How long a Query gets to reach a Worker on a service somebody else runs. There is nothing to
 # start there, so the only thing that answers is a deployment already serving that generation,
@@ -94,7 +121,57 @@ A row whose seal could not go on explains itself here and not in the printed tab
 `failure_retry_state` is why the retries stopped. A row ended by a result the seal could not
 vouch for names no step and no retry state, because its step succeeded: it carries the kind and
 the message alone, and those are the check that refused the answer.
+
+A row that served a committed source cell carries `source_provenance`, which is what that source
+was and which cell of it this row was served, and two answers read off the row rather than held
+in it. `receipt_lifecycle` is what became of the receipt and `receipt_availability` is whether
+its evidence is still there; the second reads beside the first and never in place of it, so a
+row can be committed and unavailable, which says the commitment happened and the objects behind
+it went missing afterwards.
+
+{operations} is the other half of that second answer, rebuilt from the same history at the same
+time: every operation of this generation that could not produce the evidence it depended on, in
+commit order, with the operation, the phase, the reason, the outcome, the generation whose
+operation it was, the epochs it was refused and answered under and the objects it could not
+produce. A refusal and the recovery that answered it both stand there, and an operation that
+failed before any receipt sealed is a row here and a row in no attempt's line.
 """
+
+# What became of one attempt's receipt. Seven values, tested in this order, first match winning.
+#
+# Legacy is first for a reason: an attempt from before any of this existed can end in a seal
+# failure like any other, and absence there predates the question rather than answering it, so it
+# reads as legacy and never as a receipt that failed.
+#
+# Withheld is the roster's own answer and not a missed delivery. A position given no payload
+# obligation still seals, still grades and still records its source, so there is no selection for
+# it to be missing: the absence is structural.
+RECEIPT_LEGACY = "legacy"
+RECEIPT_FAILED_BEFORE_CAPTURE = "failed_before_capture"
+RECEIPT_ASSIGNED_BUT_UNSEALED = "assigned_but_unsealed"
+RECEIPT_WITHHELD = "withheld"
+RECEIPT_BUILT = "built"
+RECEIPT_OFFERED = "offered"
+RECEIPT_COMMITTED = "committed"
+RECEIPT_LIFECYCLES: Tuple[str, ...] = (
+    RECEIPT_LEGACY,
+    RECEIPT_FAILED_BEFORE_CAPTURE,
+    RECEIPT_ASSIGNED_BUT_UNSEALED,
+    RECEIPT_WITHHELD,
+    RECEIPT_BUILT,
+    RECEIPT_OFFERED,
+    RECEIPT_COMMITTED,
+)
+
+# And whether the evidence behind it is still there. This is the second axis and it replaces no
+# lifecycle value: a committed row that later loses an object is committed and unavailable, what
+# was committed having happened and no later loss unhappening it.
+RECEIPT_AVAILABLE = "available"
+RECEIPT_UNAVAILABLE = "unavailable"
+RECEIPT_AVAILABILITIES: Tuple[str, ...] = (RECEIPT_AVAILABLE, RECEIPT_UNAVAILABLE)
+
+# The states an obligation is in while its candidate exists and nobody has been offered it.
+_OWED = (MATERIALIZED, ELIGIBLE)
 
 _COLUMNS = (
     "task",
@@ -140,7 +217,12 @@ class RunRecords:
     one that can say either, by reconciling its own writing against these rows; a harness that
     keeps no transcript can ignore them.
 
-    Both halves are answered by one Query, so a row and the commitments beside it are the same
+    ``operation_failures`` is the third list, read off that same moment. An attempt whose evidence
+    went missing reads as delivered in one answer and as refused in another, and which of the two
+    is true is a question about one point in the run. The rows are kept in commit order, and the
+    last one naming an attempt is the latest word about it.
+
+    All three are answered by one Query, so a row and the commitments beside it are the same
     generation at the same point rather than two reads of one that moved between them.
     """
 
@@ -148,6 +230,7 @@ class RunRecords:
     workflow_id: str
     records: List[AttemptRecord]
     presentations: List[PresentedMessage] = dataclasses.field(default_factory=list)
+    operation_failures: List[OperationFailure] = dataclasses.field(default_factory=list)
 
 
 async def read_records(root: Union[str, Path]) -> RunRecords:
@@ -169,6 +252,7 @@ async def read_records(root: Union[str, Path]) -> RunRecords:
         workflow_id=run.manifest.workflow_id,
         records=list(answer.attempts),
         presentations=list(answer.presentations),
+        operation_failures=list(answer.operation_failures),
     )
 
 
@@ -272,12 +356,35 @@ def write_records(run: RunRecords) -> Path:
     files that compare as text. The note is written beside it every time, because a file whose
     reader has to be told it is derived should say so where it is found rather than only where
     it was documented.
+
+    The two receipt axes are written after the record's own fields, because they are read off the
+    row rather than held in it: what became of the receipt and whether its evidence is still
+    there are an answer about this moment, and the operation failures they are computed against
+    are a list of the generation's and not a column of the attempt's.
+
+    Those failures are written out as their own file, in commit order, member by member. An
+    attempt row can only carry the one word the availability axis comes to, and the episode is
+    more than that word: which operation failed, at which phase, for which reason, under which
+    epoch, which objects it could not produce and whether anything answered it afterwards. A
+    failure before any receipt sealed names no attempt at all and has no row here to be part of.
+    So the list is exported beside the records rather than folded into them, and an external
+    reader holding both files holds what one consistent Query answered with.
+
+    One Query, and one writer at a time. The two files are written one after the other and
+    nothing here makes the pair atomic, so two exports of one run racing each other could leave
+    a reader holding one file from each. What is promised is that a snapshot is exported whole,
+    and a deployment wanting concurrent exporters owes them a publication rule this does not have.
     """
     path = run.root / RECORDS_FILE
-    rows = [json.dumps(_row(record)) + "\n" for record in run.records]
+    rows = [json.dumps(_row(record, run.operation_failures)) + "\n" for record in run.records]
     path.write_text("".join(rows), encoding="utf-8")
+    episodes = [json.dumps(_failure_row(row)) + "\n" for row in run.operation_failures]
+    (run.root / OPERATIONS_FILE).write_text("".join(episodes), encoding="utf-8")
     (run.root / NOTE_FILE).write_text(
-        _NOTE.format(records=RECORDS_FILE, workflow=run.workflow_id), encoding="utf-8"
+        _NOTE.format(
+            records=RECORDS_FILE, operations=OPERATIONS_FILE, workflow=run.workflow_id
+        ),
+        encoding="utf-8",
     )
     return path
 
@@ -312,6 +419,123 @@ def format_records(records: List[AttemptRecord]) -> str:
     widths = [max(len(row[index]) for row in [_COLUMNS, *rows]) for index in range(len(_COLUMNS))]
     lines = [_line(_COLUMNS, widths), *(_line(row, widths) for row in rows)]
     return "\n".join(lines)
+
+
+def receipt_lifecycle(record: AttemptRecord) -> str:
+    """Return what became of one attempt's receipt, as one of the seven values.
+
+    The order is the definition. A pre-artifact attempt that ended in a seal failure is legacy
+    and not a receipt that failed, because a generation that declared no contract was never asked
+    for a source; an attempt under a contract that ended before it captured one is the second
+    answer, and the seal's own failure fields say at which stage. Everything from the fourth
+    value on holds a descriptor, so what separates them is the roster and the obligation: no
+    obligation at all is withheld, a candidate nobody has been offered is built, a reservation is
+    offered, and a presentation is committed.
+
+    Exactly one value describes any row a generation projects, and a row that describes none is
+    reported rather than labelled: the whole point of two axes was to stop a row that matched
+    nothing from being filed under whichever value was closest.
+    """
+    for value, matches in _LIFECYCLE_TESTS:
+        if matches(record):
+            return value
+    raise ValueError(
+        f"attempt {record.attempt_id} is in no state this generation projects: it holds "
+        f"{'a' if record.source_provenance is not None else 'no'} committed source, its "
+        f"obligation is {record.payload_state!r} and its ending is {record.final_failure!r}"
+    )
+
+
+def receipt_availability(
+    record: AttemptRecord, failures: Sequence[OperationFailure]
+) -> str:
+    """Return whether the evidence behind one attempt's receipt is still there.
+
+    It reads beside the lifecycle and never in place of it. A committed row that later loses an
+    object is committed and unavailable, what was committed having happened and no later loss
+    unhappening it, and a withheld row that loses a body is withheld and unavailable, which is a
+    state a predicate needing a selection could not reach at all.
+
+    The last row naming this attempt is what answers, because the rows are an episode: a refusal
+    and the recovery that answered it both stand, and the latest word is the one at the end. So an
+    attempt reads available while an earlier pull of its own is still unresolved, where a later
+    operation on another of its objects recovered after it. The ordered list keeps that earlier
+    refusal, and the delivery depending on those bytes checks them again.
+    """
+    naming = [row for row in failures if row.attempt_id == record.attempt_id]
+    if naming and naming[-1].outcome in (REFUSED_OPERATION, UNRECOVERABLE_OPERATION):
+        return RECEIPT_UNAVAILABLE
+    return RECEIPT_AVAILABLE
+
+
+def observed_receipt(record: AttemptRecord, witness: Mapping[str, str]) -> bool:
+    """Say whether the harness's own transcript witnesses this attempt's committed receipt.
+
+    ``witness`` is what the harness wrote down, by message identity, as the digest of the bytes
+    it wrote. A commitment is where this generation's claim stops: it is accepted before the
+    transport has a result to hand anybody, so an acknowledgement can be lost and the owner
+    replaced before the bytes reach a model. What upgrades it is the harness's own durable entry
+    for that message, matched on the identity and on the digest, and both have to hold.
+
+    So a row that never committed is never observed, a message the transcript has no entry for is
+    committed and not observed, and an entry whose digest is not the one this generation stands
+    behind is not a witness for it. Nothing here imputes a dose either way: what comes back is
+    whether the two records agree.
+    """
+    if receipt_lifecycle(record) != RECEIPT_COMMITTED:
+        return False
+    written = witness.get(record.payload_message_id)
+    return written is not None and written == record.payload_visible_sha256
+
+
+# The seven predicates, in the order they are tested. Each is written whole rather than leaning
+# on the ones above it, so the values are disjoint as definitions and not only as an order: a
+# reader checking that exactly one describes a row is asking about the definitions.
+_LIFECYCLE_TESTS: Tuple[Tuple[str, Callable[[AttemptRecord], bool]], ...] = (
+    (
+        RECEIPT_LEGACY,
+        lambda row: row.source_provenance is None and row.receipt_contract_id is None,
+    ),
+    (
+        RECEIPT_FAILED_BEFORE_CAPTURE,
+        lambda row: row.source_provenance is None
+        and row.receipt_contract_id is not None
+        and row.final_failure is not None,
+    ),
+    (
+        RECEIPT_ASSIGNED_BUT_UNSEALED,
+        lambda row: row.source_provenance is None
+        and row.receipt_contract_id is not None
+        and row.final_failure is None,
+    ),
+    (
+        RECEIPT_WITHHELD,
+        lambda row: row.source_provenance is not None
+        and row.score is not None
+        and not row.creates_payload_obligation,
+    ),
+    (
+        RECEIPT_BUILT,
+        lambda row: row.source_provenance is not None
+        and row.source_provenance.selected_cell is not None
+        and row.creates_payload_obligation
+        and row.payload_state in _OWED,
+    ),
+    (
+        RECEIPT_OFFERED,
+        lambda row: row.source_provenance is not None
+        and row.creates_payload_obligation
+        and row.payload_state == OFFERED,
+    ),
+    (
+        RECEIPT_COMMITTED,
+        lambda row: row.source_provenance is not None
+        and row.creates_payload_obligation
+        and row.payload_state == PRESENTED
+        and row.payload_delivered
+        and bool(row.payload_visible_sha256),
+    ),
+)
 
 
 def _require_authority(root: Path) -> None:
@@ -438,9 +662,64 @@ async def _query(client: Client, workflow_id: str) -> _Answer:
         ) from error
 
 
-def _row(record: AttemptRecord) -> Dict[str, Any]:
-    """Return one record as the JSON object a line holds, in the record's field order."""
-    return {field.name: getattr(record, field.name) for field in dataclasses.fields(record)}
+def _row(record: AttemptRecord, failures: Sequence[OperationFailure]) -> Dict[str, Any]:
+    """Return one record as the JSON object a line holds, in the record's field order.
+
+    The nested provenance is converted here rather than left to the encoder. What the builder
+    hands over is the field's own value, and the source provenance is a record and not a string,
+    so an object would reach the encoder as an object it has no rule for. Naming the members is
+    also what keeps the file's shape a decision rather than a consequence of a dataclass.
+    """
+    row = {field.name: getattr(record, field.name) for field in dataclasses.fields(record)}
+    row["source_provenance"] = _provenance_row(record.source_provenance)
+    row["receipt_lifecycle"] = receipt_lifecycle(record)
+    row["receipt_availability"] = receipt_availability(record, failures)
+    return row
+
+
+def _failure_row(row: OperationFailure) -> Dict[str, Any]:
+    """Return one failed operation as the object its line holds, member by member.
+
+    The members are named rather than read off the dataclass for the reason the provenance is:
+    what this file's shape is should be a decision somebody made, and a field added to the record
+    should reach an external reader because somebody put it here.
+    """
+    return {
+        "operation": row.operation,
+        "phase": row.phase,
+        "reason": row.reason,
+        "outcome": row.outcome,
+        "generation": row.generation,
+        "refused_epoch": row.refused_epoch,
+        "attempt_id": row.attempt_id,
+        "payload_position": row.payload_position,
+        "references": list(row.references),
+        "request_id": row.request_id,
+        "recovered_epoch": row.recovered_epoch,
+        "protocol_version": row.protocol_version,
+    }
+
+
+def _provenance_row(source: Optional[SourceProvenance]) -> Optional[Dict[str, Any]]:
+    """Return one attempt's committed source as the object its line holds, member by member."""
+    if source is None:
+        return None
+    return {
+        "source_commitment": source.source_commitment,
+        "bundle_digest": source.bundle_digest,
+        "environment_task_id": source.environment_task_id,
+        "source_attempt_id": source.source_attempt_id,
+        "source_seal_id": source.source_seal_id,
+        "execution_ordinal": source.execution_ordinal,
+        "canonicalization_version": source.canonicalization_version,
+        "renderer_configuration": source.renderer_configuration,
+        "canonical_submission_sha256": source.canonical_submission_sha256,
+        "kernel_submission_digest": source.kernel_submission_digest,
+        "selected_cell": source.selected_cell,
+        "selected_body_reference": source.selected_body_reference,
+        "selected_policy_digest": source.selected_policy_digest,
+        "protocol_version": source.protocol_version,
+    }
 
 
 def _cells(record: AttemptRecord) -> Tuple[str, ...]:
