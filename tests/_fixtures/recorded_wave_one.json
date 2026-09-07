@@ -194,6 +194,10 @@
     },
     "workdir": "/work"
   },
+  "offer": {
+    "budget": 52,
+    "dispenses": 37
+  },
   "outcome": {
     "dispensed": 37,
     "eval_after_legs": 120,
@@ -221,6 +225,7 @@
       "launch.cli_package, launch.cli_registry": "docker/agent.Dockerfile at that same revision. It installs the package by name and passes no registry, so the recorded run has a package to check against and no registry: a registry is this cell's own choice and is null here rather than invented",
       "launch.credential_names": "manifest.json, which records the credential mode this run ran under and, on its credential_mode axis, the name the environment carried. The spec that mode selects is in src/shobench/credentials.py at the shobench revision manifest names",
       "launch.mounts, launch.workdir": "src/shobench/containers.py and src/shobench/runner.py at that same revision",
+      "offer": "rollout/traces/leg-0000.stream.jsonl, the `get_task` results the agent was answered with. Every one of the 37 offers carried `budget: 52`, which is the number that agent paced each task against and the horizon the env published at the shogym revision this fixture names (max_steps 50 plus 2). It is here rather than in the cell block because the cell block is manifest.json's and the manifest does not record it.",
       "outcome.dispensed, outcome.queued, outcome.stop_reason": "rollout_stopping.json",
       "outcome.legs, outcome.eval_after_legs, outcome.turns, outcome.wall_clock_s, outcome.returncode, outcome.terminal_reason": "legs.json",
       "run_id, started_at, started_at_utc, cell, container, harness, instruction, split.id_digest, split.seed, split.total_tasks, substrate.shogym_rev, substrate.shobench_rev, substrate.mcp_server_name, work, outcome.memory_files": "manifest.json",

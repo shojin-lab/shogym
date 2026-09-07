@@ -41,8 +41,11 @@ from shogym.serve.protocol_v2.errors import WireFormatError
 from shogym.serve.protocol_v2.kernel.messages import AttemptRecord, PresentedMessage
 from shogym.serve.protocol_v2.records import Task
 
-#: The one served tool that names no attempt. It is counted on its own, because how often an
-#: agent asked for work is a different fact from how much work it did.
+#: The served tool that asks for work. It names no attempt, and it is counted on its own, because
+#: how often an agent asked for work is a different fact from how much work it did. The tool that
+#: says how much work is left names no attempt either, and asking is neither a pull nor work on a
+#: task, so it is counted as neither; the answer it comes back with is a presented message like
+#: any other and is reconciled as one.
 PULL_TOOL = f"{SERVED_PREFIX}pull"
 
 #: How a message names itself inside a result the agent was handed. Every record this protocol
