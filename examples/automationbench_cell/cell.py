@@ -1,24 +1,30 @@
 """Run one Claude Code cell over AutomationBench under protocol v2, and read what it scored.
 
-The cell this reruns served the same benchmark, in the same order, to the same model at the same
-effort, and told the agent its score the moment each task ended. What differs is the serving
-contract: the agent asks for work with ``pull`` rather than being handed it, every call names the
-attempt it belongs to, the terminal is intercepted and sealed by the stream rather than by the
-harness, and the score reaches the agent as a payload the stream released against the attempt
-instead of as a field on the tool result that ended it. That difference is the measurement, so
-everything else here is pinned to what the earlier cell ran.
+The run this reruns queued the same task ids in the same order, to the same model at the same
+effort, and told the agent its score the moment each task ended. It queued them at an earlier
+revision of the benchmark, and a task id is an index into a revision's own list, so the same id
+can carry other instructions and other scoring assertions here; the launch record names both
+revisions. What differs on purpose is the serving contract: the agent asks for work with ``pull``
+rather than being handed it, every call names the attempt it belongs to, the terminal is
+intercepted and sealed by the stream rather than by the harness, and the score reaches the agent
+as a payload the stream released against the attempt instead of as a field on the tool result that
+ended it. That difference is the measurement, so everything else here is pinned to what that run
+ran. The launch record names what it is pinned to; the differences that could not be pinned, the
+timers, the continuation, the topology, the evaluation bookend and the rest of that image, are
+set out in the pull request that brought this cell to that run rather than in this directory.
 
 The run is two containers on a private network. The generation, the benchmark source and every
 grade the run commits are in one of them, and the agent is in the other with the directory it
-works in and the Claude Code home it writes to and nothing else. That is the shape the earlier
-cell ran, and it is what makes this a rerun of it rather than a rerun on the honour system: an
-agent under ``bypassPermissions`` reads whatever filesystem it is on, so the only useful question
-is whether the answers were ever on that filesystem.
+works in and the Claude Code home it writes to and nothing else. The recorded run kept the same
+property by another arrangement, and the property is what makes this a rerun rather than a rerun
+on the honour system: an agent under ``bypassPermissions`` reads whatever filesystem it is on, so
+the only useful question is whether the answers were ever on that filesystem.
 
 Three commands. ``run`` composes the generation, serves it to the agent's container over the
 network, and keeps the transcript and the durable history side by side in one directory. ``probe``
-stands the same two domains up and asks, from inside a container started exactly as the agent's
-is, whether any of it can be reached. ``table`` reads a run directory back: the rows ``shogym
+stands the same two domains up and asks, from inside a container started as the agent's is, save
+that it carries a credential only where the environment has one, whether any of it can be reached.
+``table`` reads a run directory back: the rows ``shogym
 results`` prints, and beside them the join that says which benchmark task each attempt was and how
 much work went into it.
 """
@@ -35,6 +41,7 @@ import sys
 import uuid
 from contextlib import contextmanager
 from datetime import datetime, timezone
+from hashlib import sha256
 from pathlib import Path
 from secrets import token_hex
 from types import FrameType
@@ -43,22 +50,34 @@ from typing import Any, Dict, Iterator, List, Mapping, NamedTuple, Optional, Seq
 from examples.automationbench_cell import pinned
 from examples.automationbench_cell import sandbox
 from examples.automationbench_cell import table as read_back
-from examples.automationbench_cell.serve import ROSTER_FILE, SERVER, release_for, roster
+from examples.automationbench_cell.serve import (
+    CAPACITY,
+    CELL_ONE,
+    POOL_CEILING,
+    ROSTER_FILE,
+    SERVED_TOOLS,
+    SERVER,
+    STREAM_SEED,
+    release_for,
+    roster,
+)
 
 HERE = Path(__file__).resolve().parent
 REPO = HERE.parent.parent
 
-#: The model and effort the cell this one reruns was served to. Both are overridable, because a
-#: smoke run proving the pipe should not cost what a cell costs, and the earlier harness took the
-#: same two as overrides for the same reason.
+#: The model and effort the recorded run used. Both are overridable, because a smoke run proving
+#: the pipe should not cost what a cell costs, and the recorded harness took the same two as
+#: overrides for the same reason.
 MODEL = "claude-opus-5"
 EFFORT = "xhigh"
 
-#: The user turn. Everything else the agent is told is the system prompt, which is where the
-#: earlier cell put it so that it survives compaction.
-KICKOFF = "Begin."
+#: The user turn, byte for byte as the recorded run sent it, trailing newline included. Everything
+#: else the agent is told is the system prompt, which is where that run put it so that it survives
+#: compaction. The bytes matter beyond tidiness: the turn is the end of the cached prompt prefix,
+#: so a run that trimmed it is a run the model met under a different prefix.
+KICKOFF = "Begin.\n"
 
-#: The regime the earlier cell ran, read off its broker rather than its documentation: the score
+#: The regime the recorded run served, read off its broker rather than its documentation: the score
 #: and the environment's numbers reached the agent inside the result of the call that ended each
 #: task, on every task, with no path that could withhold one. Under this protocol the equivalent
 #: is the honest payload released at each seal, which is what ``immediate`` is.
@@ -78,9 +97,9 @@ RUN_FILE = "run.json"
 
 #: What the run's record says of itself when it is read back. A launch is complete when work
 #: crossed the boundary in both directions and the two containers were taken down afterwards, and
-#: it says why it is not when it is not: an exit code alone cannot tell a cell that served four
-#: hundred and eighty tasks from one whose agent never found the endpoint. A read holds a run this
-#: calls complete to checks it lets an incomplete one report as unavailable.
+#: it says why it is not when it is not: an exit code alone cannot tell a cell that served two
+#: hundred tasks from one whose agent never found the endpoint. A read holds a run this calls
+#: complete to checks it lets an incomplete one report as unavailable.
 COMPLETE = "complete"
 INCOMPLETE = "incomplete"
 
@@ -152,11 +171,11 @@ def mcp_config(run_dir: Path, *, url: str) -> Path:
     keeps the server a process on the other side of a container rather than a child of the agent's
     own. The file goes in a directory of its own, mounted read only and outside the directory the
     agent works in, so it never becomes part of a self a later run would start from. That is where
-    the earlier cell kept its own.
+    the recorded run kept its own, under the name that run gave it.
     """
     directory = run_dir / CONFIG
     directory.mkdir(parents=True, exist_ok=True)
-    path = directory / ".mcp.json"
+    path = directory / sandbox.MCP_CONFIG
     path.write_text(
         json.dumps({"mcpServers": {SERVER: {"type": "http", "url": url}}}, indent=2) + "\n",
         encoding="utf-8",
@@ -167,12 +186,19 @@ def mcp_config(run_dir: Path, *, url: str) -> Path:
 def claude_argv(
     config: Path, *, model: str, effort: str, system_prompt: str, session_id: str
 ) -> List[str]:
-    """The command the earlier cell launched, with this protocol's prompt in it.
+    """The command the recorded run launched, with this protocol's prompt in it.
 
-    Every flag is the one that cell passed. ``--strict-mcp-config`` keeps the operator's own MCP
-    servers out of the run, and nothing is denied: that cell ran its rollout arm with the agent's
-    own tools left in place, web included, so a rerun that took them away would be comparing two
-    things at once.
+    Every flag is the one that run passed, in the order that run's own launcher wrote them. The
+    order is unlikely to change what the CLI does, and it is what a command line is compared by:
+    an argument list in another order is not the recorded command, and a rerun claiming to be that
+    command should be readable beside it word for word.
+
+    ``--strict-mcp-config`` keeps the operator's own MCP servers out of the run, and nothing is
+    denied: that run's rollout arm ran with the agent's own tools left in place, web included, so
+    a rerun that took them away would be comparing two things at once. ``--setting-sources`` is
+    passed with nothing after it for the same reason the home is fresh: a settings file the image
+    or the home happened to carry would configure the CLI from outside the launch, and the empty
+    value is what says no source at all rather than the default set.
     """
     return [
         "claude",
@@ -180,20 +206,22 @@ def claude_argv(
         KICKOFF,
         "--model",
         model,
-        "--effort",
-        effort,
         "--mcp-config",
         str(config),
         "--strict-mcp-config",
+        "--setting-sources",
+        "",
         "--permission-mode",
         "bypassPermissions",
+        "--append-system-prompt",
+        system_prompt,
         "--forward-subagent-text",
         "--output-format",
         "stream-json",
         "--verbose",
         "--include-partial-messages",
-        "--append-system-prompt",
-        system_prompt,
+        "--effort",
+        effort,
         "--session-id",
         session_id,
     ]
@@ -204,6 +232,37 @@ def write_run_file(run_dir: Path, record: Dict[str, object]) -> Path:
     path = run_dir / RUN_FILE
     path.write_text(json.dumps(record, indent=2, sort_keys=True) + "\n", encoding="utf-8")
     return path
+
+
+def pinned_to(system_prompt: str) -> Dict[str, object]:
+    """What this cell is a rerun of, named strongly enough to tell it from another cell's.
+
+    A run directory outlives the checkout that made it, and the names in it move: a roster called
+    by the same name can mean other tasks a year later, and a benchmark revision can change the
+    text of every task under ids that did not move. So the launch record carries the identifiers
+    rather than the words: the run this cell is pinned to, the digest of the standing instruction
+    that run served, the digest of the split its roster came from, the seed and the cap that turn
+    that split into this roster, the capacity the generation serves at, and both benchmark
+    revisions, the one this checkout pins and the one that run was over.
+
+    The prompt is named twice on purpose. The recorded digest is the run's, and the second is of
+    the bytes this launch actually passed, so a prompt edited between them is a difference a
+    reader can see rather than one they have to reconstruct.
+    """
+    from shogym.envs.automationbench.adapter import UPSTREAM_SHA
+
+    return {
+        "recorded_run": pinned.RECORDED_RUN,
+        "recorded_prompt_sha256": pinned.RECORDED_PROMPT_SHA256,
+        "prompt_sha256": sha256(system_prompt.encode("utf-8")).hexdigest(),
+        "split_id_digest": pinned.RECORDED_SPLIT_DIGEST,
+        "roster_seed": STREAM_SEED,
+        "roster_ceiling": POOL_CEILING,
+        "capacity": CAPACITY,
+        "benchmark_revision": UPSTREAM_SHA,
+        "recorded_benchmark_revision": pinned.RECORDED_BENCHMARK_REVISION,
+        "recorded_shogym_revision": pinned.RECORDED_SHOGYM_REVISION,
+    }
 
 
 class Domains(NamedTuple):
@@ -381,8 +440,9 @@ def unserved(run_dir: Path) -> List[str]:
     endpoint, which the handshake and the tool listing do as well, so an initialization that
     arrived before the first pull failed would answer this half of a run that served nothing.
 
-    The init line is not enough on its own to answer either. The recorded cell's own first line
-    reports the MCP server as pending, because that line is written before the connection is made.
+    The init line is not enough on its own to answer either. It reports the server it was
+    configured with, which the recorded run's own first line reports as connected, and a
+    connection is not a delivery: it is written before any pull has been made.
     """
     reasons: List[str] = []
     transcript = run_dir / TRANSCRIPT
@@ -445,7 +505,7 @@ def launch(
 
     The record ends by saying whether this is a run at all. A cell whose agent never reached the
     endpoint exits nought with an empty transcript, and a pilot reading exit codes would file it
-    beside a cell that served four hundred and eighty tasks.
+    beside a cell that served two hundred.
     """
     positions = roster(tasks)
     # These are read here for their refusals. A misspelled roster, an unknown schedule, a CLI that
@@ -462,11 +522,15 @@ def launch(
     server_image = f"{sandbox.SERVER_IMAGE}:latest"
     images = sandbox.build_images(agent=agent_image, server=server_image, rebuild=build)
     pinned.check_image_build(images[agent_image], allow_drift=allow_image_drift)
+    # Taken whether or not it is empty, and kept in the record either way. An operator who allowed
+    # the drift was told it would be recorded, and the resolved inputs alone cannot say which of
+    # them this cell did not expect.
+    image_drift = pinned.image_drift(images[agent_image])
     cli_version = pinned.resolve_cli_version(sandbox.cli_version_command(agent_image))
     pinned.check_cli_version(cli_version, allow_drift=allow_cli_drift)
 
     work = run_dir / SELF
-    pinned.seed_workdir(work)
+    pinned.empty_workdir(work)
     home = run_dir / HOME
     home.mkdir(parents=True, exist_ok=True)
     record: Dict[str, object] = {}
@@ -481,7 +545,10 @@ def launch(
             )
             config = mcp_config(run_dir, url=domains.url)
             session_id = str(uuid.uuid4())
-            system_prompt = (HERE / "PROMPT.txt").read_text(encoding="utf-8").strip()
+            # Read whole and passed whole. The file is the recorded standing instruction with the
+            # two substitutions this protocol forces, and its trailing newline is part of it: the
+            # prompt is the front of the cached prefix, so trimming it served a different one.
+            system_prompt = (HERE / "PROMPT.txt").read_text(encoding="utf-8")
             environment = pinned.agent_environment(os.environ)
             started = agent_command(
                 domains,
@@ -537,6 +604,8 @@ def launch(
                 },
                 "cli_version": cli_version,
                 "cli_version_recorded": pinned.CLI_VERSION,
+                "image_drift": image_drift,
+                "pinned": pinned_to(system_prompt),
                 # Written before the launch and rewritten after it, so a run killed hard enough to
                 # skip the rest of this reads back as the unfinished thing it is.
                 "status": INCOMPLETE,
@@ -557,7 +626,7 @@ def launch(
     # The tool surface is the half of the launch that only exists once the agent has started, so
     # it is read out of the transcript's first line and compared to the recorded one here.
     init = pinned.init_event(run_dir / TRANSCRIPT)
-    drift = pinned.surface_drift(init)
+    drift = pinned.surface_drift(init, served=SERVED_TOOLS)
     if stopped is not None:
         reasons = [str(stopped)]
     elif returncode:
@@ -616,7 +685,7 @@ def probe(
     reruns did, so what it can reach out there is reported as the retained egress it is.
     """
     cache = sandbox.default_cache() if cache is None else cache
-    pinned.seed_workdir(run_dir / SELF)
+    pinned.empty_workdir(run_dir / SELF)
     (run_dir / HOME).mkdir(parents=True, exist_ok=True)
     sandbox.build_images(
         agent=f"{sandbox.AGENT_IMAGE}:{pinned.CLI_VERSION}",
@@ -779,8 +848,13 @@ def _parser() -> argparse.ArgumentParser:
     run = sub.add_parser("run", help="serve a roster and run the agent over it")
     run.add_argument(
         "--tasks",
-        default="cell-one",
-        help="the roster: `cell-one`, `cell-one:20`, `0-19`, or `4,0,2` (default: cell-one)",
+        default=f"{CELL_ONE}:{POOL_CEILING}",
+        help=(
+            f"the roster: `{CELL_ONE}` is the {POOL_CEILING} tasks the recorded run queued, in "
+            f"the order it queued them, `{CELL_ONE}:20` is the first twenty of them, and a "
+            f"plain list or range (`0-19`, `4,0,2`) is a roster of your own (default: "
+            f"{CELL_ONE}:{POOL_CEILING})"
+        ),
     )
     run.add_argument("--domain", default="public", help="automationbench domain (default: public)")
     run.add_argument(
@@ -788,7 +862,7 @@ def _parser() -> argparse.ArgumentParser:
         default=CELL_ONE_SCHEDULE,
         help=(
             "what the agent is told: `immediate` is the honest score at every seal, which is "
-            f"the regime the earlier cell ran; `never` tells it nothing (default: "
+            f"the regime the recorded run served; `never` tells it nothing (default: "
             f"{CELL_ONE_SCHEDULE})"
         ),
     )

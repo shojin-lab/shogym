@@ -57,6 +57,26 @@ from shogym.serve.protocol_v2.policy import (  # noqa: E402
 )
 from shogym.task import TaskSpec, ToolManifest  # noqa: E402
 
+#: The recorded run, as much of it as a test needs, copied out of that run's own directory. Every
+#: pin below is checked against this rather than against itself: a test that built its expectation
+#: out of the constant it was checking would pass whatever the constant said, which is how the
+#: cell came to be pinned to another cell's launch in the first place. The file says in its own
+#: provenance block which record each field came from.
+RECORDED = json.loads(
+    (Path(__file__).resolve().parent / "_fixtures" / "recorded_wave_one.json").read_text(
+        encoding="utf-8"
+    )
+)
+
+#: The two halves of the tool array that run's first line reported: the build's own tools, and the
+#: names its server contributed. Four of the second half have no counterpart here, which is what
+#: makes them the right fixture for a comparison that has to keep the two apart.
+RECORDED_BUILTINS = [name for name in RECORDED["init"]["tools"] if not name.startswith("mcp__")]
+RECORDED_SERVED = [name for name in RECORDED["init"]["tools"] if name.startswith("mcp__")]
+
+#: The tasks that run was served, in the order its own results hold them.
+RECORDED_DISPENSES = RECORDED["dispensed_task_ids"]
+
 CLAIM = "c" * 64
 
 SPEC = TaskSpec(
@@ -113,43 +133,71 @@ def test_a_roster_that_names_nothing_is_refused() -> None:
         cell.roster(" , ")
 
 
-def test_the_roster_this_cell_reruns_is_the_one_that_run_was_served() -> None:
-    """The stream the earlier cell dispensed, recomputed from the seeds it drew it with.
+def test_the_roster_this_cell_reruns_is_the_one_that_run_queued() -> None:
+    """The queue the recorded run dispensed from, recomputed from the seeds it drew it with.
 
-    These are its first twenty and its last ten, read off that run's own records. The order is
-    part of the measurement, so it is checked rather than trusted: a rerun over the same tasks in
-    another order differs from the run it is being compared with in more than the serving.
+    The whole derivation is checked against that run's own records rather than against itself.
+    The pool the split file holds is what the two seeds have to reproduce, in its order; the cap
+    the manifest recorded is what turns that pool into a queue; and the tasks the results file
+    holds are what that queue has to start with. A rerun over the same tasks in another order
+    differs from that run in more than the serving, and a rerun over the whole pool is over 280
+    tasks that run never offered.
     """
     stream = cell.cell_one_stream()
-    assert len(stream) == 480
-    assert stream[:10] == [247, 481, 266, 121, 326, 156, 348, 454, 414, 27]
-    assert stream[-10:] == [341, 405, 155, 384, 255, 19, 81, 561, 198, 543]
+    recorded_pool = RECORDED["split"]["pool_task_ids"]
+    queued = RECORDED["cell"]["pool_ceiling"]
+    assert len(stream) == cell.POOL_CEILING == queued == 200
+    assert stream == recorded_pool[:queued]
+    assert stream[: len(RECORDED_DISPENSES)] == RECORDED_DISPENSES == RECORDED_DISPENSES[:37]
     # A shorter rerun works a prefix of it: the same tasks, in the same order, and fewer of them.
     assert cell.roster("cell-one:5") == stream[:5]
-    assert cell.roster("cell-one") == stream
+    assert cell.roster("cell-one") == cell.roster("cell-one:200") == stream
+
+
+def test_the_two_seeds_are_the_recorded_runs_and_not_one_derived_from_the_other() -> None:
+    """The order seed is the one that run recorded, and the split seed is not it.
+
+    They were one expression apart here, the second being the first plus one, which drew another
+    order under a name that said it was that run's. The order seed has a record to check against.
+    The split seed has none, because that run adopted its held-out fifth from an earlier study
+    rather than drawing it: what stands in for a record is that this seed reproduces the adopted
+    set exactly, which the next test checks.
+    """
+    assert cell.STREAM_SEED == RECORDED["split"]["seed"] == 20260807
+    assert cell.SPLIT_SEED == 20260726 and cell.SPLIT_SEED != cell.STREAM_SEED
 
 
 @pytest.mark.parametrize("named", ["cell-one-typo", "cell-one:", "cell-one:x", "cell-one :2"])
 def test_a_name_that_is_nearly_this_cells_roster_names_no_roster(named: str) -> None:
     # A near miss used to be the whole experiment: anything starting `cell-one` was accepted and
     # what followed the colon was passed to a slice. A roster is the measurement, so a spelling
-    # this cell does not serve is refused at the boundary rather than turned into 480 tasks.
+    # this cell does not serve is refused at the boundary rather than turned into the whole of it.
     with pytest.raises(ValueError, match="not this cell's roster"):
         cell.roster(named)
 
 
-@pytest.mark.parametrize("size", ["0", "-1", "999"])
+@pytest.mark.parametrize("size", ["0", "-1", "201", "480"])
 def test_a_prefix_this_stream_does_not_have_is_refused(size: str) -> None:
     # Zero got past parsing and failed later at the first position; a negative prefix quietly
-    # meant all but one task and an oversized one quietly meant all of them.
+    # meant all but one task and an oversized one quietly meant all of them. The bound is the
+    # roster's own length, so the pool's 480 is as refused as any other number past the cap.
     with pytest.raises(ValueError, match="prefix|not this cell's roster"):
         cell.roster(f"cell-one:{size}")
 
 
-def test_the_held_out_fifth_is_not_in_the_stream_this_cell_serves() -> None:
-    # The split is the earlier cell's, and its held-out tasks were never trained on. A rerun that
-    # drew them would be measuring the serving contract over tasks that cell never saw.
-    assert set(cell.cell_one_stream()).isdisjoint({2, 7, 8, 15, 16, 17, 18, 24, 28, 31})
+def test_the_held_out_fifth_is_the_recorded_one_and_is_not_in_the_stream() -> None:
+    """What the split seed is for: the fifth that run kept back, and none of it in the roster.
+
+    Those 120 were the measurement that followed the roster, and the recorded split is a partition
+    of the benchmark's 600, so a seed that reproduced only most of the pool would put the rest of
+    the held-out set in front of the agent. The roster is checked against the whole set rather
+    than against a sample of it.
+    """
+    heldout = RECORDED["split"]["heldout_task_ids"]
+    pool = RECORDED["split"]["pool_task_ids"]
+    assert len(heldout) == 120 and len(pool) == 480
+    assert sorted(heldout + pool) == list(range(RECORDED["split"]["total_tasks"]))
+    assert set(cell.cell_one_stream()).isdisjoint(heldout)
 
 
 def test_a_schedule_this_cell_does_not_serve_is_refused_rather_than_defaulted() -> None:
@@ -371,16 +419,24 @@ def transcript(
         texts = [body(identifier) for identifier in received]
     lines = [
         {"type": "system", "subtype": "init", "session_id": "s"},
-        _assistant([_call("mcp__curriculum__pull", {})]),
+        _assistant([_call(read_back.PULL_TOOL, {})]),
         *[_result(text) for text in texts],
         *[_refused(code) for code in refusals or []],
         _assistant(
-            [_call("mcp__curriculum__api_fetch", {"attempt_id": "a" * 32, "arguments": {}})]
+            [
+                _call(
+                    f"{read_back.SERVED_PREFIX}api_fetch",
+                    {"attempt_id": "a" * 32, "arguments": {}},
+                )
+            ]
         ),
         _assistant(
             [
-                _call("mcp__curriculum__api_search", {"attempt_id": "a" * 32, "arguments": {}}),
-                _call("mcp__curriculum__done", {"attempt_id": "a" * 32, "arguments": {}}),
+                _call(
+                    f"{read_back.SERVED_PREFIX}api_search",
+                    {"attempt_id": "a" * 32, "arguments": {}},
+                ),
+                _call(f"{read_back.SERVED_PREFIX}done", {"attempt_id": "a" * 32, "arguments": {}}),
             ]
         ),
         _assistant([_call("Bash", {"command": "ls"})]),
@@ -448,6 +504,33 @@ def test_calls_are_counted_against_the_attempt_they_named(tmp_path: Path) -> Non
     assert read.unserved == 1
 
 
+def test_a_task_record_is_a_task_whether_or_not_it_carries_a_budget(tmp_path: Path) -> None:
+    """Both encodings of a work order decode, because the protocol's own decoder is what answers.
+
+    A generation that declares a step budget serves that number on the task record, and one that
+    declares none leaves the key out; the two are the same record to the wire. A key set written
+    out here instead would count one of them as something other than work, and a run served under
+    it would read back as a run that served nothing.
+    """
+    for extra in ({}, {"budget": 52}):
+        path = tmp_path / f"budget-{len(extra)}.jsonl"
+        lines = [
+            _assistant([_call(read_back.PULL_TOOL, {})]),
+            _result(json.dumps({**_message(message_id(0, "a")), **extra})),
+        ]
+        path.write_text("".join(json.dumps(line) + "\n" for line in lines), encoding="utf-8")
+        assert read_back.read_transcript(path).tasks == 1
+    # And a record the wire would refuse is not work either. There is no field a queue position
+    # could be written into, so a result carrying one is not the task record it resembles.
+    path = tmp_path / "positioned.jsonl"
+    lines = [
+        _assistant([_call(read_back.PULL_TOOL, {})]),
+        _result(json.dumps({**_message(message_id(0, "a")), "task_position": 3})),
+    ]
+    path.write_text("".join(json.dumps(line) + "\n" for line in lines), encoding="utf-8")
+    assert read_back.read_transcript(path).tasks == 0
+
+
 def test_a_transcript_that_stops_mid_line_still_counts_what_it_holds(tmp_path: Path) -> None:
     path = transcript(tmp_path / "transcript.jsonl")
     path.write_text(path.read_text() + '{"type": "assistant", "message"', encoding="utf-8")
@@ -490,6 +573,35 @@ def test_the_env_this_cell_serves_grades_a_spent_step_budget() -> None:
     )
     assert env.protocol_v2_horizon_ending() == GRADED_HORIZON
     assert env.describe().horizon == 52
+
+
+def test_the_served_names_written_down_here_are_the_ones_the_gateway_would_serve() -> None:
+    """The list the launch compares against, checked against the list a generation composes.
+
+    It is written down because the surface is read off the transcript afterwards and compared,
+    and that first line carries names rather than manifests. A list nobody checked would drift
+    from what is served the first time this env changes a tool, and the comparison would report
+    the drift as the run's rather than as its own.
+
+    The gateway also drops one tool the env advertises. This protocol serves no separate abort,
+    because a call to one would end the episode with no terminal request and leave an attempt
+    nothing could seal, so `terminate` is on the spec and never on the wire.
+
+    The order the list is written in is checked rather than sorted away. It is compared against an
+    init line, and the recorded line listed its server's tools in name order, so that is the order
+    a faithful line here will list these in. Sorting both sides would have let the pin be written
+    in any order at all, and a live run would then have reported drift against it.
+    """
+    import shogym
+    from shogym.serve.protocol_v2.gateway import PULL_TOOL, wrapped_manifests
+
+    env = shogym.make(cell.ENV, config={"tasks": [{"prompt": [], "info": {}}], "max_steps": 50})
+    spec = env.describe()
+    served = [PULL_TOOL, *(tool.name for tool in wrapped_manifests(spec, terminal_manifest(spec)))]
+    assert RECORDED_SERVED == sorted(RECORDED_SERVED)
+    assert list(cell.SERVED_TOOLS) == sorted(f"{cell.SERVED_PREFIX}{name}" for name in served)
+    assert "terminate" in {tool.name for tool in spec.tools}
+    assert f"{cell.SERVED_PREFIX}terminate" not in cell.SERVED_TOOLS
 
 
 def test_an_attempt_the_horizon_filed_is_not_read_as_one_the_agent_finished() -> None:
@@ -767,38 +879,72 @@ def test_the_refusal_count_is_written_where_a_read_looks_for_it(tmp_path: Path) 
     assert read_back.read_refusals(tmp_path) == counted(4)
 
 
-def test_the_launch_is_the_command_the_earlier_cell_ran() -> None:
-    """Every flag that cell passed, and nothing this one added.
+def test_the_launch_is_the_command_the_recorded_run_ran() -> None:
+    """Every flag that run passed, with its value, in that run's own order.
 
-    What is being compared is the serving contract, so the launch has to be the same launch: the
-    same permission mode, the same output format, the same strictness about which MCP servers are
-    in the run, and no deny list, because that cell's rollout arm left the agent's own tools in
-    place.
+    The expected list is the recorded launcher's, from the fixture, with this launch's values put
+    where that launcher put its own. Written out here instead, it would have been a copy of the
+    code it checks: the flags were in another order than the recorded command for a while and a
+    test that retyped the current order could not say so.
+
+    The order is unlikely to change what the CLI does. It is still what a command line is read by,
+    and the claim this cell makes is that it runs the recorded command.
+
+    Two flags are worth naming. `--setting-sources` is passed with nothing after it, and the empty
+    value is the point: it says no settings source rather than the default set, so a file the
+    image or the home carried cannot configure the CLI from outside the launch. An argument list
+    that dropped it for being falsy would pass `--setting-sources --permission-mode`, which is
+    neither launch. And the user turn is checked to the byte, because it is the end of the cached
+    prompt prefix and it went out trimmed for a while.
     """
     argv = launcher.claude_argv(
-        Path("/cfg/.mcp.json"),
+        Path(f"/cfg/{sandbox.MCP_CONFIG}"),
         model="claude-opus-5",
         effort="xhigh",
         system_prompt="Get Better.",
         session_id="a-session",
     )
-    assert argv[:3] == ["claude", "-p", launcher.KICKOFF]
-    for flag, value in (
-        ("--model", "claude-opus-5"),
-        ("--effort", "xhigh"),
-        ("--permission-mode", "bypassPermissions"),
-        ("--output-format", "stream-json"),
-        ("--append-system-prompt", "Get Better."),
-        ("--session-id", "a-session"),
-    ):
-        assert argv[argv.index(flag) + 1] == value
-    assert {"--strict-mcp-config", "--verbose", "--include-partial-messages"} <= set(argv)
-    assert "--forward-subagent-text" in argv
+    supplied = {
+        "<user_prompt>": launcher.KICKOFF,
+        "<model>": "claude-opus-5",
+        "<mcp_config_path>": f"/cfg/{sandbox.MCP_CONFIG}",
+        "<system_prompt>": "Get Better.",
+        "<effort>": "xhigh",
+        "<session_id>": "a-session",
+    }
+    recorded = RECORDED["launch"]["argv"]
+    assert set(supplied) == set(RECORDED["launch"]["argv_placeholders"])
+    assert argv == [supplied.get(token, token) for token in recorded]
+    # No flag this cell added and none that run's launcher only emits on a continuation.
+    assert "--resume" not in argv and "--continue" not in argv and "--max-turns" not in argv
     assert "--disallowedTools" not in argv and "--allowedTools" not in argv
+    assert argv[2] == launcher.KICKOFF == RECORDED["instruction"]["kickoff"]
+    assert argv[argv.index("--mcp-config") + 1] == RECORDED["launch"]["mcp_config_path"]
 
 
-def test_the_default_schedule_is_the_regime_the_earlier_cell_ran() -> None:
-    # Read off that cell's broker rather than its documentation: the score reached the agent in
+def test_the_command_line_defaults_are_the_recorded_runs_own() -> None:
+    """What an operator gets by typing the command in the README and nothing else.
+
+    The roster functions had tests and the defaults that reach them did not, so the whole cell
+    could have been served under another name while every underlying test passed. These are the
+    parser's own answers: the queue that run dispensed from, its feedback regime, its model and
+    its effort.
+    """
+    parsed = launcher._parser().parse_args(["run"])
+    assert parsed.tasks == f"{cell.CELL_ONE}:{cell.POOL_CEILING}" == "cell-one:200"
+    assert cell.roster(parsed.tasks) == cell.cell_one_stream()
+    assert parsed.schedule == launcher.CELL_ONE_SCHEDULE == RECORDED["cell"]["rollout_feedback"]
+    assert parsed.model == RECORDED["cell"]["model"]
+    assert parsed.effort == RECORDED["cell"]["effort"]
+    assert parsed.domain == "public"
+    assert not parsed.allow_cli_drift and not parsed.allow_image_drift
+    # The probe's roster is a short prefix of the same one, because what it measures is the
+    # boundary rather than the benchmark.
+    assert cell.roster(launcher._parser().parse_args(["probe"]).tasks) == cell.cell_one_stream(2)
+
+
+def test_the_default_schedule_is_the_regime_the_recorded_run_ran() -> None:
+    # Read off that run's broker rather than its documentation: the score reached the agent in
     # the result of the call that ended each task, on every task. Under this protocol that is the
     # honest payload released at the seal.
     assert launcher.CELL_ONE_SCHEDULE == "immediate"
@@ -806,26 +952,67 @@ def test_the_default_schedule_is_the_regime_the_earlier_cell_ran() -> None:
     assert launcher.MODEL == "claude-opus-5" and launcher.EFFORT == "xhigh"
 
 
-def test_the_served_tools_reach_the_model_under_the_name_that_cell_saw(tmp_path: Path) -> None:
-    # A tool name is part of the prompt prefix, so the server key is pinned to the earlier cell's.
+def test_the_generation_serves_one_task_at_a_time_and_says_so() -> None:
+    # A pull while a task is live is answered with a wait here, and the composition is checked
+    # rather than assumed: the number decides the regime, and the run's record names it.
+    assert cell.CAPACITY == 1
+    assert composed(["first", "second"], "immediate").capacity == cell.CAPACITY
+
+
+def test_the_served_tools_reach_the_model_under_the_name_that_run_saw(tmp_path: Path) -> None:
+    # A tool name is part of the prompt prefix, so the server key is pinned to the recorded run's.
     # The prompt does not name it: the model meets the name in every tool it is offered.
     url = sandbox.gateway_url("a-server")
     config = json.loads(launcher.mcp_config(tmp_path, url=url).read_text())
-    assert list(config["mcpServers"]) == [cell.SERVER] == ["curriculum"]
+    assert list(config["mcpServers"]) == [cell.SERVER] == ["shogym"]
     served = config["mcpServers"][cell.SERVER]
     # The agent is given somewhere to connect and nothing to spawn, which is what puts the server
     # on the far side of a container rather than in the agent's own process tree.
     assert served == {"type": "http", "url": url}
     assert "command" not in served and "args" not in served and "env" not in served
-    assert read_back.SERVED_PREFIX == "mcp__curriculum__"
-    prompt = (Path(launcher.HERE) / "PROMPT.txt").read_text()
-    assert prompt.startswith("Get Better.")
-    # The prompt is the earlier cell's, the instruction and the loop only. The intended
-    # difference is the loop's names: this protocol's pull and its done record. Everything
-    # else the model must know, the record kinds and the attempt_id wrapper, is stated on the
-    # tools themselves, so the prompt does not repeat it.
-    assert "`pull`" in prompt and '{"kind": "done"}' in prompt
-    assert "get_task" not in prompt and "attempt_id" not in prompt and "seal_ack" not in prompt
+    assert read_back.SERVED_PREFIX == cell.SERVED_PREFIX == "mcp__shogym__"
+    assert read_back.PULL_TOOL == "mcp__shogym__pull"
+    assert all(name.startswith("mcp__shogym__") for name in cell.SERVED_TOOLS)
+
+
+def test_the_word_this_cell_used_to_serve_its_tools_under_is_gone(tmp_path: Path) -> None:
+    """The old key was another cell's, and a name in the prefix is not a detail.
+
+    It reached the model in every tool it was offered, so it is checked out of the example rather
+    than out of the one constant: a stray occurrence in a prompt, a comment or a fixture is a
+    reader being told the run served something it did not.
+    """
+    example = Path(launcher.HERE)
+    files = [
+        *sorted(example.glob("*.py")),
+        *sorted(example.glob("*.md")),
+        *sorted(example.glob("*.Dockerfile")),
+        example / "PROMPT.txt",
+    ]
+    for path in files:
+        assert "curriculum" not in path.read_text(encoding="utf-8"), path
+
+
+def test_the_prompt_is_the_recorded_one_with_the_two_substitutions_this_protocol_forces() -> None:
+    """The standing instruction, byte for byte, and not a paraphrase of it.
+
+    The bytes are pinned by turning them back: `pull` becomes `get_task` again and the done record
+    becomes the shape that run's queue answered with, and what is left has to be the recorded
+    prompt's own digest. So the file cannot drift into the eval prompt it was once taken from, or
+    lose its trailing newline, or gain a sentence, without this failing, and the recorded text is
+    derived here rather than typed out a second time.
+
+    The two substitutions are the two the protocol forces and nothing else: the control tool is
+    named `pull` here, and the exhausted queue answers with a record rather than a flag.
+    """
+    served = (Path(launcher.HERE) / "PROMPT.txt").read_text(encoding="utf-8")
+    recorded = served.replace("`pull`", "`get_task`").replace('{"kind": "done"}', "{done: true}")
+    # Against the recorded text itself, and against its digest, which is what the launch record
+    # names. The bytes are the stronger check and the digest is the one a reader can carry.
+    assert recorded == RECORDED["instruction"]["rollout_system"]
+    assert sha256(recorded.encode("utf-8")).hexdigest() == pinned.RECORDED_PROMPT_SHA256
+    assert served.startswith("Get Better.") and served.endswith("unfinished.\n")
+    assert "get_task" not in served and "attempt_id" not in served and "seal_ack" not in served
 
 
 def test_a_row_that_owed_no_payload_is_not_read_as_one_that_missed_it() -> None:
@@ -850,25 +1037,127 @@ def test_a_row_that_owed_no_payload_is_not_read_as_one_that_missed_it() -> None:
 
 
 def init_line(**overrides: Any) -> Dict[str, Any]:
-    """The line Claude Code writes first, saying which build served the run and what it offered."""
+    """The line Claude Code writes first, saying which build served the run and what it offered.
+
+    The build's half of it is the recorded line's own: the version, the built-ins in their order,
+    the subagents and the skills come out of the record rather than out of the constants they are
+    there to check. What this cell decides is the other half, the names its server contributes, so
+    those are the served list and a faithful line is the two together.
+    """
     line: Dict[str, Any] = {
         "type": "system",
         "subtype": "init",
-        "claude_code_version": pinned.CLI_VERSION,
-        "tools": list(pinned.CLI_TOOLS),
-        "agents": list(pinned.CLI_AGENTS),
-        "skills": list(pinned.CLI_SKILLS),
+        "claude_code_version": RECORDED["init"]["claude_code_version"],
+        "tools": [*RECORDED_BUILTINS, *cell.SERVED_TOOLS],
+        "agents": list(RECORDED["init"]["agents"]),
+        "skills": list(RECORDED["init"]["skills"]),
     }
     line.update(overrides)
     return line
 
 
-def test_the_agent_starts_from_the_file_that_cell_put_in_front_of_it(tmp_path: Path) -> None:
-    # An empty working directory and one holding this file are two different system prompts, so
-    # the file is seeded rather than assumed and its bytes are the recorded ones.
+def _fixture_leaves(node: Any, path: str = "") -> List[str]:
+    """Every path in the fixture that carries a value rather than more fields."""
+    if not isinstance(node, dict) or not node:
+        return [path]
+    return [
+        found
+        for key, value in node.items()
+        for found in _fixture_leaves(value, f"{path}.{key}" if path else key)
+    ]
+
+
+def test_the_fixture_says_where_every_part_of_it_came_from() -> None:
+    """The fixture is only an oracle while a reader can check it against the run.
+
+    So its provenance names where each field was taken from, and every field it holds is named:
+    a part nobody could trace is a part somebody would have to trust, and this file is the thing
+    the pins are trusted against. Four are not out of the run directory at all, because no run
+    writes down the argv it was launched with, and those say where they do come from.
+
+    The check walks the whole structure rather than its top level. A name may cover a field or the
+    block it sits in, since a block copied whole out of one record has one source, but a field
+    under no named block is a field nobody sourced, wherever it is; a top-level check passed those
+    as long as something else under the same name had been named once.
+    """
+    sources = RECORDED["provenance"]["sources"]
+    named = {part.strip() for entry in sources for part in entry.split(",")}
+    body = {name: value for name, value in RECORDED.items() if name != "provenance"}
+    fields = _fixture_leaves(body)
+
+    def sourced(field: str) -> bool:
+        parts = field.split(".")
+        return any(".".join(parts[: depth + 1]) in named for depth in range(len(parts)))
+
+    assert fields and [field for field in fields if not sourced(field)] == []
+    # And nothing is named that this fixture does not carry, so a field that goes away takes its
+    # provenance with it rather than leaving a line that describes nothing.
+    assert [
+        name
+        for name in named
+        if not any(field == name or field.startswith(f"{name}.") for field in fields)
+    ] == []
+    assert RECORDED["provenance"]["run"] == RECORDED["run_id"]
+
+
+def test_the_pins_beside_the_command_are_the_recorded_runs_own_values() -> None:
+    """Each pin against the record it came from, rather than against itself.
+
+    This is the test the cell did not have when it was pinned to another cell's launch: every
+    constant had a test, and every one of those tests built its expectation out of the constant.
+    The build, the surface it reported, the model, the effort, the feedback regime, the server
+    key, the queue cap and the identifiers the launch record carries all have a recorded value,
+    and this is where each is compared with it.
+    """
+    assert pinned.CLI_VERSION == RECORDED["init"]["claude_code_version"] == "2.1.226"
+    assert RECORDED["harness"]["version"].startswith(pinned.CLI_VERSION)
+    # In order and in full. Four names were missing while this list was another cell's, so every
+    # faithful run reported four built-ins it had lost.
+    assert list(pinned.CLI_TOOLS) == RECORDED_BUILTINS and len(pinned.CLI_TOOLS) == 33
+    assert list(pinned.CLI_AGENTS) == RECORDED["init"]["agents"]
+    assert list(pinned.CLI_SKILLS) == RECORDED["init"]["skills"]
+    assert launcher.MODEL == RECORDED["cell"]["model"] == RECORDED["init"]["model"]
+    assert launcher.EFFORT == RECORDED["cell"]["effort"]
+    assert launcher.CELL_ONE_SCHEDULE == RECORDED["cell"]["rollout_feedback"]
+    assert cell.SERVER == RECORDED["substrate"]["mcp_server_name"]
+    assert cell.POOL_CEILING == RECORDED["cell"]["pool_ceiling"]
+    assert launcher.KICKOFF == RECORDED["instruction"]["kickoff"]
+    work = RECORDED["work"]
+    assert pinned.EMPTY_TREE == work["digest_before"] == work["digest_after"]
+    assert pinned.RECORDED_RUN == RECORDED["run_id"]
+    assert pinned.RECORDED_PROMPT_SHA256 == RECORDED["instruction"]["rollout_system_sha256"]
+    assert pinned.RECORDED_SPLIT_DIGEST == RECORDED["split"]["id_digest"]
+    assert pinned.RECORDED_SHOGYM_REVISION == RECORDED["substrate"]["shogym_rev"]
+    assert pinned.RECORDED_BENCHMARK_REVISION == RECORDED["substrate"]["automationbench_rev"]
+    # The credential arm and the working directory are pins with a recorded value too.
+    assert pinned.CREDENTIALS == tuple(RECORDED["launch"]["credential_names"])
+    assert RECORDED["cell"]["credential_mode"] == "subscription"
+    assert RECORDED["init"]["apiKeySource"] == "none"
+    assert RECORDED["init"]["cwd"] == sandbox.WORK == RECORDED["launch"]["workdir"]
+    assert RECORDED["init"]["memory_paths"]["auto"].startswith(f"{sandbox.AGENT_HOME}/")
+    # So are the launch's own shape: what the environment held, where the three directories were
+    # bound, and what the endpoint file was called.
+    assert pinned.PINNED_ENVIRONMENT == RECORDED["launch"]["environment"]
+    assert sandbox.MCP_CONFIG == RECORDED["launch"]["mcp_config"]
+    bound = sandbox.agent_mounts(Path("/runs/a-run"), self_dir="self", home_dir="home",
+                                 config_dir="cfg")
+    assert {target: mode for _, target, mode in bound} == RECORDED["launch"]["mounts"]
+    # The package the image installs is the recorded image's own. The registry is not: that image
+    # passed none and took whatever npm defaulted to, so this pins a choice rather than a record,
+    # and it is written out here rather than read from the constant it checks.
+    assert pinned.CLI_PACKAGE == RECORDED["launch"]["cli_package"]
+    assert RECORDED["launch"]["cli_registry"] is None
+    assert pinned.CLI_REGISTRY == "https://registry.npmjs.org"
+
+
+def test_the_agent_starts_from_the_empty_directory_that_run_started_from(tmp_path: Path) -> None:
+    # An empty working directory and one holding a CLAUDE.md are two different system prompts,
+    # because the CLI reads that file into the prompt when it is there. The recorded run's was
+    # empty at the start and empty at the end, and this is the digest of that.
     work = tmp_path / "self"
-    pinned.seed_workdir(work)
-    assert (work / "CLAUDE.md").read_bytes() == b"# self\n"
+    pinned.empty_workdir(work)
+    assert work.is_dir() and list(work.iterdir()) == []
+    assert pinned.digest_tree(work) == pinned.EMPTY_TREE
 
 
 def test_the_environment_each_container_gets_is_built_and_never_the_operators() -> None:
@@ -889,9 +1178,12 @@ def test_the_environment_each_container_gets_is_built_and_never_the_operators() 
     }
     built = pinned.agent_environment(ambient)
     assert built["CLAUDE_CODE_OAUTH_TOKEN"] == "a-token-nobody-should-read"
-    assert built["IS_SANDBOX"] == "1" and built["ENABLE_TOOL_SEARCH"] == "true"
+    # Two settings and no third. The tool search variable was another cell's and is gone: it
+    # decides whether the CLI offers its tools inline or behind a search, which is the front of
+    # the prompt prefix, and the recorded run set it nowhere.
+    assert built["IS_SANDBOX"] == "1" and built["NODE_OPTIONS"] == ""
     # The image supplies the operating system, so the ambient one contributes nothing at all.
-    assert set(built) == {"IS_SANDBOX", "ENABLE_TOOL_SEARCH", "CLAUDE_CODE_OAUTH_TOKEN"}
+    assert set(built) == {"IS_SANDBOX", "NODE_OPTIONS", "CLAUDE_CODE_OAUTH_TOKEN"}
     # The server is told the run and nothing else, and the cache it reads is the one bound into
     # it rather than whichever path the launching shell was pointing at.
     served = sandbox.server_environment(tasks="cell-one:2", domain="public", schedule="immediate")
@@ -903,6 +1195,25 @@ def test_the_environment_each_container_gets_is_built_and_never_the_operators() 
     assert pinned.redacted(built)["CLAUDE_CODE_OAUTH_TOKEN"] == pinned.REDACTED
     assert pinned.credential_name(ambient) == "CLAUDE_CODE_OAUTH_TOKEN"
     assert pinned.credential_name({"PATH": "/usr/bin"}) is None
+
+
+def test_an_api_key_is_refused_with_the_reason_rather_than_quietly_spent() -> None:
+    """The recorded run authenticated on a subscription, and a key is another billing arm.
+
+    Falling back to one used to be the helpful thing to do, and what it did was change an arm of
+    the measurement without saying so. The refusal names the arm, because an operator who exported
+    a key meant it to be used and would otherwise be told only that nothing authenticated the run.
+    """
+    assert pinned.CREDENTIALS == ("CLAUDE_CODE_OAUTH_TOKEN",)
+    with pytest.raises(ValueError, match="subscription"):
+        pinned.check_credential({"ANTHROPIC_API_KEY": "a-key-nobody-should-spend"})
+    with pytest.raises(ValueError, match="nothing else can authenticate"):
+        pinned.check_credential({"PATH": "/usr/bin"})
+    both = {"ANTHROPIC_API_KEY": "a-key", "CLAUDE_CODE_OAUTH_TOKEN": "a-token"}
+    assert pinned.check_credential(both) == "CLAUDE_CODE_OAUTH_TOKEN"
+    # A key is never carried into the agent's container, and never into a record either.
+    assert "ANTHROPIC_API_KEY" not in pinned.agent_environment(both)
+    assert pinned.redacted(both)["ANTHROPIC_API_KEY"] == pinned.REDACTED
 
 
 def test_the_recorded_image_inputs_are_the_ones_this_tree_would_build(tmp_path: Path) -> None:
@@ -955,6 +1266,99 @@ def test_the_agents_os_packages_are_a_frozen_archive_and_an_exact_version_each()
         pinned.check_image_build(
             {**pinned.AGENT_IMAGE_BUILD, "apt_snapshot": "20200101T000000Z"}, allow_drift=False
         )
+
+
+def test_the_image_holds_the_package_set_and_the_environment_that_run_reached() -> None:
+    """What the model met through Bash, as far as a rebuild can restore it.
+
+    The archive is read at the day the run started, which bounds the build rather than dating it:
+    that image was built from an unpinned archive on a day nobody wrote down, and it is gone. The
+    package set is that run's, `fd` included, and Debian ships it as `fdfind`, so the recipe links
+    it under the name a model would type.
+
+    `NODE_OPTIONS` is empty in both places, the image and the launch, as that run had it. The
+    image half needs the name in the list the probe checks against, or a faithful rerun reports a
+    variable the agent was handed that nobody wrote down.
+    """
+    recipe = (Path(sandbox.HERE) / "agent.Dockerfile").read_text(encoding="utf-8")
+    # The snapshot is the day the run started, and the list is written out here in full: what is
+    # installed is the surface the model reaches through Bash, and a set of versions nobody
+    # compared could move one at a time. The record holds no package list of its own, since that
+    # image resolved them live and is gone, so this pins what this cell resolved at that snapshot.
+    assert pinned.APT_SNAPSHOT == "20260819T000000Z"
+    assert RECORDED["started_at_utc"].startswith("2026-08-19")
+    assert pinned.APT_PACKAGES == (
+        "ca-certificates=20250419~deb12u1",
+        "curl=7.88.1-10+deb12u15",
+        "fd-find=8.6.0-3",
+        "git=1:2.39.5-0+deb12u3",
+        "jq=1.6-2.1+deb12u2",
+        "procps=2:4.0.2-3",
+        "python3=3.11.2-1+b1",
+        "python3-pip=23.0.1+dfsg-1",
+        "python3-venv=3.11.2-1+b1",
+        "ripgrep=13.0.0-4+b2",
+    )
+    assert "ln -sf /usr/bin/fdfind /usr/local/bin/fd" in recipe
+    assert 'ENV NODE_OPTIONS=""' in recipe
+    assert "NODE_OPTIONS" in sandbox.IMAGE_ENVIRONMENT
+    assert pinned.PINNED_ENVIRONMENT["NODE_OPTIONS"] == ""
+    # The recipe's digest is one of the recorded inputs, so an edit that adds any of this without
+    # recording it is a refusal rather than a rebuild nobody hears about.
+    assert sandbox.agent_build_inputs()["dockerfile"] == pinned.AGENT_IMAGE_BUILD["dockerfile"]
+
+
+def test_every_recorded_image_input_is_one_the_build_is_handed(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """An input that labels the image and decides nothing is not a pin.
+
+    The package name was written out in the recipe and recorded as an input beside the version and
+    the registry, so changing it would have rebuilt, relabelled and recorded an image that still
+    installed the package the recipe named. Every input the identity is made of is handed to the
+    build now, and this is where the two lists are compared.
+    """
+    ran: List[List[str]] = []
+
+    def fake_docker(args, **kwargs):
+        ran.append(list(args))
+        if args[0] == "image":
+            return subprocess.CompletedProcess(args, 0, stdout="", stderr="")
+        return subprocess.CompletedProcess(args, 0, stdout="built", stderr="")
+
+    monkeypatch.setattr(sandbox, "_docker", fake_docker)
+    sandbox.build_images(agent="an-agent", server="a-server")
+    build = next(command for command in ran if command[0] == "build" and "an-agent" in command)
+    arguments = dict(
+        pair.split("=", 1)
+        for flag, pair in zip(build, build[1:])
+        if flag == "--build-arg"
+    )
+    assert arguments == {
+        "APT_SNAPSHOT": pinned.APT_SNAPSHOT,
+        "APT_PACKAGES": " ".join(pinned.APT_PACKAGES),
+        "CLAUDE_CODE_PACKAGE": pinned.CLI_PACKAGE,
+        "CLAUDE_CODE_VERSION": pinned.CLI_VERSION,
+        "CLAUDE_CODE_REGISTRY": pinned.CLI_REGISTRY,
+    }
+    recipe = (Path(sandbox.HERE) / "agent.Dockerfile").read_text(encoding="utf-8")
+    assert '"${CLAUDE_CODE_PACKAGE}@${CLAUDE_CODE_VERSION}"' in recipe
+    assert pinned.CLI_PACKAGE not in recipe
+    # Every recorded input is either handed over above or is the recipe itself: the base is the
+    # FROM line and the recipe's digest covers it, and the other five are these arguments.
+    assert set(arguments.values()) == {
+        pinned.AGENT_IMAGE_BUILD[name]
+        for name in ("apt_packages", "apt_snapshot", "cli_package", "cli_registry", "cli_version")
+    }
+    assert set(pinned.AGENT_IMAGE_BUILD) == {
+        "apt_packages",
+        "apt_snapshot",
+        "base",
+        "cli_package",
+        "cli_registry",
+        "cli_version",
+        "dockerfile",
+    }
 
 
 def test_the_server_installs_the_lock_rather_than_resolving_the_ranges_beside_it(
@@ -1227,10 +1631,10 @@ def test_a_launch_the_environment_does_not_authenticate_starts_nothing(
     # authenticate it. Without a credential the launch would build both images, serve the roster
     # and record an agent that exited at once; it refuses before any of that instead.
     ran = no_docker(monkeypatch)
-    for name in pinned.CREDENTIALS:
+    for name in (*pinned.CREDENTIALS, *pinned.REFUSED_CREDENTIALS):
         monkeypatch.delenv(name, raising=False)
     run_dir = tmp_path / "cell"
-    with pytest.raises(ValueError, match="CLAUDE_CODE_OAUTH_TOKEN or ANTHROPIC_API_KEY"):
+    with pytest.raises(ValueError, match="no CLAUDE_CODE_OAUTH_TOKEN"):
         launcher.launch(
             run_dir,
             tasks="cell-one:2",
@@ -1252,7 +1656,7 @@ def test_a_cli_that_is_not_the_recorded_build_is_refused_until_it_is_allowed() -
     pinned.check_cli_version("2.1.258", allow_drift=True)
 
 
-def test_the_surface_the_run_started_with_is_compared_to_the_one_that_cell_saw(
+def test_the_surface_the_run_started_with_is_compared_to_the_one_that_run_saw(
     tmp_path: Path,
 ) -> None:
     """The tools, subagents and skills the build offered, which no flag can pin.
@@ -1260,13 +1664,16 @@ def test_the_surface_the_run_started_with_is_compared_to_the_one_that_cell_saw(
     They exist only once the agent has started, so they are read off the transcript's first line
     and reported: a rerun that cannot hold them fixed can at least say how they differed.
     """
-    assert pinned.surface_drift(init_line()) == {}
+    served = list(cell.SERVED_TOOLS)
+    assert pinned.surface_drift(init_line(), served=served) == {}
     drifted = pinned.surface_drift(
         init_line(
             claude_code_version="2.1.258",
-            tools=[name for name in pinned.CLI_TOOLS if name != "WebSearch"] + ["Glob"],
+            tools=[name for name in pinned.CLI_TOOLS if name != "WebSearch"]
+            + ["Glob", *cell.SERVED_TOOLS],
             skills=[],
-        )
+        ),
+        served=served,
     )
     assert drifted["claude_code_version"] == {
         "recorded": pinned.CLI_VERSION,
@@ -1280,7 +1687,95 @@ def test_the_surface_the_run_started_with_is_compared_to_the_one_that_cell_saw(
     empty = tmp_path / "stream.jsonl"
     empty.write_text("", encoding="utf-8")
     assert pinned.init_event(empty) is None
-    assert "init" in pinned.surface_drift(None)
+    assert "init" in pinned.surface_drift(None, served=served)
+
+
+def test_the_built_in_tools_and_the_served_ones_are_two_comparisons_and_not_one() -> None:
+    """The reported array holds both surfaces, and only one of them is the CLI's.
+
+    Compared as one list, every faithful run reported drift: this cell's server offers `pull`
+    where that one offered `get_task`, offers no abort at all, and had no queue tool, so four of
+    the seven names that run's model saw have no counterpart here. Read as one array those show up
+    as tools the run lost and tools it gained, which is the same false alarm the four missing
+    built-ins used to raise from the other side.
+
+    So the built-ins are compared against the recorded build's and the served names against the
+    ones this generation composes, and a run that really did lose a built-in is still caught.
+    """
+    served = list(cell.SERVED_TOOLS)
+    # The recorded run's own array, unaltered, against this cell's two lists. That line reported
+    # forty tools, thirty-three of the build's and seven of its server's.
+    recorded = RECORDED["init"]["tools"]
+    assert (len(recorded), len(RECORDED_BUILTINS), len(RECORDED_SERVED)) == (40, 33, 7)
+    drift = pinned.surface_drift(init_line(tools=recorded), served=served)
+    assert "tools" not in drift
+    assert drift["served"] == {
+        "missing": ["mcp__shogym__pull"],
+        "added": ["mcp__shogym__get_task", "mcp__shogym__queue_info", "mcp__shogym__terminate"],
+    }
+    # And a built-in that really did go missing is still a built-in that went missing.
+    lost = pinned.surface_drift(
+        init_line(tools=[name for name in RECORDED_BUILTINS if name != "Bash"]), served=served
+    )
+    assert lost["tools"] == {"missing": ["Bash"], "added": []}
+    assert lost["served"] == {"missing": served, "added": []}
+
+
+@pytest.mark.parametrize(
+    "surface,recorded",
+    [
+        ("tools", "builtins"),
+        ("served", "served"),
+        ("agents", "agents"),
+        ("skills", "skills"),
+    ],
+)
+def test_a_surface_in_another_order_or_naming_one_twice_is_drift(
+    surface: str, recorded: str
+) -> None:
+    """These are ordered arrays, and the model reads them in the order they are written.
+
+    Compared as sets, a build that offered the same tools in another order passed as faithful, and
+    so did one that listed a name twice. Neither is the surface the record holds: the array is the
+    front of the prompt prefix, so its order is part of what the agent met.
+
+    The membership report is the one a reader wants where membership is what moved, so it stays.
+    Where membership matches, what is reported is both sequences, since naming a name would not
+    show which of the two is out of place.
+    """
+    lists = {
+        "builtins": RECORDED_BUILTINS,
+        "served": list(cell.SERVED_TOOLS),
+        "agents": list(RECORDED["init"]["agents"]),
+        "skills": list(RECORDED["init"]["skills"]),
+    }
+    names = lists[recorded]
+    served = list(cell.SERVED_TOOLS)
+
+    def line(changed: List[str]) -> Dict[str, Any]:
+        if recorded == "builtins":
+            return init_line(tools=[*changed, *served])
+        if recorded == "served":
+            return init_line(tools=[*RECORDED_BUILTINS, *changed])
+        return init_line(**{recorded: changed})
+
+    swapped = [names[1], names[0], *names[2:]]
+    assert pinned.surface_drift(line(swapped), served=served)[surface] == {
+        "recorded_order": names,
+        "reported_order": swapped,
+    }
+    reversed_names = list(reversed(names))
+    assert pinned.surface_drift(line(reversed_names), served=served)[surface] == {
+        "recorded_order": names,
+        "reported_order": reversed_names,
+    }
+    doubled = [names[0], *names]
+    assert pinned.surface_drift(line(doubled), served=served)[surface] == {
+        "recorded_order": names,
+        "reported_order": doubled,
+    }
+    # And the faithful order is still no drift at all.
+    assert surface not in pinned.surface_drift(line(names), served=served)
 
 
 def server_inputs(scratch: Path) -> Dict[str, str]:
@@ -1312,7 +1807,7 @@ def a_credential(monkeypatch: pytest.MonkeyPatch) -> None:
 
 def no_docker(
     monkeypatch: pytest.MonkeyPatch,
-    version: str = "2.1.220",
+    version: str = pinned.CLI_VERSION,
     *,
     pulled: bool = True,
     answered: bool = True,
@@ -1411,8 +1906,63 @@ def test_a_launch_records_the_argv_environment_and_directories_it_resolved(
     assert written["digests"]["config"] == pinned.digest_tree(run_dir / launcher.CONFIG)
     assert written["init"]["claude_code_version"] == pinned.CLI_VERSION
     assert written["drift"] == {} and written["exit_code"] == 0
+    # The working directory the agent started from was empty, and the digest says so rather than
+    # the record saying nothing was seeded there.
+    assert written["digests"]["work"] == pinned.EMPTY_TREE
     # A run that served work and was taken down afterwards says so, and says nothing else.
     assert written["status"] == launcher.COMPLETE and written["reason"] == []
+
+
+def test_the_record_says_which_run_this_cell_is_a_rerun_of(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A run directory outlives the checkout that made it, so the names in it are not enough.
+
+    A roster called `cell-one` can mean other tasks a year from now, and a benchmark revision can
+    change the text of every task under ids that did not move. So the record carries identifiers:
+    the run this cell is pinned to, the digest of the standing instruction that run served, the
+    digest of the split the roster came from, the seed and the cap that turn that split into this
+    roster, the capacity, and both benchmark revisions.
+
+    The prompt is named twice, the recorded digest and the digest of what this launch passed, so a
+    prompt edited between them is a difference somebody can see rather than reconstruct.
+    """
+    no_docker(monkeypatch)
+    run_dir = tmp_path / "cell"
+    launcher.launch(
+        run_dir,
+        tasks="cell-one:2",
+        domain="public",
+        schedule="immediate",
+        model="claude-opus-5",
+        effort="xhigh",
+        cache=tmp_path / "cache",
+    )
+    record = json.loads((run_dir / launcher.RUN_FILE).read_text())
+    written = record["pinned"]
+    # Against the recorded run's own records, not against the constants the record copied: a
+    # record that agreed with a moved constant would say the same thing either way.
+    assert written["recorded_run"] == RECORDED["run_id"]
+    assert written["recorded_prompt_sha256"] == RECORDED["instruction"]["rollout_system_sha256"]
+    assert written["split_id_digest"] == RECORDED["split"]["id_digest"]
+    assert written["roster_seed"] == RECORDED["split"]["seed"]
+    assert written["roster_ceiling"] == RECORDED["cell"]["pool_ceiling"]
+    assert written["recorded_benchmark_revision"] == RECORDED["substrate"]["automationbench_rev"]
+    assert written["recorded_shogym_revision"] == RECORDED["substrate"]["shogym_rev"]
+    # The capacity is this cell's own and has no recorded counterpart: that generation allowed
+    # eight. It is in the record because a reader cannot otherwise tell which of the two was served.
+    assert written["capacity"] == cell.CAPACITY == 1 != RECORDED["cell"]["max_in_flight"]
+    # The prompt this launch passed, digested here rather than taken from the record.
+    served = (Path(launcher.HERE) / "PROMPT.txt").read_text(encoding="utf-8")
+    assert written["prompt_sha256"] == sha256(served.encode("utf-8")).hexdigest()
+    # The benchmark this checkout serves is not the one that run served, and the record says both
+    # rather than leaving a later reader to assume the ids named the same tasks.
+    from shogym.envs.automationbench.adapter import UPSTREAM_SHA
+
+    assert written["benchmark_revision"] == UPSTREAM_SHA
+    assert written["recorded_benchmark_revision"] != written["benchmark_revision"]
+    # An image built from the inputs this cell records is a run with nothing to report about it.
+    assert record["image_drift"] == {}
 
 
 def test_a_launch_on_a_build_that_is_not_the_recorded_one_starts_nothing(
@@ -1460,18 +2010,67 @@ def test_a_launch_that_allows_the_drift_records_it_rather_than_hiding_it(
     assert written["drift"]["claude_code_version"]["resolved"] == "2.1.258"
 
 
+def test_a_launch_that_allows_an_image_it_did_not_record_says_which_input_moved(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The override says the difference is recorded, so the difference is recorded.
+
+    What the run kept was the inputs this host resolved, which cannot say which of them the cell
+    did not expect: a reader would have had to hold this checkout's constants beside the record to
+    find out. The allowed CLI drift already named both halves, and this names them the same way.
+    """
+    ran = no_docker(monkeypatch)
+    elsewhere = {**pinned.AGENT_IMAGE_BUILD, "cli_registry": "https://a-mirror"}
+    monkeypatch.setattr(
+        sandbox,
+        "build_images",
+        lambda **kwargs: {
+            kwargs["agent"]: dict(elsewhere),
+            kwargs["server"]: {"base": "python", "dockerfile": "sha256:1", "source": "sha256:2"},
+        },
+    )
+    run_dir = tmp_path / "cell"
+    assert (
+        launcher.launch(
+            run_dir,
+            tasks="cell-one:2",
+            domain="public",
+            schedule="immediate",
+            model="claude-opus-5",
+            effort="xhigh",
+            cache=tmp_path / "cache",
+            allow_image_drift=True,
+        )
+        == 0
+    )
+    assert ran, "the launch ran on the allowed image rather than refusing it"
+    written = json.loads((run_dir / launcher.RUN_FILE).read_text())
+    assert written["image_drift"] == {
+        "cli_registry": {
+            "recorded": pinned.CLI_REGISTRY,
+            "resolved": "https://a-mirror",
+        }
+    }
+    # The resolved inputs are still there, and the drift is what says which of them was unexpected.
+    assert written["topology"]["agent"]["build"] == elsewhere
+
+
 def test_the_agent_is_given_three_directories_and_no_fourth(tmp_path: Path) -> None:
     """The boundary this cell rests on, read off the command that makes it.
 
     Two of the three are the agent's own and one names the endpoint. The run directory, this
     repository and the benchmark cache are in none of them, which is the whole of the answer to
     what an agent under bypassPermissions can read about the tasks it is playing.
+
+    The home is the whole of it, as the recorded run mounted it. Only the `.claude` subtree
+    survived here for a while, so everything else the CLI wrote in the home, its own state file
+    and its caches, died with the container and was outside the digest the run recorded.
     """
     run_dir = tmp_path / "cell-immediate-stamp-abc123"
     mounts = sandbox.agent_mounts(run_dir, self_dir="self", home_dir="home", config_dir="cfg")
     assert sandbox.mount_record(mounts) == [
         f"{run_dir / 'self'}:/work:rw",
-        f"{run_dir / 'home'}:/root/.claude:rw",
+        f"{run_dir / 'home'}:/root:rw",
         f"{run_dir / 'cfg'}:/cfg:ro",
     ]
     argv = sandbox.agent_argv(
@@ -1489,7 +2088,9 @@ def test_the_agent_is_given_three_directories_and_no_fourth(tmp_path: Path) -> N
         assert not any(mount.startswith(f"{absent}:") for mount in bound)
     assert argv[-3:] == ["claude", "-p", "Begin."]
     assert "-w" in argv and argv[argv.index("-w") + 1] == "/work"
-    assert "IS_SANDBOX=1" in argv and "ENABLE_TOOL_SEARCH=true" in argv
+    # Both pinned settings reach the container, and the empty one reaches it as an empty value
+    # rather than as a name docker would leave to the image to answer for.
+    assert "IS_SANDBOX=1" in argv and "NODE_OPTIONS=" in argv
 
 
 def test_the_probe_and_the_launch_build_one_container_between_them(
@@ -1526,7 +2127,7 @@ def test_the_probe_and_the_launch_build_one_container_between_them(
     assert started.mounts == sandbox.agent_mounts(
         run_dir, self_dir=launcher.SELF, home_dir=launcher.HOME, config_dir=launcher.CONFIG
     )
-    assert "IS_SANDBOX=1" in started.argv and "ENABLE_TOOL_SEARCH=true" in started.argv
+    assert "IS_SANDBOX=1" in started.argv and "NODE_OPTIONS=" in started.argv
     # The credential reaches the probe's container the way it reaches the agent's, by name.
     assert "CLAUDE_CODE_OAUTH_TOKEN" in started.argv
     assert "a-token-nobody-should-read" not in " ".join(started.argv)
@@ -1593,7 +2194,7 @@ def test_the_run_says_what_boundary_it_ran_behind(tmp_path: Path, monkeypatch) -
     assert topology["gateway_url"] == sandbox.gateway_url(topology["server"]["container"])
     assert topology["agent"]["mounts"] == [
         f"{run_dir / 'self'}:/work:rw",
-        f"{run_dir / 'home'}:/root/.claude:rw",
+        f"{run_dir / 'home'}:/root:rw",
         f"{run_dir / 'cfg'}:/cfg:ro",
     ]
     assert topology["agent"]["workdir"] == "/work"
@@ -1607,9 +2208,9 @@ def test_the_run_says_what_boundary_it_ran_behind(tmp_path: Path, monkeypatch) -
     assert topology["agent"]["build"] == dict(pinned.AGENT_IMAGE_BUILD)
     assert topology["server"]["build"]["source"] == "sha256:2"
     # The agent's command carries the endpoint and never a command to spawn a server with.
-    config = json.loads((run_dir / launcher.CONFIG / ".mcp.json").read_text())
+    config = json.loads((run_dir / launcher.CONFIG / sandbox.MCP_CONFIG).read_text())
     assert config["mcpServers"][cell.SERVER]["url"] == topology["gateway_url"]
-    assert ran[1][ran[1].index("--mcp-config") + 1] == "/cfg/.mcp.json"
+    assert ran[1][ran[1].index("--mcp-config") + 1] == "/cfg/claude.mcp.json"
 
 
 def test_a_launch_whose_agent_never_reached_the_endpoint_is_not_a_successful_run(
@@ -1618,9 +2219,10 @@ def test_a_launch_whose_agent_never_reached_the_endpoint_is_not_a_successful_run
     """The failure the corrected endpoint had already caused once, told this time.
 
     A CLI that cannot negotiate with the server prints its opening line and exits nought, and that
-    line reports the MCP server as pending whether or not the connection ever came, exactly as the
-    recorded cell's own does. So neither the exit code nor the init line can answer whether the
-    run happened, and a pilot reading either would file an empty cell beside a full one.
+    line reports the server it was configured with either way: the recorded run's own reports it
+    connected, and a connection is not a delivery. So neither the exit code nor the init line can
+    answer whether the run happened, and a pilot reading either would file an empty cell beside a
+    full one.
     """
     no_docker(monkeypatch, pulled=False, served=False)
     run_dir = tmp_path / "cell"
@@ -2064,7 +2666,7 @@ def test_the_probe_reads_its_own_verdict() -> None:
         run_dir=Path("/runs/cell"),
         cache=Path("/cache"),
         server="a-server",
-        environment=["IS_SANDBOX", "ENABLE_TOOL_SEARCH"],
+        environment=["IS_SANDBOX", "NODE_OPTIONS"],
     )
     assert "/runs/cell" in command and "/cache" in command
     assert str(sandbox.REPO) in command
@@ -2083,11 +2685,11 @@ def test_what_the_probe_is_told_reaches_it_as_arguments_and_not_as_environment()
         run_dir=Path("/runs/cell"),
         cache=Path("/cache"),
         server="a-server",
-        environment=["CLAUDE_CODE_OAUTH_TOKEN", "ENABLE_TOOL_SEARCH", "IS_SANDBOX"],
+        environment=["CLAUDE_CODE_OAUTH_TOKEN", "IS_SANDBOX", "NODE_OPTIONS"],
     )
     assert command[:2] == ["bash", "-c"] and command[2] == sandbox.PROBE_SCRIPT
     assert not any("=" in part for part in command[3:])
-    assert "CLAUDE_CODE_OAUTH_TOKEN ENABLE_TOOL_SEARCH IS_SANDBOX" in command
+    assert "CLAUDE_CODE_OAUTH_TOKEN IS_SANDBOX NODE_OPTIONS" in command
     assert " ".join(sandbox.IMAGE_ENVIRONMENT) in command
 
 
@@ -2099,8 +2701,12 @@ def test_the_probe_asks_about_every_local_surface_it_claims_to_have_measured() -
     seccomp state, a container runtime socket, a resolver, and a metadata service holding the
     host's own credentials, and each of those is a way to the grades that answers no curl.
     """
+    # The endpoint file is named twice in the script, once to read the URL out of and once to
+    # check that it is the only thing in the mount, and both are the name the launch writes.
+    assert f"{sandbox.CONFIG_MOUNT}/{sandbox.MCP_CONFIG}" in sandbox.PROBE_SCRIPT
+    assert f'"$held" = "{sandbox.MCP_CONFIG} "' in sandbox.PROBE_SCRIPT
     for surface in (
-        "/cfg/.mcp.json",
+        "/cfg/claude.mcp.json",
         "/proc/1/environ",
         "/proc/[0-9]*",
         "CapBnd",
@@ -2185,7 +2791,7 @@ def test_a_probe_sharing_the_servers_network_stack_is_a_probe_that_fails(tmp_pat
     """
     cache = sandbox.default_cache()
     run_dir = launcher.new_run_dir(tmp_path, schedule="immediate", prefix="probe")
-    pinned.seed_workdir(run_dir / launcher.SELF)
+    pinned.empty_workdir(run_dir / launcher.SELF)
     (run_dir / launcher.HOME).mkdir(parents=True, exist_ok=True)
     domains = launcher.open_domains(
         run_dir, tasks="cell-one:2", domain="public", schedule="immediate", cache=cache

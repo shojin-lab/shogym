@@ -2,7 +2,7 @@
 # serves. It holds no benchmark source, no run directory and no grade, so what the agent can read
 # about the tasks it is playing is what the server on the far side of the network hands it.
 #
-# The build the recorded cell reported is pinned here rather than taken from whatever npm calls
+# The build the recorded run reported is pinned here rather than taken from whatever npm calls
 # latest, because a different build is a different agent: the system prompt, the built-in tools
 # and the compaction belong to the CLI. The base is pinned by digest for the same reason one step
 # down: a tag moves, and a rerun months from now on a moved tag would be a different shell, a
@@ -17,8 +17,14 @@
 #
 # Credentials are passed at run time and never built in.
 FROM node:22-bookworm-slim@sha256:83f487e0a63425e5b4d146fb5e5be574bcbe1b7b843d3ebafdd95eaf7767a7e5
+# Empty, and set here as well as on the launch, because that is how the recorded run had it: the
+# Node the CLI runs on was started with no options from its environment, and an inherited value
+# would be one more thing deciding how the agent's own harness behaves.
+ENV NODE_OPTIONS=""
 ARG APT_SNAPSHOT
 ARG APT_PACKAGES
+# Debian ships `fd` as `fdfind`, and the recorded image linked it under the name the model would
+# type. The link is part of the surface, so it is here rather than left to whoever remembers.
 RUN set -eu; \
     rm -f /etc/apt/sources.list.d/*; \
     { \
@@ -28,10 +34,16 @@ RUN set -eu; \
     } > /etc/apt/sources.list; \
     apt-get -o Acquire::Check-Valid-Until=false update; \
     apt-get install -y --no-install-recommends ${APT_PACKAGES}; \
+    ln -sf /usr/bin/fdfind /usr/local/bin/fd; \
     rm -rf /var/lib/apt/lists/*
+# The package arrives as an argument beside the registry and the version, so that what the image
+# records installing is what it installed. Written out here instead, the recorded package name
+# labelled the image and decided nothing: changing it rebuilt and relabelled an image that still
+# carried the package this line named.
+ARG CLAUDE_CODE_PACKAGE
 ARG CLAUDE_CODE_VERSION
 ARG CLAUDE_CODE_REGISTRY
 RUN npm install -g --registry "${CLAUDE_CODE_REGISTRY}" \
-        "@anthropic-ai/claude-code@${CLAUDE_CODE_VERSION}"
+        "${CLAUDE_CODE_PACKAGE}@${CLAUDE_CODE_VERSION}"
 WORKDIR /work
 CMD ["bash"]
