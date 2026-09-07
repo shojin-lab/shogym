@@ -1,0 +1,10 @@
+Get Better.
+
+An MCP server provides a stream of tasks.
+Nothing external loops for you, so drive yourself:
+
+1. Calling `pull` pulls the next task.
+   If it answers {"kind": "done"}, the stream is exhausted, stop.
+2. The task can be completed using the tools listed.
+   One of them ends the task; call it before pulling the next.
+3. Continue until the stream is exhausted.
