@@ -37,8 +37,10 @@ from shogym.serve.protocol_v2.policy import GradeIdentity, PublishedNumber
 
 #: The version this environment declares for the submission its terminal captures. It names what
 #: goes into the canonical text and what does not, so a run recorded under it is comparable with
-#: another run recorded under it and with nothing else.
-CANONICALIZATION_VERSION = "shogym.automationbench.1"
+#: another run recorded under it and with nothing else. The name is this environment's own and
+#: names no platform, because the version is in the acknowledgement that answers a filing and a
+#: model reads it there at the end of every task it finishes.
+CANONICALIZATION_VERSION = "automationbench.1"
 
 #: How fine the headline is. ``partial_credit`` is the count of assertions the end state satisfied
 #: over the count that were scored, and a division of two small whole numbers runs to as many

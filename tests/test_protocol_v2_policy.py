@@ -129,6 +129,20 @@ RECORDED_BEFORE_POLICIES = "stream/recorded-before-policies/1"
 # under has to keep producing it for a start that declares no profile.
 LEGACY_CONFIGURATION = "e884f10027a18f613045200cf29bdd02a00c0764944b6fd7ac8b825a3fe2e1c5"
 
+# What the fixture history itself committed, written out because it is a recorded value rather
+# than one this file derives. Two strings a hash like this is taken over moved when the strings a
+# model reads were made neutral: the version the generation declares, and the one every served
+# manifest carries, which is inside the environment configuration the outer hash folds in. This
+# run declares a version that did not move, and the configuration it carries is the fixture value
+# below rather than a manifest a gateway composed, so neither string is in what it committed and
+# the formula still answers it.
+RECORDED_CONFIGURATION = "7abe44d4188a1f1e4d531ab47b349a25865cab94bfae1cb6a0a09b8ac15ee0e5"
+
+# The environment configuration that history carries, which is a stand-in a test wrote rather
+# than a served manifest's digest. It is written out here because it is the other half of why
+# this recorded run is not one whose resume the neutral strings refuse.
+RECORDED_ENVIRONMENT_CONFIGURATION = "c" * 64
+
 # A grader that says its number is the environment's own, which is what an honest body needs, and
 # that declares the one number it publishes beside that score, with the domain that number lies
 # in.
@@ -1592,6 +1606,14 @@ async def test_a_history_recorded_before_policies_replays_to_what_it_recorded() 
     assert (start.profile, start.dispositions, start.provenance) == (LEGACY, [], None)
     assert start.budget is None
     assert policy_name_of(None) == "legacy-placeholder-v1"
+    # The two places the strings a model reads reach a hash like this one. The version this
+    # history declares is its own and names no platform, so it is not one of the ones that moved
+    # when those strings were made neutral. The environment configuration it carries is a
+    # stand-in rather than the digest of a served manifest, so the version every manifest carries
+    # is not folded in here either. Both are why this recorded run is not one whose resume that
+    # move refuses.
+    assert start.canonicalization_version == "kernel.1"
+    assert start.configuration_hash == RECORDED_ENVIRONMENT_CONFIGURATION
 
     committed = [
         json.loads(payload.data)
@@ -1600,7 +1622,8 @@ async def test_a_history_recorded_before_policies_replays_to_what_it_recorded() 
             event.workflow_execution_update_completed_event_attributes.outcome.success.payloads
         )
     ]
-    assert configuration_hash(start) == committed[0]["configuration_hash"]
+    assert committed[0]["configuration_hash"] == RECORDED_CONFIGURATION
+    assert configuration_hash(start) == RECORDED_CONFIGURATION
 
     [offered] = [row["visible_text"] for row in committed if row.get("kind") == "task"]
     assert offered == (
@@ -2461,7 +2484,7 @@ def test_a_worker_that_replaced_the_one_which_sealed_grades_the_play_it_sealed(
             attempt_id=ATTEMPT,
             seal_id=seal_id,
             native_terminal_name="submit",
-            canonicalization_version="shogym.wordle.1",
+            canonicalization_version="wordle.1",
         ),
     )
     request = GradeAttemptInput(

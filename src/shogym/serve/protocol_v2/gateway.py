@@ -310,9 +310,18 @@ class EnvironmentTerminal(NamedTuple):
 
 # The version a generation declares for the canonical submission its terminal captures when the
 # environment does not declare one of its own. The capture belongs to the environment, so the name
-# says which gateway made the promise, and an environment that brings its own terminal replaces
+# says which stand-in made the promise, and an environment that brings its own terminal replaces
 # both the promise and the Activities that keep it (see :func:`environment_terminal`).
-CANONICALIZATION_VERSION = "shogym.gateway.1"
+#
+# The word carries no platform name, because this string is not identity alone: it is in the
+# acknowledgement a filing is answered with, so a model reads it there whenever a filing of its
+# own is answered. The version number is kept because it is what says which capture rule a
+# recorded submission was taken under. Nothing here compares that number on its own: a seal and a
+# resume compare the whole string, so this constant moving is a changed configuration.
+#
+# This string is also in every served manifest, whatever version the environment declares, so the
+# configuration hash of every generation this gateway composes moves when it moves.
+CANONICALIZATION_VERSION = "gateway.1"
 
 # The version of the surface this gateway renders around an environment: the control tool it
 # adds, the wrapper every environment tool is advertised behind, and the note appended to a

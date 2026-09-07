@@ -43,8 +43,10 @@ from shogym.serve.protocol_v2.policy import GradeIdentity, PublishedNumber
 
 #: The version this environment declares for the submission its terminal captures. It names what
 #: goes into the canonical text and what does not, so a run recorded under it is comparable with
-#: another run recorded under it and with nothing else.
-CANONICALIZATION_VERSION = "shogym.yc_bench.1"
+#: another run recorded under it and with nothing else. The name is this environment's own and
+#: names no platform, because the version is in the acknowledgement that answers a filing and a
+#: model reads it there at the end of every task it finishes.
+CANONICALIZATION_VERSION = "yc_bench.1"
 
 #: The sim's own endings. Only these two are a genuine end of the one-year run, and anything else
 #: means the agent stopped the company early, which upstream scores as nothing.

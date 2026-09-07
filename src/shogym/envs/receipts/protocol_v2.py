@@ -80,8 +80,10 @@ from shogym.serve.protocol_v2.policy import GradeIdentity, PublishedNumber
 
 #: The version this environment declares for the submission its terminal captures. It names what
 #: goes into the canonical text and what does not, so a run recorded under it is comparable with
-#: another run recorded under it and with nothing else.
-CANONICALIZATION_VERSION = "shogym.receipts.1"
+#: another run recorded under it and with nothing else. The name is this environment's own and
+#: names no platform, because the version is in the acknowledgement that answers a filing and a
+#: model reads it there at the end of every task it finishes.
+CANONICALIZATION_VERSION = "receipts.1"
 
 #: The argument the score terminal is filed with. The stream holds a terminal call to the names
 #: the tool declares, so this is where the filing arrives and the only place it exists.

@@ -141,7 +141,7 @@ ACK_OFFER = offered(
         message_id=ACK_ID,
         attempt_id=ATTEMPT,
         submission_digest="a" * 64,
-        canonicalization_version="shogym.gateway.1",
+        canonicalization_version="gateway.1",
     ),
     ATTEMPT,
 )
@@ -154,7 +154,7 @@ SECOND_ACK_OFFER = offered(
         message_id=SECOND_ACK_ID,
         attempt_id=SECOND_ATTEMPT,
         submission_digest="b" * 64,
-        canonicalization_version="shogym.gateway.1",
+        canonicalization_version="gateway.1",
     ),
     SECOND_ATTEMPT,
 )
@@ -641,6 +641,23 @@ def hashing_spec() -> TaskSpec:
     )
 
 
+#: The digest a generation over the hashing spec is composed under when it declares no budget, no
+#: info tool and no capacity of its own. It is a literal rather than a recomputation, and what it
+#: promises is that a feature nobody declared changes nothing a recorded run is held to: three
+#: tests below check the three declarations against this one value.
+#:
+#: It has moved once, deliberately, and the move is written down rather than absorbed. The
+#: canonicalization version in the served manifest lost the platform in front of it, that string
+#: is one a model reads whenever a filing of its own is answered, and this digest is taken over
+#: the manifest carrying it. Every manifest carries it, whatever version the environment
+#: declares, so this literal moving is the same move every gateway composition made, and the
+#: value before it was e05450155cce9a1f8d2bfd0e9ea0027605853c2cafaea3760d572f9c1c83ae45. So the
+#: runs recorded before that move are refused their resume, which the change that made it names.
+#: A reader who finds this literal changed again with no such reason beside it has found the
+#: accident the literal is here to catch.
+UNDECLARED_CONFIGURATION = "dca149d701b4270cfa101545ead522ba2dcf0b2a6971316c9c7f18ab0e8b9abc"
+
+
 def configuration_of(spec: TaskSpec) -> str:
     """The digest a generation serving ``spec`` is started under."""
     return _configuration_hash(spec, terminal_manifest(spec))
@@ -874,11 +891,11 @@ def test_a_graded_horizon_is_part_of_what_the_generation_is(episode: ServedEpiso
 def test_a_generation_that_declares_no_budget_serves_what_it_always_served() -> None:
     """The two values are pinned as literals rather than recomputed from this build.
 
-    A generation composed without a budget has to serve the bytes and hash to the digest a build
-    from before there was a budget to declare produced, or every run recorded by one of those is
-    refused its resume over a number nobody handed anyone. So the digest and the task's bytes are
-    written down here as the values that build produced, and the old history that carries the
-    kernel's half of the same promise is replayed by the policy suite.
+    A generation composed without a budget has to serve the bytes a build from before there was a
+    budget to declare produced, and hash to what such a build hashed, or every run recorded by one
+    of those is refused its resume over a number nobody handed anyone. So the task's bytes are
+    written down here as that build produced them, the digest is the shared literal above, and the
+    old history that carries the kernel's half of the same promise is replayed by the policy suite.
     """
     spec = hashing_spec()
     terminal = terminal_manifest(spec)
@@ -887,9 +904,7 @@ def test_a_generation_that_declares_no_budget_serves_what_it_always_served() -> 
     assert served_manifest(spec, terminal)["control_tool"]["description"] == (
         gateway_module._PULL_DESCRIPTION
     )
-    assert configuration_of(spec) == (
-        "e05450155cce9a1f8d2bfd0e9ea0027605853c2cafaea3760d572f9c1c83ae45"
-    )
+    assert configuration_of(spec) == UNDECLARED_CONFIGURATION
     offered = Task(
         message_id="0" * 32,
         attempt_id="1" * 32,
@@ -925,19 +940,17 @@ def test_a_declared_budget_is_said_in_the_words_the_generation_hashed() -> None:
 def test_a_generation_that_declares_no_info_tool_serves_what_it_always_served() -> None:
     """No tool, no words about one, and the same digest a build without one produced.
 
-    The digest is a literal for the reason the budget's and the capacity's are: a generation
-    composed without the tool has to hash to what a build from before there was a tool to declare
-    produced, or every run recorded by one of those is refused its resume over a tool nobody
-    served.
+    The digest is the shared literal above, for the reason the budget's and the capacity's are: a
+    generation composed without the tool has to hash to what a build from before there was a tool
+    to declare produced, or every run recorded by one of those is refused its resume over a tool
+    nobody served.
     """
     spec = hashing_spec()
     terminal = terminal_manifest(spec)
     composed = stream_start(spec, terminal, claim_hash="a" * 64, evaluation_only=True)
     assert composed.info is False
     assert "info_tool" not in served_manifest(spec, terminal)
-    assert configuration_of(spec) == (
-        "e05450155cce9a1f8d2bfd0e9ea0027605853c2cafaea3760d572f9c1c83ae45"
-    )
+    assert configuration_of(spec) == UNDECLARED_CONFIGURATION
     assert _configuration_hash(spec, terminal, None, "floor", None, 1, False) == (
         configuration_of(spec)
     )
@@ -1019,10 +1032,10 @@ def test_an_info_declaration_that_is_not_a_yes_or_a_no_is_refused_where_it_is_de
 def test_a_generation_that_declares_no_capacity_serves_what_it_always_served() -> None:
     """One task at a time is the default, and it is the composition every history was made under.
 
-    The values are pinned as literals for the reason the budget's are: a generation composed
-    without a capacity has to serve the bytes and hash to the digest a build from before there
-    was a capacity to declare produced, or every run recorded by one of those is refused its
-    resume over a number nobody chose.
+    The words are pinned here and the digest is the shared literal above, for the reason the
+    budget's are: a generation composed without a capacity has to serve the bytes and hash to what
+    a build from before there was a capacity to declare produced, or every run recorded by one of
+    those is refused its resume over a number nobody chose.
     """
     spec = hashing_spec()
     terminal = terminal_manifest(spec)
@@ -1033,9 +1046,7 @@ def test_a_generation_that_declares_no_capacity_serves_what_it_always_served() -
         "record: a task to work on, a payload, a wait, or done. Work only on the task you were "
         "given, and pull again when you have finished with it."
     )
-    assert configuration_of(spec) == (
-        "e05450155cce9a1f8d2bfd0e9ea0027605853c2cafaea3760d572f9c1c83ae45"
-    )
+    assert configuration_of(spec) == UNDECLARED_CONFIGURATION
     assert _configuration_hash(spec, terminal, None, "floor", None, 1) == configuration_of(spec)
 
 
@@ -4314,7 +4325,7 @@ async def _drive_stdio(address: str, tmp_path: Any) -> None:
         assert len(ack["submission_digest"]) == 64
         # Wordle brings its own terminal, so the digest was taken under the version that env
         # declares rather than under this gateway's stand-in.
-        assert ack["canonicalization_version"] == "shogym.wordle.1"
+        assert ack["canonicalization_version"] == "wordle.1"
 
         payload = await _record(client, PULL_TOOL, {})
         assert payload["kind"] == "payload"

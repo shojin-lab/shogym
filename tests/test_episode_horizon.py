@@ -81,7 +81,7 @@ class _ScriptedStream:
             message_id=ACK,
             attempt_id=attempt_id,
             submission_digest="d" * 64,
-            canonicalization_version="shogym.fixture.1",
+            canonicalization_version="fixture.1",
         )
         return OfferedMessage(
             message_id=ACK,
