@@ -76,6 +76,12 @@ README covers the model and the shared env-README template.
   [τ²-bench](https://github.com/sierra-research/tau2-bench). Tool-using customer-service agents
   (`tau2_mock`, `tau2_airline`, `tau2_retail`, `tau2_telecom`, `tau2_banking_knowledge`), scored
   by tau2's own evaluator. Needs the `tau2` extra + data.
+- **[`receipts_v1`](src/shogym/envs/receipts/README.md)**: sibling tasks under one drawn hidden
+  convention, for measuring what a single graded receipt is worth. A clerical filing task whose
+  policy extract leaves four decisions open; the same draw scores both siblings, and after the
+  filing seals a fork commits three cells of one envelope (graded, a structurally congruent
+  placebo, and an oracle) once. The generator, the key and the convention stay controller-side.
+  No extra deps.
 - **[`yc_bench`](src/shogym/envs/yc_bench/README.md)**: a port of
   [YC-Bench](https://github.com/collinear-ai/yc-bench). Operate a simulated AI startup for a year
   via a single `run_command` tool, scored on survival, funds, and tasks. In-process sim, no data
