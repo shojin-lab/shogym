@@ -234,7 +234,7 @@ def run_command(command: str, _session_id: str) -> str:
 def submit(_session_id: str) -> str:
     """End the episode and record your final result.
 
-    Calling ``submit`` finishes the run — there is no separate stop step. shogym seals the
+    Calling ``submit`` finishes the run — there is no separate stop step. The harness seals the
     episode, reads the authoritative final metrics off the sim DB (``survived`` (funds ≥ 0),
     ``final_funds_cents``, ``tasks_succeeded`` / ``tasks_failed``, ``horizon_reached``,
     ``terminal_reason``), scores it, and ends the episode. Call it once the run is over

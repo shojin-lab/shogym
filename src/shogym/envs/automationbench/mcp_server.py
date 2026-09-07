@@ -233,7 +233,7 @@ def done() -> str:
     the episode and scores the current state of the workspace (there is no second submission and no
     ``done``-then-fix loop). You do not need to call ``terminate`` after ``done``.
 
-    Scoring is performed by the harness on the sealed final state (AutomationBench's own rubric);
+    Scoring is performed by the harness on the sealed final state, against the task's own rubric;
     this tool takes no arguments and reveals nothing about the grade.
     """
     # The serve layer intercepts `done` as the env's `score` terminal (validate -> seal ->

@@ -9,6 +9,40 @@ direction.
 
 ## Unreleased
 
+### `serve`: three strings a model reads lose the platform, and every configuration hash moves
+
+The canonicalization version each environment declares is now its own name and the version number
+behind it: `automationbench.1`, `receipts.1`, `wordle.1`, `yc_bench.1`, and `gateway.1` for the
+stand-in a generation declares when the environment brings no terminal of its own. The version is
+carried in the acknowledgement that answers a filing, so a model read the old name whenever a
+filing of its own was answered. Two tool descriptions moved with them. The AutomationBench `done`
+description says scoring runs against the task's own rubric rather than naming the benchmark whose
+rubric it is, and the YC-Bench `submit` description says the harness seals the episode rather than
+naming the platform that does.
+
+**The configuration hash of every generation this gateway composes has changed, and a run recorded
+before this release is refused on resume with `configuration_mismatch`.** The version a generation
+declares is in the hash, and so is the served manifest, which carries the gateway's version and
+the tool descriptions whatever version the environment declares. So the change reaches every
+composition, including one over an environment that brings its own terminal and declares a version
+this release did not touch. The refusal happens where a directory is read and before anything is
+claimed.
+
+No run recorded in this repository needs resuming. There are two. The measured run this
+repository's cell reruns, `automationbench-claude_code-claude-opus-5-20260819T011123Z`, was served
+over the version one contract, which keeps no configuration hash and is not resumable under
+protocol v2 at all. The recorded durable history kept as a replay fixture, execution
+`e7795118-04c3-4171-b675-055314345d1f` of 2026-09-02, committed configuration hash
+`7abe44d4188a1f1e4d531ab47b349a25865cab94bfae1cb6a0a09b8ac15ee0e5` under canonicalization version
+`kernel.1`, which did not move, and over an environment configuration that is a recorded stand-in
+rather than a served manifest's digest, so neither string that moved is in what it committed: it
+replays to what it recorded and a resume of it is held to the same value it always was. What this
+release does refuse is a generation that was started before it and is still open: it has to be
+finished under the build that started it.
+
+The wrapper version is untouched. It is in the hashed document and in nothing the model can read,
+so moving it would refuse those resumes and close no leak.
+
 ### `serve`: a generation may tell the agent how much work is left
 
 `stream_start` takes `info`, and a generation that declares it serves an `info` tool beside `pull`.

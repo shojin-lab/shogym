@@ -320,7 +320,7 @@ def record(attempt: str, position: int, **overrides) -> AttemptRecord:
         "state": "ack_presented",
         "terminal_tool": "done",
         "terminal_source": "agent",
-        "canonicalization_version": "shogym.automationbench.1",
+        "canonicalization_version": "automationbench.1",
         "submission_digest": "d" * 64,
         "score": 0.5,
         "decode_state": "decoded",
@@ -549,7 +549,7 @@ def _message(identifier: str) -> Dict[str, Any]:
             **common,
             "kind": kind,
             "submission_digest": "d" * 64,
-            "canonicalization_version": "shogym.automationbench.1",
+            "canonicalization_version": "automationbench.1",
         }
     return {**common, "kind": kind, "body": f"the {kind} body"}
 

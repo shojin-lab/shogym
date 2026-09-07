@@ -71,8 +71,10 @@ WorldRoute = Callable[[str], Optional[Tuple[Any, str]]]
 
 #: The version this environment declares for the submission its terminal captures. It names what
 #: goes into the canonical text and what does not, so a run recorded under it can be compared
-#: with another run recorded under it and with nothing else.
-CANONICALIZATION_VERSION = "shogym.wordle.1"
+#: with another run recorded under it and with nothing else. The name is this environment's own
+#: and names no platform, because the version is in the acknowledgement that answers a filing and
+#: a model reads it there at the end of every task it finishes.
+CANONICALIZATION_VERSION = "wordle.1"
 
 MAX_GUESSES = mcp_server.MAX_GUESSES
 
