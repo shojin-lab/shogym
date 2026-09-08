@@ -143,6 +143,7 @@ with workflow.unsafe.imports_passed_through():
         EnvironmentLease,
         FinalizeRequest,
         finalize_request_identity,
+        ForkOrigin,
         GeneratePayloadBundleInput,
         GenerationRecords,
         GradeAttemptInput,
@@ -153,6 +154,7 @@ with workflow.unsafe.imports_passed_through():
         OwnershipReceipt,
         PayloadCandidate,
         PayloadCandidateResult,
+        PreparedChild,
         PresentedMessage,
         QueueClosed,
         SealAttemptInput,
@@ -169,6 +171,8 @@ with workflow.unsafe.imports_passed_through():
         Writer,
         assignments_for,
         carrier_version,
+        check_complete_start_authorization,
+        check_fork_origin,
         configuration_hash,
         continuation_argument,
         derived_selection,
@@ -318,6 +322,12 @@ assert (
 # under the same Update ID, at the execution that comes next.
 TURNOVER_PENDING = "turnover_pending"
 
+# The refusal a call that would own or serve a child is rejected with while that child has still
+# to authorize the lineage it carries. It is not a protocol error the agent is ever shown: nothing
+# the caller sent is wrong, and the verification the child owes is its own first work, so the same
+# call reaches a generation that has done it.
+ORIGIN_UNVERIFIED = "origin_unverified"
+
 # Why a generation gave up on a boundary it had decided to take. Both are recorded where a
 # launcher can read them, because both leave the generation serving out the execution it is in
 # and therefore able to reach the service cap the boundary existed to avoid.
@@ -426,6 +436,30 @@ class TurnoverPending(ApplicationError):
             "this generation is continuing as new; the same request reaches the execution that "
             "follows",
             type=TURNOVER_PENDING,
+            non_retryable=True,
+        )
+
+
+class OriginUnverified(ApplicationError):
+    """This generation was cut from a fork and has not yet authorized that lineage.
+
+    It is deliberately not a protocol refusal, for the reason a turnover's is not: the protocol's
+    codes are a closed set of things the caller's own request was wrong about, and nothing the
+    caller sent is wrong. A child comes up owning nothing, serving nothing and answering no agent
+    until its own history has read the parent's record of it, because a child that served one
+    message before discovering its origin was false has already spent the measurement it was
+    created for.
+
+    So this reaches the caller as its own type and the same call sent again reaches a generation
+    that has done the reading. What the reading can conclude instead is a refusal of another kind
+    entirely, permanent and never a retry.
+    """
+
+    def __init__(self) -> None:
+        super().__init__(
+            "this generation has still to authorize the lineage it was cut from, and it owns "
+            "nothing and serves nothing until it has",
+            type=ORIGIN_UNVERIFIED,
             non_retryable=True,
         )
 
@@ -937,22 +971,38 @@ class StreamWorkflow:
         # what makes a carrier legal, and it is also what tells the profile marker below that
         # this is not a generation being created.
         self._continued = workflow.info().continued_run_id is not None
+        # Whether this execution has still to authorize the lineage its start carries. A child
+        # comes up owning nothing and serving nothing until its own history has read the parent's
+        # record of it, because a child that served one message before discovering its origin was
+        # false has already spent the measurement it was created for. It is this execution's own
+        # state and is never carried: what it gates is the comparison of a child against the
+        # parent it was cut from, which is asked once, at the entry that was cut.
+        self._origin_unverified = start.fork_origin is not None and not self._continued
         self._restore(start.carry)
 
     def _restore(self, carry: Optional[StreamCarry]) -> None:
-        """Take the projection an earlier execution handed over, or refuse the pair.
+        """Take the projection this execution was handed, or refuse the pair.
 
-        A carrier is legal exactly where a continuation is. An execution the service started
-        fresh may not be handed a projection, because a caller composing one could write a
-        cursor, a score, a presentation or an ownership epoch into a generation that never
-        served any of them. An execution continued from another may not be handed nothing,
-        because the generation would come back as an empty roster under a fenced writer and
-        serve the whole run again. So the two are checked against each other rather than the
-        carrier being trusted for saying it is one.
+        A carry is legal in four entries and nowhere else, and lineage is kept apart from the
+        authorization of the carry a start actually holds. A fresh ordinary generation carries
+        nothing and was cut from no fork. A fresh child holds a lineage record and the carry its
+        parent composed, and the identity inside that carry is the parent's, which the record
+        names. A continued ordinary generation holds its own carry, authorized by the service's
+        own continuation fact. A continued child holds its own carry under that same fact,
+        compared against its own identity, and retains its lineage as provenance that authorizes
+        nothing about the carry. A start with a carry and none of those authorizations is refused
+        whole, and so is a start that names a lineage and carries no projection: a child is the
+        prefix it inherited.
 
-        The version and the configuration identity are checked next, and for the same reason. A
-        carrier this code cannot read is refused rather than read half way, and one composed
-        against another generation is refused before any of it is believed.
+        The reason the two are checked against each other rather than the carrier being trusted
+        is unchanged. A caller composing a projection could write a cursor, a score, a
+        presentation or an ownership epoch into a generation that never served any of them, and an
+        execution continued from another that was handed nothing would come back as an empty
+        roster under a fenced writer and serve the whole run again.
+
+        The version and the identity are checked next, and for the same reason. A carrier this
+        code cannot read is refused rather than read half way, and one composed against another
+        generation is refused before any of it is believed.
 
         A carrier that cannot be read at all is refused the same way, and reading it means all of
         it: the decoding, and the writing of what was decoded over the state the start rebuilt. A
@@ -962,15 +1012,27 @@ class StreamWorkflow:
         the whole reading is one refusal, and the execution ends saying it could not read what it
         was handed. The refusals raised inside it are already the answer and pass through.
         """
+        origin = self._start.fork_origin
+        if origin is not None:
+            self._check_lineage(origin)
         if carry is None:
             if self._continued:
                 raise _refuse_carrier("a continued execution was handed no carried projection")
+            if origin is not None:
+                raise _refuse_carrier(
+                    "a generation cut from a fork was handed no carried projection, and a child "
+                    "is the prefix it inherited"
+                )
             return
-        if not self._continued:
+        if self._continued:
+            cut_from: Optional[ForkOrigin] = None
+        elif origin is None:
             raise _refuse_carrier(
                 "a generation started fresh was handed a carried projection, and carrying one "
-                "is legal only where an execution continues another"
+                "is legal only where an execution continues another or a fork cut it"
             )
+        else:
+            cut_from = origin
         if carry.carrier_schema_version not in CARRIER_SCHEMA_VERSIONS:
             raise _refuse_carrier(
                 f"the carried projection is version {carry.carrier_schema_version} and this "
@@ -978,10 +1040,7 @@ class StreamWorkflow:
             )
         try:
             projection = unpack_carrier(carry, workflow.payload_converter())
-            if projection.configuration_hash != self._configuration_hash:
-                raise _refuse_carrier(
-                    "the carried projection was composed against another generation"
-                )
+            self._authorize_carry(projection, cut_from)
             self._apply(projection, _check_carried_receipts(self._start, projection))
         except ApplicationError:
             raise
@@ -989,6 +1048,96 @@ class StreamWorkflow:
             raise _refuse_carrier(
                 f"the carried projection could not be read: {unreadable}"
             ) from unreadable
+
+    def _check_lineage(self, origin: ForkOrigin) -> None:
+        """Hold the lineage a start carries to what this build reads and to this child's identity.
+
+        Both run at every entry, fresh or continued, because a lineage record is immutable
+        provenance rather than an authorization of anything: a child that has continued twice
+        still says which generation it was cut from, and still has to be the child that record was
+        written about.
+        """
+        try:
+            check_fork_origin(origin)
+        except WireFormatError as error:
+            raise _refuse_carrier(
+                f"the lineage this start carries is not one this build reads: {error}"
+            ) from error
+        if origin.child_configuration_hash != self._configuration_hash:
+            raise _refuse_carrier(
+                "the lineage this start carries records another generation's identity as this "
+                "child's, and a child is what its own start says it is"
+            )
+
+    def _authorize_carry(
+        self, projection: CarriedProjection, cut_from: Optional[ForkOrigin]
+    ) -> None:
+        """Say which authorization admits this carry, and refuse a projection none of them does.
+
+        A continued execution's carry is its own, whether or not the generation was cut from a
+        fork, so it is compared against this start's own identity: the record's parent hash is
+        what the inherited carrier was written under, and a child that has continued once has
+        written its own since. Comparing against the record instead would refuse a child's own
+        lawful continuation, which is the whole reason lineage and authorization are separate.
+
+        A fresh child's carry is its parent's, so the identity inside it is the parent's and the
+        record's own copy of that hash is what admits it. The cursor and the seal ordinal are the
+        ones the record names, so a carrier cut somewhere other than the acknowledged boundary is
+        refused before any of it is believed. The ordered presented rows are not compared here at
+        all: the record commits to none of them, and the complete start digest in the parent's
+        prepared record covers the carrier those rows ride in, so a row altered anywhere fails
+        that authorization whether or not it changed an identifier.
+        """
+        if cut_from is None:
+            if projection.configuration_hash != self._configuration_hash:
+                raise _refuse_carrier(
+                    "the carried projection was composed against another generation"
+                )
+            return
+        if projection.configuration_hash != cut_from.parent_configuration_hash:
+            raise _refuse_carrier(
+                "the carried projection a fresh child was handed was composed against a "
+                "generation other than the parent its lineage names"
+            )
+        if projection.cursor != cut_from.acknowledged_cursor:
+            raise _refuse_carrier(
+                f"this child was cut at the cursor {cut_from.acknowledged_cursor} and the "
+                f"projection it was handed stands at {projection.cursor}"
+            )
+        if projection.seal_ordinal != cut_from.source_seal_ordinal:
+            raise _refuse_carrier(
+                f"this child was cut over {cut_from.source_seal_ordinal} filings and the "
+                f"projection it was handed counts {projection.seal_ordinal}"
+            )
+
+    def _admit_lineage(self, record: PreparedChild) -> None:
+        """Take the parent's own row for this child as the authority its start is checked against.
+
+        This is the transition the origin verification reads its answer into, and it is the only
+        thing that opens the gate. Until it commits the child owns nothing and serves nothing,
+        because a child that served one message before discovering its origin was false has
+        already spent the measurement it was created for.
+
+        A disagreement is permanent. The row came from the parent's own record and the start is
+        the one this execution is running, so there is nothing here for a retry to reach.
+        """
+        try:
+            check_complete_start_authorization(
+                self._start, workflow_id=workflow.info().workflow_id, record=record
+            )
+        except WireFormatError as error:
+            raise _refuse_origin(str(error)) from error
+        self._origin_unverified = False
+
+    def _require_authorized_lineage(self) -> None:
+        """Refuse a call that would own or serve a child that has not authorized its lineage.
+
+        It is read in the validator, where a rejection costs the generation nothing, and read
+        again in the two handler-side places a call that got past it would take effect: the claim
+        that installs ownership and the writer check every stream-affecting call makes.
+        """
+        if self._origin_unverified:
+            raise OriginUnverified()
 
     def _apply(self, carry: CarriedProjection, read: Dict[str, _CarriedSource]) -> None:
         """Write the carried projection over the state the start alone rebuilt.
@@ -1348,10 +1497,18 @@ class StreamWorkflow:
         presentation commit of the one message that can be pending, the end of the one grant
         that can be held, and the retry of the one seal that can be prepared.
 
+        A generation that has still to authorize the lineage it was cut from rejects every one of
+        them, whatever it is reaching for. It is the same shape of answer for the same reason:
+        nothing the caller sent is wrong, a rejection costs the generation nothing, and the same
+        request under the same identifier reaches a child that has done its own first work. Reads
+        are Queries and reach none of this, which is what leaves a controller able to watch a
+        gated child without spending anything.
+
         This runs in a validator, so it is synchronous and reads without writing. Every
         precondition it reads is read again in the handler, because state can move between the
         two and only the handler's reading decides anything.
         """
+        self._require_authorized_lineage()
         if not self._reaching_for_a_boundary():
             return
         if not progress or self._post_latch >= ADMISSION_RESERVE:
@@ -3915,7 +4072,12 @@ class StreamWorkflow:
         It is separate from the swap because it runs twice on a resume, once before the store is
         read and once after, and because everything it does is a refusal: a claim that fails
         here leaves the epoch, the token, and the stream exactly where it found them.
+
+        A child that has not authorized its lineage is refused before any of it is read. Ownership
+        is what a claim installs, and a child owns nothing until its own history has read the
+        parent's record of it.
         """
+        self._require_authorized_lineage()
         if claim.protocol_version != PROTOCOL_VERSION:
             raise StreamProtocolError("unsupported_version")
         if self._generation_state != OPEN or self._draining:
@@ -3977,7 +4139,13 @@ class StreamWorkflow:
         at the start of every stream-affecting call and again after every await inside one,
         because a resume can arrive while a call is waiting on an Activity and the call that
         comes back is then speaking for an owner that no longer exists.
+
+        A child that has not authorized its lineage is refused here too, and the two refusals are
+        different facts. A gated child holds no ownership at all, so nothing could be speaking for
+        it, and saying that it serves nothing yet is the honest answer rather than saying that the
+        caller was fenced by an owner that never existed.
         """
+        self._require_authorized_lineage()
         if writer.protocol_version != PROTOCOL_VERSION:
             raise StreamProtocolError("unsupported_version")
         if self._fencing_token_hash is None:
@@ -4431,6 +4599,17 @@ def _refuse_carrier(complaint: str) -> ApplicationError:
     would serve a history nobody committed to.
     """
     return ApplicationError(complaint, type="CarrierRefused", non_retryable=True)
+
+
+def _refuse_origin(complaint: str) -> ApplicationError:
+    """The failure a child whose parent's record does not name it is refused with.
+
+    It is the answer to a question already asked and answered: the row came from the parent's own
+    record, so the two values are what they are and asking again returns them again. An
+    unavailable parent, an unavailable Worker or a history nobody could read is a different thing
+    entirely and is retryable infrastructure while the child stays gated.
+    """
+    return ApplicationError(complaint, type="OriginRefused", non_retryable=True)
 
 
 def _bindings(rows: List[CarriedBinding]) -> Dict[str, _Bound]:

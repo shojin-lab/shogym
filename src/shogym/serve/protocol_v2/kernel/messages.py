@@ -3152,6 +3152,72 @@ def start_difference_projection(
     ]
 
 
+def check_complete_start_authorization(
+    start: StreamStart, *, workflow_id: str, record: PreparedChild
+) -> None:
+    """Refuse a child whose own start is not the one its parent recorded for this ordinal.
+
+    Comparing hashes, cursors and carried rows is not enough, because a start holds no workflow id
+    and the configuration hash folds none in: an authentic start submitted under the wrong
+    identity passes every one of those comparisons and every parent lookup, and two executions
+    under one hidden execution id make :func:`hidden_seal_id` mint one seal id in two places for
+    the same public attempt. So what is compared here is the identity this execution is actually
+    running as and the digest of its complete start, carrier and all, against the row the parent
+    committed before it fenced, followed by each classified member that row says this child
+    changed against the digest recorded for it.
+
+    A signature inside the start would prove nothing, because the key that verified it would
+    travel in the same start. The parent's own record is the authority, and this is the comparison
+    a child makes against it.
+
+    Nothing here becomes a retry. The row was read from the parent's record, so a disagreement is
+    authenticated: asking again returns the same two values.
+    """
+    origin = start.fork_origin
+    if origin is None:
+        raise WireFormatError(
+            "a complete start is authorized against the parent that recorded it, and this start "
+            "carries no fork origin to say which parent that is"
+        )
+    if record.child_ordinal != origin.child_ordinal:
+        raise WireFormatError(
+            f"this start says it is child {origin.child_ordinal} of its fork, and it is being "
+            f"authorized against the row for child {record.child_ordinal}"
+        )
+    if record.child_workflow_id != workflow_id:
+        raise WireFormatError(
+            f"this execution runs as {workflow_id!r}, and the parent recorded its child "
+            f"{record.child_ordinal} as {record.child_workflow_id!r}"
+        )
+    recorded = origin_digest(origin)
+    if record.origin_digest != recorded:
+        raise WireFormatError(
+            f"the parent recorded this child's lineage as {record.origin_digest[:16]}, and the "
+            f"lineage this start carries is {recorded[:16]}"
+        )
+    complete = complete_start_digest(start)
+    if record.complete_start_digest != complete:
+        raise WireFormatError(
+            f"the parent recorded this child's complete start as "
+            f"{record.complete_start_digest[:16]}, and this one is {complete[:16]}"
+        )
+    check_start_classification()
+    for difference in record.start_differences:
+        if difference.field_name not in CHILD_START_FIELDS:
+            raise WireFormatError(
+                f"the parent recorded a difference in {difference.field_name!r}, which is not a "
+                "field a start declares"
+            )
+        held = sha256(
+            fork_preimage(DIFFERENCE_TAG, getattr(start, difference.field_name))
+        ).hexdigest()
+        if held != difference.value_digest:
+            raise WireFormatError(
+                f"the parent recorded this child's {difference.field_name} as "
+                f"{difference.value_digest[:16]}, and this start holds {held[:16]}"
+            )
+
+
 # The most one run id the service mints may come to inside a measured shape. A fork measures every
 # shape it transmits before the barrier commits, and one class of field cannot be measured then: a
 # child's initial exact run id comes back in the start response and does not exist while the

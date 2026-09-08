@@ -108,6 +108,7 @@ from shogym.serve.protocol_v2.kernel.messages import (  # noqa: E402
     check_checkpoint_manifest,
     check_child_configuration,
     check_child_ready,
+    check_complete_start_authorization,
     check_fork_origin,
     check_fork_receipt,
     check_fork_request,
@@ -1522,3 +1523,106 @@ def test_a_receipt_over_the_bound_proved_for_it_is_refused_with_its_measurement(
         check_receipt_within_bound(receipt, 32, CONVERTER)
     refusal = str(caught.value)
     assert str(encoded_size(receipt, CONVERTER)) in refusal and "32" in refusal
+
+
+def test_a_child_start_the_parent_recorded_is_authorized_against_its_own_row() -> None:
+    """The comparison a child makes before it owns or serves anything.
+
+    Its identity, its lineage, its complete start and each member the record says it changed,
+    against the row the parent committed for its ordinal. Each child answers for its own row and
+    for no other, which is what stops one sibling's evidence from authorizing the other.
+    """
+    for ordinal in (0, 1):
+        check_complete_start_authorization(
+            a_child(ordinal),
+            workflow_id=a_child_id(ordinal),
+            record=a_prepared_child(ordinal),
+        )
+    for ordinal, sibling in ((0, 1), (1, 0)):
+        with pytest.raises(WireFormatError, match="child"):
+            check_complete_start_authorization(
+                a_child(ordinal),
+                workflow_id=a_child_id(ordinal),
+                record=a_prepared_child(sibling),
+            )
+
+
+def test_an_authentic_start_under_an_identity_the_parent_did_not_record_is_refused() -> None:
+    """The one thing hashes, cursors and rows cannot catch, which is why this comparison exists.
+
+    A start carries no workflow id and the configuration hash folds none in, so an authentic
+    child start submitted under another identity passes every one of those comparisons and every
+    parent lookup, and two executions under one hidden execution id mint one seal id in two
+    places for the same public attempt.
+    """
+    child = a_child(0)
+    record = a_prepared_child(0)
+    check_complete_start_authorization(child, workflow_id=a_child_id(0), record=record)
+    for wrong in (a_child_id(1), f"{PARENT_ID}.{FORK_ID_TOKEN}.0.{'f' * 32}", PARENT_ID):
+        with pytest.raises(WireFormatError, match="runs as"):
+            check_complete_start_authorization(child, workflow_id=wrong, record=record)
+
+
+def test_two_siblings_that_exchanged_their_lineage_are_authorized_by_neither_row() -> None:
+    """Each start is authentic and each lineage is authentic, and the pairing is not.
+
+    The row for the ordinal a start claims is the row it is compared against, so a start wearing
+    its sibling's lineage is asked for that sibling's complete start and cannot produce it, and
+    the row for its own ordinal is not the row it claims to be.
+    """
+    exchanged = replace(a_child(0), fork_origin=an_origin(child=a_child(1), ordinal=1))
+    with pytest.raises(WireFormatError, match="child 1 of its fork"):
+        check_complete_start_authorization(
+            exchanged, workflow_id=a_child_id(0), record=a_prepared_child(0)
+        )
+    with pytest.raises(WireFormatError, match="complete start"):
+        check_complete_start_authorization(
+            exchanged, workflow_id=a_child_id(1), record=a_prepared_child(1)
+        )
+    # And a lineage record that is neither sibling's fails before the start is asked about at
+    # all: the record names the lineage the parent wrote, and this start carries another.
+    child = a_child(0)
+    origin = child.fork_origin
+    assert origin is not None
+    with pytest.raises(WireFormatError, match="lineage"):
+        check_complete_start_authorization(
+            replace(child, fork_origin=replace(origin, projection_digest="0" * 64)),
+            workflow_id=a_child_id(0),
+            record=a_prepared_child(0),
+        )
+
+
+def test_a_member_the_record_says_a_child_changed_is_compared_against_its_own_value() -> None:
+    """No parent start is transmitted to a child, so the record carries the digests instead.
+
+    Each is the digest of the child's own value under the difference domain, so a child checks
+    its own members against them and a refusal names the member that moved.
+    """
+    child = a_child(0)
+    row = a_prepared_child(0)
+    assert [difference.field_name for difference in row.start_differences]
+    for index, difference in enumerate(row.start_differences):
+        moved = list(row.start_differences)
+        moved[index] = replace(difference, value_digest="0" * 64)
+        with pytest.raises(WireFormatError, match=difference.field_name):
+            check_complete_start_authorization(
+                child,
+                workflow_id=a_child_id(0),
+                record=replace(row, start_differences=moved),
+            )
+    unknown = replace(
+        row,
+        start_differences=[StartDifference(field_name="an_invention", value_digest="0" * 64)],
+    )
+    with pytest.raises(WireFormatError, match="not a field a start declares"):
+        check_complete_start_authorization(child, workflow_id=a_child_id(0), record=unknown)
+
+
+def test_a_start_carrying_no_lineage_is_authorized_by_nothing() -> None:
+    """A complete start is authorized against the parent that recorded it, and this one has none."""
+    with pytest.raises(WireFormatError, match="no fork origin"):
+        check_complete_start_authorization(
+            replace(a_child(0), fork_origin=None),
+            workflow_id=a_child_id(0),
+            record=a_prepared_child(0),
+        )
