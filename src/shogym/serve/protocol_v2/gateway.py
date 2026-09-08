@@ -98,6 +98,7 @@ from shogym.serve.protocol_v2 import (
     canonical_json,
     check_release,
     length_prefixed,
+    pull_request_identity,
     require_declaration,
     require_opaque_id,
     require_step_budget,
@@ -126,6 +127,7 @@ from shogym.serve.protocol_v2.kernel import (
     start_stream,
     stream_worker,
 )
+from shogym.serve.protocol_v2.artifact import ReceiptContract, check_receipt_contracts
 from shogym.serve.protocol_v2.policy import (
     DELIVER,
     EXPERIMENT,
@@ -392,14 +394,24 @@ def _opaque() -> str:
     return secrets.token_hex(16)
 
 
-def _refusal(code: str) -> ToolError:
-    """Return the transport error that carries one protocol refusal.
+class _Refused(ToolError):
+    """The transport error that carries one protocol refusal, with its code beside the text.
 
-    The canonical record is the error's whole text. It travels on the transport's error
-    channel, so a caller that reads results and a caller that reads errors never confuse a
-    refusal with a message the stream offered.
+    The canonical record is the error's whole text. It travels on the transport's error channel,
+    so a caller that reads results and a caller that reads errors never confuse a refusal with a
+    message the stream offered. The code is kept as a field as well, for this gateway's own use:
+    one refusal is retained where it can be sent again and every other one is not, and telling
+    them apart by parsing the text back would be reading a record this object already holds.
     """
-    return ToolError(canonical_bytes(ProtocolError(code=code)).decode("utf-8"))
+
+    def __init__(self, code: str) -> None:
+        super().__init__(canonical_bytes(ProtocolError(code=code)).decode("utf-8"))
+        self.code = code
+
+
+def _refusal(code: str) -> ToolError:
+    """Return the transport error that carries one protocol refusal."""
+    return _Refused(code)
 
 
 def _wrapper_schema(native: Dict[str, Any]) -> Dict[str, Any]:
@@ -634,6 +646,8 @@ def stream_start(
     dispositions: Optional[Union[Sequence[PayloadDisposition], DispositionsFor]] = None,
     experiment: str = "",
     families: Sequence[MatchedFamily] = (),
+    receipt_contracts: Sequence[ReceiptContract] = (),
+    receipt_source: str = "",
     budget: Optional[int] = None,
     capacity: int = 1,
     info: bool = False,
@@ -691,6 +705,12 @@ def stream_start(
     ``families`` are the matched arms those rows are cells of, where an experiment declares
     them. Each fixes the group its cells are built in and the byte count they come to, and a
     cell that comes back as anything else ends the attempt rather than being served.
+
+    ``receipt_contracts`` are the shapes an environment's own bodies are admitted under, and
+    ``receipt_source`` is the bank source they are admitted over. A row names its contract in the
+    column it would name a family in, a withholding included, because a capture is validated
+    against a contract whether or not anything is delivered from it. Several may be declared: a
+    generation that inferred the only one would stop working at the second.
 
     ``budget`` is what this generation tells the agent it may spend, on every task it serves. It
     is off by default: handing the number over is a decision about the run, and a generation that
@@ -757,7 +777,15 @@ def stream_start(
     check_release(plan, roster, evaluation_only=evaluation_only)
     registered = dispositions(roster) if callable(dispositions) else dispositions
     resolved = _resolved_dispositions(
-        profile, roster, plan.creates_obligations, registered, grade, experiment, list(families)
+        profile,
+        roster,
+        plan.creates_obligations,
+        registered,
+        grade,
+        experiment,
+        list(families),
+        list(receipt_contracts),
+        receipt_source,
     )
     return StreamStart(
         configuration_hash=_configuration_hash(
@@ -785,6 +813,8 @@ def stream_start(
         dispositions=resolved,
         provenance=_provenance(profile, resolved, experiment),
         families=list(families),
+        receipt_contracts=list(receipt_contracts),
+        receipt_source=receipt_source,
         budget=budget,
         info=info,
     )
@@ -850,6 +880,8 @@ def _resolved_dispositions(
     grade: GradeIdentity,
     experiment: str,
     families: List[MatchedFamily],
+    contracts: List[ReceiptContract],
+    source: str,
 ) -> List[PayloadDisposition]:
     """Return one resolved disposition per roster row, or refuse to build the generation.
 
@@ -910,6 +942,14 @@ def _resolved_dispositions(
             grade=grade,
             provenance=_provenance(profile, rows, experiment),
             families=families,
+            contract_ids=[contract.contract_id for contract in contracts],
+        )
+        check_receipt_contracts(
+            contracts,
+            profile=profile,
+            dispositions=rows,
+            families=families,
+            source=source,
         )
     except PolicyViolation as error:
         raise ValueError(str(error)) from error
@@ -1065,6 +1105,45 @@ class _PresentationRefused:
 
 
 @dataclass(frozen=True)
+class _PullRecovered:
+    """A pull the controller sent again after a repair, whose message the stream is holding.
+
+    The recovery stops at the offer. A presentation is a commitment, and one committed outside a
+    call the agent made would be committed and never observed, so what the recovery does is get
+    the generation to reserve the bytes again and then leave them reserved. The agent's own next
+    pull adopts this record, sends that same request once more, receives the message the
+    generation reserved for it and presents it under an attestation built for that call.
+
+    Adoption is the one ownership rule this adds. The record belongs to the recovery rather than
+    to the call that was refused, and the next pull takes it over instead of being refused
+    against it, which is what makes the recovered bytes reachable by the agent at all.
+    """
+
+    owner: bytes
+    request: PullRequest
+
+
+@dataclass(frozen=True)
+class _RefusedPull:
+    """A pull the generation refused because the evidence it depends on was not there.
+
+    It holds the whole request by value, the canonical identity bound to it and the call it was
+    made under. The identity alone would not do: it is a digest of the request rather than its
+    fields, and what a recovery has to do is send that exact request again.
+
+    It reserves nothing and gates nothing. The refusal reserved no message, so no later call is
+    refused against this and an ordinary next pull mints a fresh request as it always did. What
+    it is for is the one thing that cannot be rebuilt afterwards: the request the original exact
+    Update was made under, which is what a recovery under a stepped epoch has to send to reach
+    that same logical operation.
+    """
+
+    request: PullRequest
+    identity: str
+    call: bytes
+
+
+@dataclass(frozen=True)
 class _HorizonOwed:
     """A filing this gateway owes on an attempt's behalf, and what the call that owes it landed
     with.
@@ -1122,6 +1201,7 @@ class _ResultOwed:
 _Recovery = Union[
     _Idle,
     _RequestUncertain,
+    _PullRecovered,
     _LeaseHeld,
     _HorizonOwed,
     _Offered,
@@ -1129,6 +1209,16 @@ _Recovery = Union[
     _PresentationRefused,
     _ResultOwed,
 ]
+
+# The one refusal a pull is retained after. Every other refusal settles the request it answered:
+# nothing was reserved, nothing is owed, and the record held open for an answer closes. This one
+# says the bytes a delivery depends on are not in the store, which is a thing somebody can repair
+# and then ask again, and the request that asked is what has to be sent again to ask it.
+_EVIDENCE_UNAVAILABLE = "evidence_unavailable"
+
+# What the controller's recovery is named as, so it claims this gateway the way a call does and a
+# tool call can never collide with it: no tool of this protocol is called this.
+_RECOVERY_OPERATION = "recover-refused-pull"
 
 
 @dataclass
@@ -1281,6 +1371,12 @@ class StreamGateway:
         self._operation: Optional[_Operation] = None
         self._landing: Optional["asyncio.Future[Any]"] = None
         self._recovery: _Recovery = _Idle()
+        # The pulls this transport is holding for a recovery, by the canonical identity of each.
+        # A pull refused because its evidence was missing is the one refusal that leaves anything
+        # behind here, and what it leaves is the request itself: the controller repairs the bytes,
+        # claims the generation, and names one of these, and this gateway sends that exact request
+        # again under the new epoch. They reserve nothing and refuse nothing meanwhile.
+        self._refused_pulls: Dict[str, _RefusedPull] = {}
         # Whether this transport is still serving, which the stream neither knows nor decides.
         self._serving = _SERVING
         self._shutdown: Optional["asyncio.Future[None]"] = None
@@ -1473,15 +1569,53 @@ class StreamGateway:
 
         The model's own call carries nothing, so an argument is not a value to ignore: it is a
         call this protocol does not define, and it is refused before a request is built.
+
+        A recovery the controller ran leaves a request reserved and nothing presented, and this
+        call is what collects it. The record is adopted before anything else happens, so the pull
+        takes over what the recovery left rather than being refused against it, sends that same
+        request once more, and presents what comes back under an attestation built for this call.
         """
         if arguments:
             raise self._refuse("invalid_message")
+        self._adopt_recovered_pull(key)
         owed = await self._resumed(key)
         if owed is not None:
             return owed
         request = self._pull_request(key)
-        message = await self._decisive(key, self._stream.pull(request))
+        try:
+            message = await self._decisive(key, self._stream.pull(request))
+        except _Refused as refusal:
+            self._retain_refused_pull(request, refusal, key)
+            raise
         return await self._deliver(message, key)
+
+    def _adopt_recovered_pull(self, key: bytes) -> None:
+        """Take over the request a recovery left reserved, before this call reads anything.
+
+        The record the recovery installed is a request that was sent and answered, which is
+        exactly the state a call whose answer was lost leaves. So it becomes that state under this
+        call's name, and everything after it is the ordinary path: the same request goes again,
+        reaches the same Update, and comes back with the bytes the generation reserved.
+        """
+        record = self._recovery
+        if isinstance(record, _PullRecovered):
+            self._recovery = _RequestUncertain(owner=key, request=record.request)
+
+    def _retain_refused_pull(self, request: PullRequest, refusal: _Refused, key: bytes) -> None:
+        """Keep a pull the generation refused over evidence, where it can be sent again.
+
+        Every other refusal is decisive about the request and settles it. This one is decisive
+        about the request and about nothing else: the objects the delivery depends on are not in
+        the store, somebody can put them back, and the operation that was refused is reachable
+        afterwards only by sending this exact request again. So it is written down here, and the
+        gateway is left idle: nothing is reserved, nothing is owed, and the next call is served.
+        """
+        if refusal.code != _EVIDENCE_UNAVAILABLE:
+            return
+        identity = pull_request_identity(request)
+        self._refused_pulls[identity] = _RefusedPull(
+            request=request, identity=identity, call=key
+        )
 
     async def _info(self, key: bytes, arguments: Dict[str, Any]) -> str:
         """Ask the stream how much of its queue there is, once it has nothing older to give.
@@ -1531,6 +1665,91 @@ class StreamGateway:
         withhold.
         """
         return await self._stream.stream_state()
+
+    @property
+    def refused_pulls(self) -> Tuple[str, ...]:
+        """The canonical identities of the pulls this transport is holding for a recovery.
+
+        A controller that repaired an object names one of these to say which refused operation it
+        repaired for. The identity is what joins the two: the same request id under a moved cursor
+        is a different identity and a different operation, so naming the id alone would let a
+        recovery adopt a pull that was never refused.
+        """
+        return tuple(self._refused_pulls)
+
+    async def recover_refused_pull(self, identity: str) -> bool:
+        """Send one refused pull again, and hold what comes back for the agent's next call.
+
+        This is the controller's operation and no public message changes for it. The controller
+        repairs the bytes from a verified copy, claims the generation on the handle this gateway
+        holds, and names the refused pull by its canonical identity; this sends that exact request
+        again under the new epoch, so the same request id and identity reach the handler under a
+        different Update id and the check runs rather than replays.
+
+        The pull that recovers is this gateway's own rather than the controller's, and that is
+        the reason it is here at all. A controller pulling on its own handle would reserve the
+        offer for a request this gateway does not hold, and this gateway's next call, idle with a
+        message pending, would be refused with ``outstanding_response`` and could never collect
+        it: those bytes would never reach the agent and would be committed anyway.
+
+        It stops at the offer. What comes back is held the way any answered call's result is held
+        and nothing is presented, because a presentation is a commitment and one committed outside
+        a call the agent made would be committed and never observed.
+
+        ``True`` says the generation answered and the bytes are reserved for the agent's next
+        pull. ``False`` says it refused again, which is the store still not holding what the
+        delivery depends on: the record is kept, and a controller that has another verified copy
+        can repair and ask again.
+
+        This holds the gateway the way a tool call does, and a controller that asks while another
+        call is in flight is turned away with the same code. What it is not is a refusal an agent
+        was given, so it does not join the count that is reconciled against the harness's own
+        transcript of what the model saw.
+        """
+        retained = self._refused_pulls.get(identity)
+        if retained is None:
+            raise ValueError(
+                f"this transport is holding no refused pull under {identity[:16]}, and a "
+                "recovery sends a request that was refused rather than a fresh one"
+            )
+        operation = self._claim(
+            _call_key(_RECOVERY_OPERATION, {"identity": identity}), counted=False
+        )
+        try:
+            return await self._recovering(retained, operation.key)
+        finally:
+            self._released(operation)
+
+    async def _recovering(self, retained: _RefusedPull, key: bytes) -> bool:
+        """Send the retained request again, and keep the record of what it reserved.
+
+        The record is written before the request goes, for the reason every other request here is
+        written before it goes: the case that matters is the one where no answer comes back, and
+        a reply lost on the way needs nothing further to be done about it. The record is the
+        uncertainty, the agent's next pull adopts it, and the same request under the same epoch
+        reaches the same Update and collects the bytes once.
+
+        A refusal is the other answer, and it is decisive: the generation reserved nothing, so
+        the record goes back to where it was and the pull stays retained for the next repair.
+        """
+        if not isinstance(self._recovery, _Idle):
+            raise ValueError(
+                "this transport has a call outstanding, and a recovery may not take what "
+                "another call is owed"
+            )
+        # The retained record and the recovered one belong to the recovery rather than to the
+        # call that was refused, which is what lets the agent's next pull adopt one.
+        self._refused_pulls.pop(retained.identity, None)
+        self._recovery = _PullRecovered(owner=key, request=retained.request)
+        try:
+            await self._stream.pull(retained.request)
+        except Exception as error:  # noqa: BLE001 - a refusal is an answer, and it is returned
+            if protocol_error_code(error) is None:
+                raise
+            self._recovery = _Idle()
+            self._refused_pulls[retained.identity] = retained
+            return False
+        return True
 
     async def close_queue(self) -> QueueClosed:
         """Close the generation's queue to insertion.
@@ -1833,7 +2052,7 @@ class StreamGateway:
 
     # The entry discipline: the stream first, then what it says is unfinished, then new work.
 
-    def _claim(self, key: bytes) -> _Operation:
+    def _claim(self, key: bytes, *, counted: bool = True) -> _Operation:
         """Take this gateway for one call, before anything has had the chance to await.
 
         The check and the claim are both synchronous, because a call that waited its turn would
@@ -1845,16 +2064,26 @@ class StreamGateway:
         over: Done is what closes a generation, so the pull that asked for Done may be the one
         caller that has not read it. A generation with something owed is entered rather than
         refused, and the recovery record decides who gets what.
+
+        ``counted`` says whether a refusal from here is one an agent was given. The count is a
+        cross-check against the harness transcript, which records what the model saw, so a
+        controller call turned away at this door has no entry there to be checked against: adding
+        it would make the two disagree by exactly the errors nobody was ever told about. The
+        controller is told the same thing either way.
         """
         if self._serving != _SERVING:
             raise GatewayClosed("this transport has stopped serving its generation")
         if self._closed and isinstance(self._recovery, _Idle):
-            raise self._refuse("closed_stream")
+            raise self._turn_away("closed_stream", counted)
         if self._operation is not None:
-            raise self._refuse("overlapping_call")
+            raise self._turn_away("overlapping_call", counted)
         operation = _Operation(key=key)
         self._operation = operation
         return operation
+
+    def _turn_away(self, code: str, counted: bool) -> ToolError:
+        """Return the refusal one call is turned away with, counting it where an agent got it."""
+        return self._refuse(code) if counted else _refusal(code)
 
     async def _accepted(
         self, operation: _Operation, call: Coroutine[Any, Any, _Result]
@@ -1962,6 +2191,13 @@ class StreamGateway:
         if self._nothing_to_collect(record, state):
             record = self._recovery = _Idle()
         if record.owner is not None and record.owner != key:
+            raise self._refuse("outstanding_response")
+        if isinstance(record, _PullRecovered):
+            # A recovery's record belongs to the recovery. The agent's own next pull adopts it
+            # into a request of its own before it reaches here, and every other call arrives
+            # against a record it does not own, which is what the comparison above answers. So
+            # the answer is the same one, said here rather than left to a record this call has
+            # no way to advance.
             raise self._refuse("outstanding_response")
         if isinstance(record, _Idle):
             if state.pending_message_id is not None:
@@ -3120,12 +3356,15 @@ def install_policies(blobs: FilesystemBlobStore, composed: StreamStart) -> None:
     here as well: an object installed under a name other than the one this generation resolved
     would satisfy nothing that reads it back.
 
-    The set covers every cell of every matched family this generation declares as well as the
-    rows it serves. A leg builds one cell of an arm and never renders the counterpart it is
-    matched against, so a directory holding only the served descriptor can say what this body
-    was allowed to contain and not what the comparison was between.
+    The set covers every cell of every matched family and of every receipt contract this
+    generation declares, as well as the rows it serves. A leg builds one cell of an arm and never
+    renders the counterpart it is matched against, so a directory holding only the served
+    descriptor can say what this body was allowed to contain and not what the comparison was
+    between.
     """
-    for digest in descriptor_digests(composed.dispositions, composed.families):
+    for digest in descriptor_digests(
+        composed.dispositions, composed.families, composed.receipt_contracts
+    ):
         policy = POLICIES.get(digest)
         if policy is None:
             continue

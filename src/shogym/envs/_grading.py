@@ -301,16 +301,23 @@ def routed(
     return state
 
 
-def installed(blob_root: Optional[str], text: str) -> BlobRef:
+def installed(
+    blob_root: Optional[str], text: str, media_type: str = _RECORD_MEDIA_TYPE
+) -> BlobRef:
     """Put bytes a result names where an event may cite them, and return the name.
 
     A generation with no store gets the reference anyway: it is the hash of the same bytes, and
     what changes without a store is that nothing can be read back under it.
+
+    ``media_type`` is what the reference says the bytes are. The store addresses an object by
+    the hash of its bytes and nothing else, so this travels with the name rather than with the
+    object: a port that installs a rendered body says so, and one that installs a record it
+    wrote keeps the default it has always had.
     """
     if blob_root is None:
-        return blob_ref(text, _RECORD_MEDIA_TYPE)
+        return blob_ref(text, media_type)
     return FilesystemBlobStore(Path(blob_root)).put(
-        text.encode("utf-8"), media_type=_RECORD_MEDIA_TYPE
+        text.encode("utf-8"), media_type=media_type
     )
 
 

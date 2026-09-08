@@ -8,7 +8,7 @@ names those bytes, and the digest is folded into what the generation is, so two 
 recorded the same policy delivered under the same rules and a run that changed renderers has a
 different identity.
 
-Four policies ship. ``honest-v1`` tells the agent its score and the numbers the grader published
+Six policies ship. ``honest-v1`` tells the agent its score and the numbers the grader published
 beside it, and it is what an ordinary run delivers. ``blinded-receipt-v1`` says that a filing was
 answered and nothing about the work in it, and only an experiment may select it, which is what
 makes concealment a thing a run is recorded as having chosen. ``placebo-receipt-v1`` is the cell
@@ -20,6 +20,14 @@ policies come to one shape, and a check over one record is a check over nothing.
 ``legacy-placeholder-v1`` is the receipt this kernel used to build before a body could say
 anything, and it exists so a history recorded then still replays to the bytes it recorded. It is
 not selectable at all: a generation created now cannot ask for it.
+
+``graded-receipt-artifact-v1`` and ``placebo-receipt-artifact-v1`` are the pair an environment
+that renders its own feedback is delivered through. They are registered rather than reused,
+because the shipped pair renders one string for both of its cells: a graded label over that
+string proves that no receipt was delivered, and a body cut from an environment's own committed
+bytes is a different claim. Their exposure is a third class, ``artifact``, so the graded one does
+not inherit the blinded label's promise that its body holds no verdict, and their bodies are
+resolved through a store rather than rendered, which is what the resolver identity on them names.
 
 The projection is the whole of what reaches an honest body. :class:`PublicGrade` is a closed type
 carrying the attempt the authority assigned, one score in the unit interval, and finite numbers
@@ -64,9 +72,15 @@ import math
 import re
 from dataclasses import dataclass, field
 from hashlib import sha256
-from typing import Dict, List, Optional, Sequence, Tuple
+from typing import TYPE_CHECKING, Dict, List, Optional, Sequence, Tuple
 
 from shogym.serve.protocol_v2.jcs import encode as canonical_json
+
+if TYPE_CHECKING:  # pragma: no cover - the annotation is a string at runtime
+    # The receipt admission record is declared where the descriptor it admits is, and that
+    # module reads this one. The name is needed here for one signature, so it is imported for
+    # the type checker alone and nothing at runtime depends on the order the two are loaded in.
+    from shogym.serve.protocol_v2.artifact import ReceiptContract
 
 #: A generation whose payload policy the platform stamped. Every obligation delivers the honest
 #: body and nothing registers anything, which is what an ordinary run is.
@@ -105,6 +119,11 @@ PLATFORM_REASONS = (NO_RELEASE, NO_OBLIGATION)
 #: What an honest body may be drawn from: the score's exposure class, and the placeholder's.
 HONEST = "honest"
 BLINDED = "blinded"
+#: The third class, and the one no renderer builds. An artifact body is the environment's own
+#: committed bytes for a declared cell, resolved through a store and copied out. It is named
+#: apart from the blinded class because the blinded label is a claim that a body holds no verdict,
+#: and the graded cell of a receipt pair holds exactly one.
+ARTIFACT = "artifact"
 
 #: The wrapper a candidate is built in. Every body this kernel renders travels in the same
 #: envelope, so this is the one group a matched family's cells can be declared in: a family built
@@ -163,6 +182,11 @@ class PayloadPolicy:
     ``number_format`` is how a number in that projection becomes text. It is declared rather than
     left to the renderer because a body that says a score is making a claim about the number the
     seal committed, and a format that drops digits makes a claim about a different number.
+
+    ``resolver_id`` and ``resolver_version`` are the implementation that fetches a body this
+    policy does not render. They are empty on every policy whose body is built from the
+    projection, and they enter the preimage only where they are not, so the policies that shipped
+    before a body could be resolved keep the bytes their digests were taken over.
     """
 
     policy_name: str
@@ -173,6 +197,8 @@ class PayloadPolicy:
     cells: Tuple[str, ...]
     projection: Tuple[Tuple[str, str], ...]
     number_format: str = NO_GRADE_NUMBERS
+    resolver_id: str = ""
+    resolver_version: str = ""
 
 
 def policy_preimage(policy: PayloadPolicy) -> bytes:
@@ -180,19 +206,27 @@ def policy_preimage(policy: PayloadPolicy) -> bytes:
 
     The preimage is retained rather than merely hashed. A digest says that something was hashed,
     and what a run has to be able to prove years later is what that something said.
+
+    The resolver is written only where there is one. A policy whose body is rendered from its
+    projection resolves nothing, and a member carrying the empty string would be a new field in
+    the bytes every shipped policy's digest was taken over, which would move four digests that
+    are recorded in histories nobody may refuse.
     """
-    return canonical_json(
-        {
-            "policy_name": policy.policy_name,
-            "policy_version": policy.policy_version,
-            "renderer_id": policy.renderer_id,
-            "renderer_version": policy.renderer_version,
-            "exposure": policy.exposure,
-            "cells": list(policy.cells),
-            "projection": [{"field": name, "type": kind} for name, kind in policy.projection],
-            "number_format": policy.number_format,
-        }
-    )
+    declared: Dict[str, object] = {
+        "policy_name": policy.policy_name,
+        "policy_version": policy.policy_version,
+        "renderer_id": policy.renderer_id,
+        "renderer_version": policy.renderer_version,
+        "exposure": policy.exposure,
+        "cells": list(policy.cells),
+        "projection": [{"field": name, "type": kind} for name, kind in policy.projection],
+        "number_format": policy.number_format,
+    }
+    if policy.resolver_id:
+        declared["resolver_id"] = policy.resolver_id
+    if policy.resolver_version:
+        declared["resolver_version"] = policy.resolver_version
+    return canonical_json(declared)
 
 
 def policy_digest(policy: PayloadPolicy) -> str:
@@ -254,10 +288,54 @@ LEGACY_PLACEHOLDER_V1 = PayloadPolicy(
     ),
 )
 
+#: The pair an environment's own committed bodies are delivered through. Both name the same
+#: renderer identity and the same resolver, declare one cell each, and publish no number: what a
+#: body says is the environment's, and what these two records fix is which cell of one committed
+#: source a leg was served and under which admitted contract.
+GRADED_RECEIPT_ARTIFACT_V1 = PayloadPolicy(
+    policy_name="graded-receipt-artifact-v1",
+    policy_version="1",
+    renderer_id="kernel-receipt-artifact-1",
+    renderer_version="1",
+    exposure=ARTIFACT,
+    cells=("graded",),
+    projection=(
+        ("source_cell", "selected_cell_reference"),
+        ("contract", "receipt_contract_id"),
+    ),
+    resolver_id="blob-store-artifact-1",
+    resolver_version="1",
+)
+
+PLACEBO_RECEIPT_ARTIFACT_V1 = PayloadPolicy(
+    policy_name="placebo-receipt-artifact-v1",
+    policy_version="1",
+    renderer_id="kernel-receipt-artifact-1",
+    renderer_version="1",
+    exposure=ARTIFACT,
+    cells=("placebo",),
+    projection=(
+        ("source_cell", "selected_cell_reference"),
+        ("contract", "receipt_contract_id"),
+    ),
+    resolver_id="blob-store-artifact-1",
+    resolver_version="1",
+)
+
 HONEST_V1_DIGEST = policy_digest(HONEST_V1)
 BLINDED_RECEIPT_V1_DIGEST = policy_digest(BLINDED_RECEIPT_V1)
 PLACEBO_RECEIPT_V1_DIGEST = policy_digest(PLACEBO_RECEIPT_V1)
 LEGACY_PLACEHOLDER_V1_DIGEST = policy_digest(LEGACY_PLACEHOLDER_V1)
+GRADED_RECEIPT_ARTIFACT_V1_DIGEST = policy_digest(GRADED_RECEIPT_ARTIFACT_V1)
+PLACEBO_RECEIPT_ARTIFACT_V1_DIGEST = policy_digest(PLACEBO_RECEIPT_ARTIFACT_V1)
+
+#: The pair a receipt contract admits, by the digests that name the two records. It is the pair
+#: rather than either half: what a contract declares is one graded cell and one placebo cell of
+#: one source, and a contract holding one of these twice would be a comparison with itself.
+ARTIFACT_POLICY_DIGESTS = (
+    GRADED_RECEIPT_ARTIFACT_V1_DIGEST,
+    PLACEBO_RECEIPT_ARTIFACT_V1_DIGEST,
+)
 
 #: Every policy this kernel can render, by the digest that names it. A digest that is not in here
 #: is a policy this build does not implement, and the answer to one is a refusal rather than
@@ -267,6 +345,8 @@ POLICIES: Dict[str, PayloadPolicy] = {
     BLINDED_RECEIPT_V1_DIGEST: BLINDED_RECEIPT_V1,
     PLACEBO_RECEIPT_V1_DIGEST: PLACEBO_RECEIPT_V1,
     LEGACY_PLACEHOLDER_V1_DIGEST: LEGACY_PLACEHOLDER_V1,
+    GRADED_RECEIPT_ARTIFACT_V1_DIGEST: GRADED_RECEIPT_ARTIFACT_V1,
+    PLACEBO_RECEIPT_ARTIFACT_V1_DIGEST: PLACEBO_RECEIPT_ARTIFACT_V1,
 }
 
 #: The policies a generation created now may select, by name. The placeholder is renderable and
@@ -278,6 +358,8 @@ SELECTABLE: Dict[str, PayloadPolicy] = {
     HONEST_V1.policy_name: HONEST_V1,
     BLINDED_RECEIPT_V1.policy_name: BLINDED_RECEIPT_V1,
     PLACEBO_RECEIPT_V1.policy_name: PLACEBO_RECEIPT_V1,
+    GRADED_RECEIPT_ARTIFACT_V1.policy_name: GRADED_RECEIPT_ARTIFACT_V1,
+    PLACEBO_RECEIPT_ARTIFACT_V1.policy_name: PLACEBO_RECEIPT_ARTIFACT_V1,
 }
 
 
@@ -468,7 +550,9 @@ def policy_name_of(digest: Optional[str]) -> str:
 
 
 def descriptor_digests(
-    dispositions: Sequence[PayloadDisposition], families: Sequence[MatchedFamily]
+    dispositions: Sequence[PayloadDisposition],
+    families: Sequence[MatchedFamily],
+    contracts: Sequence["ReceiptContract"] = (),
 ) -> List[str]:
     """Return every descriptor this generation has to be able to produce, in one order.
 
@@ -483,11 +567,18 @@ def descriptor_digests(
     counterpart was allowed to say. So the counterparts are required objects for the same reason
     the served descriptor is, and they are read back at every claim under the same rule.
 
-    Every cell of a declared family resolves to a policy this build implements, which is checked
-    where the family is, so this adds no name the store could not be given the bytes for.
+    The cells of its receipt contracts are the same half of the same question. A contract admits
+    one graded cell and one placebo cell of a single committed source, one leg is served one of
+    them, and the counterpart's preimage is what says what the other cell was allowed to be. So a
+    contract's pair is enumerated exactly as a family's cells are.
+
+    Every cell of a declared family or contract resolves to a policy this build implements, which
+    is checked where the declaration is, so this adds no name the store could not be given the
+    bytes for.
     """
     named = {row.policy_digest for row in dispositions if row.policy_digest}
     named.update(digest for family in families for digest, _ in family.cells)
+    named.update(digest for contract in contracts for digest, _ in contract.cells)
     return sorted(named)
 
 
@@ -643,7 +734,17 @@ def render_body(
     list rather than a schema, so a score outside the unit interval, a name that is not a token,
     a value that is not a finite number, and a component roster past the declared bound are each
     a body that does not get built.
+
+    An artifact policy is refused outright. Its body is an environment's own committed bytes for
+    a declared cell, so there is nothing here to rebuild it from and a body this function could
+    produce for one would be a scalar receipt served under a record that says a source was
+    delivered. Falling back is the failure, so there is no fallback.
     """
+    if policy.exposure == ARTIFACT:
+        raise PolicyViolation(
+            f"{policy.policy_name} delivers a committed source cell, which no renderer rebuilds, "
+            "so there is no body for this function to return and no scalar one to fall back to"
+        )
     if policy.exposure == HONEST:
         if grade is None:
             raise PolicyViolation(
@@ -834,6 +935,7 @@ def check_families(
     *,
     profile: str,
     dispositions: List[PayloadDisposition],
+    contract_ids: Sequence[str] = (),
 ) -> None:
     """Refuse a matched family that could not hold, and a row claiming one that is not there.
 
@@ -862,6 +964,12 @@ def check_families(
 
     An ordinary run declares none. A matched family is a comparison an experiment is running,
     and a platform stamp is not a comparison.
+
+    ``contract_ids`` are the receipt contracts this generation declares, which share the column a
+    row names its family in. A row that names one of those is a receipt row and is validated
+    against its contract instead: what a family checks is that a rendered cell comes to the count
+    the arm registered, and a receipt body's count is a function of the filing rather than of the
+    registration, which is why the two declarations are separate records.
     """
     declared: Dict[str, MatchedFamily] = {}
     for family in families:
@@ -915,9 +1023,16 @@ def check_families(
                     f"is, so it is not a cell the matched family {family.family_id} can hold to "
                     "one byte count"
                 )
+            if policy.exposure == ARTIFACT:
+                raise PolicyViolation(
+                    f"{policy.policy_name} delivers an environment's own committed bytes, whose "
+                    f"count is a fact about one filing, so it is not a cell the matched family "
+                    f"{family.family_id} can hold to one byte count: a receipt row declares a "
+                    "contract instead"
+                )
     claimed: Dict[str, str] = {}
     for row in dispositions:
-        if not row.family_id:
+        if not row.family_id or row.family_id in set(contract_ids):
             continue
         family = declared.get(row.family_id)
         if family is None:
@@ -983,6 +1098,7 @@ def check_dispositions(
     grade: GradeIdentity,
     provenance: Optional[PolicyProvenance] = None,
     families: Optional[List[MatchedFamily]] = None,
+    contract_ids: Sequence[str] = (),
 ) -> None:
     """Refuse a roster of dispositions that does not resolve this generation.
 
@@ -995,6 +1111,11 @@ def check_dispositions(
     ``provenance`` is what entitles the generation to the profile it claims, and ``families``
     are the matched arms it registered. Both are checked here, with the rows, because a profile
     and a family are claims about these rows and are worth nothing said over another set.
+
+    ``contract_ids`` are the receipt contracts declared beside those families, named here so a
+    row that names one is not read as a row naming a family that was never declared. What a
+    contract admits is checked where the contract is, which is the record that holds a body size
+    and a slot layout rather than a byte count.
 
     ``profile`` decides which rows are admissible at all, and it is checked here rather than
     trusted from the builder that produced them. An ordinary generation carries the platform's
@@ -1018,12 +1139,19 @@ def check_dispositions(
                 "a run that was created after policies existed and says it was not"
             )
         check_provenance(provenance, profile=profile, dispositions=[])
-        check_families(list(families or []), profile=profile, dispositions=[])
+        check_families(
+            list(families or []), profile=profile, dispositions=[], contract_ids=contract_ids
+        )
         return
     if profile not in (ORDINARY, EXPERIMENT):
         raise PolicyViolation(f"a generation is {ORDINARY} or {EXPERIMENT}, not {profile!r}")
     check_provenance(provenance, profile=profile, dispositions=dispositions)
-    check_families(list(families or []), profile=profile, dispositions=dispositions)
+    check_families(
+        list(families or []),
+        profile=profile,
+        dispositions=dispositions,
+        contract_ids=contract_ids,
+    )
     check_grade(grade)
     positions = {**obligations, **silent}
     seen: Dict[str, PayloadDisposition] = {}

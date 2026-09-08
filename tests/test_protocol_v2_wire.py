@@ -354,8 +354,9 @@ def test_the_error_code_set_is_closed() -> None:
         "closed_stream",
         "fenced_writer",
         "configuration_mismatch",
+        "evidence_unavailable",
     }
-    assert len(PROTOCOL_ERROR_CODES) == 15
+    assert len(PROTOCOL_ERROR_CODES) == 16
 
 
 @pytest.mark.parametrize("cls,name", DECLARED_FIELDS)

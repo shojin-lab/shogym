@@ -58,6 +58,11 @@ PROTOCOL_ERROR_CODES: Tuple[str, ...] = (
     "closed_stream",
     "fenced_writer",
     "configuration_mismatch",
+    # The one code about an object rather than about a call: the bytes a delivery depends on are
+    # not in the store this run keeps them in. It is a bare token by design. What is missing, which
+    # cell it belonged to and which implementation went looking are all facts about the run's own
+    # evidence, and none of them is a thing to hand the agent.
+    "evidence_unavailable",
 )
 
 
