@@ -59,6 +59,7 @@ from shogym.serve.protocol_v2.policy import (
     ARTIFACT,
     LEGACY,
     POLICIES,
+    SINGLETON_SLOT,
     GradeIdentity,
     MatchedFamily,
     PayloadDisposition,
@@ -128,27 +129,35 @@ class TerminalTool:
 # does not know is refused rather than served from a half-understood record, so a number moves
 # whenever a field changes meaning.
 #
-# The two numbers name two dispositions rather than two stages of one. A generation that declares
-# a receipt contract carries receipt evidence from its first boundary, whether or not it has
-# captured anything yet, and writes the later number for the whole of its life. A generation that
-# declares none of that configuration and holds none of that evidence writes the earlier one and
-# stays there.
+# The three numbers name three dispositions rather than three stages of one. A generation that
+# declares a receipt contract carries receipt evidence from its first boundary, whether or not it
+# has captured anything yet, and writes the middle number for the whole of its life. A generation
+# that declares a fork writes the highest one from its first boundary, before any fork exists and
+# whether or not it has captured anything, and so does a child that holds a fork origin. A
+# generation that declares none of either route's configuration and holds none of either's
+# evidence writes the earliest one and stays there.
 #
 # Choosing the number from the state is not on its own the compatibility promise, because the
 # number is a label and the bytes are the record: the codec serializes the dataclass through the
 # converter and then shares and compresses the result, so a field defaulting to absent is an
 # explicit member of that JSON and one attempt with it packs to a different string from the same
-# attempt without it while both carriers report the earlier number. So the earlier number is an
+# attempt without it while both carriers report the earlier number. So each lower number is an
 # exact serialization adapter as well: before packing it drops every member added since, on the
-# carried attempt, on any nested candidate and on the start the continuation carries, emitting the
-# member set that version already had. It is applied to genuinely legacy state alone.
+# carried attempt, on the carried obligation, on any nested candidate and on the start the
+# continuation carries, emitting the member set that version already had. Each is applied to
+# genuinely earlier state alone.
 LEGACY_CARRIER_SCHEMA_VERSION = 6
 RECEIPT_CARRIER_SCHEMA_VERSION = 7
-#: Every carrier this code reads back. A generation writes one of these two and never a third.
-CARRIER_SCHEMA_VERSIONS = (LEGACY_CARRIER_SCHEMA_VERSION, RECEIPT_CARRIER_SCHEMA_VERSION)
+FORK_CARRIER_SCHEMA_VERSION = 8
+#: Every carrier this code reads back. A generation writes one of these three and never a fourth.
+CARRIER_SCHEMA_VERSIONS = (
+    LEGACY_CARRIER_SCHEMA_VERSION,
+    RECEIPT_CARRIER_SCHEMA_VERSION,
+    FORK_CARRIER_SCHEMA_VERSION,
+)
 
-# The members this build added, named once so that the adapter below is arithmetic on the names
-# rather than a second copy of the records. The journal is deliberately absent from the list: its
+# The members each route added, named once so that the adapters below are arithmetic on the names
+# rather than a second copy of the records. The journal is deliberately absent from the lists: its
 # rows carry offered messages and acknowledgement identifiers, and none of those grew a member
 # here, so there is nothing in one to drop.
 _RECEIPT_START_MEMBERS = ("receipt_contracts", "receipt_source")
@@ -169,6 +178,74 @@ _RECEIPT_CANDIDATE_MEMBERS = (
     "resolver_version",
 )
 _RECEIPT_PROJECTION_MEMBERS = ("operation_failures",)
+# And the fork's own. The two slots and the origin are the start's, and the preparation gate is
+# the one member a child's carried obligation holds that no other generation writes.
+_FORK_START_MEMBERS = ("served_slot", "forkable_slots", "fork_origin")
+_FORK_OBLIGATION_MEMBERS = ("pending_preparation",)
+
+
+#: The shape of a fork origin this build writes and admits.
+FORK_ORIGIN_SCHEMA_VERSION = 1
+
+
+@dataclass(frozen=True)
+class StartDifference:
+    """One classified start field whose value differs between a parent's start and a child's.
+
+    The digest is of the child's value, so the projection says what the child holds rather than
+    what the parent held, and a reader comparing a child against the record the parent kept for
+    it has one value per named field to compare.
+    """
+
+    field_name: str
+    value_digest: str
+
+
+@dataclass(frozen=True)
+class ForkOrigin:
+    """Where a child generation was cut from, as immutable lineage rather than as authority.
+
+    It rides on the child's start beside the carry and outside the configuration hash, and it is
+    what makes a carried projection legal in a child at all. What it authorizes is narrow and
+    stated where it is read: the parent identity an inherited source was sealed under, and the
+    parent hash the carrier a fresh child was handed was composed against. It authorizes nothing
+    about a carry the child itself hands on afterwards, which the service's own continuation fact
+    authorizes exactly as it does for any other generation.
+
+    The parent's and the child's configuration hashes are both here because they answer different
+    questions: the first is what the inherited carrier was written under, the second is what this
+    child is. The source seal's own identity is here whole, so a reader of a child can say what
+    work it inherited without reading the parent's history.
+    """
+
+    parent_workflow_id: str
+    parent_run_id: str
+    parent_configuration_hash: str
+    child_configuration_hash: str
+    parent_execution_ordinal: int
+    parent_hidden_execution_id: str
+    acknowledged_cursor: str
+    projection_digest: str
+    attestation_id: str
+    acknowledged_visible_sha256: str
+    checkpoint_manifest_reference: str
+    source_attempt_id: str
+    source_seal_id: str
+    source_submission_digest: str
+    source_canonicalization_version: str
+    source_score: Optional[float]
+    source_seal_ordinal: int
+    source_graded_evidence: str
+    source_commitment: str
+    source_artifact_references: List[str]
+    branch_slot: str
+    dispositions_digest: str
+    start_differences: List[StartDifference]
+    parent_turnovers: int
+    fork_id: str
+    child_ordinal: int
+    children: int
+    schema_version: int = FORK_ORIGIN_SCHEMA_VERSION
 
 
 @dataclass(frozen=True)
@@ -412,12 +489,20 @@ class CarriedObligation:
     Whether the candidate was ever built is kept apart from the candidate, because the count of
     materializations is inside the projection hash and the body is not. An obligation that has
     been presented, or that ended without being rendered, keeps the fact and drops the bytes.
+
+    ``pending_preparation`` is the one state in which an offerable obligation lawfully carries no
+    candidate: a fork child's inherited obligation, selected against the parent's committed source
+    and unbuilt until the child builds it. The parent writes it into the child's start and the
+    child's own preparation clears it in the same transition that installs the candidate, so an
+    obligation claiming it is told from a damaged carry by a value the parent committed to rather
+    than by the absence of bytes. No other generation writes one.
     """
 
     attempt_id: str
     state: str
     materialized: bool = False
     candidate: Optional[PayloadCandidate] = None
+    pending_preparation: bool = False
 
 
 @dataclass(frozen=True)
@@ -541,15 +626,47 @@ def resolved_echo(candidate: "PayloadCandidate") -> bool:
     return any(getattr(candidate, name) for name in _RECEIPT_CANDIDATE_MEMBERS)
 
 
+def fork_configuration(start: "StreamStart") -> bool:
+    """Say whether one start declares a fork, which is the first thing the version rule reads.
+
+    A served slot other than the one every generation serves, or a nonempty set of slots this
+    generation's fork may create. The default is excluded on purpose: the served slot is a new
+    field whose default is the slot every row carries today, and reading a defaulted singleton as
+    a declaration of fork capability would promote every legacy and receipt-only start to the
+    highest carrier and strand it on a codec that had never read it.
+    """
+    return start.served_slot != SINGLETON_SLOT or bool(start.forkable_slots)
+
+
+def carried_fork_evidence(projection: "CarriedProjection") -> bool:
+    """Say whether one projection holds a member only a fork puts there.
+
+    The preparation gate is that member: no ordinary generation and no receipt one writes an
+    obligation marked pending preparation, and a projection holding one may never be written as a
+    record that had no room for it.
+    """
+    return any(owed.pending_preparation for owed in projection.obligations)
+
+
 def carrier_version(start: "StreamStart", projection: "CarriedProjection") -> int:
     """Return the version one generation writes its carrier under.
 
-    Configuration decides it first: a generation that declares a receipt contract writes the later
-    number from its first boundary, before it has captured anything, because the start the
-    continuation carries holds that contract and the source it is admitted over. Evidence decides
-    it otherwise, so a projection holding a descriptor, a selection or a resolved candidate can
-    never be written as a record that had no room for one.
+    Configuration decides it first, and the fork's configuration before the receipt route's: a
+    generation that declares a fork, or a child that holds a fork origin, writes the highest
+    number from its first boundary, before any fork exists; a generation that declares a receipt
+    contract writes the middle one from its first boundary, before it has captured anything.
+    Evidence decides it otherwise, so a projection holding a preparation gate, a descriptor, a
+    selection or a resolved candidate can never be written as a record that had no room for one.
+
+    The number is selected from what a start declares rather than from the evidence it happens to
+    hold, because an adapter run over a fork-capable start would strip the slots from the one copy
+    the next execution rebuilds its configuration identity from, and the parent would refuse its
+    own lawful continuation.
     """
+    if fork_configuration(start) or start.fork_origin is not None:
+        return FORK_CARRIER_SCHEMA_VERSION
+    if carried_fork_evidence(projection):
+        return FORK_CARRIER_SCHEMA_VERSION
     if start.receipt_contracts or start.receipt_source:
         return RECEIPT_CARRIER_SCHEMA_VERSION
     for row in projection.attempts:
@@ -564,11 +681,23 @@ def carrier_version(start: "StreamStart", projection: "CarriedProjection") -> in
     return LEGACY_CARRIER_SCHEMA_VERSION
 
 
+def _without(written: Dict[str, Any], names: Sequence[str]) -> Dict[str, Any]:
+    """Return one written document without the members named, and otherwise exactly as it was."""
+    return {name: value for name, value in written.items() if name not in names}
+
+
 def legacy_start_members(written: Dict[str, Any]) -> Dict[str, Any]:
     """Return one encoded start as the legacy carrier version had it, members and all."""
-    return {
-        name: value for name, value in written.items() if name not in _RECEIPT_START_MEMBERS
-    }
+    return _without(written, (*_RECEIPT_START_MEMBERS, *_FORK_START_MEMBERS))
+
+
+def receipt_start_members(written: Dict[str, Any]) -> Dict[str, Any]:
+    """Return one encoded start as the receipt carrier version had it.
+
+    It omits the fork's members and nothing else, so a receipt generation's continuation carries
+    the contract and the bank source it is admitted over and none of the names the fork added.
+    """
+    return _without(written, _FORK_START_MEMBERS)
 
 
 def legacy_projection_members(written: Dict[str, Any]) -> Dict[str, Any]:
@@ -577,27 +706,32 @@ def legacy_projection_members(written: Dict[str, Any]) -> Dict[str, Any]:
     Every other member is passed through exactly as the converter wrote it, so what comes out is
     the document that version produced rather than a document this one rebuilt to look like it.
     """
-    adapted = {
-        name: value
-        for name, value in written.items()
-        if name not in _RECEIPT_PROJECTION_MEMBERS
-    }
+    adapted = _without(written, _RECEIPT_PROJECTION_MEMBERS)
     adapted["attempts"] = [
-        {name: value for name, value in row.items() if name not in _RECEIPT_ATTEMPT_MEMBERS}
-        for row in written.get("attempts", [])
+        _without(row, _RECEIPT_ATTEMPT_MEMBERS) for row in written.get("attempts", [])
     ]
     adapted["obligations"] = [
-        row
+        _without(row, _FORK_OBLIGATION_MEMBERS)
         if row.get("candidate") is None
         else {
-            **row,
-            "candidate": {
-                name: value
-                for name, value in row["candidate"].items()
-                if name not in _RECEIPT_CANDIDATE_MEMBERS
-            },
+            **_without(row, _FORK_OBLIGATION_MEMBERS),
+            "candidate": _without(row["candidate"], _RECEIPT_CANDIDATE_MEMBERS),
         }
         for row in written.get("obligations", [])
+    ]
+    return adapted
+
+
+def receipt_projection_members(written: Dict[str, Any]) -> Dict[str, Any]:
+    """Return one encoded projection as the receipt carrier version had it.
+
+    One member goes, the preparation gate on the carried obligation, and every other name and
+    value crosses as the converter wrote it. A receipt generation writes no gate, so what this
+    removes is the field's default rather than a state anything held.
+    """
+    adapted = dict(written)
+    adapted["obligations"] = [
+        _without(row, _FORK_OBLIGATION_MEMBERS) for row in written.get("obligations", [])
     ]
     return adapted
 
@@ -605,17 +739,18 @@ def legacy_projection_members(written: Dict[str, Any]) -> Dict[str, Any]:
 def continuation_argument(start: "StreamStart", converter: Any, version: int) -> Any:
     """Return what a continuation is handed, written as the version it declares.
 
-    A generation on the current version hands its own start over and the converter encodes it. A
-    legacy one hands over what that same encoding says minus the members this build added, so a
-    reader of that version finds the document it has always found rather than one carrying names
-    it never had. The value is a plain mapping there, and the execution that receives it decodes
-    it back into a start with those members at their defaults, which is what absent means.
+    A generation on the current version hands its own start over and the converter encodes it. An
+    earlier one hands over what that same encoding says minus the members added since, so a reader
+    of that version finds the document it has always found rather than one carrying names it never
+    had. The value is a plain mapping there, and the execution that receives it decodes it back
+    into a start with those members at their defaults, which is what absent means.
     """
-    if version != LEGACY_CARRIER_SCHEMA_VERSION:
+    if version == FORK_CARRIER_SCHEMA_VERSION:
         return start
-    return legacy_start_members(
-        json.loads(converter.to_payloads([start])[0].data.decode("utf-8"))
-    )
+    written = json.loads(converter.to_payloads([start])[0].data.decode("utf-8"))
+    if version == RECEIPT_CARRIER_SCHEMA_VERSION:
+        return receipt_start_members(written)
+    return legacy_start_members(written)
 
 
 def pack_carrier(projection: Any, converter: Any, *, version: int) -> "StreamCarry":
@@ -627,6 +762,8 @@ def pack_carrier(projection: Any, converter: Any, *, version: int) -> "StreamCar
     value = json.loads(converter.to_payloads([projection])[0].data.decode("utf-8"))
     if version == LEGACY_CARRIER_SCHEMA_VERSION:
         value = legacy_projection_members(value)
+    elif version == RECEIPT_CARRIER_SCHEMA_VERSION:
+        value = receipt_projection_members(value)
     raw = json.dumps(
         _shared(value), sort_keys=True, separators=(",", ":"), ensure_ascii=False
     ).encode("utf-8")
@@ -835,11 +972,22 @@ class StreamStart:
     served, nothing about it is hashed, and the counts stay where they have always been, which is
     with the harness.
 
+    ``served_slot`` is the branch this generation serves its dispositions on, and
+    ``forkable_slots`` are the slots its fork may create children for. Both are inside the
+    configuration hash where they are declared, so a child plan naming a slot the parent never
+    declared is refused against a value the parent committed to before it forked. The default is
+    the one slot every generation serves today, and it is hashed nowhere, so a generation that
+    declares no fork hashes exactly what it hashed before there was a slot to declare.
+
     ``carry`` is the one field a running generation puts here rather than a caller. It is how one
     execution hands the whole logical projection to the next, and it is legal only there: a fresh
     start carrying one is refused, and a continued execution given none is refused too. It is
     outside :func:`configuration_hash` by construction, because what the generation is has not
     changed and every resume is held to that value.
+
+    ``fork_origin`` is beside it and outside that hash for the same reason: it is the lineage a
+    child was cut on rather than a thing the generation is, and a child's own configuration
+    identity is inside the origin rather than derived from it.
     """
 
     configuration_hash: str
@@ -866,11 +1014,14 @@ class StreamStart:
     families: List[MatchedFamily] = field(default_factory=list)
     receipt_contracts: List[ReceiptContract] = field(default_factory=list)
     receipt_source: str = ""
+    served_slot: str = SINGLETON_SLOT
+    forkable_slots: List[str] = field(default_factory=list)
     budget: Optional[int] = None
     info: bool = False
     schedule_version: str = SCHEDULE_VERSION
     protocol_version: int = PROTOCOL_VERSION
     carry: Optional[StreamCarry] = None
+    fork_origin: Optional[ForkOrigin] = None
 
 
 def configuration_hash(start: StreamStart) -> str:
@@ -1049,6 +1200,15 @@ def configuration_hash(start: StreamStart) -> str:
         ]
     if start.receipt_source:
         declared["receipt_source"] = start.receipt_source
+    # And the branch it serves and the branches its fork may create, on the same terms. A
+    # generation serving the one slot every generation serves declares nothing here, so a history
+    # recorded before a fork was a thing hashes what it always hashed; one that declares a slot of
+    # its own is held to it, and a child plan naming an undeclared slot is refused against a value
+    # the parent committed to before it forked.
+    if start.served_slot != SINGLETON_SLOT:
+        declared["served_slot"] = start.served_slot
+    if start.forkable_slots:
+        declared["forkable_slots"] = sorted(start.forkable_slots)
     return sha256(canonical_json(declared)).hexdigest()
 
 
