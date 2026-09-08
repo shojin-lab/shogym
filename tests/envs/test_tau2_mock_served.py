@@ -2,8 +2,8 @@
 that tau2's evaluator verdict flows back into episode feedback.
 
 Requires the ``tau2`` extra (Python <3.14) plus the provisioned upstream source, and a loadable
-tau2 ``mock`` data set — skipped otherwise (naming the reason), so the offline core suite stays
-green. Solo mode ⇒ no user-simulator LLM ⇒ the whole path (engine + tools + evaluator) runs
+tau2 ``mock`` data set. A machine with none of those skips, naming the reason; a prepared machine
+fails instead. Solo mode ⇒ no user-simulator LLM ⇒ the whole path (engine + tools + evaluator) runs
 offline.
 """
 
@@ -11,9 +11,7 @@ from __future__ import annotations
 
 import json
 
-import pytest
-
-from tests._fixtures.upstream_gate import gate
+from tests._fixtures.upstream_gate import environmental_skip, gate
 
 # Provisions the pinned upstream source (network on a cold cache) and imports tau2, so this is
 # also the check that the `tau2` extra is installed. A missing extra or an unreachable network
@@ -29,10 +27,10 @@ def _mock_task_index(task_id: str) -> int:
     """Resolve a tau2 mock task id to its index in the env's train split, or skip."""
     try:
         env = shogym.make("tau2_mock")
-    except Exception as exc:  # missing data etc.
-        pytest.skip(f"tau2 mock env not constructible offline: {exc}")
+    except Exception as exc:  # missing domain data, most often
+        environmental_skip(f"the tau2 mock env is not constructible: {exc}")
     if task_id not in env._task_ids:
-        pytest.skip(f"task {task_id} not in mock train split")
+        environmental_skip(f"task {task_id} is not in the mock train split")
     return env._task_ids.index(task_id)
 
 

@@ -35,6 +35,19 @@ Two rules the callers depend on:
 Each port keeps its own ``ensure_source()`` wrapper holding its ``UPSTREAM_SHA``; importing that
 port's adapter triggers provisioning (a one-time network fetch on a cold cache), so it is only
 ever paid when the env is *constructed* or *served* — never by ``import shogym``.
+
+**When the fetch is allowed is a decision the caller makes**, through
+:data:`PROVISIONING_ENV_VAR` and the three modes :func:`provisioning_mode` reads out of it. The
+default fetches on demand, which is what a laptop wants. A run that has been prepared in advance
+says ``offline`` and then this module never downloads: a source that was not prepared raises
+:class:`UpstreamNotPrepared` naming it, rather than reaching for the network from inside a stage
+that promised not to. Binding a prepared source is not the end of it, because *importing* an
+upstream can fetch as well, so that mode also selects the bundled data of the libraries these
+upstreams import (see :func:`use_bundled_import_data`).
+
+An upstream's bulk **data** is provisioned separately by :func:`ensure_data`, under the same
+rules. It is deliberately not part of a source: it is read, never imported, and for tau2-bench it
+is ~700 MB, so a port that needs none of it should pay for none of it.
 """
 
 from __future__ import annotations
@@ -52,11 +65,84 @@ import threading
 import urllib.request
 import warnings
 from pathlib import Path
-from typing import Iterator, Optional
+from typing import Iterator, Optional, Sequence, Tuple
 
 _DOWNLOAD_TIMEOUT_SECONDS = 120.0
 
 _provision_lock = threading.Lock()
+
+#: The env var that says which provisioning stage this process belongs to.
+PROVISIONING_ENV_VAR = "SHOGYM_PROVISIONING"
+
+#: Fetch whatever is missing. The stage that prepares a machine, and the one place a download is
+#: the point rather than a surprise.
+PREPARE = "prepare"
+
+#: Use what is already prepared and download nothing. A source nobody prepared is an error that
+#: names it, never a quiet fetch.
+OFFLINE = "offline"
+
+#: The default, for a developer's machine: fetch on demand, and let a caller read an unreachable
+#: network as "this machine cannot run these tests" rather than as a defect.
+LOCAL = "local"
+
+_MODES = (PREPARE, OFFLINE, LOCAL)
+
+
+class UpstreamNotPrepared(RuntimeError):
+    """An upstream source is absent in a mode that may not fetch it. Says which one, and where."""
+
+
+def provisioning_mode() -> str:
+    """The provisioning mode this process runs under, read from :data:`PROVISIONING_ENV_VAR`.
+
+    Three values, and the difference between them is only ever about the network:
+
+    - ``prepare`` fetches and binds every pinned source, over the network, on purpose.
+    - ``offline`` fetches nothing. A source that is already prepared (in the cache, or behind the
+      port's ``_SRC`` override) is used; one that is not raises :class:`UpstreamNotPrepared`.
+    - ``local``, the default, fetches on demand, which is what an unprepared laptop needs.
+
+    An unset variable means ``local``. **An unrecognized value raises** rather than falling back
+    to it: a typo that quietly restored on-demand downloading would give a stage that promised to
+    fetch nothing the behavior it was configured out of, and say nothing about it.
+
+    Which is why every entry point that provisions something calls this *first*, before the check
+    that returns what is already there: :func:`ensure_package`, :func:`ensure_data`, the image and
+    oracle-package entry points in :mod:`shogym.envs.frontier_bench.mcp_server`, and the test
+    fixtures that prepare or require one of those. A read that happened only on the cold path
+    would refuse a typo on the machines with nothing prepared and nowhere else, which is the same
+    as not refusing it: the machines this mode is for are the prepared ones."""
+    raw = os.environ.get(PROVISIONING_ENV_VAR, "").strip().lower()
+    if not raw:
+        return LOCAL
+    if raw not in _MODES:
+        raise RuntimeError(
+            f"{PROVISIONING_ENV_VAR}={raw!r} is not a provisioning mode; it must be one of "
+            f"{', '.join(_MODES)} (or unset, which means {LOCAL})."
+        )
+    return raw
+
+
+#: What an ``offline`` process must put in its environment so that *importing* an upstream stays
+#: offline too. LiteLLM fetches its model-cost map from a file server the moment ``import litellm``
+#: runs, unless this says to read the copy that ships inside the wheel; it swallows the failure and
+#: falls back to that same copy, so the fetch is invisible in the result and visible only on the
+#: wire. Two of the three ports provisioned here reach LiteLLM as they import: tau2 from upstream's
+#: own package ``__init__``, which runs while the source is being bound, and yc_bench from the
+#: upstream module its adapter imports immediately afterwards. Either chain would otherwise reach
+#: the network on a machine whose source is already prepared.
+_OFFLINE_IMPORT_ENV = {"LITELLM_LOCAL_MODEL_COST_MAP": "true"}
+
+
+def use_bundled_import_data() -> None:
+    """Point the libraries an upstream imports at their bundled data instead of a download.
+
+    Set unconditionally rather than as a default, because the mode is the stronger statement: a
+    run that says it fetches nothing may not be talked into a fetch by an inherited variable. It
+    is set in ``os.environ`` (not in a copy) so that the child processes a port launches, which
+    import the same upstream from the same prepared source, inherit it."""
+    os.environ.update(_OFFLINE_IMPORT_ENV)
 
 
 def source_env_var(package: str) -> str:
@@ -67,10 +153,26 @@ def source_env_var(package: str) -> str:
     return f"{package.upper()}_SRC"
 
 
-def _cache_root(package: str, sha: str) -> Path:
+def cache_root() -> Path:
+    """The directory shogym provisions into: ``~/.cache/shogym``, or ``SHOGYM_CACHE``."""
     base = os.environ.get("SHOGYM_CACHE")
-    root = Path(base) if base else Path.home() / ".cache" / "shogym"
-    return root / package / sha
+    return Path(base) if base else Path.home() / ".cache" / "shogym"
+
+
+def _cache_root(package: str, sha: str) -> Path:
+    return cache_root() / package / sha
+
+
+def data_dir(package: str) -> Path:
+    """Where a port's bulk upstream *data* is provisioned: beside its per-SHA source trees.
+
+    Not inside one, because that is where upstream's own resolver looks. tau2 reads its domain
+    data from three directories above its ``utils`` module plus ``data``, which for a source at
+    ``<cache>/tau2/<sha>/tau2`` is exactly this path, so data provisioned here is found with no
+    environment variable and no patch to the upstream. The cost of upstream's convention is that
+    the location is not per-SHA; :func:`ensure_data` stamps the SHA it wrote and replaces a tree
+    that was written for another one."""
+    return cache_root() / package / "data"
 
 
 def _source_dir(package: str, sha: str) -> Path:
@@ -289,6 +391,39 @@ def _sweep_download_residue(directory: Path) -> None:
             os.close(descriptor)
 
 
+def _fetch_and_extract(
+    tarball_url: str, staging: Path, keep: Sequence[str]
+) -> Tuple[Path, Optional[str]]:
+    """Download the pinned tarball into ``staging`` and extract the ``keep`` subtrees from it.
+
+    ``keep`` holds paths relative to the archive's single root directory, whose name carries the
+    SHA and is therefore not known until the first member is read. Everything outside them is
+    streamed past rather than written: these archives carry top-level ``tests/`` / ``docs/`` /
+    ``visualizer/`` dirs, and for tau2-bench ~700 MB of benchmark data and results, none of which
+    a caller asked for. Returns the directory the members landed in and that root's name (``None``
+    for an archive with no members at all, which the callers report as a layout error).
+
+    tarfile's ``data`` filter rejects path traversal, and the archive is deleted as soon as it is
+    extracted so the staging directory never holds both copies for longer than it must."""
+    archive = staging / "archive.tar.gz"
+    with urllib.request.urlopen(tarball_url, timeout=_DOWNLOAD_TIMEOUT_SECONDS) as resp:
+        with archive.open("wb") as fh:
+            shutil.copyfileobj(resp, fh)
+
+    extracted = staging / "x"
+    root: Optional[str] = None
+    wanted: list[str] = []
+    with tarfile.open(archive, mode="r:gz") as tf:
+        for member in tf:
+            if root is None:
+                root = member.name.split("/", 1)[0]
+                wanted = [f"{root}/{path}" for path in keep]
+            if any(member.name == w or member.name.startswith(w + "/") for w in wanted):
+                tf.extract(member, extracted, filter="data")
+    archive.unlink()
+    return extracted, root
+
+
 def _download_package(package: str, tarball_url: str, archive_subdir: str, dest: Path) -> None:
     """Fetch the pinned upstream tarball and extract it so ``dest/<package>`` exists.
 
@@ -310,25 +445,12 @@ def _download_package(package: str, tarball_url: str, archive_subdir: str, dest:
     staging = tempfile.TemporaryDirectory(dir=str(dest.parent), prefix=".dl-")
     with staging as tmp, _locked(Path(tmp)):
         tmp_path = Path(tmp)
-        archive = tmp_path / "archive.tar.gz"
-        with urllib.request.urlopen(tarball_url, timeout=_DOWNLOAD_TIMEOUT_SECONDS) as resp:
-            with archive.open("wb") as fh:
-                shutil.copyfileobj(resp, fh)
-
         # A GitHub archive extracts to a single `<repo>-<sha>/` root; the package sits at
         # `<root>/<archive_subdir>/<package>` (`archive_subdir` is "" for a flat layout, "src"
         # for a src-layout upstream).
-        extracted = tmp_path / "x"
-        wanted: str | None = None
-        with tarfile.open(archive, mode="r:gz") as tf:
-            for member in tf:
-                if wanted is None:
-                    root = member.name.split("/", 1)[0]
-                    parts = [root, archive_subdir, package] if archive_subdir else [root, package]
-                    wanted = "/".join(parts)
-                if member.name == wanted or member.name.startswith(wanted + "/"):
-                    tf.extract(member, extracted, filter="data")
-        archive.unlink()
+        relative = f"{archive_subdir}/{package}" if archive_subdir else package
+        extracted, root = _fetch_and_extract(tarball_url, tmp_path, [relative])
+        wanted = f"{root}/{relative}" if root is not None else None
 
         staged_pkg = extracted / (wanted or "")
         if wanted is None or not (staged_pkg / "__init__.py").is_file():
@@ -369,7 +491,22 @@ def ensure_package(
     each (see :func:`_locked`; on a filesystem that cannot lock they each pay it, correctly, and
     say so once). The package is then registered directly in ``sys.modules``, never onto
     ``sys.path``, and never over the top of a different package already bound to that name (see
-    :func:`_register_package`)."""
+    :func:`_register_package`).
+
+    Under ``SHOGYM_PROVISIONING=offline`` the download is refused rather than performed: a source
+    that is present is bound as usual, and a source that is absent raises
+    :class:`UpstreamNotPrepared` naming the package and the directory it was expected in (see
+    :func:`provisioning_mode`).
+
+    **The mode is read on every call, warm cache or cold**, for two reasons. An unrecognized
+    value has to be refused wherever it is read, or a typo would be caught only on the machines
+    that happened to need a download. And a prepared source still has an import to pay for, which
+    is where :func:`use_bundled_import_data` comes in: binding is what runs upstream's own
+    ``__init__``, and the port's own upstream imports follow it, so this is the last moment before
+    any of them can start."""
+    mode = provisioning_mode()
+    if mode == OFFLINE:
+        use_bundled_import_data()
     src = _source_dir(package, sha)
     with _provision_lock:
         if not (src / package).is_dir():
@@ -377,6 +514,13 @@ def ensure_package(
             if override:
                 raise RuntimeError(
                     f"{source_env_var(package)}={src} does not contain a '{package}' package"
+                )
+            if mode == OFFLINE:
+                raise UpstreamNotPrepared(
+                    f"{package} at {sha} was not prepared: no '{package}' package under {src}. "
+                    f"{PROVISIONING_ENV_VAR}={OFFLINE} forbids the download that would fetch it, "
+                    f"so fetch it first in a stage that may ({PROVISIONING_ENV_VAR}={PREPARE}), "
+                    f"or point {source_env_var(package)} at a checkout that contains it."
                 )
             src.parent.mkdir(parents=True, exist_ok=True)
             with _locked(src.parent):
@@ -389,4 +533,119 @@ def ensure_package(
     return src
 
 
-__all__ = ["ensure_package", "source_env_var"]
+#: Written into a provisioned data directory, holding the SHA it was extracted from. The data
+#: location is upstream's to choose and is not per-SHA (see :func:`data_dir`), so this file is how
+#: a later pin can tell its own data from an older pin's, and how :func:`ensure_data` knows a tree
+#: is one it wrote rather than one a caller put there.
+DATA_SHA_FILE = ".shogym-upstream-sha"
+
+
+def ensure_data(
+    *,
+    package: str,
+    sha: str,
+    tarball_url: str,
+    archive_subdir: str,
+    keep: Sequence[str],
+) -> Path:
+    """Ensure the pinned archive's data subtree is on disk for ``package``; return its directory.
+
+    The counterpart of :func:`ensure_package` for the part of an upstream that is *read* rather
+    than imported. Some ports need it (tau2's domains are its tasks, policies and databases) and
+    the source extraction deliberately drops it, because ~700 MB of benchmark data has no business
+    on an import path.
+
+    Idempotent: a directory already stamped with this SHA, holding every subtree asked for, is
+    returned untouched, so preparing twice costs a few directory reads. A directory stamped with a
+    *different* SHA, or missing a subtree a later caller added to ``keep``, is this function's own
+    older work and is replaced. A directory with no stamp is somebody else's, and is left exactly
+    as it is, because upstream's resolver would have used it and it is not shogym's to delete.
+
+    Under ``offline`` an absent tree raises :class:`UpstreamNotPrepared` naming it, for the same
+    reason a source does: a stage that promised to fetch nothing must say what it is missing
+    rather than go and get it."""
+    mode = provisioning_mode()
+    dest = data_dir(package)
+    with _provision_lock:
+        if dest.is_dir() and not (dest / DATA_SHA_FILE).is_file():
+            return dest  # a caller's own checkout, in the place upstream looks for one
+        if _data_is_prepared(dest, sha, keep):
+            return dest
+        if mode == OFFLINE:
+            raise UpstreamNotPrepared(
+                f"{package} data at {sha} was not prepared: no {list(keep)} under {dest} carrying "
+                f"that pin. {PROVISIONING_ENV_VAR}={OFFLINE} forbids the download that would "
+                f"fetch it, so fetch it first in a stage that may "
+                f"({PROVISIONING_ENV_VAR}={PREPARE})."
+            )
+        dest.parent.mkdir(parents=True, exist_ok=True)
+        with _locked(dest.parent):
+            # Re-check under the lock, as the source path does: waiting on it usually means
+            # waiting for this very download.
+            if not _data_is_prepared(dest, sha, keep):
+                _sweep_download_residue(dest.parent)
+                _download_data(package, tarball_url, archive_subdir, keep, sha, dest)
+    return dest
+
+
+def _data_is_prepared(dest: Path, sha: str, keep: Sequence[str]) -> bool:
+    """Whether ``dest`` is this SHA's data *and* holds every subtree the caller asked for.
+
+    The second half matters because the stamp records which pin was extracted, not which parts of
+    it: a port that later reads one more subtree would otherwise be handed the tree that predates
+    it and told it was prepared."""
+    stamp = dest / DATA_SHA_FILE
+    if not stamp.is_file() or stamp.read_text().strip() != sha:
+        return False
+    return all((dest / path).is_dir() for path in keep)
+
+
+def _download_data(
+    package: str,
+    tarball_url: str,
+    archive_subdir: str,
+    keep: Sequence[str],
+    sha: str,
+    dest: Path,
+) -> None:
+    """Fetch the pinned tarball and publish ``<root>/<archive_subdir>`` at ``dest``, stamped.
+
+    Only the ``keep`` subtrees within it are extracted, so the caller pays for the data it named
+    and not for the rest of the archive. The publish is the same single rename the source path
+    uses, with one difference: an existing tree that this function wrote before (it carries the
+    stamp) is removed first, because a rename cannot replace a non-empty directory and an older
+    pin's data in the place upstream reads from is worse than no data at all."""
+    dest.parent.mkdir(parents=True, exist_ok=True)
+    staging = tempfile.TemporaryDirectory(dir=str(dest.parent), prefix=".dl-")
+    with staging as tmp, _locked(Path(tmp)):
+        tmp_path = Path(tmp)
+        relative = [f"{archive_subdir}/{path}" for path in keep]
+        extracted, root = _fetch_and_extract(tarball_url, tmp_path, relative)
+        staged = extracted / f"{root}/{archive_subdir}" if root is not None else extracted
+        missing = [path for path in keep if not (staged / path).exists()]
+        if root is None or missing:
+            raise RuntimeError(
+                f"unexpected {package} archive layout: no {missing or [archive_subdir]} under "
+                f"'{archive_subdir}' in {tarball_url}"
+            )
+        (staged / DATA_SHA_FILE).write_text(sha + "\n")
+        if (dest / DATA_SHA_FILE).is_file():
+            shutil.rmtree(dest)
+        os.replace(staged, dest)
+
+
+__all__ = [
+    "DATA_SHA_FILE",
+    "LOCAL",
+    "OFFLINE",
+    "PREPARE",
+    "PROVISIONING_ENV_VAR",
+    "UpstreamNotPrepared",
+    "cache_root",
+    "data_dir",
+    "ensure_data",
+    "ensure_package",
+    "provisioning_mode",
+    "source_env_var",
+    "use_bundled_import_data",
+]

@@ -33,6 +33,8 @@ from dataclasses import dataclass
 from pathlib import Path, PurePosixPath
 from typing import Dict, List, Optional, Sequence
 
+from shogym.envs._upstream import OFFLINE, provisioning_mode
+
 # Harbor's environment path conventions (linux). The verifier writes its 0/1 under
 # /logs/verifier/reward.txt; the tests image owns /tests/ (separate mode skips the upload).
 VERIFIER_DIR = "/logs/verifier"
@@ -130,20 +132,30 @@ def build_image(
     Pins ``--platform linux/amd64`` so every host builds the architecture the tasks were
     authored and validated on. The vendored bases are multi-arch image indexes, so an arm64 host
     emulates rather than silently building a different architecture.
+
+    Under ``SHOGYM_PROVISIONING=offline`` the build runs with ``--network none``, so its ``RUN``
+    steps cannot fetch. Most of these Dockerfiles install packages from apt, PyPI and astral.sh
+    (see the env README), so building one is a download however the run around it was described.
+
+    That flag is a backstop, not the plan. A run in that mode is meant to find both images
+    already built: each tag is content-addressed and existence-checked before any build, and the
+    Docker-gated tests require the images they build and fail naming the one that is missing. A
+    build that happens anyway stops at its first networked ``RUN`` instead of quietly reaching a
+    third party's server, and it does not fall back on the preparation stage's layers either,
+    because the builder counts the network mode as part of a layer's cache key.
+
+    What the flag does not do is make a build fetch nothing. It governs the ``RUN`` steps;
+    resolving and pulling the ``FROM`` image is the builder's own work and is unaffected, so a
+    machine missing a base image would still pull it. That is the other half of why the gate
+    requires prepared images rather than trusting this flag: the flag narrows what an unexpected
+    build can reach, and the gate is what keeps the build from happening. The preparation stage
+    builds every task image, which is also what puts every base image on the machine.
     """
-    _run_docker(
-        [
-            "build",
-            "--platform",
-            platform,
-            "-f",
-            str(dockerfile),
-            "-t",
-            tag,
-            str(context_dir),
-        ],
-        timeout=timeout,
-    )
+    args = ["build", "--platform", platform, "-f", str(dockerfile), "-t", tag]
+    if provisioning_mode() == OFFLINE:
+        args += ["--network", "none"]
+    args.append(str(context_dir))
+    _run_docker(args, timeout=timeout)
 
 
 def image_exists(tag: str) -> bool:
@@ -329,12 +341,17 @@ def run_separate_verifier(
 
     The reward is computed off the container end-state, never the trajectory.
     """
-    build_image(
-        context_dir=tests_context_dir,
-        dockerfile=tests_dockerfile,
-        tag=verifier_image_tag,
-        timeout=build_timeout,
-    )
+    # Existence-checked like the environment image, and for the same reason: the tag carries the
+    # task's content hash, so an image already under it was built from these exact bytes. It is
+    # what lets a prepared image be used as prepared rather than rebuilt at the one moment a
+    # rebuild cannot be paid for.
+    if not image_exists(verifier_image_tag):
+        build_image(
+            context_dir=tests_context_dir,
+            dockerfile=tests_dockerfile,
+            tag=verifier_image_tag,
+            timeout=build_timeout,
+        )
     verifier = Container(
         image=verifier_image_tag,
         workdir="/",

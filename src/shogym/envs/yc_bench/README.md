@@ -91,8 +91,9 @@ the default `dev` group, so `uv sync` includes it. On top of that:
   (seed → commands → verdict) makes no network call of its own. It is not strictly
   network-free: importing the adapter pulls in litellm (below), which fetches a model-cost map
   on import unless `LITELLM_LOCAL_MODEL_COST_MAP=true`, falling back to a bundled copy when
-  that fails. (A YC-Bench *model* key is only needed by upstream's own agent loop, which this
-  port replaces with the harness.)
+  that fails. `SHOGYM_PROVISIONING=offline` sets that variable, so a run in that stage reads the
+  bundled copy instead. (A YC-Bench *model* key is only needed by upstream's own agent loop,
+  which this port replaces with the harness.)
 - **Heavy extra.** YC-Bench depends on litellm / streamlit / matplotlib / plotly (its own
   runner/dashboard). streamlit, matplotlib and plotly are never imported. **litellm is**: the
   adapter imports `_init_simulation` from `yc_bench.runner.main`, which pulls in

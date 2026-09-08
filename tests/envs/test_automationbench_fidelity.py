@@ -7,16 +7,18 @@ on synthetic state.
 Unlike the verify/served tests (which inject synthetic tasks), these exercise the real upstream
 domain loader — ``datasets``-backed, with deterministic per-``example_id`` noise injection — so
 they require the ``datasets`` extra and the provisioned upstream source; the module skips without
-either, keeping the core offline suite green.
+either on a machine nobody prepared, keeping the core offline suite green, and fails naming what
+is missing on one that was.
 """
 
 from __future__ import annotations
 
-import pytest
+from tests._fixtures.upstream_gate import environmental_skip, gate
 
-pytest.importorskip("datasets", reason="automationbench extra (datasets) not installed")
-
-from tests._fixtures.upstream_gate import gate
+try:
+    import datasets  # noqa: F401
+except ImportError:
+    environmental_skip("automationbench extra (datasets) not installed", module_level=True)
 
 adapter = gate(
     "shogym.envs.automationbench.adapter",

@@ -34,6 +34,16 @@ jobs:
       - name: Install dependencies
         run: uv sync
 
+      # The one step that fetches benchmark material, and the only one allowed to. It provisions
+      # each pinned upstream source, tau2's domain data, the Temporal test server binary, every
+      # frontier_bench task image and the packages one vendored oracle installs while it runs,
+      # which is what the offline step below then requires rather than downloads. Putting the
+      # fetching here is what makes a slow mirror or a bad minute at a registry fail in the stage
+      # whose job is fetching, instead of inside a run that calls itself offline. Nothing may skip
+      # in this mode either, so a preparation that did not prepare says so.
+      - name: Prepare upstream sources, data and task images (networked)
+        run: env -u OPENAI_API_KEY SHOGYM_PROVISIONING=prepare uv run python tests/prepare_offline_suite.py
+
       # The offline suite runs keyless: keyed tests (tau2 user-sim, hle judge) self-skip
       # without OPENAI_API_KEY. Unset it explicitly so nothing here depends on a secret.
       # `-m "not network"` is the other half of the same promise: it deselects the tests that
@@ -41,12 +51,17 @@ jobs:
       # tests/envs/test_frontier_bench_served.py), so a PR cannot go red because someone else's
       # server had a bad minute. A plain `uv run pytest` still selects them.
       #
-      # SHOGYM_REQUIRE_UPSTREAM removes the runtime-provisioned envs' escape hatch. Their test
-      # modules must import a production adapter before they can collect, and a laptop with no
-      # extras or no network is allowed to skip that; this runner has both, so here any failure to
-      # provision and import — upstream drift, a gap in a hand-maintained extra, a corrupt
+      # SHOGYM_PROVISIONING=offline is what makes "offline" a property of this run rather than a
+      # description of it: no pinned source is downloaded and no task image is built here, so
+      # anything the step above failed to prepare fails by name instead of being fetched from
+      # under a promise. It also removes the runtime-provisioned envs' escape hatch, since this
+      # runner has the extras and was prepared: a failure to provision and import (upstream
+      # drift, a gap in a hand-maintained extra, a corrupt cache, a plain NameError) is a red
+      # test here, never a quiet skip that would delete an env's coverage while the run stays
+      # green. `--no-sync` is the same promise applied to uv itself: the environment was installed
+      # two steps up, and a step that may not fetch should not be one resolver away from doing it.
       - name: Run tests (offline, keyless)
-        run: env -u OPENAI_API_KEY SHOGYM_REQUIRE_UPSTREAM=1 uv run pytest -q -m "not network"
+        run: env -u OPENAI_API_KEY SHOGYM_PROVISIONING=offline uv run --no-sync pytest -q -m "not network"
 
       - name: Lint (ruff)
         run: uv run ruff check .

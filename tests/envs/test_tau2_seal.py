@@ -12,18 +12,19 @@ finalize before tearing down (tau2's
 ``end_session``/``abort`` can't race the finalizer).
 
 Requires the ``tau2`` extra plus the provisioned upstream source, and a loadable tau2 ``mock``
-data set — skipped otherwise (naming the reason), so the offline core suite stays green. Solo
+data set. A machine with none of those skips, naming the reason, so the offline core suite stays
+green on a laptop; a machine the preparation stage ran on fails instead, because there is nothing
+left for it to legitimately skip for. Solo
 mode ⇒ no user-simulator LLM ⇒ keyless (importing tau2's registry still reaches for litellm's
-model-cost map unless ``LITELLM_LOCAL_MODEL_COST_MAP=true``).
+model-cost map unless ``LITELLM_LOCAL_MODEL_COST_MAP=true``, which the ``offline`` provisioning
+mode sets before it binds the source).
 """
 
 from __future__ import annotations
 
 import asyncio
 
-import pytest
-
-from tests._fixtures.upstream_gate import gate
+from tests._fixtures.upstream_gate import environmental_skip, gate
 
 # Provisions the pinned upstream source (network on a cold cache) and imports tau2, so this is
 # also the check that the `tau2` extra is installed. A missing extra or an unreachable network
@@ -39,10 +40,10 @@ from shogym.shared.terminate_mcp import TERMINATE_TOOL_NAME  # noqa: E402
 def _mock_task_index(task_id: str) -> int:
     try:
         env = shogym.make("tau2_mock")
-    except Exception as exc:  # missing data etc.
-        pytest.skip(f"tau2 mock env not constructible offline: {exc}")
+    except Exception as exc:  # missing domain data, most often
+        environmental_skip(f"the tau2 mock env is not constructible: {exc}")
     if task_id not in env._task_ids:
-        pytest.skip(f"task {task_id} not in mock train split")
+        environmental_skip(f"task {task_id} is not in the mock train split")
     return env._task_ids.index(task_id)
 
 
