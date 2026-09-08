@@ -4597,6 +4597,59 @@ def _child_obligation(owed: CarriedObligation) -> CarriedObligation:
     return replace(owed, candidate=None, pending_preparation=True)
 
 
+def transformed_child_counters(projection: CarriedProjection) -> CarriedProjection:
+    """Return one parent's projection with what a child must not inherit taken out of it.
+
+    What is preserved describes the prefix both children inherited: the cursor, the closed queue,
+    the hidden ordinal, the seal ordinal, the waits and their reasons, the offers, the
+    eligibilities, the attempts handed out, every attempt and obligation row, the presented
+    messages, the committed references and the operation failure rows the parent's own operations
+    left. The Activity ordinal is preserved too, so a child's ordinary numbering equals the number
+    its inherited prefix left, and the verification batch count is preserved and then incremented
+    by the child's own claim exactly as any claim increments it.
+
+    What resets is ownership and this execution's own bookkeeping. The epoch, the token, the
+    consumer and the claim epoch go, so the child's own gateway takes it with a first claim and
+    the parent's token can never write to it, and the cumulative claim count goes with them
+    because a child's first claim is a first claim. The turnover count starts at zero and the
+    parent's is recorded in the origin, so a lineage total is a sum over named source generations.
+
+    The journal and the four tables are dropped rather than quietly absent. An identifier the
+    parent answered is owed to the parent's caller, and a child answering it would hand a fenced
+    transport bytes another generation produced. Nothing here is inside the projection hash, so
+    dropping it moves no digest the inherited prefix committed to.
+    """
+    return replace(
+        projection,
+        ownership_epoch=0,
+        fencing_token_hash=None,
+        ownership_claims=0,
+        consumer_id=None,
+        claim_epoch=0,
+        pull_requests=[],
+        info_requests=[],
+        terminal_requests=[],
+        finalize_requests=[],
+        attestations=[],
+        journal=[],
+        turnovers=0,
+    )
+
+
+def child_carrier(
+    projection: CarriedProjection, *, selections: Sequence[ChildSelection]
+) -> CarriedProjection:
+    """Return the whole projection one fork child is handed, from the parent's own.
+
+    Two transformations and no third: the selected delivery evidence of the named attempts
+    becomes the child's, and the counters and tables become a fresh execution's. Everything else
+    crosses as the parent wrote it.
+    """
+    return transformed_child_counters(
+        transformed_child_selection(projection, selections=selections)
+    )
+
+
 def _provenance(attempt: _Attempt) -> Optional[SourceProvenance]:
     """Return what one attempt's committed source was, or nothing where none was committed.
 

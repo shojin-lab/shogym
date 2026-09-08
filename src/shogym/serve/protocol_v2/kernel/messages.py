@@ -25,7 +25,15 @@ from __future__ import annotations
 import base64
 import json
 import lzma
-from dataclasses import dataclass, field
+import math
+from dataclasses import (
+    asdict,
+    dataclass,
+    field,
+    fields as dataclass_fields,
+    is_dataclass,
+    replace,
+)
 from hashlib import sha256
 from typing import Any, Dict, List, Mapping, Optional, Sequence, Tuple
 
@@ -67,6 +75,7 @@ from shogym.serve.protocol_v2.policy import (
     PublicGrade,
     disposition_key,
     number_text,
+    roster_digest,
 )
 
 
@@ -2255,3 +2264,953 @@ def hidden_seal_id(hidden_execution_id: str, execution_ordinal: int, attempt_id:
         + execution_ordinal.to_bytes(8, "big")
         + length_prefixed(attempt_id.encode("utf-8"))
     ).hexdigest()
+
+
+# What one fork is made of: the harness's witness that its own state is frozen, what a controller
+# asks for, what the parent commits to before it fences, and what it answers with. None of it
+# reaches an agent and none of it is configuration, because a fork is an operation over two
+# generations rather than a thing either generation is.
+
+#: The shape of a checkpoint manifest this build writes and admits.
+CHECKPOINT_MANIFEST_SCHEMA_VERSION = "shogym.stream-fork-checkpoint.1"
+#: How its covered bytes are written, so a reference is the digest of one encoding and not of two.
+CHECKPOINT_MANIFEST_ENCODING = "canonical-json.v1"
+
+
+@dataclass(frozen=True)
+class CheckpointComponent:
+    """One component of the harness snapshot, and the transcript it asserts it restores.
+
+    A digest validates identified bytes and never proves that one object contains or restores
+    another. A snapshot taken before an acknowledgement and a transcript written after it both
+    hash correctly and both name the right identifiers, and restoring that snapshot still loses
+    the acknowledgement, so each component names the transcript a restore of it reproduces and a
+    manifest binds those assertions rather than a list of independent digests.
+    """
+
+    component_id: str
+    sha256: str
+    size: int
+    media_type: str
+    restores_transcript: str
+
+
+@dataclass(frozen=True)
+class SettledHarness:
+    """Whether each thing the harness could still owe is finished.
+
+    Settlement comes before the fence rather than after it. A committed presentation leaves the
+    gateway holding a result owed, no stream-side quiescence check can see it, and the
+    confirmation that hands it over is a writing call a fenced parent would refuse. So the harness
+    says here that its transport, its recovery record, the provider response, any model update and
+    any compaction pass are all finished, and the platform fences afterwards.
+    """
+
+    transport: bool
+    recovery: bool
+    provider: bool
+    model: bool
+    compaction: bool
+
+
+@dataclass(frozen=True)
+class CheckpointManifest:
+    """The harness's half of the freeze, as one immutable object bound to the stream's half.
+
+    Neither witness alone is the boundary. The stream's is the acknowledged cursor and the
+    projection digest at it; this is the other, and what makes it a witness rather than a copied
+    directory is that it binds the transcript, the acknowledgement entry inside it and every
+    snapshot component together, each component asserting it restores that same transcript.
+
+    ``settled`` is the runtime quiescence the adapter attests and the platform does not check, and
+    the stream side below is what the platform validates against its own state. Neither side
+    proves the other's half: the adapter attests, the parent compares, and the origin records
+    which manifest the comparison was made against.
+
+    ``frozen_plan_digest`` is what the pause, the clock and the resource accounting a child is
+    parked under are declared under. The primitive carries the digest and never the plan, so none
+    of the experiment enters it.
+    """
+
+    transcript_reference: str
+    acknowledgement_locator: str
+    acknowledgement_entry_sha256: str
+    components: List[CheckpointComponent]
+    adapter_version: str
+    container_image_digest: str
+    harness_configuration: str
+    settled: SettledHarness
+    frozen_plan_digest: str
+    acknowledgement_message_id: str
+    acknowledged_visible_sha256: str
+    acknowledged_cursor: str
+    projection_digest: str
+    schema_version: str = CHECKPOINT_MANIFEST_SCHEMA_VERSION
+    encoding: str = CHECKPOINT_MANIFEST_ENCODING
+
+
+def checkpoint_manifest_reference(manifest: CheckpointManifest) -> str:
+    """Return the reference one checkpoint is named by.
+
+    It is the plain SHA-256 of the manifest's canonical bytes, which is the rule the source
+    artifact commitment already keeps: the preimage is the object, and no second digest is
+    invented over the same bytes.
+    """
+    return sha256(canonical_json(asdict(manifest))).hexdigest()
+
+
+def check_checkpoint_manifest(manifest: CheckpointManifest) -> None:
+    """Refuse a checkpoint this build cannot read, or one the harness has not finished."""
+    if manifest.schema_version != CHECKPOINT_MANIFEST_SCHEMA_VERSION:
+        raise WireFormatError(
+            f"this build reads {CHECKPOINT_MANIFEST_SCHEMA_VERSION!r}, and this checkpoint is "
+            f"written as {manifest.schema_version!r}"
+        )
+    if manifest.encoding != CHECKPOINT_MANIFEST_ENCODING:
+        raise WireFormatError(
+            f"a checkpoint is written as {CHECKPOINT_MANIFEST_ENCODING!r}, and this one says "
+            f"{manifest.encoding!r}"
+        )
+    for name in (
+        "transcript_reference",
+        "acknowledgement_locator",
+        "adapter_version",
+        "container_image_digest",
+        "harness_configuration",
+        "frozen_plan_digest",
+        "acknowledgement_message_id",
+        "acknowledged_cursor",
+    ):
+        if not getattr(manifest, name):
+            raise WireFormatError(f"a checkpoint names its {name}, and this one names none")
+    for name in ("acknowledgement_entry_sha256", "acknowledged_visible_sha256",
+                 "projection_digest"):
+        if not _is_digest(getattr(manifest, name)):
+            raise WireFormatError(
+                f"a checkpoint's {name} is 64 lower-case hexadecimal characters, and this one "
+                f"is {getattr(manifest, name)!r}"
+            )
+    if not manifest.components:
+        raise WireFormatError(
+            "a checkpoint names the snapshot components a restore reads, and this one names none"
+        )
+    for component in manifest.components:
+        if component.restores_transcript != manifest.transcript_reference:
+            raise WireFormatError(
+                f"the component {component.component_id} restores "
+                f"{component.restores_transcript!r} and this checkpoint's transcript is "
+                f"{manifest.transcript_reference!r}"
+            )
+        if not _is_digest(component.sha256) or component.size <= 0:
+            raise WireFormatError(
+                f"the component {component.component_id} names bytes by digest and size, and "
+                f"this one names {component.sha256!r} at {component.size}"
+            )
+    unsettled = sorted(
+        name for name, settled in asdict(manifest.settled).items() if not settled
+    )
+    if unsettled:
+        raise WireFormatError(
+            f"a checkpoint is taken over a harness that owes nothing, and this one still owes "
+            f"{unsettled}"
+        )
+
+
+def _is_digest(value: Any) -> bool:
+    """True iff this is 64 lower-case hexadecimal characters and nothing else."""
+    return (
+        isinstance(value, str)
+        and len(value) == 64
+        and all(character in "0123456789abcdef" for character in value)
+    )
+
+
+#: The shape of a fork request this build admits.
+FORK_REQUEST_SCHEMA_VERSION = 1
+
+
+@dataclass(frozen=True)
+class ForkChildPlan:
+    """One child a controller asks for, and nothing about the experiment that wanted it.
+
+    ``dispositions`` are the rows ahead of the cursor, which is a dependency statement rather than
+    an ordering comparison over opaque identifiers: the inherited task has crossed the cursor and
+    its payload has not, so the policy of that undelivered obligation is the only one a child may
+    change. ``target_cell`` is which of the source's eligible cells this child delivers from it.
+
+    ``frozen_plan_digest`` is the plan the child's pause, clock, resource accounting and release
+    policy are declared under. The plan digest crosses and the plan does not, which is how a
+    child is bound to an experiment's frozen plan without any of that experiment entering the
+    primitive.
+    """
+
+    branch_slot: str
+    dispositions: List[PayloadDisposition]
+    target_cell: str
+    run_directory: str
+    consumer_claim_hash: str
+    hidden_execution_id: str
+    frozen_plan_digest: str
+
+
+@dataclass(frozen=True)
+class ForkRequest:
+    """One typed fork, carrying both witnesses and the ordered child plans.
+
+    The parent generation and the exact execution scope are both here because a turnover between
+    the moment a controller read the checkpoint evidence and the moment it submitted this is an
+    ordinary event: the request is refused as retryable against a moved execution, the controller
+    reads the evidence again and resubmits the same fork under the same checkpoint and plans.
+    That resubmission is the same logical fork, which is why :func:`fork_request_digest` covers
+    the parent workflow id and not the run id.
+
+    The stream side is stated rather than looked up: the acknowledgement's attestation and message
+    identifiers, the visible byte digest of what was presented, and the cursor and projection
+    digest after that presentation. The parent compares each against its own state and refuses a
+    mismatch without installing a barrier or creating a child.
+    """
+
+    parent_workflow_id: str
+    parent_run_id: str
+    parent_execution_ordinal: int
+    parent_configuration_hash: str
+    source_attempt_id: str
+    attestation_id: str
+    acknowledgement_message_id: str
+    acknowledged_visible_sha256: str
+    acknowledged_cursor: str
+    projection_digest: str
+    checkpoint_manifest_reference: str
+    fork_id: str
+    child_plans: List[ForkChildPlan]
+    schema_version: int = FORK_REQUEST_SCHEMA_VERSION
+
+
+# What the record says about one child, and the four values are exhaustive. Never attempted is no
+# start dispatched for that ordinal, confirmed existing is a start response or an authoritative
+# resolution naming its execution, and existence unconfirmed is a start dispatched whose outcome
+# is not known. An Activity failure, a durably journalled failure and an empty confirmation slot
+# each establish nothing, so proven absence is reported only where an authoritative resolution
+# establishes it and only a proven absence lets the record say a child was never created.
+NEVER_ATTEMPTED = "never_attempted"
+CONFIRMED_EXISTING = "confirmed_existing"
+EXISTENCE_UNCONFIRMED = "existence_unconfirmed"
+PROVEN_ABSENT = "proven_absent"
+CHILD_EXISTENCE = (
+    NEVER_ATTEMPTED,
+    CONFIRMED_EXISTING,
+    EXISTENCE_UNCONFIRMED,
+    PROVEN_ABSENT,
+)
+
+# Where one fork stands. Prepared is the barrier committed and no child started; abandoned is the
+# ending a spent reserve or an expired preparation bound commits, and it carries the evidence
+# class of every child it could not confirm.
+FORK_PREPARED = "prepared"
+FORK_CHILDREN_CONFIRMED = "children_confirmed"
+FORK_COMPLETE = "complete"
+FORK_CONFLICTED = "conflicted"
+FORK_ABANDONED = "abandoned"
+FORK_STATUSES = (
+    FORK_PREPARED,
+    FORK_CHILDREN_CONFIRMED,
+    FORK_COMPLETE,
+    FORK_CONFLICTED,
+    FORK_ABANDONED,
+)
+
+# And why it was abandoned. Both are endings the parent commits itself rather than waiting for a
+# controller that stopped asking.
+SPENT_RECOVERY_RESERVE = "spent_recovery_reserve"
+EXPIRED_PREPARATION = "expired_preparation"
+ABANDONED_REASONS = (SPENT_RECOVERY_RESERVE, EXPIRED_PREPARATION)
+
+#: The shape of a prepared fork record this build writes and admits.
+PREPARED_FORK_SCHEMA_VERSION = 1
+
+
+@dataclass(frozen=True)
+class PreparedChild:
+    """The parent's immutable row for one child, and the authority the child asks against.
+
+    Comparing hashes, cursors and presented rows is not enough, because a start carries no
+    workflow id and the configuration hash folds none in: an authentic start submitted under the
+    wrong workflow id would pass every one of those comparisons, and two executions under one
+    hidden execution id mint one seal id in two places for the same public attempt. So the row
+    maps the exact child workflow id and the child ordinal to that child's complete start digest,
+    carrier included, and the child compares its actual service identity and its own start against
+    it. A projection hash cannot stand in for the start digest: a changed carried score or artifact
+    reference need not move a projection hash at all.
+
+    ``child_run_id`` is filled in where a start response or an authoritative resolution named the
+    child's original execution, and ``existence`` says which class this child is in. The derived
+    identity is retained in every one of them, an unconfirmed child is preserved and never
+    replaced, and a history that cannot be read is expired authority rather than evidence the
+    child never existed.
+    """
+
+    child_ordinal: int
+    child_workflow_id: str
+    complete_start_digest: str
+    origin_digest: str
+    branch_slot: str
+    target_cell: str
+    selected_body_reference: str
+    consumer_claim_hash: str
+    hidden_execution_id: str
+    start_differences: List[StartDifference]
+    existence: str = NEVER_ATTEMPTED
+    child_run_id: Optional[str] = None
+
+
+@dataclass(frozen=True)
+class PreparedFork:
+    """One fork as the parent committed it, in the transition that fenced the parent.
+
+    ``request_digest`` is what binds a fork id to the request it was accepted under, so the same
+    id over a different checkpoint or different plans is a conflict rather than a match, and the
+    same id over the same bound request is answered with the children that already exist. It
+    excludes the exact parent run id, so a fork resubmitted against a moved execution is the same
+    logical fork.
+
+    ``children`` is what the fork set out to create and the rows below are what it knows about
+    them, which are different facts: an abandoned fork names both, so a reader can say a child was
+    attempted and unconfirmed rather than inferring absence from a shorter list.
+    """
+
+    fork_id: str
+    request_digest: str
+    checkpoint_manifest_reference: str
+    parent_workflow_id: str
+    parent_run_id: str
+    children: int
+    child_records: List[PreparedChild]
+    status: str = FORK_PREPARED
+    abandoned_reason: Optional[str] = None
+    schema_version: int = PREPARED_FORK_SCHEMA_VERSION
+
+
+#: The shape of a fork receipt this build writes and admits.
+FORK_RECEIPT_SCHEMA_VERSION = 1
+
+
+@dataclass(frozen=True)
+class ForkChildReceipt:
+    """What the fork says about one child it created.
+
+    ``next_task_body_sha256`` and ``next_assignment_id`` are read from that child's own start
+    rather than from the parent's, so a reader can check the two children agree on the task they
+    are both about to work rather than being told they do.
+    """
+
+    child_ordinal: int
+    child_workflow_id: str
+    child_run_id: str
+    configuration_hash: str
+    complete_start_digest: str
+    origin_digest: str
+    branch_slot: str
+    target_cell: str
+    selected_body_reference: str
+    acknowledged_cursor: str
+    projection_digest: str
+    start_differences: List[StartDifference]
+    next_task_body_sha256: str
+    next_assignment_id: str
+
+
+@dataclass(frozen=True)
+class ForkReceipt:
+    """The complete evidence one fork returns, which is stable across every replay of it.
+
+    It is separate from any per-call observation of whether this call created the children or
+    found them already created, because an exact outcome replay returns the original outcome
+    including its original flags.
+    """
+
+    fork_id: str
+    parent_workflow_id: str
+    parent_run_id: str
+    checkpoint_manifest_reference: str
+    children: int
+    child_receipts: List[ForkChildReceipt]
+    boundary_evidence: List[str]
+    schema_version: int = FORK_RECEIPT_SCHEMA_VERSION
+
+
+#: The shape of a child's readiness evidence this build writes and admits.
+CHILD_READY_SCHEMA_VERSION = 1
+
+
+@dataclass(frozen=True)
+class ChildReady:
+    """One child certified at one checkpoint with one candidate and one ownership state.
+
+    It is what releases a container, and nothing a reader computes is: the lifecycle a reader
+    reports labels a selected, materialized or eligible row as built without consulting a
+    candidate at all, so that label is a position in a lifecycle and never this.
+    """
+
+    fork_id: str
+    child_workflow_id: str
+    child_run_id: str
+    checkpoint_manifest_reference: str
+    origin_digest: str
+    verified_set_digest: str
+    source_attempt_id: str
+    selected_cell: str
+    selected_body_reference: str
+    selected_policy_digest: str
+    receipt_contract_id: str
+    ownership_epoch: int
+    consumer_id: str
+    preparation_operation: str
+    schema_version: int = CHILD_READY_SCHEMA_VERSION
+
+
+#: How many children one fork of this build creates. More than two at one fork is a roster and a
+#: selector problem this transition does not solve, so a request asking for another number is
+#: refused rather than served by machinery nobody wrote.
+FORK_CHILD_COUNT = 2
+
+
+def _admitted_version(name: str, declared: Any, admitted: Any) -> None:
+    """Refuse a fork shape written at a version this build does not read."""
+    if declared != admitted:
+        raise WireFormatError(
+            f"this build reads {name} at version {admitted!r}, and this one is written at "
+            f"{declared!r}"
+        )
+
+
+def check_fork_origin(origin: ForkOrigin) -> None:
+    """Refuse a lineage record this build cannot read."""
+    _admitted_version("a fork origin", origin.schema_version, FORK_ORIGIN_SCHEMA_VERSION)
+
+
+def check_fork_request(request: ForkRequest) -> None:
+    """Refuse a request this build cannot serve, before anything reads the stream's state.
+
+    What is checked here is the request against itself: the version, the number of children, that
+    the plans name eligible cells, and that the branch, the hidden execution, the consumer and the
+    store are each one child's alone. That last one is here because this is the only place the
+    plans are read together: every check after it compares one child against its parent, and two
+    executions under one hidden execution id make :func:`hidden_seal_id` mint one seal id in two
+    places for the same public attempt. Whether the branches are ones the parent declared, whether
+    the witnesses match and whether the boundary holds are questions about a generation rather
+    than about a request, and they are asked where that generation is.
+    """
+    _admitted_version("a fork request", request.schema_version, FORK_REQUEST_SCHEMA_VERSION)
+    if len(request.child_plans) != FORK_CHILD_COUNT:
+        raise WireFormatError(
+            f"one fork of this build creates {FORK_CHILD_COUNT} children, and this request names "
+            f"{len(request.child_plans)}"
+        )
+    for name in ("branch_slot", "hidden_execution_id", "consumer_claim_hash", "run_directory"):
+        named = [getattr(plan, name) for plan in request.child_plans]
+        if len(set(named)) != len(named):
+            raise WireFormatError(
+                f"each child of one fork is given a {name} of its own, and these name {named}"
+            )
+    for plan in request.child_plans:
+        if plan.target_cell not in ELIGIBLE_CELLS:
+            raise WireFormatError(
+                f"a child delivers one of {sorted(ELIGIBLE_CELLS)} and the plan for "
+                f"{plan.branch_slot} names {plan.target_cell!r}"
+            )
+
+
+def check_prepared_fork(record: PreparedFork) -> None:
+    """Refuse a prepared record this build cannot read, or one that says two things at once."""
+    _admitted_version("a prepared fork", record.schema_version, PREPARED_FORK_SCHEMA_VERSION)
+    if record.status not in FORK_STATUSES:
+        raise WireFormatError(
+            f"a fork stands in one of {list(FORK_STATUSES)}, and this one says {record.status!r}"
+        )
+    if record.status == FORK_ABANDONED:
+        if record.abandoned_reason not in ABANDONED_REASONS:
+            raise WireFormatError(
+                f"an abandoned fork carries one of {list(ABANDONED_REASONS)}, and this one "
+                f"carries {record.abandoned_reason!r}"
+            )
+    elif record.abandoned_reason is not None:
+        raise WireFormatError(
+            f"a fork that is {record.status!r} was not abandoned, and this one carries "
+            f"{record.abandoned_reason!r}"
+        )
+    for child in record.child_records:
+        if child.existence not in CHILD_EXISTENCE:
+            raise WireFormatError(
+                f"the child {child.child_ordinal} is in one of {list(CHILD_EXISTENCE)}, and this "
+                f"record says {child.existence!r}"
+            )
+
+
+def check_fork_receipt(receipt: ForkReceipt) -> None:
+    """Refuse a receipt this build cannot read."""
+    _admitted_version("a fork receipt", receipt.schema_version, FORK_RECEIPT_SCHEMA_VERSION)
+
+
+def check_child_ready(ready: ChildReady) -> None:
+    """Refuse readiness evidence this build cannot read."""
+    _admitted_version("a child readiness", ready.schema_version, CHILD_READY_SCHEMA_VERSION)
+
+
+# The domains one fork's digests are taken under. A preimage is the tag's ASCII bytes, then one
+# zero byte, then the canonical encoding of the covered value, so bytes built for one purpose are
+# never a preimage for another and no tag can borrow the value's first byte. No tag holds a zero
+# byte, which is what makes that separator a separator.
+ORIGIN_TAG = "stream-fork-origin-v1"
+START_TAG = "stream-fork-start-v1"
+DIFFERENCE_TAG = "stream-fork-difference-v1"
+CHILD_IDENTITY_TAG = "stream-fork-child-v1"
+REQUEST_TAG = "stream-fork-request-v1"
+
+#: The version of the conversion below, beside the tags because it is half of what a preimage is.
+NUMERIC_CONVERSION_VERSION = 1
+
+# Every position under a covered value whose number need not be whole. The canonical encoding
+# writes whole numbers only and refuses a float, and these records hold real ones: the source
+# seal's score in a lineage record, and the published bounds of the grade identity in a complete
+# start. Each named position is written as the exact text this kernel writes numbers in, which is
+# the shortest text that reads back as the same number and is already how the configuration hash
+# writes those same bounds, so a bound and a digest covering it agree byte for byte.
+#
+# A path names a member by name and a list by the empty brackets after it. What the table does not
+# name is encoded as the value it is, and a covered value still holding a number that need not be
+# whole after the conversion is refused rather than rounded, so a numeric field added to one of
+# these records is denied until this table reaches it.
+FORK_NUMERIC_FIELDS: Dict[str, Tuple[str, ...]] = {
+    ORIGIN_TAG: ("source_score",),
+    START_TAG: (
+        "grade.public_components[].minimum",
+        "grade.public_components[].maximum",
+    ),
+    DIFFERENCE_TAG: (),
+    CHILD_IDENTITY_TAG: (),
+    REQUEST_TAG: (),
+}
+
+
+def fork_preimage(tag: str, value: Any) -> bytes:
+    """Return the bytes one fork digest is taken over, under ``tag``.
+
+    The value is written out as the plain members it is made of, the numbers the table names are
+    converted to their exact text, and what is left is refused if it still holds a number the
+    encoder cannot write. Nothing is rounded and nothing is coerced: a score is never made whole
+    to satisfy the encoder, and a number that is not finite is a refusal rather than a text.
+    """
+    if tag not in FORK_NUMERIC_FIELDS:
+        raise WireFormatError(f"{tag!r} is not a domain this build takes a fork digest under")
+    converted = _plain_value(value)
+    for path in FORK_NUMERIC_FIELDS[tag]:
+        converted = _converted_at(converted, path.split("."))
+    _refuse_an_uncovered_number(tag, converted, "")
+    return tag.encode("ascii") + b"\x00" + canonical_json(converted)
+
+
+def _plain_value(value: Any) -> Any:
+    """Return one value as the plain members a canonical encoding is written from."""
+    if is_dataclass(value) and not isinstance(value, type):
+        return {
+            member.name: _plain_value(getattr(value, member.name))
+            for member in dataclass_fields(value)
+        }
+    if isinstance(value, Mapping):
+        return {str(name): _plain_value(member) for name, member in value.items()}
+    if isinstance(value, (list, tuple)):
+        return [_plain_value(item) for item in value]
+    return value
+
+
+def _converted_at(node: Any, steps: Sequence[str]) -> Any:
+    """Return ``node`` with the number at ``steps`` written as its exact text."""
+    if not steps:
+        return _number_as_text(node)
+    step, rest = steps[0], steps[1:]
+    listed = step.endswith("[]")
+    name = step[:-2] if listed else step
+    if not isinstance(node, Mapping) or node.get(name) is None:
+        return node
+    inner = node[name]
+    if not listed:
+        return {**node, name: _converted_at(inner, rest)}
+    if not isinstance(inner, list):
+        raise WireFormatError(f"the covered field {name!r} is a list, and this one is {inner!r}")
+    return {**node, name: [_converted_at(item, rest) for item in inner]}
+
+
+def _number_as_text(value: Any) -> str:
+    """Return one covered number as its exact text, or refuse a value that is not one."""
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        raise WireFormatError(
+            f"a covered numeric position holds a number, and this one holds {value!r}"
+        )
+    if not math.isfinite(value):
+        raise WireFormatError(
+            "a number that is not finite has no text that reads back as itself, and a digest "
+            "over one would name a value nothing can reproduce"
+        )
+    return number_text(value)
+
+
+def _refuse_an_uncovered_number(tag: str, value: Any, path: str) -> None:
+    """Refuse a covered value holding a number no entry of the table reaches."""
+    if isinstance(value, bool):
+        return
+    if isinstance(value, float):
+        raise WireFormatError(
+            f"{path or 'the covered value'} under {tag} is a number that need not be whole, and "
+            f"the conversion at version {NUMERIC_CONVERSION_VERSION} names no such field: a "
+            "number is denied until the table reaches it"
+        )
+    if isinstance(value, Mapping):
+        for name, member in value.items():
+            _refuse_an_uncovered_number(tag, member, f"{path}.{name}" if path else str(name))
+    elif isinstance(value, (list, tuple)):
+        for index, item in enumerate(value):
+            _refuse_an_uncovered_number(tag, item, f"{path}[{index}]")
+
+
+def origin_digest(origin: ForkOrigin) -> str:
+    """Return the digest of one child's lineage record.
+
+    It covers no digest of the start it rides in, so nothing about it is recursive: the start
+    covers the origin by reference and the origin covers nothing of the start.
+    """
+    check_fork_origin(origin)
+    return sha256(fork_preimage(ORIGIN_TAG, origin)).hexdigest()
+
+
+def complete_start_digest(start: StreamStart) -> str:
+    """Return the digest of one complete child start, carrier and all.
+
+    The origin member is replaced by the origin digest, so the start covers the lineage by
+    reference. The digest never lives inside the start it covers: it lives in the parent's
+    prepared record and in the receipt, which is what a child compares its own start against.
+
+    A projection hash cannot stand in for it, because a changed carried score or artifact
+    reference need not move a projection hash at all.
+    """
+    if start.fork_origin is None:
+        raise WireFormatError(
+            "a complete start digest is a child's, and this start holds no fork origin"
+        )
+    written = _plain_value(start)
+    written["fork_origin"] = origin_digest(start.fork_origin)
+    return sha256(fork_preimage(START_TAG, written)).hexdigest()
+
+
+#: The token a derived child identity carries between its parent's identity and its ordinal.
+FORK_ID_TOKEN = "fork"
+
+
+def child_identity_digest(
+    *, identity_namespace: str, parent_workflow_id: str, fork_id: str, child_ordinal: int
+) -> str:
+    """Return the digest a child's identity is derived from.
+
+    Uniqueness follows from the parent identity, which the run controller already keeps unique in
+    its namespace, so two parents that both use a local fork id of the same name cannot collide
+    and a fork id need be unique only under one parent. Every value here is fixed when the
+    request is admitted and none of them is a run id, so a recovery run of the same fork derives
+    the same children.
+    """
+    return sha256(
+        fork_preimage(
+            CHILD_IDENTITY_TAG,
+            {
+                "identity_namespace": identity_namespace,
+                "parent_workflow_id": parent_workflow_id,
+                "fork_id": fork_id,
+                "child_ordinal": child_ordinal,
+            },
+        )
+    ).hexdigest()
+
+
+def child_workflow_id(
+    *, identity_namespace: str, parent_workflow_id: str, fork_id: str, child_ordinal: int
+) -> str:
+    """Return one child's derived identity, which is never minted at random."""
+    derived = child_identity_digest(
+        identity_namespace=identity_namespace,
+        parent_workflow_id=parent_workflow_id,
+        fork_id=fork_id,
+        child_ordinal=child_ordinal,
+    )
+    return ".".join((parent_workflow_id, FORK_ID_TOKEN, str(child_ordinal), derived[:32]))
+
+
+def fork_request_digest(request: ForkRequest) -> str:
+    """Return what binds one fork id to the request it was accepted under.
+
+    It covers the checkpoint, the fork id, the ordered plans and the parent identity, so the same
+    id over a different checkpoint or different plans is a conflict rather than a match. It
+    excludes the exact parent run id, because a turnover between the moment a controller read the
+    checkpoint evidence and the moment it submitted the request moves that value and the fork it
+    resubmits is the same logical fork.
+    """
+    check_fork_request(request)
+    return sha256(
+        fork_preimage(
+            REQUEST_TAG,
+            {
+                "schema_version": request.schema_version,
+                "parent_workflow_id": request.parent_workflow_id,
+                "checkpoint_manifest_reference": request.checkpoint_manifest_reference,
+                "fork_id": request.fork_id,
+                "child_plans": [_plain_value(plan) for plan in request.child_plans],
+            },
+        )
+    ).hexdigest()
+
+
+# How every field of a start may stand in a child of the generation that holds it. The
+# transformation is a closed enumeration with default denial rather than a prose list: a field
+# added to a start is denied until it is classified here, and the completeness check below is what
+# makes that true rather than hoped for.
+#
+# ``equal`` is what a child may not change without being a different generation rather than a
+# different arm: the environment's own configuration digest, the versions, the manifest and the
+# roster, the plan, the grader, the families, the contracts and the bank source they are admitted
+# over, every declared behaviour from the deadlines to the info tool, and the set of branches a
+# fork of this generation may create, which is the parent's declaration and not a child's to
+# widen. Only the branch a child serves is drawn from that set. ``distinct`` is the two
+# values a child is given of its own, both inside the configuration hash, which is why a child's
+# configuration hash always differs from its parent's even under the same policy. ``location`` is
+# where the child keeps its bytes, which is outside that hash and still covered by the complete
+# start digest. ``branch`` is the slot the child serves, drawn from the set its parent declared
+# before it forked. ``delivery`` is the one thing a child changes on purpose, the policy of the
+# obligation nothing has delivered, with the provenance digest recomputed over its own rows.
+# ``lineage`` is the carry and the origin, which the restore matrix governs and no comparison of
+# configuration reaches.
+EQUAL_IN_A_CHILD = "equal"
+DISTINCT_IN_A_CHILD = "distinct"
+CHILD_LOCATION = "location"
+DECLARED_BRANCH = "branch"
+RESOLVED_DELIVERY = "delivery"
+CARRIED_LINEAGE = "lineage"
+CHILD_START_FIELDS: Dict[str, str] = {
+    "configuration_hash": EQUAL_IN_A_CHILD,
+    "consumer_claim_hash": DISTINCT_IN_A_CHILD,
+    "initial_cursor": EQUAL_IN_A_CHILD,
+    "done_message_id": EQUAL_IN_A_CHILD,
+    "id_key_hex": EQUAL_IN_A_CHILD,
+    "hidden_execution_id": DISTINCT_IN_A_CHILD,
+    "canonicalization_version": EQUAL_IN_A_CHILD,
+    "terminal_tool": EQUAL_IN_A_CHILD,
+    "tasks": EQUAL_IN_A_CHILD,
+    "capacity": EQUAL_IN_A_CHILD,
+    "wait_retry_after_ms": EQUAL_IN_A_CHILD,
+    "attempt_deadline_ms": EQUAL_IN_A_CHILD,
+    "execution_ordinal": EQUAL_IN_A_CHILD,
+    "release": EQUAL_IN_A_CHILD,
+    "assignments": EQUAL_IN_A_CHILD,
+    "evaluation_only": EQUAL_IN_A_CHILD,
+    "blob_root": CHILD_LOCATION,
+    "profile": EQUAL_IN_A_CHILD,
+    "grade": EQUAL_IN_A_CHILD,
+    "dispositions": RESOLVED_DELIVERY,
+    "provenance": RESOLVED_DELIVERY,
+    "families": EQUAL_IN_A_CHILD,
+    "receipt_contracts": EQUAL_IN_A_CHILD,
+    "receipt_source": EQUAL_IN_A_CHILD,
+    "served_slot": DECLARED_BRANCH,
+    "forkable_slots": EQUAL_IN_A_CHILD,
+    "budget": EQUAL_IN_A_CHILD,
+    "info": EQUAL_IN_A_CHILD,
+    "schedule_version": EQUAL_IN_A_CHILD,
+    "protocol_version": EQUAL_IN_A_CHILD,
+    "carry": CARRIED_LINEAGE,
+    "fork_origin": CARRIED_LINEAGE,
+}
+
+
+def check_start_classification() -> None:
+    """Refuse a start field the transformation above does not reach.
+
+    A newly added field is denied here rather than silently equal or silently free, because a
+    child is a bounded difference from its parent and a field nobody classified is neither.
+    """
+    declared = tuple(member.name for member in dataclass_fields(StreamStart))
+    unclassified = [name for name in declared if name not in CHILD_START_FIELDS]
+    if unclassified:
+        raise WireFormatError(
+            f"a child's start differs from its parent's by a classified amount, and {unclassified}"
+            " is classified nowhere: name it before a fork may carry it"
+        )
+    stale = [name for name in CHILD_START_FIELDS if name not in declared]
+    if stale:
+        raise WireFormatError(f"the transformation classifies {stale}, and no start carries it")
+
+
+def check_child_configuration(parent: StreamStart, child: StreamStart) -> None:
+    """Refuse a child start that differs from its parent's by more than its classes permit.
+
+    Every equal field is compared by value, both distinct values have to be the child's own, the
+    store has to be a durable one of its own, the branch has to be one the parent declared before
+    it forked, and the rows have to resolve the same obligations on the child's own branch under
+    a provenance recomputed over them. The two configuration hashes differ by construction, which
+    is asserted here rather than assumed, because it is why a child's projection digest at the
+    inherited cursor is its own from the first presentation.
+    """
+    check_start_classification()
+    for name, classification in CHILD_START_FIELDS.items():
+        held, given = getattr(parent, name), getattr(child, name)
+        if classification == EQUAL_IN_A_CHILD and held != given:
+            raise WireFormatError(
+                f"a child serves its parent's {name}, and this one declares {given!r} where its "
+                f"parent declares {held!r}"
+            )
+        if classification == DISTINCT_IN_A_CHILD and (not given or given == held):
+            raise WireFormatError(
+                f"a child is given its own {name}, and this one carries {given!r}"
+            )
+        if classification == CHILD_LOCATION and (not given or given == held):
+            raise WireFormatError(
+                f"a child keeps its bytes in a durable {name} of its own, and this one keeps "
+                f"them in {given!r}"
+            )
+    if child.served_slot not in parent.forkable_slots:
+        raise WireFormatError(
+            f"a child serves a branch its parent declared, and {child.served_slot!r} is not one "
+            f"of {sorted(parent.forkable_slots)}"
+        )
+    if child.served_slot == parent.served_slot:
+        raise WireFormatError(
+            f"a child serves a branch of its own, and this one serves {child.served_slot!r} as "
+            "its parent does"
+        )
+    _check_child_delivery(parent, child)
+    if configuration_hash(parent) == configuration_hash(child):
+        raise WireFormatError(
+            "a child holds its own claim hash and its own hidden execution, so its configuration "
+            "identity differs from its parent's, and these two are one value"
+        )
+
+
+def _check_child_delivery(parent: StreamStart, child: StreamStart) -> None:
+    """Refuse a child whose rows resolve something other than its parent's obligations."""
+    owed = sorted((row.attempt_id, row.payload_position) for row in parent.dispositions)
+    resolved = sorted((row.attempt_id, row.payload_position) for row in child.dispositions)
+    if owed != resolved:
+        raise WireFormatError(
+            "a child resolves the obligations its parent resolved, and this one resolves "
+            f"{resolved} where its parent resolves {owed}"
+        )
+    astray = sorted(
+        {row.branch_slot for row in child.dispositions if row.branch_slot != child.served_slot}
+    )
+    if astray:
+        raise WireFormatError(
+            f"a child's rows carry the branch it serves, and these carry {astray}"
+        )
+    if child.provenance is None or parent.provenance is None:
+        raise WireFormatError(
+            "a child keeps the authority its parent's rows were registered under, and one of "
+            "these two generations carries none"
+        )
+    if child.provenance.roster_digest != roster_digest(child.dispositions):
+        raise WireFormatError(
+            "a child recomputes the digest of its own rows, and this one carries "
+            f"{child.provenance.roster_digest!r}"
+        )
+    for name in ("authority", "experiment_id", "descriptor_digest"):
+        if getattr(parent.provenance, name) != getattr(child.provenance, name):
+            raise WireFormatError(
+                f"a child keeps its parent's {name}, and this one declares "
+                f"{getattr(child.provenance, name)!r}"
+            )
+
+
+def start_difference_projection(
+    parent: StreamStart, child: StreamStart
+) -> List[StartDifference]:
+    """Return the canonical difference between a parent's complete start and a child's.
+
+    It is the classified field names whose values differ, in the order a start declares them,
+    each with the digest of the child's value. The carry and the origin are excluded by
+    construction: they are lineage rather than configuration, and the restore matrix is what
+    reads them.
+
+    The parent validates this against both starts when it builds them, because it holds both.
+    The child checks its own members against the recorded digests, which is why the digest is of
+    the child's value rather than of the difference: no parent start is transmitted to a child.
+    """
+    check_start_classification()
+    return [
+        StartDifference(
+            field_name=member.name,
+            value_digest=sha256(
+                fork_preimage(DIFFERENCE_TAG, getattr(child, member.name))
+            ).hexdigest(),
+        )
+        for member in dataclass_fields(StreamStart)
+        if CHILD_START_FIELDS[member.name] != CARRIED_LINEAGE
+        and getattr(parent, member.name) != getattr(child, member.name)
+    ]
+
+
+# The most one run id the service mints may come to inside a measured shape. A fork measures every
+# shape it transmits before the barrier commits, and one class of field cannot be measured then: a
+# child's initial exact run id comes back in the start response and does not exist while the
+# parent is building the starts. So the known parts are measured exactly and the rest is bounded,
+# and the response is measured against that bound when it arrives.
+RUN_ID_CEILING_BYTES = 64
+
+
+def encoded_size(value: Any, converter: Any) -> int:
+    """Return the bytes one value comes to as the configured converter would encode it."""
+    return int(converter.to_payloads([value])[0].ByteSize())
+
+
+def check_transmitted_size(name: str, value: Any, converter: Any, *, ceiling: int) -> int:
+    """Measure one shape the operation transmits, and refuse it where it will not fit.
+
+    A wrapper can exceed the limit while everything it wraps fits, so what is measured is the
+    converter's actual output for the shape that crosses rather than the size of its largest
+    member. The measurement is returned, because a refusal that says how far over it was is what
+    a controller can act on.
+    """
+    measured = encoded_size(value, converter)
+    if measured > ceiling:
+        raise WireFormatError(
+            f"{name} encodes to {measured} bytes and one shape this operation transmits may be "
+            f"{ceiling}"
+        )
+    return measured
+
+
+def converter_wrapper_bytes(converter: Any) -> int:
+    """Return what the converter costs around a value, measured over an empty one."""
+    return encoded_size(None, converter)
+
+
+def fork_receipt_bound(receipt: ForkReceipt, converter: Any) -> int:
+    """Return the proved encoded upper bound of a receipt whose run ids do not exist yet.
+
+    The known parts are measured exactly with the run ids empty, each run id is allowed its
+    declared ceiling, and the converter's own wrapper is measured empty and added, so the bound
+    stands whatever identifiers the service mints.
+    """
+    known = replace(
+        receipt,
+        child_receipts=[replace(child, child_run_id="") for child in receipt.child_receipts],
+    )
+    return (
+        encoded_size(known, converter)
+        + RUN_ID_CEILING_BYTES * len(receipt.child_receipts)
+        + converter_wrapper_bytes(converter)
+    )
+
+
+def check_receipt_within_bound(receipt: ForkReceipt, bound: int, converter: Any) -> int:
+    """Measure a complete receipt against the bound proved for it before the barrier."""
+    measured = encoded_size(receipt, converter)
+    if measured > bound:
+        raise WireFormatError(
+            f"the fork receipt encodes to {measured} bytes and the bound proved for it before "
+            f"the barrier was {bound}"
+        )
+    return measured
