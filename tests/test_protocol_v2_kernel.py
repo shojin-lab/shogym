@@ -19,12 +19,14 @@ them would pin nothing.
 from __future__ import annotations
 
 import asyncio
+import base64
 import json
 import subprocess
 import sys
 from dataclasses import replace
 from datetime import timedelta
 from hashlib import sha256
+from pathlib import Path
 from typing import Any, AsyncIterator, Dict, List, Optional
 
 import pytest
@@ -35,6 +37,7 @@ import pytest_asyncio  # noqa: E402
 from temporalio import activity  # noqa: E402
 from temporalio.client import (  # noqa: E402
     WorkflowFailureError,
+    WorkflowHistory,
     WorkflowUpdateFailedError,
 )
 from temporalio.exceptions import ApplicationError  # noqa: E402
@@ -539,24 +542,35 @@ async def test_malformed_arguments_are_rejected_without_touching_the_attempt(
 
 @pytest.mark.network
 @pytest.mark.parametrize(
-    "corrupted", ["seal", "grade", "grade_seal", "bundle", "bundle_filing", "bundle_count"]
+    "corrupted",
+    ["seal", "seal_version", "grade", "grade_seal", "bundle", "bundle_filing", "bundle_count"],
 )
 async def test_a_result_the_seal_cannot_vouch_for_ends_the_attempt_it_prepared(
     env: WorkflowEnvironment, corrupted: str
 ) -> None:
     """A seal whose batch is answered with a result it cannot use ends the attempt instead.
 
-    An Activity that answers for another attempt, or another seal, or another filing, or that
-    records measurements of something other than the body it carries, acknowledges nothing. It
-    succeeded, so there is no step left for the exact filing to take again, and an attempt held
-    prepared under it would hold the generation's capacity with no way to an outcome. The
-    ending is written apart from the one a failed Activity leaves, because what a reader is
-    looking at here is work that reported success.
+    An Activity that answers for another attempt, or another seal, or another filing, or under a
+    capture rule this generation never declared, or that records measurements of something other
+    than the body it carries, acknowledges nothing. It succeeded, so there is no step left for
+    the exact filing to take again, and an attempt held prepared under it would hold the
+    generation's capacity with no way to an outcome. The ending is written apart from the one a
+    failed Activity leaves, because what a reader is looking at here is work that reported
+    success.
     """
 
     @activity.defn(name=SEAL_ATTEMPT)
     async def seal_of_another_attempt(request: SealAttemptInput) -> Any:
         return replace(await seal_attempt_activity(request), attempt_id=oid(0x999))
+
+    @activity.defn(name=SEAL_ATTEMPT)
+    async def seal_captured_under_another_version(request: SealAttemptInput) -> Any:
+        # The right attempt and the right seal, captured under a rule this generation did not
+        # declare. The acknowledgement carries the declared version, so a result answering with
+        # another would name one capture rule over bytes written under a second, which is what
+        # the version is in the record to rule out. The environment refuses a seal asked under a
+        # version it does not capture under; this is the same disagreement from the other side.
+        return replace(await seal_attempt_activity(request), canonicalization_version="another.1")
 
     @activity.defn(name=GRADE_ATTEMPT)
     async def score_of_another_attempt(request: GradeAttemptInput) -> Any:
@@ -591,6 +605,11 @@ async def test_a_result_the_seal_cannot_vouch_for_ends_the_attempt_it_prepared(
 
     served = {
         "seal": [seal_of_another_attempt, grade_attempt_activity, generate_payload_bundle_activity],
+        "seal_version": [
+            seal_captured_under_another_version,
+            grade_attempt_activity,
+            generate_payload_bundle_activity,
+        ],
         "grade": [seal_attempt_activity, score_of_another_attempt, generate_payload_bundle_activity],
         "grade_seal": [
             seal_attempt_activity,
@@ -629,6 +648,106 @@ async def test_a_result_the_seal_cannot_vouch_for_ends_the_attempt_it_prepared(
         # And the generation can reach Done, which is the whole of what a stranded attempt cost.
         await caller.stream.close_queue()
         assert (await caller.pull()).kind == "done"
+
+
+#: The version the recorded generation below declared and its seal answered under, and the
+#: version that seal is made to answer under instead. Nothing compared the two when that history
+#: was written, so a build from then could record either one.
+RECORDED_VERSION = "kernel.1"
+ANOTHER_VERSION = "another.1"
+
+
+def _compact(value: Dict[str, Any]) -> bytes:
+    """The bytes a recorded payload holds for one value: sorted keys and no spaces."""
+    return json.dumps(value, separators=(",", ":"), sort_keys=True).encode("utf-8")
+
+
+def _activity_names(recorded: Dict[str, Any]) -> Dict[int, str]:
+    """What each Activity a recorded history scheduled was asked for, by scheduling event."""
+    return {
+        int(event["eventId"]): event["activityTaskScheduledEventAttributes"]["activityType"][
+            "name"
+        ]
+        for event in recorded["events"]
+        if "activityTaskScheduledEventAttributes" in event
+    }
+
+
+def _answered_seal(recorded: Dict[str, Any]) -> Dict[str, Any]:
+    """The one event where the seal Activity answered, found by what it was scheduled as."""
+    names = _activity_names(recorded)
+    [answered] = [
+        event
+        for event in recorded["events"]
+        if "activityTaskCompletedEventAttributes" in event
+        and names[int(event["activityTaskCompletedEventAttributes"]["scheduledEventId"])]
+        == SEAL_ATTEMPT
+    ]
+    return answered
+
+
+def _committed(recorded: Dict[str, Any]) -> List[Dict[str, Any]]:
+    """Every Update a recorded history committed, decoded from the bytes it committed."""
+    return [
+        json.loads(base64.b64decode(payload["data"]).decode("utf-8"))
+        for event in recorded["events"]
+        for payload in event.get("workflowExecutionUpdateCompletedEventAttributes", {})
+        .get("outcome", {})
+        .get("success", {})
+        .get("payloads", [])
+    ]
+
+
+async def test_a_recorded_seal_that_answered_under_another_version_replays_to_its_own_grade(
+) -> None:
+    """The check on the answer is behind a marker, and this is the history that needs one.
+
+    The fixture is a whole generation recorded by a build from before there was any comparison
+    here, kept as the bytes that server wrote. Its seal answered under the version the
+    generation declared, but nothing checked that, so a build from then could record the same
+    history with that one field different and go on to schedule the grade, take the score and
+    mint the acknowledgement. That is the history this replays: the recorded bytes with the
+    version the seal answered under changed and nothing else.
+
+    A replay is how a deployment picks up every stream that is already open, and it reruns this
+    code over the events that were recorded. Read without a marker, the comparison would end the
+    attempt where the history says the grade was scheduled, and the generation would fail to
+    replay rather than reconstruct what it served: a run that was graded and acknowledged would
+    become one nothing could read back. Read behind one, a history with no marker takes the
+    decision it recorded and only an execution that writes the marker takes the comparison.
+    """
+    recorded = json.loads(
+        (Path(__file__).parent / "_fixtures" / "recorded_before_policies.json").read_text(
+            encoding="utf-8"
+        )
+    )
+    answered = _answered_seal(recorded)
+    payload = answered["activityTaskCompletedEventAttributes"]["result"]["payloads"][0]
+    result = json.loads(base64.b64decode(payload["data"]).decode("utf-8"))
+    assert result["canonicalization_version"] == RECORDED_VERSION
+    # One field of one event, and every other byte the recorded one: the re-encoding below is
+    # what the recorded payload already holds, so what the replay meets is that history and a
+    # version, rather than a history this test wrote.
+    assert base64.b64decode(payload["data"]) == _compact(result)
+    result["canonicalization_version"] = ANOTHER_VERSION
+    payload["data"] = base64.b64encode(_compact(result)).decode("ascii")
+
+    # What that history goes on to record, which is what this replay has to reach. The grade was
+    # scheduled after the seal was believed, and the acknowledgement was minted from the version
+    # the generation declared rather than the one the seal answered under.
+    after = [
+        name
+        for scheduled, name in _activity_names(recorded).items()
+        if scheduled > int(answered["eventId"])
+    ]
+    assert GRADE_ATTEMPT in after
+    [acknowledged] = [row for row in _committed(recorded) if row.get("kind") == "seal_ack"]
+    visible = json.loads(acknowledged["visible_text"])
+    assert visible["canonicalization_version"] == RECORDED_VERSION
+
+    await stream_replayer().replay_workflow(
+        WorkflowHistory.from_json("stream/recorded/seal-version", recorded)
+    )
 
 
 @pytest.mark.network

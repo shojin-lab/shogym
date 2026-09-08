@@ -264,7 +264,19 @@ def _seal(route: WorldRoute, store: SealStore, request: SealAttemptInput) -> Sea
     never inside them: the canonical text is what the digest covers and what the payload
     renderer is handed, so the answer being in it would be an answer oracle reaching the agent
     through the acknowledgement's own evidence.
+
+    A generation started under another version is refused before anything is read. The
+    acknowledgement carries the version the generation declared and the canonical text is
+    written under the version this world is captured as, so a seal that answered a request
+    asking for another one would put two capture rules on one submission, which is what the
+    version is in the record to rule out.
     """
+    if request.canonicalization_version != CANONICALIZATION_VERSION:
+        raise _refusal(
+            f"this world is captured as {CANONICALIZATION_VERSION!r} and the generation was "
+            f"started as {request.canonicalization_version!r}",
+            "CanonicalizationMismatch",
+        )
     existing = store.sealed(request.seal_id)
     if existing is None:
         world = route(request.attempt_id)

@@ -2864,6 +2864,29 @@ class StreamWorkflow:
         )
         if sealed.attempt_id != attempt.item.attempt_id or sealed.seal_id != attempt.seal_id:
             raise _unusable("the sealed submission is not the one this seal asked for")
+        # And it was captured under the version this generation declared. That version is what
+        # the acknowledgement names and what a reader takes the submission's capture rule from,
+        # so a result answering with another one would put a rule in the record that the bytes
+        # were not written under. The environment is asked under the declared version and every
+        # port refuses any other, so this is the check on the answer rather than on the
+        # question, and it is here because a submission whose capture rule this generation
+        # cannot state is not one to grade or to acknowledge.
+        #
+        # It is behind a marker because it changes what a seal does with a result, and a history
+        # recorded before it holds seals no build compared. A build from then could answer under
+        # another version and be believed, and what it recorded next was a grade and an
+        # acknowledgement; replaying that history against an unguarded check would end the
+        # attempt where the history says the grade was scheduled, and the generation would fail
+        # to replay rather than reconstruct what it served. The marker is read only where the
+        # two versions differ, so a seal that agrees records nothing and every ordinary
+        # generation keeps the history it had.
+        if sealed.canonicalization_version != self._start.canonicalization_version and (
+            workflow.patched("seal-answers-under-the-declared-version")
+        ):
+            raise _unusable(
+                f"the submission was captured as {sealed.canonicalization_version!r} and this "
+                f"generation was started as {self._start.canonicalization_version!r}"
+            )
         # The prepared seal, recorded before the grader runs. It fixes the submission and its
         # digest by value, so a resumed seal grades what was filed and not what is there now.
         attempt.canonical_submission_text = sealed.canonical_submission_text
