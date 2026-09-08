@@ -1099,6 +1099,7 @@ def check_dispositions(
     provenance: Optional[PolicyProvenance] = None,
     families: Optional[List[MatchedFamily]] = None,
     contract_ids: Sequence[str] = (),
+    served_slot: str = SINGLETON_SLOT,
 ) -> None:
     """Refuse a roster of dispositions that does not resolve this generation.
 
@@ -1126,11 +1127,12 @@ def check_dispositions(
     impossible.
 
     A row for a branch this generation does not serve is refused. Such a row is a precommitment,
-    and there is no fork here to declare the slots it would create, map them to children, or stop
-    a child from resolving itself again: an audit surface that recorded one would be claiming an
-    assignment that never controlled an exposure. The key keeps its branch, because the fork this
-    is for is the reason two rows can share an obligation, and the roster it will be bound to is
-    the thing that has to arrive with it.
+    and nothing here maps it to a generation that would deliver it: an audit surface that recorded
+    one would be claiming an assignment that never controlled an exposure. ``served_slot`` is the
+    branch this generation declares, which every ordinary generation leaves at the one slot every
+    row carries; a child of a fork declares its own, its rows carry that one, and the coverage
+    below is counted on it. The key keeps its branch either way, because two children sharing one
+    obligation is the reason a row is keyed by more than the obligation.
     """
     if profile == LEGACY:
         if dispositions:
@@ -1167,11 +1169,11 @@ def check_dispositions(
         _check_source(row, profile=profile)
         served = obligations if row.kind == DELIVER else silent
         other = silent if row.kind == DELIVER else obligations
-        if row.branch_slot != SINGLETON_SLOT:
+        if row.branch_slot != served_slot:
             raise PolicyViolation(
                 f"the row for attempt {row.attempt_id} resolves the branch "
-                f"{row.branch_slot!r}, and this generation serves one branch: a row for a slot "
-                "nothing has created is a precommitment nothing can be held to"
+                f"{row.branch_slot!r}, and this generation serves {served_slot!r}: a row for a "
+                "slot nothing has created is a precommitment nothing can be held to"
             )
         if row.attempt_id in other:
             raise PolicyViolation(
@@ -1185,7 +1187,7 @@ def check_dispositions(
                 f"{row.payload_position}, which is not the position its roster row assigns"
             )
     for attempt_id in sorted(positions):
-        if f"{attempt_id}/{positions[attempt_id]}/{SINGLETON_SLOT}" not in seen:
+        if f"{attempt_id}/{positions[attempt_id]}/{served_slot}" not in seen:
             raise PolicyViolation(
                 f"attempt {attempt_id} has no disposition, and a generation serves no payload "
                 "position it has not resolved"

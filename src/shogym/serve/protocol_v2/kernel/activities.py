@@ -1,4 +1,4 @@
-"""The Activities the stream depends on: two stand-ins, and two that are not.
+"""The Activities the stream depends on: two stand-ins, two that are not, and the fork's three.
 
 The seal and the grade compute deterministically from their inputs, hold no state between calls,
 and reach no environment. What is not a stand-in is their shape: each already carries the attempt
@@ -19,6 +19,12 @@ all.
 hashing it, and the workflow may not open a file, so the read lives here and the decision the
 read supports lives there.
 
+The fork's three are real and none of them is a stand-in. One reads the objects a fork requires
+before its barrier commits, one creates a child under its derived identity and never a second one,
+and one asks a parent for the row it committed about a child. The last two reach the service
+rather than the store, which is the other reason they are here: a workflow may open no file and it
+may call no client either.
+
 Everything that will one day be I/O is already on this side of the line. The workflow computes
 the submission digest from what :func:`seal_attempt_activity` returns and never opens a file,
 a socket, or a clock of its own.
@@ -26,12 +32,15 @@ a socket, or a clock of its own.
 
 from __future__ import annotations
 
+from datetime import timedelta
 from hashlib import sha256
 from pathlib import Path
-from typing import Optional
+from typing import Any, List, Optional
 
 from temporalio import activity
-from temporalio.exceptions import ApplicationError
+from temporalio.common import WorkflowIDReusePolicy
+from temporalio.exceptions import ApplicationError, WorkflowAlreadyStartedError
+from temporalio.service import RPCError, RPCStatusCode
 
 from shogym.serve.protocol_v2 import (
     BlobRef,
@@ -53,6 +62,10 @@ from shogym.serve.protocol_v2.policy import (
 )
 from shogym.serve.protocol_v2.kernel.messages import (
     BlobsVerified,
+    ForkAvailability,
+    ForkAvailabilityInput,
+    ForkChildStarted,
+    ForkOriginVerified,
     GeneratePayloadBundleInput,
     GradeAttemptInput,
     GradeAttemptResult,
@@ -61,13 +74,39 @@ from shogym.serve.protocol_v2.kernel.messages import (
     SealAttemptInput,
     SealAttemptResult,
     SelectedSourceReference,
+    StartForkChildInput,
+    StreamStart,
     VerifyBlobsInput,
+    VerifyForkOriginInput,
 )
 
 SEAL_ATTEMPT = "shogym.protocol_v2.SealAttemptActivity"
 GRADE_ATTEMPT = "shogym.protocol_v2.GradeAttemptActivity"
 GENERATE_PAYLOAD_BUNDLE = "shogym.protocol_v2.GeneratePayloadBundleActivity"
 VERIFY_BLOBS = "shogym.protocol_v2.VerifyBlobsActivity"
+FORK_AVAILABILITY = "shogym.protocol_v2.ForkAvailabilityActivity"
+START_FORK_CHILD = "shogym.protocol_v2.StartForkChildActivity"
+VERIFY_FORK_ORIGIN = "shogym.protocol_v2.VerifyForkOriginActivity"
+
+#: The workflow type a fork creates its children as, named rather than imported: the workflow
+#: module reads this one, so a name imported the other way would close the cycle.
+STREAM_WORKFLOW_TYPE = "ShogymStreamV2"
+#: The Query a gated child asks its parent, by the name the workflow registers it under, for the
+#: same reason. A controller reads the fork's own status through the typed runtime call instead.
+FORK_CHILD_QUERY = "fork_child"
+
+#: What an origin reading asked after its parent's answers stopped standing comes back as. It is a
+#: name rather than a literal because the child that receives it decides on it: the window does not
+#: reopen, so this is the one failure of that reading a child records instead of asking again.
+EXPIRED_AUTHORITY_FAILURE = "ExpiredAuthority"
+
+#: What a reading that authenticated a disagreement comes back as. It is a name rather than a
+#: literal because the parent that receives it decides on it: the reading is permanent, so the fork
+#: ends on it rather than asking again or replacing what is already there.
+ORIGIN_DISAGREEMENT_FAILURE = "OriginDisagreement"
+
+#: How long an origin question waits for an answer before it is retried.
+_QUERY_TIMEOUT = timedelta(seconds=10)
 
 KERNEL_CELL = "graded"
 # The renderer a request with no policy in it gets, which is the one a legacy history recorded.
@@ -317,6 +356,197 @@ async def verify_blobs_activity(request: VerifyBlobsInput) -> BlobsVerified:
     )
 
 
+@activity.defn(name=FORK_AVAILABILITY)
+async def fork_availability_activity(request: ForkAvailabilityInput) -> ForkAvailability:
+    """Read the three objects one fork requires, and measure what the store produced.
+
+    The manifest is read under its commitment and both eligible bodies under that manifest's own
+    entries, because none of the three is in an ordinary claim's verified set and the committed
+    identities prove what was published rather than that the bytes are still there. Nothing here
+    decides anything: what comes back is which names produced bytes and how many, and the parent
+    that asked is what refuses a barrier over an object nobody could read.
+    """
+    store = FilesystemBlobStore(Path(request.blob_root))
+    asked = [request.source_commitment, *request.body_references]
+    present: List[str] = []
+    missing: List[str] = []
+    measured: List[int] = []
+    for reference in asked:
+        try:
+            measured.append(len(store.read(reference)))
+        except WireFormatError:
+            missing.append(reference)
+            continue
+        present.append(reference)
+    return ForkAvailability(present=present, missing=missing, measured_bytes=measured)
+
+
+@activity.defn(name=START_FORK_CHILD)
+async def start_fork_child_activity(request: StartForkChildInput) -> ForkChildStarted:
+    """Create one child under its derived identity, or resolve the one that is already there.
+
+    The reuse policy is set rather than left to the default, which allows a duplicate: a child that
+    failed its first activation is an existing child and not permission to create a replacement
+    under its id, and a closed failed child stays failed. A duplicate is therefore resolved rather
+    than started, and what is resolved is verified to be this child before it is adopted.
+    """
+    client = activity.client()
+    try:
+        handle = await client.start_workflow(
+            STREAM_WORKFLOW_TYPE,
+            request.start,
+            id=request.child_workflow_id,
+            task_queue=request.task_queue,
+            id_reuse_policy=WorkflowIDReusePolicy.REJECT_DUPLICATE,
+        )
+    except WorkflowAlreadyStartedError:
+        return ForkChildStarted(
+            child_ordinal=request.child_ordinal,
+            child_workflow_id=request.child_workflow_id,
+            child_run_id=await _the_child_already_there(request),
+            created=False,
+        )
+    return ForkChildStarted(
+        child_ordinal=request.child_ordinal,
+        child_workflow_id=request.child_workflow_id,
+        child_run_id=handle.result_run_id or handle.first_execution_run_id or "",
+        created=True,
+    )
+
+
+async def _the_child_already_there(request: StartForkChildInput) -> str:
+    """Return the run an existing child was first created under, having checked it is this child.
+
+    The comparison is against that original execution rather than against whatever runs under the
+    identity now: a child that has since continued as new carries a different carrier under the
+    same id, and comparing the latest run would refuse a child that is lawfully further on. What is
+    compared is how that first execution was created, which is the workflow type, the task queue
+    and the start argument.
+
+    The start is compared as the converter's own complete payload for the value the history holds
+    against its complete payload for the value this request carries, which is the one comparison
+    that is total: the recorded argument is read back through the converter first, so a codec that
+    writes different bytes for one value each time is decoded away rather than read as a
+    disagreement, and neither side has to be a shape any particular digest is defined over.
+
+    The whole payload is compared and not the body inside it, because a converter is free to keep
+    part of what it encodes beside the body: two starts that differ in a member a converter puts in
+    the metadata have equal bodies, and adopting an execution on that comparison would confirm an
+    execution created from a start this fork never built.
+
+    A disagreement here is authenticated and permanent. Something else is running under this
+    child's derived identity, and the answer to that is never to replace it: the fork keeps the
+    identity, records the child unconfirmed, and stops.
+    """
+    client = activity.client()
+    described = await client.get_workflow_handle(request.child_workflow_id).describe()
+    run_id = described.raw_info.first_run_id or described.run_id
+    handle = client.get_workflow_handle(request.child_workflow_id, run_id=run_id)
+    started = None
+    async for event in handle.fetch_history_events(page_size=1):
+        started = event.workflow_execution_started_event_attributes
+        break
+    if started is None or not started.workflow_type.name:
+        raise ApplicationError(
+            f"the first execution of {request.child_workflow_id!r} could not be read, so what "
+            "runs under this child's identity is not established either way",
+            type="UnreadableChild",
+        )
+    if (
+        started.workflow_type.name != STREAM_WORKFLOW_TYPE
+        or started.task_queue.name != request.task_queue
+    ):
+        raise ApplicationError(
+            f"{request.child_workflow_id!r} was created as {started.workflow_type.name!r} on "
+            f"{started.task_queue.name!r}, and this child is a {STREAM_WORKFLOW_TYPE!r} on "
+            f"{request.task_queue!r}",
+            type=ORIGIN_DISAGREEMENT_FAILURE,
+            non_retryable=True,
+        )
+    converter = client.data_converter.payload_converter
+    try:
+        [original] = await client.data_converter.decode_wrapper(
+            started.input, [StreamStart]
+        )
+        held = _the_whole_payload(converter.to_payloads([original])[0])
+    except Exception as error:  # noqa: BLE001 - anything unreadable here is another execution
+        raise ApplicationError(
+            f"{request.child_workflow_id!r} was created from something other than a start this "
+            "fork built",
+            type=ORIGIN_DISAGREEMENT_FAILURE,
+            non_retryable=True,
+        ) from error
+    asked = _the_whole_payload(converter.to_payloads([request.start])[0])
+    if held != asked:
+        raise ApplicationError(
+            f"{request.child_workflow_id!r} was created from the start "
+            f"{sha256(held).hexdigest()[:16]}, and this child's start is "
+            f"{sha256(asked).hexdigest()[:16]}",
+            type=ORIGIN_DISAGREEMENT_FAILURE,
+            non_retryable=True,
+        )
+    return run_id
+
+
+def _the_whole_payload(payload: Any) -> bytes:
+    """Return everything one encoded value is, the body and what the converter kept beside it.
+
+    A payload is its metadata and its body, and both are what a converter made of the value: what
+    an encoding names and anything a converter chose to keep out there belong to the value exactly
+    as the bytes in the body do. The serialization is asked for in a fixed order so that two
+    encodings of one value are one string of bytes.
+    """
+    return payload.SerializeToString(deterministic=True)
+
+
+@activity.defn(name=VERIFY_FORK_ORIGIN)
+async def verify_fork_origin_activity(request: VerifyForkOriginInput) -> ForkOriginVerified:
+    """Ask the parent a gated child's lineage names for the row it committed about that child.
+
+    The read is an Activity rather than a workflow call because the SDK's external workflow handle
+    exposes signal and cancel and no Query at all, and it is recorded in the child's history so a
+    replay performs no fresh client I/O and reaches the same answer. It is pinned to the exact
+    preparing execution, so a parent replaced under the same identity answers for the execution
+    that prepared this child.
+
+    The three ways it can fail are kept apart. A parent, a Worker or a history that cannot be read
+    is infrastructure and is retried while the child stays gated. A history the service has already
+    deleted is expired authority, which is its own result and neither of the other two: the window
+    a parent's answers stand in does not reopen, so the answer comes back once instead of being
+    asked for again for ever, and what the child does with it is record it and stay gated. A parent
+    that answers and names no such child is authenticated, so that is permanent and never becomes a
+    retry.
+    """
+    handle = activity.client().get_workflow_handle(
+        request.parent_workflow_id, run_id=request.parent_run_id
+    )
+    try:
+        answer: ForkOriginVerified = await handle.query(
+            FORK_CHILD_QUERY,
+            args=[request.fork_id, request.child_ordinal],
+            result_type=ForkOriginVerified,
+            rpc_timeout=_QUERY_TIMEOUT,
+        )
+    except RPCError as error:
+        if error.status is RPCStatusCode.NOT_FOUND:
+            raise ApplicationError(
+                f"the execution {request.parent_run_id} that prepared this child can no longer be "
+                "read, so its answer window has closed",
+                type=EXPIRED_AUTHORITY_FAILURE,
+                non_retryable=True,
+            ) from error
+        raise
+    if answer.record.child_workflow_id != request.child_workflow_id:
+        raise ApplicationError(
+            f"the parent recorded its child {request.child_ordinal} as "
+            f"{answer.record.child_workflow_id!r} and this execution runs as "
+            f"{request.child_workflow_id!r}",
+            type=ORIGIN_DISAGREEMENT_FAILURE,
+            non_retryable=True,
+        )
+    return answer
+
+
 def kernel_activities() -> list:
     """Return the Activities a stream Worker registers."""
     return [
@@ -324,4 +554,19 @@ def kernel_activities() -> list:
         grade_attempt_activity,
         generate_payload_bundle_activity,
         verify_blobs_activity,
+    ]
+
+
+def fork_activities() -> list:
+    """Return the infrastructure Activities one fork adds, which are registered explicitly.
+
+    A Worker takes whatever Activity list it is handed wholesale, and an environment that brings
+    its own terminal hands over only its seal, its grade, the payload bundle Activity and the blob
+    verification Activity. These three are none of those, so they are added beside whatever an
+    environment supplied rather than being left to a caller to remember.
+    """
+    return [
+        fork_availability_activity,
+        start_fork_child_activity,
+        verify_fork_origin_activity,
     ]
