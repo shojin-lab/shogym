@@ -2,11 +2,12 @@
 
 [**τ²-bench**](https://github.com/sierra-research/tau2-bench) (Sierra's benchmark for tool-using
 customer-service agents) served through shogym at upstream source commit `1d244f5`. The domain
-policies, tasks and DBs come from a checkout the caller supplies, by `TAU2_DATA_DIR` or by
-upstream's source-relative `<checkout>/data` fallback; shogym version-checks neither. tau2 puts
-an agent in a domain (airline, retail, telecom, …) where it uses domain tools and converses
-with a simulated user to resolve a task, then scores the run with a deterministic evaluator
-(final DB state, the actions taken) plus optional NL assertions.
+policies, tasks and DBs are provisioned at that commit by `ensure_data()`, or come from a checkout
+the caller supplies, by `TAU2_DATA_DIR` or by upstream's source-relative `<checkout>/data`
+fallback; shogym version-checks neither of those two. tau2 puts an agent in a domain (airline,
+retail, telecom, …) where it uses domain tools and converses with a simulated user to resolve a
+task, then scores the run with a deterministic evaluator (final DB state, the actions taken) plus
+optional NL assertions.
 
 Like every shogym env this **describes** a task, **serves** its tools over MCP, and **verifies**
 a recorded trajectory while an external harness drives the tools — see
@@ -17,16 +18,17 @@ tools/tasks and evaluator verbatim and replacing only the agent. The runnable de
 
 ## Running it
 
-> Requires **Python 3.12 + the `tau2` extra**, a tau2 `data/` checkout (by `TAU2_DATA_DIR`, or
-> by a full `TAU2_SRC` clone that carries its own `data/`), and a one-time fetch of the pinned
-> upstream source on first construction — see [Requirements](#requirements) below.
+> Requires **Python 3.12 + the `tau2` extra**, tau2's domain data (provisioned at the pin by
+> `ensure_data()`, or supplied by `TAU2_DATA_DIR` or a full `TAU2_SRC` clone), and a one-time
+> fetch of the pinned upstream source on first construction — see
+> [Requirements](#requirements) below.
 
 ### Construct + serve
 
 ```python
 import shogym
 
-env = shogym.make("tau2_mock")          # needs tau2 data (TAU2_DATA_DIR, or a full TAU2_SRC clone)
+env = shogym.make("tau2_mock")          # needs tau2 data (ensure_data(), TAU2_DATA_DIR, or a clone)
 spec = env.describe("0")               # task 0: policy + this task's ticket + the tool manifest
 ```
 
@@ -63,13 +65,14 @@ variable at the top of its `serve.py`:
 ENV = "tau2_mock"
 ```
 
-The mock domain needs no key and no network of its own once tau2's `data/` is reachable, by
-`TAU2_DATA_DIR` or by a full `TAU2_SRC` clone. It is not strictly network-free: serving imports
-tau2's `registry`, which reaches `agent.llm_agent` → `utils.llm_utils` → `litellm`, and litellm
-fetches a model-cost map on import unless `LITELLM_LOCAL_MODEL_COST_MAP=true` is set, falling
-back to a bundled copy when that fails.
-A real (non-solo) domain additionally needs `OPENAI_API_KEY` for tau2's own user simulator,
-which is a real cost.
+The mock domain needs no key and no network of its own once tau2's `data/` is reachable, whether
+`ensure_data()` provisioned it at the pin or `TAU2_DATA_DIR` or a full `TAU2_SRC` clone supplies
+it. It is not strictly network-free: serving imports tau2's `registry`, which reaches
+`agent.llm_agent` → `utils.llm_utils` → `litellm`, and litellm fetches a model-cost map on import
+unless `LITELLM_LOCAL_MODEL_COST_MAP=true` is set, falling back to a bundled copy when that
+fails. `SHOGYM_PROVISIONING=offline` sets it, so a run in that stage reads the bundled copy rather
+than reaching for one. A real (non-solo) domain additionally needs `OPENAI_API_KEY` for tau2's own
+user simulator, which is a real cost.
 
 ## Requirements
 
@@ -87,12 +90,19 @@ default `dev` group, so `uv sync` includes it. On top of that:
   as `automationbench` does. The `tau2` extra declares upstream's own runtime dependencies
   explicitly (its base deps plus its `[gym]` and `[knowledge]` extras), since pip no longer
   resolves them transitively.
-- **tau2 data**, separately. tau2 does **not** ship its `data/` in the install, and the default
-  runtime fetch extracts `src/tau2` alone, so a provisioned-from-cache run must supply the data
-  itself. Two routes work: set `TAU2_DATA_DIR` to a tau2-bench `data/` checkout, or point
-  `TAU2_SRC` at a **full** clone's `src/`, whose sibling `data/` upstream finds on its own
-  (`tau2/utils/utils.py` falls back to `<checkout>/data` when `TAU2_DATA_DIR` is unset). shogym
-  version-checks neither.
+- **tau2 data**, separately. tau2 does **not** ship its `data/` in the install, and the source
+  fetch extracts `src/tau2` alone, so the data arrives by its own route. Three work.
+  `shogym.envs.tau2.adapter.ensure_data()` provisions the domains and the user-simulator
+  guidelines at the pinned commit into `~/.cache/shogym/tau2/data`, which is exactly where
+  upstream's fallback looks, so nothing needs configuring afterwards (~93 MB downloaded, 139 MB
+  kept; upstream's ~576 MB of `results/` and its `voice/` are not extracted). It is a separate
+  call from `ensure_source()` and is never made on demand, so constructing an env never surprises
+  a caller with it; `tests/prepare_offline_suite.py` is what calls it. Or supply the data
+  yourself: set `TAU2_DATA_DIR` to a tau2-bench `data/` checkout, or point `TAU2_SRC` at a
+  **full** clone's `src/`, whose sibling `data/` upstream finds on its own (`tau2/utils/utils.py`
+  falls back to `<checkout>/data` when `TAU2_DATA_DIR` is unset). shogym version-checks neither of
+  those two caller-supplied routes, which it does not control; only what `ensure_data()` writes
+  carries the pin it was extracted at.
 - **`OPENAI_API_KEY`** — required for the **default/live user simulator** on non-solo domains
   (it's an OpenAI LLM), and for evaluator paths that call a judge (NL assertions, mostly
   `retail`) or dense retrieval (`banking_knowledge` only; `retail` ships no retrieval code). It is
@@ -201,14 +211,14 @@ semantics (give each run its own trace file for a guaranteed 1:1 mapping).
   is a ratio it computes over upstream's per-action `action_checks`, `success` is
   `reward >= 1.0`, and an abort or a missing verdict scores `reward = 0.0`. There are **zero
   shogym core changes**; the whole port is additive under `src/shogym/envs/tau2/`.
-- **Pinned to source commit `1d244f5`.** The pin covers tau2's Python source only, and the
-  default provisioner extracts `src/tau2` alone, so it ships no benchmark data at all. The
-  domain policies, tasks and DBs arrive by one of two caller-controlled routes: `TAU2_DATA_DIR`,
-  or upstream's source-relative fallback (`tau2/utils/utils.py` resolves `<checkout>/data` when
-  that variable is unset), which a `TAU2_SRC=/repo/src` clone satisfies on its own. shogym
-  checks no revision or hash on either route, and `TAU2_SRC` likewise swaps the source for a
-  checkout nothing version-checks, so two runs under the same commit label can serve different
-  benchmark content.
+- **Pinned to source commit `1d244f5`.** The pin covers tau2's Python source, and the source
+  provisioner extracts `src/tau2` alone, so the benchmark data is provisioned separately.
+  `ensure_data()` takes it from the same pinned archive and stamps the commit it wrote, so that
+  route is pinned too. The two caller-controlled routes are not: `TAU2_DATA_DIR`, and upstream's
+  source-relative fallback (`tau2/utils/utils.py` resolves `<checkout>/data` when that variable is
+  unset), which a `TAU2_SRC=/repo/src` clone satisfies on its own. shogym checks no revision or
+  hash on either, and `TAU2_SRC` likewise swaps the source for a checkout nothing version-checks,
+  so two runs under the same commit label can serve different benchmark content.
 - **Python 3.12 pin rationale.** The pinned tau2 revision imports the stdlib `audioop` module,
   removed in 3.13 — this is why the shared project pin is `>=3.12,<3.13`.
 - **banking uses `bm25_grep`.** `tau2_banking_knowledge` is pinned to the `bm25_grep` retrieval

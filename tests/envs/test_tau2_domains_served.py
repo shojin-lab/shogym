@@ -15,7 +15,7 @@ import json
 
 import pytest
 
-from tests._fixtures.upstream_gate import gate
+from tests._fixtures.upstream_gate import environmental_skip, gate
 
 # Provisions the pinned upstream source (network on a cold cache) and imports tau2, so this is
 # also the check that the `tau2` extra is installed. A missing extra or an unreachable network
@@ -40,11 +40,14 @@ _NON_SOLO = {
 }
 
 
-def _skip_if_unconstructible(env_name: str) -> None:
+def _require_constructible(env_name: str) -> None:
+    """Construct the env once, so a machine that cannot says so before the test does something
+    more complicated. A machine the preparation stage ran on has the domain data, so there the
+    failure to construct is a failure rather than a skip."""
     try:
         shogym.make(env_name)
-    except Exception as exc:  # missing data / offline construction blocker
-        pytest.skip(f"{env_name} not constructible offline: {exc}")
+    except Exception as exc:  # missing domain data, most often
+        environmental_skip(f"the {env_name} env is not constructible: {exc}")
 
 
 @pytest.mark.parametrize(
@@ -54,7 +57,7 @@ def test_env_task_ids_match_tau2_declared_split(env_name: str, domain: str) -> N
     # The env must expose tau2's *declared* train/test splits verbatim — not a positional
     # slice — so held-out test tasks never leak into the train env. (Airline/retail/telecom
     # all declare train+test; mock/banking declare no holdout and are excluded here.)
-    _skip_if_unconstructible(env_name)
+    _require_constructible(env_name)
     import shogym
 
     loader = mcp_server._reg.get_tasks_loader(domain)
@@ -75,7 +78,7 @@ def test_env_task_ids_match_tau2_declared_split(env_name: str, domain: str) -> N
 def test_non_solo_default_user_args_match_upstream() -> None:
     # The default user-simulator kwargs must copy tau2's DEFAULT_LLM_ARGS_USER (temperature
     # 0.0) — not an empty dict — so the default non-solo config matches upstream `tau2 run`.
-    _skip_if_unconstructible("tau2_airline")
+    _require_constructible("tau2_airline")
     from tau2.config import DEFAULT_LLM_ARGS_USER
 
     task = mcp_server.load_tasks("airline")[0]
@@ -96,7 +99,7 @@ def test_non_solo_default_user_args_match_upstream() -> None:
 
 @pytest.mark.parametrize("env_name,cfg", list(_NON_SOLO.items()))
 async def test_non_solo_domain_round_trips_and_scores(env_name: str, cfg: dict) -> None:
-    _skip_if_unconstructible(env_name)
+    _require_constructible(env_name)
     episode = await ServedEpisode.start(env_name, task=0, env_config=cfg)
     try:
         spec = episode.describe()
@@ -131,7 +134,7 @@ async def test_airline_gold_actions_satisfy_db() -> None:
     # Positive, fully-offline non-solo check: replaying a task's gold agent actions makes
     # tau2's DB check pass (db_match True). Robust to the split — finds a train task that has
     # replayable assistant actions.
-    _skip_if_unconstructible("tau2_airline")
+    _require_constructible("tau2_airline")
     import shogym
 
     env = shogym.make("tau2_airline")
@@ -167,7 +170,7 @@ async def test_user_stop_verdict_retrieved_via_done() -> None:
     # If tau2 auto-terminates (here the user simulator says ###STOP###), the verdict is
     # stashed and surfaced when the harness calls `done` — so it lands on a `done` step and
     # the verifier (which trusts only `done`) still scores the episode.
-    _skip_if_unconstructible("tau2_airline")
+    _require_constructible("tau2_airline")
     cfg = {"user_llm_args": {"mock_response": "###STOP###"}}
     episode = await ServedEpisode.start("tau2_airline", task=0, env_config=cfg)
     try:
@@ -188,7 +191,7 @@ async def test_user_stop_verdict_retrieved_via_done() -> None:
 
 async def test_premature_terminate_scores_zero_non_solo() -> None:
     # Ending a non-solo episode without `done` scores premature zero (no verdict recorded).
-    _skip_if_unconstructible("tau2_telecom")
+    _require_constructible("tau2_telecom")
     cfg = {"user_llm_args": {"mock_response": _MOCK_USER}}
     episode = await ServedEpisode.start("tau2_telecom", task=0, env_config=cfg)
     try:

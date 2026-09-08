@@ -27,11 +27,17 @@ without Docker, so ``describe`` and the manifest probe stay offline.
 from __future__ import annotations
 
 import json
+import os
+import shlex
+import shutil
+import tempfile
 import threading
-from typing import Any, Dict, Optional
+from pathlib import Path
+from typing import Any, Dict, List, Optional
 
 from fastmcp import FastMCP
 
+from shogym.envs._upstream import OFFLINE, cache_root, provisioning_mode
 from shogym.envs.frontier_bench import docker_backend as dk
 from shogym.envs.frontier_bench.docker_backend import VerifierOutcome
 from shogym.envs.frontier_bench.manifest import FrontierTask, load_task
@@ -54,9 +60,9 @@ def _image_tags(task: FrontierTask) -> tuple[str, str]:
     """Deterministic, content-addressed image tags, one per role.
 
     The *environment* tag is what repeated episodes reuse: :func:`build_task_image`
-    existence-checks it and skips the build. The *verifier* tag is rebuilt on every finalization
-    and, unless ``keep_image``, removed afterwards, so only Docker's layer cache spares the
-    downloads there."""
+    existence-checks it and skips the build. The *verifier* tag is existence-checked the same way
+    at finalization but, unless ``keep_image``, removed afterwards, so an ordinary run rebuilds it
+    per scored episode and only Docker's layer cache spares the downloads there."""
     short = task.content_sha256[:12]
     return (
         f"shogym-frontier-env-{task.name}:{short}",
@@ -71,7 +77,12 @@ def build_task_image(task_name: Optional[str] = None) -> str:
     up front (e.g. an example preflight) — a Dockerfile / base-image-pull / platform failure
     surfaces here rather than crashing the served server on the first tool call. Serving then
     reuses the content-addressed image from cache. Needs Docker.
+
+    The provisioning mode is read first, before the existence check that usually returns: a value
+    nobody recognizes is refused here as well as inside the build, so a typo is not something only
+    the machines with nothing prepared find out about (see :func:`provisioning_mode`).
     """
+    provisioning_mode()
     task = load_task(task_name)
     env_tag, _ = _image_tags(task)
     if not dk.image_exists(env_tag):
@@ -82,6 +93,159 @@ def build_task_image(task_name: Optional[str] = None) -> str:
             timeout=task.build_timeout_sec,
         )
     return env_tag
+
+
+def build_verifier_image(task_name: Optional[str] = None) -> str:
+    """Build the task's verifier image (if not already cached) and return its tag.
+
+    The other half of :func:`build_task_image`, and it exists for the same reason: the build is
+    otherwise first performed in the middle of something else, here a finalization. A prepared
+    machine wants both images up front, because an ordinary run removes this one after each
+    scored episode and builds it again for the next, and only the layer cache spares the network
+    installs those Dockerfiles carry. Needs Docker.
+
+    Reads the mode first for the same reason :func:`build_task_image` does, and on the same warm
+    path: an existing image returns without a build, and a build is where the mode is otherwise
+    read.
+    """
+    provisioning_mode()
+    task = load_task(task_name)
+    _, verifier_tag = _image_tags(task)
+    if not dk.image_exists(verifier_tag):
+        dk.build_image(
+            context_dir=task.tests_dir,
+            dockerfile=task.tests_dockerfile,
+            tag=verifier_tag,
+            timeout=task.build_timeout_sec,
+        )
+    return verifier_tag
+
+
+#: Where the oracle's own packages are copied to inside the task container. Under ``/opt`` rather
+#: than anywhere the task owns, so nothing the verifier reads and nothing the agent is scored on
+#: shares a directory with them.
+ORACLE_PACKAGES_PATH = "/opt/shogym-oracle-packages"
+
+
+def oracle_pip_requirements(task: FrontierTask) -> List[str]:
+    """The requirements this task's own oracle installs while it runs, read out of its script.
+
+    Some vendored oracles begin by installing what they need (``fin-saccr-rwa`` installs
+    ``openpyxl``, ``protein-autointerp-disulfide`` installs ``requests`` and ``biopython``),
+    because upstream runs them in a container with open egress. Those installs are the task's
+    bytes and stay untouched; this only *reads* them, so that a stage which may fetch can put the
+    same packages within the oracle's reach and a stage which may not can hand them over instead
+    of letting it reach PyPI.
+
+    Read rather than listed in shogym, so a re-pin that changes what an oracle installs changes
+    this with it. Only the plain form upstream uses is understood: one ``pip install`` per line,
+    with the requirements written out. Anything else (a requirements file, a continuation) would
+    arrive as a preparation failure naming the package it could not fetch, which is the right way
+    for an unrecognized install to surface."""
+    script = task.solution_dir / "solve.sh"
+    if not script.is_file():
+        return []
+    requirements: List[str] = []
+    for line in script.read_text().splitlines():
+        tokens = shlex.split(line, comments=True)
+        if "install" not in tokens:
+            continue
+        install = tokens.index("install")
+        if not any(token in ("pip", "pip3") for token in tokens[:install]):
+            continue
+        requirements += [token for token in tokens[install + 1 :] if not token.startswith("-")]
+    return requirements
+
+
+def oracle_packages_dir(task_name: Optional[str] = None) -> Path:
+    """Where this task's prepared oracle packages live on the host.
+
+    Content-addressed by the same task hash the image tags carry, so a re-pinned task looks for
+    its own packages rather than inheriting the previous pin's."""
+    task = load_task(task_name)
+    packages = cache_root() / "frontier_bench" / "oracle-packages"
+    return packages / task.name / task.content_sha256[:12]
+
+
+def oracle_install_environment(task: FrontierTask) -> Dict[str, str]:
+    """What a run that may not fetch puts in front of the oracle's own ``pip install``.
+
+    Empty in every other mode, and for every task whose oracle installs nothing, so the oracle
+    runs exactly as upstream wrote it wherever a download is allowed. Under ``offline`` it is
+    pip's own configuration for "install from these files and consult no index", which is the
+    honest way to keep an unchanged install offline: not a preference the resolver may override,
+    but the absence of anywhere else to look."""
+    if provisioning_mode() != OFFLINE or not oracle_pip_requirements(task):
+        return {}
+    return {"PIP_NO_INDEX": "1", "PIP_FIND_LINKS": ORACLE_PACKAGES_PATH}
+
+
+def prepare_oracle_packages(task_name: Optional[str] = None) -> Optional[Path]:
+    """Fetch the packages this task's oracle installs, as files it can install without an index.
+
+    Returns the directory, or ``None`` for a task whose oracle installs nothing. Needs Docker and
+    the network, which is why it belongs to the preparation stage.
+
+    The download runs *inside* the task's own environment image, so what lands is what that
+    container's Python can install: same platform, same interpreter version, same resolution the
+    oracle would have got from PyPI itself. Idempotent, and cheap when warm (one directory read).
+
+    The mode is read before that warm return, so a supply this machine already holds is not what
+    decides whether an unrecognized value is refused.
+    """
+    provisioning_mode()
+    task = load_task(task_name)
+    requirements = oracle_pip_requirements(task)
+    if not requirements:
+        return None
+    dest = oracle_packages_dir(task.name)
+    if dest.is_dir() and any(dest.iterdir()):
+        return dest
+    dest.parent.mkdir(parents=True, exist_ok=True)
+    container = dk.Container(image=build_task_image(task.name), workdir="/app")
+    container.start()
+    try:
+        quoted = " ".join(shlex.quote(requirement) for requirement in requirements)
+        result = container.exec(
+            f"python3 -m pip download --no-cache-dir --dest {ORACLE_PACKAGES_PATH} {quoted}",
+            user="root",
+        )
+        if not result.ok:
+            raise RuntimeError(
+                f"could not fetch the {task.name} oracle's packages ({', '.join(requirements)}): "
+                f"{result.stderr[-2000:] or result.stdout[-2000:]}"
+            )
+        # Staged and renamed, so a supply is either whole or absent: the gate that requires it
+        # reads a directory's existence, and half a directory would pass that and fail an install.
+        staging = Path(tempfile.mkdtemp(dir=str(dest.parent), prefix=".dl-"))
+        try:
+            if not container.copy_out(ORACLE_PACKAGES_PATH, staging / "packages"):
+                raise RuntimeError(
+                    f"the {task.name} oracle's packages were downloaded but could not be copied "
+                    f"out of {ORACLE_PACKAGES_PATH} in its container"
+                )
+            os.replace(staging / "packages", dest)
+        finally:
+            shutil.rmtree(staging, ignore_errors=True)
+    finally:
+        container.stop()
+    return dest
+
+
+def keeps_verifier_image(keep_container: bool) -> bool:
+    """Whether a finalization leaves the verifier image behind rather than removing it.
+
+    Ordinarily it follows ``keep_container``: the image is rebuilt per scored episode and removed
+    after, which keeps a developer's machine tidy. A run that may not fetch keeps it either way,
+    because removing it would leave the next episode of this task needing a build that the same
+    run has promised not to perform.
+
+    The mode is read before the answer is worked out rather than as the second half of an ``or``,
+    which would let a caller that asked to keep its container skip the refusal an unrecognized
+    value is owed.
+    """
+    mode = provisioning_mode()
+    return keep_container or mode == OFFLINE
 
 
 class _Session:
@@ -156,7 +320,7 @@ class _Session:
             artifacts=self.task.artifacts,
             build_timeout=self.task.build_timeout_sec,
             verifier_timeout=self.task.verifier_timeout_sec,
-            keep_image=self.keep_container,
+            keep_image=keeps_verifier_image(self.keep_container),
         )
 
     def run_oracle(self) -> Dict[str, Any]:
@@ -164,18 +328,37 @@ class _Session:
 
         Not an agent-facing tool — a session helper the Docker-gated sanity gate uses to
         confirm the task's own oracle scores 1 through this port's verifier.
+
+        Under ``SHOGYM_PROVISIONING=offline`` the oracle's own ``pip install`` is handed the
+        packages the preparation stage fetched and told to use no index (see
+        :func:`prepare_oracle_packages`). The script is unchanged: it is the task's bytes, and the
+        container it runs in has a network like upstream's does, so the only honest way to keep an
+        offline run offline is to make the install it performs find what it needs locally. A
+        supply that was never prepared leaves the install with no index and no packages, which
+        fails the oracle rather than fetching behind the mode's back.
         """
         self.container.exec("mkdir -p /solution", user="root")
         for item in sorted(self.task.solution_dir.iterdir()):
             self.container.copy_in(item, f"/solution/{item.name}")
         self.container.exec("chmod +x /solution/solve.sh", user="root")
         r = self.container.exec(
-            "bash /solution/solve.sh",
+            self._oracle_command(),
             workdir="/app",
             user="root",
             timeout=self.task.verifier_timeout_sec,
         )
         return {"ok": r.ok, "exit_code": r.exit_code, "stdout": r.stdout, "stderr": r.stderr}
+
+    def _oracle_command(self) -> str:
+        """``bash solve.sh``, prefixed under ``offline`` with pip's local-supply environment."""
+        environment = oracle_install_environment(self.task)
+        if not environment:
+            return "bash /solution/solve.sh"
+        prepared = oracle_packages_dir(self.task.name)
+        if prepared.is_dir():
+            self.container.copy_in(prepared, ORACLE_PACKAGES_PATH)
+        prefix = "".join(f"{name}={shlex.quote(value)} " for name, value in environment.items())
+        return f"{prefix}bash /solution/solve.sh"
 
     def teardown(self) -> None:
         if not self.keep_container:
@@ -316,8 +499,15 @@ __all__ = [
     "end_session",
     "reset_state",
     "build_task_image",
+    "build_verifier_image",
+    "keeps_verifier_image",
+    "oracle_install_environment",
+    "oracle_packages_dir",
+    "oracle_pip_requirements",
+    "prepare_oracle_packages",
     "EXEC_TOOL_NAME",
     "READ_FILE_TOOL_NAME",
     "WRITE_FILE_TOOL_NAME",
     "DONE_TOOL_NAME",
+    "ORACLE_PACKAGES_PATH",
 ]

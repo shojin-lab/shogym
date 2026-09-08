@@ -9,6 +9,45 @@ direction.
 
 ## Unreleased
 
+### `envs`: provisioning says which stage may download, and a stage that may not says so
+
+`SHOGYM_PROVISIONING` names the stage a run belongs to. `prepare` fetches every SHA pinned
+upstream source, tau2's domain data and the Temporal test server, and builds every frontier_bench
+task image, over the network, on purpose. `offline` fetches nothing: a source that was prepared is
+bound as before, and a source that was not raises `UpstreamNotPrepared` naming the package and the
+directory it was looked for in, instead of downloading it. An unset variable means `local`, which
+is what a developer's machine had all along, fetching on demand.
+
+Binding a prepared source is not the whole of provisioning, because an import can fetch too.
+`offline` also selects the bundled model cost map of the library two of these upstreams import,
+which otherwise downloads one while it initializes and hides the attempt behind a fallback.
+
+Task image builds follow the same rule. A verifier image already under its content addressed tag
+is now used rather than rebuilt, which is what the environment image always did, and under
+`offline` it is kept rather than removed after a finalization, because a run that may not fetch
+cannot rebuild what it throws away. A build that happens anyway in that mode is given no network,
+so its `RUN` steps stop at the first `apt-get` or `pip install` rather than reaching one. The
+packages one vendored oracle installs *inside* its container while it solves are fetched by the
+preparation stage as files instead, and under `offline` that oracle installs from them with no
+index, because putting them in the image would hand the agent a library upstream does not.
+
+New: `shogym.envs.tau2.adapter.ensure_data()` provisions the pinned domain data into the directory
+upstream's own resolver reads, so a prepared machine needs no `TAU2_DATA_DIR`. The two caller
+supplied routes still win wherever they are set.
+
+Removed: `SHOGYM_REQUIRE_UPSTREAM`, which said "this machine has the extras and a network, so
+nothing may skip". A machine that was prepared says that now, and says more: `prepare` is the same
+strictness with a network, and `offline` is the same strictness with the additional requirement
+that everything already be on the machine. A setup that set the old variable wants one of those.
+
+The offline test suite runs under `offline` in CI, after a step that prepares. It used to download
+the pinned tau2 tarball while collecting, build task images while running, and download a Temporal
+test server before its durable tests, so one upstream's bad minute could redden a suite that
+promises to reach nobody. Its tau2 tests used to skip wherever the domain data was absent, which
+on a fresh runner was everywhere; they now run. Two skips remain in every mode, because neither is
+about provisioning: a keyed test still skips without its key, and a Docker gated test still skips
+where no daemon is reachable.
+
 ### `serve`: a seal is asked under one canonicalization version and answered under the same one
 
 The wordle terminal compares the version a seal is asked under against the one it captures under,

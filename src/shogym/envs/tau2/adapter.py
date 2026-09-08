@@ -28,17 +28,22 @@ only thing that touches upstream), and that module calls :func:`ensure_source` b
 provisioning, a one-time network fetch if the cache is cold, is paid only when a tau2 env is
 *constructed* or *served*, never by ``import shogym``.
 
-Note: tau2's **domain data** is a separate concern and is unchanged by the fetch-and-import move.
-Upstream resolves it from ``TAU2_DATA_DIR`` (falling back to a path relative to the installed
-package), so a tau2 env needs a data checkout by one of two routes: ``TAU2_DATA_DIR``, or a
-``TAU2_SRC`` pointing at a *full* clone's ``src/``, whose sibling ``data/`` that fallback finds
-on its own. shogym version-checks neither.
+tau2's **domain data** is the separate half, and :func:`ensure_data` is how it arrives. Upstream
+resolves it from ``TAU2_DATA_DIR``, falling back to ``data`` three directories above its own
+``utils`` module, which for a cached source is ``<cache>/tau2/data``; that is where
+:func:`ensure_data` puts it, so a prepared machine needs no environment variable. It is a separate
+call rather than part of :func:`ensure_source` because it is a separate size: the domains are 139
+MB against the source's few, and a port that only needs to import tau2 should pay for neither the
+domains nor the ~576 MB of upstream results beside them. The two caller-supplied routes still win
+where they are set: ``TAU2_DATA_DIR``, or a ``TAU2_SRC`` pointing at a *full* clone's ``src/``,
+whose sibling ``data/`` that fallback finds on its own. shogym version-checks neither.
 """
 
 from __future__ import annotations
 
 from pathlib import Path
 
+from shogym.envs._upstream import ensure_data as _ensure_data
 from shogym.envs._upstream import ensure_package
 
 # Fidelity pin: the upstream commit this port reproduces.
@@ -58,4 +63,29 @@ def ensure_source() -> Path:
     )
 
 
-__all__ = ["UPSTREAM_SHA", "ensure_source"]
+#: The part of upstream's ``data/`` a tau2 env reads: the five domains, each holding the policy,
+#: the task set and the databases the env is made of, and the guidelines every non-solo domain's
+#: user simulator is built from. Deliberately not ``data/`` whole, whose ``tau2/results/`` is four
+#: times the size of everything here and which no env opens, nor its ``voice/``, which only the
+#: voice modes this port does not serve would read.
+DATA_SUBTREES = ("tau2/domains", "tau2/user_simulator")
+
+
+def ensure_data() -> Path:
+    """Ensure the pinned domain data is on disk where upstream looks for it; return that dir.
+
+    Idempotent, and not called by :func:`ensure_source`: an env is *constructed* from this data,
+    so a machine that has it prepared needs nothing else, and a machine that does not gets the
+    same missing-data error from upstream it always did rather than a surprise 93 MB download in
+    the middle of a construction. The preparation stage calls it; ``offline`` requires what it
+    prepared and says so by name when it is absent."""
+    return _ensure_data(
+        package="tau2",
+        sha=UPSTREAM_SHA,
+        tarball_url=_TARBALL_URL,
+        archive_subdir="data",
+        keep=DATA_SUBTREES,
+    )
+
+
+__all__ = ["DATA_SUBTREES", "UPSTREAM_SHA", "ensure_data", "ensure_source"]

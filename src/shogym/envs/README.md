@@ -99,16 +99,27 @@ The three runtime-provisioned envs add one wrinkle: their test modules must impo
 adapter before they can collect anything, and that import needs the extra and (on a cold cache)
 the network. Those two failures skip the module, and **nothing else does** — upstream drift, a
 gap in a hand-maintained extra, a corrupt cache or a plain `NameError` all fail, because a
-regression that deletes an env's tests while the run stays green is worse than a red one. CI sets
-`SHOGYM_REQUIRE_UPSTREAM=1`, which removes even the environmental skip: that runner has the
-extras and the network, so there is nothing left for it to legitimately skip.
+regression that deletes an env's tests while the run stays green is worse than a red one.
+
+`SHOGYM_PROVISIONING` says which stage a run is, and so who may download. `prepare` fetches every
+pinned source, tau2's domain data, the Temporal test server binary and the packages a vendored
+oracle installs while it runs, and builds every frontier_bench task image, over the network, on
+purpose; `tests/prepare_offline_suite.py` is that stage. `offline` fetches nothing: a prepared
+source is bound, an import that would fetch reads bundled data instead, and anything nobody
+prepared fails by name, whether it is a source, some data, an image or a binary. Nothing skips for
+want of provisioning there, because a machine that was prepared and has the extras has nothing
+left to skip for; a keyed test with no key and a Docker-gated test with no daemon still skip,
+because neither is about provisioning. Unset means `local`, a developer's machine, where sources
+are fetched on demand and an unreachable network still skips with its reason. CI runs the two
+stages in that order, which is what makes its offline step offline rather than merely called
+that.
 
 ## Available environments
 
 | Env | What it is | README |
 |---|---|---|
 | `wordle_v1` | The reference env-as-center environment — Wordle in the smallest honest form (`guess` + reserved `terminate`, a pure trajectory verifier). No extra deps; runs on core shogym. | [`wordle/README.md`](wordle/README.md) |
-| `tau2_mock`, `tau2_airline`, `tau2_retail`, `tau2_telecom`, `tau2_banking_knowledge` | [τ²-bench](https://github.com/sierra-research/tau2-bench) served through shogym at upstream source commit `1d244f5`, with domain data from an unversioned caller-supplied checkout (`TAU2_DATA_DIR`, or upstream's source-relative fallback) — tool-using customer-service agents across domains, scored by tau2's own evaluator. Needs the `tau2` extra + tau2 data. | [`tau2/README.md`](tau2/README.md) |
+| `tau2_mock`, `tau2_airline`, `tau2_retail`, `tau2_telecom`, `tau2_banking_knowledge` | [τ²-bench](https://github.com/sierra-research/tau2-bench) served through shogym at upstream source commit `1d244f5`, with domain data provisioned at the pinned commit by `ensure_data()`, or from a caller-supplied checkout (`TAU2_DATA_DIR`, or upstream's source-relative fallback) — tool-using customer-service agents across domains, scored by tau2's own evaluator. Needs the `tau2` extra + tau2 data. | [`tau2/README.md`](tau2/README.md) |
 | `yc_bench` | [YC-Bench](https://github.com/collinear-ai/yc-bench) served through shogym at upstream commit `e7d6067` — operate a simulated AI startup for one year via a single `run_command` tool, scored on survival, funds, and tasks completed. Needs the `yc_bench` extra (in-process sim, no data or key; a seed reproduces the business attributes, not the `uuid4` row ids). | [`yc_bench/README.md`](yc_bench/README.md) |
 | `hle` | [Humanity's Last Exam](https://huggingface.co/datasets/cais/hle) served through shogym — a single-turn, expert-level question answered via one `submit_answer` tool, graded server-side with HLE's own judge prompt (exact-match fast path, then an OpenAI model judge; shogym's first model-graded verifier). Needs the `hle` extra, `OPENAI_API_KEY`, and gated `cais/hle` access. | [`hle/README.md`](hle/README.md) |
 | `browsecomp_plus` | [BrowseComp-Plus](https://github.com/texttron/BrowseComp-Plus) served through shogym at upstream commit `0469490` for the qrels and the copied evaluation code, with separately pinned Hugging Face revisions for the queries and the BM25 index — answer reasoning-heavy queries against a fixed ~100K-doc corpus via `search` / `get_document` / `submit_answer`, graded by an LLM judge plus deterministic retrieval-recall / citation metrics. Needs the `browsecomp_plus` extra, `OPENAI_API_KEY`, Java 21, and Hugging Face network access (the datasets are public). | [`browsecomp_plus/README.md`](browsecomp_plus/README.md) |

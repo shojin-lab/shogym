@@ -29,7 +29,6 @@ import pytest_asyncio  # noqa: E402
 from temporalio.api.enums.v1 import EventType  # noqa: E402
 from temporalio.client import Client, WorkflowUpdateFailedError  # noqa: E402
 from temporalio.converter import default as default_converter  # noqa: E402
-from temporalio.testing import WorkflowEnvironment  # noqa: E402
 
 from shogym.envs.receipts.env_v1 import ReceiptsV1Env, sibling  # noqa: E402
 from shogym.envs.receipts.generators.ledger import GENERATOR  # noqa: E402
@@ -93,6 +92,8 @@ from shogym.serve.protocol_v2.policy import (  # noqa: E402
     roster_digest,
 )
 from tests._fixtures.receipts_bundle import verified_bundle  # noqa: E402
+from tests._fixtures.temporal_server import time_skipping_environment  # noqa: E402
+from tests._fixtures.upstream_gate import environmental_skip  # noqa: E402
 
 ATTEMPT = "b" * 32
 SILENT = "c" * 32
@@ -135,9 +136,9 @@ def frozen_bundle(tmp_path_factory: pytest.TempPathFactory) -> Path:
 @pytest_asyncio.fixture
 async def env() -> Any:
     try:
-        environment = await WorkflowEnvironment.start_time_skipping()
-    except Exception as error:  # noqa: BLE001 - an absent test server is a skip, not a failure
-        pytest.skip(f"the Temporal test server is unavailable: {error}")
+        environment = await time_skipping_environment()
+    except Exception as error:  # noqa: BLE001 - an unusable server is the machine's, not the test's
+        environmental_skip(f"the Temporal test server is unavailable: {error}")
     async with environment:
         yield environment
 

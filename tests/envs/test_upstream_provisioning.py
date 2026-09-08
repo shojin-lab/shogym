@@ -11,13 +11,21 @@ Two layers, both of which exist because a *silent* wrong answer is the failure m
 - **A live provisioning assertion for every port.** The per-env test modules each gate on their own
   upstream; this one asserts all three at once, so "the fetch-and-import path works" is a claim the
   suite makes in one identifiable place. It uses the same classifier, so an offline laptop still
-  skips while CI (``SHOGYM_REQUIRE_UPSTREAM=1``) cannot.
+  skips while a prepared run (``SHOGYM_PROVISIONING=offline``) cannot.
+
+The unit tests provision a *fake* upstream out of a temp dir, so :func:`_ensure` pins the
+provisioning mode to ``local`` for the length of the call: what they exercise is the machinery,
+under whichever mode the suite around them happens to run. The mode's own rules are asserted
+separately, below, including at the two entry points that read it outside this module: the gate,
+and the preparation of the Temporal test server binary.
 """
 
 from __future__ import annotations
 
+import asyncio
 import errno
 import fcntl
+import json
 import os
 import subprocess
 import sys
@@ -30,7 +38,9 @@ from typing import Iterator, List
 import pytest
 
 from shogym.envs import _upstream
-from tests._fixtures.upstream_gate import REQUIRE_ENV_VAR, _environmental_reason, gate
+from shogym.envs._upstream import LOCAL, OFFLINE, PREPARE, PROVISIONING_ENV_VAR
+from tests._fixtures import temporal_server
+from tests._fixtures.upstream_gate import _environmental_reason, gate
 
 _PORTS = [
     ("tau2", "shogym.envs.tau2.mcp_server", "tau2"),
@@ -75,12 +85,25 @@ def _make_archive(
 
 
 def _ensure(tmp_path: Path, package: str, **kwargs: object) -> Path:
-    """Provision ``package`` into a cache under ``tmp_path``."""
+    """Provision ``package`` into a cache under ``tmp_path``, in ``local`` mode.
+
+    The mode is pinned because these tests are about the machinery, not about who may fetch: the
+    archive is a ``file://`` URL in a temp dir, so "downloading" it costs nothing and reaches
+    nobody, and a suite running under ``offline`` would otherwise refuse it for a reason that has
+    no bearing on what is being asserted."""
+    outer_mode = os.environ.get(PROVISIONING_ENV_VAR)
     os.environ["SHOGYM_CACHE"] = str(tmp_path / "cache")
+    os.environ[PROVISIONING_ENV_VAR] = LOCAL
     try:
         return _upstream.ensure_package(package=package, sha="sha1", **kwargs)  # type: ignore[arg-type]
     finally:
         os.environ.pop("SHOGYM_CACHE", None)
+        # Restored, not cleared: the suite around this may be running under a mode of its own,
+        # and dropping it here would quietly hand every later test the default instead.
+        if outer_mode is None:
+            os.environ.pop(PROVISIONING_ENV_VAR, None)
+        else:
+            os.environ[PROVISIONING_ENV_VAR] = outer_mode
 
 
 # ----- extraction + binding -----
@@ -368,6 +391,294 @@ def test_a_wrong_override_says_so_instead_of_fetching(tmp_path: Path) -> None:
         os.environ.pop("DEMO_WRONG_SRC", None)
 
 
+# ----- the provisioning mode: who may fetch, and what a stage that may not does instead -----
+
+
+def test_an_unset_mode_is_local_and_the_spelling_is_forgiving(monkeypatch) -> None:
+    monkeypatch.delenv(PROVISIONING_ENV_VAR, raising=False)
+    assert _upstream.provisioning_mode() == LOCAL
+    monkeypatch.setenv(PROVISIONING_ENV_VAR, " Offline ")
+    assert _upstream.provisioning_mode() == OFFLINE
+
+
+@pytest.mark.parametrize("value", ["ofline", "1", "true", "no-download"])
+def test_an_unrecognized_mode_is_refused_rather_than_defaulted(monkeypatch, value: str) -> None:
+    """A typo must not read as the default.
+
+    Silently falling back to ``local`` would give a stage that was configured to fetch nothing
+    the fetching behavior it was configured out of, and the only evidence would be a download
+    nobody was watching for."""
+    monkeypatch.setenv(PROVISIONING_ENV_VAR, value)
+    with pytest.raises(RuntimeError, match=PROVISIONING_ENV_VAR):
+        _upstream.provisioning_mode()
+
+
+def test_prepare_mode_provisions_like_the_default(tmp_path: Path, monkeypatch) -> None:
+    """The stage that fetches, fetching. It is the default's behavior under another name, and it
+    exists so the *test gate* can tell a prepared machine from an unprepared one."""
+    url = _make_archive(tmp_path, package="demo_prepare_mode")
+    monkeypatch.setenv("SHOGYM_CACHE", str(tmp_path / "cache"))
+    monkeypatch.setenv(PROVISIONING_ENV_VAR, PREPARE)
+
+    src = _upstream.ensure_package(package="demo_prepare_mode", sha="sha1", tarball_url=url)
+
+    assert (src / "demo_prepare_mode" / "__init__.py").is_file()
+
+
+def test_offline_mode_refuses_to_provision_what_was_not_prepared(
+    tmp_path: Path, monkeypatch
+) -> None:
+    """The refusal is the mode's, not the network's: this tarball is right there and readable.
+
+    That is the whole difference between this and a cache that downloads on a miss. The error
+    names the package, the directory it was looked for in, and both ways out, because "not
+    prepared" is only actionable if it says what was not prepared."""
+    url = _make_archive(tmp_path, package="demo_unprepared")
+    monkeypatch.setenv("SHOGYM_CACHE", str(tmp_path / "cache"))
+    monkeypatch.setenv(PROVISIONING_ENV_VAR, OFFLINE)
+
+    with pytest.raises(_upstream.UpstreamNotPrepared) as raised:
+        _upstream.ensure_package(package="demo_unprepared", sha="sha1", tarball_url=url)
+
+    message = str(raised.value)
+    assert "demo_unprepared" in message
+    assert str(tmp_path / "cache") in message
+    assert f"{PROVISIONING_ENV_VAR}={PREPARE}" in message
+    assert "DEMO_UNPREPARED_SRC" in message
+    assert not (tmp_path / "cache" / "demo_unprepared" / "sha1").exists(), "nothing was fetched"
+
+
+def test_offline_mode_binds_a_source_that_was_prepared(tmp_path: Path, monkeypatch) -> None:
+    """The other half: what preparation bought is used, with an unreachable URL to prove it."""
+    url = _make_archive(tmp_path, package="demo_prepared")
+    _ensure(tmp_path, "demo_prepared", tarball_url=url)  # the preparation stage
+    sys.modules.pop("demo_prepared", None)  # a later process starts with nothing bound
+
+    monkeypatch.setenv("SHOGYM_CACHE", str(tmp_path / "cache"))
+    monkeypatch.setenv(PROVISIONING_ENV_VAR, OFFLINE)
+    src = _upstream.ensure_package(
+        package="demo_prepared", sha="sha1", tarball_url="http://unreachable.invalid/x.tar.gz"
+    )
+
+    assert (src / "demo_prepared" / "__init__.py").is_file()
+    assert sys.modules["demo_prepared"].VALUE == "pinned"  # type: ignore[attr-defined]
+
+
+def test_a_prepared_source_still_refuses_an_unrecognized_mode(tmp_path: Path, monkeypatch) -> None:
+    """The warm path reads the mode too.
+
+    A typo that only mattered on a cold cache would be found by whichever machine happened to
+    need a download and by no other, which is the same as not refusing it: the machines that
+    matter here are the prepared ones, and they take the branch that returns."""
+    url = _make_archive(tmp_path, package="demo_warm_mode")
+    _ensure(tmp_path, "demo_warm_mode", tarball_url=url)
+    sys.modules.pop("demo_warm_mode", None)
+
+    monkeypatch.setenv("SHOGYM_CACHE", str(tmp_path / "cache"))
+    monkeypatch.setenv(PROVISIONING_ENV_VAR, "ofline")
+    with pytest.raises(RuntimeError, match=PROVISIONING_ENV_VAR):
+        _upstream.ensure_package(
+            package="demo_warm_mode", sha="sha1", tarball_url="http://unreachable.invalid/x.tar.gz"
+        )
+
+
+def test_a_prepared_temporal_test_server_still_refuses_an_unrecognized_mode(
+    tmp_path: Path, monkeypatch
+) -> None:
+    """The binary the durable tests run on is prepared like a source, and reads the mode like one.
+
+    Its preparation lives in a test fixture rather than in shogym, but what it obeys is this
+    module's contract, so the assertion is here with the rest of it. The file being present is the
+    warm path, and the first call is what shows that a recognized mode returns it rather than
+    starting a download."""
+    monkeypatch.setenv("SHOGYM_CACHE", str(tmp_path / "cache"))
+    prepared = temporal_server.test_server_path()
+    prepared.parent.mkdir(parents=True, exist_ok=True)
+    prepared.write_bytes(b"")
+
+    monkeypatch.setenv(PROVISIONING_ENV_VAR, OFFLINE)
+    assert asyncio.run(temporal_server.prepare_test_server()) == prepared
+
+    monkeypatch.setenv(PROVISIONING_ENV_VAR, "ofline")
+    with pytest.raises(RuntimeError, match=PROVISIONING_ENV_VAR):
+        asyncio.run(temporal_server.prepare_test_server())
+
+
+def test_binding_under_offline_selects_a_librarys_bundled_data_over_its_download(
+    tmp_path: Path, monkeypatch
+) -> None:
+    """Binding a prepared source is where the *import* happens, and an import can fetch too.
+
+    LiteLLM downloads its model-cost map the moment it is imported unless this variable says to
+    read the copy inside its own wheel, and two of the three ports reach LiteLLM as they import:
+    tau2 through upstream's own package ``__init__``, yc_bench through the upstream module its
+    adapter imports once the source is bound. So the mode sets it here, before the source is
+    registered and either chain starts, and it is set in the environment rather than in a copy so
+    the subprocesses a port launches inherit it."""
+    url = _make_archive(tmp_path, package="demo_import_data")
+    _ensure(tmp_path, "demo_import_data", tarball_url=url)
+    sys.modules.pop("demo_import_data", None)
+
+    monkeypatch.setenv("SHOGYM_CACHE", str(tmp_path / "cache"))
+    monkeypatch.setenv(PROVISIONING_ENV_VAR, OFFLINE)
+    monkeypatch.delenv("LITELLM_LOCAL_MODEL_COST_MAP", raising=False)
+
+    _upstream.ensure_package(package="demo_import_data", sha="sha1", tarball_url=url)
+
+    assert os.environ["LITELLM_LOCAL_MODEL_COST_MAP"] == "true"
+
+
+def test_binding_under_the_other_modes_leaves_that_environment_alone(
+    tmp_path: Path, monkeypatch
+) -> None:
+    """A developer's machine keeps the library's own default, which is what it always had."""
+    url = _make_archive(tmp_path, package="demo_import_data_local")
+    monkeypatch.setenv("SHOGYM_CACHE", str(tmp_path / "cache"))
+    monkeypatch.setenv(PROVISIONING_ENV_VAR, LOCAL)
+    monkeypatch.delenv("LITELLM_LOCAL_MODEL_COST_MAP", raising=False)
+
+    _upstream.ensure_package(package="demo_import_data_local", sha="sha1", tarball_url=url)
+
+    assert "LITELLM_LOCAL_MODEL_COST_MAP" not in os.environ
+
+
+# ----- upstream data: the part that is read rather than imported -----
+
+
+def _make_data_archive(tmp_path: Path, *, present: List[str]) -> str:
+    """Build a GitHub-shaped archive holding ``present`` directories; return its ``file://`` URL."""
+    root = tmp_path / "build" / "demo-repo-sha"
+    for relative in present:
+        directory = root / relative
+        directory.mkdir(parents=True, exist_ok=True)
+        (directory / "tasks.json").write_text('{"pinned": true}\n')
+    archive = tmp_path / "data.tar.gz"
+    with tarfile.open(archive, "w:gz") as tf:
+        tf.add(root, arcname=root.name)
+    return archive.as_uri()
+
+
+def _ensure_data(package: str, url: str, keep: List[str], sha: str = "sha1") -> Path:
+    """Provision ``package``'s data from ``url`` under whatever mode the test has set."""
+    return _upstream.ensure_data(
+        package=package, sha=sha, tarball_url=url, archive_subdir="data", keep=keep
+    )
+
+
+def test_only_the_data_subtrees_a_port_asked_for_are_extracted(tmp_path: Path, monkeypatch) -> None:
+    """tau2's ``data/`` is ~700 MB of which its envs read 139, so the data is a list of subtrees
+    rather than a directory."""
+    url = _make_data_archive(
+        tmp_path, present=["data/domains/mock", "data/results/huge", "docs/manual"]
+    )
+    monkeypatch.setenv("SHOGYM_CACHE", str(tmp_path / "cache"))
+    monkeypatch.setenv(PROVISIONING_ENV_VAR, PREPARE)
+
+    dest = _ensure_data("demo_data", url, ["domains/mock"])
+
+    assert dest == tmp_path / "cache" / "demo_data" / "data"
+    assert (dest / "domains" / "mock" / "tasks.json").is_file()
+    assert not (dest / "results").exists()
+    assert (dest / _upstream.DATA_SHA_FILE).read_text().strip() == "sha1"
+
+
+def test_offline_refuses_data_that_was_not_prepared(tmp_path: Path, monkeypatch) -> None:
+    """Naming what is missing, as a source does, because a skipped env is a deleted env."""
+    url = _make_data_archive(tmp_path, present=["data/domains/mock"])
+    monkeypatch.setenv("SHOGYM_CACHE", str(tmp_path / "cache"))
+    monkeypatch.setenv(PROVISIONING_ENV_VAR, OFFLINE)
+
+    with pytest.raises(_upstream.UpstreamNotPrepared) as raised:
+        _ensure_data("demo_data_absent", url, ["domains/mock"])
+
+    message = str(raised.value)
+    assert "demo_data_absent" in message
+    assert str(tmp_path / "cache" / "demo_data_absent" / "data") in message
+    assert f"{PROVISIONING_ENV_VAR}={PREPARE}" in message
+    assert not (tmp_path / "cache" / "demo_data_absent").exists(), "nothing was fetched"
+
+
+def test_prepared_data_is_used_again_without_fetching(tmp_path: Path, monkeypatch) -> None:
+    """The other half, with an unreachable URL as the proof, as the source path has."""
+    url = _make_data_archive(tmp_path, present=["data/domains/mock"])
+    monkeypatch.setenv("SHOGYM_CACHE", str(tmp_path / "cache"))
+    monkeypatch.setenv(PROVISIONING_ENV_VAR, PREPARE)
+    _ensure_data("demo_data_warm", url, ["domains/mock"])
+
+    monkeypatch.setenv(PROVISIONING_ENV_VAR, OFFLINE)
+    dest = _upstream.ensure_data(
+        package="demo_data_warm",
+        sha="sha1",
+        tarball_url="http://unreachable.invalid/x.tar.gz",
+        archive_subdir="data",
+        keep=["domains/mock"],
+    )
+
+    assert (dest / "domains" / "mock" / "tasks.json").is_file()
+
+
+def test_prepared_data_still_refuses_an_unrecognized_mode(tmp_path: Path, monkeypatch) -> None:
+    """The data path has the warm return a source has, and reads the mode in front of it too."""
+    url = _make_data_archive(tmp_path, present=["data/domains/mock"])
+    monkeypatch.setenv("SHOGYM_CACHE", str(tmp_path / "cache"))
+    monkeypatch.setenv(PROVISIONING_ENV_VAR, PREPARE)
+    _ensure_data("demo_data_mode", url, ["domains/mock"])
+
+    monkeypatch.setenv(PROVISIONING_ENV_VAR, "ofline")
+    with pytest.raises(RuntimeError, match=PROVISIONING_ENV_VAR):
+        _ensure_data("demo_data_mode", "http://unreachable.invalid/x.tar.gz", ["domains/mock"])
+
+
+def test_a_subtree_a_port_added_later_is_fetched_rather_than_assumed(
+    tmp_path: Path, monkeypatch
+) -> None:
+    """The stamp records which pin was extracted, not which parts of it, so the parts are checked
+    as well: a port that starts reading one more directory must not be handed the tree from
+    before it did."""
+    url = _make_data_archive(tmp_path, present=["data/domains/mock", "data/guidelines"])
+    monkeypatch.setenv("SHOGYM_CACHE", str(tmp_path / "cache"))
+    monkeypatch.setenv(PROVISIONING_ENV_VAR, PREPARE)
+    dest = _ensure_data("demo_data_grew", url, ["domains/mock"])
+    assert not (dest / "guidelines").exists()
+
+    dest = _ensure_data("demo_data_grew", url, ["domains/mock", "guidelines"])
+
+    assert (dest / "guidelines" / "tasks.json").is_file()
+    assert (dest / "domains" / "mock" / "tasks.json").is_file()
+
+
+def test_data_provisioned_for_another_pin_is_replaced(tmp_path: Path, monkeypatch) -> None:
+    """Upstream reads its data from a path that carries no SHA, so the stamp is what makes a
+    re-pin an upgrade rather than a silent mixture of two pins."""
+    url = _make_data_archive(tmp_path, present=["data/domains/mock"])
+    monkeypatch.setenv("SHOGYM_CACHE", str(tmp_path / "cache"))
+    monkeypatch.setenv(PROVISIONING_ENV_VAR, PREPARE)
+    dest = _ensure_data("demo_data_repin", url, ["domains/mock"])
+    (dest / "domains" / "stale").mkdir()
+
+    dest = _ensure_data("demo_data_repin", url, ["domains/mock"], sha="sha2")
+
+    assert (dest / _upstream.DATA_SHA_FILE).read_text().strip() == "sha2"
+    assert not (dest / "domains" / "stale").exists(), "the previous pin's tree was replaced"
+
+
+def test_a_data_directory_shogym_did_not_write_is_left_exactly_as_it_is(
+    tmp_path: Path, monkeypatch
+) -> None:
+    """Upstream's resolver would have used it, and an unstamped tree is somebody's own checkout:
+    not shogym's to replace, and not an absence to refuse either."""
+    monkeypatch.setenv("SHOGYM_CACHE", str(tmp_path / "cache"))
+    monkeypatch.setenv(PROVISIONING_ENV_VAR, OFFLINE)
+    theirs = tmp_path / "cache" / "demo_data_theirs" / "data" / "domains"
+    theirs.mkdir(parents=True)
+    (theirs / "tasks.json").write_text("{}\n")
+
+    dest = _ensure_data("demo_data_theirs", "http://unreachable.invalid/x.tar.gz", ["domains"])
+
+    assert (dest / "domains" / "tasks.json").is_file()
+    assert not (dest / _upstream.DATA_SHA_FILE).exists()
+
+
 # ----- the gate's classifier: what may skip, and what may not -----
 
 
@@ -405,13 +716,16 @@ def test_regressions_may_not_skip(exc: BaseException) -> None:
     assert _environmental_reason(exc, package="tau2", extra="tau2") is None
 
 
-def test_gate_skips_an_environmental_failure_but_not_under_require(tmp_path: Path, monkeypatch) -> None:
-    """The one case the classifier cannot separate on its own, and why CI sets the env var.
+@pytest.mark.parametrize("prepared_mode", [PREPARE, OFFLINE])
+def test_gate_skips_an_environmental_failure_but_not_on_a_prepared_machine(
+    tmp_path: Path, monkeypatch, prepared_mode: str
+) -> None:
+    """The one case the classifier cannot separate on its own, and why the mode exists.
 
     A dependency genuinely missing from a hand-copied extra list and a developer who simply never
     installed the extra raise the *same* ``ModuleNotFoundError``; nothing in the process can tell
-    them apart. ``SHOGYM_REQUIRE_UPSTREAM`` is what resolves it, by asserting from outside that
-    this machine has the extras — so on CI the first case fails instead of skipping."""
+    them apart. The provisioning mode is what resolves it, by asserting from outside that this
+    machine was prepared, so on a prepared runner the first case fails instead of skipping."""
     module_dir = tmp_path / "gatee"
     module_dir.mkdir()
     (module_dir / "demo_gate_env.py").write_text(
@@ -419,16 +733,28 @@ def test_gate_skips_an_environmental_failure_but_not_under_require(tmp_path: Pat
     )
     monkeypatch.syspath_prepend(str(module_dir))
 
-    monkeypatch.delenv(REQUIRE_ENV_VAR, raising=False)
+    monkeypatch.delenv(PROVISIONING_ENV_VAR, raising=False)
     # `pytest.skip` raises `Skipped`, a BaseException — catching it here is what proves the gate
     # skipped rather than propagating, without skipping this test too.
     with pytest.raises(pytest.skip.Exception, match="extra not installed"):
         gate("demo_gate_env", package="demo_gate", extra="demo_gate")
 
     sys.modules.pop("demo_gate_env", None)
-    monkeypatch.setenv(REQUIRE_ENV_VAR, "1")
+    monkeypatch.setenv(PROVISIONING_ENV_VAR, prepared_mode)
     with pytest.raises(ModuleNotFoundError):
         gate("demo_gate_env", package="demo_gate", extra="demo_gate")
+
+
+def test_the_gate_refuses_an_unrecognized_mode_before_an_import_that_would_have_worked(
+    monkeypatch,
+) -> None:
+    """The gate reads the mode in front of the import, not only when one fails.
+
+    ``json`` is importable on every machine, so a refusal here can only have come from the read
+    ahead of it, which is what makes the typo a machine with everything prepared finds too."""
+    monkeypatch.setenv(PROVISIONING_ENV_VAR, "ofline")
+    with pytest.raises(RuntimeError, match=PROVISIONING_ENV_VAR):
+        gate("json", package="json", extra="json")
 
 
 def test_a_wrapped_cause_is_still_recognized() -> None:
@@ -445,7 +771,8 @@ def test_a_wrapped_cause_is_still_recognized() -> None:
 def test_each_port_provisions_and_binds_its_pinned_upstream(
     package: str, module: str, extra: str
 ) -> None:
-    """Skips only on a recognized environmental failure; `SHOGYM_REQUIRE_UPSTREAM` removes even that."""
+    """Skips only on a recognized environmental failure, and only in `local` mode; a prepared
+    machine (`prepare` or `offline`) has nothing left to skip for, so there it fails instead."""
     gate(module, package=package, extra=extra)
 
     bound = sys.modules[package]
@@ -461,3 +788,72 @@ def test_each_port_provisions_and_binds_its_pinned_upstream(
     # the cache dir holds the package and nothing else, which is what makes it safe to hand to a
     # subprocess on PYTHONPATH
     assert [p.name for p in source.parent.iterdir()] == [package]
+
+
+#: Imports one module with every outbound connection recorded *and* refused, then prints what was
+#: attempted. Recording is the point: LiteLLM catches the failure and falls back to its bundled
+#: copy, so a blocked request leaves no trace in the result and a run that only checked for an
+#: exception would call a fetching import offline.
+_IMPORT_PROBE = '''
+import json
+import socket
+import sys
+
+attempts = []
+
+
+def refuse(address, *args, **kwargs):
+    attempts.append(str(address))
+    raise OSError("this probe permits no outbound connection")
+
+
+def refuse_method(self, address, *args, **kwargs):
+    return refuse(address)
+
+
+def refuse_lookup(host, port=None, *args, **kwargs):
+    attempts.append(f"{host}:{port}")
+    raise socket.gaierror(8, "this probe permits no name resolution")
+
+
+socket.create_connection = refuse
+socket.socket.connect = refuse_method
+socket.socket.connect_ex = refuse_method
+socket.getaddrinfo = refuse_lookup
+
+__import__(sys.argv[1])
+print("PROBE " + json.dumps(attempts))
+'''
+
+
+@pytest.mark.parametrize("package,module,extra", _PORTS, ids=[p[0] for p in _PORTS])
+def test_importing_a_prepared_upstream_under_offline_asks_for_no_connection(
+    package: str, module: str, extra: str, tmp_path: Path
+) -> None:
+    """Binding a prepared source is only half of provisioning; the other half is the import.
+
+    Two of these upstreams import LiteLLM, which fetches a model-cost map from a file server as
+    its package initializes unless it is told to read the copy in its own wheel. Nothing about the
+    result says so, because it falls back to that copy when the fetch fails, so the only way to
+    assert "this import reached nobody" is to watch the socket. A fresh process, because the
+    variable that settles it is read once, when LiteLLM is first imported."""
+    gate(module, package=package, extra=extra)  # prepared here, or skipped as the mode allows
+    script = tmp_path / "probe.py"
+    script.write_text(_IMPORT_PROBE)
+    environment = {**os.environ, PROVISIONING_ENV_VAR: OFFLINE}
+    # Removed rather than left: the child has to be the one that selects the bundled copy, and an
+    # inherited variable would let a broken production path pass on the parent's doing.
+    environment.pop("LITELLM_LOCAL_MODEL_COST_MAP", None)
+
+    result = subprocess.run(
+        [sys.executable, str(script), module],
+        capture_output=True,
+        text=True,
+        timeout=300,
+        env=environment,
+    )
+
+    assert result.returncode == 0, result.stderr[-3000:]
+    reported = [line for line in result.stdout.splitlines() if line.startswith("PROBE ")]
+    assert len(reported) == 1, result.stdout[-3000:]
+    assert json.loads(reported[0][len("PROBE ") :]) == [], "the import reached for the network"

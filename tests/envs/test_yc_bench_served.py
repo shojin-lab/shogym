@@ -6,7 +6,8 @@ the reason), so the offline core suite stays green. YC-Bench generates its world
 and runs its sim in process, so once the source is cached the path (seed → CLI commands →
 sealed finalize → verdict) makes no model call and needs no API key. It is not strictly
 network-free: importing the adapter pulls in litellm, which reaches for a model-cost map unless
-``LITELLM_LOCAL_MODEL_COST_MAP=true``. Row ids are ``uuid4`` and differ per run, so what is
+``LITELLM_LOCAL_MODEL_COST_MAP=true``, which the ``offline`` provisioning mode sets before it
+binds the source. Row ids are ``uuid4`` and differ per run, so what is
 reproducible is the seeded business state and the final funds, not the identifiers.
 """
 

@@ -28,7 +28,7 @@ import json
 import pytest
 from pydantic import ValidationError
 
-from tests._fixtures.upstream_gate import gate
+from tests._fixtures.upstream_gate import environmental_skip, gate
 
 adapter = gate(
     "shogym.envs.automationbench.adapter",
@@ -397,7 +397,10 @@ def test_score_state_accepts_a_dump_for_compatibility() -> None:
 
 @pytest.fixture(scope="module")
 def public_tasks() -> list[dict]:
-    pytest.importorskip("datasets", reason="the automationbench extra is not installed")
+    try:
+        import datasets  # noqa: F401
+    except ImportError:
+        environmental_skip("the automationbench extra (datasets) is not installed")
     return [_normalize_row(row) for row in adapter.load_domain_tasks("public")]
 
 
