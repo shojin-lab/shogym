@@ -1309,10 +1309,17 @@ async def test_a_graded_horizon_whose_seal_ended_the_attempt_leaves_the_transpor
         env.client, activities=with_grader(list(environment.activities), grader)
     ):
         try:
-            start = make_start(
-                bodies=("guess the first word", "and the second"),
-                terminal="terminate",
-                argument_names=(),
+            # Declared under the version this environment captures under, because the Worker
+            # above registers that environment's own Activities and a port refuses a seal asked
+            # under any other. A generation composed the ordinary way takes its version from the
+            # environment it asks how attempts end, so this is that composition written out.
+            start = replace(
+                make_start(
+                    bodies=("guess the first word", "and the second"),
+                    terminal="terminate",
+                    argument_names=(),
+                ),
+                canonicalization_version=environment.canonicalization_version,
             )
             stream = await start_stream(
                 env.client,

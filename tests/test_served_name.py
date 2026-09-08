@@ -811,12 +811,9 @@ class Filing:
     does not declare it.
 
     That pairing is what production makes rather than the only pairing the code can be made to
-    hold. A seal through the shared grading port refuses a request whose version is not the one
-    the environment captures under, and so does the receipts port, so ``automationbench``,
-    ``yc_bench`` and ``receipts`` reject a mismatched pairing at the seal. The wordle port does
-    not compare the request's version at all, so a caller that handed the gateway a doctored
-    descriptor over a wordle episode would be answered rather than refused. Nothing here does
-    that, and the pairing each row makes is the environment's own.
+    hold. Every port refuses a request whose version is not the one the environment captures
+    under, which is checked port by port in ``tests/test_seal_versions.py`` and not here.
+    Nothing here doctors a pairing, and the pairing each row makes is the environment's own.
 
     ``port`` is the module that declares the version, which is the module whose constant has to
     be put back to reconstruct what a build from before the cut was answered with.
@@ -938,7 +935,7 @@ async def test_no_platform_name_reaches_the_model_in_a_real_acknowledgement(
     declares and the one the acknowledgement carries. The stand-in's version is what an
     environment that brings no terminal of its own is served under, which is why the row for it
     is such an environment. Whether a doctored pairing would be refused is a different question
-    and this does not ask it; the table above says which ports compare the version at the seal.
+    and this does not ask it; every port refuses one, which is checked where the ports are.
     ``automationbench`` and ``yc_bench`` are provisioned from upstream at runtime, so their cases
     skip on a machine that has neither the source nor the network to fetch it; the other three
     need nothing fetched.

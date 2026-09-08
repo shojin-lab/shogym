@@ -9,6 +9,35 @@ direction.
 
 ## Unreleased
 
+### `serve`: a seal is asked under one canonicalization version and answered under the same one
+
+The wordle terminal compares the version a seal is asked under against the one it captures under,
+and refuses any other with `CanonicalizationMismatch`, which is not retried. It did not compare
+before, so a generation opened with a descriptor naming another version was sealed and acknowledged
+under that version while the canonical submission text inside the same seal was written under
+`wordle.1`: a reader of the acknowledgement and a reader of the text got two different answers about
+how one submission was captured. The receipts terminal and the shared grading terminal behind
+AutomationBench and YC-Bench already refused this, so what changes is that every environment here
+answers a doctored pairing the same way.
+
+The stream checks the answer as well as the question. A seal result whose canonicalization version
+is not the one the generation declared ends the attempt as a seal that could not be used, with the
+reason recorded, and nothing is graded and nothing is acknowledged.
+
+That check is behind a compatibility marker, and the boundary it draws is the seal rather than the
+generation. A seal answered from here on takes it in a generation started now, and in an open
+generation whose history holds no unmarked mismatch; the marker is looked up once per execution,
+so an execution that replays an earlier unmarked mismatch keeps the legacy path for its later
+seals until it continues as new, which starts fresh marker state and carries its outcomes
+forward. A seal a history already recorded keeps the decision that history recorded, mismatch
+and all, so a stream open across the upgrade replays to the grade and
+the acknowledgement it served rather than failing to replay at all. An ordinary generation writes
+no marker, because it is read only where the two versions differ.
+
+Nothing an ordinary generation does changes. The gateway takes the version from the environment it
+asks how attempts end, so a generation over a wordle episode declares `wordle.1` and its seals are
+answered as they were.
+
 ### `serve`: three strings a model reads lose the platform, and every configuration hash moves
 
 The canonicalization version each environment declares is now its own name and the version number
