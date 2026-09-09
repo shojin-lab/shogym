@@ -635,7 +635,16 @@ async def _cancel_cleanup_before_begin(_tmp: Path) -> None:
 
 async def _normal_close_while_dispatching_legacy(_tmp: Path) -> None:
     """A non-seal close that cannot wait tombstones the call it gave up on, so that call commits
-    no step and runs no `verify` against an env that is already gone."""
+    no step and runs no `verify` against an env that is already gone.
+
+    The close runs beside the blocked tool rather than in front of it. What is under test is what
+    the close does when the call outruns its teardown budget, and it does that within the budget:
+    it gives up on the call and, for a non-seal env, ends the episode against it. So the tool is
+    held until that state is observed, which is the state this cell is named for, and only then
+    released. Awaited before the release instead, the close sat on the session's disposal until
+    the tool's own thirty second fail-safe let go, and thirty seconds of a fixture waiting for
+    itself was the whole measured cost of this cell.
+    """
     score_mcp.reset_block()
     ep = await ServedEpisode.start(score_env.ENV_NAME, task=0)
     ep._seal_enabled = False
@@ -644,8 +653,15 @@ async def _normal_close_while_dispatching_legacy(_tmp: Path) -> None:
     try:
         running = asyncio.ensure_future(ep.call("block", {}))
         await asyncio.sleep(0.1)
-        await ep.close()
+        closing = asyncio.ensure_future(ep.close())
+        # Still inside the tool, and already given up on: the budget is 0.05s and the fail-safe
+        # that would end the block on its own is thirty seconds away. A bound rather than a wait,
+        # so a close that never reaches that state fails here instead of hanging.
+        assert await _awaited(lambda: ep.terminated), (
+            "the close never gave up on the call it could not wait for"
+        )
         score_mcp.released.set()
+        await closing
         late = await running
         assert late.tombstoned is True, "the call the close gave up on committed anyway"
         assert [e.tool for e in ep._trajectory] == []

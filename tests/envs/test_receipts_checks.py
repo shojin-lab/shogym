@@ -398,8 +398,9 @@ def test_the_registered_bars_fill_a_bank() -> None:
     from shogym.envs.receipts import bank as bank_mod
 
     registered = admission.Thresholds()
-    built = bank_mod.materialize(GENERATOR, MASTER, 4)
-    found = bank_mod.population(built, GENERATOR)
+    # The fill hands back the population it had to compute to prove the bank could be filled,
+    # rather than a second walk of the same ordinals under the same rule.
+    built, found = bank_mod.materialized(GENERATOR, MASTER, 4)
     assert built.size == 4
     assert len(found.instances) == 4
     assert found.considered >= 4
@@ -460,11 +461,13 @@ def test_a_bank_is_filled_under_the_registered_bars_or_not_at_all() -> None:
     assert loose.settled and not loose.registered
     # And a moved H bar is not settled either: H is part of what the gate name means.
     assert not admission.Thresholds(min_headroom=0.0).settled
-    built = bank_mod.materialize(GENERATOR, MASTER, 1)
+    # The fill's own population is the one taken under no stated bars, which is the left side of
+    # the comparison below; asking for it again would be the same walk under the same rule.
+    built, default_bars = bank_mod.materialized(GENERATOR, MASTER, 1)
     with pytest.raises(ValueError, match="only the registered bars may fill a bank"):
         bank_mod.population(built, GENERATOR, loose)
     # The population is a function of the registered rule, not of a caller's bars.
-    assert bank_mod.population(built, GENERATOR).ordinals == bank_mod.population(
+    assert default_bars.ordinals == bank_mod.population(
         built, GENERATOR, admission.Thresholds()
     ).ordinals
 

@@ -10,6 +10,7 @@ rather than reading anything off it.
 
 from __future__ import annotations
 
+import functools
 from pathlib import Path
 
 import pytest
@@ -17,6 +18,7 @@ import pytest
 from shogym.cli import main
 from shogym.envs.receipts import admission as admission_mod
 from shogym.envs.receipts.registry import BANK_DIR_VAR
+from tests._fixtures.receipts_bundle import private_bundle, screen_artifact
 
 #: The registered parameters, supplied explicitly because there is no default to fall
 #: back on. These are test values and nothing here claims they are the registration.
@@ -38,6 +40,63 @@ def _banks(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Path:
     """Every test gets its own bank directory, controller-side and disposable."""
     monkeypatch.setenv(BANK_DIR_VAR, str(tmp_path / "banks"))
     return tmp_path
+
+
+#: The instances each bank this module has walked holds. A population is a function of the bank
+#: and the running code and is recomputed rather than stored, so one bank walked twice in one
+#: process is one answer twice. Every command below still recomputes its own; this is only for
+#: the helper that builds a command's input.
+_POPULATIONS: dict = {}
+
+
+def _held(bank):
+    """The instances a bank holds, walked once per bank."""
+    from shogym.envs.receipts import bank as bank_mod
+    from shogym.envs.receipts.registry import load_generator
+
+    known = _POPULATIONS.get(bank)
+    if known is None:
+        known = bank_mod.population(bank, load_generator("ledger"))
+        _POPULATIONS[bank] = known
+    return known
+
+
+@functools.lru_cache(maxsize=4)
+def _filled(size: int):
+    """One real bank of this size, filled once for the whole module, with its population.
+
+    Filling a bank walks admission over every ordinal it considers, which is what every command
+    below is measured in. A test whose subject is `gate`, `check` or `draw` needs a frozen bank
+    to run against and does not need a freshly filled one, so the fill happens once here and
+    :func:`_frozen_bank` writes the same frozen input into each test's own directory.
+
+    The real materialize command is what five of the tests below are about, and they still run
+    it: its report, its refusal to overwrite, its forced replacement, its refusal of a gate
+    vector, and the whole materialize/bundle/verify/list chain.
+    """
+    from shogym.envs.receipts import bank as bank_mod
+    from shogym.envs.receipts import streams
+    from shogym.envs.receipts.registry import load_generator
+
+    bank, held = bank_mod.materialized(
+        load_generator("ledger"), streams.new_master_key(), size
+    )
+    _POPULATIONS[bank] = held
+    return bank, held
+
+
+def _frozen_bank(size: int) -> None:
+    """Freeze that bank where this test's commands will look for it.
+
+    The same file the materialize command writes, written the same way: a bank is five fields
+    and every command below recomputes everything else from them.
+    """
+    from shogym.envs.receipts import bank as bank_mod
+    from shogym.envs.receipts.registry import bank_path
+
+    path = bank_path("ledger")
+    path.parent.mkdir(parents=True, exist_ok=True)
+    bank_mod.save_bank(_filled(size)[0], path)
 
 
 def test_list_says_when_nothing_is_materialized(capsys: pytest.CaptureFixture[str]) -> None:
@@ -81,8 +140,7 @@ def test_a_bank_alone_is_not_dealable(capsys: pytest.CaptureFixture[str]) -> Non
 
 
 def test_a_gated_bank_holds_only_passers(capsys: pytest.CaptureFixture[str]) -> None:
-    assert _run(["receipts", "materialize", "ledger", "--size", "3", *BARS]) == 0
-    capsys.readouterr()
+    _frozen_bank(3)
     assert _run(["receipts", "gate", "ledger", "--instances", "3"]) == 0
     assert "0 of 3 instances rejected" in capsys.readouterr().out
 
@@ -106,8 +164,7 @@ def test_gate_admits_the_merging_vector(capsys: pytest.CaptureFixture[str]) -> N
 
 
 def test_check_reports_every_named_check(capsys: pytest.CaptureFixture[str]) -> None:
-    assert _run(["receipts", "materialize", "ledger", "--size", "1", *BARS]) == 0
-    capsys.readouterr()
+    _frozen_bank(1)
     assert _run(["receipts", "check", "ledger", "--instances", "1", *BARS]) == 0
     out = capsys.readouterr().out
     for name in ("exercise", "materiality", "copy", "fixation", "envelope", "graded",
@@ -221,8 +278,7 @@ def test_a_gate_vector_needs_no_bank() -> None:
 def test_check_exits_nonzero_when_a_threshold_bites(
     capsys: pytest.CaptureFixture[str],
 ) -> None:
-    assert _run(["receipts", "materialize", "ledger", "--size", "1", *BARS]) == 0
-    capsys.readouterr()
+    _frozen_bank(1)
     assert _run(
         ["receipts", "check", "ledger", "--instances", "1",
          "--max-copy-score", "0.0", "--max-flip-score", "0.95", "--min-leverage", "0.05"]
@@ -250,8 +306,7 @@ def test_draw_needs_a_bank_before_it_will_render(
 def test_draw_prints_both_siblings_and_all_three_cells(
     capsys: pytest.CaptureFixture[str],
 ) -> None:
-    assert _run(["receipts", "materialize", "ledger", "--size", "2", *BARS]) == 0
-    capsys.readouterr()
+    _frozen_bank(2)
     assert _run(["receipts", "draw", "ledger"]) == 0
     out = capsys.readouterr().out
     assert "TASK A" in out and "TASK B" in out
@@ -266,14 +321,13 @@ def test_draw_prints_both_siblings_and_all_three_cells(
 def test_draw_refuses_an_ordinal_the_bank_does_not_hold(
     capsys: pytest.CaptureFixture[str],
 ) -> None:
-    assert _run(["receipts", "materialize", "ledger", "--size", "2", *BARS]) == 0
-    capsys.readouterr()
+    _frozen_bank(2)
     assert _run(["receipts", "draw", "ledger", "--instance", "99"]) == 1
     assert "is not in this bank" in capsys.readouterr().out
 
 
 def test_draw_takes_no_seed() -> None:
-    assert _run(["receipts", "materialize", "ledger", "--size", "1", *BARS]) == 0
+    _frozen_bank(1)
     with pytest.raises(SystemExit):
         main(["receipts", "draw", "ledger", "--seed", "4"])
 
@@ -281,8 +335,7 @@ def test_draw_takes_no_seed() -> None:
 def test_draw_renders_every_registered_filing_shape(
     capsys: pytest.CaptureFixture[str],
 ) -> None:
-    assert _run(["receipts", "materialize", "ledger", "--size", "1", *BARS]) == 0
-    capsys.readouterr()
+    _frozen_bank(1)
     for shape, expected in (
         ("canonical", "component score 1.000000"),
         ("empty", "no filing (empty)"),
@@ -293,8 +346,7 @@ def test_draw_renders_every_registered_filing_shape(
 
 
 def test_tasks_only_stops_before_the_cells(capsys: pytest.CaptureFixture[str]) -> None:
-    assert _run(["receipts", "materialize", "ledger", "--size", "1", *BARS]) == 0
-    capsys.readouterr()
+    _frozen_bank(1)
     assert _run(["receipts", "draw", "ledger", "--tasks-only"]) == 0
     out = capsys.readouterr().out
     assert "TASK B" in out
@@ -315,7 +367,7 @@ def _artifacts(room: Path) -> tuple[Path, Path]:
 
     generator = load_generator("ledger")
     bank = bank_mod.load_bank(bank_path("ledger"))
-    held = bank_mod.population(bank, generator)
+    held = _held(bank)
     screen = room / "screen.json"
     screen.write_text(json.dumps({
         "family": generator.name,
@@ -355,10 +407,18 @@ def _artifacts(room: Path) -> tuple[Path, Path]:
 def test_screen_scores_the_artifact_it_is_given(
     tmp_path: Path, capsys: pytest.CaptureFixture[str]
 ) -> None:
-    assert _run(["receipts", "materialize", "ledger", "--size", "1"]) == 0
-    capsys.readouterr()
-    screen, _ = _artifacts(tmp_path)
-    assert _run(["receipts", "screen", "ledger", "--outcomes", str(screen)]) == 0
+    """The command reads the artifact it is given, and the artifact is the whole input.
+
+    `screen` opens no bank: the rows, the model, the seeds and the bars are all in the file, and
+    that is the design, because a screen scored under bars supplied elsewhere is a screen whose
+    verdict depends on who reran it. So the rows here are the suite's own forty-pair artifact
+    rather than a bank materialized and a review pack built to obtain one file.
+    """
+    import json
+
+    artifact = tmp_path / "screen.json"
+    artifact.write_text(json.dumps(screen_artifact()), encoding="utf-8")
+    assert _run(["receipts", "screen", "ledger", "--outcomes", str(artifact)]) == 0
     out = capsys.readouterr().out
     assert "VERDICT                ADMITTED" in out
     assert "model a scripted policy, 40 task seeds" in out
@@ -395,20 +455,21 @@ def test_bundle_then_verify_then_list(
 
 
 def test_verify_refuses_a_bundle_whose_file_was_edited(
-    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+    capsys: pytest.CaptureFixture[str],
 ) -> None:
+    """An honest bundle, cloned into this genre's directory and then edited.
+
+    What is under test is the recomputation `verify` makes, so the bundle it is given is frozen
+    input: a private copy of one built once for this process. Building it again here would pay
+    for a bank, a review pack and a build to reach the one line that matters, and the copy is
+    the same bytes under the same address.
+    """
     import json
 
     from shogym.envs.receipts import bundle as bundle_mod
-    from shogym.envs.receipts.registry import bundles
+    from shogym.envs.receipts.registry import bundle_dir, bundles
 
-    assert _run(["receipts", "materialize", "ledger", "--size", "1"]) == 0
-    capsys.readouterr()
-    screen, pack = _artifacts(tmp_path)
-    assert _run([
-        "receipts", "bundle", "ledger", "--screen", str(screen), "--review", str(pack)
-    ]) == 0
-    capsys.readouterr()
+    private_bundle(bundle_dir("ledger"))
     root = bundles("ledger")[0]
     stored = json.loads((root / bundle_mod.BANK).read_text(encoding="utf-8"))
     (root / bundle_mod.BANK).write_text(
@@ -432,8 +493,7 @@ def test_a_bundle_that_does_not_verify_is_not_left_behind(
 
     from shogym.envs.receipts.registry import bundles
 
-    assert _run(["receipts", "materialize", "ledger", "--size", "1"]) == 0
-    capsys.readouterr()
+    _frozen_bank(1)
     screen, pack = _artifacts(tmp_path)
     stored = json.loads(pack.read_text(encoding="utf-8"))
     kept = [e for e in stored["renders"] if e["category"] != "option"]
@@ -446,20 +506,19 @@ def test_a_bundle_that_does_not_verify_is_not_left_behind(
 
 
 def test_the_roster_prints_no_claim_from_an_unverified_bank(
-    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+    capsys: pytest.CaptureFixture[str],
 ) -> None:
     """A stale development bank beside a verified bundle would give an operator two
-    descriptions of what looks like one family, with nothing saying which was checked."""
-    from shogym.envs.receipts import bank as bank_mod
-    from shogym.envs.receipts.registry import bank_path
+    descriptions of what looks like one family, with nothing saying which was checked.
 
-    assert _run(["receipts", "materialize", "ledger", "--size", "1"]) == 0
-    capsys.readouterr()
-    screen, pack = _artifacts(tmp_path)
-    assert _run([
-        "receipts", "bundle", "ledger", "--screen", str(screen), "--review", str(pack)
-    ]) == 0
-    capsys.readouterr()
+    The verified bundle is a private copy of the one built once for this process, because what
+    the roster is being held to is what it prints over a bundle it verified and a bank it did
+    not, and building the bundle here again would say nothing more about that.
+    """
+    from shogym.envs.receipts import bank as bank_mod
+    from shogym.envs.receipts.registry import bank_path, bundle_dir
+
+    private_bundle(bundle_dir("ledger"))
     bank_mod.save_bank(
         bank_mod.Bank(generator="ledger", genre="invented-genre",
                       renderer="invented-renderer", master=bytes(range(32)), size=999),

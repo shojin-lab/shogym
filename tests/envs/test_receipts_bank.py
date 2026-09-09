@@ -20,14 +20,22 @@ MASTER = bytes(range(32, 64))
 
 
 @functools.lru_cache(maxsize=2)
+def _filled(size: int = 2) -> tuple[bank_mod.Bank, bank_mod.Population]:
+    """One materialized bank and the population filling it computed, cached.
+
+    Filling reruns admission per ordinal, and it has to recompute the population to prove the
+    bank can be filled at all, so the walk that answers the second question is the walk that
+    answered the first. Asking for the population separately paid for it twice.
+    """
+    return bank_mod.materialized(GENERATOR, MASTER, size)
+
+
 def _bank(size: int = 2) -> bank_mod.Bank:
-    """One materialized bank, cached: filling one reruns admission per ordinal."""
-    return bank_mod.materialize(GENERATOR, MASTER, size)
+    return _filled(size)[0]
 
 
-@functools.lru_cache(maxsize=2)
 def _population(size: int = 2) -> bank_mod.Population:
-    return bank_mod.population(_bank(size), GENERATOR)
+    return _filled(size)[1]
 
 
 def test_a_bank_holds_the_instances_admission_admits_in_order() -> None:

@@ -109,7 +109,7 @@ from shogym.serve.protocol_v2.rundir import (  # noqa: E402
 )
 from shogym.serve.server import SERVED_NAME, TASK_RESOURCE, build_server  # noqa: E402
 
-from tests._fixtures.receipts_bundle import verified_bundle  # noqa: E402
+from tests._fixtures.receipts_bundle import private_bundle  # noqa: E402
 from tests._fixtures.upstream_gate import gate  # noqa: E402
 
 # The env most tests here serve over. It needs no extra, no key and no download, so the sweep
@@ -369,9 +369,9 @@ async def test_no_platform_name_reaches_the_model_from_the_receipts_environment(
     An environment brings its own instructions, its own terminal and its own tool descriptions
     into the served surface, so the audit has to be over more than one of them: a name written
     into an environment reaches the model as surely as one written into the gateway. What is
-    swept is the environment as it is served, over a bundle built here rather than a stub.
+    swept is the environment as it is served, over a real admitted bundle rather than a stub.
     """
-    bundle = verified_bundle(tmp_path_factory.mktemp("bundles"), size=1)
+    bundle = private_bundle(tmp_path_factory.mktemp("bundles"), size=1)
     surface = await gateway_surface(env_name="receipts_v1", env_config={"bundle": str(bundle)})
     assert [tool["name"] for tool in surface["tools"]] == [PULL_TOOL, "info", "submit_filing"]
     assert offences("receipts", surface) == []
@@ -843,7 +843,7 @@ FILINGS: Tuple[Filing, ...] = (
 def offline_config(env_name: str, room: Path) -> Optional[Dict[str, Any]]:
     """What each environment above needs to be served with nothing fetched."""
     if env_name == "receipts_v1":
-        return {"bundle": str(verified_bundle(room, size=1))}
+        return {"bundle": str(private_bundle(room, size=1))}
     if env_name == cell.ENV:
         return {"tasks": [OFFLINE_TASK], "max_steps": 50}
     if env_name == "browsecomp_plus":
