@@ -15,16 +15,30 @@ almost nothing.
 
     uv run python tests/prepare_offline_suite.py
 
+That prepares everything, which is what a developer wants and what one job running the whole
+suite wanted. CI runs the suite in four jobs now (see :mod:`tests.ci_shards`), and most of them
+need almost none of this: the receipt shards bind no upstream, read no domain data and start no
+test server, and only one shard runs a task container. So the groups are selectable, and each job
+asks for the ones its own modules need:
+
+    uv run python tests/prepare_offline_suite.py --assets sources,tau2-data
+
+An empty ``--assets`` is a shard that needs nothing, and it prepares nothing rather than
+everything. Group order on the command line does not matter: they are prepared in the order below,
+so a source is always in place before the data that goes beside it.
+
 Docker is optional. A machine with no daemon skips the images and the oracle packages, which is
 the same machine on which every test that would need one is skipped, so the two agree.
 """
 
 from __future__ import annotations
 
+import argparse
 import asyncio
 import importlib
 import sys
 from pathlib import Path
+from typing import Callable, Dict, Optional, Sequence, Tuple
 
 # This script is run by path, so the repository root is not on `sys.path` the way pytest puts it
 # there. The preparation of the Temporal test server is shared with the fixture that requires it,
@@ -36,6 +50,7 @@ from shogym.envs.frontier_bench import docker_backend as dk  # noqa: E402
 from shogym.envs.frontier_bench import manifest, mcp_server  # noqa: E402
 from shogym.envs.tau2 import adapter as tau2_adapter  # noqa: E402
 from tests._fixtures.temporal_server import prepare_test_server  # noqa: E402
+from tests.ci_shards import DURABLE_SERVICE, SOURCES, TASK_IMAGES, TAU2_DATA  # noqa: E402
 
 #: The adapter module of each env whose upstream source is provisioned at runtime. Importing it
 #: and calling its ``ensure_source`` is what the gated test modules do on their first import, so
@@ -94,7 +109,40 @@ def prepare_images() -> None:
             print(f"prepared oracle packages: {name} -> {packages}", flush=True)
 
 
-def main() -> int:
+#: What each asset group means, in the order they are prepared. The names are the ones a shard
+#: declares in tests/ci_shards.py, imported from there so the two cannot drift apart.
+PREPARERS: Dict[str, Callable[[], None]] = {
+    SOURCES: prepare_sources,
+    TAU2_DATA: prepare_data,
+    DURABLE_SERVICE: prepare_durable_service,
+    TASK_IMAGES: prepare_images,
+}
+
+
+def _asset_groups(value: str) -> Tuple[str, ...]:
+    """The groups named in one comma separated value, in the order they are prepared."""
+    asked = [name for name in value.split(",") if name]
+    unknown = sorted(set(asked) - set(PREPARERS))
+    if unknown:
+        raise argparse.ArgumentTypeError(
+            f"unknown asset group(s) {', '.join(unknown)}; the groups are {', '.join(PREPARERS)}"
+        )
+    return tuple(name for name in PREPARERS if name in asked)
+
+
+def main(argv: Optional[Sequence[str]] = None) -> int:
+    parser = argparse.ArgumentParser(description=__doc__.splitlines()[0] if __doc__ else None)
+    parser.add_argument(
+        "--assets",
+        type=_asset_groups,
+        default=tuple(PREPARERS),
+        help=(
+            "comma separated asset groups to prepare, out of "
+            f"{', '.join(PREPARERS)}. Everything, if the option is left off."
+        ),
+    )
+    args = parser.parse_args(argv)
+
     mode = _upstream.provisioning_mode()
     if mode == _upstream.OFFLINE:
         print(
@@ -103,10 +151,11 @@ def main() -> int:
             file=sys.stderr,
         )
         return 2
-    prepare_sources()
-    prepare_data()
-    prepare_durable_service()
-    prepare_images()
+    if not args.assets:
+        print("no assets asked for; this selection needs nothing prepared", flush=True)
+        return 0
+    for group in args.assets:
+        PREPARERS[group]()
     return 0
 
 

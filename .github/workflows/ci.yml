@@ -14,11 +14,54 @@ concurrency:
   cancel-in-progress: true
 
 jobs:
-  test:
+  # CI is the suite, and the suite does not divide by count: a few modules hold most of its
+  # seconds. So it runs as four jobs over the four selections in tests/ci_shards.py, each with its
+  # own checkout, its own install and only the preparation its own modules need, and a run costs
+  # what its slowest selection costs rather than what all four cost together.
+  #
+  # The names come from that module rather than from this file, so a shard added or renamed there
+  # reaches CI without a second edit here, and no selection can be left out by a workflow nobody
+  # remembered to update. Reading it needs nothing installed: it imports the standard library only.
+  shards:
     runs-on: ubuntu-latest
+    outputs:
+      matrix: ${{ steps.read.outputs.matrix }}
     steps:
       - name: Checkout
         uses: actions/checkout@v4
+
+      # The value is read into a variable before it is written, because a command substitution
+      # inside `echo` reports its own failure to nobody: `echo "matrix=$(python3 ...)"` succeeds
+      # with an empty matrix when the interpreter fails, and a matrix that expands to nothing is a
+      # run with no test job in it and no red step to say why. As an assignment, the failure is
+      # the step's.
+      - name: Read the shard names
+        id: read
+        run: |
+          set -euo pipefail
+          matrix="$(python3 tests/ci_shards.py matrix)"
+          printf 'matrix=%s\n' "$matrix" >> "$GITHUB_OUTPUT"
+
+  test:
+    needs: shards
+    runs-on: ubuntu-latest
+    strategy:
+      # One shard failing is not a reason to hide what the other three found.
+      fail-fast: false
+      matrix: ${{ fromJson(needs.shards.outputs.matrix) }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      # The shard says what this job runs, what it needs prepared and whether it carries the lint
+      # and type checks. Every step below reads those variables and names no selection of its own,
+      # which is what keeps the partition a single fact: tests/test_ci_shards.py holds the same
+      # four selections against the tests on disk and against what this job collected, in every
+      # one of these jobs, so a file no shard names and a job given the wrong paths both fail a
+      # test rather than quietly running in no job at all. tests/test_ci_partition.py holds the
+      # four collections against the suite's own, in the one job that can collect the whole tree.
+      - name: Read this shard's selection
+        run: python3 tests/ci_shards.py github-env "${{ matrix.shard }}" >> "$GITHUB_ENV"
 
       # setup-uv reads the committed .python-version (3.12); the project is pinned
       # >=3.12,<3.13 because the pinned tau2 revision imports stdlib `audioop`, removed in 3.13.
@@ -41,8 +84,15 @@ jobs:
       # fetching here is what makes a slow mirror or a bad minute at a registry fail in the stage
       # whose job is fetching, instead of inside a run that calls itself offline. Nothing may skip
       # in this mode either, so a preparation that did not prepare says so.
-      - name: Prepare upstream sources, data and task images (networked)
-        run: env -u OPENAI_API_KEY SHOGYM_PROVISIONING=prepare uv run python tests/prepare_offline_suite.py
+      #
+      # It prepares this shard's assets and no others. Most of that material belongs to modules
+      # one shard holds: only the frontier selection runs a task container, and the receipt
+      # selections bind no upstream, read no domain data and start no test server, so their jobs
+      # ask for nothing and pay for nothing.
+      - name: Prepare this shard's upstream sources, data and task images (networked)
+        run: |
+          env -u OPENAI_API_KEY SHOGYM_PROVISIONING=prepare \
+            uv run python tests/prepare_offline_suite.py --assets "$SHOGYM_CI_ASSETS"
 
       # The offline suite runs keyless: keyed tests (tau2 user-sim, hle judge) self-skip
       # without OPENAI_API_KEY. Unset it explicitly so nothing here depends on a secret.
@@ -60,11 +110,66 @@ jobs:
       # test here, never a quiet skip that would delete an env's coverage while the run stays
       # green. `--no-sync` is the same promise applied to uv itself: the environment was installed
       # two steps up, and a step that may not fetch should not be one resolver away from doing it.
+      #
+      # The paths are this shard's and are deliberately unquoted, because they are a list of
+      # arguments rather than one. `--durations=25` leaves each shard's own slowest phases in its
+      # own log, which is where the next partition will be read from, and the copy is what the
+      # summary at the end counts outcomes out of.
       - name: Run tests (offline, keyless)
-        run: env -u OPENAI_API_KEY SHOGYM_PROVISIONING=offline uv run --no-sync pytest -q -m "not network"
+        run: |
+          set -o pipefail
+          env -u OPENAI_API_KEY SHOGYM_PROVISIONING=offline \
+            uv run --no-sync pytest -q -m "not network" --durations=25 $SHOGYM_CI_PATHS \
+            | tee "$RUNNER_TEMP/pytest.log"
 
+      # Once, in the shard that prepares nothing and finishes first, because the answer is about
+      # the checkout rather than about any selection and four of it would be three too many.
       - name: Lint (ruff)
+        if: env.SHOGYM_CI_QUALITY == 'true'
         run: uv run ruff check .
 
       - name: Type check (pyright)
+        if: env.SHOGYM_CI_QUALITY == 'true'
         run: uv run pyright
+
+      # What each shard ran, on the run's own summary page, so four jobs still read as one result.
+      - name: Report this shard's outcome
+        if: always()
+        run: |
+          {
+            printf '### %s\n\n' "${{ matrix.shard }}"
+            if [ -s "$RUNNER_TEMP/pytest.log" ]; then
+              awk 'NF { line = $0 } END { printf "%s\n", line }' "$RUNNER_TEMP/pytest.log"
+            else
+              printf 'no pytest output: this shard failed before its tests ran\n'
+            fi
+          } >> "$GITHUB_STEP_SUMMARY"
+
+  # The one name branch protection can ask for. A matrix job reports one check per shard, named
+  # after it, so requiring the jobs by name would mean a new required context every time a shard is
+  # added, renamed or re-cut, and a shard whose name nobody added would gate nothing. This job is
+  # the single stable context: it needs every other job and passes only when all of them passed.
+  #
+  # `if: always()` is what makes it a gate rather than a report. Without it a failing dependency
+  # skips this job instead of failing it, and a required check that was skipped does not hold a
+  # merge. So it runs whatever happened, and reads the results itself: `success` is the only result
+  # it accepts, which is also how a cancelled matrix leg and a job that never ran are refused.
+  ci:
+    needs: [shards, test]
+    if: always()
+    runs-on: ubuntu-latest
+    steps:
+      - name: Every job this run needs succeeded
+        env:
+          SHARDS: ${{ needs.shards.result }}
+          TEST: ${{ needs.test.result }}
+        run: |
+          set -euo pipefail
+          printf 'shards: %s\ntest: %s\n' "$SHARDS" "$TEST"
+          refused=""
+          [ "$SHARDS" = "success" ] || refused="$refused shards($SHARDS)"
+          [ "$TEST" = "success" ] || refused="$refused test($TEST)"
+          if [ -n "$refused" ]; then
+            printf 'this run does not pass, because these did not succeed:%s\n' "$refused" >&2
+            exit 1
+          fi
