@@ -36,13 +36,28 @@ MASTER = bytes(range(32))
 BARS = admission.Thresholds(max_copy_score=0.6, max_flip_score=0.95, min_leverage=0.05)
 
 
-@functools.lru_cache(maxsize=1)
-def _admitted():
-    """One instance a bank would actually hold, cached: filling one is not cheap."""
+@functools.lru_cache(maxsize=8)
+def _filled(generator, master: bytes, size: int):
+    """The bank and the population that filling it computed, filled once per key.
+
+    Filling walks admission over every ordinal it considers, which is the expensive thing this
+    package does, and that walk is the same walk whatever the caller is about to do to the
+    bundle built over it. The six malformed-identity parameters below are six real failing
+    builds over one honest input bank, so the bank is filled once and the six builds still run.
+
+    Frozen input and nothing else. A bank and a population are both frozen dataclasses and no
+    test here writes to either; everything a test damages is written per room by its caller.
+    Keyed on the generator object, so a wrapped generator built for one test is never answered
+    with another's.
+    """
     from shogym.envs.receipts import bank as bank_mod
 
-    bank = bank_mod.materialize(GENERATOR, MASTER, 1)
-    return bank_mod.population(bank, GENERATOR).instances[0]
+    return bank_mod.materialized(generator, master, size)
+
+
+def _admitted():
+    """One instance a bank would actually hold, out of the fill the materials below share."""
+    return _filled(GENERATOR, MASTER, 1)[1].instances[0]
 
 
 def _instance(ordinal: int = 0):
@@ -843,10 +858,40 @@ def test_the_correlated_exhibit_draws_only_inside_its_declared_support() -> None
         assert tuple(sorted(drawn.items())) in reachable
 
 
+class _OneTableAndEnvelope(_Wrapped):
+    """The ledger, handing every sibling the same table and every draw the same envelope.
+
+    A draw does two things: it chooses the convention, and it builds the two sibling tasks and
+    the envelope under it. Only the first is what four hundred draws are being asked about here,
+    and the second is what they cost: a ledger table is generated and rescored until one moves
+    enough rows on every axis, twice per draw, and an envelope is a filler stream per slot per
+    row on top of that. Both are built once, from the real generator, and handed back for every
+    ordinal.
+
+    What stays real is the whole of the branch under test. `draw` reads the support off this
+    object, which delegates to the ledger and so declares none; it samples from the real axes
+    under the real key; and it freezes and reads back the convention it drew. The set of
+    conventions four hundred draws reach is therefore the set the shipped sampler reaches, and
+    the same set it reached when each draw built its own tables.
+    """
+
+    def __init__(self) -> None:
+        super().__init__()
+        self._table = GENERATOR.build_table(MASTER, 0, "A")
+        self._envelope = GENERATOR.build_envelope(MASTER, 0)
+
+    def build_table(self, master, ordinal, label):
+        return self._table
+
+    def build_envelope(self, master, ordinal):
+        return self._envelope
+
+
 def test_an_ordinary_family_still_draws_the_whole_product() -> None:
     assert not hasattr(GENERATOR, "SUPPORT")
+    ordinary = _OneTableAndEnvelope()
     drawn = {
-        tuple(sorted(protocol.draw(GENERATOR, MASTER, o).convention.items()))
+        tuple(sorted(protocol.draw(ordinary, MASTER, o).convention.items()))
         for o in range(400)
     }
     assert len(drawn) > 40
@@ -1245,7 +1290,7 @@ def _materials(room, generator=None, master=MASTER, size: int = 1):
     from shogym.envs.receipts.review import required_coverage
 
     generator = generator or GENERATOR
-    bank, held = bank_mod.materialized(generator, master, size)
+    bank, held = _filled(generator, master, size)
     screen = room / "screen.json"
     screen.write_text(
         json.dumps(_screen_payload(family=generator.name)), encoding="utf-8"
@@ -1827,8 +1872,9 @@ def test_review_row_coverage_comes_from_both_siblings() -> None:
             return table
 
     generator = ShortB()
-    bank = bank_mod.materialize(generator, MASTER, 1)
-    held = bank_mod.population(bank, generator)
+    # The fill hands back the population it had to compute, rather than a second walk of the
+    # same ordinals under the same rule to learn what the first one already knew.
+    _, held = bank_mod.materialized(generator, MASTER, 1)
     instance = held.instances[0]
     assert instance.a.n_rows != instance.b.n_rows
     coverage = required_coverage(

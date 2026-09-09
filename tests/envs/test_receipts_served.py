@@ -24,19 +24,29 @@ from shogym.envs.receipts.env_v1 import ReceiptsV1Env
 from shogym.envs.receipts.generators.ledger import GENERATOR
 from shogym.envs.receipts.protocol import option_mentions
 from shogym.serve import ServedEpisode
-from tests._fixtures.receipts_bundle import verified_bundle
+from tests._fixtures.receipts_bundle import private_bundle
 
 
 @pytest.fixture(scope="module")
 def frozen_bundle(tmp_path_factory: pytest.TempPathFactory) -> Path:
-    """One admission bundle that actually verifies, shared by the module."""
-    return verified_bundle(tmp_path_factory.mktemp("bundles"))
+    """One admission bundle that actually verifies, shared by the module.
+
+    This module's own copy of the process's verified template, under a room no other module
+    writes into: what an environment opened on it forks and seals goes beside it.
+    """
+    return private_bundle(tmp_path_factory.mktemp("bundles"))
 
 
 def _built_bundle(room: Path) -> Path:
-    """A second admission bundle, under its own key, for the tests that need two."""
+    """A second admission bundle, under its own key, for the tests that need two.
+
+    A copy of the one-instance template, which was built under a key of its own and is therefore
+    a different bundle from the module's: a different digest, a different directory, and its own
+    verification when something opens it. Each caller gets its own copy, because every test here
+    that asks for one is about to edit it, link to it or open it from a directory of its own.
+    """
     room.mkdir(parents=True, exist_ok=True)
-    return verified_bundle(room, size=1)
+    return private_bundle(room, size=1)
 
 
 def _config(frozen_bundle: Path, side: str = "a") -> dict:
@@ -455,7 +465,11 @@ def test_a_second_open_of_one_bundle_reuses_the_first_verification(
     """
     from shogym.envs.receipts import env_v1, streams
 
-    env_v1._OPENED.clear()
+    # A dictionary of this test's own, not the process's emptied. Every cache test here starts
+    # from nothing remembered, and emptying the shared one takes the module bundle's verification
+    # with it: the next test to open it pays a second cold verification for a cache flush that
+    # was never part of what it asserts.
+    monkeypatch.setattr(env_v1, "_OPENED", {})
     hashed = []
     real = streams.file_digest
     monkeypatch.setattr(
@@ -488,7 +502,7 @@ def test_another_bundle_or_moved_code_misses_the_cache(
     from shogym.envs.receipts import bank as bank_mod
     from shogym.envs.receipts import env_v1, streams
 
-    env_v1._OPENED.clear()
+    monkeypatch.setattr(env_v1, "_OPENED", {})
     hashed = []
     real = streams.file_digest
     monkeypatch.setattr(
@@ -540,7 +554,7 @@ def test_one_relative_name_in_two_directories_is_two_bundles(
     record.write_text(record.read_text(encoding="utf-8") + " ", encoding="utf-8")
     assert not bundle_mod.verify_at(other, GENERATOR).verified
 
-    env_v1._OPENED.clear()
+    monkeypatch.setattr(env_v1, "_OPENED", {})
     monkeypatch.chdir(valid.parent)
     first = ReceiptsV1Env(bundle=valid.name)
     assert first.dealable
@@ -567,14 +581,14 @@ def test_the_opener_still_refuses_a_symlinked_bundle(
     linked.mkdir()
     (linked / valid.name).symlink_to(valid, target_is_directory=True)
 
-    env_v1._OPENED.clear()
+    monkeypatch.setattr(env_v1, "_OPENED", {})
     monkeypatch.chdir(linked)
     with pytest.raises(ValueError, match="link"):
         ReceiptsV1Env(bundle=valid.name)
 
 
 def test_a_bundle_edited_after_it_was_opened_is_refused_by_the_next_process(
-    tmp_path: Path,
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     """WITHIN ONE PROCESS THE CACHE TRUSTS THE DIGEST. This is what that means.
 
@@ -593,7 +607,7 @@ def test_a_bundle_edited_after_it_was_opened_is_refused_by_the_next_process(
     from shogym.envs.receipts import env_v1
 
     root = _built_bundle(tmp_path / "edited")
-    env_v1._OPENED.clear()
+    monkeypatch.setattr(env_v1, "_OPENED", {})
     assert ReceiptsV1Env(**_config(root)).dealable
 
     # An edit inside the digest directory, after that open.

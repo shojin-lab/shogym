@@ -91,7 +91,7 @@ from shogym.serve.protocol_v2.policy import (  # noqa: E402
     PolicyProvenance,
     roster_digest,
 )
-from tests._fixtures.receipts_bundle import verified_bundle  # noqa: E402
+from tests._fixtures.receipts_bundle import private_bundle  # noqa: E402
 from tests._fixtures.temporal_server import time_skipping_environment  # noqa: E402
 from tests._fixtures.upstream_gate import environmental_skip  # noqa: E402
 
@@ -129,8 +129,12 @@ def carried_origin(row: CarriedAttempt) -> SourceOriginContext:
 
 @pytest.fixture(scope="module")
 def frozen_bundle(tmp_path_factory: pytest.TempPathFactory) -> Path:
-    """One admission bundle that actually verifies, shared by the module."""
-    return verified_bundle(tmp_path_factory.mktemp("bundles"))
+    """One admission bundle that actually verifies, shared by the module.
+
+    This module's own copy of the process's verified template, under a room no other module
+    writes into: what an environment opened on it forks and seals goes beside it.
+    """
+    return private_bundle(tmp_path_factory.mktemp("bundles"))
 
 
 @pytest_asyncio.fixture

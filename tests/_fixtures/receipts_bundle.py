@@ -9,17 +9,44 @@ testing the claim, not the path.
 
 It lives here rather than in one test module because two of them now open an environment on a
 bundle, and a second copy of this would be a second answer to what a bundle that verifies is.
+
+BUILDING ONE IS THE EXPENSIVE THING THIS SUITE DOES, so it is built once. Filling the bank walks
+admission over every ordinal it considers, the build walks it again to record the instances and a
+third time to verify what it just wrote, and the explicit verification below is a fourth. Seven
+modules each wanted a bundle of the same shape, so those four walks ran seven times to produce
+seven bundles that differed only in the key they were frozen under, and no test read the key.
+:func:`verified_template` runs them once per process and :func:`private_bundle` hands out copies,
+which is the whole saving.
+
+WHAT MAY BE SHARED AND WHAT MAY NOT. The template is frozen input: a bank, a population and a
+verification, none of which any test writes to. Everything a test forks, seals, captures or edits
+has to be its own, and for a bundle that is not a matter of taste. The environment files its forks
+at ``root.parent / "forks"`` and its seals underneath them, so two tests over one root would file
+into one directory and one module's filing could answer another module's idempotency test. A copy
+under a private parent is therefore the unit that is handed out, never the template itself, and
+the template is left read-only so that a caller who takes it anyway fails where the mistake is.
+Each copy is its own absolute path, so each still pays its own first open and its own real
+verification: what the sharing removes is the building, not the checking.
 """
 
 from __future__ import annotations
 
+import atexit
 import json
+import shutil
+import stat
+import tempfile
 from pathlib import Path
 
 from shogym.envs.receipts import bank as bank_mod
 from shogym.envs.receipts import bundle as bundle_mod
 from shogym.envs.receipts import streams
 from shogym.envs.receipts.generators.ledger import GENERATOR
+
+#: The template bundle for each size this process has been asked for. One per process, which under
+#: CI is one per shard job, because a shard is one pytest process and a session fixture would be
+#: no wider than this.
+_TEMPLATES: dict[int, Path] = {}
 
 
 def verified_bundle(room: Path, size: int = 2) -> Path:
@@ -31,6 +58,61 @@ def verified_bundle(room: Path, size: int = 2) -> Path:
     built = bundle_mod.build(room / "bundles", GENERATOR, bank, outcomes, pack)
     assert bundle_mod.verify(built, GENERATOR).problems == ()
     return built.root
+
+
+def verified_template(size: int = 2) -> Path:
+    """The one bundle of this size this process builds, read-only and shared.
+
+    Built under the system temporary directory rather than under a test's own, because it outlives
+    every test that reads it and belongs to none of them. It is removed when the process ends.
+    """
+    known = _TEMPLATES.get(size)
+    if known is not None:
+        return known
+    room = Path(tempfile.mkdtemp(prefix=f"shogym-receipts-template-{size}-"))
+    atexit.register(_discard, room)
+    built = verified_bundle(room, size=size)
+    _mode(built, writable=False)
+    _TEMPLATES[size] = built
+    return built
+
+
+def private_bundle(room: Path, size: int = 2) -> Path:
+    """A writable copy of that template under ``room``, which is this caller's alone.
+
+    The copy keeps the template's name, because a bundle is addressed by its own contents and a
+    directory called anything else is not the bundle it holds. ``room`` is what has to differ:
+    it is where the forks and seals of whoever opens this copy will be written.
+    """
+    source = verified_template(size)
+    room.mkdir(parents=True, exist_ok=True)
+    private = room / source.name
+    shutil.copytree(source, private)
+    _mode(private, writable=True)
+    return private
+
+
+def _mode(root: Path, *, writable: bool) -> None:
+    """Set the whole tree readable, and writable or not, from the bottom up.
+
+    A directory has to keep its execute bit either way or nothing under it can be reached, and the
+    read-only pass runs deepest first so that a directory is not sealed before what it holds.
+    """
+    files = stat.S_IRUSR | stat.S_IRGRP | stat.S_IROTH
+    folders = files | stat.S_IXUSR | stat.S_IXGRP | stat.S_IXOTH
+    if writable:
+        files |= stat.S_IWUSR
+        folders |= stat.S_IWUSR
+    for item in sorted(root.rglob("*"), key=lambda p: len(p.parts), reverse=True):
+        item.chmod(folders if item.is_dir() else files)
+    root.chmod(folders)
+
+
+def _discard(room: Path) -> None:
+    """Remove a template's room at exit, unsealing it first so that removal can happen."""
+    if room.is_dir():
+        _mode(room, writable=True)
+    shutil.rmtree(room, ignore_errors=True)
 
 
 def screen_artifact(pairs: int = 40) -> dict:
@@ -96,4 +178,10 @@ def review_pack(room: Path, held: bank_mod.Population, bank: bank_mod.Bank) -> P
     return pack
 
 
-__all__ = ["review_pack", "screen_artifact", "verified_bundle"]
+__all__ = [
+    "private_bundle",
+    "review_pack",
+    "screen_artifact",
+    "verified_bundle",
+    "verified_template",
+]
