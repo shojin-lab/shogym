@@ -215,6 +215,14 @@ markers = [
     # run still selects it, which is where a live upstream dependency is meant to be checked,
     # with a human reading the result.
     "network: needs a live third-party service; deselected from the offline suite",
+    # A test that drives a real workflow on the Temporal test server and reaches nothing else: no
+    # third party, no key, no download. The binary is provisioned by tests/prepare_offline_suite.py
+    # into ~/.cache/shogym/temporal, so these run in the offline suite rather than beside the tests
+    # that fetch. The mark is what says so out loud: it is selected by `-m "not network"` like any
+    # unmarked test, and it names the one thing such a test needs prepared, so a machine without it
+    # fails by name instead of leaving a whole layer of the kernel untested behind a `network` mark
+    # it never earned.
+    "durable: needs the prepared Temporal test server; runs in the offline suite",
     # A test that needs the local dev service rather than the time-skipping test server, because
     # what it is about is a limit only the dev service enforces. The time-skipping server accepts
     # Updates past the cap and takes no dynamic configuration, so the cap cannot be lowered there

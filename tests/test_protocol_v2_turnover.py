@@ -19,10 +19,11 @@ and it is tested per slot against the transport's own recovery records. The Acti
 are what a failure recorded after a boundary publishes, and they are tested against the twin.
 
 Most of these drive a real workflow on Temporal's time-skipping environment and are marked
-``network`` for the download it does on first use. The few that are about the service's cap
-itself need the local dev service, because the time-skipping server does not enforce the cap and
-takes no dynamic configuration to lower it; those are marked ``dev_server`` and skip unless
-``SHOGYM_DEV_SERVER_TESTS`` is set.
+``durable``, because the binary that environment runs on is prepared before the suite is. The few
+that are about the service's cap itself need the local dev service, because the time-skipping
+server does not enforce the cap and takes no dynamic configuration to lower it; those are marked
+``dev_server`` and ``network``, the dev binary being a download nothing prepares, and they skip
+unless ``SHOGYM_DEV_SERVER_TESTS`` is set.
 """
 
 from __future__ import annotations
@@ -123,6 +124,8 @@ from shogym.serve.protocol_v2.kernel.messages import (  # noqa: E402
 from shogym.serve.protocol_v2.kernel.runtime import temporal_home  # noqa: E402
 from shogym.serve.protocol_v2.reader import _refuse_a_moved_history  # noqa: E402
 from tests._fixtures.policy_rows import registering_the_receipt  # noqa: E402
+from tests._fixtures.temporal_server import time_skipping_environment  # noqa: E402
+from tests._fixtures.upstream_gate import environmental_skip  # noqa: E402
 
 CLAIM_HASH = "d" * 64
 BLOB = "e" * 64
@@ -195,9 +198,9 @@ async def _a_store_that_answers(payload: VerifyBlobsInput) -> BlobsVerified:
 @pytest_asyncio.fixture
 async def env() -> AsyncIterator[WorkflowEnvironment]:
     try:
-        environment = await WorkflowEnvironment.start_time_skipping()
-    except Exception as error:  # noqa: BLE001 - an absent test server is a skip, not a failure
-        pytest.skip(f"the Temporal test server is unavailable: {error}")
+        environment = await time_skipping_environment()
+    except Exception as error:  # noqa: BLE001 - an unusable server is the machine's, not the test's
+        environmental_skip(f"the Temporal test server is unavailable: {error}")
     async with environment:
         yield environment
 
@@ -1047,7 +1050,7 @@ async def _every_operation_a_gateway_can_make(
     return journal
 
 
-@pytest.mark.network
+@pytest.mark.durable
 async def test_a_generation_that_crossed_boundaries_answers_as_the_one_that_did_not(
     env, turnover_at, tmp_path
 ) -> None:
@@ -1084,7 +1087,7 @@ async def test_a_generation_that_crossed_boundaries_answers_as_the_one_that_did_
         assert mine == theirs, label
 
 
-@pytest.mark.network
+@pytest.mark.durable
 async def test_the_projection_hash_a_presentation_attests_to_does_not_move_at_a_boundary(
     env, turnover_at
 ) -> None:
@@ -1103,7 +1106,7 @@ async def test_the_projection_hash_a_presentation_attests_to_does_not_move_at_a_
     assert crossed["state"]["configuration_hash"] == plain["state"]["configuration_hash"]
 
 
-@pytest.mark.network
+@pytest.mark.durable
 async def test_the_generation_keeps_its_identifier_and_its_owner_across_a_boundary(
     env, turnover_at
 ) -> None:
@@ -1130,7 +1133,7 @@ async def test_the_generation_keeps_its_identifier_and_its_owner_across_a_bounda
     assert len(chain) == after.turnovers + 1
 
 
-@pytest.mark.network
+@pytest.mark.durable
 async def test_the_gate_bounds_what_is_accepted_while_a_claim_holds_a_handler_open(
     env, turnover_at, monkeypatch, tmp_path
 ) -> None:
@@ -1238,7 +1241,7 @@ async def _cross_a_boundary(caller: Caller, turnover_at, workflow_id: str, clien
     raise AssertionError("the generation never crossed a boundary")
 
 
-@pytest.mark.network
+@pytest.mark.durable
 async def test_the_same_environment_end_after_a_boundary_answers_as_it_did_before(
     env, turnover_at
 ) -> None:
@@ -1270,7 +1273,7 @@ async def test_the_same_environment_end_after_a_boundary_answers_as_it_did_befor
         assert (await caller.stream.end_environment_call(other)).held is False
 
 
-@pytest.mark.network
+@pytest.mark.durable
 async def test_a_begin_sent_twice_grants_one_world_and_counts_one_call(env, turnover_at) -> None:
     """The same begin, sent again after a boundary, is answered rather than granted a second time.
 
@@ -1296,7 +1299,7 @@ async def test_a_begin_sent_twice_grants_one_world_and_counts_one_call(env, turn
         assert (await caller.stream.stream_state()).environment_call is None
 
 
-@pytest.mark.network
+@pytest.mark.durable
 async def test_a_failure_after_a_boundary_names_the_activity_the_twin_would_have_named(
     env, turnover_at
 ) -> None:
@@ -1360,7 +1363,7 @@ async def test_a_failure_after_a_boundary_names_the_activity_the_twin_would_have
     )
 
 
-@pytest.mark.network
+@pytest.mark.durable
 async def test_the_filing_whose_work_failed_is_answered_the_same_way_after_a_boundary(
     env, turnover_at
 ) -> None:
@@ -1416,7 +1419,7 @@ async def test_the_filing_whose_work_failed_is_answered_the_same_way_after_a_bou
         )))) == "conflicting_seal"
 
 
-@pytest.mark.network
+@pytest.mark.durable
 async def test_a_pending_message_makes_the_boundary_wait_and_then_lets_it_through(
     env, turnover_at
 ) -> None:
@@ -1451,7 +1454,7 @@ async def test_a_pending_message_makes_the_boundary_wait_and_then_lets_it_throug
         assert (await caller.stream.stream_state()).pending_message_id is None
 
 
-@pytest.mark.network
+@pytest.mark.durable
 async def test_a_held_grant_makes_the_boundary_wait_until_it_is_given_back(
     env, turnover_at
 ) -> None:
@@ -1485,7 +1488,7 @@ async def test_a_held_grant_makes_the_boundary_wait_until_it_is_given_back(
         assert (await caller.stream.stream_state()).environment_call is None
 
 
-@pytest.mark.network
+@pytest.mark.durable
 async def test_a_pull_repeated_under_its_own_identifier_after_a_boundary_gets_its_offer(
     env, turnover_at
 ) -> None:
@@ -1524,7 +1527,7 @@ async def test_a_pull_repeated_under_its_own_identifier_after_a_boundary_gets_it
         assert await refused(caller.stream.pull(stale)) == "invalid_cursor"
 
 
-@pytest.mark.network
+@pytest.mark.durable
 async def test_a_takeover_after_a_boundary_finds_the_generation_where_it_left_it(
     env, turnover_at
 ) -> None:
@@ -1556,7 +1559,7 @@ async def test_a_takeover_after_a_boundary_finds_the_generation_where_it_left_it
         assert await refused(caller.stream.confirm_state()) == "fenced_writer"
 
 
-@pytest.mark.network
+@pytest.mark.durable
 async def test_every_execution_of_a_chain_replays_on_its_own(env, turnover_at) -> None:
     """Each link, fetched by its own run identifier and replayed, not just the last one.
 
@@ -1577,7 +1580,7 @@ async def test_every_execution_of_a_chain_replays_on_its_own(env, turnover_at) -
             await stream_replayer().replay_workflow(await handle.fetch_history())
 
 
-@pytest.mark.network
+@pytest.mark.durable
 async def test_an_execution_that_never_latched_acquires_the_boundary_when_traffic_resumes(
     env, turnover_at
 ) -> None:
@@ -1641,7 +1644,7 @@ def test_a_start_recorded_before_the_carrier_existed_decodes_with_none() -> None
     assert len(decoded.tasks) >= 1
 
 
-@pytest.mark.network
+@pytest.mark.durable
 async def test_a_carrier_that_will_not_fit_is_refused_and_the_size_is_recorded(
     env, turnover_at, monkeypatch
 ) -> None:
@@ -1676,7 +1679,7 @@ async def test_a_carrier_that_will_not_fit_is_refused_and_the_size_is_recorded(
         assert [message.kind for message in await served(caller)][-1] == "done"
 
 
-@pytest.mark.network
+@pytest.mark.durable
 async def test_the_supported_profile_encodes_well_under_the_ceiling(env, turnover_at) -> None:
     """The measurement the ceiling is set from: a full roster, driven to the end, sized.
 
@@ -1801,7 +1804,7 @@ async def _carried(client: Client, workflow_id: str, run_id: str) -> Dict[str, A
     return asdict(_unpacked(StreamCarry(**carry)))
 
 
-@pytest.mark.network
+@pytest.mark.durable
 async def test_the_carried_projection_is_written_in_one_order_and_only_one(
     env, turnover_at
 ) -> None:
@@ -1844,7 +1847,7 @@ async def test_the_carried_projection_is_written_in_one_order_and_only_one(
         assert all(row["message"]["visible_text"] == "" for row in carry["pull_requests"])
 
 
-@pytest.mark.network
+@pytest.mark.durable
 async def test_eight_attempts_being_worked_at_once_cross_a_boundary_together(
     env, turnover_at
 ) -> None:
@@ -1876,7 +1879,7 @@ async def test_eight_attempts_being_worked_at_once_cross_a_boundary_together(
         assert [message.kind for message in await served(caller)][-1] == "done"
 
 
-@pytest.mark.network
+@pytest.mark.durable
 async def test_a_payload_built_but_not_yet_offered_crosses_with_its_body(env, turnover_at) -> None:
     """An obligation that can still be offered keeps its candidate, and is offered afterwards.
 
@@ -1905,7 +1908,7 @@ async def test_a_payload_built_but_not_yet_offered_crosses_with_its_body(env, tu
         assert payload.message_id == oid(0x103)
 
 
-@pytest.mark.network
+@pytest.mark.durable
 async def test_a_seal_in_flight_holds_the_boundary_until_its_answer_lands(
     env, turnover_at
 ) -> None:
@@ -1956,7 +1959,7 @@ async def test_a_seal_in_flight_holds_the_boundary_until_its_answer_lands(
         assert [message.kind for message in await served(caller)][-1] == "done"
 
 
-@pytest.mark.network
+@pytest.mark.durable
 async def test_a_deadline_armed_before_a_boundary_still_ends_its_attempt_after_one(
     env, turnover_at
 ) -> None:
@@ -1989,7 +1992,7 @@ async def test_a_deadline_armed_before_a_boundary_still_ends_its_attempt_after_o
         assert state.final_failures[task.attempt_id or ""] == "deadline"
 
 
-@pytest.mark.network
+@pytest.mark.durable
 async def test_what_a_query_read_before_a_boundary_an_update_after_one_still_answers(
     env, turnover_at
 ) -> None:
@@ -2016,7 +2019,7 @@ async def test_what_a_query_read_before_a_boundary_an_update_after_one_still_ans
         assert (await caller.stream.stream_state()).stream_state_sha256 != read.stream_state_sha256
 
 
-@pytest.mark.network
+@pytest.mark.durable
 async def test_the_wait_total_and_every_reason_behind_it_cross(env, turnover_at) -> None:
     """The reasons are published and nothing a presentation records could rebuild them.
 
@@ -2050,7 +2053,7 @@ async def test_the_wait_total_and_every_reason_behind_it_cross(env, turnover_at)
         assert (await caller.stream.stream_state()).wait_count == 1
 
 
-@pytest.mark.network
+@pytest.mark.durable
 async def test_a_finalization_receipt_is_the_one_that_was_given_and_not_a_rebuilt_one(
     env, turnover_at
 ) -> None:
@@ -2085,7 +2088,7 @@ async def test_a_finalization_receipt_is_the_one_that_was_given_and_not_a_rebuil
         assert await caller.stream.finalize(ending) == receipt
 
 
-@pytest.mark.network
+@pytest.mark.durable
 async def test_info_across_a_boundary_still_counts_an_attempt_it_handed_out(
     env, turnover_at
 ) -> None:
@@ -2119,7 +2122,7 @@ async def test_info_across_a_boundary_still_counts_an_attempt_it_handed_out(
         assert counted["remaining"] == 2
 
 
-@pytest.mark.network
+@pytest.mark.durable
 async def test_the_same_ownership_claim_after_a_boundary_returns_the_receipt_it_returned(
     env, turnover_at
 ) -> None:
@@ -2181,7 +2184,7 @@ async def test_the_same_ownership_claim_after_a_boundary_returns_the_receipt_it_
         assert state.ownership_epoch == 2
 
 
-@pytest.mark.network
+@pytest.mark.durable
 async def test_the_same_consumer_claim_after_a_boundary_returns_the_receipt_it_returned(
     env, turnover_at
 ) -> None:
@@ -2429,7 +2432,7 @@ async def test_the_copied_run_reader_answers_for_a_chain_as_one_generation(
     )
 
 
-@pytest.mark.network
+@pytest.mark.durable
 async def test_a_call_waits_out_a_boundary_a_world_call_is_holding_open(
     env, turnover_at, monkeypatch
 ) -> None:
@@ -2513,7 +2516,7 @@ def test_the_wait_rule_reads_a_generation_reaching_for_a_boundary_from_its_state
     assert _still_reaching_for_a_boundary(standing, None)
 
 
-@pytest.mark.network
+@pytest.mark.durable
 async def test_what_a_caller_is_handed_when_it_stops_waiting_is_not_a_refusal(
     env, turnover_at, monkeypatch
 ) -> None:
@@ -2555,7 +2558,7 @@ async def test_what_a_caller_is_handed_when_it_stops_waiting_is_not_a_refusal(
         assert state.turnovers == 0
 
 
-@pytest.mark.network
+@pytest.mark.durable
 async def test_an_execution_the_branch_is_unavailable_to_keeps_serving_to_the_end(
     env, turnover_at
 ) -> None:
@@ -2594,7 +2597,7 @@ async def test_an_execution_the_branch_is_unavailable_to_keeps_serving_to_the_en
     assert finished.generation_state == "done"
 
 
-@pytest.mark.network
+@pytest.mark.durable
 async def test_a_claim_reading_the_store_over_and_over_is_not_a_generation_that_stopped(
     env, turnover_at, monkeypatch
 ) -> None:
@@ -2696,11 +2699,9 @@ async def test_a_claim_reading_the_store_over_and_over_is_not_a_generation_that_
     await _let_go(claim)
 
 
-@DEV_SERVER_ONLY
-@pytest.mark.dev_server
-@pytest.mark.network
+@pytest.mark.durable
 async def test_a_deadline_already_due_is_applied_before_the_boundary_rather_than_after_it(
-    turnover_at,
+    env, turnover_at
 ) -> None:
     """A clock that has run out belongs to the execution it ran out in.
 
@@ -2718,43 +2719,42 @@ async def test_a_deadline_already_due_is_applied_before_the_boundary_rather_than
     """
     deadline_ms = 2000
     start = replace(make_start(tasks=2), attempt_deadline_ms=deadline_ms)
-    async with _dev_service() as env:
+    turnover_at(10_000)
+    async with stream_worker(env.client, cached_workflows=0):
+        caller = await open_stream(env.client, start, workflow_id="stream/overdue/1")
+        await caller.stream.close_queue()
+        task = await caller.take()
+        assert (await caller.stream.stream_state()).attempts[task.attempt_id or ""] == "active"
+        accepted = await _accepted_updates(env.client, "stream/overdue/1")
+
+    # No Worker is watching while the clock passes the deadline.
+    await asyncio.sleep(deadline_ms / 1000 + 0.2)
+    turnover_at(accepted + 1)
+    latching = _in_the_background(caller.stream.confirm_state())
+    await asyncio.sleep(0.05)
+
+    async with stream_worker(env.client, cached_workflows=0):
+        await latching
+        for _ in range(400):
+            state = await caller.stream.stream_state()
+            if state.turnovers == 1:
+                break
+            await asyncio.sleep(0.02)
+        else:
+            raise AssertionError("the generation never crossed a boundary")
         turnover_at(10_000)
-        async with stream_worker(env.client, cached_workflows=0):
-            caller = await open_stream(env.client, start, workflow_id="stream/overdue/1")
-            await caller.stream.close_queue()
-            task = await caller.take()
-            assert (await caller.stream.stream_state()).attempts[task.attempt_id or ""] == "active"
-            accepted = await _accepted_updates(env.client, "stream/overdue/1")
 
-        # No Worker is watching while the clock passes the deadline.
-        await asyncio.sleep(deadline_ms / 1000 + 0.2)
-        turnover_at(accepted + 1)
-        latching = _in_the_background(caller.stream.confirm_state())
-        await asyncio.sleep(0.05)
-
-        async with stream_worker(env.client, cached_workflows=0):
-            await latching
-            for _ in range(400):
-                state = await caller.stream.stream_state()
-                if state.turnovers == 1:
-                    break
-                await asyncio.sleep(0.02)
-            else:
-                raise AssertionError("the generation never crossed a boundary")
-            turnover_at(10_000)
-
-            chain = await run_ids(env.client, "stream/overdue/1")
-            carried = await _carried(env.client, "stream/overdue/1", chain[-1])
-            crossed = {row["attempt_id"]: row for row in carried["attempts"]}
-            # The ending was written by the execution whose clock ran out, not the one after it.
-            assert crossed[task.attempt_id or ""]["state"] == "final_failed"
-            assert crossed[task.attempt_id or ""]["final_failure"] == "deadline"
-            assert crossed[task.attempt_id or ""]["deadline_at"] is None
-            assert state.final_failures[task.attempt_id or ""] == "deadline"
+        chain = await run_ids(env.client, "stream/overdue/1")
+        carried = await _carried(env.client, "stream/overdue/1", chain[-1])
+        crossed = {row["attempt_id"]: row for row in carried["attempts"]}
+        # The ending was written by the execution whose clock ran out, not the one after it.
+        assert crossed[task.attempt_id or ""]["state"] == "final_failed"
+        assert crossed[task.attempt_id or ""]["final_failure"] == "deadline"
+        assert crossed[task.attempt_id or ""]["deadline_at"] is None
+        assert state.final_failures[task.attempt_id or ""] == "deadline"
 
 
-@pytest.mark.network
+@pytest.mark.durable
 async def test_repeatable_calls_cannot_spend_the_slot_a_held_grant_needs(
     env, turnover_at
 ) -> None:
@@ -2806,7 +2806,7 @@ async def test_repeatable_calls_cannot_spend_the_slot_a_held_grant_needs(
             raise AssertionError("the boundary never followed the end of the grant")
 
 
-@pytest.mark.network
+@pytest.mark.durable
 async def test_a_filing_frozen_before_it_was_sent_is_answered_after_a_boundary(
     env, turnover_at
 ) -> None:
@@ -2863,7 +2863,7 @@ async def test_a_filing_frozen_before_it_was_sent_is_answered_after_a_boundary(
         assert await caller.stream.seal(filing) == acknowledgement
 
 
-@pytest.mark.network
+@pytest.mark.durable
 async def test_a_finalization_that_ends_more_than_it_names_carries_the_whole_list(
     env, turnover_at
 ) -> None:
@@ -2961,7 +2961,7 @@ async def _a_gateway_over(
     )
 
 
-@pytest.mark.network
+@pytest.mark.durable
 async def test_a_generation_gives_up_on_a_boundary_its_own_gate_can_no_longer_reach(
     env, turnover_at, tmp_path
 ) -> None:
@@ -3051,7 +3051,7 @@ async def test_a_generation_gives_up_on_a_boundary_its_own_gate_can_no_longer_re
     assert gated["refused"] == kernel_workflow.ADMISSION_EXHAUSTED
 
 
-@pytest.mark.network
+@pytest.mark.durable
 async def test_confirmations_cannot_spend_the_claim_that_recovers_an_abandoned_grant(
     env, turnover_at
 ) -> None:
@@ -3105,7 +3105,7 @@ async def test_confirmations_cannot_spend_the_claim_that_recovers_an_abandoned_g
             raise AssertionError("the boundary never followed the end of the grant")
 
 
-@pytest.mark.network
+@pytest.mark.durable
 @pytest.mark.parametrize(
     "holding",
     ("a held grant", "a pending message"),
@@ -3213,7 +3213,7 @@ async def test_claims_that_failed_do_not_close_the_recovery_they_were_making(
                 assert (await arm_result["handle"].end_environment_call(arm_result["call"])).held
 
 
-@pytest.mark.network
+@pytest.mark.durable
 async def test_an_acknowledgement_already_given_survives_a_takeover_and_a_boundary(
     env, turnover_at
 ) -> None:
@@ -3274,7 +3274,7 @@ async def test_an_acknowledgement_already_given_survives_a_takeover_and_a_bounda
     assert crossed == without
 
 
-@pytest.mark.network
+@pytest.mark.durable
 async def test_a_finalization_retried_after_a_takeover_and_a_boundary_gets_its_receipt(
     env, turnover_at
 ) -> None:
@@ -3313,7 +3313,7 @@ async def test_a_finalization_retried_after_a_takeover_and_a_boundary_gets_its_r
     assert crossed_again == crossed_given == given
 
 
-@pytest.mark.network
+@pytest.mark.durable
 async def test_a_refused_begin_stays_refused_under_its_own_identifier_and_is_judged_under_another(
     env, turnover_at
 ) -> None:
@@ -3370,7 +3370,7 @@ async def test_a_refused_begin_stays_refused_under_its_own_identifier_and_is_jud
         assert after.environment_calls[task.attempt_id or ""] == 1
 
 
-@pytest.mark.network
+@pytest.mark.durable
 async def test_a_lost_offer_reaches_the_same_ending_whether_or_not_a_boundary_intervened(
     env, turnover_at
 ) -> None:
@@ -3453,7 +3453,7 @@ async def test_a_lost_offer_reaches_the_same_ending_whether_or_not_a_boundary_in
     assert crossed["the call after that"] == "outstanding_response"
 
 
-@pytest.mark.network
+@pytest.mark.durable
 async def test_a_superseded_transports_retry_leaves_the_replacements_world_where_it_is(
     env, turnover_at
 ) -> None:
@@ -3732,7 +3732,7 @@ async def _one_of_every_handler(
     return rows
 
 
-@pytest.mark.network
+@pytest.mark.durable
 @pytest.mark.parametrize("outcome", ("success", "refusal"), ids=("answered", "refused"))
 @pytest.mark.parametrize("takeover", (False, True), ids=("one owner", "taken over"))
 async def test_update_outcomes_survive_every_boundary_schedule(
@@ -3875,7 +3875,7 @@ def test_a_recipe_that_rebuilds_other_bytes_is_refused_rather_than_served(
             generation._rebuilt("pull-1", kernel_workflow._Answer("pull", 1, "value", recipe=tampered))
 
 
-@pytest.mark.network
+@pytest.mark.durable
 async def test_an_offered_task_crosses_as_a_recipe_and_comes_back_as_the_same_bytes(
     env, turnover_at
 ) -> None:

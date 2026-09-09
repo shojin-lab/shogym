@@ -109,6 +109,8 @@ from shogym.serve.protocol_v2.kernel.activities import (  # noqa: E402
 )
 from tests._fixtures.history import the_activity_that_failed  # noqa: E402
 from tests._fixtures.policy_rows import registering_the_receipt  # noqa: E402
+from tests._fixtures.temporal_server import time_skipping_environment  # noqa: E402
+from tests._fixtures.upstream_gate import environmental_skip  # noqa: E402
 
 TEST_ENV = "wordle_v1"
 TASK_BODY = "file the report"
@@ -295,9 +297,9 @@ async def refused(awaitable: Any) -> str:
 @pytest_asyncio.fixture
 async def env() -> AsyncIterator[WorkflowEnvironment]:
     try:
-        environment = await WorkflowEnvironment.start_time_skipping()
-    except Exception as error:
-        pytest.skip(f"the Temporal test server is unavailable: {error}")
+        environment = await time_skipping_environment()
+    except Exception as error:  # noqa: BLE001 - an unusable server is the machine's, not the test's
+        environmental_skip(f"the Temporal test server is unavailable: {error}")
     async with environment:
         yield environment
 
@@ -321,7 +323,7 @@ async def caller(env: WorkflowEnvironment) -> AsyncIterator[Caller]:
         yield await open_stream(env, workflow_id="stream/finalize/1")
 
 
-@pytest.mark.network
+@pytest.mark.durable
 async def test_the_controller_ends_an_active_attempt_and_mints_nothing(caller: Caller) -> None:
     """Capacity back, obligation resolved, outcome at the floor, and not one byte offered."""
     await caller.take()
@@ -349,7 +351,7 @@ async def test_the_controller_ends_an_active_attempt_and_mints_nothing(caller: C
     assert state.materialization_count == 0
 
 
-@pytest.mark.network
+@pytest.mark.durable
 async def test_a_finalization_never_overtakes_an_accepted_terminal(caller: Caller) -> None:
     """Once a filing has been accepted the attempt is the seal's, before and after the Ack."""
     await caller.take()
@@ -363,7 +365,7 @@ async def test_a_finalization_never_overtakes_an_accepted_terminal(caller: Calle
     assert state.final_failures == {}
 
 
-@pytest.mark.network
+@pytest.mark.durable
 async def test_a_finalization_waits_for_an_outstanding_result(caller: Caller) -> None:
     """A result nobody has presented is a caller's turn, not a controller's."""
     await caller.take()
@@ -377,7 +379,7 @@ async def test_a_finalization_waits_for_an_outstanding_result(caller: Caller) ->
     assert (await caller.finalize(ABANDONED)).reason == ABANDONED
 
 
-@pytest.mark.network
+@pytest.mark.durable
 async def test_an_unknown_attempt_and_a_reason_this_generation_does_not_declare(
     caller: Caller,
 ) -> None:
@@ -398,7 +400,7 @@ async def test_an_unknown_attempt_and_a_reason_this_generation_does_not_declare(
     assert state.attempts[ATTEMPT] == "active"
 
 
-@pytest.mark.network
+@pytest.mark.durable
 async def test_a_filing_for_a_finalized_attempt_conflicts_however_often_it_is_retried(
     caller: Caller,
 ) -> None:
@@ -426,7 +428,7 @@ async def test_a_filing_for_a_finalized_attempt_conflicts_however_often_it_is_re
     assert state.offer_count == 1
 
 
-@pytest.mark.network
+@pytest.mark.durable
 async def test_a_deadline_ends_an_attempt_that_stayed_active(env) -> None:
     """A durable timer, fired in skipped time, on an attempt nobody was finishing."""
     async with stream_worker(env.client):
@@ -450,7 +452,7 @@ async def test_a_deadline_ends_an_attempt_that_stayed_active(env) -> None:
         assert state.pending_message_id is None
 
 
-@pytest.mark.network
+@pytest.mark.durable
 async def test_a_deadline_does_not_end_an_attempt_that_was_filed_in_time(env) -> None:
     """The timer is disarmed by the accepted terminal, not by the seal committing."""
     async with stream_worker(env.client):
@@ -469,7 +471,7 @@ async def test_a_deadline_does_not_end_an_attempt_that_was_filed_in_time(env) ->
         assert state.final_failures == {}
 
 
-@pytest.mark.network
+@pytest.mark.durable
 async def test_done_counts_a_finalized_attempt_as_resolved_and_the_history_replays(env) -> None:
     """A closed queue and one ended attempt is a generation with nothing left to do."""
     async with stream_worker(env.client):
@@ -495,7 +497,7 @@ async def test_done_counts_a_finalized_attempt_as_resolved_and_the_history_repla
     await stream_replayer().replay_workflow(history)
 
 
-@pytest.mark.network
+@pytest.mark.durable
 async def test_the_step_budget_ends_the_attempt_and_the_next_pull_moves_on(env) -> None:
     """The env's budget, counted where the calls that spend it actually pass.
 
@@ -591,7 +593,7 @@ async def test_the_step_budget_ends_the_attempt_and_the_next_pull_moves_on(env) 
             await episode.close()
 
 
-@pytest.mark.network
+@pytest.mark.durable
 async def test_a_replacement_transport_ends_an_attempt_whose_budget_is_already_spent(
     env,
 ) -> None:
@@ -656,7 +658,7 @@ async def test_a_replacement_transport_ends_an_attempt_whose_budget_is_already_s
             await episode.close()
 
 
-@pytest.mark.network
+@pytest.mark.durable
 async def test_a_replacement_transport_gets_what_is_left_of_the_budget_and_no_more(
     env,
 ) -> None:
@@ -719,7 +721,7 @@ async def test_a_replacement_transport_gets_what_is_left_of_the_budget_and_no_mo
             await episode.close()
 
 
-@pytest.mark.network
+@pytest.mark.durable
 async def test_an_owner_that_restores_the_world_restores_the_budget_with_it(env) -> None:
     """The budget comes back exactly where the world it was spent in does.
 
@@ -800,7 +802,7 @@ async def test_an_owner_that_restores_the_world_restores_the_budget_with_it(env)
             await episode.close()
 
 
-@pytest.mark.network
+@pytest.mark.durable
 @pytest.mark.parametrize("how", ["exhausted", "non_retryable"])
 async def test_a_seal_whose_work_finally_failed_ends_the_attempt_it_prepared(env, how) -> None:
     """The batch behind an accepted terminal cannot fail into a state with no way out.
@@ -848,7 +850,7 @@ async def test_a_seal_whose_work_finally_failed_ends_the_attempt_it_prepared(env
         assert done.kind == "done"
 
 
-@pytest.mark.network
+@pytest.mark.durable
 @pytest.mark.parametrize(
     "how", ["seal", "exhausted", "refused", "renderer", "oversized", "another_script"]
 )
@@ -991,7 +993,7 @@ async def test_a_row_whose_seal_failed_names_the_step_and_what_it_failed_with(
         )
 
 
-@pytest.mark.network
+@pytest.mark.durable
 async def test_a_row_whose_seal_ran_out_of_time_says_which_clock_ran_out(
     env, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -1032,7 +1034,7 @@ async def test_a_row_whose_seal_ran_out_of_time_says_which_clock_ran_out(
     assert row.failure_retry_state == "MAXIMUM_ATTEMPTS_REACHED"
 
 
-@pytest.mark.network
+@pytest.mark.durable
 async def test_a_history_that_recorded_a_failed_activity_replays_to_the_same_row(env) -> None:
     """The explanation is a reading of the history and not a note taken while it happened.
 
@@ -1106,7 +1108,7 @@ def test_a_failure_that_cannot_be_described_is_still_a_failure_that_ends_the_att
     assert attempt.failure_retry_state is None
 
 
-@pytest.mark.network
+@pytest.mark.durable
 @pytest.mark.parametrize("how", ["non_retryable", "unusable"])
 async def test_a_seal_that_ended_its_attempt_leaves_the_transport_serving(env, how) -> None:
     """The filing that ended an attempt is not one the transport waits for an answer to.
@@ -1258,7 +1260,7 @@ def with_grader(activities: List[Any], grader: Any) -> List[Any]:
     return [*kept, grader]
 
 
-@pytest.mark.network
+@pytest.mark.durable
 @pytest.mark.parametrize("how", ["non_retryable", "unusable"])
 async def test_a_graded_horizon_whose_seal_ended_the_attempt_leaves_the_transport_serving(
     env, how: str
@@ -1385,7 +1387,7 @@ async def test_a_graded_horizon_whose_seal_ended_the_attempt_leaves_the_transpor
                 await opened.close()
 
 
-@pytest.mark.network
+@pytest.mark.durable
 async def test_an_ending_floors_every_attempt_that_was_waiting_on_it(env) -> None:
     """A stop before the outcome writes the floor over the whole of what that outcome covered.
 
@@ -1427,7 +1429,7 @@ async def test_an_ending_floors_every_attempt_that_was_waiting_on_it(env) -> Non
         assert state.pending_message_id is None
 
 
-@pytest.mark.network
+@pytest.mark.durable
 async def test_a_gate_that_can_no_longer_open_leaves_attempts_the_counts_do_not_hold(env) -> None:
     """The two attempts floored behind A were never handed out and never will be.
 
@@ -1460,7 +1462,7 @@ async def test_a_gate_that_can_no_longer_open_leaves_attempts_the_counts_do_not_
         assert counted["remaining"] + counted["consumed"] + 2 == len(state.attempts)
 
 
-@pytest.mark.network
+@pytest.mark.durable
 async def test_a_deadline_that_passes_while_a_world_is_being_called_ends_it_afterwards(
     env,
 ) -> None:
@@ -1510,7 +1512,7 @@ async def test_a_deadline_that_passes_while_a_world_is_being_called_ends_it_afte
     await stream_replayer().replay_workflow(history)
 
 
-@pytest.mark.network
+@pytest.mark.durable
 async def test_a_takeover_ends_the_grant_a_deferred_expiry_is_waiting_on(env) -> None:
     """A call that never comes back is ended by the owner that replaces the one holding it.
 
@@ -1557,7 +1559,7 @@ async def test_a_takeover_ends_the_grant_a_deferred_expiry_is_waiting_on(env) ->
         assert state.offer_count == 1
 
 
-@pytest.mark.network
+@pytest.mark.durable
 async def test_an_attestation_built_before_the_deadline_passed_does_not_present_after_it(
     env,
 ) -> None:
@@ -1610,7 +1612,7 @@ async def test_an_attestation_built_before_the_deadline_passed_does_not_present_
         assert state.presentation_count == after.presentation_count + 1
 
 
-@pytest.mark.network
+@pytest.mark.durable
 async def test_an_attestation_the_deadline_overtakes_mid_commit_does_not_present(
     env, tmp_path: Path
 ) -> None:
@@ -1695,7 +1697,7 @@ async def test_an_attestation_the_deadline_overtakes_mid_commit_does_not_present
         assert state.presentation_count == before.presentation_count + 1
 
 
-@pytest.mark.network
+@pytest.mark.durable
 async def test_an_armed_deadline_survives_the_worker_that_armed_it(env) -> None:
     """The clock an attempt is on is the generation's, and the generation outlives a process.
 
@@ -1736,7 +1738,7 @@ async def test_an_armed_deadline_survives_the_worker_that_armed_it(env) -> None:
     await stream_replayer().replay_workflow(history)
 
 
-@pytest.mark.network
+@pytest.mark.durable
 async def test_a_negative_deadline_is_a_generation_this_kernel_will_not_serve(env) -> None:
     """Zero is the one value that turns the deadline off, and a typo must not read as zero."""
     async with stream_worker(env.client):
@@ -1749,7 +1751,7 @@ async def test_a_negative_deadline_is_a_generation_this_kernel_will_not_serve(en
             await caller.pull()
 
 
-@pytest.mark.network
+@pytest.mark.durable
 async def test_one_logical_finalization_is_one_ending_however_often_it_is_retried(
     caller: Caller,
 ) -> None:
@@ -1782,7 +1784,7 @@ async def test_one_logical_finalization_is_one_ending_however_often_it_is_retrie
     assert state.final_failures == {ATTEMPT: ABANDONED}
 
 
-@pytest.mark.network
+@pytest.mark.durable
 async def test_the_ending_a_logical_request_reached_is_the_one_a_new_owner_reads(env) -> None:
     """The map from a logical request to its ending outlives the owner that made the request.
 
@@ -1872,7 +1874,7 @@ class Lossy:
         )
 
 
-@pytest.mark.network
+@pytest.mark.durable
 @pytest.mark.parametrize(
     "lose,applied",
     [("release", False), ("release", True), ("finalize", False), ("finalize", True)],
@@ -1952,7 +1954,7 @@ async def test_the_spent_budget_survives_a_lost_response_and_spends_no_second_st
             await episode.close()
 
 
-@pytest.mark.network
+@pytest.mark.durable
 async def test_a_world_that_will_not_close_leaves_the_next_task_unoffered(env) -> None:
     """The ended attempt's world is retired where the attempt ends, and a failure is not skipped.
 

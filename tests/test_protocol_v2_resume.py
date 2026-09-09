@@ -15,8 +15,9 @@ identifier minted twice.
 Fencing is proved with a handle that still works. The old owner reaches the generation exactly
 as it did before, and the generation refuses it, which is a fence rather than a lost socket.
 
-These are marked ``network`` because the time-skipping environment downloads a test server on
-first use, and they skip rather than fail when it is not there.
+These are marked ``durable``: the test server the time-skipping environment runs on is prepared
+before the suite is, so they run in the offline suite, and a machine that was prepared and has no
+binary fails naming it rather than skipping.
 """
 
 from __future__ import annotations
@@ -88,6 +89,8 @@ from shogym.serve.protocol_v2.rundir import (  # noqa: E402
     create_run_directory,
 )
 from tests._fixtures.policy_rows import registering_the_receipt  # noqa: E402
+from tests._fixtures.temporal_server import time_skipping_environment  # noqa: E402
+from tests._fixtures.upstream_gate import environmental_skip  # noqa: E402
 
 CLAIM_HASH = "d" * 64
 BLOB = "e" * 64
@@ -210,9 +213,9 @@ async def refused(awaitable: Any) -> str:
 @pytest_asyncio.fixture
 async def env() -> AsyncIterator[WorkflowEnvironment]:
     try:
-        environment = await WorkflowEnvironment.start_time_skipping()
-    except Exception as error:
-        pytest.skip(f"the Temporal test server is unavailable: {error}")
+        environment = await time_skipping_environment()
+    except Exception as error:  # noqa: BLE001 - an unusable server is the machine's, not the test's
+        environmental_skip(f"the Temporal test server is unavailable: {error}")
     async with environment:
         yield environment
 
@@ -252,7 +255,7 @@ async def take_over(
     return Caller(stream, state.cursor, counter=caller.counter)
 
 
-@pytest.mark.network
+@pytest.mark.durable
 async def test_a_resume_fences_the_writer_it_replaced(env: WorkflowEnvironment) -> None:
     """One writer at a time. The old handle still calls, and the generation refuses it."""
     start = make_start()
@@ -296,7 +299,7 @@ async def test_a_resume_fences_the_writer_it_replaced(env: WorkflowEnvironment) 
         assert (await second.stream.stream_state()).cursor == TASK_ID
 
 
-@pytest.mark.network
+@pytest.mark.durable
 async def test_a_fenced_writer_does_not_reach_the_world_either(
     env: WorkflowEnvironment,
 ) -> None:
@@ -322,7 +325,7 @@ async def test_a_fenced_writer_does_not_reach_the_world_either(
         assert (await second.stream.end_environment_call(call)).held is True
 
 
-@pytest.mark.network
+@pytest.mark.durable
 async def test_a_claim_does_not_grant_a_second_lease_over_an_unresolved_one(
     env: WorkflowEnvironment,
 ) -> None:
@@ -358,7 +361,7 @@ async def test_a_claim_does_not_grant_a_second_lease_over_an_unresolved_one(
         assert (await second.stream.begin_environment_call(later)).held is True
 
 
-@pytest.mark.network
+@pytest.mark.durable
 async def test_an_active_attempt_comes_back_only_over_a_world_nothing_happened_in(
     env: WorkflowEnvironment,
 ) -> None:
@@ -429,7 +432,7 @@ async def test_an_active_attempt_comes_back_only_over_a_world_nothing_happened_i
         assert acknowledgement.kind == "seal_ack"
 
 
-@pytest.mark.network
+@pytest.mark.durable
 async def test_a_claim_that_believes_another_configuration_fences_nobody(
     env: WorkflowEnvironment,
 ) -> None:
@@ -457,7 +460,7 @@ async def test_a_claim_that_believes_another_configuration_fences_nobody(
         assert (await first.pull()).message_id == TASK_ID
 
 
-@pytest.mark.network
+@pytest.mark.durable
 async def test_a_generation_nobody_ever_claimed_is_still_taken(
     env: WorkflowEnvironment,
 ) -> None:
@@ -497,7 +500,7 @@ async def test_a_generation_nobody_ever_claimed_is_still_taken(
         assert (await Caller(taken, receipt.initial_cursor).pull()).message_id == TASK_ID
 
 
-@pytest.mark.network
+@pytest.mark.durable
 async def test_the_cuts_around_an_offer_replay_it_and_mint_nothing(
     env: WorkflowEnvironment,
 ) -> None:
@@ -537,7 +540,7 @@ async def test_the_cuts_around_an_offer_replay_it_and_mint_nothing(
         assert state.ownership_epoch == 4
 
 
-@pytest.mark.network
+@pytest.mark.durable
 async def test_a_new_owner_reads_back_the_call_a_reserved_result_is_owed_to(
     env: WorkflowEnvironment,
 ) -> None:
@@ -578,7 +581,7 @@ async def test_a_new_owner_reads_back_the_call_a_reserved_result_is_owed_to(
         assert state.pending_request_id == filing.metadata.request_id
 
 
-@pytest.mark.network
+@pytest.mark.durable
 async def test_a_committed_presentation_replays_its_acknowledgement(
     env: WorkflowEnvironment,
 ) -> None:
@@ -602,7 +605,7 @@ async def test_a_committed_presentation_replays_its_acknowledgement(
         assert await refused(caller.stream.commit_presentation(second)) == "already_presented"
 
 
-@pytest.mark.network
+@pytest.mark.durable
 @pytest.mark.parametrize("cut", [SEAL_ATTEMPT, GRADE_ATTEMPT, GENERATE_PAYLOAD_BUNDLE])
 async def test_a_prepared_seal_outlives_the_owner_that_prepared_it(
     env: WorkflowEnvironment, cut: str
@@ -682,7 +685,7 @@ async def test_a_prepared_seal_outlives_the_owner_that_prepared_it(
     await stream_replayer().replay_workflow(await second.stream.handle.fetch_history())
 
 
-@pytest.mark.network
+@pytest.mark.durable
 async def test_a_new_owner_continues_a_seal_it_kept_nothing_of(env: WorkflowEnvironment) -> None:
     """A filing prepared by a process that is gone, continued by one that never saw it.
 
@@ -749,7 +752,7 @@ async def test_a_new_owner_continues_a_seal_it_kept_nothing_of(env: WorkflowEnvi
         assert (after.materialization_count, after.offer_count) == (1, 2)
 
 
-@pytest.mark.network
+@pytest.mark.durable
 async def test_a_question_about_the_queue_never_displaces_a_prepared_seal(
     env: WorkflowEnvironment,
 ) -> None:
@@ -812,7 +815,7 @@ async def test_a_question_about_the_queue_never_displaces_a_prepared_seal(
         assert json.loads(answer.visible_text)["consumed"] == 1
 
 
-@pytest.mark.network
+@pytest.mark.durable
 async def test_an_acknowledgement_offered_before_the_cut_is_replayed_not_reissued(
     env: WorkflowEnvironment,
 ) -> None:
@@ -849,7 +852,7 @@ async def test_an_acknowledgement_offered_before_the_cut_is_replayed_not_reissue
         )
 
 
-@pytest.mark.network
+@pytest.mark.durable
 async def test_a_blob_is_verified_before_an_event_may_reference_it(
     env: WorkflowEnvironment, tmp_path: Path
 ) -> None:
@@ -895,7 +898,7 @@ async def test_a_blob_is_verified_before_an_event_may_reference_it(
         assert await refused(caller.pull()) == "fenced_writer"
 
 
-@pytest.mark.network
+@pytest.mark.durable
 async def test_a_resume_reads_what_the_committed_events_reference(
     env: WorkflowEnvironment, tmp_path: Path
 ) -> None:
@@ -940,7 +943,7 @@ async def test_a_resume_reads_what_the_committed_events_reference(
         assert receipt.ownership_epoch == 2
 
 
-@pytest.mark.network
+@pytest.mark.durable
 async def test_a_resume_reads_what_committed_while_it_was_reading(
     env: WorkflowEnvironment, tmp_path: Path
 ) -> None:
@@ -1035,7 +1038,7 @@ async def test_a_resume_reads_what_committed_while_it_was_reading(
         assert reads[-1] == (descriptor, task_blob, wait_blob)
 
 
-@pytest.mark.network
+@pytest.mark.durable
 async def test_a_directory_resume_is_held_to_what_its_new_owner_serves(
     env: WorkflowEnvironment, tmp_path: Path
 ) -> None:
@@ -1076,7 +1079,7 @@ async def test_a_directory_resume_is_held_to_what_its_new_owner_serves(
         assert (await taken.stream_state()).ownership_epoch == 2
 
 
-@pytest.mark.network
+@pytest.mark.durable
 async def test_a_generation_that_says_two_versions_serves_nothing(
     env: WorkflowEnvironment,
 ) -> None:

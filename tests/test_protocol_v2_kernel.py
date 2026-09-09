@@ -1,8 +1,9 @@
 """The durable stream kernel: what one generation will and will not do.
 
 The tests below drive a real workflow through the same Updates a gateway uses, on Temporal's
-time-skipping test environment. They are marked ``network`` because that environment downloads
-a test server on first use, and they skip rather than fail when it is not there.
+time-skipping test environment. They are marked ``durable``: the test server that environment
+runs on is prepared before the suite is, so these run in the offline suite, and a machine that was
+prepared and has no binary fails naming it rather than skipping.
 
 What they are pinning is the order the protocol insists on. An offer is a reservation, so the
 same request gets the same bytes back until a presentation commits and an error afterwards,
@@ -84,6 +85,8 @@ from shogym.serve.protocol_v2.kernel.activities import (  # noqa: E402
 )
 from shogym.serve.protocol_v2.kernel.messages import GradeAttemptInput  # noqa: E402
 from tests._fixtures.policy_rows import registering_the_receipt  # noqa: E402
+from tests._fixtures.temporal_server import time_skipping_environment  # noqa: E402
+from tests._fixtures.upstream_gate import environmental_skip  # noqa: E402
 
 TASK_BODY = "file the report"
 FILING = {"answer": "42"}
@@ -286,9 +289,9 @@ async def failed(awaitable: Any) -> str:
 @pytest_asyncio.fixture
 async def env() -> AsyncIterator[WorkflowEnvironment]:
     try:
-        environment = await WorkflowEnvironment.start_time_skipping()
-    except Exception as error:
-        pytest.skip(f"the Temporal test server is unavailable: {error}")
+        environment = await time_skipping_environment()
+    except Exception as error:  # noqa: BLE001 - an unusable server is the machine's, not the test's
+        environmental_skip(f"the Temporal test server is unavailable: {error}")
     async with environment:
         yield environment
 
@@ -312,7 +315,7 @@ async def caller(env: WorkflowEnvironment) -> AsyncIterator[Caller]:
         yield await open_stream(env)
 
 
-@pytest.mark.network
+@pytest.mark.durable
 async def test_one_task_from_offer_to_done(caller: Caller) -> None:
     """Task, SealAck, Payload, Done: the whole loop, byte for byte."""
     task = await caller.pull()
@@ -356,7 +359,7 @@ async def test_one_task_from_offer_to_done(caller: Caller) -> None:
     assert outcome.cursor == DONE_ID
 
 
-@pytest.mark.network
+@pytest.mark.durable
 async def test_a_declared_budget_rides_every_task_the_generation_offers(env) -> None:
     """The budget is the generation's, so it is the same number on every task and it is minted
     once. A retry replays the bytes that were minted rather than building the record again, which
@@ -383,7 +386,7 @@ async def test_a_declared_budget_rides_every_task_the_generation_offers(env) -> 
         assert second.visible_text == GOLDEN_SECOND_BUDGETED_TASK
 
 
-@pytest.mark.network
+@pytest.mark.durable
 async def test_a_full_capacity_waits_and_every_early_poll_is_its_own_message(env) -> None:
     """A busy stream never drains itself, and a poll before readiness is a new Wait."""
     async with stream_worker(env.client):
@@ -407,7 +410,7 @@ async def test_a_full_capacity_waits_and_every_early_poll_is_its_own_message(env
         assert state.attempts[oid(0x104)] == "planned"
 
 
-@pytest.mark.network
+@pytest.mark.durable
 async def test_an_offer_belongs_to_its_request_until_it_is_presented(caller: Caller) -> None:
     """A retry replays the offer, a changed retry conflicts, a new request never inherits it."""
     request = caller.pull_request()
@@ -444,7 +447,7 @@ async def test_an_offer_belongs_to_its_request_until_it_is_presented(caller: Cal
     assert await refused(caller.stream.pull(stale)) == "invalid_cursor"
 
 
-@pytest.mark.network
+@pytest.mark.durable
 async def test_a_presentation_is_verified_not_believed(caller: Caller) -> None:
     """Wrong bytes, a stale cursor, and a missing checkpoint are all refused."""
     task = await caller.pull()
@@ -474,7 +477,7 @@ async def test_a_presentation_is_verified_not_believed(caller: Caller) -> None:
     await caller.present(task)
 
 
-@pytest.mark.network
+@pytest.mark.durable
 async def test_a_terminal_request_seals_once_and_replays_until_presented(caller: Caller) -> None:
     """One seal, one score, one acknowledgement, however many times it is asked for."""
     await caller.take()
@@ -520,7 +523,7 @@ async def test_a_terminal_request_seals_once_and_replays_until_presented(caller:
     assert state.obligations[ATTEMPT] == "eligible"
 
 
-@pytest.mark.network
+@pytest.mark.durable
 async def test_malformed_arguments_are_rejected_without_touching_the_attempt(
     caller: Caller,
 ) -> None:
@@ -540,7 +543,7 @@ async def test_malformed_arguments_are_rejected_without_touching_the_attempt(
     assert ack.visible_text == GOLDEN_ACK
 
 
-@pytest.mark.network
+@pytest.mark.durable
 @pytest.mark.parametrize(
     "corrupted",
     ["seal", "seal_version", "grade", "grade_seal", "bundle", "bundle_filing", "bundle_count"],
@@ -750,7 +753,7 @@ async def test_a_recorded_seal_that_answered_under_another_version_replays_to_it
     )
 
 
-@pytest.mark.network
+@pytest.mark.durable
 async def test_done_waits_for_the_last_payload(env) -> None:
     """A closed and empty queue is not enough: a live task or an undelivered payload is."""
     async with stream_worker(env.client):
@@ -770,7 +773,7 @@ async def test_done_waits_for_the_last_payload(env) -> None:
         assert (await caller.pull()).kind == "done"
 
 
-@pytest.mark.network
+@pytest.mark.durable
 async def test_the_generation_has_one_consumer_and_one_call_in_flight(env) -> None:
     """A second consumer and an overlapping call are both refused before any mutation."""
 
@@ -803,7 +806,7 @@ async def test_the_generation_has_one_consumer_and_one_call_in_flight(env) -> No
         assert (await sealing).kind == "seal_ack"
 
 
-@pytest.mark.network
+@pytest.mark.durable
 async def test_the_stream_holds_itself_for_a_call_it_will_never_see(caller: Caller) -> None:
     """An ordinary environment call reaches a world this stream cannot see, so it decides it.
 
@@ -850,7 +853,7 @@ async def test_the_stream_holds_itself_for_a_call_it_will_never_see(caller: Call
     assert (await caller.seal()).kind == "seal_ack"
 
 
-@pytest.mark.network
+@pytest.mark.durable
 async def test_the_stream_outlives_its_worker(env) -> None:
     """Stop the worker mid-attempt, start another, and the stream carries on where it was."""
     # Without a sticky cache the server does not hold the stream's tasks for a Worker that has
@@ -874,7 +877,7 @@ async def test_the_stream_outlives_its_worker(env) -> None:
     await stream_replayer().replay_workflow(history)
 
 
-@pytest.mark.network
+@pytest.mark.durable
 async def test_a_version_one_generation_never_starts(env) -> None:
     """The kernel serves protocol v2 and refuses to guess at anything else."""
     async with stream_worker(env.client):
@@ -891,7 +894,7 @@ async def test_a_version_one_generation_never_starts(env) -> None:
         assert protocol_error_code(caught.value.cause) == "unsupported_version"
 
 
-@pytest.mark.network
+@pytest.mark.durable
 @pytest.mark.parametrize("budget", [0, -1, 2**53])
 async def test_a_generation_declaring_a_budget_no_task_could_carry_never_starts(
     env, budget: Any
@@ -912,7 +915,7 @@ async def test_a_generation_declaring_a_budget_no_task_could_carry_never_starts(
         assert protocol_error_code(caught.value.cause) == "invalid_message"
 
 
-@pytest.mark.network
+@pytest.mark.durable
 @pytest.mark.parametrize("capacity", [0, -1, 2**53])
 async def test_a_generation_whose_capacity_is_not_a_count_never_starts(env, capacity: Any) -> None:
     """How many attempts may be live at once decides what every pull can be answered with, so a
@@ -1008,7 +1011,7 @@ def test_the_worker_registers_the_stream_and_every_activity_it_schedules() -> No
 # ----- the info tool -----
 
 
-@pytest.mark.network
+@pytest.mark.durable
 async def test_an_info_answer_is_minted_offered_and_committed_like_a_pull(env) -> None:
     """The answer is a message of the generation's own, and it travels the way every other one
     does: reserved for the request that asked, presented under an attestation, and left in the
@@ -1042,7 +1045,7 @@ async def test_an_info_answer_is_minted_offered_and_committed_like_a_pull(env) -
         assert state.presentation_count == 1
 
 
-@pytest.mark.network
+@pytest.mark.durable
 async def test_a_generation_that_declares_no_info_tool_has_no_answer_to_give(caller) -> None:
     """The Update is reachable by anything holding the writer, so the refusal is the stream's
     rather than the transport's: a tool this generation does not serve is not a call it takes."""
@@ -1050,7 +1053,7 @@ async def test_a_generation_that_declares_no_info_tool_has_no_answer_to_give(cal
     assert (await caller.stream.stream_state()).offer_count == 0
 
 
-@pytest.mark.network
+@pytest.mark.durable
 async def test_a_retried_info_call_is_answered_with_the_bytes_it_reserved(env) -> None:
     """A retry replays a reservation rather than taking a second reading, so the answer cannot
     describe a stream that moved after the request that asked for it."""
@@ -1098,7 +1101,7 @@ async def test_a_retried_info_call_is_answered_with_the_bytes_it_reserved(env) -
         )
 
 
-@pytest.mark.network
+@pytest.mark.durable
 async def test_neither_a_pull_nor_an_info_call_overtakes_what_the_other_is_owed(env) -> None:
     """One answer is outstanding at a time, whichever tool asked for it."""
     async with stream_worker(env.client):
@@ -1116,7 +1119,7 @@ async def test_neither_a_pull_nor_an_info_call_overtakes_what_the_other_is_owed(
         await caller.present(task)
 
 
-@pytest.mark.network
+@pytest.mark.durable
 async def test_an_info_answer_is_held_to_the_bytes_the_stream_minted(env) -> None:
     """The presentation attests to what was offered, so an attestation over anything else
     commits nothing: the counts an agent was told are the counts the stream stands behind."""
@@ -1143,7 +1146,7 @@ async def test_an_info_answer_is_held_to_the_bytes_the_stream_minted(env) -> Non
         assert caller.cursor == answer.message_id
 
 
-@pytest.mark.network
+@pytest.mark.durable
 async def test_the_counts_follow_the_attempts_through_the_states_they_reach(env) -> None:
     """Handed out, still going, never handed out: one reading of each as the work moves.
 
@@ -1194,7 +1197,7 @@ async def test_the_counts_follow_the_attempts_through_the_states_they_reach(env)
         assert counted["remaining"] + counted["consumed"] + 1 == len(state.attempts)
 
 
-@pytest.mark.network
+@pytest.mark.durable
 async def test_an_attempt_the_generation_ended_after_handing_it_over_stays_consumed(env) -> None:
     """A deadline ends an attempt that was handed out, so what it leaves is a consumed attempt
     that is no longer in flight rather than one the counts forget."""
@@ -1215,7 +1218,7 @@ async def test_an_attempt_the_generation_ended_after_handing_it_over_stays_consu
         assert (await caller.stream.stream_state()).attempts[ATTEMPT] == "final_failed"
 
 
-@pytest.mark.network
+@pytest.mark.durable
 async def test_at_capacity_eight_in_flight_counts_every_attempt_that_is_being_worked(env) -> None:
     """Capacity changes how many attempts can be live, not what the three names mean."""
     async with stream_worker(env.client):
@@ -1240,7 +1243,7 @@ async def test_at_capacity_eight_in_flight_counts_every_attempt_that_is_being_wo
         assert (counted["remaining"], counted["consumed"], counted["in_flight"]) == (1, 8, 8)
 
 
-@pytest.mark.network
+@pytest.mark.durable
 async def test_the_info_tool_answers_between_a_seal_and_the_next_pull(env) -> None:
     """The moment an agent asks is the moment between finishing one task and asking for the
     next, and the tool is not tied to a pull, so that is a moment it answers in."""

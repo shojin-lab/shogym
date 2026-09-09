@@ -6,8 +6,9 @@ because the schedule is invisible from the model's side and has to stay that way
 generation under Immediate and the same one under Never differ only in what arrives between the
 tasks, and neither shows a tool, a field, or a count that says so.
 
-The gateway is built in process against the durable service. They are marked ``network``
-because that service downloads a test server on first use, and they skip when it is not there.
+The gateway is built in process against the durable service. They are marked ``durable``: the
+test server it runs on is prepared before the suite is, so these run in the offline suite, and a
+machine that was prepared and has no binary fails naming it rather than skipping.
 """
 
 from __future__ import annotations
@@ -96,6 +97,8 @@ from shogym.serve.protocol_v2.rundir import (  # noqa: E402
 )
 
 from tests._fixtures import score_env, score_mcp  # noqa: E402
+from tests._fixtures.temporal_server import time_skipping_environment  # noqa: E402
+from tests._fixtures.upstream_gate import environmental_skip  # noqa: E402
 
 TEST_ENV = "wordle_v1"
 # The env whose terminal takes an argument and whose per-session state can be read from out
@@ -153,9 +156,9 @@ ONE_OF_EVERY_KIND: Tuple[Any, ...] = (
 @pytest_asyncio.fixture
 async def env() -> AsyncIterator[WorkflowEnvironment]:
     try:
-        environment = await WorkflowEnvironment.start_time_skipping()
-    except Exception as error:  # noqa: BLE001 - an absent test server is a skip, not a failure
-        pytest.skip(f"the Temporal test server is unavailable: {error}")
+        environment = await time_skipping_environment()
+    except Exception as error:  # noqa: BLE001 - an unusable server is the machine's, not the test's
+        environmental_skip(f"the Temporal test server is unavailable: {error}")
     async with environment:
         yield environment
 
@@ -359,7 +362,7 @@ async def served(gateway: StreamGateway, *, limit: int = 200) -> List[Dict[str, 
     raise AssertionError("the generation never reached Done")
 
 
-@pytest.mark.network
+@pytest.mark.durable
 async def test_a_dose_of_twelve_tasks_and_their_payloads(serving_wordle, episode) -> None:
     """Task, acknowledgement, payload, twelve times, and then Done, as a model would see it."""
     serving, terminal = serving_wordle
@@ -390,7 +393,7 @@ async def test_a_dose_of_twelve_tasks_and_their_payloads(serving_wordle, episode
     assert await refused(gateway.pull({})) == "closed_stream"
 
 
-@pytest.mark.network
+@pytest.mark.durable
 async def test_a_declared_budget_reaches_the_model_on_every_task(serving_wordle, episode) -> None:
     """The number the agent reads is the step cap this transport enforces.
 
@@ -422,7 +425,7 @@ async def test_a_declared_budget_reaches_the_model_on_every_task(serving_wordle,
             assert set(record) == PUBLIC_KEYS[record["kind"]]
 
 
-@pytest.mark.network
+@pytest.mark.durable
 async def test_a_declared_info_tool_answers_the_model_through_the_whole_stack(
     serving_wordle, episode
 ) -> None:
@@ -501,7 +504,7 @@ async def test_a_declared_info_tool_answers_the_model_through_the_whole_stack(
     assert [row.message_id for row in presentations] == [record["message_id"] for record in shown]
 
 
-@pytest.mark.network
+@pytest.mark.durable
 async def test_the_same_dose_under_never_delivers_nothing(serving_wordle, episode) -> None:
     """The same twelve tasks with no payload between them, through the same tools."""
     serving, terminal = serving_wordle
@@ -522,7 +525,7 @@ async def test_the_same_dose_under_never_delivers_nothing(serving_wordle, episod
     assert state.assignment_count == DOSE
 
 
-@pytest.mark.network
+@pytest.mark.durable
 async def test_every_task_is_worked_in_a_world_of_its_own(serving) -> None:
     """Three tasks, three worlds. What a task inherits from the task before it is nothing.
 
@@ -575,7 +578,7 @@ async def test_every_task_is_worked_in_a_world_of_its_own(serving) -> None:
     assert [score_mcp.gold(world.session_id) for world in worlds] == ["", "", ""]
 
 
-@pytest.mark.network
+@pytest.mark.durable
 async def test_a_task_is_sealed_in_the_world_its_own_calls_reached(serving) -> None:
     """The attempt a world was opened for is said out loud, so a terminal can find that world.
 
@@ -634,7 +637,7 @@ async def test_a_task_is_sealed_in_the_world_its_own_calls_reached(serving) -> N
     assert len(route) == 2
 
 
-@pytest.mark.network
+@pytest.mark.durable
 async def test_two_tasks_are_held_at_once_and_each_call_lands_in_its_own_world(serving) -> None:
     """A capacity above one is several live attempts, each working in a world of its own.
 
@@ -709,7 +712,7 @@ async def test_two_tasks_are_held_at_once_and_each_call_lands_in_its_own_world(s
     assert len({world.session_id for world in order}) == 3
 
 
-@pytest.mark.network
+@pytest.mark.durable
 async def test_two_live_attempts_are_sealed_and_paid_out_from_their_own_worlds(
     serving_wordle,
 ) -> None:
@@ -777,7 +780,7 @@ async def test_two_live_attempts_are_sealed_and_paid_out_from_their_own_worlds(
     assert json.loads(await gateway.pull({}))["kind"] == "done"
 
 
-@pytest.mark.network
+@pytest.mark.durable
 async def test_a_world_handed_to_a_replacement_is_the_world_its_seal_captures(
     serving_wordle,
 ) -> None:
@@ -840,7 +843,7 @@ async def test_a_world_handed_to_a_replacement_is_the_world_its_seal_captures(
     await replacement.aclose()
 
 
-@pytest.mark.network
+@pytest.mark.durable
 async def test_a_pull_past_the_capacity_waits_and_says_nothing_about_why(serving) -> None:
     """The tasks a generation holds out at once are its capacity, and the next pull is a Wait.
 
@@ -885,7 +888,7 @@ async def test_a_pull_past_the_capacity_waits_and_says_nothing_about_why(serving
     await gateway.aclose()
 
 
-@pytest.mark.network
+@pytest.mark.durable
 async def test_a_pull_at_a_full_capacity_still_answers_what_is_ready(serving) -> None:
     """A full capacity stops tasks being offered and stops nothing else, as the words say.
 
@@ -992,7 +995,7 @@ def how_it_went(state: Any) -> Dict[str, Any]:
     }
 
 
-@pytest.mark.network
+@pytest.mark.durable
 async def test_a_generation_at_eight_serves_a_one_at_a_time_agent_the_way_one_does(
     serving_wordle,
 ) -> None:
@@ -1042,7 +1045,7 @@ async def test_a_generation_at_eight_serves_a_one_at_a_time_agent_the_way_one_do
     assert (after_one.capacity, after_eight.capacity) == (1, 8)
 
 
-@pytest.mark.network
+@pytest.mark.durable
 async def test_a_world_that_would_not_open_leaves_the_task_where_it_was(
     serving_wordle, episode
 ) -> None:
@@ -1091,7 +1094,7 @@ async def test_a_world_that_would_not_open_leaves_the_task_where_it_was(
     await gateway.aclose()
 
 
-@pytest.mark.network
+@pytest.mark.durable
 async def test_a_world_that_would_not_close_leaves_the_acknowledgement_where_it_was(
     serving_wordle, episode
 ) -> None:
@@ -1204,7 +1207,7 @@ async def test_a_world_is_retired_when_its_attempt_ends_without_a_seal() -> None
         await gateway.aclose()
 
 
-@pytest.mark.network
+@pytest.mark.durable
 async def test_a_deadline_closes_the_world_of_the_attempt_it_ended(serving) -> None:
     """A deadline reaches an attempt that is still working, and the world goes with the attempt.
 
@@ -1253,7 +1256,7 @@ async def test_a_deadline_closes_the_world_of_the_attempt_it_ended(serving) -> N
     await gateway.aclose()
 
 
-@pytest.mark.network
+@pytest.mark.durable
 async def test_a_deadline_that_reaches_several_live_attempts_closes_every_one_of_their_worlds(
     serving,
 ) -> None:
@@ -1346,7 +1349,7 @@ def ending_is_visible(
     return Waited()
 
 
-@pytest.mark.network
+@pytest.mark.durable
 async def test_a_call_that_spans_its_deadline_lets_the_world_go_before_it_answers(serving) -> None:
     """The deadline of the attempt this call is in falls due while the call is in its world.
 
@@ -1402,7 +1405,7 @@ async def test_a_call_that_spans_its_deadline_lets_the_world_go_before_it_answer
     await gateway.aclose()
 
 
-@pytest.mark.network
+@pytest.mark.durable
 async def test_a_landed_observation_collected_after_its_deadline_lets_the_world_go(serving) -> None:
     """The same ending, reached by the call that comes back for an observation it never got.
 
@@ -1458,7 +1461,7 @@ async def test_a_landed_observation_collected_after_its_deadline_lets_the_world_
     await gateway.aclose()
 
 
-@pytest.mark.network
+@pytest.mark.durable
 async def test_a_call_that_fails_after_its_deadline_lets_the_world_go_all_the_same(serving) -> None:
     """The call the ending was made inside failed, and the world it was in goes anyway.
 
@@ -1509,7 +1512,7 @@ async def test_a_call_that_fails_after_its_deadline_lets_the_world_go_all_the_sa
     await gateway.aclose()
 
 
-@pytest.mark.network
+@pytest.mark.durable
 async def test_a_lease_given_back_a_second_time_lets_go_of_what_that_release_ended(serving) -> None:
     """A call that landed nothing comes back, gives its grant back, and finds its attempt over.
 
@@ -1565,7 +1568,7 @@ async def test_a_lease_given_back_a_second_time_lets_go_of_what_that_release_end
     await gateway.aclose()
 
 
-@pytest.mark.network
+@pytest.mark.durable
 async def test_a_retirement_that_cannot_close_one_world_still_closes_the_others(serving) -> None:
     """A world that will not close is one world, and the ended ones beside it are still retired.
 
@@ -1626,7 +1629,7 @@ async def test_a_retirement_that_cannot_close_one_world_still_closes_the_others(
     await gateway.aclose()
 
 
-@pytest.mark.network
+@pytest.mark.durable
 async def test_eight_tasks_are_held_at_once_and_each_of_the_eight_worlds_stands_up(
     serving,
 ) -> None:
@@ -1754,7 +1757,7 @@ async def test_a_stream_that_never_started_leaves_no_generation_to_resume(
     assert open_run_directory(root).manifest == run.manifest
 
 
-@pytest.mark.network
+@pytest.mark.durable
 async def test_a_generation_no_manifest_ever_named_does_not_stay_running(
     serving: WorkflowEnvironment,
     episode: ServedEpisode,
@@ -1854,7 +1857,7 @@ async def test_a_manifest_arrives_whole_or_leaves_the_directory_as_it_was(
     assert open_run_directory(root).manifest == run.manifest
 
 
-@pytest.mark.network
+@pytest.mark.durable
 async def test_a_run_this_call_composed_can_still_be_taken_over(
     serving: WorkflowEnvironment, episode: ServedEpisode, tmp_path: Path
 ) -> None:
@@ -1893,7 +1896,7 @@ async def opened_run(
     )
 
 
-@pytest.mark.network
+@pytest.mark.durable
 async def test_a_budgeted_generation_is_taken_over_with_the_number_it_declared(
     serving_wordle: Tuple[WorkflowEnvironment, EnvironmentTerminal],
     episode: ServedEpisode,

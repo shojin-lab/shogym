@@ -9,8 +9,8 @@ sequence, so the environment outcome is deterministic regardless of the (LLM) us
 simulator's replies — making the equality assertion robust, while the real user simulator is
 still exercised (its opening turn) and therefore requires ``OPENAI_API_KEY``.
 
-Skipped when the key is absent, so offline CI stays green; run it with a key to confirm
-real-user-sim fidelity.
+Skipped when the key is absent, and marked ``network`` besides, so the offline suite deselects
+it on a machine that has one; run it with a key to confirm real-user-sim fidelity.
 """
 
 from __future__ import annotations
@@ -30,6 +30,12 @@ mcp_server = gate("shogym.envs.tau2.mcp_server", package="tau2", extra="tau2")
 
 if not os.getenv("OPENAI_API_KEY"):
     pytest.skip("OPENAI_API_KEY not set; keyed fidelity test skipped", allow_module_level=True)
+
+# The skip above is what a keyless machine does, and it is not the same statement as the mark.
+# A machine that has a key runs the real user simulator against a third party, so the suite that
+# promises to reach none has to deselect these by name rather than by trusting that nobody
+# exported one.
+pytestmark = pytest.mark.network
 
 from shogym.serve import ServedEpisode  # noqa: E402
 
