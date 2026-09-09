@@ -224,6 +224,7 @@ SHARDS: Tuple[Shard, ...] = (
             "tests/test_protocol_v2_artifact.py",
             "tests/test_protocol_v2_artifact_carry.py",
             "tests/test_protocol_v2_blobs.py",
+            "tests/test_protocol_v2_fork_values.py",
             "tests/test_protocol_v2_gateway.py",
             "tests/test_protocol_v2_operation_failures.py",
             "tests/test_protocol_v2_receipt_policies.py",

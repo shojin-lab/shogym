@@ -43,6 +43,7 @@ from shogym.serve.protocol_v2 import (  # noqa: E402
     TASK_FIRST,
     Payload,
     PresentationAck,
+    PullRequest,
     ReleasePlan,
     SealAck,
     Task,
@@ -71,24 +72,33 @@ from shogym.serve.protocol_v2.errors import WireFormatError  # noqa: E402
 from shogym.serve.protocol_v2.kernel import (  # noqa: E402
     FORK_CARRIER_SCHEMA_VERSION,
     LEGACY_CARRIER_SCHEMA_VERSION,
+    ORIGIN_UNVERIFIED,
     RECEIPT_CARRIER_SCHEMA_VERSION,
     CarriedProjection,
     ChildSelection,
     ForkOrigin,
     OfferedMessage,
+    OwnershipClaim,
     PayloadCandidate,
+    PreparedChild,
     PresentedMessage,
     SourceOriginContext,
     StartDifference,
     StreamStart,
     TaskItem,
     TerminalTool,
+    Writer,
     carrier_version,
+    child_carrier,
+    child_workflow_id,
+    complete_start_digest,
     configuration_hash,
     continuation_argument,
     derived_selection,
     fork_configuration,
     hidden_seal_id,
+    origin_digest,
+    start_difference_projection,
     stream_replayer,
     transformed_child_selection,
 )
@@ -2745,3 +2755,469 @@ def test_a_gated_child_projection_is_written_over_the_state_its_start_rebuilt(
     # carry that lost its candidate.
     handed_on = restored._projection().obligations
     assert [(owed.attempt_id, owed.pending_preparation) for owed in handed_on] == [(ATTEMPT, True)]
+
+
+# The door a fresh child comes in through, and what it may do before its lineage is authorized.
+
+#: The namespace the run's identities are derived under, which is what makes a child's own
+#: identity a value nothing mints.
+NAMESPACE = "default"
+
+
+def a_child_id(ordinal: int) -> str:
+    """The identity that child of that parent is derived under."""
+    return child_workflow_id(
+        identity_namespace=NAMESPACE,
+        parent_workflow_id="stream/the-parent/1",
+        fork_id=FORK,
+        child_ordinal=ordinal,
+    )
+
+
+def a_fresh_child(
+    *, cell: str = PLACEBO_CELL, presented: bool = False, **changes: Any
+) -> StreamStart:
+    """One child exactly as its parent hands it over: its own start, its parent's whole carry.
+
+    The carrier is the two transformations a parent makes and no third, packed at the version a
+    fork writes, so this is the value a fresh child's own constructor reads rather than a
+    projection composed for a check. The lineage carries the difference projection the parent
+    computed over the two starts, which is what the child compares its own members against.
+    """
+    parent = a_fork_parent()
+    child = a_child_start(cell=cell, slot=SINGLETON_SLOT)
+    origin = child.fork_origin
+    assert origin is not None
+    composed = a_projection(parent)
+    carried = child_carrier(
+        replace(
+            composed,
+            presented=_committed_messages(parent.tasks) if presented else composed.presented,
+        ),
+        selections=[
+            ChildSelection(attempt_id=ATTEMPT, cell=cell, policy_digest=CELL_POLICIES[cell])
+        ],
+    )
+    handed = replace(
+        child,
+        fork_origin=replace(
+            origin, start_differences=start_difference_projection(parent, child)
+        ),
+        carry=pack_carrier(carried, CONVERTER, version=FORK_CARRIER_SCHEMA_VERSION),
+    )
+    return replace(handed, **changes) if changes else handed
+
+
+def a_recorded_row(child: StreamStart, **changes: Any) -> PreparedChild:
+    """The parent's immutable row for that child, which is the authority the child asks against."""
+    origin = child.fork_origin
+    assert origin is not None
+    delivered = next(row for row in child.dispositions if row.kind == DELIVER)
+    declared = PreparedChild(
+        child_ordinal=origin.child_ordinal,
+        child_workflow_id=a_child_id(origin.child_ordinal),
+        complete_start_digest=complete_start_digest(child),
+        origin_digest=origin_digest(origin),
+        branch_slot=child.served_slot,
+        target_cell=delivered.cell,
+        selected_body_reference=digest_of(BODIES[delivered.cell]),
+        consumer_claim_hash=child.consumer_claim_hash,
+        hidden_execution_id=child.hidden_execution_id,
+        start_differences=list(origin.start_differences),
+    )
+    return replace(declared, **changes) if changes else declared
+
+
+def serving_as(
+    monkeypatch: pytest.MonkeyPatch, *, workflow_id: str, continued: Optional[str] = None
+) -> None:
+    """Run the constructor as the service would: under this identity, continuing that run."""
+    monkeypatch.setattr(kernel_workflow.workflow, "payload_converter", lambda: CONVERTER)
+    monkeypatch.setattr(
+        kernel_workflow.workflow,
+        "info",
+        lambda: SimpleNamespace(workflow_id=workflow_id, continued_run_id=continued),
+    )
+
+
+def refused_start(start: StreamStart) -> str:
+    """Construct this generation, and return what its own constructor refused it with."""
+    with pytest.raises(ApplicationError) as raised:
+        kernel_workflow.StreamWorkflow(start)
+    assert raised.value.type == "CarrierRefused"
+    return str(raised.value)
+
+
+def a_claim(child: StreamStart, **changes: Any) -> OwnershipClaim:
+    """The first claim a child's own gateway makes, which is a claim like any other."""
+    declared = OwnershipClaim(
+        claimant_id="the child's own gateway",
+        previous_epoch=0,
+        fencing_token="c" * 64,
+        configuration_hash=configuration_hash(child),
+        reason="fresh",
+    )
+    return replace(declared, **changes) if changes else declared
+
+
+def test_a_fresh_child_restores_through_the_door_its_own_lineage_opens(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The entry this build did not have: a start the service created fresh, holding a carry.
+
+    A carry is legal in four entries. This is the second of them: the child was created rather
+    than continued, it carries the projection its parent composed, and what admits that carry is
+    the parent hash its own lineage records. It comes up holding the whole inherited prefix, with
+    its own selection, no candidate, the gate its preparation clears, and a first claim to make.
+    """
+    serving_as(monkeypatch, workflow_id=a_child_id(1))
+    child = a_fresh_child()
+    restored = kernel_workflow.StreamWorkflow(child)
+
+    origin = child.fork_origin
+    assert origin is not None
+    assert restored._origin_unverified
+    assert restored._cursor == origin.acknowledged_cursor
+    assert restored._seal_ordinal == origin.source_seal_ordinal
+    # Ownership is a first claim's to install, and the parent's token can never write here.
+    assert (restored._ownership_epoch, restored._fencing_token_hash) == (0, None)
+    owed = restored._obligations[ATTEMPT]
+    assert (owed.pending_preparation, owed.candidate, owed.materialized) == (True, None, True)
+    # The source evidence crosses the entry exactly as its parent committed it, which is what
+    # makes the seal the child inherits the parent's filing rather than a copy of one. Only the
+    # selected delivery moved, and it moved where the parent built the start.
+    attempt = restored._attempts[ATTEMPT]
+    inherited = a_row()
+    assert attempt.source_artifact == a_manifest()
+    assert attempt.source_origin == SourceOriginContext(
+        hidden_execution_id=EXECUTION, execution_ordinal=0
+    )
+    assert attempt.seal_id == hidden_seal_id(EXECUTION, 0, ATTEMPT)
+    for name in (
+        "state",
+        "seal_id",
+        "submission_digest",
+        "score",
+        "decode_state",
+        "graded_evidence",
+        "seal_ordinal",
+        "source_commitment",
+        "receipt_contract_id",
+        "presentation_references",
+    ):
+        assert getattr(attempt, name) == getattr(inherited, name), name
+    assert attempt.selected_cell == PLACEBO_CELL != inherited.selected_cell
+    assert attempt.selected_body_reference == digest_of(BODIES[PLACEBO_CELL])
+    assert attempt.selected_policy_digest == PLACEBO_RECEIPT_ARTIFACT_V1_DIGEST
+
+    # And the door stays shut for the generation that carries no lineage at all.
+    assert "started fresh" in refused_start(replace(child, fork_origin=None))
+
+
+def test_a_generation_cut_from_a_fork_and_handed_no_projection_is_refused(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A child is the prefix it inherited, so a lineage with nothing behind it is not one.
+
+    Both ways round: created with a lineage and no carry, and continued with neither.
+    """
+    serving_as(monkeypatch, workflow_id=a_child_id(1))
+    alone = replace(a_fresh_child(), carry=None)
+    assert "no carried projection" in refused_start(alone)
+
+    serving_as(monkeypatch, workflow_id=a_child_id(1), continued="the childs earlier run")
+    assert "no carried projection" in refused_start(alone)
+
+
+def test_a_fresh_childs_carrier_is_admitted_by_the_hash_its_lineage_recorded(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Which hash the comparison is against is the whole of this, and it is the parent's.
+
+    A fresh child holds its parent's carry, so the identity inside it is the parent's. Comparing
+    it against the child's own would admit a carrier composed for this child by anybody, and
+    refuse the one its parent actually handed over.
+    """
+    serving_as(monkeypatch, workflow_id=a_child_id(1))
+    child = a_fresh_child()
+    for hash_of in (configuration_hash(child), "0" * 64):
+        composed = replace(
+            child_carrier(
+                a_projection(a_fork_parent()),
+                selections=[
+                    ChildSelection(
+                        attempt_id=ATTEMPT,
+                        cell=PLACEBO_CELL,
+                        policy_digest=CELL_POLICIES[PLACEBO_CELL],
+                    )
+                ],
+            ),
+            configuration_hash=hash_of,
+        )
+        elsewhere = replace(
+            child,
+            carry=pack_carrier(composed, CONVERTER, version=FORK_CARRIER_SCHEMA_VERSION),
+        )
+        assert "other than the parent its lineage names" in refused_start(elsewhere)
+
+
+def test_a_fresh_child_cut_somewhere_its_carrier_does_not_stand_is_refused(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The cursor and the filing count the lineage names are the ones the carrier holds.
+
+    Both are fresh-entry comparisons: they say where this child was cut, and a carrier standing
+    anywhere else is a projection from another moment of the parent's life.
+    """
+    serving_as(monkeypatch, workflow_id=a_child_id(1))
+    child = a_fresh_child()
+    origin = child.fork_origin
+    assert origin is not None
+    moved = replace(
+        child, fork_origin=replace(origin, acknowledged_cursor=oid(0x999))
+    )
+    assert "cut at the cursor" in refused_start(moved)
+    counted = replace(child, fork_origin=replace(origin, source_seal_ordinal=2))
+    assert "cut over 2 filings" in refused_start(counted)
+
+
+def test_a_lineage_this_build_cannot_read_or_that_names_another_child_is_refused(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Two every-entry checks, so a child that fails either refuses whole at any entry.
+
+    A lineage record is immutable provenance rather than an authorization of anything, and a
+    child that has continued twice still has to be the child that record was written about.
+    """
+    child = a_fresh_child()
+    origin = child.fork_origin
+    assert origin is not None
+    unreadable = replace(
+        child, fork_origin=replace(origin, schema_version=origin.schema_version + 1)
+    )
+    another = replace(child, fork_origin=replace(origin, child_configuration_hash="0" * 64))
+    continued = a_continued_child()
+    onwards = continued.fork_origin
+    assert onwards is not None
+    for entry, unread, mistaken in (
+        (None, unreadable, another),
+        (
+            "the childs earlier run",
+            replace(
+                continued,
+                fork_origin=replace(onwards, schema_version=onwards.schema_version + 1),
+            ),
+            replace(continued, fork_origin=replace(onwards, child_configuration_hash="0" * 64)),
+        ),
+    ):
+        serving_as(monkeypatch, workflow_id=a_child_id(1), continued=entry)
+        assert "not one this build reads" in refused_start(unread)
+        assert "records another generation's identity" in refused_start(mistaken)
+
+
+def a_continued_child(**changes: Any) -> StreamStart:
+    """That same child at its own later boundary: its own carry, its lineage retained.
+
+    The carrier holds this child's own identity, because the child composed it, and it stands
+    past the cursor and the filing count the lineage records, because a continued child has
+    advanced past them lawfully.
+    """
+    child = a_fresh_child(presented=True)
+    parent = a_fork_parent()
+    composed = child_carrier(
+        a_projection(parent),
+        selections=[
+            ChildSelection(
+                attempt_id=ATTEMPT,
+                cell=PLACEBO_CELL,
+                policy_digest=CELL_POLICIES[PLACEBO_CELL],
+            )
+        ],
+    )
+    onwards = replace(
+        composed,
+        configuration_hash=configuration_hash(child),
+        cursor=oid(0x103),
+        seal_ordinal=2,
+        presented=_committed_messages(parent.tasks),
+        ownership_epoch=1,
+        fencing_token_hash="a" * 64,
+        consumer_id="the child's own gateway",
+        claim_epoch=1,
+    )
+    carried = replace(
+        child, carry=pack_carrier(onwards, CONVERTER, version=FORK_CARRIER_SCHEMA_VERSION)
+    )
+    return replace(carried, **changes) if changes else carried
+
+
+def test_a_child_continuation_is_authorized_by_the_service_and_by_its_own_identity(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The fourth legal entry, and the half of the matrix that is not reapplied to it.
+
+    A continued child's carry is its own, authorized by the service's continuation fact and
+    compared against this start's own identity rather than against the parent hash its lineage
+    records. The cursor and the filing count that lineage names are not compared at all: the
+    child has advanced past them lawfully, and the rows it presented since are its own work
+    rather than a mutation of the prefix it inherited. Its lineage is retained through all of it,
+    authorizing nothing about the carry beside it.
+    """
+    serving_as(
+        monkeypatch, workflow_id=a_child_id(1), continued="the childs earlier run"
+    )
+    child = a_continued_child()
+    restored = kernel_workflow.StreamWorkflow(child)
+
+    origin = child.fork_origin
+    assert origin is not None
+    assert restored._cursor == oid(0x103) != origin.acknowledged_cursor
+    assert restored._seal_ordinal == 2 != origin.source_seal_ordinal
+    assert restored._start.fork_origin == origin
+    # The rows it added after the cut are its own lawful work and are kept whole.
+    assert list(restored._presented) == [
+        row.message_id for row in _committed_messages(a_fork_parent().tasks)
+    ]
+    # And it is not gated again: the comparison against the parent it was cut from was made at
+    # the entry that was cut, and this execution is not that entry.
+    assert not restored._origin_unverified
+
+    # A continued child holding the carry its parent composed is refused, which is the other
+    # direction of the same rule: that carrier's identity is not this generation's.
+    parents = replace(child, carry=a_fresh_child().carry)
+    assert "another generation" in refused_start(parents)
+
+    # And a continuation that dropped its lineage is not an ordinary generation that never had
+    # one. The source it inherited was sealed under the parent's identity, and with the record
+    # gone nothing in the start vouches for that, so the carrier is refused whole.
+    assert "no fork origin of its own vouches for" in refused_start(
+        replace(child, fork_origin=None)
+    )
+
+
+def test_a_gated_child_owns_nothing_and_serves_nothing_until_its_lineage_is_authorized(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The gate, in the three places a child could otherwise spend what it was made for.
+
+    Every accepted Update is rejected before it is admitted, which costs the generation nothing
+    and leaves the same request under the same identifier reaching a child that has done its own
+    first work. Ownership is what a claim installs and serving is what a writer does, and the
+    handler-side reading of both says so too: the writer path says the generation has not
+    authorized its lineage rather than saying an owner that never existed fenced somebody.
+    """
+    serving_as(monkeypatch, workflow_id=a_child_id(1))
+    child = a_fresh_child()
+    restored = kernel_workflow.StreamWorkflow(child)
+    writer = Writer(ownership_epoch=0, fencing_token="c" * 64)
+
+    gated = (
+        lambda: restored._claim_ownership_admitted(a_claim(child)),
+        lambda: restored._pull_admitted(
+            PullRequest(request_id=oid(0x711), last_presented_cursor=oid(9)), writer
+        ),
+        lambda: restored._confirm_state_admitted(writer),
+        lambda: restored._check_claim(a_claim(child)),
+        lambda: restored._require_writer(writer),
+    )
+    for refused_call in gated:
+        with pytest.raises(ApplicationError) as raised:
+            refused_call()
+        assert raised.value.type == ORIGIN_UNVERIFIED
+
+    restored._admit_lineage(a_recorded_row(child))
+
+    assert not restored._origin_unverified
+    # The claim the gate was refusing is admitted now, and the writer path has gone back to
+    # answering the question it is there to answer: nobody owns this generation yet.
+    restored._claim_ownership_admitted(a_claim(child))
+    restored._check_claim(a_claim(child))
+    with pytest.raises(ApplicationError) as fenced:
+        restored._require_writer(writer)
+    assert fenced.value.type == "ProtocolError" and "fenced_writer" in str(fenced.value)
+
+    # And a generation cut from no fork is never gated at all.
+    serving_as(monkeypatch, workflow_id="stream/an-ordinary-one/1")
+    ordinary = kernel_workflow.StreamWorkflow(a_fork_parent())
+    assert not ordinary._origin_unverified
+    ordinary._check_claim(a_claim(a_fork_parent()))
+
+
+def test_a_child_the_parents_record_does_not_name_never_leaves_the_gate(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """An authentic start under the wrong identity passes every hash and cursor comparison.
+
+    So the identity this execution is actually running as is compared against the row the parent
+    committed, and a disagreement is permanent: the row came from the parent's own record, so
+    asking again returns the same two values. The gate stands afterwards.
+    """
+    serving_as(monkeypatch, workflow_id=a_child_id(0))
+    child = a_fresh_child()
+    restored = kernel_workflow.StreamWorkflow(child)
+    with pytest.raises(ApplicationError) as raised:
+        restored._admit_lineage(a_recorded_row(child))
+    assert raised.value.type == "OriginRefused"
+    assert "runs as" in str(raised.value)
+    assert restored._origin_unverified
+    with pytest.raises(ApplicationError) as still:
+        restored._check_claim(a_claim(child))
+    assert still.value.type == ORIGIN_UNVERIFIED
+
+
+def test_a_carried_row_altered_off_the_boundary_fails_the_complete_start_authorization(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """What the withdrawn row comparison was for, done by the digest that actually covers them.
+
+    A presented row's visible digest and an inherited score are both outside the projection hash,
+    which covers the presented message identifiers rather than the rows, so a carrier altered in
+    either place restores into a child whose cursor and projection digest are exactly the
+    parent's. The complete start digest covers the carrier those rows ride in, so each one moves
+    it, and the parent's record is what refuses them.
+    """
+    serving_as(monkeypatch, workflow_id=a_child_id(1))
+    child = a_fresh_child(presented=True)
+    restored = kernel_workflow.StreamWorkflow(child)
+    restored._admit_lineage(a_recorded_row(child))
+    authorized = restored._projection_hash()
+
+    carried = unpack_carrier(child.carry, CONVERTER) if child.carry is not None else None
+    assert carried is not None
+    altered = (
+        replace(
+            carried,
+            presented=[
+                replace(carried.presented[0], visible_bytes_sha256="0" * 64),
+                *carried.presented[1:],
+            ],
+        ),
+        replace(carried, attempts=[replace(carried.attempts[0], score=0.5)]),
+        replace(
+            carried,
+            attempts=[
+                replace(carried.attempts[0], selected_body_reference=digest_of(BODIES[GRADED_CELL]))
+            ],
+        ),
+    )
+    for moved in altered[:2]:
+        touched = replace(
+            child, carry=pack_carrier(moved, CONVERTER, version=FORK_CARRIER_SCHEMA_VERSION)
+        )
+        changed = kernel_workflow.StreamWorkflow(touched)
+        # Nothing a presentation attests against has moved.
+        assert changed._projection_hash() == authorized
+        assert changed._cursor == restored._cursor
+        with pytest.raises(ApplicationError) as raised:
+            changed._admit_lineage(a_recorded_row(child))
+        assert raised.value.type == "OriginRefused"
+        assert "complete start" in str(raised.value)
+        assert changed._origin_unverified
+
+    # An altered artifact reference moves that same digest, and it is refused a step earlier too:
+    # the checks that hold a selection to the source it is a cell of never let it restore at all.
+    reference = replace(
+        child, carry=pack_carrier(altered[2], CONVERTER, version=FORK_CARRIER_SCHEMA_VERSION)
+    )
+    assert complete_start_digest(reference) != a_recorded_row(child).complete_start_digest
+    assert "other than its source's own entry" in refused_start(reference)

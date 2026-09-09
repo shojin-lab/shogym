@@ -3941,6 +3941,7 @@ def test_a_carrier_this_code_cannot_read_is_refused_whole(
     )
     start = make_start(tasks=2)
     generation = StreamWorkflow.__new__(StreamWorkflow)
+    generation._start = start
     generation._continued = True
     generation._configuration_hash = configuration_hash(start)
     carrier = _a_carrier(start)
