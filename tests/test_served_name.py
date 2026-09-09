@@ -601,6 +601,8 @@ ATTEMPT = "0" * 31 + "1"
 TASK_ID = "0" * 31 + "2"
 ACK_ID = "0" * 31 + "3"
 CURSOR = "0" * 32
+#: What the service calls the generation this sweep serves.
+GENERATION = "stream/name/1"
 
 #: The canonicalization versions this repository declared before the cut. They are kept because
 #: the configuration hash of every run recorded under them was taken over them, so they are what
@@ -656,6 +658,7 @@ class OneAttemptStream:
 
     def __init__(self, version: str) -> None:
         self.version = version
+        self.handle = SimpleNamespace(id=GENERATION)
         self.cursor = CURSOR
         self.attempts: Dict[str, str] = {}
         self.environment_calls: Dict[str, int] = {}

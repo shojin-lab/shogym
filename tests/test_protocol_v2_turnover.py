@@ -955,6 +955,22 @@ def _without_the_token(receipt: OwnershipReceipt) -> Dict[str, Any]:
     }
 
 
+#: What a row's own generation reads as once it has been checked against the generation holding it.
+OWN_WORK = "the generation this record was read from"
+
+
+def _whose_work(records: List[Any], workflow_id: str) -> List[Any]:
+    """One generation's records, with whose work each row is given its expected value.
+
+    A row names the generation whose work it is, and two separate generations differ in that name
+    exactly as they differ in the identifier it is taken from. So the name is checked against this
+    generation and then read as the same thing on both sides, which keeps a value here rather than
+    an exclusion.
+    """
+    assert [row.source_generation for row in records] == [workflow_id] * len(records)
+    return [replace(row, source_generation=OWN_WORK) for row in records]
+
+
 async def _every_operation_a_gateway_can_make(
     client: Client, start: StreamStart, workflow_id: str, *, turnover_at=None
 ) -> List[Tuple[str, Any]]:
@@ -1048,7 +1064,7 @@ async def _every_operation_a_gateway_can_make(
     await note("kinds served to the end", [message.kind for message in seen])
     await note("messages served to the end", seen)
     records = await caller.stream.handle.query(StreamWorkflow.generation_records)
-    await note("attempt records", records.attempts)
+    await note("attempt records", _whose_work(records.attempts, workflow_id))
     await note("presentations", records.presentations)
     await note("every acknowledgement", list(caller.acknowledgements))
     await note("final state", _comparable(await caller.stream.stream_state()))
@@ -1340,7 +1356,7 @@ async def test_a_failure_after_a_boundary_names_the_activity_the_twin_would_have
             await caller.work(second)
         records = await caller.stream.handle.query(StreamWorkflow.generation_records)
         return {
-            "records": records.attempts,
+            "records": _whose_work(records.attempts, workflow_id),
             "presentations": records.presentations,
             "state": _comparable(await caller.stream.stream_state()),
         }
@@ -3509,7 +3525,9 @@ async def test_a_superseded_transports_retry_leaves_the_replacements_world_where
         task = await taking.pull(gateway._recovery.request)
         await taking.attest(task)
         live = SimpleNamespace(env="probe", session_id="live-world")
-        route.record(task.attempt_id or "", live, replacement.writer.ownership_epoch)
+        route.record(
+            workflow_id, task.attempt_id or "", live, replacement.writer.ownership_epoch
+        )
         if cross:
             await _cross_a_boundary(taking, turnover_at, workflow_id, env.client)
 
@@ -3518,7 +3536,7 @@ async def test_a_superseded_transports_retry_leaves_the_replacements_world_where
         return {
             "the task that was lost": task.attempt_id,
             "the retry": retry,
-            "where the world is": route(task.attempt_id or ""),
+            "where the world is": route.resolve(workflow_id, task.attempt_id or ""),
             "boundaries": (await caller.stream.stream_state()).turnovers,
         }
 

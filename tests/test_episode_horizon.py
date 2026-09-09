@@ -34,6 +34,8 @@ from tests._fixtures.score_env import ENV_NAME, HORIZON
 ATTEMPT = "a" * 32
 MESSAGE = "b" * 32
 CURSOR = "c" * 32
+#: What the service calls the generation this file serves.
+GENERATION = "stream/horizon/1"
 ACK = "d" * 32
 
 
@@ -53,6 +55,7 @@ class _ScriptedStream:
 
     def __init__(self, task: Any) -> None:
         self._task = task
+        self.handle = SimpleNamespace(id=GENERATION)
         self.finalized: List[Any] = []
         self.sealed: List[Any] = []
         self.attempts: dict = {}

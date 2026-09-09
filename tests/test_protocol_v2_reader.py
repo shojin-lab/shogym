@@ -45,6 +45,7 @@ from __future__ import annotations
 import asyncio
 import dataclasses
 import json
+import shutil
 import time
 from contextlib import asynccontextmanager, suppress
 from datetime import timedelta
@@ -103,18 +104,28 @@ from shogym.serve.protocol_v2.kernel.activities import (
 from shogym.serve.protocol_v2.kernel.runtime import STREAM_DATABASE_FILE, temporal_home
 from shogym.serve.protocol_v2 import reader as reader_module
 from shogym.serve.protocol_v2.reader import (
+    INHERITED_WORK,
+    LOCAL_WORK,
     NOTE_FILE,
     RECORDS_FILE,
     NothingToRead,
     ReadRefused,
     RunRecords,
     format_records,
+    inherited_work,
+    local_work,
     read_records,
     receipt_availability,
     receipt_lifecycle,
     write_records,
 )
-from shogym.serve.protocol_v2.rundir import create_run_directory
+from shogym.serve.protocol_v2.kernel.messages import LineageOrigin
+from shogym.serve.protocol_v2.rundir import (
+    MANIFEST_FILE,
+    attach_run_directory,
+    create_run_directory,
+    open_run_directory,
+)
 from shogym.serve.protocol_v2.schedule import (
     BY_POSITION,
     IMMEDIATE,
@@ -481,8 +492,13 @@ def field_names() -> List[str]:
 
 
 def exported_keys() -> List[str]:
-    """Every key one exported line holds: the record's own fields, then the two receipt axes."""
-    return [*field_names(), "receipt_lifecycle", "receipt_availability"]
+    """Every key one exported line holds: the record's own fields, then the three read off it."""
+    return [
+        *field_names(),
+        "receipt_lifecycle",
+        "receipt_availability",
+        "work_provenance",
+    ]
 
 
 def exported_row(record: AttemptRecord) -> Dict[str, Any]:
@@ -491,6 +507,7 @@ def exported_row(record: AttemptRecord) -> Dict[str, Any]:
         **dataclasses.asdict(record),
         "receipt_lifecycle": receipt_lifecycle(record),
         "receipt_availability": receipt_availability(record, []),
+        "work_provenance": LOCAL_WORK,
     }
 
 
@@ -1530,4 +1547,222 @@ def _record(position: int, how: str) -> AttemptRecord:
         payload_disposition="deliver:honest-v1:honest:platform_default",
         profile="ordinary",
         payload_resolution_source="platform_default",
+    )
+
+
+# A run holding more than one generation: one root, one history, one task queue, and each
+# generation in a directory of its own with its own manifest and blobs.
+
+CHILD_WORKFLOW_ID = "stream/records/2"
+
+
+def a_child_directory(root: Path, start: StreamStart, *, workflow_id: str = CHILD_WORKFLOW_ID) -> Path:
+    """A directory for a generation of this run that shares the run's own history.
+
+    It says where that history is as a walk from itself, and it says which generation it was cut
+    from, which is what a reader of the directory alone has to go on.
+    """
+    attach_run_directory(
+        root / "child-1",
+        workflow_id=workflow_id,
+        task_queue=STREAM_TASK_QUEUE,
+        configuration_hash=configuration_hash(start),
+        database_root="..",
+        origin=LineageOrigin(
+            parent_workflow_id=WORKFLOW_ID,
+            parent_run_id="run-1",
+            acknowledged_cursor=oid(0x102),
+            branch_slot="kept",
+            fork_id="fork-1",
+        ),
+    )
+    return root / "child-1"
+
+
+@pytest.mark.network
+async def test_a_generation_of_a_lineage_is_read_out_of_the_history_its_root_names(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """One run, two generations, one history, and each read out of its own directory.
+
+    A generation that shares its lineage's history keeps its own manifest and blobs and nothing
+    else, so a read that looked for a database beside the manifest would report every one of them
+    as a run with nothing to read. What it follows instead is the walk the manifest holds, and
+    what comes back is that generation's rows and not its neighbour's.
+    """
+    monkeypatch.delenv(TEMPORAL_ADDRESS_ENV, raising=False)
+    start = make_start(("first",))
+    root = a_run_directory(tmp_path / "run", start)
+    async with durable_client(run_directory=root) as client:
+        async with stream_worker(client):
+            first = await open_stream(client, start)
+            await first.solve()
+            parent_rows = await first.records()
+
+            second = await start_stream(client, start, workflow_id=CHILD_WORKFLOW_ID)
+            receipt = await second.claim_consumer(
+                ConsumerClaim(consumer_id="harness-2", claim_hash=CLAIM_HASH)
+            )
+            child_driver = Driver(second, receipt.initial_cursor, minted=200)
+            await child_driver.take()
+            child_rows = await child_driver.records()
+
+    child = a_child_directory(root, start)
+    assert open_run_directory(child).manifest.origin is not None
+    assert open_run_directory(child).database_root == root.resolve()
+
+    assert (await read_records(root)).records == parent_rows
+    read = await read_records(child)
+    assert read.records == child_rows
+    assert read.workflow_id == CHILD_WORKFLOW_ID
+    assert read.root == child
+
+    # The export goes beside that generation's own manifest rather than at the run's root.
+    assert write_records(read) == child / RECORDS_FILE
+    assert (root / RECORDS_FILE).exists() is False
+
+
+@pytest.mark.network
+async def test_a_lineage_copied_somewhere_else_is_read_where_the_copy_is(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A whole run moved to another path reads back, and nothing in it points at the original.
+
+    That is the whole of what relocation promises here: the rows come back. The manifest says
+    where the history is as a walk rather than as a place, so the walk lands inside the copy, and
+    a manifest carrying the original's own location would have sent this read to a database
+    somebody else may still be serving.
+    """
+    monkeypatch.delenv(TEMPORAL_ADDRESS_ENV, raising=False)
+    start = make_start(("first",))
+    root = a_run_directory(tmp_path / "run", start)
+    async with durable_client(run_directory=root) as client:
+        async with stream_worker(client):
+            second = await start_stream(client, start, workflow_id=CHILD_WORKFLOW_ID)
+            receipt = await second.claim_consumer(
+                ConsumerClaim(consumer_id="harness-2", claim_hash=CLAIM_HASH)
+            )
+            driver = Driver(second, receipt.initial_cursor, minted=200)
+            await driver.solve()
+            served = await driver.records()
+
+    a_child_directory(root, start)
+    elsewhere = tmp_path / "archive" / "run"
+    shutil.copytree(root, elsewhere)
+
+    moved = await read_records(elsewhere / "child-1")
+    assert moved.records == served
+    assert moved.root == elsewhere / "child-1"
+    written = (elsewhere / "child-1" / MANIFEST_FILE).read_text(encoding="utf-8")
+    assert str(root) not in written
+
+
+async def test_a_generation_whose_shared_history_did_not_travel_has_nothing_to_read(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A copy taken without the history it shares is a directory with nothing behind it.
+
+    It reads as an absence rather than as a fault, and the absence names the place the manifest
+    sent the read to, because that is the thing somebody has to go and fetch.
+    """
+    monkeypatch.delenv(TEMPORAL_ADDRESS_ENV, raising=False)
+    root = tmp_path / "run"
+    child = a_child_directory(root, make_start(("first",)))
+    with pytest.raises(NothingToRead) as absent:
+        await read_records(child)
+    assert str(root.resolve()) in str(absent.value)
+    assert str(child) in str(absent.value)
+
+
+@pytest.mark.network
+async def test_reading_one_generation_never_stops_the_sibling_being_served(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A run that is up is read through the service serving it, and goes on serving.
+
+    An offline read copies the history, and under one shared database the directory being copied
+    can have a live sibling writing it. So a lineage that is up is read the other way: as a client
+    of the one service the run has, which starts no second Worker and applies nothing. The run
+    holds one service and one Worker throughout, which is the deployment this is built for, and
+    the sibling that was mid task finishes it afterwards.
+    """
+    service = tmp_path / "service"
+    service.mkdir()
+    start = make_start(("first",))
+    root = a_run_directory(tmp_path / "run", start)
+
+    async with a_service_somebody_else_runs(service) as client:
+        monkeypatch.setenv(TEMPORAL_ADDRESS_ENV, client.service_client.config.target_host)
+        monkeypatch.setattr(reader_module, "stream_worker", no_worker_a_read_may_start)
+        async with stream_worker(client):
+            live = await open_stream(client, start)
+            working = await live.take()
+            assert working.attempt_id is not None
+
+            second = await start_stream(client, start, workflow_id=CHILD_WORKFLOW_ID)
+            receipt = await second.claim_consumer(
+                ConsumerClaim(consumer_id="harness-2", claim_hash=CLAIM_HASH)
+            )
+            sibling = Driver(second, receipt.initial_cursor, minted=200)
+            await sibling.solve()
+            served = await sibling.records()
+
+            child = a_child_directory(root, start)
+            read = await read_records(child)
+            assert read.records == served
+            assert read.workflow_id == CHILD_WORKFLOW_ID
+
+            # And the generation that was mid task is where it was, and finishes.
+            await live.present(await live.file(working.attempt_id))
+            await live.take()
+            assert (await live.records())[0].payload_delivered
+
+
+def test_a_lineage_is_counted_by_the_generation_each_rows_work_belongs_to(
+    tmp_path: Path,
+) -> None:
+    """A child holds work it did and work it was handed, and the export says which is which.
+
+    The counts a generation reports describe the prefix it holds rather than the work it did, so
+    adding up a lineage's own totals counts the shared prefix once per generation. What a reader
+    totals instead is the rows, by the generation whose work each is, and the export carries that
+    on every line and says so in the note beside it.
+    """
+    inherited = dataclasses.replace(_record(0, "sealed"), source_generation=WORKFLOW_ID)
+    mine = dataclasses.replace(_record(1, "sealed"), source_generation=CHILD_WORKFLOW_ID)
+    run = RunRecords(
+        root=tmp_path,
+        workflow_id=CHILD_WORKFLOW_ID,
+        records=[inherited, mine],
+        origin=LineageOrigin(
+            parent_workflow_id=WORKFLOW_ID,
+            parent_run_id="run-1",
+            acknowledged_cursor=oid(0x102),
+            branch_slot="kept",
+            fork_id="fork-1",
+        ),
+    )
+    assert local_work(run) == [mine]
+    assert inherited_work(run) == [inherited]
+
+    rows = [
+        json.loads(line)
+        for line in write_records(run).read_text(encoding="utf-8").splitlines()
+    ]
+    assert [row["work_provenance"] for row in rows] == [INHERITED_WORK, LOCAL_WORK]
+    assert [row["source_generation"] for row in rows] == [WORKFLOW_ID, CHILD_WORKFLOW_ID]
+
+    note = (tmp_path / NOTE_FILE).read_text(encoding="utf-8")
+    assert WORKFLOW_ID in note
+    assert "fork-1" in note
+    assert "work_provenance" in note
+
+    # A run nobody cut says so, and every row on it is its own work, including a row from a
+    # history recorded before the question existed.
+    alone = RunRecords(root=tmp_path, workflow_id=WORKFLOW_ID, records=[_record(0, "sealed")])
+    assert local_work(alone) == alone.records
+    assert inherited_work(alone) == []
+    write_records(alone)
+    assert "was cut from no other generation" in (tmp_path / NOTE_FILE).read_text(
+        encoding="utf-8"
     )

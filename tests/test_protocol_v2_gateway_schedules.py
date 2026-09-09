@@ -758,10 +758,12 @@ async def test_two_live_attempts_are_sealed_and_paid_out_from_their_own_worlds(
     await guessed(newer, "slate")
     await guessed(newer, "adieu")
     assert (len(worlds[older]._trajectory), len(worlds[newer]._trajectory)) == (1, 2)
-    # Both are where a seal would find them, and each is its own.
-    assert terminal.route(older) is not None
-    assert terminal.route(newer) is not None
-    assert terminal.route(older) != terminal.route(newer)
+    # Both are where a seal would find them, and each is its own. The generation is half of
+    # what a pairing is named by, because one Worker serves a run that can hold several.
+    routed = terminal.route.bound_to("stream/gateway-two-live-wordle/1")
+    assert routed(older) is not None
+    assert routed(newer) is not None
+    assert routed(older) != routed(newer)
 
     # Sealed in the reverse of the order they were served.
     sealed = {}
@@ -775,7 +777,7 @@ async def test_two_live_attempts_are_sealed_and_paid_out_from_their_own_worlds(
         # The receipt reports the play this attempt made in the world it made it in.
         assert f"guesses_used {len(worlds[attempt_id]._trajectory)}" in payload["body"]
         # And the world it was sealed in is gone, while anything still live is not.
-        assert terminal.route(attempt_id) is None
+        assert routed(attempt_id) is None
     assert sealed[older] != sealed[newer]
     assert json.loads(await gateway.pull({}))["kind"] == "done"
 
@@ -827,11 +829,12 @@ async def test_a_world_handed_to_a_replacement_is_the_world_its_seal_captures(
         world_attempt=attempt,
         environment=terminal,
     )
-    assert terminal.route(attempt) == (restored.env, restored.session_id)
+    routed = terminal.route.bound_to(gateway._stream.handle.id)
+    assert routed(attempt) == (restored.env, restored.session_id)
     # And the transport it replaced lets go of the world it was holding, which is not the world
     # this attempt is in any more.
     await gateway.aclose()
-    assert terminal.route(attempt) == (restored.env, restored.session_id)
+    assert routed(attempt) == (restored.env, restored.session_id)
 
     filing = {"attempt_id": attempt, "arguments": {}}
     assert json.loads(await replacement.terminal(filing))["kind"] == "seal_ack"

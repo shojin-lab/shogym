@@ -195,6 +195,7 @@ with workflow.unsafe.imports_passed_through():
         GenerationRecords,
         GradeAttemptInput,
         GradeAttemptResult,
+        LineageOrigin,
         OfferedMessage,
         OperationFailure,
         OwnershipClaim,
@@ -773,6 +774,12 @@ class _Attempt:
     # presentation reference is refused over evidence this attempt needs, and the row it leaves
     # names it. A generation that declares no receipt contract keeps none of this.
     presentation_references: List[str] = dataclass_field(default_factory=list)
+    # The generation whose work this row is, where that is not this one. A parent writes it onto
+    # every row a child inherits that had already been worked, and nothing writes it anywhere
+    # else, so a row a generation opened itself carries nothing here and reads as its own. It is
+    # a field rather than a derivation from the source beside it because an attempt that ended
+    # before it filed anything committed no source and its ending is still the parent's outcome.
+    source_generation: Optional[str] = None
 
 
 # The attempt fields one execution hands the next, taken from the carried row rather than listed
@@ -3278,15 +3285,18 @@ class StreamWorkflow:
             child_ordinal=ordinal,
             children=len(request.child_plans),
         )
-        carrier = child_carrier(
-            projection,
-            selections=[
-                ChildSelection(
-                    attempt_id=request.source_attempt_id,
-                    cell=plan.target_cell,
-                    policy_digest=self._child_policy(plan, request.source_attempt_id),
-                )
-            ],
+        carrier = attributed_child_work(
+            child_carrier(
+                projection,
+                selections=[
+                    ChildSelection(
+                        attempt_id=request.source_attempt_id,
+                        cell=plan.target_cell,
+                        policy_digest=self._child_policy(plan, request.source_attempt_id),
+                    )
+                ],
+            ),
+            generation=workflow.info().workflow_id,
         )
         holding = replace(bare, fork_origin=origin)
         composed = replace(
@@ -4574,12 +4584,52 @@ class StreamWorkflow:
         So a reader that wants both asks for both here. The separate queries stay, because a
         caller that wants one half is not made wrong by the other being available, and a
         generation nobody is serving cannot move between two questions anyway.
+
+        Where this generation was cut from is answered with them. It is a fact about the rows
+        rather than one beside them: a generation cut from another holds that generation's rows,
+        and a reader given the rows and not the cut counts inherited work as this generation's.
         """
         return GenerationRecords(
             attempts=self.attempt_records(),
             presentations=self.presented_messages(),
             operation_failures=list(self._operation_failures),
+            origin=self._lineage(),
         )
+
+    def _lineage(self) -> Optional[LineageOrigin]:
+        """Where this generation was cut from, or nothing for one nobody cut.
+
+        It is read off the immutable origin the start carries, so it says the same thing at every
+        entry: the cut does not move when a child continues, and the branch a generation serves
+        is what it declared rather than what any row happens to hold.
+        """
+        origin = self._start.fork_origin
+        if origin is None:
+            return None
+        return LineageOrigin(
+            parent_workflow_id=origin.parent_workflow_id,
+            parent_run_id=origin.parent_run_id,
+            acknowledged_cursor=origin.acknowledged_cursor,
+            branch_slot=self._start.served_slot,
+            fork_id=origin.fork_id,
+        )
+
+    def _source_generation(self, attempt: _Attempt) -> str:
+        """Which generation the work behind one row belongs to.
+
+        It is read off the row rather than derived from the evidence beside it. A parent writes
+        the generation onto every row a child inherits that it had already worked, so an inherited
+        row goes on naming the generation that did the work through every boundary the child
+        crosses afterwards and through a further fork, and a row this generation opened carries
+        nothing there and is this generation's.
+
+        Deriving it from the source a seal committed would be the same answer for a sealed row and
+        the wrong one for an ending: an attempt finalized before it filed anything has no source,
+        no seal and no descriptor, and the floor and the reason are still the work of the
+        generation that ended it. A lineage totalling such rows out of both children would count
+        one ending three times.
+        """
+        return attempt.source_generation or self._generation_id
 
     def _record(self, attempt: _Attempt) -> AttemptRecord:
         """Return one attempt's record, read out of the attempt and the presentations.
@@ -4622,6 +4672,11 @@ class StreamWorkflow:
         attempt still waiting to seal is legible as one under a contract rather than as a row that
         predates the question, and the visible digest of what was committed is named beside that,
         which is what a harness reconciles its own transcript against.
+
+        And for a seventh, whose work it is comes with the row. A generation cut from another
+        holds that generation's rows, so a reader given a row and not that fact counts work the
+        generation was handed as work it did, and a total over a lineage counts the shared prefix
+        once per generation that holds it.
         """
         item = attempt.item
         obligation = self._obligations.get(item.attempt_id)
@@ -4683,6 +4738,7 @@ class StreamWorkflow:
             payload_visible_sha256=(
                 None if presented is None else presented.visible_bytes_sha256
             ),
+            source_generation=self._source_generation(attempt),
         )
 
     # Pull.
@@ -7036,14 +7092,49 @@ def transformed_child_counters(projection: CarriedProjection) -> CarriedProjecti
     )
 
 
+def attributed_child_work(
+    projection: CarriedProjection, *, generation: str
+) -> CarriedProjection:
+    """Return one child's projection with whose work each inherited row is written on it.
+
+    Preserving the prefix preserves the counters, and the counters describe a cumulative prefix
+    rather than local work: a child reports the seals and the endings its parent produced beside
+    its own, and a lineage that totalled those reports would count the shared prefix once per
+    generation. What a reader totals instead is the rows, by the generation whose work each is,
+    and this is where that is written down.
+
+    It is written over what a row had done and not over what it had committed. Every row the
+    parent had worked is the parent's, whether it sealed, was acknowledged, or ended without
+    filing anything at all: an attempt finalized where it stood carries no source and no seal to
+    derive an answer from, and its floor and its reason are the parent's outcome exactly as a
+    seal is. A row still planned at the cut is nobody's work yet, so it is left as it is and
+    belongs to whichever child goes on to work it, which is what makes the inherited task the
+    parent's and the next task each child's own in the same table.
+
+    A row already naming a generation keeps it. The lineage may be deeper than one fork, and the
+    row names the generation that did the work rather than whichever one copied it last.
+    """
+    return replace(
+        projection,
+        attempts=[
+            row
+            if row.state == PLANNED or row.source_generation
+            else replace(row, source_generation=generation)
+            for row in projection.attempts
+        ],
+    )
+
+
 def child_carrier(
     projection: CarriedProjection, *, selections: Sequence[ChildSelection]
 ) -> CarriedProjection:
-    """Return the whole projection one fork child is handed, from the parent's own.
+    """Return the parent's own projection as a child inherits it.
 
     Two transformations and no third: the selected delivery evidence of the named attempts
     becomes the child's, and the counters and tables become a fresh execution's. Everything else
-    crosses as the parent wrote it.
+    crosses as the parent wrote it. Whose work each inherited row is is written on it afterwards,
+    by :func:`attributed_child_work` where the parent builds the start, because that answer is the
+    parent's own identity rather than anything in the projection it is reading.
     """
     return transformed_child_counters(
         transformed_child_selection(projection, selections=selections)

@@ -74,6 +74,7 @@ from shogym.serve.protocol_v2.kernel.messages import (
     UNRECOVERABLE_OPERATION,
     AttemptRecord,
     GenerationRecords,
+    LineageOrigin,
     OperationFailure,
     PresentedMessage,
     SourceProvenance,
@@ -135,7 +136,14 @@ commit order, with the operation, the phase, the reason, the outcome, the genera
 operation it was, the epochs it was refused and answered under and the objects it could not
 produce. A refusal and the recovery that answered it both stand there, and an operation that
 failed before any receipt sealed is a row here and a row in no attempt's line.
+
+{lineage}
 """
+
+# What a row says about whose work it is. The generation is on the row already; these are the
+# answer to whether that generation is the one this file was written for.
+LOCAL_WORK = "local"
+INHERITED_WORK = "inherited"
 
 # What became of one attempt's receipt. Seven values, tested in this order, first match winning.
 #
@@ -224,6 +232,10 @@ class RunRecords:
 
     All three are answered by one Query, so a row and the commitments beside it are the same
     generation at the same point rather than two reads of one that moved between them.
+
+    ``origin`` is which generation this one was cut from, for one that was cut. It travels with
+    the rows because a child's rows hold work the child did not do: the prefix it inherited is
+    the parent's work and each row says whose, so a total over a lineage counts that work once.
     """
 
     root: Path
@@ -231,6 +243,7 @@ class RunRecords:
     records: List[AttemptRecord]
     presentations: List[PresentedMessage] = dataclasses.field(default_factory=list)
     operation_failures: List[OperationFailure] = dataclasses.field(default_factory=list)
+    origin: Optional[LineageOrigin] = None
 
 
 async def read_records(root: Union[str, Path]) -> RunRecords:
@@ -242,7 +255,7 @@ async def read_records(root: Union[str, Path]) -> RunRecords:
     its own history and a run served against a service somebody else runs.
     """
     run = open_run_directory(root)
-    _require_authority(run.root)
+    _require_authority(run)
     if os.environ.get(TEMPORAL_ADDRESS_ENV):
         answer = await _read_through_a_deployment(run)
     else:
@@ -253,6 +266,7 @@ async def read_records(root: Union[str, Path]) -> RunRecords:
         records=list(answer.attempts),
         presentations=list(answer.presentations),
         operation_failures=list(answer.operation_failures),
+        origin=answer.origin,
     )
 
 
@@ -266,6 +280,13 @@ async def _read_off_a_copy(run: RunDirectory) -> _Answer:
     whatever the queue has ready goes to it. The copy is a plain copy of the files the service
     keeps, which is consistent because a directory being read is a directory nothing is serving:
     two services on one database is not an arrangement this supports.
+
+    A run holding several generations shares one history between them, so that condition is about
+    the run and not about the generation being read. An idle child directory can have a live
+    sibling writing the database this copy is taken from, and a copy taken mid write is a copy of
+    somebody else's half finished work. So an offline read of a lineage is a read of a run whose
+    service is stopped, and a run that is up is read the other way, through the deployment that
+    is serving it.
 
     The Worker that answers registers no Activity. Answering a Query needs the workflow, which
     is this package's and is deterministic. The seal, the grade and the payload bundle are the
@@ -289,7 +310,7 @@ async def _read_off_a_copy(run: RunDirectory) -> _Answer:
     is this run's next step, and its owner is who decides what that step comes to.
     """
     with TemporaryDirectory(prefix="shogym-read-") as scratch:
-        for path in sorted(run.root.glob(f"{STREAM_DATABASE_FILE}*")):
+        for path in sorted(run.database_root.glob(f"{STREAM_DATABASE_FILE}*")):
             shutil.copy2(path, Path(scratch) / path.name)
         workflow_id = run.manifest.workflow_id
         async with durable_client(run_directory=Path(scratch)) as client:
@@ -376,17 +397,55 @@ def write_records(run: RunRecords) -> Path:
     and a deployment wanting concurrent exporters owes them a publication rule this does not have.
     """
     path = run.root / RECORDS_FILE
-    rows = [json.dumps(_row(record, run.operation_failures)) + "\n" for record in run.records]
+    rows = [
+        json.dumps(_row(record, run.operation_failures, run.workflow_id)) + "\n"
+        for record in run.records
+    ]
     path.write_text("".join(rows), encoding="utf-8")
     episodes = [json.dumps(_failure_row(row)) + "\n" for row in run.operation_failures]
     (run.root / OPERATIONS_FILE).write_text("".join(episodes), encoding="utf-8")
     (run.root / NOTE_FILE).write_text(
         _NOTE.format(
-            records=RECORDS_FILE, operations=OPERATIONS_FILE, workflow=run.workflow_id
+            records=RECORDS_FILE,
+            operations=OPERATIONS_FILE,
+            workflow=run.workflow_id,
+            lineage=_lineage_note(run),
         ),
         encoding="utf-8",
     )
     return path
+
+
+def local_work(run: RunRecords) -> List[AttemptRecord]:
+    """The rows whose work this generation did itself.
+
+    A generation cut from another holds that generation's rows as well as its own, and each row
+    says which. Splitting them is what lets a lineage be totalled: the work of the shared prefix
+    is counted once, where it happened, and each generation's own rows are counted with it.
+
+    A row from a history recorded before the question existed says nothing about whose work it
+    is, and it reads as this generation's, because that is what it was.
+    """
+    return [
+        record
+        for record in run.records
+        if record.source_generation in (None, run.workflow_id)
+    ]
+
+
+def inherited_work(run: RunRecords) -> List[AttemptRecord]:
+    """The rows this generation was handed, whose work belongs to the generation it names.
+
+    They are kept rather than dropped. An inherited row is the treatment this generation was
+    working from, and each generation holding it made its own delivery against it, so an analysis
+    that dropped them would lose what every child was continuing.
+    """
+    return [
+        record
+        for record in run.records
+        if record.source_generation is not None
+        and record.source_generation != run.workflow_id
+    ]
 
 
 def format_records(records: List[AttemptRecord]) -> str:
@@ -538,20 +597,26 @@ _LIFECYCLE_TESTS: Tuple[Tuple[str, Callable[[AttemptRecord], bool]], ...] = (
 )
 
 
-def _require_authority(root: Path) -> None:
+def _require_authority(run: RunDirectory) -> None:
     """Refuse a directory whose history is not here, saying which half is missing.
 
     A run served without a directory kept its history in a temporary file that went away with
     the process, and a directory that was never served has none yet. Both look the same from
     here: blobs and a manifest, and nothing that can answer for an attempt.
+
+    Where the history is comes from the manifest rather than from the directory being read. A
+    generation cut from another keeps its own manifest and blobs and shares its lineage's
+    history, so a read that looked beside the manifest would report every child as a run with
+    nothing to read. A copy that was taken without the shared history is that same absence and
+    is reported as it, naming the place the manifest sent this read to.
     """
     if os.environ.get(TEMPORAL_ADDRESS_ENV):
         return
-    if (root / STREAM_DATABASE_FILE).is_file():
+    if (run.database_root / STREAM_DATABASE_FILE).is_file():
         return
     raise NothingToRead(
-        f"{root} holds no {STREAM_DATABASE_FILE}, so the history its records would be read out "
-        f"of is not here"
+        f"{run.database_root} holds no {STREAM_DATABASE_FILE}, so the history the records of "
+        f"{run.root} would be read out of is not here"
     )
 
 
@@ -662,19 +727,52 @@ async def _query(client: Client, workflow_id: str) -> _Answer:
         ) from error
 
 
-def _row(record: AttemptRecord, failures: Sequence[OperationFailure]) -> Dict[str, Any]:
+def _row(
+    record: AttemptRecord, failures: Sequence[OperationFailure], workflow_id: str
+) -> Dict[str, Any]:
     """Return one record as the JSON object a line holds, in the record's field order.
 
     The nested provenance is converted here rather than left to the encoder. What the builder
     hands over is the field's own value, and the source provenance is a record and not a string,
     so an object would reach the encoder as an object it has no rule for. Naming the members is
     also what keeps the file's shape a decision rather than a consequence of a dataclass.
+
+    ``work_provenance`` is the third answer read off the row, beside the two receipt axes. The
+    row already names the generation whose work it is; this says whether that is the generation
+    the file is being written for, which is the question a table asks when it totals a lineage.
     """
     row = {field.name: getattr(record, field.name) for field in dataclasses.fields(record)}
     row["source_provenance"] = _provenance_row(record.source_provenance)
     row["receipt_lifecycle"] = receipt_lifecycle(record)
     row["receipt_availability"] = receipt_availability(record, failures)
+    row["work_provenance"] = (
+        LOCAL_WORK
+        if record.source_generation in (None, workflow_id)
+        else INHERITED_WORK
+    )
     return row
+
+
+def _lineage_note(run: RunRecords) -> str:
+    """The paragraph the note carries about where this generation came from.
+
+    A run nobody cut says so in one line, because a reader of an ordinary run should not have to
+    work out that a lineage paragraph is about somebody else.
+    """
+    if run.origin is None:
+        return (
+            f"{run.workflow_id} was cut from no other generation, so every row here is its own "
+            f"work and `work_provenance` reads {LOCAL_WORK!r} throughout."
+        )
+    return (
+        f"{run.workflow_id} was cut from {run.origin.parent_workflow_id} (run "
+        f"{run.origin.parent_run_id}) at cursor {run.origin.acknowledged_cursor} under fork "
+        f"{run.origin.fork_id}, and it serves the branch {run.origin.branch_slot}. It holds that "
+        f"generation's rows as well as its own, so `source_generation` names whose work each row "
+        f"is and `work_provenance` says whether that is this generation. A total over a lineage "
+        f"counts the inherited rows once, where the work happened, and counts each generation's "
+        f"own deliveries against them separately."
+    )
 
 
 def _failure_row(row: OperationFailure) -> Dict[str, Any]:

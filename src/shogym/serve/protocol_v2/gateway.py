@@ -73,6 +73,7 @@ from fastmcp import FastMCP
 from fastmcp.exceptions import ToolError
 from fastmcp.tools import ToolResult
 from mcp.types import TextContent
+from temporalio import activity
 from temporalio.client import Client
 from temporalio.service import RPCError
 
@@ -109,6 +110,7 @@ from shogym.serve.protocol_v2.kernel import (
     ConsumerClaim,
     EnvironmentCall,
     FinalizeRequest,
+    LineageOrigin,
     OfferedMessage,
     QueueClosed,
     SealRequest,
@@ -124,6 +126,7 @@ from shogym.serve.protocol_v2.kernel import (
     kernel_activities,
     protocol_error_code,
     refuse_a_carried_projection,
+    resume_stream,
     start_stream,
     stream_worker,
 )
@@ -155,6 +158,8 @@ from shogym.serve.protocol_v2.policy import (
     roster_digest,
 )
 from shogym.serve.protocol_v2.rundir import (
+    OWN_DATABASE_ROOT,
+    attach_run_directory,
     create_run_directory,
     prepare_run_directory,
     stage_run_directory,
@@ -209,6 +214,29 @@ DispositionsFor = Callable[[Sequence[Assignment]], Sequence[PayloadDisposition]]
 ReleaseFor = Callable[[Sequence[TaskItem]], ReleasePlan]
 
 
+def dispatching_generation() -> str:
+    """Which generation the Activity now running belongs to.
+
+    An Activity is scheduled by one generation and the service tells the Worker which, so this is
+    read off the call rather than inferred from anything the request carries. That matters where
+    one Worker serves several generations of one run: two of them can hold one public attempt
+    identifier between them, so an attempt is only half of the question and the generation is the
+    other half.
+
+    Outside an Activity there is no such call and no answer to give, and neither is there for an
+    Activity no generation scheduled. Both are refused rather than answered with a world, because
+    the alternative is picking one of the worlds a run is holding and calling it the right one. A
+    caller that has a generation in hand asks the route for it by name instead.
+    """
+    generation = activity.info().workflow_id
+    if generation is None:
+        raise RuntimeError(
+            "this call was not made for any generation, so which world an attempt is being "
+            "worked in has no answer here"
+        )
+    return generation
+
+
 class WorldRoute:
     """Which world each attempt filed in, for an environment that ends an attempt in its own.
 
@@ -217,6 +245,20 @@ class WorldRoute:
     before the first of those worlds exists. An environment asked for its terminal is therefore
     handed this rather than one world, and it resolves an attempt when it seals rather than when
     it is registered.
+
+    A pairing is named by the generation as well as the attempt, and that is the whole of what
+    keeps one Worker able to serve a run holding several. One Worker serves a run, an environment
+    registers each of its Activities once under a fixed name, and a generation cut from another
+    inherits its public attempt identifiers whole, so two of them can be working one attempt
+    identifier in two different worlds at the same time. Keyed by the attempt alone the second
+    world recorded would replace the first, and the seal that followed would read whichever world
+    was written last. So the generation is part of the key, and every generation gets its own
+    world for the attempt it is working.
+
+    Ownership is compared inside that key rather than across it. Two transports of one generation
+    are ordered by the epoch each claimed, and two generations are not ordered at all: a child
+    taking its own first claim and a sibling taking its own are both first claims, and neither is
+    older than the other.
 
     An attempt this process never opened a world for resolves to nothing, which is what every
     attempt resolves to in a process that took the generation over. That is the answer the
@@ -231,9 +273,11 @@ class WorldRoute:
     """
 
     def __init__(self) -> None:
-        self._worlds: Dict[str, Tuple[ServedEpisode, int]] = {}
+        self._worlds: Dict[Tuple[str, str], Tuple[ServedEpisode, int]] = {}
 
-    def record(self, attempt_id: str, episode: ServedEpisode, owner: int) -> None:
+    def record(
+        self, generation: str, attempt_id: str, episode: ServedEpisode, owner: int
+    ) -> None:
         """Say that this attempt is working in this episode's world, unless a newer owner has.
 
         The owner is named because two transports for one generation can be alive in one process
@@ -258,14 +302,16 @@ class WorldRoute:
         the pairings they belonged to, which is a watermark rather than this.
 
         The comparison is here, at the writing, rather than at the caller, because a caller that
-        gets this wrong is by definition one that does not know it has been replaced.
+        gets this wrong is by definition one that does not know it has been replaced. It is made
+        inside one generation's own entry, because that is as far as the ordering goes: a sibling
+        generation's first claim is not an older owner of this one.
         """
-        standing = self._worlds.get(attempt_id)
+        standing = self._worlds.get((generation, attempt_id))
         if standing is not None and standing[1] > owner:
             return
-        self._worlds[attempt_id] = (episode, owner)
+        self._worlds[(generation, attempt_id)] = (episode, owner)
 
-    def forget(self, attempt_id: str, episode: ServedEpisode) -> None:
+    def forget(self, generation: str, attempt_id: str, episode: ServedEpisode) -> None:
         """Say that this world of this attempt's is gone, if it is still the one recorded.
 
         The episode is named rather than only the attempt, because an attempt may have been
@@ -273,15 +319,40 @@ class WorldRoute:
         the attempt it took over, and the transport it replaced still holds the world it was
         working in and lets go of it afterwards. That later cleanup is about its own world, so it
         clears the pairing only where the pairing is still that world's.
+
+        The generation is named for the same reason one step further out: a generation letting go
+        of the world it worked an attempt in says nothing about the world a sibling is working
+        that same attempt in.
         """
-        standing = self._worlds.get(attempt_id)
+        key = (generation, attempt_id)
+        standing = self._worlds.get(key)
         if standing is not None and standing[0] is episode:
-            del self._worlds[attempt_id]
+            del self._worlds[key]
+
+    def resolve(self, generation: str, attempt_id: str) -> Optional[Tuple[Any, str]]:
+        """The environment and session this attempt filed in, or ``None`` if not this process."""
+        standing = self._worlds.get((generation, attempt_id))
+        return None if standing is None else (standing[0].env, standing[0].session_id)
+
+    def bound_to(self, generation: str) -> Callable[[str], Optional[Tuple[Any, str]]]:
+        """This route as one generation reads it: the callback an environment already takes.
+
+        An environment is handed something it calls with an attempt identifier, and that stays
+        what it is handed. Binding is what supplies the other half of the key for a caller that
+        knows which generation it is, and dispatch is what supplies it for a caller that is an
+        Activity.
+        """
+        return lambda attempt_id: self.resolve(generation, attempt_id)
 
     def __call__(self, attempt_id: str) -> Optional[Tuple[Any, str]]:
-        """The environment and session this attempt filed in, or ``None`` if not this process."""
-        standing = self._worlds.get(attempt_id)
-        return None if standing is None else (standing[0].env, standing[0].session_id)
+        """The world this attempt filed in, under the generation dispatching this call.
+
+        The generation comes from the Activity the environment is being asked through, which is
+        the one place it is a fact rather than a guess: the service scheduled that Activity for
+        one generation and says which. It is never taken from the attempt identifier, because two
+        generations of one run share those.
+        """
+        return self.resolve(dispatching_generation(), attempt_id)
 
 
 class EnvironmentTerminal(NamedTuple):
@@ -1327,6 +1398,16 @@ class StreamGateway:
         # by stopping the world an attempt worked in. It is recorded as each world opens, which
         # is the only moment both halves of the pair are in one place.
         self._route = WorldRoute() if environment is None else environment.route
+        # Which generation this transport is serving, as the service names it. It is the other
+        # half of every pairing written below: one Worker serves a whole run, a run can hold
+        # several generations, and two of them cut from one prefix carry the same public attempt
+        # identifiers. The identifier is read off the handle rather than off the composition,
+        # because it is the same value the Activity the environment is asked through reports.
+        #
+        # A transport whose stream cannot say names nothing, exactly as one whose stream cannot
+        # say who owns it speaks for nobody. Such a transport reaches no authority, so nothing it
+        # recorded could ever be resolved by a seal.
+        self._generation_id = getattr(getattr(stream, "handle", None), "id", "")
         # A world handed over is written into both at once. The attempt it belongs to is a fact
         # the caller states, and every way of asking which world an attempt is in has to get the
         # same answer from it: the ordinary call routes through the map and the environment's own
@@ -1334,7 +1415,7 @@ class StreamGateway:
         # the restored world and seal whatever the process before this one left behind.
         if world_attempt is not None:
             self._worlds[world_attempt] = episode
-            self._route.record(world_attempt, episode, self._owner())
+            self._route.record(self._generation_id, world_attempt, episode, self._owner())
         self._spec = spec
         self._terminal = terminal.name
         self._cursor = initial_cursor
@@ -2837,7 +2918,7 @@ class StreamGateway:
                     f"{started_as.configuration_digest!r}"
                 )
         self._worlds[attempt_id] = opened
-        self._route.record(attempt_id, opened, self._owner())
+        self._route.record(self._generation_id, attempt_id, opened, self._owner())
 
     def _owner(self) -> int:
         """Which owner of the generation this transport speaks for.
@@ -2870,7 +2951,7 @@ class StreamGateway:
         if claimed is None:
             return None
         self._worlds[attempt_id] = claimed
-        self._route.record(attempt_id, claimed, self._owner())
+        self._route.record(self._generation_id, attempt_id, claimed, self._owner())
         self._unclaimed = None
         return claimed
 
@@ -2895,7 +2976,7 @@ class StreamGateway:
         episode = self._worlds.get(attempt_id)
         if episode is not None:
             await _let_go(episode)
-            self._route.forget(attempt_id, episode)
+            self._route.forget(self._generation_id, attempt_id, episode)
         self._worlds.pop(attempt_id, None)
 
     async def _closed_each(self, attempt_ids: Sequence[str]) -> List[Exception]:
@@ -3266,6 +3347,165 @@ async def open_gateway(
         generation=composed,
         environment=environment,
         on_refusal=on_refusal,
+    )
+
+
+async def attach_gateway(
+    client: Client,
+    episode: ServedEpisode,
+    *,
+    workflow_id: str,
+    start: StreamStart,
+    run_directory: Union[str, Path],
+    database_root: str = OWN_DATABASE_ROOT,
+    consumer_id: Optional[str] = None,
+    open_episode: Optional[EpisodeOpener] = None,
+    environment: Optional[EnvironmentTerminal] = None,
+    on_refusal: Optional[RefusalSink] = None,
+) -> StreamGateway:
+    """Bind this transport to a generation that already exists, with a first claim.
+
+    This is the sibling of :func:`open_gateway` for a generation something else created. A fork
+    creates its children before anything serves them: each comes up gated, owning nothing, and
+    what a controller then does is prepare its directory, copy its objects in, and attach. So
+    nothing here starts a stream, nothing composes one, and nothing rewrites the start.
+
+    That last one is the difference that matters. A composition this call was handed is a value
+    the generation was created from and is authenticated against a record elsewhere, so the
+    version this environment declares is compared against it rather than written over it. The
+    comparison is the version alone, because that is the value the environment's own seal is held
+    to when the first attempt ends: refusing here is refusing before a world was worked rather
+    than a second opinion about what the generation is.
+
+    The directory is adopted rather than made fresh, because publishing a manifest, installing a
+    closure and claiming ownership are three steps a crash can be between and the repair is to do
+    them again. ``database_root`` is where the history this generation shares lives, as a walk
+    from its own directory, and the origin the start carries is written into the manifest so a
+    reader of the directory can say which generation this one was cut from.
+
+    The store is the one the authenticated start names, and it has to be inside the directory
+    being attached. A claim verifies this generation's committed objects against that blob root,
+    and the root is covered by the digest the generation was authorized under, so a directory
+    somewhere else is a generation this process may read and not one it may serve.
+
+    The cursor comes from the generation rather than from the consumer receipt, because a
+    generation being attached to has a prefix: the receipt answers with the cursor the start
+    began at, and what this transport serves from is where the generation stands now.
+
+    The claim is a first claim wherever nobody has owned this generation, which is what a child
+    the fork created answers with. A generation that has not yet authorized its own lineage
+    rejects it and says so, and the caller waiting for a child to come up asks again. A caller
+    that named no consumer is answered with the one this generation already holds rather than
+    with a fresh one, because that is what makes a repeat a repeat: a second logical consumer is
+    the one thing a generation will not adopt, and minting one on a retry would leave a child
+    fenced away from the transport that had just taken it over.
+    """
+    _ended_by_the_stream(episode)
+    spec = episode.describe()
+    terminal = terminal_manifest(spec)
+    grade = environment.grade if environment is not None else environment_grade(episode)
+    _check_honest_over(start, grade)
+    _check_declared_budget(spec, start.budget)
+    if environment is not None:
+        _check_graded_horizon(spec, terminal, environment)
+        if start.canonicalization_version != environment.canonicalization_version:
+            raise ValueError(
+                f"this generation was created as {start.canonicalization_version!r} and the "
+                f"environment this process holds captures as "
+                f"{environment.canonicalization_version!r}"
+            )
+    if len(start.tasks) > 1 and open_episode is None:
+        raise ValueError(
+            f"this generation has {len(start.tasks)} tasks and one episode to serve them with; "
+            "each task is worked in a world of its own, so attaching to one with more than one "
+            "task needs a way to open the next"
+        )
+    if len(start.tasks) > 1 and environment is None and _seals_its_own_worlds(episode):
+        raise ValueError(
+            f"this generation has {len(start.tasks)} tasks and its environment ends an attempt "
+            "in the world that attempt worked in; without the terminal this gateway records "
+            "those worlds into, every task after the first would be sealed against the first "
+            "task's world"
+        )
+    blobs = _the_store_it_names(start, run_directory)
+    attach_run_directory(
+        run_directory,
+        workflow_id=workflow_id,
+        task_queue=STREAM_TASK_QUEUE,
+        configuration_hash=configuration_hash(start),
+        database_root=database_root,
+        origin=_lineage_origin(start),
+    )
+    install_policies(blobs, start)
+    stream = await resume_stream(
+        client, workflow_id=workflow_id, configuration_hash=configuration_hash(start)
+    )
+    # The consumer a repeat attaches as is the one this generation already has. A caller naming
+    # none is asking for one to be minted, and minting a second would be the one part of this
+    # call that is not a repeat: the generation keeps the consumer it was claimed under and
+    # rejects any other, so the retry that recovers a lost reply would fence the gateway whose
+    # reply went missing and then be refused by the child it had just taken over. So the
+    # authoritative consumer is recovered before one is minted, and it is minted only where this
+    # generation has none.
+    state = await stream.stream_state()
+    await stream.claim_consumer(
+        ConsumerClaim(
+            consumer_id=consumer_id or state.consumer_id or _opaque(),
+            claim_hash=start.consumer_claim_hash,
+        )
+    )
+    return StreamGateway(
+        stream,
+        episode,
+        spec,
+        terminal,
+        initial_cursor=state.cursor,
+        open_episode=open_episode,
+        blobs=blobs,
+        generation=start,
+        environment=environment,
+        on_refusal=on_refusal,
+    )
+
+
+def _the_store_it_names(
+    start: StreamStart, run_directory: Union[str, Path]
+) -> FilesystemBlobStore:
+    """The store this generation verifies its objects against, held to the directory it is in.
+
+    A generation that names no store verifies nothing, and one naming a store outside the
+    directory being attached is a generation that was moved: the blob root is inside the start
+    the generation was authorized under, so serving it from somewhere else would mean rewriting
+    an authenticated value. Reading such a lineage back is what relocation promises, and serving
+    it is not.
+    """
+    directory = Path(run_directory).resolve()
+    named = Path(start.blob_root).resolve() if start.blob_root else None
+    if named is None or (named != directory and directory not in named.parents):
+        raise ValueError(
+            f"this generation verifies its committed objects against {start.blob_root!r} and it "
+            f"is being attached to {str(directory)!r}: a generation moved somewhere else is one "
+            "this build reads and never serves"
+        )
+    return FilesystemBlobStore(named)
+
+
+def _lineage_origin(start: StreamStart) -> Optional[LineageOrigin]:
+    """What a directory records about the generation this one was cut from, or nothing.
+
+    It is the public half of the origin the start carries: where the cut was and which branch
+    this generation serves. None of the identities the origin authorizes anything with goes into
+    a file beside the blobs.
+    """
+    origin = start.fork_origin
+    if origin is None:
+        return None
+    return LineageOrigin(
+        parent_workflow_id=origin.parent_workflow_id,
+        parent_run_id=origin.parent_run_id,
+        acknowledged_cursor=origin.acknowledged_cursor,
+        branch_slot=start.served_slot,
+        fork_id=origin.fork_id,
     )
 
 

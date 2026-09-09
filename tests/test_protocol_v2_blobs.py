@@ -9,6 +9,10 @@ The run directory tests are the version rules. A protocol v1 run directory stays
 readable as it was, by the reader that wrote it, and it is never resumed as v2. So is a
 directory that says nothing about its version, and so is one that holds both.
 
+The last of them are about a run holding more than one generation: what a directory says about
+the history it shares and the generation it was cut from, and the door a generation created
+before its directory comes in by, which adopts what it finds rather than refusing it.
+
 Nothing here needs Temporal or a server: a store is a directory and a manifest is a file.
 """
 
@@ -23,13 +27,16 @@ from typing import List, Tuple
 import pytest
 
 from shogym.serve.protocol_v2 import FilesystemBlobStore, WireFormatError, blob_ref
+from shogym.serve.protocol_v2.kernel.messages import LineageOrigin
 from shogym.serve.protocol_v2.rundir import (
     MANIFEST_FILE,
     STARTING_FILE,
     ResumeRefused,
+    attach_run_directory,
     create_run_directory,
     open_run_directory,
     prepare_run_directory,
+    serving_record,
     stage_run_directory,
     staged_generation,
 )
@@ -320,3 +327,157 @@ def test_a_directory_names_the_generation_it_is_starting_before_it_starts(tmp_pa
     )
     assert (root / STARTING_FILE).exists() is False
     assert open_run_directory(root).manifest == run.manifest
+
+
+def a_lineage_origin(fork_id: str = "fork-1", slot: str = "kept") -> LineageOrigin:
+    """What a child's directory says about the generation it was cut from."""
+    return LineageOrigin(
+        parent_workflow_id="stream/run-1/gen-1",
+        parent_run_id="run-abcdef",
+        acknowledged_cursor="0" * 32,
+        branch_slot=slot,
+        fork_id=fork_id,
+    )
+
+
+def test_a_directory_written_before_a_run_could_hold_a_lineage_is_read_as_it_was(
+    tmp_path: Path,
+) -> None:
+    """A manifest that names one generation and no lineage is the file it always was.
+
+    A run with one generation keeps its history beside its own manifest and was cut from
+    nothing, so it writes the five fields it wrote before either question existed and reads back
+    saying its history is here. That is what stops a directory an older build left behind from
+    becoming unreadable, and it is checked against the file rather than against the value.
+    """
+    run = create_run_directory(
+        tmp_path / "run",
+        workflow_id="stream/plain/1",
+        task_queue="shogym-stream-v2",
+        configuration_hash=CONFIGURATION,
+    )
+    written = json.loads((run.root / MANIFEST_FILE).read_text(encoding="utf-8"))
+    assert set(written) == {
+        "protocol_version",
+        "schedule_version",
+        "workflow_id",
+        "task_queue",
+        "configuration_hash",
+    }
+    reopened = open_run_directory(run.root)
+    assert reopened.manifest.origin is None
+    assert reopened.database_root == run.root.resolve()
+
+
+def test_a_child_directory_says_where_its_lineages_history_is_and_what_cut_it(
+    tmp_path: Path,
+) -> None:
+    """The two things a generation cut from another writes down, and how they read back.
+
+    The history is a walk from this directory rather than a place, because the walk is what
+    survives the lineage being copied somewhere else: a manifest holding the original's own
+    location would send a read of the copy back to the database the original is serving. So an
+    absolute one is refused rather than followed.
+    """
+    root = tmp_path / "run"
+    origin = a_lineage_origin()
+    child = attach_run_directory(
+        root / "child-1",
+        workflow_id="stream/plain/1.fork.1.abcd",
+        task_queue="shogym-stream-v2",
+        configuration_hash=CONFIGURATION,
+        database_root="..",
+        origin=origin,
+    )
+    assert child.database_root == root.resolve()
+
+    reopened = open_run_directory(child.root)
+    assert reopened.manifest.origin == origin
+    assert reopened.manifest.database_root == ".."
+    assert reopened.database_root == root.resolve()
+
+    # An origin is whole or it is not there, and the history is a walk or it is refused.
+    for change, code in (
+        ({"origin": {"fork_id": "fork-1"}}, "configuration_mismatch"),
+        ({"database_root": str(root.resolve())}, "configuration_mismatch"),
+        ({"database_root": ""}, "configuration_mismatch"),
+    ):
+        elsewhere = tmp_path / f"edited-{len(list(tmp_path.iterdir()))}"
+        elsewhere.mkdir()
+        payload = {**json.loads((child.root / MANIFEST_FILE).read_text(encoding="utf-8")), **change}
+        (elsewhere / MANIFEST_FILE).write_text(json.dumps(payload), encoding="utf-8")
+        assert refusal(elsewhere) == code
+
+
+def test_attaching_a_directory_twice_adopts_it_and_never_makes_a_second(tmp_path: Path) -> None:
+    """The repair for a crash mid registration is to do it again, so the door is idempotent.
+
+    Publishing a manifest, installing a closure and claiming ownership are three steps a crash
+    can be between. The ordinary creation door refuses a directory that already holds a manifest,
+    so a retry through it would refuse the child it had just registered; this one adopts the
+    manifest it finds where the manifest says the same thing, and refuses where it does not.
+    """
+    root = tmp_path / "run" / "child-1"
+    first = attach_run_directory(
+        root,
+        workflow_id="stream/plain/1.fork.1.abcd",
+        task_queue="shogym-stream-v2",
+        configuration_hash=CONFIGURATION,
+        database_root="..",
+        origin=a_lineage_origin(),
+    )
+    again = attach_run_directory(
+        root,
+        workflow_id="stream/plain/1.fork.1.abcd",
+        task_queue="shogym-stream-v2",
+        configuration_hash=CONFIGURATION,
+        database_root="..",
+        origin=a_lineage_origin(),
+    )
+    assert again == first
+    assert open_run_directory(root).manifest == first.manifest
+
+    # A directory already holding a generation is not somewhere to put a second, whichever half
+    # of what it says has moved.
+    for change in (
+        {"workflow_id": "stream/plain/1.fork.2.beef"},
+        {"configuration_hash": "b" * 64},
+        {"database_root": "."},
+        {"origin": a_lineage_origin(fork_id="fork-2")},
+    ):
+        with pytest.raises(ResumeRefused) as caught:
+            attach_run_directory(
+                root,
+                **{
+                    "workflow_id": "stream/plain/1.fork.1.abcd",
+                    "task_queue": "shogym-stream-v2",
+                    "configuration_hash": CONFIGURATION,
+                    "database_root": "..",
+                    "origin": a_lineage_origin(),
+                    **change,
+                },
+            )
+        assert caught.value.code == "configuration_mismatch"
+
+
+def test_a_generation_created_before_its_directory_still_gets_one(tmp_path: Path) -> None:
+    """Attaching makes the directory and the store where there is nothing there yet.
+
+    A fork creates its children before anything serves them, so the stream exists first and
+    there is no name to reserve: the manifest is written for a generation that is already
+    running rather than to stand in for one about to start. What that leaves behind is a
+    directory the ordinary reader opens like any other.
+    """
+    root = tmp_path / "run" / "child-2"
+    child = attach_run_directory(
+        root,
+        workflow_id="stream/plain/1.fork.2.beef",
+        task_queue="shogym-stream-v2",
+        configuration_hash=CONFIGURATION,
+        database_root="..",
+        origin=a_lineage_origin(fork_id="fork-1", slot="placebo"),
+    )
+    assert child.root.is_dir()
+    assert (root / STARTING_FILE).exists() is False
+    assert serving_record(root) is not None
+    assert open_run_directory(root) == child
