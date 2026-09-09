@@ -21,7 +21,7 @@ from dataclasses import replace
 from datetime import timedelta
 from hashlib import sha256
 from pathlib import Path
-from typing import Any, List, Optional, Sequence
+from typing import Any, List, Optional, Sequence, Tuple
 
 import pytest
 
@@ -63,6 +63,7 @@ from shogym.serve.protocol_v2.artifact import (  # noqa: E402
     SourceArtifactManifest,
     mask_spans,
     masked_body,
+    payload_wire_count,
     read_source_artifact,
     source_commitment,
 )
@@ -72,7 +73,7 @@ from shogym.serve.protocol_v2.kernel import (  # noqa: E402
     CONFIRMED_EXISTING,
     EXISTENCE_UNCONFIRMED,
     FORK_COMPLETE,
-    FORK_CONFLICTED,
+    FORK_CONFLICTED,    FORK_CARRIER_SCHEMA_VERSION,
     FORK_EXPIRED_AUTHORITY,
     FORK_NOT_QUIET,
     FORK_PREPARED,
@@ -83,13 +84,21 @@ from shogym.serve.protocol_v2.kernel import (  # noqa: E402
     RECEIPT_CARRIER_SCHEMA_VERSION,
     BlobsVerified,
     ConsumerClaim,
+    ChildReady,
     ForkAvailability,
     ForkAvailabilityInput,
     ForkChildPlan,
     ForkChildStarted,
+    ForkPreparation,
+    ForkPreparationInput,
     ForkRequest,
     GeneratePayloadBundleInput,
+    GradeAttemptInput,
+    GradeAttemptResult,
     OfferedMessage,
+    PayloadBundle,
+    SealAttemptInput,
+    SealAttemptResult,
     SealRequest,
     SourceOriginContext,
     StartForkChildInput,
@@ -104,28 +113,54 @@ from shogym.serve.protocol_v2.kernel import (  # noqa: E402
     derived_selection,
     fork_availability_activity,
     fork_barrier_stands,
+    fork_preparation_activity,
+    fork_preparation_operation_identity,
     fork_can_be_retried,
     fork_refusal,
     fork_status,
     fork_stream,
     generate_payload_bundle_activity,
+    origin_digest,
+    origin_unverified,
     protocol_error_code,
     resume_stream,
     start_fork_child_activity,
     start_stream,
     stream_worker,
+    verified_set_digest,
     verify_blobs_activity,
 )
 from shogym.serve.protocol_v2.kernel.activities import (  # noqa: E402
     FORK_AVAILABILITY,
+    GENERATE_PAYLOAD_BUNDLE,
+    GRADE_ATTEMPT,
+    PREPARE_FORK_CHILD,
+    SEAL_ATTEMPT,
     START_FORK_CHILD,
     STREAM_WORKFLOW_TYPE,
     VERIFY_BLOBS,
 )
+from shogym.serve.protocol_v2.kernel import activities as kernel_activities  # noqa: E402
 from shogym.serve.protocol_v2.kernel import workflow as kernel_workflow  # noqa: E402
-from shogym.serve.protocol_v2.kernel.workflow import StreamWorkflow  # noqa: E402
+from shogym.serve.protocol_v2.kernel.workflow import (  # noqa: E402
+    TURNOVER_PAYLOAD_CEILING_BYTES,
+    StreamWorkflow,
+)
+from shogym.serve.protocol_v2.reader import (  # noqa: E402
+    RECEIPT_AVAILABLE,
+    RECEIPT_UNAVAILABLE,
+    receipt_availability,
+)
 from shogym.serve.protocol_v2.kernel.messages import (  # noqa: E402
-    FORK_ORIGIN_DISAGREEMENT,
+    FORK_ORIGIN_DISAGREEMENT,    CONTRACT_DRIFT,
+    FORK_CONTRACT_DRIFT,
+    FORK_PREPARATION,
+    FORK_WRONG_SOURCE,
+    RECOVERED_OPERATION,
+    REFUSED_OPERATION,
+    UNAVAILABLE_EVIDENCE,
+    UNRECOVERABLE_OPERATION,
+    WRONG_SOURCE,
     CarriedAttempt,
     read_source_origin,
     unpack_carrier,
@@ -418,11 +453,24 @@ async def cross_a_boundary(
     caller: Caller, turnover_at: Any, workflow_id: str, client: Client
 ) -> None:
     """Make this generation continue as new exactly once, from wherever it is now."""
-    before = (await caller.stream.stream_state()).turnovers
+    await hand_it_on(caller.stream, turnover_at, workflow_id, client)
+
+
+async def hand_it_on(
+    stream: Any, turnover_at: Any, workflow_id: str, client: Client
+) -> None:
+    """The same crossing for a generation nobody is pulling from yet, driven by its owner.
+
+    A child that has claimed and has not prepared is quiet by every clause a boundary reads, so it
+    crosses one like any other generation. That is the entry the gate its parent wrote is designed
+    to survive, and it is where a preparation refused on the near side has to be recovered from on
+    the far one.
+    """
+    before = (await stream.stream_state()).turnovers
     turnover_at(await accepted_updates(client, workflow_id) + 1)
-    await caller.stream.confirm_state()
+    await stream.confirm_state()
     for _ in range(400):
-        if (await caller.stream.stream_state()).turnovers > before:
+        if (await stream.stream_state()).turnovers > before:
             turnover_at(10_000)
             return
         await asyncio.sleep(0.02)
@@ -1855,3 +1903,1022 @@ async def test_a_duplicate_is_compared_as_the_whole_of_what_its_converter_made_o
     again = await activities.run(start_fork_child_activity, mine)
     assert again.created is False
     assert again.child_run_id == started.child_run_id
+
+# The child side: a gated child's own closure, the body it prepares, and what it publishes.
+#
+# Everything below the fork runs under a Worker that cannot seal, cannot grade and cannot render.
+# The claim under test is that a child derives its first payload from committed evidence and
+# nothing else, and the only way to show that is to take everything else away.
+
+
+#: This environment's own capture, and whether this run may still ask for it. One Worker serves a
+#: whole run, so the calls that could rebuild A are closed by name when the fork returns rather
+#: than being taken away with the Worker that answered them.
+_CAPTURE: dict = {}
+
+
+def a_closing_worker(episode: ServedEpisode) -> List[Any]:
+    """This environment's own Activities under a switch, and the read a claim needs."""
+    named = {
+        getattr(one, "__temporal_activity_definition").name: one
+        for one in activities_of(episode)
+    }
+    _CAPTURE.clear()
+    _CAPTURE.update({"closed": False, **named})
+    return [_a_closing_seal, _a_closing_grade, _a_closing_render, verify_blobs_activity]
+
+
+def close_the_capture() -> None:
+    """Make every call that could rebuild A fatal, which is what a child has to work without."""
+    _CAPTURE["closed"] = True
+
+
+def _still_open(name: str) -> Any:
+    """The environment's own Activity, while this run may still ask for A's own capture."""
+    if _CAPTURE["closed"]:
+        raise ApplicationError(
+            f"a child derives its body from committed evidence and this run asked {name} again",
+            non_retryable=True,
+        )
+    return _CAPTURE[name]
+
+
+@activity.defn(name=SEAL_ATTEMPT)
+async def _a_closing_seal(request: SealAttemptInput) -> SealAttemptResult:
+    """Seal while A's own capture is open, and refuse once the fork has closed it."""
+    return await _still_open(SEAL_ATTEMPT)(request)
+
+
+@activity.defn(name=GRADE_ATTEMPT)
+async def _a_closing_grade(request: GradeAttemptInput) -> GradeAttemptResult:
+    """Grade on the same terms, so no child can be scored a second time."""
+    return await _still_open(GRADE_ATTEMPT)(request)
+
+
+@activity.defn(name=GENERATE_PAYLOAD_BUNDLE)
+async def _a_closing_render(request: GeneratePayloadBundleInput) -> PayloadBundle:
+    """Render on the same terms, so a child's body can only have come from its preparation."""
+    return await _still_open(GENERATE_PAYLOAD_BUNDLE)(request)
+
+
+def carried(start: StreamStart) -> Any:
+    """The projection one start hands over, read the way the far side reads it."""
+    assert start.carry is not None
+    return unpack_carrier(start.carry, CONVERTER)
+
+
+def selected_reference(start: StreamStart) -> str:
+    """The committed entry one child was selected for, out of its own carrier."""
+    [row] = [one for one in carried(start).attempts if one.attempt_id == ATTEMPT]
+    return row.selected_body_reference or ""
+
+
+def child_closure(start: StreamStart) -> List[str]:
+    """Every object one child needs: what its own claim reads back, and the body it prepares.
+
+    Neither eligible body is in the claim-required half and the oracle is in neither, so a child
+    whose counterpart body or oracle body never arrived still claims and still prepares.
+    """
+    return [*carried(start).committed_blobs, selected_reference(start)]
+
+
+def copy_closure(source: Path, destination: str, references: List[str]) -> None:
+    """Install those exact objects in a child's own store, out of the store its parent used."""
+    origin = FilesystemBlobStore(source)
+    into = FilesystemBlobStore(Path(destination))
+    for reference in references:
+        into.put(origin.read(reference))
+
+
+async def a_claimed_child(client: Client, start: StreamStart, identity: str) -> Any:
+    """Claim one child, once its own history has authorized the lineage it carries.
+
+    A gated child owns nothing and serves nothing until it has read the parent's record of it, and
+    it says that rather than refusing: the same claim under the same identifier reaches a child
+    that has done its own first work, so waiting it out is what a controller does.
+    """
+    for _ in range(500):
+        try:
+            return await resume_stream(
+                client, workflow_id=identity, configuration_hash=configuration_hash(start)
+            )
+        except Exception as error:  # noqa: BLE001 - the gate is waited out and nothing else is
+            if not origin_unverified(error):
+                raise
+            await asyncio.sleep(0.02)
+    raise AssertionError(f"{identity} never authorized the lineage it carries")
+
+
+async def a_ready_child(
+    client: Client, start: StreamStart, identity: str, blobs: Path
+) -> Tuple[Any, ChildReady]:
+    """Copy one child's closure into its own store, claim it, and prepare the body it owes."""
+    copy_closure(blobs, start.blob_root or "", child_closure(start))
+    stream = await a_claimed_child(client, start, identity)
+    return stream, await stream.prepare_child(fork_id=FORK)
+
+
+async def a_child_caller(stream: Any, start: StreamStart) -> Caller:
+    """Bind one child's own consumer, and read from where its inherited prefix left the cursor."""
+    await stream.claim_consumer(
+        ConsumerClaim(
+            consumer_id=f"harness-{start.served_slot}",
+            claim_hash=start.consumer_claim_hash,
+        )
+    )
+    state = await stream.stream_state()
+    return Caller(stream, state.cursor, FilesystemBlobStore(Path(start.blob_root or "")))
+
+
+async def child_records(client: Client, identity: str) -> Any:
+    """One child's own attempts and the operation rows beside them, read off one moment."""
+    return await client.get_workflow_handle(identity).query(StreamWorkflow.generation_records)
+
+
+async def forked(
+    env: Any,
+    world: ServedEpisode,
+    composed: StreamStart,
+    blobs: Path,
+    tmp_path: Path,
+    workflow_id: str,
+    *,
+    crossed: bool = False,
+    turnover_at: Any = None,
+) -> Tuple[ForkRequest, Any, List[StreamStart]]:
+    """Take one generation to its acknowledgement, fork it, and read out both child starts.
+
+    ``crossed`` takes the parent over a continuation boundary before the fork, which is where a
+    child's preparation has to work from: the world behind A is gone with the execution that held
+    it and the committed evidence is all there is.
+
+    One Worker serves the whole lineage, which is the deployment invariant, so this runs inside
+    the caller's Worker rather than owning one of its own.
+    """
+    caller = await worked(env, composed, blobs, workflow_id, filing_of(world.env))
+    if crossed:
+        await cross_a_boundary(caller, turnover_at, workflow_id, env.client)
+    request = await a_fork_request(env.client, caller, composed, tmp_path)
+    receipt = await fork_stream(env.client, request)
+    starts = [
+        await started_with(env.client, child.child_workflow_id)
+        for child in receipt.child_receipts
+    ]
+    return request, receipt, starts
+
+
+async def test_a_gated_child_prepares_the_cell_it_was_selected_for_and_says_it_is_ready(
+    env: Any, world: ServedEpisode, tmp_path: Path, turnover_at: Any
+) -> None:
+    """The whole child side, over a parent that has already continued as new.
+
+    Nothing that could rebuild A is available: the world behind the filing is gone with the
+    execution that held it, and the Worker serving the children refuses to seal, to grade or to
+    render. What each child has is the descriptor its parent committed, the entry in it for the
+    cell it was selected for, and the bytes under that entry, and that is what it delivers.
+
+    The two children deliver different cells of one source and their payloads come to one
+    measurement, which is what the pair evidence is for: publication verified both bodies against
+    one registered mask and one encoded body count, so equal wire measurement and separately
+    correct per-cell hashes are what each of them proves here.
+    """
+    blobs = tmp_path / "blobs"
+    contract = contract_of(world.env)
+    turnover_at(10_000)
+    composed = fork_capable(start_for(world, contract, blobs, silent=True))
+    delivered = {}
+    async with stream_worker(env.client, activities=a_closing_worker(world)):
+        request, receipt, starts = await forked(
+            env,
+            world,
+            composed,
+            blobs,
+            tmp_path,
+            "stream/child-ready/1",
+            crossed=True,
+            turnover_at=turnover_at,
+        )
+        manifest = carried_source(
+            [one for one in carried(starts[0]).attempts if one.attempt_id == ATTEMPT][0]
+        )
+        close_the_capture()
+        for start, child in zip(starts, receipt.child_receipts):
+            identity = child.child_workflow_id
+            store = FilesystemBlobStore(Path(start.blob_root or ""))
+            stream, ready = await a_ready_child(env.client, start, identity, blobs)
+
+            # Neither the counterpart body nor the oracle body ever reached this child, and
+            # neither blocked its claim or its preparation.
+            assert store.unverified(
+                [manifest.cells[ORACLE_CELL].sha256]
+            ) == [manifest.cells[ORACLE_CELL].sha256]
+            counterpart = manifest.cells[
+                PLACEBO_CELL if child.target_cell == GRADED_CELL else GRADED_CELL
+            ].sha256
+            assert store.unverified([counterpart]) == [counterpart]
+
+            # The readiness certifies one child at one checkpoint with one candidate and one
+            # ownership state, and every value in it is one this child holds.
+            assert ready.fork_id == FORK
+            assert ready.child_workflow_id == identity
+            assert ready.child_run_id
+            assert ready.checkpoint_manifest_reference == (
+                request.checkpoint_manifest_reference
+            )
+            assert start.fork_origin is not None
+            assert ready.origin_digest == origin_digest(start.fork_origin)
+            assert ready.verified_set_digest == verified_set_digest(
+                carried(start).committed_blobs
+            )
+            assert ready.source_attempt_id == ATTEMPT
+            assert ready.selected_cell == child.target_cell
+            assert ready.selected_body_reference == manifest.cells[child.target_cell].sha256
+            assert ready.selected_policy_digest == CELL_POLICIES[child.target_cell]
+            assert ready.receipt_contract_id == CONTRACT
+            assert ready.ownership_epoch == 1
+            assert ready.consumer_id == ""
+            assert ready.preparation_operation == fork_preparation_operation_identity(
+                FORK, identity, 1
+            )
+
+            # The candidate is installed exactly once and counts as neither a materialization nor
+            # a release: the obligation it fills was materialized and released by the generation
+            # this child inherited. The preparation reads its objects through an Activity of its
+            # own, so it adds no verification batch to the one this child's claim took.
+            state = await stream.stream_state()
+            assert state.materialization_count == 1
+            assert state.eligibility_count == 1
+            assert state.verification_batches == carried(start).verification_batches + 1
+            assert state.obligations[ATTEMPT] == "eligible"
+
+            caller = await a_child_caller(stream, start)
+            payload = await caller.pull()
+            assert payload.kind == "payload"
+            assert payload.message_id == oid(0x103)
+            delivered[child.target_cell] = payload
+
+            # The bytes are the environment's own for this cell, and every measurement the
+            # contract fixed holds over them.
+            body = body_of(payload)
+            raw = body.encode("ascii")
+            assert sha256(raw).hexdigest() == manifest.cells[child.target_cell].sha256
+            assert len(raw) == BODY_SIZE == contract.body_size
+            assert sha256(masked_body(raw, mask_spans(contract))).hexdigest() == (
+                manifest.pair_parity.masked_body_sha256
+            )
+            assert len(payload.visible_text.encode("utf-8")) == payload_wire_count(
+                payload_message_id=oid(0x103),
+                attempt_id=ATTEMPT,
+                encoded_body_bytes=manifest.pair_parity.encoded_body_bytes,
+            )
+            # And no oracle: the cell nobody may be served is not the body either child got.
+            assert sha256(raw).hexdigest() != manifest.cells[ORACLE_CELL].sha256
+
+            # Every call this child made is one no unforked twin makes, its own first claim
+            # among them, and every one of them took its identifier from the fork's own
+            # namespace. So the child consumed no ordinary ordinal at all and its numbering is
+            # exactly the number its inherited prefix left, while its verification batch count
+            # is the one batch its claim took ahead of the twin's.
+            scheduled = await scheduled_activities(env.client, identity)
+            assert scheduled == [
+                f"fork.{FORK}.origin.1",
+                f"fork.{FORK}.claim.1",
+                f"fork.{FORK}.preparation.1",
+            ]
+
+    # Two cells of one source, one measurement, and nothing filed twice.
+    [graded, placebo] = [delivered[GRADED_CELL], delivered[PLACEBO_CELL]]
+    assert body_of(graded) != body_of(placebo)
+    assert len(graded.visible_text.encode("utf-8")) == len(
+        placebo.visible_text.encode("utf-8")
+    )
+
+
+async def test_a_child_that_lost_its_body_after_claiming_refuses_and_recovers_as_one_operation(
+    env: Any, world: ServedEpisode, tmp_path: Path, turnover_at: Any
+) -> None:
+    """Valid committed bytes lost in the window between a successful claim and a preparation.
+
+    The claim, the grade, the source and the selection are all intact and only the object is gone,
+    so this is repairable rather than a decision: the exact bytes go back and the same logical
+    preparation runs again. What makes it the same operation is the identity frozen at the first
+    attempt, which is recomputed after the epoch steps and comes out the same, and what makes it
+    reach a handler at all is the derived Update identifier, which is the one thing the epoch
+    moves. The original refusal stands for ever under the identifier that met it.
+    """
+    blobs = tmp_path / "blobs"
+    contract = contract_of(world.env)
+    turnover_at(10_000)
+    composed = fork_capable(start_for(world, contract, blobs))
+    async with stream_worker(env.client, activities=a_closing_worker(world)):
+        _request, receipt, starts = await forked(
+            env, world, composed, blobs, tmp_path, "stream/child-repair/1"
+        )
+        close_the_capture()
+        start, child = starts[0], receipt.child_receipts[0]
+        identity = child.child_workflow_id
+        store = FilesystemBlobStore(Path(start.blob_root or ""))
+        frozen = fork_preparation_operation_identity(FORK, identity, 1)
+        copy_closure(blobs, start.blob_root or "", child_closure(start))
+        stream = await a_claimed_child(env.client, start, identity)
+        reference = selected_reference(start)
+        store.path_for(reference).unlink()
+
+        with pytest.raises(Exception) as raised:
+            await stream.prepare_child(fork_id=FORK)
+        assert fork_refusal(raised.value) == FORK_REPAIRABLE_ABSENCE
+        assert fork_can_be_retried(raised.value)
+
+        # The row names the object the operation could not produce, under the identity the
+        # recovery will be joined to it by, and the child reads unavailable while it stands.
+        records = await child_records(env.client, identity)
+        [row] = records.operation_failures
+        assert (row.phase, row.reason, row.outcome) == (
+            FORK_PREPARATION,
+            UNAVAILABLE_EVIDENCE,
+            REFUSED_OPERATION,
+        )
+        assert row.operation == frozen
+        assert row.generation == identity
+        assert row.attempt_id == ATTEMPT
+        assert row.payload_position == 0
+        assert row.references == [reference]
+        assert (row.refused_epoch, row.recovered_epoch) == (1, None)
+        [attempt] = [one for one in records.attempts if one.attempt_id == ATTEMPT]
+        assert receipt_availability(attempt, records.operation_failures) == (
+            RECEIPT_UNAVAILABLE
+        )
+        assert (await stream.stream_state()).obligations[ATTEMPT] == "eligible"
+
+        # Putting the bytes back appends nothing, and the identifier that met the loss keeps
+        # returning what it was answered with.
+        copy_closure(blobs, start.blob_root or "", [reference])
+        with pytest.raises(Exception) as again:
+            await stream.prepare_child(fork_id=FORK)
+        assert fork_refusal(again.value) == FORK_REPAIRABLE_ABSENCE
+        assert len((await child_records(env.client, identity)).operation_failures) == 1
+
+        # And a boundary crossed while this child is still unprepared, which is lawful and is the
+        # entry the gate its parent wrote exists to survive: the obligation carries that gate over
+        # and the execution on the far side is the one the repair has to be answered by. It
+        # carries the episode the first attempt opened over with it, so what keeps the repair one
+        # operation is the child's own record rather than anything the far side reconstructs.
+        await hand_it_on(stream, turnover_at, identity, env.client)
+        crossed = await handed_on(env.client, identity)
+        assert crossed.fork_origin == start.fork_origin
+        assert crossed.carry is not None
+        continued = unpack_carrier(crossed.carry, CONVERTER)
+        [owed] = [one for one in continued.obligations if one.attempt_id == ATTEMPT]
+        assert owed.pending_preparation is True
+        assert owed.candidate is None
+        assert owed.preparation_epoch == 1
+        assert [one.operation for one in continued.operation_failures] == [frozen]
+
+        # Progress is the same preparation under the owner that follows: a fresh derived Update
+        # identifier reaches a handler, and the identity it is recorded under is the frozen one.
+        second = await a_claimed_child(env.client, start, identity)
+        ready = await second.prepare_child(fork_id=FORK)
+        assert ready.ownership_epoch == 2
+        assert ready.preparation_operation == frozen
+
+        records = await child_records(env.client, identity)
+        assert [
+            (one.operation, one.outcome, one.refused_epoch, one.recovered_epoch)
+            for one in records.operation_failures
+        ] == [(frozen, REFUSED_OPERATION, 1, None), (frozen, RECOVERED_OPERATION, 1, 2)]
+        [attempt] = [one for one in records.attempts if one.attempt_id == ATTEMPT]
+        assert receipt_availability(attempt, records.operation_failures) == RECEIPT_AVAILABLE
+
+        # A crash between the installation and the answer is a republished readiness rather than
+        # a second candidate and a second episode.
+        third = await a_claimed_child(env.client, start, identity)
+        republished = await third.prepare_child(fork_id=FORK)
+        assert republished == replace(ready, ownership_epoch=3)
+        assert len((await child_records(env.client, identity)).operation_failures) == 2
+
+        caller = await a_child_caller(third, start)
+        payload = await caller.pull()
+        assert sha256(body_of(payload).encode("ascii")).hexdigest() == reference
+
+
+#: Whether the preparation below is holding its answer back, and whether it has reached the point
+#: it holds at. The pair is how a preparation is caught in flight: one owner asks, the Activity
+#: says it has read the objects, a second owner takes the generation over, and the first owner is
+#: fenced on the way back in with its episode already open.
+_HELD: dict = {}
+
+
+@activity.defn(name=PREPARE_FORK_CHILD)
+async def _a_held_preparation(request: ForkPreparationInput) -> ForkPreparation:
+    """Read the objects for real, and hold the answer for as long as the test holds it."""
+    prepared = await fork_preparation_activity(request)
+    _HELD["running"] = True
+    while _HELD.get("held"):
+        await asyncio.sleep(0.02)
+    return prepared
+
+
+async def test_a_childs_preparation_episode_is_the_one_it_opened_whatever_its_first_attempt_did(
+    env: Any, world: ServedEpisode, tmp_path: Path, turnover_at: Any
+) -> None:
+    """The episode is frozen at the first attempt, and a first attempt need not leave a row.
+
+    A preparation writes an operation failure row when it is refused and writes none when it
+    succeeds, and the receipt route's own ordering says a superseded owner is fenced without a
+    stale row as well. So an identity reconstructed from rows is an identity two of the three
+    first attempts cannot supply, and the record the episode is kept in is the child's own
+    obligation instead.
+
+    Both halves are driven here over a real child, each across the boundary that destroys anything
+    an execution was holding in memory. The first child prepares, crosses and is reattached, and
+    republishes its readiness under the episode it opened. The second is fenced after its Activity
+    answered, leaves nothing behind but the episode, crosses, and the owner after that prepares
+    under that same episode rather than opening a second one.
+    """
+    blobs = tmp_path / "blobs"
+    contract = contract_of(world.env)
+    turnover_at(10_000)
+    composed = fork_capable(start_for(world, contract, blobs))
+    _HELD.clear()
+    async with stream_worker(
+        env.client, activities=[*a_closing_worker(world), _a_held_preparation]
+    ):
+        _request, receipt, starts = await forked(
+            env, world, composed, blobs, tmp_path, "stream/child-episode/1"
+        )
+        close_the_capture()
+
+        # The first attempt succeeds, so there is no failure row anywhere to read an epoch out of.
+        start, child = starts[0], receipt.child_receipts[0]
+        identity = child.child_workflow_id
+        opened = fork_preparation_operation_identity(FORK, identity, 1)
+        stream, ready = await a_ready_child(env.client, start, identity, blobs)
+        assert (ready.ownership_epoch, ready.preparation_operation) == (1, opened)
+        assert (await child_records(env.client, identity)).operation_failures == []
+
+        # The boundary takes this execution's memory with it, and the episode crosses in the
+        # record the obligation keeps rather than in the rows the attempt did not write.
+        await hand_it_on(stream, turnover_at, identity, env.client)
+        [owed] = [
+            one
+            for one in carried(await handed_on(env.client, identity)).obligations
+            if one.attempt_id == ATTEMPT
+        ]
+        assert (owed.pending_preparation, owed.preparation_epoch) == (False, 1)
+
+        second = await a_claimed_child(env.client, start, identity)
+        again = await second.prepare_child(fork_id=FORK)
+        assert again.child_run_id != ready.child_run_id
+        assert again == replace(
+            ready, ownership_epoch=2, child_run_id=again.child_run_id
+        )
+        assert (await child_records(env.client, identity)).operation_failures == []
+
+        # And the other first attempt that leaves no row: one fenced on the way back in, after
+        # its Activity answered and before anything it read could be recorded.
+        held, sibling_child = starts[1], receipt.child_receipts[1]
+        theirs = sibling_child.child_workflow_id
+        their_episode = fork_preparation_operation_identity(FORK, theirs, 1)
+        copy_closure(blobs, held.blob_root or "", child_closure(held))
+        first_owner = await a_claimed_child(env.client, held, theirs)
+        _HELD.update({"held": True, "running": False})
+        preparing = asyncio.ensure_future(first_owner.prepare_child(fork_id=FORK))
+        for _ in range(500):
+            if _HELD.get("running"):
+                break
+            await asyncio.sleep(0.02)
+        assert _HELD.get("running"), "the preparation never reached the point it holds at"
+        replacement = await a_claimed_child(env.client, held, theirs)
+        _HELD["held"] = False
+        with pytest.raises(Exception) as fenced:
+            await preparing
+        assert protocol_error_code(fenced.value) == "fenced_writer"
+        assert (await child_records(env.client, theirs)).operation_failures == []
+
+        await hand_it_on(replacement, turnover_at, theirs, env.client)
+        [still_owed] = [
+            one
+            for one in carried(await handed_on(env.client, theirs)).obligations
+            if one.attempt_id == ATTEMPT
+        ]
+        assert (still_owed.pending_preparation, still_owed.preparation_epoch) == (True, 1)
+
+        third = await a_claimed_child(env.client, held, theirs)
+        theirs_ready = await third.prepare_child(fork_id=FORK)
+        assert theirs_ready.ownership_epoch == 3
+        assert theirs_ready.preparation_operation == their_episode
+        assert (await child_records(env.client, theirs)).operation_failures == []
+    _HELD.clear()
+
+
+async def test_a_child_that_lost_its_manifest_names_the_object_it_could_not_produce(
+    env: Any, world: ServedEpisode, tmp_path: Path, turnover_at: Any
+) -> None:
+    """The manifest is a second object lost in the same window, and it fails on its own terms.
+
+    This is why a preparation reads the manifest again rather than calling the resolver bare: the
+    resolver opens the store for the selected body alone, so a manifest lost after the claim would
+    let a child publish readiness over a source object nobody could produce. The descriptor
+    carried in state stays perfectly valid while that is true, which is the whole point of reading
+    the store: a value in state is not a claim about a store.
+    """
+    blobs = tmp_path / "blobs"
+    contract = contract_of(world.env)
+    turnover_at(10_000)
+    composed = fork_capable(start_for(world, contract, blobs))
+    async with stream_worker(env.client, activities=a_closing_worker(world)):
+        _request, receipt, starts = await forked(
+            env, world, composed, blobs, tmp_path, "stream/child-manifest/1"
+        )
+        close_the_capture()
+        start, child = starts[0], receipt.child_receipts[0]
+        identity = child.child_workflow_id
+        store = FilesystemBlobStore(Path(start.blob_root or ""))
+        frozen = fork_preparation_operation_identity(FORK, identity, 1)
+        copy_closure(blobs, start.blob_root or "", child_closure(start))
+        stream = await a_claimed_child(env.client, start, identity)
+        [row] = [one for one in carried(start).attempts if one.attempt_id == ATTEMPT]
+        commitment = row.source_commitment or ""
+        store.path_for(commitment).unlink()
+
+        with pytest.raises(Exception) as raised:
+            await stream.prepare_child(fork_id=FORK)
+        assert fork_refusal(raised.value) == FORK_REPAIRABLE_ABSENCE
+
+        # Nothing was installed, nothing was marked and nothing was published: the child is where
+        # it was, holding an eligible obligation and no body for it.
+        records = await child_records(env.client, identity)
+        [failure] = records.operation_failures
+        assert failure.operation == frozen
+        assert failure.references == [commitment]
+        assert failure.outcome == REFUSED_OPERATION
+        state = await stream.stream_state()
+        assert state.obligations[ATTEMPT] == "eligible"
+        assert state.payload_delivery_count == 0
+        [attempt] = [one for one in records.attempts if one.attempt_id == ATTEMPT]
+        assert receipt_availability(attempt, records.operation_failures) == (
+            RECEIPT_UNAVAILABLE
+        )
+
+        # And the descriptor this child carries is exactly as valid as it was, because what went
+        # missing is the object under its digest rather than anything about the value.
+        manifest = carried_source(row)
+        assert source_commitment(manifest) == commitment
+        assert store.unverified([commitment]) == [commitment]
+
+        # Repairing those exact bytes recovers under the identity the first attempt froze.
+        copy_closure(blobs, start.blob_root or "", [commitment])
+        second = await a_claimed_child(env.client, start, identity)
+        ready = await second.prepare_child(fork_id=FORK)
+        assert ready.preparation_operation == frozen
+        assert ready.selected_body_reference == manifest.cells[child.target_cell].sha256
+        records = await child_records(env.client, identity)
+        assert [one.outcome for one in records.operation_failures] == [
+            REFUSED_OPERATION,
+            RECOVERED_OPERATION,
+        ]
+
+
+#: What one value of a preparation's result is replaced with before it comes back. The Worker
+#: registers the substitute below instead of the real preparation, because two Activities of one
+#: name are refused, and what it stands in for is a resolver this generation did not ask for.
+_SUBSTITUTED: dict = {}
+
+#: Which children this Worker actually ran a preparation for, in order. A preparation that never
+#: reached an Activity is the point of a terminal episode, and a count is how that is observed
+#: rather than inferred from the refusal that came back.
+_PREPARATIONS: List[str] = []
+
+
+@activity.defn(name=PREPARE_FORK_CHILD)
+async def _a_substituted_preparation(request: ForkPreparationInput) -> ForkPreparation:
+    """Read the objects for real, then move the one value under test on the way back."""
+    _PREPARATIONS.append(request.payload.attempt_id)
+    prepared = await fork_preparation_activity(request)
+    if prepared.bundle is None or not _SUBSTITUTED:
+        return prepared
+    [candidate] = prepared.bundle.candidates
+    return replace(
+        prepared,
+        bundle=replace(
+            prepared.bundle, candidates=[replace(candidate, **_SUBSTITUTED)]
+        ),
+    )
+
+
+async def test_a_child_handed_a_result_it_cannot_vouch_for_is_refused_for_good(
+    env: Any, world: ServedEpisode, tmp_path: Path, turnover_at: Any
+) -> None:
+    """The two permanent halves of a preparation, and the repair neither of them becomes.
+
+    A result naming a source other than the one this obligation was selected from is the wrong
+    source; one naming this source and failing a check of what it is, is contract drift. Both are
+    endings: the row is unrecoverable, no candidate is installed, the exact identifier keeps
+    returning the refusal, and an owner that follows meets the same answer rather than a repair.
+
+    An ending is a fact about the episode and not about the attempt that met it, so the owner that
+    follows is answered from the record rather than allowed to make the decision again. That is
+    the case a resolver put back in order would otherwise pass: the substitution is cleared before
+    the retry here, so a preparation that ran would come back with a candidate every check admits,
+    and what the child does instead is refuse without asking for one at all.
+    """
+    blobs = tmp_path / "blobs"
+    contract = contract_of(world.env)
+    turnover_at(10_000)
+    composed = fork_capable(start_for(world, contract, blobs))
+    substitutions = [
+        ({"source_commitment": "a" * 64}, FORK_WRONG_SOURCE, WRONG_SOURCE),
+        ({"resolver_id": "a resolver nobody registered"}, FORK_CONTRACT_DRIFT, CONTRACT_DRIFT),
+    ]
+    _SUBSTITUTED.clear()
+    _PREPARATIONS.clear()
+    async with stream_worker(
+        env.client, activities=[*a_closing_worker(world), _a_substituted_preparation]
+    ):
+        _request, receipt, starts = await forked(
+            env, world, composed, blobs, tmp_path, "stream/child-refused/1"
+        )
+        close_the_capture()
+        for start, child, (moved, refusal, reason) in zip(
+            starts, receipt.child_receipts, substitutions
+        ):
+            identity = child.child_workflow_id
+            frozen = fork_preparation_operation_identity(FORK, identity, 1)
+            copy_closure(blobs, start.blob_root or "", child_closure(start))
+            stream = await a_claimed_child(env.client, start, identity)
+            _SUBSTITUTED.clear()
+            _SUBSTITUTED.update(moved)
+
+            with pytest.raises(Exception) as raised:
+                await stream.prepare_child(fork_id=FORK)
+            assert fork_refusal(raised.value) == refusal
+            assert not fork_can_be_retried(raised.value)
+
+            records = await child_records(env.client, identity)
+            [row] = records.operation_failures
+            assert (row.operation, row.phase, row.reason, row.outcome) == (
+                frozen,
+                FORK_PREPARATION,
+                reason,
+                UNRECOVERABLE_OPERATION,
+            )
+            assert (await stream.stream_state()).obligations[ATTEMPT] == "eligible"
+
+            # It is an ending and not an absence, so an owner that follows meets it again rather
+            # than repairing anything. The substitution is gone by then, so a preparation that ran
+            # would be handed a candidate every check admits; the episode is over, so none runs,
+            # and the row the ending wrote is still the only row there is.
+            _SUBSTITUTED.clear()
+            ran = len(_PREPARATIONS)
+            second = await a_claimed_child(env.client, start, identity)
+            with pytest.raises(Exception) as again:
+                await second.prepare_child(fork_id=FORK)
+            assert fork_refusal(again.value) == refusal
+            assert not fork_can_be_retried(again.value)
+            assert len(_PREPARATIONS) == ran
+            outcomes = (await child_records(env.client, identity)).operation_failures
+            assert [one.outcome for one in outcomes] == [UNRECOVERABLE_OPERATION]
+            assert [one.refused_epoch for one in outcomes] == [1]
+            assert {one.operation for one in outcomes} == {frozen}
+            assert (await second.stream_state()).obligations[ATTEMPT] == "eligible"
+    _SUBSTITUTED.clear()
+    _PREPARATIONS.clear()
+
+
+#: The size a preparation's result is grown to before it comes back, and the hold that catches one
+#: owner on the way in. An empty mapping is the ordinary result, untouched.
+_OVERSIZED: dict = {}
+
+#: Which children this Worker actually ran a preparation for, so an episode that ended can be
+#: observed to have run none rather than inferred from the refusal that came back.
+_OVERSIZED_RUNS: List[str] = []
+
+
+@activity.defn(name=PREPARE_FORK_CHILD)
+async def _an_oversized_preparation(request: ForkPreparationInput) -> ForkPreparation:
+    """Read the objects for real, and hand back a result too big for this child to carry."""
+    _OVERSIZED_RUNS.append(request.payload.attempt_id)
+    prepared = await fork_preparation_activity(request)
+    if prepared.bundle is None or not _OVERSIZED:
+        return prepared
+    _OVERSIZED["running"] = True
+    while _OVERSIZED.get("held"):
+        await asyncio.sleep(0.02)
+    [candidate] = prepared.bundle.candidates
+    return replace(
+        prepared,
+        bundle=replace(
+            prepared.bundle,
+            candidates=[replace(candidate, body="x" * int(_OVERSIZED["size"]))],
+        ),
+    )
+
+
+async def test_a_preparation_result_this_child_cannot_carry_ends_the_episode_it_opened(
+    env: Any, world: ServedEpisode, tmp_path: Path, turnover_at: Any
+) -> None:
+    """The bytes a result comes back in are a completion like any other, classified in one place.
+
+    A result too big for this child to carry is a decision about that result and never a fault of
+    the call, so it is measured where the owner has just been checked again: the episode it ends
+    is the one the child froze, the row it writes is the permanent one the declared failure model
+    has for it, and an owner that follows meets the ending rather than making the decision again.
+
+    The owner check is what comes first, and the sibling here is why. A writer a resume replaced
+    while the store was being read is told that it was replaced, not that the result it never gets
+    to see was too big, and it leaves nothing behind for the owner that replaced it.
+    """
+    blobs = tmp_path / "blobs"
+    contract = contract_of(world.env)
+    turnover_at(10_000)
+    composed = fork_capable(start_for(world, contract, blobs))
+    oversize = TURNOVER_PAYLOAD_CEILING_BYTES + 10_000
+    _OVERSIZED.clear()
+    _OVERSIZED_RUNS.clear()
+    async with stream_worker(
+        env.client, activities=[*a_closing_worker(world), _an_oversized_preparation]
+    ):
+        _request, receipt, starts = await forked(
+            env, world, composed, blobs, tmp_path, "stream/child-oversize/1"
+        )
+        close_the_capture()
+
+        start, child = starts[0], receipt.child_receipts[0]
+        identity = child.child_workflow_id
+        frozen = fork_preparation_operation_identity(FORK, identity, 1)
+        copy_closure(blobs, start.blob_root or "", child_closure(start))
+        stream = await a_claimed_child(env.client, start, identity)
+        _OVERSIZED.update({"size": oversize})
+
+        with pytest.raises(Exception) as raised:
+            await stream.prepare_child(fork_id=FORK)
+        assert fork_refusal(raised.value) == FORK_CONTRACT_DRIFT
+        assert not fork_can_be_retried(raised.value)
+        assert "encodes to" in str(raised.value.cause)
+
+        records = await child_records(env.client, identity)
+        [row] = records.operation_failures
+        assert (row.operation, row.phase, row.reason, row.outcome) == (
+            frozen,
+            FORK_PREPARATION,
+            CONTRACT_DRIFT,
+            UNRECOVERABLE_OPERATION,
+        )
+        assert row.refused_epoch == 1
+        state = await stream.stream_state()
+        assert state.obligations[ATTEMPT] == "eligible"
+        assert state.payload_delivery_count == 0
+
+        # It is an ending, so the owner that follows is answered from the record. The result is
+        # ordinary again by then, and no preparation runs at all.
+        _OVERSIZED.clear()
+        ran = len(_OVERSIZED_RUNS)
+        second = await a_claimed_child(env.client, start, identity)
+        with pytest.raises(Exception) as again:
+            await second.prepare_child(fork_id=FORK)
+        assert fork_refusal(again.value) == FORK_CONTRACT_DRIFT
+        assert len(_OVERSIZED_RUNS) == ran
+        outcomes = (await child_records(env.client, identity)).operation_failures
+        assert [one.outcome for one in outcomes] == [UNRECOVERABLE_OPERATION]
+
+        # The sibling: an owner replaced while its Activity ran is told it was replaced, and the
+        # oversize it never saw leaves no row of its own behind.
+        held, theirs_child = starts[1], receipt.child_receipts[1]
+        theirs = theirs_child.child_workflow_id
+        their_episode = fork_preparation_operation_identity(FORK, theirs, 1)
+        copy_closure(blobs, held.blob_root or "", child_closure(held))
+        first_owner = await a_claimed_child(env.client, held, theirs)
+        _OVERSIZED.update({"size": oversize, "held": True, "running": False})
+        preparing = asyncio.ensure_future(first_owner.prepare_child(fork_id=FORK))
+        for _ in range(500):
+            if _OVERSIZED.get("running"):
+                break
+            await asyncio.sleep(0.02)
+        assert _OVERSIZED.get("running"), "the preparation never reached the point it holds at"
+        replacement = await a_claimed_child(env.client, held, theirs)
+        _OVERSIZED["held"] = False
+        with pytest.raises(Exception) as fenced:
+            await preparing
+        assert protocol_error_code(fenced.value) == "fenced_writer"
+        assert (await child_records(env.client, theirs)).operation_failures == []
+
+        # And the owner that replaced it is the one the same oversize is recorded under, in the
+        # episode the fenced attempt opened rather than in one of its own.
+        with pytest.raises(Exception) as ended:
+            await replacement.prepare_child(fork_id=FORK)
+        assert fork_refusal(ended.value) == FORK_CONTRACT_DRIFT
+        [their_row] = (await child_records(env.client, theirs)).operation_failures
+        assert their_row.operation == their_episode
+        assert (their_row.refused_epoch, their_row.outcome) == (2, UNRECOVERABLE_OPERATION)
+    _OVERSIZED.clear()
+    _OVERSIZED_RUNS.clear()
+
+
+#: The object a store loses in the window between a preparation's two reads, or nothing.
+_LOST: dict = {}
+
+
+class ALosingStore(FilesystemBlobStore):
+    """A store that loses one object between the read that checks it and the read that uses it.
+
+    A preparation checks both objects and then resolves the selected body, which opens the store a
+    second time. The interval between those two reads is a real one, and this is how it is driven:
+    the check answers truthfully that nothing is missing, and the object is gone by the time the
+    resolver asks for it.
+    """
+
+    def unverified(self, digests: Any) -> List[str]:
+        answer = super().unverified(digests)
+        losing = _LOST.get("reference")
+        if not answer and losing:
+            self.path_for(str(losing)).unlink(missing_ok=True)
+        return answer
+
+
+async def test_a_body_lost_between_a_preparations_two_reads_is_the_absence_a_repair_answers(
+    env: Any, world: ServedEpisode, tmp_path: Path, turnover_at: Any, monkeypatch: Any
+) -> None:
+    """Valid committed bytes lost after the claim and before derivation reads them.
+
+    The claim, the grade, the source and the selection are all intact and only the object is gone,
+    which is the repairable case: the exact bytes are reinstalled from a verified copy and the
+    same logical preparation runs again under the owner that follows. Where in the operation the
+    loss falls does not change what it is, so a body that disappeared between the check and the
+    resolver comes back as the name that could not be produced rather than as a failure of the
+    call, which nothing would classify and no row would name.
+    """
+    blobs = tmp_path / "blobs"
+    contract = contract_of(world.env)
+    turnover_at(10_000)
+    composed = fork_capable(start_for(world, contract, blobs))
+    _LOST.clear()
+    monkeypatch.setattr(kernel_activities, "FilesystemBlobStore", ALosingStore)
+    async with stream_worker(env.client, activities=a_closing_worker(world)):
+        _request, receipt, starts = await forked(
+            env, world, composed, blobs, tmp_path, "stream/child-lost-body/1"
+        )
+        close_the_capture()
+        start, child = starts[0], receipt.child_receipts[0]
+        identity = child.child_workflow_id
+        frozen = fork_preparation_operation_identity(FORK, identity, 1)
+        copy_closure(blobs, start.blob_root or "", child_closure(start))
+        stream = await a_claimed_child(env.client, start, identity)
+
+        # The claim read its own set back with the body present, and the body goes missing in the
+        # window inside the preparation rather than before it.
+        body = selected_reference(start)
+        store = FilesystemBlobStore(Path(start.blob_root or ""))
+        assert store.unverified([body]) == []
+        _LOST["reference"] = body
+
+        with pytest.raises(Exception) as raised:
+            await stream.prepare_child(fork_id=FORK)
+        assert fork_refusal(raised.value) == FORK_REPAIRABLE_ABSENCE
+        assert fork_can_be_retried(raised.value)
+        assert body in str(raised.value.cause)
+        _LOST.clear()
+        assert store.unverified([body]) == [body]
+
+        records = await child_records(env.client, identity)
+        [failure] = records.operation_failures
+        assert (failure.operation, failure.reason, failure.outcome) == (
+            frozen,
+            UNAVAILABLE_EVIDENCE,
+            REFUSED_OPERATION,
+        )
+        assert failure.references == [body]
+        assert (await stream.stream_state()).obligations[ATTEMPT] == "eligible"
+        [attempt] = [one for one in records.attempts if one.attempt_id == ATTEMPT]
+        assert receipt_availability(attempt, records.operation_failures) == (
+            RECEIPT_UNAVAILABLE
+        )
+
+        # Those exact bytes put back, under the owner that follows, is the whole repair.
+        copy_closure(blobs, start.blob_root or "", [body])
+        second = await a_claimed_child(env.client, start, identity)
+        ready = await second.prepare_child(fork_id=FORK)
+        assert ready.preparation_operation == frozen
+        assert ready.selected_body_reference == body
+        assert [
+            one.outcome
+            for one in (await child_records(env.client, identity)).operation_failures
+        ] == [REFUSED_OPERATION, RECOVERED_OPERATION]
+    _LOST.clear()
+
+
+async def test_a_prepared_child_crosses_its_own_boundary_and_serves_the_body_it_built(
+    env: Any, world: ServedEpisode, tmp_path: Path, turnover_at: Any
+) -> None:
+    """A child's own later continuation, which is a different entry from the one it was cut at.
+
+    The lineage crosses as immutable provenance and authorizes nothing about the carry on the far
+    side: what authorizes that is the service's own continuation fact, and the identity inside the
+    carrier is the child's own by then rather than the parent's. Nothing asks the parent again,
+    because the comparison of a child against the parent it was cut from is made once, at the
+    entry that was cut.
+
+    The body the child built crosses with it, the gate its preparation cleared stays cleared, and
+    what it serves afterwards is the same bytes it would have served before.
+    """
+    blobs = tmp_path / "blobs"
+    contract = contract_of(world.env)
+    turnover_at(10_000)
+    composed = fork_capable(start_for(world, contract, blobs))
+    async with stream_worker(env.client, activities=a_closing_worker(world)):
+        _request, receipt, starts = await forked(
+            env, world, composed, blobs, tmp_path, "stream/child-crossed/1"
+        )
+        close_the_capture()
+        start, child = starts[0], receipt.child_receipts[0]
+        identity = child.child_workflow_id
+        stream, ready = await a_ready_child(env.client, start, identity, blobs)
+        caller = await a_child_caller(stream, start)
+        await cross_a_boundary(caller, turnover_at, identity, env.client)
+        crossed = await handed_on(env.client, identity)
+
+        # The lineage is retained exactly, and the carry on the far side is the child's own.
+        assert crossed.fork_origin == start.fork_origin
+        assert crossed.carry is not None
+        assert crossed.carry.carrier_schema_version == FORK_CARRIER_SCHEMA_VERSION
+        projection = unpack_carrier(crossed.carry, CONVERTER)
+        assert projection.configuration_hash == configuration_hash(crossed)
+        assert projection.configuration_hash != carried(start).configuration_hash
+        assert projection.configuration_hash != start.fork_origin.parent_configuration_hash
+
+        # The body it built crossed with it, and the gate its preparation cleared stays cleared.
+        [owed] = [one for one in projection.obligations if one.attempt_id == ATTEMPT]
+        assert owed.candidate is not None
+        assert owed.pending_preparation is False
+        assert owed.candidate.inner_sha256 == ready.selected_body_reference
+
+        # And the continued execution asks the parent nothing at all. The ordinal it carries over
+        # is the one it was cut at, because everything the child did on the near side was work no
+        # unforked twin does and every one of those reads took a fork identifier.
+        assert not [
+            one
+            for one in await scheduled_activities(env.client, identity)
+            if one.startswith("fork.")
+        ]
+        assert projection.activity_ordinal == carried(start).activity_ordinal
+
+        payload = await caller.pull()
+        assert payload.kind == "payload"
+        assert sha256(body_of(payload).encode("ascii")).hexdigest() == (
+            ready.selected_body_reference
+        )
+        # The mark that says this execution read the objects behind that delivery is this
+        # execution's own, so the first dependent delivery after a boundary reads them again.
+        state = await stream.stream_state()
+        assert state.verification_batches == projection.verification_batches + 1
+
+
+async def test_a_child_claims_over_the_closure_it_was_given_and_never_over_less(
+    env: Any, world: ServedEpisode, tmp_path: Path, turnover_at: Any
+) -> None:
+    """The child's first claim is the acceptance test for the copy that was made for it.
+
+    The verification path refuses a claim over references the store cannot produce, so a closure
+    that arrived short is caught before the child owns anything, and the row says whose evidence
+    went missing. Reinstalling those exact bytes recovers the same claim rather than creating
+    anything: no child is deleted here and none is replaced.
+    """
+    blobs = tmp_path / "blobs"
+    contract = contract_of(world.env)
+    turnover_at(10_000)
+    composed = fork_capable(start_for(world, contract, blobs))
+    async with stream_worker(env.client, activities=a_closing_worker(world)):
+        _request, receipt, starts = await forked(
+            env, world, composed, blobs, tmp_path, "stream/child-closure/1"
+        )
+        close_the_capture()
+        start, child = starts[0], receipt.child_receipts[0]
+        identity = child.child_workflow_id
+        [row] = [one for one in carried(start).attempts if one.attempt_id == ATTEMPT]
+        evidence = row.graded_evidence or ""
+        copy_closure(
+            blobs,
+            start.blob_root or "",
+            [one for one in child_closure(start) if one != evidence],
+        )
+        with pytest.raises(Exception) as raised:
+            await a_claimed_child(env.client, start, identity)
+        assert protocol_error_code(raised.value) == "invalid_message"
+
+        records = await child_records(env.client, identity)
+        [refused] = records.operation_failures
+        assert refused.reason == UNAVAILABLE_EVIDENCE
+        assert refused.outcome == REFUSED_OPERATION
+        assert refused.attempt_id == ATTEMPT
+        assert refused.references == [evidence]
+        assert refused.generation == identity
+
+        copy_closure(blobs, start.blob_root or "", [evidence])
+        stream, ready = await a_ready_child(env.client, start, identity, blobs)
+        assert ready.child_workflow_id == identity
+        records = await child_records(env.client, identity)
+        assert [one.outcome for one in records.operation_failures] == [
+            REFUSED_OPERATION,
+            RECOVERED_OPERATION,
+        ]
+        [attempt] = [one for one in records.attempts if one.attempt_id == ATTEMPT]
+        assert receipt_availability(attempt, records.operation_failures) == RECEIPT_AVAILABLE

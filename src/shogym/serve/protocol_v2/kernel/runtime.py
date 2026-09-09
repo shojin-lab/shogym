@@ -75,6 +75,7 @@ from shogym.serve.protocol_v2.kernel.activities import fork_activities, kernel_a
 from shogym.serve.protocol_v2.kernel.messages import (
     AnsweredUpdate,
     AttemptFinalized,
+    ChildReady,
     ConsumerClaim,
     ConsumerReceipt,
     EnvironmentCall,
@@ -99,6 +100,7 @@ from shogym.serve.protocol_v2.kernel.messages import (
     StreamStart,
     StreamState,
     Writer,
+    check_child_ready,
     check_fork_receipt,
     check_fork_request,
     check_prepared_fork,
@@ -108,6 +110,7 @@ from shogym.serve.protocol_v2.kernel.messages import (
 )
 from shogym.serve.protocol_v2.kernel.workflow import (
     FORK_BARRIER,
+    ORIGIN_UNVERIFIED,
     TURNOVER_PENDING,
     TURNOVER_PAYLOAD_CEILING_BYTES,
     ForkRefused,
@@ -311,7 +314,7 @@ def _registered(activities: Optional[Sequence[Any]]) -> list:
 
     A Worker takes whatever Activity list it is given wholesale, and an environment that brings its
     own terminal hands over only its seal, its grade, the payload bundle Activity and the blob
-    verification Activity. The fork's three are none of those and a caller composing a list has no
+    verification Activity. The fork's four are none of those and a caller composing a list has no
     reason to know about them, so they are added here rather than left to be remembered. A caller
     that supplied one of them itself keeps its own, because the SDK refuses two Activities of one
     name in a Worker.
@@ -628,6 +631,18 @@ def turnover_pending(error: BaseException) -> bool:
     """
     cause = error.__cause__ if isinstance(error, WorkflowUpdateFailedError) else error
     return isinstance(cause, ApplicationError) and cause.type == TURNOVER_PENDING
+
+
+def origin_unverified(error: BaseException) -> bool:
+    """Whether this failure says a child had not yet authorized the lineage it carries.
+
+    It is the gate rather than a refusal, and it is not something :func:`protocol_error_code`
+    answers for. Nothing the caller sent is wrong: a child owns nothing and serves nothing until
+    its own history has read the parent's record of it, so the same request under the same
+    identifier reaches a child that has done that first work.
+    """
+    cause = error.__cause__ if isinstance(error, WorkflowUpdateFailedError) else error
+    return isinstance(cause, ApplicationError) and cause.type == ORIGIN_UNVERIFIED
 
 
 def fork_refusal(error: BaseException) -> Optional[str]:
@@ -1232,6 +1247,28 @@ class StreamHandle:
                 StreamWorkflow.confirm_state, args=[writer], id=update_id
             )
         )
+
+    async def prepare_child(self, *, fork_id: str) -> ChildReady:
+        """Build this child's own body for the obligation it inherited, and read its readiness.
+
+        The Update identifier carries the epoch this owner holds, which is the one thing that
+        moves between two attempts at one logical preparation. A refusal keeps coming back under
+        the identifier that met it, however thoroughly the object behind it is repaired, so a
+        repair is submitted by the owner that follows and reaches a handler rather than replaying
+        an answer. The operation the record joins them by is frozen at the first attempt and is
+        inside neither identifier.
+        """
+        writer = self.writer
+        update_id = f"prepare-{fork_id}-{writer.ownership_epoch}"
+        ready = await self._sent(
+            update_id,
+            ChildReady,
+            lambda: self.handle.execute_update(
+                StreamWorkflow.prepare_child, args=[writer], id=update_id
+            ),
+        )
+        check_child_ready(ready)
+        return ready
 
     async def stream_state(self) -> StreamState:
         """Read the generation's state without changing it."""

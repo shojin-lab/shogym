@@ -191,7 +191,7 @@ _RECEIPT_PROJECTION_MEMBERS = ("operation_failures",)
 # And the fork's own. The two slots and the origin are the start's, and the preparation gate is
 # the one member a child's carried obligation holds that no other generation writes.
 _FORK_START_MEMBERS = ("served_slot", "forkable_slots", "fork_origin")
-_FORK_OBLIGATION_MEMBERS = ("pending_preparation",)
+_FORK_OBLIGATION_MEMBERS = ("pending_preparation", "preparation_epoch")
 
 
 #: The shape of a fork origin this build writes and admits.
@@ -506,6 +506,14 @@ class CarriedObligation:
     child's own preparation clears it in the same transition that installs the candidate, so an
     obligation claiming it is told from a damaged carry by a value the parent committed to rather
     than by the absence of bytes. No other generation writes one.
+
+    ``preparation_epoch`` is the ownership epoch the child's first preparation of this obligation
+    was created under, written once at that first attempt and never recomputed from the epoch the
+    child holds later. It is the child's own preparation record: a repair that steps the owner
+    repeats one logical preparation rather than opening a second operation nothing joins to the
+    first, and the identity has to survive a success, a refusal and a lost claim alike, so it is
+    kept here rather than reconstructed from whatever rows an attempt happened to leave. Zero is a
+    child that has opened no episode.
     """
 
     attempt_id: str
@@ -513,6 +521,7 @@ class CarriedObligation:
     materialized: bool = False
     candidate: Optional[PayloadCandidate] = None
     pending_preparation: bool = False
+    preparation_epoch: int = 0
 
 
 @dataclass(frozen=True)
@@ -651,11 +660,16 @@ def fork_configuration(start: "StreamStart") -> bool:
 def carried_fork_evidence(projection: "CarriedProjection") -> bool:
     """Say whether one projection holds a member only a fork puts there.
 
-    The preparation gate is that member: no ordinary generation and no receipt one writes an
-    obligation marked pending preparation, and a projection holding one may never be written as a
-    record that had no room for it.
+    The obligation's two preparation members are those: no ordinary generation and no receipt one
+    marks an obligation pending preparation or opens a preparation episode against it, and a
+    projection holding either may never be written as a record that had no room for it. The
+    episode counts as much as the gate, because a child that has prepared clears the gate and
+    keeps the episode for as long as it runs.
     """
-    return any(owed.pending_preparation for owed in projection.obligations)
+    return any(
+        owed.pending_preparation or owed.preparation_epoch > 0
+        for owed in projection.obligations
+    )
 
 
 def carrier_version(start: "StreamStart", projection: "CarriedProjection") -> int:
@@ -735,9 +749,10 @@ def legacy_projection_members(written: Dict[str, Any]) -> Dict[str, Any]:
 def receipt_projection_members(written: Dict[str, Any]) -> Dict[str, Any]:
     """Return one encoded projection as the receipt carrier version had it.
 
-    One member goes, the preparation gate on the carried obligation, and every other name and
-    value crosses as the converter wrote it. A receipt generation writes no gate, so what this
-    removes is the field's default rather than a state anything held.
+    The carried obligation's two preparation members go, and every other name and value crosses as
+    the converter wrote it. A receipt generation neither gates an obligation nor opens a
+    preparation episode against one, so what this removes is those fields' defaults rather than a
+    state anything held.
     """
     adapted = dict(written)
     adapted["obligations"] = [
@@ -3075,6 +3090,20 @@ def canonical_location(location: str) -> str:
     return "/" + "/".join(parts)
 
 
+def verified_set_digest(references: Sequence[str]) -> str:
+    """Return the digest of the object set one child's claim read back.
+
+    It names a set of objects rather than a value with a shape, so it is the plain hash of a
+    length-prefixed tag and the sorted names under it rather than a canonical encoding under a
+    domain tag: there is no field path here for the numeric conversion table to reach and nothing
+    in it that is not already a digest. The order is fixed so that two readings of one set produce
+    one digest, and a duplicate name counts once.
+    """
+    digest = sha256(length_prefixed(b"fork-verified-set-v1"))
+    for reference in sorted(set(references)):
+        digest.update(length_prefixed(reference.encode("utf-8")))
+    return digest.hexdigest()
+
 
 def fork_request_digest(request: ForkRequest) -> str:
     """Return what binds one fork id to the request it was accepted under.
@@ -3427,16 +3456,19 @@ def check_receipt_within_bound(receipt: ForkReceipt, bound: int, converter: Any)
 # The Activity namespace a fork's own invocations take their identifiers from, and what a step of
 # one is called. A child's ordinary Activity numbering has to equal the number its inherited prefix
 # left, so that it maps onto an unforked twin's, and every fork-only call takes an identifier from
-# here rather than consuming the generation's own ordinal. That covers the calls of the existing
-# blob verification and payload Activities a fork makes as well as the three types it adds.
+# here rather than consuming the generation's own ordinal. That covers the four Activity types a
+# fork adds and the calls it makes of the existing blob verification and payload Activities, the
+# gated child's own first claim among them.
 FORK_AVAILABILITY_STEP = "availability"
 FORK_START_STEP = "start"
 FORK_ORIGIN_STEP = "origin"
+FORK_CLAIM_STEP = "claim"
 FORK_PREPARATION_STEP = "preparation"
 FORK_STEPS = (
     FORK_AVAILABILITY_STEP,
     FORK_START_STEP,
     FORK_ORIGIN_STEP,
+    FORK_CLAIM_STEP,
     FORK_PREPARATION_STEP,
 )
 
@@ -3665,6 +3697,40 @@ def check_origin_reply_within_bound(
             f"bytes and the bound proved for it before the barrier was {bound}"
         )
     return measured
+
+
+@dataclass(frozen=True)
+class ForkPreparationInput:
+    """What one gated child reads before it can offer the cell its parent selected for it.
+
+    Two objects and no more: the committed manifest under the source commitment, read afresh, and
+    that child's own target cell body under the manifest's entry for it. One child's preparation
+    therefore never fails on the other child's body, and the oracle is in neither set.
+
+    ``payload`` is the ordinary payload request the selected-body resolver already answers, so a
+    child's candidate comes back through the same code a fresh capture's does rather than through
+    a second resolver written for the fork.
+    """
+
+    blob_root: str
+    source_commitment: str
+    payload: GeneratePayloadBundleInput
+
+
+@dataclass(frozen=True)
+class ForkPreparation:
+    """What the store produced for one child's preparation, and what it resolved.
+
+    The manifest read is why this exists rather than a bare call of the resolver: the resolver
+    opens the store for the selected body alone, so a manifest lost after the child's successful
+    claim would let a child publish readiness over a source object nobody could produce.
+
+    Nothing here decides anything. A name the store cannot produce comes back as a name, and the
+    child that asked is what records the refusal and says which object it could not get.
+    """
+
+    missing: List[str]
+    bundle: Optional[PayloadBundle] = None
 
 
 @dataclass(frozen=True)

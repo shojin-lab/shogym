@@ -2199,6 +2199,9 @@ def a_child_start(
         parent,
         hidden_execution_id=CHILD_EXECUTION,
         consumer_claim_hash="f" * 64,
+        # A child keeps a durable store of its own, because a generation given none verifies its
+        # committed objects by reading nothing at all.
+        blob_root="/the-store-of-this-child",
         served_slot=slot,
         dispositions=rows,
         provenance=PolicyProvenance(
@@ -3088,6 +3091,24 @@ def test_a_lineage_this_build_cannot_read_or_that_names_another_child_is_refused
         serving_as(monkeypatch, workflow_id=a_child_id(1), continued=entry)
         assert "not one this build reads" in refused_start(unread)
         assert "records another generation's identity" in refused_start(mistaken)
+
+
+def test_a_child_cut_from_a_fork_and_given_no_store_is_refused_at_either_entry(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A child inherits a closure of objects and reads its own body out of one.
+
+    A generation given no store verifies its committed objects by reading nothing at all, so a
+    child without one would claim over a closure nobody checked and prepare a body out of a store
+    that is not there. It is refused where the rest of the lineage is checked, which is at every
+    entry rather than only at the one it was cut at.
+    """
+    for entry, child in (
+        (None, a_fresh_child()),
+        ("the childs earlier run", a_continued_child()),
+    ):
+        serving_as(monkeypatch, workflow_id=a_child_id(1), continued=entry)
+        assert "given no store" in refused_start(replace(child, blob_root=None))
 
 
 def a_continued_child(**changes: Any) -> StreamStart:
@@ -4033,12 +4054,12 @@ async def test_a_receipt_at_a_version_this_build_does_not_read_is_refused_where_
     assert "999" in str(raised.value)
 
 
-def test_a_worker_serves_the_environments_own_activities_and_the_forks_three_beside_them() -> None:
+def test_a_worker_serves_the_environments_own_activities_and_the_forks_own_beside_them() -> None:
     """The registration a fork depends on, which nothing else would have supplied.
 
     A Worker takes whatever Activity list it is handed wholesale, and an environment that brings
     its own terminal hands over only its seal, its grade, the payload bundle Activity and the blob
-    verification Activity. The fork's three are none of those, so they are registered explicitly
+    verification Activity. The fork's four are none of those, so they are registered explicitly
     beside whatever an environment supplied.
     """
     supplied = [seal_attempt_activity, verify_blobs_activity]
@@ -4092,8 +4113,22 @@ def test_every_fork_only_activity_takes_its_identifier_from_the_forks_own_namesp
     ]
     assert parent._activity_ordinal == ordinal
     assert parent._next_activity_id() == str(ordinal)
+    # A generation no fork cut reads under the ordinary ordinal, its own first claim included.
+    assert parent._first_claim_activity() is None
     with pytest.raises(WireFormatError):
         fork_activity_id(fork_id=FORK, step="a step this build does not perform", ordinal=1)
+
+    # A child's own first claim is the one read of the existing blob verification Activity that
+    # no twin makes, so it takes a fork identifier too and a repair of it is the next attempt at
+    # that step. Once the epoch has moved, a claim is an ordinary resume the twin makes as well.
+    serving_as(monkeypatch, workflow_id=a_child_id(1))
+    child = kernel_workflow.StreamWorkflow(a_fresh_child())
+    inherited = child._activity_ordinal
+    assert child._first_claim_activity() == f"fork.{FORK}.claim.1"
+    assert child._first_claim_activity() == f"fork.{FORK}.claim.2"
+    assert child._activity_ordinal == inherited
+    child._ownership_epoch = 1
+    assert child._first_claim_activity() is None
 
 
 def test_a_request_the_service_would_never_carry_is_refused_where_admission_is_decided(

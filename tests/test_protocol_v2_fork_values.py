@@ -128,6 +128,7 @@ from shogym.serve.protocol_v2.kernel.messages import (  # noqa: E402
     origin_digest,
     origin_fields,
     start_difference_projection,
+    verified_set_digest,
 )
 from shogym.serve.protocol_v2.kernel.workflow import (  # noqa: E402
     TURNOVER_PAYLOAD_CEILING_BYTES,
@@ -854,6 +855,25 @@ def test_every_fork_digest_is_the_same_value_in_a_second_process() -> None:
     )
     assert json.loads(finished.stdout) == here
     assert here["identities"] == [a_child_id(0), a_child_id(1)]
+
+
+def test_one_verified_set_is_one_digest_however_the_names_arrive() -> None:
+    """A child's readiness names the closure it proved rather than saying that it proved one.
+
+    It names a set of objects rather than a value with a shape, so what it is over is the names
+    themselves: a reading that found them in another order, or that read one of them twice, is a
+    reading of the same closure and comes to the same digest. A closure missing one of them is a
+    different closure and says so.
+    """
+    closure = [
+        sha256(name.encode("utf-8")).hexdigest()
+        for name in ("the descriptor", "the filing", "the evidence")
+    ]
+    assert verified_set_digest(closure) == verified_set_digest(list(reversed(closure)))
+    assert verified_set_digest(closure) == verified_set_digest([*closure, closure[0]])
+    assert verified_set_digest(closure) != verified_set_digest(closure[:2])
+    assert verified_set_digest([]) != verified_set_digest(closure)
+    assert len(verified_set_digest(closure)) == 64
 
 
 def test_a_childs_identity_is_derived_from_its_parents_and_never_minted() -> None:
