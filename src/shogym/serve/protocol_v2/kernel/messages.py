@@ -2507,6 +2507,57 @@ def _is_digest(value: Any) -> bool:
     )
 
 
+#: The shape of the checkpoint evidence this build answers a controller with.
+CHECKPOINT_EVIDENCE_SCHEMA_VERSION = 1
+
+
+@dataclass(frozen=True)
+class CheckpointEvidence:
+    """The stream's half of a freeze, as the generation itself recorded it.
+
+    A fork is cut over an acknowledgement that was presented here and persisted there, and both
+    halves have to be named before either can be compared. This is the half the platform holds:
+    which attempt was sealed, which acknowledgement was presented for it, the attestation that
+    committed it, and the cursor and projection digest at that commitment. The harness's own
+    checkpoint says what it wrote about the same moment, and the parent compares the two when the
+    request arrives.
+
+    It is answered out of recorded state rather than out of whatever a transport remembers, which
+    is what makes it a witness: a harness reading its own memory for a cursor, a digest or an
+    attestation would be comparing a value against itself.
+
+    The execution scope is here because a fork is prepared against one execution. A turnover
+    between this read and the request is an ordinary event, and reading again is what answers it.
+    """
+
+    parent_workflow_id: str
+    parent_run_id: str
+    execution_ordinal: int
+    configuration_hash: str
+    capacity_in_use: int
+    source_attempt_id: str
+    attestation_id: str
+    acknowledgement_message_id: str
+    acknowledged_visible_sha256: str
+    acknowledged_cursor: str
+    projection_digest: str
+    schema_version: int = CHECKPOINT_EVIDENCE_SCHEMA_VERSION
+
+
+@dataclass(frozen=True)
+class CheckpointEvidenceAnswer:
+    """The evidence, or the reason this generation has none to give.
+
+    A generation with no acknowledgement standing answers rather than failing: a controller that
+    asked while the agent was still working has asked a question that has no answer yet, and that
+    is a state of the run rather than a fault of the call.
+    """
+
+    found: bool
+    reason: str = ""
+    evidence: Optional[CheckpointEvidence] = None
+
+
 #: The shape of a fork request this build admits.
 FORK_REQUEST_SCHEMA_VERSION = 1
 
@@ -2843,6 +2894,13 @@ def _admitted_version(name: str, declared: Any, admitted: Any) -> None:
 def check_fork_origin(origin: ForkOrigin) -> None:
     """Refuse a lineage record this build cannot read."""
     _admitted_version("a fork origin", origin.schema_version, FORK_ORIGIN_SCHEMA_VERSION)
+
+
+def check_checkpoint_evidence(evidence: CheckpointEvidence) -> None:
+    """Refuse checkpoint evidence written at a version this build does not read."""
+    _admitted_version(
+        "checkpoint evidence", evidence.schema_version, CHECKPOINT_EVIDENCE_SCHEMA_VERSION
+    )
 
 
 def check_fork_request(request: ForkRequest) -> None:

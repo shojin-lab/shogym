@@ -75,6 +75,7 @@ from shogym.serve.protocol_v2.kernel.activities import fork_activities, kernel_a
 from shogym.serve.protocol_v2.kernel.messages import (
     AnsweredUpdate,
     AttemptFinalized,
+    CheckpointEvidenceAnswer,
     ChildReady,
     ConsumerClaim,
     ConsumerReceipt,
@@ -671,6 +672,25 @@ def fork_can_be_retried(error: BaseException) -> bool:
     """
     reason = fork_refusal(error)
     return reason is not None and reason in RETRYABLE_FORK_REFUSALS
+
+
+def fork_preparation_epoch(error: BaseException) -> int:
+    """Return the epoch the preparation this refusal came from was frozen at, or zero.
+
+    Zero is a refusal raised before any episode existed, which is a different fact from a refusal
+    recorded inside one: the first has no operation to be kept under, and the second has exactly
+    one and keeps it for ever, whatever epoch the child holds by the time a controller comes back.
+
+    What travels is that number and never the operation's own identity, so a caller recomputes the
+    name it keeps the outcome under rather than being handed one by a transport.
+    """
+    cause = error.__cause__ if isinstance(error, WorkflowUpdateFailedError) else error
+    if not isinstance(cause, ApplicationError) or cause.type not in FORK_REFUSALS:
+        return 0
+    details = list(cause.details)
+    if len(details) < 3 or not isinstance(details[2], int) or details[2] < 1:
+        return 0
+    return details[2]
 
 
 def fork_barrier_stands(error: BaseException) -> bool:
@@ -1273,6 +1293,19 @@ class StreamHandle:
     async def stream_state(self) -> StreamState:
         """Read the generation's state without changing it."""
         return await self.handle.query(StreamWorkflow.stream_state)
+
+    async def checkpoint_evidence(self) -> CheckpointEvidenceAnswer:
+        """Read the stream's half of a freeze, which is what a fork is prepared against.
+
+        This is the documented way to it, and there is no other: the cursor, the visible digest and
+        the attestation a request carries are the generation's own record of what it committed, and
+        a controller reading them off a transport would be handing the parent back a value that
+        transport already believed.
+
+        It is a Query, so it charges nothing, writes nothing, and can be asked as often as a
+        controller likes while it waits for a generation to reach the quiet point.
+        """
+        return await self.handle.query(StreamWorkflow.checkpoint_evidence)
 
     async def present(
         self,

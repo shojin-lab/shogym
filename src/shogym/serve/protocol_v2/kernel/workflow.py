@@ -141,6 +141,7 @@ with workflow.unsafe.imports_passed_through():
         FORK_PREPARATION_STEP,
         FORK_PREPARED,
         FORK_REPAIRABLE_ABSENCE,
+        FORK_REFUSALS,
         FORK_REQUEST_CONFLICT,
         FORK_START_STEP,
         FORK_UNDECLARED_BRANCH,
@@ -171,6 +172,8 @@ with workflow.unsafe.imports_passed_through():
         CarriedBinding,
         CarriedFinalization,
         CarriedObligation,
+        CheckpointEvidence,
+        CheckpointEvidenceAnswer,
         ChildReady,
         ConsumerClaim,
         ConsumerReceipt,
@@ -628,15 +631,24 @@ class ForkRefused(ApplicationError):
     refusal has to keep its reason wherever the failure is kept: the outcome journal holds a type
     and a message and no details, and an exact identifier answered from that journal after a
     boundary or from a closed parent has to say the same thing the live refusal said.
+
+    ``creation_epoch`` is the epoch a child's preparation froze at, where this refusal was
+    recorded inside one, and zero where it was raised before any episode existed. It travels as
+    that number rather than as the operation's own identity, so a caller keeping the outcome
+    recomputes the name it keeps it under instead of being handed one by a transport. It survives
+    the journal for the same reason the reason does, by being read again out of the record that
+    holds it rather than out of a detail the journal never kept.
     """
 
-    def __init__(self, reason: str, clause: str) -> None:
+    def __init__(self, reason: str, clause: str, *, creation_epoch: int = 0) -> None:
         self.reason = reason
         self.clause = clause
+        self.creation_epoch = creation_epoch
         super().__init__(
             f"this fork is refused: {clause}",
             reason,
             clause,
+            creation_epoch,
             type=reason,
             non_retryable=reason not in RETRYABLE_FORK_REFUSALS,
         )
@@ -3641,6 +3653,7 @@ class StreamWorkflow:
             raise ForkRefused(
                 FORK_REPAIRABLE_ABSENCE,
                 f"this child's preparation was not given {sorted(prepared.missing)}",
+                creation_epoch=obligation.preparation_epoch,
             )
         candidate = self._prepared_candidate(operation, attempt, selected, prepared, writer)
         # One transition, no await inside it: the body, the gate and this execution's own mark on
@@ -3695,6 +3708,7 @@ class StreamWorkflow:
             _PREPARATION_ENDINGS.get(ended.reason, FORK_UNRECOVERABLE_EVIDENCE),
             f"this child's preparation ended under {ended.reason} and no candidate any later "
             "owner is handed changes that",
+            creation_epoch=self._frozen_preparation_epoch(),
         )
 
     def _inherited_selection(
@@ -3740,7 +3754,11 @@ class StreamWorkflow:
                 outcome=UNRECOVERABLE_OPERATION,
                 references=[],
             )
-            raise ForkRefused(FORK_WRONG_SOURCE, str(error)) from error
+            raise ForkRefused(
+                FORK_WRONG_SOURCE,
+                str(error),
+                creation_epoch=self._frozen_preparation_epoch(),
+            ) from error
 
     async def _read_the_child_evidence(
         self, origin: ForkOrigin, attempt: _Attempt, selected: SelectedSourceReference
@@ -3842,6 +3860,7 @@ class StreamWorkflow:
             raise ForkRefused(
                 FORK_WRONG_SOURCE if reason == WRONG_SOURCE else FORK_CONTRACT_DRIFT,
                 str(oversize),
+                creation_epoch=self._frozen_preparation_epoch(),
             ) from oversize
 
     def _prepared_candidate(
@@ -3929,6 +3948,7 @@ class StreamWorkflow:
             raise ForkRefused(
                 FORK_WRONG_SOURCE if reason == WRONG_SOURCE else FORK_CONTRACT_DRIFT,
                 str(unusable),
+                creation_epoch=self._frozen_preparation_epoch(),
             ) from unusable
         return candidate
 
@@ -3989,6 +4009,87 @@ class StreamWorkflow:
         )
 
     # What a controller and a child read, both of which are Queries and cost the parent nothing.
+
+    @workflow.query(name="checkpoint_evidence")
+    def checkpoint_evidence(self) -> CheckpointEvidenceAnswer:
+        """The stream's half of a freeze, for a controller about to cut a fork over it.
+
+        A fork carries two witnesses, and this is where the one this generation holds is read.
+        Every value in it is recorded state: the attempt whose acknowledgement was presented, the
+        row that presentation committed, and the attestation that committed it. A harness that read
+        its own memory for any of them would be comparing a value against itself, and a private
+        field of a transport is not a witness to anything.
+
+        The cursor and the digest are where this generation stands rather than where it stood, and
+        the two need not be the same place at a quiet point: an info presentation moves the cursor
+        without touching the acknowledgement or the source, and the boundary admits a generation
+        that has committed one. They are read as the current pair because that pair is what an
+        arriving request is compared against, so a generation that has moved says so to the
+        controller about to compose one rather than to the barrier that would refuse it.
+
+        Which acknowledgement a fork would be cut at is named rather than counted. The source is
+        the attempt owing the one unresolved payload, which is what the boundary itself reads and
+        what a child inherits, and it has to hold a presented acknowledgement. A prefix that
+        withheld an earlier receipt holds that attempt's acknowledgement too and both children
+        inherit it whole, so a count of every acknowledgement this generation has ever presented
+        would refuse to compose the request for a fork this generation goes on to accept.
+
+        The cursor is answered rather than asked with, for the same reason it is compared
+        separately at the barrier: it is where this generation stands, a presentation after the
+        acknowledgement moves it without moving the source, and what an arriving request is held
+        to is the acknowledgement's own identity and the current cursor as two values.
+
+        A generation whose owed payload belongs to an attempt with no acknowledgement standing
+        answers with the reason rather than failing, which is what a controller asking while an
+        agent is still working has asked. So does one owing more than the single payload a child
+        inherits, which is a prefix the boundary refuses rather than a read to guess between.
+        """
+        owed = sorted(
+            attempt_id
+            for attempt_id, obligation in self._obligations.items()
+            if obligation.state in UNFULFILLED_OBLIGATION
+        )
+        if len(owed) != 1:
+            return CheckpointEvidenceAnswer(
+                found=False,
+                reason="a child inherits the one unresolved payload of the attempt a fork is cut "
+                f"over, and this generation owes {owed}",
+            )
+        attempt = self._attempts.get(owed[0])
+        if attempt is None or attempt.state != ACK_PRESENTED:
+            return CheckpointEvidenceAnswer(
+                found=False,
+                reason=f"the attempt {owed[0]} owing this generation's unresolved payload holds no "
+                "presented acknowledgement, and a fork is cut at one that does",
+            )
+        presented = self._presented.get(attempt.item.ack_message_id)
+        attested = [
+            attestation_id
+            for attestation_id, ack in self._attestations.items()
+            if ack.cursor == attempt.item.ack_message_id
+        ]
+        if presented is None or not attested:
+            return CheckpointEvidenceAnswer(
+                found=False,
+                reason=f"the acknowledgement of {attempt.item.attempt_id} is not one this "
+                "generation holds the commitment for",
+            )
+        return CheckpointEvidenceAnswer(
+            found=True,
+            evidence=CheckpointEvidence(
+                parent_workflow_id=workflow.info().workflow_id,
+                parent_run_id=workflow.info().run_id,
+                execution_ordinal=self._start.execution_ordinal,
+                configuration_hash=self._configuration_hash,
+                capacity_in_use=self._capacity_in_use(),
+                source_attempt_id=attempt.item.attempt_id,
+                attestation_id=attested[0],
+                acknowledgement_message_id=presented.message_id,
+                acknowledged_visible_sha256=presented.visible_bytes_sha256,
+                acknowledged_cursor=self._cursor,
+                projection_digest=self._projection_hash(),
+            ),
+        )
 
     @workflow.query(name="fork_status")
     def fork_status(self, question: ForkStatusQuestion) -> ForkStatusAnswer:
@@ -6011,10 +6112,27 @@ class StreamWorkflow:
         return self._journal.get(self._update_id())
 
     def _give_back(self, answer: _Answer) -> Any:
-        """Hand back an answer this generation has already given, or raise it again."""
+        """Hand back an answer this generation has already given, or raise it again.
+
+        A fork refusal is raised again as the refusal it was rather than as a bare failure with
+        its type on it. What separates the two is the episode a preparation refusal names: a
+        controller keeps a permanent decision under the identity the child froze, and an outcome
+        replayed without it would be kept under the pair's fallback name instead, which is not the
+        name the surface is keyed by. The journal holds a type and a message, so the episode is
+        taken from the record that holds it, which is frozen once and never moves: the answer
+        given here is the answer that was given.
+        """
         if answer.kind == REFUSED:
             raise StreamProtocolError(answer.code)
         if answer.kind == FAILED:
+            if answer.type_name in FORK_REFUSALS:
+                raise ForkRefused(
+                    answer.type_name,
+                    answer.message,
+                    creation_epoch=(
+                        self._frozen_preparation_epoch() if answer.handler == PREPARE else 0
+                    ),
+                )
             raise ApplicationError(answer.message, type=answer.type_name, non_retryable=True)
         if answer.kind == BY_ROW:
             return self._row(answer)
@@ -6071,6 +6189,11 @@ class StreamWorkflow:
             if isinstance(failure, ApplicationError) and failure.type:
                 kind = failure.type
             said = getattr(failure, "message", None)
+            if isinstance(failure, ForkRefused):
+                # A fork refusal composes its message from the clause it names, so the clause is
+                # what is kept: raising it again from a message that already carried the composed
+                # text would say the same thing twice.
+                said = failure.clause
             self._remember(
                 handler,
                 epoch,

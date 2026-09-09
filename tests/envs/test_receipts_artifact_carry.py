@@ -79,6 +79,21 @@ from shogym.serve.protocol_v2.rundir import (  # noqa: E402
     open_run_directory,
     run_directory_of,
 )
+from shogym.serve.protocol_v2.fork import (  # noqa: E402
+    ChildAttached,
+    ContainerEquality,
+    ForkOperations,
+    RestoredContainer,
+    ResumedContainer,
+    attach_child,
+    attachment_key,
+    bind_child,
+    compare_child,
+    fork_request_for,
+    prepare_child,
+    release_children,
+    retrieve_checkpoint,
+)
 from shogym.serve.protocol_v2.kernel import (  # noqa: E402
     CONFIRMED_EXISTING,
     EXISTENCE_UNCONFIRMED,
@@ -93,8 +108,11 @@ from shogym.serve.protocol_v2.kernel import (  # noqa: E402
     NEVER_ATTEMPTED,
     RECEIPT_CARRIER_SCHEMA_VERSION,
     BlobsVerified,
+    CheckpointComponent,
+    CheckpointManifest,
     ConsumerClaim,
     ChildReady,
+    SettledHarness,
     ForkAvailability,
     ForkAvailabilityInput,
     ForkChildPlan,
@@ -124,6 +142,7 @@ from shogym.serve.protocol_v2.kernel import (  # noqa: E402
     fork_availability_activity,
     fork_barrier_stands,
     fork_preparation_activity,
+    fork_preparation_epoch,
     fork_preparation_operation_identity,
     fork_can_be_retried,
     fork_refusal,
@@ -2679,6 +2698,20 @@ async def test_a_preparation_result_this_child_cannot_carry_ends_the_episode_it_
         assert state.obligations[ATTEMPT] == "eligible"
         assert state.payload_delivery_count == 0
 
+        # The refusal names the episode it ended, live. A boundary takes the service's own memory
+        # of that identifier with it, so the same one sent again is answered out of this
+        # generation's journal, and the episode it names there is the same one: it is read out of
+        # the record that holds it rather than composed from the epoch the child holds now.
+        assert fork_preparation_epoch(raised.value) == 1
+        _OVERSIZED.clear()
+        replays = len(_OVERSIZED_RUNS)
+        await hand_it_on(stream, turnover_at, identity, env.client)
+        with pytest.raises(Exception) as replayed:
+            await stream.prepare_child(fork_id=FORK)
+        assert fork_refusal(replayed.value) == FORK_CONTRACT_DRIFT
+        assert fork_preparation_epoch(replayed.value) == 1
+        assert len(_OVERSIZED_RUNS) == replays
+
         # It is an ending, so the owner that follows is answered from the record. The result is
         # ordinary again by then, and no preparation runs at all.
         _OVERSIZED.clear()
@@ -2814,6 +2847,80 @@ async def test_a_body_lost_between_a_preparations_two_reads_is_the_absence_a_rep
             for one in (await child_records(env.client, identity)).operation_failures
         ] == [REFUSED_OPERATION, RECOVERED_OPERATION]
     _LOST.clear()
+
+
+async def test_a_permanent_preparation_outcome_replayed_from_the_journal_names_its_episode(
+    env: Any, world: ServedEpisode, tmp_path: Path, turnover_at: Any
+) -> None:
+    """The crash interval between a permanent refusal and the controller record of it.
+
+    A decision is kept under the episode the child froze, and the child says which episode that is
+    inside the refusal it raises. A controller that lost that reply sends the same identifier
+    again, and after a boundary the service no longer knows the identifier at all: the generation
+    answers from its own outcome journal instead, which keeps a type and a message and no details.
+    So the episode is read again out of the record that holds it, and the outcome a controller
+    keeps after the crash is the outcome it would have kept before it.
+    """
+    blobs = tmp_path / "blobs"
+    contract = contract_of(world.env)
+    turnover_at(10_000)
+    composed = fork_capable(start_for(world, contract, blobs))
+    _SUBSTITUTED.clear()
+    _PREPARATIONS.clear()
+    async with stream_worker(
+        env.client, activities=[*a_closing_worker(world), _a_substituted_preparation]
+    ):
+        _request, receipt, starts = await forked(
+            env, world, composed, blobs, tmp_path, "stream/child-replayed/1"
+        )
+        close_the_capture()
+        start, child = starts[0], receipt.child_receipts[0]
+        identity = child.child_workflow_id
+        frozen = fork_preparation_operation_identity(FORK, identity, 1)
+        copy_closure(blobs, start.blob_root or "", child_closure(start))
+        stream = await a_claimed_child(env.client, start, identity)
+        _SUBSTITUTED.update({"source_commitment": "a" * 64})
+
+        with pytest.raises(Exception) as raised:
+            await stream.prepare_child(fork_id=FORK)
+        assert fork_refusal(raised.value) == FORK_WRONG_SOURCE
+        assert fork_preparation_epoch(raised.value) == 1
+
+        # The boundary takes the service's own memory of that identifier with it, so the same one
+        # sent again reaches a handler that answers from this generation's journal. The resolver is
+        # in order by then, which is what makes this a replay rather than a second decision.
+        _SUBSTITUTED.clear()
+        ran = len(_PREPARATIONS)
+        await hand_it_on(stream, turnover_at, identity, env.client)
+        with pytest.raises(Exception) as replayed:
+            await stream.prepare_child(fork_id=FORK)
+        assert fork_refusal(replayed.value) == FORK_WRONG_SOURCE
+        assert fork_preparation_epoch(replayed.value) == 1
+        assert len(_PREPARATIONS) == ran
+
+        # And that is the name a controller with no record of its own keeps the decision under.
+        operations = ForkOperations.under(tmp_path / "controller")
+        kept = await prepare_child(
+            stream,
+            operations,
+            attachment=ChildAttached(
+                fork_id=FORK,
+                child_workflow_id=identity,
+                run_directory=start.blob_root or "",
+                configuration_hash=configuration_hash(start),
+                complete_start_digest=child.complete_start_digest,
+                installed=[],
+                retained_absent=[],
+                ownership_epoch=1,
+                consumer_id="",
+            ),
+        )
+        assert (kept.ready, kept.reason) == (None, FORK_WRONG_SOURCE)
+        assert kept.preparation_operation == frozen
+        assert operations.recorded(frozen, type(kept)) == kept
+        assert len(_PREPARATIONS) == ran
+    _SUBSTITUTED.clear()
+    _PREPARATIONS.clear()
 
 
 async def test_a_prepared_child_crosses_its_own_boundary_and_serves_the_body_it_built(
@@ -3226,3 +3333,298 @@ async def test_a_child_is_attached_to_a_directory_of_its_own_under_one_shared_ru
     finally:
         if attached is not None:
             await attached.close()
+
+
+# The controller's own side, over one real fork: the freeze it reads, the objects and claims it
+# installs, the copies it keeps, and the two containers it lets go.
+
+
+class Harness:
+    """The harness half of one fork, over directories and the transports the children were given.
+
+    It does what the adapter of a measured run does and nothing else: it settles, it persists the
+    decoded acknowledgement in its own transcript, it commits the checkpoint that binds the two
+    witnesses, it restores one independently owned copy per child, it compares each against the
+    parent, it binds each to the child generation it serves, and it resumes them so the agent
+    inside each one pulls. The real adapter is the experiment controller's.
+    """
+
+    def __init__(self, root: Path, caller: Caller) -> None:
+        presented, acknowledged = caller.presented, caller.acknowledged
+        assert presented is not None and acknowledged is not None
+        self.root = root
+        self.parent = root / "parent"
+        self.parent.mkdir(parents=True)
+        entry = json.dumps(
+            {"message_id": presented.message_id, "visible": presented.visible_text},
+            sort_keys=True,
+        )
+        transcript = self.parent / "transcript.jsonl"
+        transcript.write_text(f"the work of one attempt\n{entry}", encoding="utf-8")
+        (self.parent / "memory.md").write_text("what the agent learned", encoding="utf-8")
+        (self.parent / "weights.bin").write_bytes(b"the weights this harness owns")
+        self.manifest = CheckpointManifest(
+            transcript_reference=sha256(transcript.read_bytes()).hexdigest(),
+            acknowledgement_locator="entry 2",
+            acknowledgement_entry_sha256=sha256(entry.encode("utf-8")).hexdigest(),
+            components=[
+                CheckpointComponent(
+                    component_id="the container of the parent",
+                    sha256=sha256(b"the snapshot of that container").hexdigest(),
+                    size=len(transcript.read_bytes()),
+                    media_type="application/octet-stream",
+                    restores_transcript=sha256(transcript.read_bytes()).hexdigest(),
+                )
+            ],
+            adapter_version="the adapter this run is driven by",
+            container_image_digest=sha256(b"the image it runs").hexdigest(),
+            harness_configuration=sha256(b"the configuration it holds").hexdigest(),
+            settled=SettledHarness(
+                transport=True, recovery=True, provider=True, model=True, compaction=True
+            ),
+            frozen_plan_digest=sha256(b"the plan both children are parked under").hexdigest(),
+            acknowledgement_message_id=presented.message_id,
+            acknowledged_visible_sha256=sha256(
+                presented.visible_text.encode("utf-8")
+            ).hexdigest(),
+            acknowledged_cursor=acknowledged.cursor,
+            projection_digest=acknowledged.stream_state_sha256,
+        )
+        self.transports: Dict[str, Any] = {}
+        self.restores: List[str] = []
+        self.resumed: List[str] = []
+        self.pulled: Dict[str, Any] = {}
+
+    def container(self, child: str) -> Path:
+        """Where one child's own copy lives."""
+        return self.root / f"container-of-{child.rsplit('.', 1)[-1]}"
+
+    async def checkpoint(
+        self, *, parent_workflow_id: str, attestation_id: str
+    ) -> CheckpointManifest:
+        return self.manifest
+
+    async def restore(
+        self, *, fork_id: str, child_workflow_id: str, checkpoint_manifest_reference: str
+    ) -> RestoredContainer:
+        path = self.container(child_workflow_id)
+        assert not path.exists(), f"{child_workflow_id} was restored a second time"
+        shutil.copytree(self.parent, path)
+        self.restores.append(child_workflow_id)
+        transcript = path / "transcript.jsonl"
+        return RestoredContainer(
+            container_id=path.name,
+            transcript_reference=sha256(transcript.read_bytes()).hexdigest(),
+            acknowledgement_entry_sha256=sha256(
+                transcript.read_text(encoding="utf-8").splitlines()[-1].encode("utf-8")
+            ).hexdigest(),
+        )
+
+    async def compare(
+        self, *, fork_id: str, child_workflow_id: str, container_id: str
+    ) -> ContainerEquality:
+        path = self.root / container_id
+        return ContainerEquality(
+            allowlist_version="containers.rebinding.1",
+            rebound=["binding.json"],
+            differences=[
+                name
+                for name in ("transcript.jsonl", "memory.md", "weights.bin")
+                if (path / name).read_bytes() != (self.parent / name).read_bytes()
+            ],
+        )
+
+    async def bind(
+        self, *, fork_id: str, child_workflow_id: str, container_id: str, consumer_id: str
+    ) -> None:
+        (self.root / container_id / "binding.json").write_text(
+            json.dumps({"serves": child_workflow_id, "through": consumer_id}, sort_keys=True),
+            encoding="utf-8",
+        )
+
+    async def release(
+        self, *, fork_id: str, child_workflow_id: str, container_id: str
+    ) -> ResumedContainer:
+        # The container is let go and the agent inside it pulls, which is its first act. Nothing
+        # is injected to bring that about and nothing is presented for it here.
+        message = json.loads(await self.transports[child_workflow_id].pull({}))
+        self.resumed.append(child_workflow_id)
+        self.pulled[child_workflow_id] = message
+        return ResumedContainer(
+            container_id=container_id, first_message_id=message["message_id"]
+        )
+
+
+async def test_a_controller_carries_one_frozen_parent_through_to_two_children_that_pull(
+    env: Any, world: ServedEpisode, frozen_bundle: Path, tmp_path: Path, turnover_at: Any
+) -> None:
+    """The whole controller surface, in the order one fork is finished in.
+
+    The parent is worked to its acknowledgement and left there, the harness persists what it
+    decoded and commits the checkpoint over it, and every step after that is a controller
+    operation with a name of its own: the freeze both witnesses agree on, the objects and the claim
+    each child is attached with, the body each child builds, the copy each one is restored into and
+    compared under, the container each is bound to, and the release that lets them go.
+
+    What the two children then do is ordinary. Each one's first act is a pull, neither sees a wait,
+    a retry or a refusal, and what comes back is the cell that child's own disposition names,
+    against the message identifier both of them inherited.
+    """
+    blobs = tmp_path / "blobs"
+    contract = contract_of(world.env)
+    turnover_at(10_000)
+    composed = fork_capable(start_for(world, contract, blobs))
+    route = WorldRoute()
+    parent = "stream/the-whole-fork/1"
+    route.record(parent, ATTEMPT, world, 1)
+    version, activities, digest = world.env.protocol_v2_terminal(route)
+    environment = EnvironmentTerminal(version, list(activities), digest, route, RECEIPTS_GRADE)
+    operations = ForkOperations.under(tmp_path)
+    opened: List[ServedEpisode] = []
+    try:
+        async with stream_worker(env.client, activities=list(activities)):
+            caller = await worked(env, composed, blobs, parent, filing_of(world.env))
+            harness = Harness(tmp_path / "containers", caller)
+
+            # The freeze: the stream's half read off the generation, the harness's half asked for,
+            # and the two compared before anything is fenced.
+            retrieval = await retrieve_checkpoint(caller.stream, harness, operations)
+            assert retrieval.source_attempt_id == ATTEMPT
+            assert retrieval.attestation_id == caller.attested
+            assert retrieval.acknowledged_cursor == caller.cursor
+
+            request = await fork_request_for(
+                caller.stream,
+                retrieval=retrieval,
+                fork_id=FORK,
+                plans=[
+                    plan_for(composed, FIRST_SLOT, GRADED_CELL, tmp_path / "child-1"),
+                    plan_for(composed, SECOND_SLOT, PLACEBO_CELL, tmp_path / "child-2"),
+                ],
+            )
+            receipt = await fork_stream(env.client, request)
+
+            children = [child.child_workflow_id for child in receipt.child_receipts]
+            for index, child in enumerate(receipt.child_receipts):
+                own = await a_world_at(frozen_bundle, tmp_path, 0, f"container-{index}")
+                opened.append(own)
+                gateway, attachment = await attach_child(
+                    env.client,
+                    own,
+                    operations,
+                    fork_id=FORK,
+                    child=child,
+                    source=FilesystemBlobStore(blobs),
+                    database_root="..",
+                    consumer_id=f"the-transport-of-{child.branch_slot}",
+                    environment=environment,
+                )
+                harness.transports[child.child_workflow_id] = gateway
+                route.record(child.child_workflow_id, ATTEMPT, own, 1)
+
+                # The claim installed ownership, the directory says which generation lives in it,
+                # and the objects the child needs are in a store of its own.
+                assert attachment.ownership_epoch == 1
+                assert attachment.retained_absent == []
+                held = open_run_directory(Path(attachment.run_directory))
+                assert held.manifest.workflow_id == child.child_workflow_id
+                assert held.manifest.origin is not None
+                assert held.manifest.origin.parent_workflow_id == parent
+
+                # The read that says what a generation committed is on the transport as well, and
+                # what a child answers with is nothing. It inherited the acknowledgement and the
+                # attestation table stayed with the parent, so the commitment behind it is the
+                # parent's to be read for and a child is forked over an acknowledgement of its own.
+                answered = await gateway.checkpoint_evidence()
+                assert not answered.found and answered.evidence is None
+                assert ATTEMPT in answered.reason
+
+                if index == 0:
+                    # A controller that crashed between the attachment and the preparation comes
+                    # back to a child that owns everything and has prepared nothing. Attaching
+                    # again is what gives it a live transport, and the claim that does it steps the
+                    # epoch past the one the record holds, so this child's first preparation is
+                    # created under an epoch no record of the attachment names.
+                    gateway, attachment = await attach_child(
+                        env.client,
+                        own,
+                        operations,
+                        fork_id=FORK,
+                        child=child,
+                        source=FilesystemBlobStore(blobs),
+                        database_root="..",
+                        consumer_id=f"the-transport-of-{child.branch_slot}",
+                        environment=environment,
+                    )
+                    harness.transports[child.child_workflow_id] = gateway
+                    assert attachment.ownership_epoch == 1
+                    assert (await gateway.stream_state()).ownership_epoch == 2
+
+                prepared = await prepare_child(gateway, operations, attachment=attachment)
+                assert prepared.ready is not None
+                assert prepared.ready.selected_cell == child.target_cell
+                assert prepared.ready.selected_body_reference == child.selected_body_reference
+                # The operation is the child's own: the identity it froze at its first attempt is
+                # what the readiness names and what the outcome is kept under.
+                assert prepared.preparation_operation == fork_preparation_operation_identity(
+                    FORK, child.child_workflow_id, 2 if index == 0 else 1
+                )
+
+                comparison = await compare_child(
+                    harness, operations, retrieval=retrieval, preparation=prepared
+                )
+                assert comparison.equal and comparison.differences == []
+                binding = await bind_child(
+                    harness, operations, attachment=attachment, comparison=comparison
+                )
+                assert binding.container_id == harness.container(child.child_workflow_id).name
+
+            released = await release_children(harness, operations, receipt=receipt)
+
+            # Both containers were let go, and each one's first act was an ordinary pull of the
+            # payload its own disposition names.
+            assert [one.resumed for one in released] == [True, True]
+            assert harness.resumed == children
+            bodies = [harness.pulled[child]["body"] for child in children]
+            assert [message["kind"] for message in harness.pulled.values()] == [
+                "payload",
+                "payload",
+            ]
+            assert {message["attempt_id"] for message in harness.pulled.values()} == {ATTEMPT}
+            # One inherited identifier, two different bodies: each child delivered its own cell of
+            # the one source their parent sealed.
+            assert len({one.first_message_id for one in released}) == 1
+            assert bodies[0] != bodies[1]
+            assert len({harness.container(child).name for child in children}) == 2
+
+            # A controller that came back reads what it already did. Attaching again is how a lost
+            # reply is recovered, and it changes neither the record nor what the harness holds.
+            came_back = ForkOperations.under(tmp_path)
+            again, attached_again = await attach_child(
+                env.client,
+                opened[0],
+                came_back,
+                fork_id=FORK,
+                child=receipt.child_receipts[0],
+                source=FilesystemBlobStore(blobs),
+                database_root="..",
+                consumer_id="the-transport-of-first",
+                environment=environment,
+            )
+            harness.transports[children[0]] = again
+            assert attached_again == came_back.recorded(
+                attachment_key(fork_id=FORK, child_workflow_id=children[0]), type(attachment)
+            )
+            assert attached_again.ownership_epoch == 1
+            assert await prepare_child(again, came_back, attachment=attached_again) == (
+                await prepare_child(again, operations, attachment=attached_again)
+            )
+            assert (
+                await release_children(harness, came_back, receipt=receipt)
+                == released
+            )
+            assert harness.restores == children
+            assert harness.resumed == children
+    finally:
+        for one in opened:
+            await one.close()
