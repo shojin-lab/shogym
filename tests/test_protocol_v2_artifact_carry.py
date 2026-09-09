@@ -4323,14 +4323,15 @@ def test_the_receipt_a_fork_will_answer_with_is_bounded_before_its_barrier(
     built = parent._built_children(request)
     known = parent._the_receipt(request, built)
     assert all(row.child_run_id == "" for row in known.child_receipts)
-    bounds = parent._measured_replies(request, built)
+    now = parent._now_ms()
+    bounds = parent._measured_replies(request, built, now)
     assert bounds.receipt == fork_receipt_bound(known, CONVERTER)
     assert bounds.receipt > encoded_size(known, CONVERTER)
 
     # A bound that does not fit is a decision about the request, taken before anything is fenced.
     monkeypatch.setattr(kernel_workflow, "TURNOVER_PAYLOAD_CEILING_BYTES", bounds.receipt - 1)
     with pytest.raises(kernel_workflow.ForkRefused) as raised:
-        parent._measured_replies(request, built)
+        parent._measured_replies(request, built, now)
     assert raised.value.reason == FORK_CONFIGURATION_VIOLATION
     assert "the fork receipt is bounded at" in raised.value.clause
     assert parent._fork is None
@@ -4572,18 +4573,21 @@ def test_the_origin_proof_is_bounded_over_every_state_its_parent_can_answer_it_i
     """The other reply this fork transmits, measured over what it becomes and not over what it is.
 
     The row a parent measures before its barrier names no run id and stands in the class a child is
-    in before it exists, and the fork it names has not moved through any of its own statuses. Every
-    one of those changes in the proof the parent goes on answering with, and none of them is
-    measured by a preflight over the row as it stands. So the bound is over the widest legal reply,
-    the run id at its declared ceiling among them, and the row that arrives with a minted run id is
-    measured against the retained value.
+    in before it exists, the fork it names has not moved through any of its own statuses, and the
+    horizon it will be answered beside does not exist yet. Every one of those changes in the proof
+    the parent goes on answering with, and none of them is measured by a preflight over the row as
+    it stands. So the bound is over the widest legal reply, the run id at its declared ceiling and
+    the horizon the barrier is about to record among them, and the row that arrives with a minted
+    run id is measured against the retained value.
     """
     parent = a_quiet_parent(monkeypatch)
     request = a_fork_request(parent)
     built = parent._built_children(request)
-    bounds = parent._measured_replies(request, built)
+    now = parent._now_ms()
+    horizon = now + FORK_AUTHORITY_HORIZON_MS
+    bounds = parent._measured_replies(request, built, now)
     assert bounds.origin == max(
-        fork_origin_bound(request.fork_id, row, CONVERTER) for row, _start in built
+        fork_origin_bound(request.fork_id, row, horizon, CONVERTER) for row, _start in built
     )
     # The state the preflight would have measured had it measured the row as it stood.
     prestart = encoded_size(
@@ -4592,12 +4596,14 @@ def test_the_origin_proof_is_bounded_over_every_state_its_parent_can_answer_it_i
     )
     assert bounds.origin > prestart
 
-    parent._commit_the_barrier(request, built, bounds)
+    parent._commit_the_barrier(request, built, bounds, now)
     assert parent._fork is not None
     assert parent._fork.origin_bound == bounds.origin
+    assert parent._fork.authority_horizon_at == horizon
     parent._note_child(1, "confirmed_existing", run_id="r" * 36)
     answered = parent.fork_child(request.fork_id, 1)
     assert answered.record.child_run_id == "r" * 36
+    assert answered.authority_horizon_at == horizon
     assert encoded_size(answered, CONVERTER) > prestart
     assert encoded_size(answered, CONVERTER) <= bounds.origin
 
@@ -4607,7 +4613,7 @@ def test_the_origin_proof_is_bounded_over_every_state_its_parent_can_answer_it_i
     theirs = narrow._built_children(request)
     monkeypatch.setattr(kernel_workflow, "TURNOVER_PAYLOAD_CEILING_BYTES", prestart)
     with pytest.raises(kernel_workflow.ForkRefused) as raised:
-        narrow._measured_replies(request, theirs)
+        narrow._measured_replies(request, theirs, now)
     assert raised.value.reason == FORK_CONFIGURATION_VIOLATION
     assert "what the origin verification answers for child 1 is bounded at" in raised.value.clause
     assert narrow._fork is None
@@ -4621,7 +4627,9 @@ def test_an_origin_proof_over_the_bound_the_barrier_retained_is_refused_where_it
     parent, request = a_barrier(monkeypatch)
     assert parent._fork is not None
     assert parent._fork.origin_bound == max(
-        fork_origin_bound(request.fork_id, row, CONVERTER)
+        fork_origin_bound(
+            request.fork_id, row, parent._fork.authority_horizon_at, CONVERTER
+        )
         for row in parent._fork.child_records
     )
     parent._fork = replace(parent._fork, origin_bound=32)
@@ -4675,6 +4683,8 @@ def test_the_origin_bound_is_measured_through_the_converter_that_encodes_the_rep
     request = a_fork_request(parent)
     built = parent._built_children(request)
     row = built[0][0]
+    now = parent._now_ms()
+    horizon = now + FORK_AUTHORITY_HORIZON_MS
     heavy = AConverterHeavyInOneState(1 << 13)
 
     # The reply with the longest words in it is not the reply this converter makes the most bytes
@@ -4688,6 +4698,7 @@ def test_the_origin_bound_is_measured_through_the_converter_that_encodes_the_rep
                 existence=max(CHILD_EXISTENCE, key=len),
                 child_run_id="0" * RUN_ID_CEILING_BYTES,
             ),
+            authority_horizon_at=horizon,
         ),
         heavy,
     )
@@ -4695,15 +4706,18 @@ def test_the_origin_bound_is_measured_through_the_converter_that_encodes_the_rep
         fork_id=request.fork_id,
         fork_status=FORK_PREPARED,
         record=replace(row, existence="confirmed_existing", child_run_id="r" * 36),
+        authority_horizon_at=horizon,
     )
     assert encoded_size(prepared, heavy) > longest
-    assert fork_origin_bound(request.fork_id, row, heavy) >= encoded_size(prepared, heavy)
+    assert fork_origin_bound(request.fork_id, row, horizon, heavy) >= encoded_size(
+        prepared, heavy
+    )
 
     # And through the fork: the bound the barrier retains is the one the reply it goes on
     # answering with fits inside, measured through the converter that will carry it.
     monkeypatch.setattr(kernel_workflow.workflow, "payload_converter", lambda: heavy)
-    bounds = parent._measured_replies(request, built)
-    parent._commit_the_barrier(request, built, bounds)
+    bounds = parent._measured_replies(request, built, now)
+    parent._commit_the_barrier(request, built, bounds, now)
     assert parent._fork is not None
     parent._note_child(1, "confirmed_existing", run_id="r" * 36)
     answered = parent.fork_child(request.fork_id, 1)
@@ -4761,18 +4775,23 @@ def test_the_reply_a_child_that_asks_before_its_start_gets_is_bounded_before_the
     row = built[0][0]
     heavy = AConverterHeavyOnAnAbsentRunId(1 << 13)
 
+    now = parent._now_ms()
+    horizon = now + FORK_AUTHORITY_HORIZON_MS
     unrecorded = ForkOriginVerified(
         fork_id=request.fork_id,
         fork_status=FORK_PREPARED,
         record=replace(row, existence="existence_unconfirmed", child_run_id=None),
+        authority_horizon_at=horizon,
     )
-    assert fork_origin_bound(request.fork_id, row, heavy) >= encoded_size(unrecorded, heavy)
+    assert fork_origin_bound(request.fork_id, row, horizon, heavy) >= encoded_size(
+        unrecorded, heavy
+    )
 
     # And through the fork: the barrier is committed over a bound that covers it, and the parent
     # answers the question that arrives before the start reply from inside that bound.
     monkeypatch.setattr(kernel_workflow.workflow, "payload_converter", lambda: heavy)
-    bounds = parent._measured_replies(request, built)
-    parent._commit_the_barrier(request, built, bounds)
+    bounds = parent._measured_replies(request, built, now)
+    parent._commit_the_barrier(request, built, bounds, now)
     assert parent._fork is not None
     parent._note_child(1, "existence_unconfirmed")
     asked_early = parent.fork_child(request.fork_id, 1)
@@ -4834,13 +4853,14 @@ def test_what_a_childs_start_answers_with_is_bounded_before_the_barrier_and_held
 
     # A bound that does not fit is a decision about the request, taken before anything is fenced.
     monkeypatch.setattr(kernel_workflow.workflow, "payload_converter", lambda: heavy)
-    bounds = parent._measured_replies(request, built)
+    now = parent._now_ms()
+    bounds = parent._measured_replies(request, built, now)
     assert bounds.start == max(
         fork_start_bound(one, heavy) for one, _start in built
     )
     monkeypatch.setattr(kernel_workflow, "TURNOVER_PAYLOAD_CEILING_BYTES", bounds.start - 1)
     with pytest.raises(kernel_workflow.ForkRefused) as raised:
-        parent._measured_replies(request, built)
+        parent._measured_replies(request, built, now)
     assert raised.value.reason == FORK_CONFIGURATION_VIOLATION
     assert "what the start of child 1 answers with is bounded at" in raised.value.clause
     assert parent._fork is None
@@ -4850,7 +4870,8 @@ def test_what_a_childs_start_answers_with_is_bounded_before_the_barrier_and_held
     parent = a_quiet_parent(monkeypatch)
     request = a_fork_request(parent)
     built = parent._built_children(request)
-    parent._commit_the_barrier(request, built, parent._measured_replies(request, built))
+    now = parent._now_ms()
+    parent._commit_the_barrier(request, built, parent._measured_replies(request, built, now), now)
     assert parent._fork is not None
     assert parent._fork.start_bound == max(
         fork_start_bound(one, CONVERTER) for one, _start in built
@@ -5077,13 +5098,23 @@ def test_a_child_directory_that_says_nothing_about_where_it_starts_reaches_no_ba
 
 
 class AStatusHandle:
-    """A parent handle that answers the status Query with one recorded answer."""
+    """A parent handle that answers the status Query with one recorded answer.
+
+    It counts the reads of when the parent closed as well, because the window the answer stands in
+    is read out of the record the answer carries: a record admitted after that read would have
+    been interpreted before anything said this build may read it.
+    """
 
     def __init__(self, answer: Any) -> None:
         self.answer = answer
+        self.described = 0
 
     async def query(self, *_arguments: Any, **_named: Any) -> Any:
         return self.answer
+
+    async def describe(self, *_arguments: Any, **_named: Any) -> Any:
+        self.described += 1
+        return SimpleNamespace(close_time=None)
 
 
 class AStatusClient:
@@ -5091,10 +5122,10 @@ class AStatusClient:
 
     def __init__(self, answer: Any) -> None:
         self.data_converter = default_converter()
-        self.answer = answer
+        self.handle = AStatusHandle(answer)
 
     def get_workflow_handle_for(self, *_arguments: Any, **_named: Any) -> AStatusHandle:
-        return AStatusHandle(self.answer)
+        return self.handle
 
 
 async def test_a_status_answer_at_a_version_this_build_does_not_read_is_refused_where_it_arrives(
@@ -5111,6 +5142,7 @@ async def test_a_status_answer_at_a_version_this_build_does_not_read_is_refused_
     parent, request = a_barrier(monkeypatch)
     assert parent._fork is not None
     standing = parent._fork
+    assert standing.authority_horizon_at > 0
     answered = ForkStatusAnswer(
         found=True,
         conflict=False,
@@ -5118,18 +5150,23 @@ async def test_a_status_answer_at_a_version_this_build_does_not_read_is_refused_
         record=standing,
         receipt=a_receipt(),
     )
-    assert await kernel_runtime.fork_status(AStatusClient(answered), request) == answered
+    admitted = AStatusClient(answered)
+    assert await kernel_runtime.fork_status(admitted, request, now_ms=1) == answered
+    # The window this answer stands in is read out of the record, so that read happened.
+    assert admitted.handle.described == 1
 
+    refused = AStatusClient(replace(answered, record=replace(standing, schema_version=999)))
     with pytest.raises(WireFormatError) as record:
-        await kernel_runtime.fork_status(
-            AStatusClient(replace(answered, record=replace(standing, schema_version=999))),
-            request,
-        )
+        await kernel_runtime.fork_status(refused, request, now_ms=1)
     assert "999" in str(record.value)
+    # And it did not happen here: the record was admitted before a field of it was interpreted.
+    assert refused.handle.described == 0
 
     with pytest.raises(WireFormatError) as receipt:
         await kernel_runtime.fork_status(
-            AStatusClient(replace(answered, receipt=a_receipt(schema_version=999))), request
+            AStatusClient(replace(answered, receipt=a_receipt(schema_version=999))),
+            request,
+            now_ms=1,
         )
     assert "999" in str(receipt.value)
 
@@ -5320,7 +5357,10 @@ def a_barrier(monkeypatch: pytest.MonkeyPatch) -> Any:
     parent = a_quiet_parent(monkeypatch)
     request = a_fork_request(parent)
     built = parent._built_children(request)
-    parent._commit_the_barrier(request, built, parent._measured_replies(request, built))
+    now = parent._now_ms()
+    parent._commit_the_barrier(
+        request, built, parent._measured_replies(request, built, now), now
+    )
     return parent, request
 
 
@@ -5460,8 +5500,9 @@ def test_a_parent_ends_a_fork_its_reserve_or_its_deadline_ran_out_on_and_admits_
         parent = a_quiet_parent(monkeypatch)
         request = a_fork_request(parent)
         built = parent._built_children(request)
+        now = parent._now_ms()
         parent._commit_the_barrier(
-            request, built, parent._measured_replies(request, built)
+            request, built, parent._measured_replies(request, built, now), now
         )
         run_it_out(parent)
         assert parent._fork is not None and parent._fork.status == FORK_PREPARED

@@ -63,6 +63,7 @@ from shogym.serve.protocol_v2.policy import (
 )
 from shogym.serve.protocol_v2.kernel.messages import (
     BlobsVerified,
+    answer_window_ends,
     ForkAvailability,
     ForkAvailabilityInput,
     ForkChildStarted,
@@ -544,6 +545,7 @@ async def verify_fork_origin_activity(request: VerifyForkOriginInput) -> ForkOri
                 non_retryable=True,
             ) from error
         raise
+    await _inside_the_answer_window(handle, request, answer)
     if answer.record.child_workflow_id != request.child_workflow_id:
         raise ApplicationError(
             f"the parent recorded its child {request.child_ordinal} as "
@@ -553,6 +555,53 @@ async def verify_fork_origin_activity(request: VerifyForkOriginInput) -> ForkOri
             non_retryable=True,
         )
     return answer
+
+
+async def _inside_the_answer_window(
+    handle: Any, request: VerifyForkOriginInput, answer: ForkOriginVerified
+) -> None:
+    """Refuse an origin read asked after the parent's answers had stopped standing.
+
+    Retention is what makes a history readable and never what makes an answer stand: a deployment
+    keeping more than it owes must not lengthen the window, so the comparison is against the
+    horizon the barrier recorded and the parent's own close rather than against whether the bytes
+    are still there. A question outside it is expired authority, which is an infrastructure state
+    the child stays gated behind and never a disagreement about which child this is.
+
+    The moment is the service's own rather than this process's, and it is when the question is
+    actually asked rather than when the attempt was put on a queue: an attempt scheduled inside
+    the window and dispatched to a Worker after it has ended is a question asked outside it, and
+    reading the scheduling stamp would admit exactly that. A parent that recorded no horizon is
+    one this build did not prepare.
+
+    The close is read under the same bound and the same classification as the Query beside it. A
+    parent that cannot be described is a parent that cannot be read, which is infrastructure and
+    stays a retry, and one the service can no longer produce at all is the same expired authority
+    the Query's own missing history is.
+    """
+    if answer.authority_horizon_at <= 0:
+        return
+    try:
+        described = await handle.describe(rpc_timeout=_QUERY_TIMEOUT)
+    except RPCError as error:
+        if error.status is RPCStatusCode.NOT_FOUND:
+            raise ApplicationError(
+                f"the execution {request.parent_run_id} that prepared this child can no longer be "
+                "read, so its answer window has closed",
+                type=EXPIRED_AUTHORITY_FAILURE,
+                non_retryable=True,
+            ) from error
+        raise
+    closed = 0 if described.close_time is None else int(described.close_time.timestamp() * 1000)
+    window = answer_window_ends(answer.authority_horizon_at, closed)
+    asked = int(activity.info().started_time.timestamp() * 1000)
+    if asked > window:
+        raise ApplicationError(
+            f"the answers the parent of {request.fork_id} owes stood until {window} and this "
+            f"child asked at {asked}",
+            type=EXPIRED_AUTHORITY_FAILURE,
+            non_retryable=True,
+        )
 
 
 @activity.defn(name=PREPARE_FORK_CHILD)

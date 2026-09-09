@@ -23,15 +23,20 @@ import subprocess
 import sys
 from contextlib import contextmanager
 from dataclasses import replace
+from datetime import datetime, timezone
 from hashlib import sha256
 from pathlib import Path
-from typing import Any, Dict, Iterator, List, Mapping
+from types import SimpleNamespace
+from typing import Any, Dict, Iterator, List, Mapping, Optional
 
 import pytest
 
 pytest.importorskip("temporalio")
 
 from temporalio.converter import default as default_converter  # noqa: E402
+from temporalio.exceptions import ApplicationError  # noqa: E402
+from temporalio.service import RPCError, RPCStatusCode  # noqa: E402
+from temporalio.testing import ActivityEnvironment  # noqa: E402
 
 from shogym.envs.receipts.protocol_v2 import RECEIPTS_GRADE  # noqa: E402
 from shogym.serve.protocol_v2 import IMMEDIATE, TASK_FIRST, PresentationAck  # noqa: E402
@@ -97,8 +102,13 @@ from shogym.serve.protocol_v2.kernel.messages import (  # noqa: E402
     PayloadCandidate,
     PreparedChild,
     PreparedFork,
+    FORK_EXPIRED_AUTHORITY,
+    FORK_UNREADABLE_PARENT,
+    ForkOriginVerified,
+    ForkStatusAnswer,
     PresentedMessage,
     SettledHarness,
+    VerifyForkOriginInput,
     SourceOriginContext,
     StartDifference,
     StreamCarry,
@@ -113,6 +123,7 @@ from shogym.serve.protocol_v2.kernel.messages import (  # noqa: E402
     check_fork_receipt,
     check_fork_request,
     check_prepared_fork,
+    answer_window_ends,
     check_receipt_within_bound,
     check_start_classification,
     assignments_for,
@@ -123,6 +134,7 @@ from shogym.serve.protocol_v2.kernel.messages import (  # noqa: E402
     configuration_hash,
     encoded_size,
     fork_preimage,
+    fork_answer_window_ends,
     fork_receipt_bound,
     fork_request_digest,
     origin_digest,
@@ -130,7 +142,21 @@ from shogym.serve.protocol_v2.kernel.messages import (  # noqa: E402
     start_difference_projection,
     verified_set_digest,
 )
+from shogym.serve.protocol_v2.kernel.activities import (  # noqa: E402
+    verify_fork_origin_activity,
+)
+from shogym.serve.protocol_v2.kernel.runtime import (  # noqa: E402
+    _ANSWER_READ_TRIES,
+    fork_can_be_retried,
+    fork_refusal,
+    fork_status,
+)
 from shogym.serve.protocol_v2.kernel.workflow import (  # noqa: E402
+    FORK_ANSWER_WINDOW_MS,
+    FORK_AUTHORITY_HORIZON_MS,
+    FORK_PREPARATION_BOUND_MS,
+    FORK_RETENTION_FLOOR_MS,
+    FORK_RETENTION_MARGIN_MS,
     TURNOVER_PAYLOAD_CEILING_BYTES,
     ChildSelection,
     child_carrier,
@@ -1645,4 +1671,296 @@ def test_a_start_carrying_no_lineage_is_authorized_by_nothing() -> None:
             replace(a_child(0), fork_origin=None),
             workflow_id=a_child_id(0),
             record=a_prepared_child(0),
+        )
+
+
+#: A moment far enough past the epoch to make every clock below a real number of milliseconds.
+A_MOMENT_MS = 1_700_000_000_000
+
+
+def a_moment(at_ms: int) -> datetime:
+    """One millisecond on the service's own clock, as the SDK publishes it."""
+    return datetime.fromtimestamp(at_ms / 1000, tz=timezone.utc)
+
+
+def an_rpc(status: RPCStatusCode) -> RPCError:
+    """One transport failure of the kind a service returns for a read it will not serve."""
+    return RPCError("the service would not serve this read", status, b"")
+
+
+class ARetainedParent:
+    """A parent that answers a child's origin question and says when it closed.
+
+    Either half of the read can fail on its own, which is the point: the Query and the description
+    of the close are one read operation in two parts, and a fault let out of the second half would
+    replace the typed result the child acts on with a transport exception naming nothing.
+    """
+
+    def __init__(
+        self,
+        answer: ForkOriginVerified,
+        *,
+        closed_at_ms: Optional[int] = None,
+        query_fails: Optional[RPCError] = None,
+        describe_fails: Optional[RPCError] = None,
+    ) -> None:
+        self.answer = answer
+        self.closed_at_ms = closed_at_ms
+        self.query_fails = query_fails
+        self.describe_fails = describe_fails
+        self.described = 0
+
+    async def query(self, *_arguments: Any, **_named: Any) -> ForkOriginVerified:
+        if self.query_fails is not None:
+            raise self.query_fails
+        return self.answer
+
+    async def describe(self, **_named: Any) -> Any:
+        self.described += 1
+        if self.describe_fails is not None:
+            raise self.describe_fails
+        return SimpleNamespace(
+            close_time=None
+            if self.closed_at_ms is None
+            else a_moment(self.closed_at_ms)
+        )
+
+
+class AParentsClient:
+    """The client an Activity is handed, which reaches exactly one parent."""
+
+    def __init__(self, parent: ARetainedParent) -> None:
+        self.parent = parent
+
+    def get_workflow_handle(self, *_arguments: Any, **_named: Any) -> ARetainedParent:
+        return self.parent
+
+
+def an_origin_question() -> VerifyForkOriginInput:
+    """What a gated child asks its parent for."""
+    return VerifyForkOriginInput(
+        parent_workflow_id=PARENT_ID,
+        parent_run_id=PARENT_RUN,
+        fork_id=FORK,
+        child_ordinal=0,
+        child_workflow_id=a_child_id(0),
+    )
+
+
+def asking_at(parent: ARetainedParent, *, scheduled_ms: int, started_ms: int) -> Any:
+    """One Activity attempt, queued at one moment and dispatched to a Worker at another."""
+    environment = ActivityEnvironment(client=AParentsClient(parent))
+    environment.info = replace(
+        environment.info,
+        current_attempt_scheduled_time=a_moment(scheduled_ms),
+        scheduled_time=a_moment(scheduled_ms),
+        started_time=a_moment(started_ms),
+    )
+    return environment
+
+
+async def test_an_origin_question_is_expired_by_when_it_was_asked_and_not_by_when_it_was_queued(
+) -> None:
+    """The window is enforced on the moment the question is actually put, inside the Activity.
+
+    An attempt has two service timestamps and they are not the same fact: one says when the
+    attempt was put on a queue and the other says when a Worker picked it up. This Activity has a
+    start-to-close bound and no schedule-to-close bound, so an attempt queued inside the window
+    and dispatched after it has ended is an ordinary thing rather than an unlikely one, and a
+    parent whose answers stopped standing would be believed by a child reading the earlier stamp.
+    """
+    horizon = A_MOMENT_MS + FORK_AUTHORITY_HORIZON_MS
+    answer = ForkOriginVerified(
+        fork_id=FORK,
+        fork_status=FORK_PREPARED,
+        record=a_prepared_child(0),
+        authority_horizon_at=horizon,
+    )
+
+    # Queued a second before the window ended and dispatched a second after it: the answer is
+    # expired authority, which is an infrastructure state and never a disagreement.
+    parent = ARetainedParent(answer)
+    with pytest.raises(ApplicationError) as raised:
+        await asking_at(
+            parent, scheduled_ms=horizon - 1_000, started_ms=horizon + 1_000
+        ).run(verify_fork_origin_activity, an_origin_question())
+    assert raised.value.type == "ExpiredAuthority"
+    # The window does not reopen, so the answer comes back once rather than being asked for again
+    # under a policy that never gives up.
+    assert raised.value.non_retryable is True
+    assert str(horizon) in str(raised.value)
+
+    # The same delay the other way round is inside the window, and the last instant it admits is
+    # the horizon itself rather than the one before it.
+    for started in (horizon - 1_000, horizon):
+        answered = await asking_at(
+            ARetainedParent(answer), scheduled_ms=A_MOMENT_MS, started_ms=started
+        ).run(verify_fork_origin_activity, an_origin_question())
+        assert answered == answer
+
+
+async def test_a_parent_that_answers_and_cannot_then_be_described_is_read_as_infrastructure(
+) -> None:
+    """Both halves of the origin read are bounded and classified, and neither escapes raw.
+
+    A description that fails after a successful Query is a parent that cannot be read, which is
+    retryable infrastructure the child stays gated behind. A description the service will not
+    serve at all is the same missing history the Query's own absence is, so it is the expired
+    authority that never becomes a retry.
+    """
+    horizon = A_MOMENT_MS + FORK_AUTHORITY_HORIZON_MS
+    answer = ForkOriginVerified(
+        fork_id=FORK,
+        fork_status=FORK_PREPARED,
+        record=a_prepared_child(0),
+        authority_horizon_at=horizon,
+    )
+    unavailable = ARetainedParent(answer, describe_fails=an_rpc(RPCStatusCode.UNAVAILABLE))
+    with pytest.raises(RPCError):
+        await asking_at(
+            unavailable, scheduled_ms=A_MOMENT_MS, started_ms=A_MOMENT_MS
+        ).run(verify_fork_origin_activity, an_origin_question())
+    assert unavailable.described == 1
+
+    gone = ARetainedParent(answer, describe_fails=an_rpc(RPCStatusCode.NOT_FOUND))
+    with pytest.raises(ApplicationError) as raised:
+        await asking_at(gone, scheduled_ms=A_MOMENT_MS, started_ms=A_MOMENT_MS).run(
+            verify_fork_origin_activity, an_origin_question()
+        )
+    assert raised.value.type == "ExpiredAuthority"
+    assert raised.value.non_retryable is True
+
+    # And a parent that recorded no horizon is one this build did not prepare, so nothing is
+    # described for it at all.
+    silent = ARetainedParent(replace(answer, authority_horizon_at=0))
+    assert await asking_at(silent, scheduled_ms=A_MOMENT_MS, started_ms=A_MOMENT_MS).run(
+        verify_fork_origin_activity, an_origin_question()
+    ) == replace(answer, authority_horizon_at=0)
+    assert silent.described == 0
+
+
+class AStatusParent:
+    """A parent that answers where its fork stands and says when it closed."""
+
+    def __init__(
+        self,
+        answer: ForkStatusAnswer,
+        *,
+        closed_at_ms: Optional[int] = None,
+        describe_fails: Optional[RPCError] = None,
+    ) -> None:
+        self.answer = answer
+        self.closed_at_ms = closed_at_ms
+        self.describe_fails = describe_fails
+        self.described = 0
+
+    async def query(self, *_arguments: Any, **_named: Any) -> ForkStatusAnswer:
+        return self.answer
+
+    async def describe(self, **_named: Any) -> Any:
+        self.described += 1
+        if self.describe_fails is not None:
+            raise self.describe_fails
+        return SimpleNamespace(
+            close_time=None
+            if self.closed_at_ms is None
+            else a_moment(self.closed_at_ms)
+        )
+
+
+class AControllersClient:
+    """The client a controller reads a status through, which reaches exactly one parent."""
+
+    def __init__(self, parent: AStatusParent) -> None:
+        self.parent = parent
+
+    def get_workflow_handle_for(self, *_arguments: Any, **_named: Any) -> AStatusParent:
+        return self.parent
+
+
+async def test_a_status_read_whose_second_half_fails_keeps_the_typed_result_it_promises(
+) -> None:
+    """The status Query and the close beside it are one read operation in two parts.
+
+    A controller reads this to decide what to do next, and what it acts on is a typed result: a
+    parent it cannot read is retryable infrastructure, and a history the service can no longer
+    produce is expired authority. A transport fault let out of the second half would be neither,
+    and the clock the second half exists for must not cost the read its own contract.
+    """
+    horizon = A_MOMENT_MS + FORK_AUTHORITY_HORIZON_MS
+    standing = ForkStatusAnswer(
+        found=True,
+        conflict=False,
+        parent_state="forked",
+        record=a_prepared(authority_horizon_at=horizon),
+    )
+    unreadable = AStatusParent(standing, describe_fails=an_rpc(RPCStatusCode.UNAVAILABLE))
+    with pytest.raises(ApplicationError) as raised:
+        await fork_status(
+            AControllersClient(unreadable), a_request(), now_ms=A_MOMENT_MS
+        )
+    assert fork_refusal(raised.value) == FORK_UNREADABLE_PARENT
+    assert fork_can_be_retried(raised.value)
+    assert unreadable.described == _ANSWER_READ_TRIES
+
+    gone = AStatusParent(standing, describe_fails=an_rpc(RPCStatusCode.NOT_FOUND))
+    with pytest.raises(ApplicationError) as raised:
+        await fork_status(AControllersClient(gone), a_request(), now_ms=A_MOMENT_MS)
+    assert fork_refusal(raised.value) == FORK_EXPIRED_AUTHORITY
+    assert not fork_can_be_retried(raised.value)
+
+    # A parent that answers both halves is inside its window until the horizon and outside it
+    # after, and the last instant it admits a question is that horizon itself.
+    answering = AStatusParent(standing)
+    assert await fork_status(
+        AControllersClient(answering), a_request(), now_ms=horizon
+    ) == standing
+    with pytest.raises(ApplicationError) as raised:
+        await fork_status(AControllersClient(answering), a_request(), now_ms=horizon + 1)
+    assert fork_refusal(raised.value) == FORK_EXPIRED_AUTHORITY
+
+
+def test_the_window_a_parents_answers_stand_in_is_the_earlier_of_its_two_clocks() -> None:
+    """The horizon is absolute and the close is not, so a late close shortens the window.
+
+    The two clocks are recorded for different reasons. The deadline bounds the parent's own fork
+    work and says nothing about when it actually closes, because a durable timer's callback runs
+    only inside a Worker activation. The horizon is recorded at the barrier because the service
+    schedules each execution's history for deletion from that execution's own close time, so a
+    child that failed early is deleted on its own clock while its parent is still prepared.
+
+    What a deployment owes is that horizon plus a margin above the service's own deletion jitter,
+    so every original execution of the fork is still readable at every moment the window admits a
+    question.
+    """
+    at = 1_700_000_000_000
+    record = a_prepared(
+        preparation_deadline_at=at + FORK_PREPARATION_BOUND_MS,
+        authority_horizon_at=at + FORK_AUTHORITY_HORIZON_MS,
+    )
+    assert FORK_AUTHORITY_HORIZON_MS == FORK_PREPARATION_BOUND_MS + FORK_ANSWER_WINDOW_MS
+    assert FORK_RETENTION_FLOOR_MS == FORK_AUTHORITY_HORIZON_MS + FORK_RETENTION_MARGIN_MS
+
+    # A parent that has not closed is answerable to the horizon, and one that closed early is
+    # answerable for the window from its close, which is the earlier of the two.
+    assert fork_answer_window_ends(record, 0) == record.authority_horizon_at
+    early = at + 60_000
+    assert fork_answer_window_ends(record, early) == early + FORK_ANSWER_WINDOW_MS
+    assert fork_answer_window_ends(record, early) < record.authority_horizon_at
+
+    # A close after the due time shortens the window rather than moving it, and a close after the
+    # horizon leaves none at all.
+    late = record.preparation_deadline_at + 3 * 60 * 60 * 1000
+    assert fork_answer_window_ends(record, late) == record.authority_horizon_at
+    assert fork_answer_window_ends(record, late) < late + FORK_ANSWER_WINDOW_MS
+    beyond = record.authority_horizon_at + 1
+    assert fork_answer_window_ends(record, beyond) == record.authority_horizon_at
+    assert fork_answer_window_ends(record, beyond) < beyond
+
+    # And the same answer from the two values it is made of rather than from the record, which is
+    # what the routes outside the workflow hold: a Query answer carries the horizon the barrier
+    # recorded, and the service says when the execution closed.
+    for closed in (0, early, late, beyond):
+        assert answer_window_ends(record.authority_horizon_at, closed) == (
+            fork_answer_window_ends(record, closed)
         )

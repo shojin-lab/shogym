@@ -17,12 +17,14 @@ from __future__ import annotations
 
 import asyncio
 import json
+import os
 import shutil
-from dataclasses import replace
+from contextlib import asynccontextmanager
+from dataclasses import fields as dataclass_fields, replace
 from datetime import timedelta
 from hashlib import sha256
 from pathlib import Path
-from typing import Any, Dict, List, Optional, Sequence, Tuple
+from typing import Any, AsyncIterator, Dict, List, Optional, Sequence, Tuple
 
 import pytest
 
@@ -31,16 +33,26 @@ pytest.importorskip("temporalio")
 import pytest_asyncio  # noqa: E402
 from temporalio import activity  # noqa: E402
 from temporalio.api.common.v1 import Payload  # noqa: E402
+from temporalio.common import RetryPolicy  # noqa: E402
 from temporalio.api.enums.v1 import EventType  # noqa: E402
-from temporalio.client import Client, WorkflowUpdateFailedError  # noqa: E402
+from temporalio.api.common.v1 import WorkflowExecution  # noqa: E402
+from temporalio.api.workflowservice.v1 import (  # noqa: E402
+    DeleteWorkflowExecutionRequest,
+    DescribeNamespaceRequest,
+)
+from temporalio.client import (  # noqa: E402
+    Client,
+    WorkflowHandle,
+    WorkflowUpdateFailedError,
+)
 from temporalio.converter import (  # noqa: E402
     DataConverter,
     DefaultPayloadConverter,
     default as default_converter,
 )
 from temporalio.exceptions import ApplicationError  # noqa: E402
-from temporalio.service import RPCError  # noqa: E402
-from temporalio.testing import ActivityEnvironment  # noqa: E402
+from temporalio.service import RPCError, RPCStatusCode  # noqa: E402
+from temporalio.testing import ActivityEnvironment, WorkflowEnvironment  # noqa: E402
 
 from shogym.envs.receipts.env_v1 import ReceiptsV1Env, sibling  # noqa: E402
 from shogym.envs.receipts.generators.ledger import GENERATOR  # noqa: E402
@@ -52,6 +64,7 @@ from shogym.envs.receipts.protocol_v2 import (  # noqa: E402
 from shogym.serve.episode import ServedEpisode  # noqa: E402
 from shogym.serve.protocol_v2 import (  # noqa: E402
     IMMEDIATE,
+    canonical_json,
     PresentationAck,
     PullRequest,
     TerminalMetadata,
@@ -75,10 +88,6 @@ from shogym.serve.protocol_v2.gateway import (  # noqa: E402
     attach_gateway,
     install_policies,
 )
-from shogym.serve.protocol_v2.rundir import (  # noqa: E402
-    open_run_directory,
-    run_directory_of,
-)
 from shogym.serve.protocol_v2.fork import (  # noqa: E402
     ChildAttached,
     ContainerEquality,
@@ -88,30 +97,51 @@ from shogym.serve.protocol_v2.fork import (  # noqa: E402
     attach_child,
     attachment_key,
     bind_child,
+    child_start,
     compare_child,
     fork_request_for,
     prepare_child,
     release_children,
     retrieve_checkpoint,
 )
+from shogym.serve.protocol_v2.rundir import (  # noqa: E402
+    MANIFEST_FILE,
+    create_run_directory,
+    open_run_directory,
+    run_directory_of,
+)
 from shogym.serve.protocol_v2.kernel import (  # noqa: E402
     CONFIRMED_EXISTING,
     EXISTENCE_UNCONFIRMED,
+    EXPIRED_PREPARATION,
+    FORK_ABANDONED,
+    FORK_ANSWER_WINDOW_MS,
+    FORK_AUTHORITY_HORIZON_MS,
     FORK_COMPLETE,
     FORK_CONFLICTED,    FORK_CARRIER_SCHEMA_VERSION,
     FORK_EXPIRED_AUTHORITY,
     FORK_NOT_QUIET,
+    FORK_PREPARATION_BOUND_MS,
     FORK_PREPARED,
     FORK_REPAIRABLE_ABSENCE,
     FORK_REQUEST_CONFLICT,
+    FORK_RESERVE,
+    FORK_RETENTION_FLOOR_MS,
+    FORK_RETENTION_MARGIN_MS,
+    FORK_UNREADABLE_PARENT,
     FORK_WITNESS_MISMATCH,
     NEVER_ATTEMPTED,
+    SPENT_RECOVERY_RESERVE,
+    STEP_CAP,
+    STREAM_TASK_QUEUE,
+    TEMPORAL_ADDRESS_ENV,
     RECEIPT_CARRIER_SCHEMA_VERSION,
     BlobsVerified,
     CheckpointComponent,
     CheckpointManifest,
     ConsumerClaim,
     ChildReady,
+    FinalizeRequest,
     SettledHarness,
     ForkAvailability,
     ForkAvailabilityInput,
@@ -119,6 +149,7 @@ from shogym.serve.protocol_v2.kernel import (  # noqa: E402
     ForkChildStarted,
     ForkPreparation,
     ForkPreparationInput,
+    ForkOriginVerified,
     ForkRequest,
     GeneratePayloadBundleInput,
     GradeAttemptInput,
@@ -134,11 +165,14 @@ from shogym.serve.protocol_v2.kernel import (  # noqa: E402
     TaskItem,
     TerminalTool,
     VerifyBlobsInput,
+    VerifyForkOriginInput,
     assignments_for,
     configuration_hash,
     child_workflow_id,
     complete_start_digest,
     derived_selection,
+    durable_client,
+    fork_answer_window_ends,
     fork_availability_activity,
     fork_barrier_stands,
     fork_preparation_activity,
@@ -146,6 +180,7 @@ from shogym.serve.protocol_v2.kernel import (  # noqa: E402
     fork_preparation_operation_identity,
     fork_can_be_retried,
     fork_refusal,
+    fork_request_digest,
     fork_status,
     fork_stream,
     generate_payload_bundle_activity,
@@ -155,12 +190,17 @@ from shogym.serve.protocol_v2.kernel import (  # noqa: E402
     resume_stream,
     start_fork_child_activity,
     start_stream,
+    stream_replayer,
     stream_worker,
+    temporal_home,
+    turnover_pending,
     verified_set_digest,
     verify_blobs_activity,
+    verify_fork_origin_activity,
 )
 from shogym.serve.protocol_v2.kernel.activities import (  # noqa: E402
     FORK_AVAILABILITY,
+    VERIFY_FORK_ORIGIN,
     GENERATE_PAYLOAD_BUNDLE,
     GRADE_ATTEMPT,
     PREPARE_FORK_CHILD,
@@ -178,6 +218,9 @@ from shogym.serve.protocol_v2.kernel.workflow import (  # noqa: E402
 from shogym.serve.protocol_v2.reader import (  # noqa: E402
     RECEIPT_AVAILABLE,
     RECEIPT_UNAVAILABLE,
+    inherited_work,
+    local_work,
+    read_records,
     receipt_availability,
 )
 from shogym.serve.protocol_v2.kernel.messages import (  # noqa: E402
@@ -200,9 +243,12 @@ from shogym.serve.protocol_v2.policy import (  # noqa: E402
     GRADED_RECEIPT_ARTIFACT_V1_DIGEST,
     PLACEBO_RECEIPT_ARTIFACT_V1_DIGEST,
     REGISTERED,
+    SINGLETON_SLOT,
     WITHHOLD,
     PayloadDisposition,
     PolicyProvenance,
+    describe_disposition,
+    disposition_key,
     roster_digest,
 )
 from tests._fixtures.receipts_bundle import private_bundle  # noqa: E402
@@ -1399,6 +1445,105 @@ async def test_a_fork_refused_over_a_lost_body_goes_through_under_a_fresh_identi
         answer = await fork_status(env.client, request)
         assert answer.found and answer.record is not None
         assert answer.record.status == FORK_COMPLETE
+
+
+def with_no_outcome_journal() -> Any:
+    """Every read of the exact outcome journal fails the way a transport does, and no other read.
+
+    The status Query and the close are left alone, so what the recovery path is left holding is a
+    parent that answers where its fork stands and cannot say what one identifier was answered
+    with, which is the interval this test is about.
+    """
+    reading = WorkflowHandle.query
+
+    async def query(self: Any, question: Any, *arguments: Any, **named: Any) -> Any:
+        if question is StreamWorkflow.answered_update:
+            raise RPCError(
+                "the parent could not be reached", RPCStatusCode.UNAVAILABLE, b""
+            )
+        return await reading(self, question, *arguments, **named)
+
+    return query
+
+
+async def test_an_outcome_nobody_can_read_is_not_answered_with_the_fork_that_went_through(
+    env: Any, world: ServedEpisode, tmp_path: Path, turnover_at: Any
+) -> None:
+    """The one interval where a failed read of the journal and an empty one are not the same.
+
+    A refusal the parent accepted is kept in its outcome journal, and the journal crosses a
+    boundary with the generation while the service's record of that Update does not. So after a
+    continuation the identifier that met the refusal reaches no handler at all, its answer is in
+    the carried journal, and a fresh identifier can meanwhile take the same logical fork through.
+    That is the whole interval: the parent has closed, its status reads say the fork completed,
+    and the only thing that says what this identifier was answered with is a read of the journal.
+
+    A read that could not be served is not that identifier answering with nothing. Treating it as
+    nothing hands the try that failed the receipt of the try that went through, which is a
+    controller told its fork succeeded over a body the store had lost. What it gets instead is the
+    typed refusal that says the parent could not be read, which is infrastructure and is asked
+    again, and the answer it gets once the read works is the refusal the parent actually recorded.
+    """
+    blobs = tmp_path / "blobs"
+    contract = contract_of(world.env)
+    turnover_at(10_000)
+    composed = fork_capable(start_for(world, contract, blobs))
+    parent = "stream/fork-unread/1"
+    async with stream_worker(env.client, activities=activities_of(world)):
+        caller = await worked(env, composed, blobs, parent, filing_of(world.env))
+        request = await a_fork_request(env.client, caller, composed, tmp_path)
+        manifest = await a_committed_manifest(env.client, parent, blobs)
+        store = FilesystemBlobStore(blobs)
+        lost = manifest.cells[PLACEBO_CELL].sha256
+        body = store.read(lost)
+        store.path_for(lost).unlink()
+
+        # One try meets the loss and the parent accepts that refusal into its journal. The object
+        # is put back, which the identifier that met it is owed nothing for.
+        with pytest.raises(Exception) as raised:
+            await fork_stream(env.client, request)
+        assert fork_refusal(raised.value) == FORK_REPAIRABLE_ABSENCE
+        assert store.put(body).sha256 == lost
+
+        # The generation crosses a boundary carrying that refusal. Its execution moves and the
+        # fork the request names does not, so the identifier a try is sent under does not move
+        # either.
+        await cross_a_boundary(caller, turnover_at, parent, env.client)
+        described = await env.client.get_workflow_handle(parent).describe()
+        successor = await handed_on(env.client, parent)
+        assert described.run_id != request.parent_run_id
+        carried = replace(
+            request,
+            parent_run_id=described.run_id,
+            parent_execution_ordinal=successor.execution_ordinal,
+        )
+        assert fork_request_digest(carried) == fork_request_digest(request)
+
+        # A fresh identifier takes the same logical fork through, and the parent closes behind it.
+        receipt = await fork_stream(env.client, carried, attempt=2)
+        assert receipt.children == 2
+        await env.client.get_workflow_handle(parent).result(
+            rpc_timeout=timedelta(seconds=30)
+        )
+        answer = await fork_status(env.client, carried)
+        assert answer.record is not None and answer.record.status == FORK_COMPLETE
+
+        # Now the try that failed asks again, against a closed successor whose status and close
+        # both read and whose journal cannot be read at all.
+        with pytest.MonkeyPatch.context() as blinded:
+            blinded.setattr(WorkflowHandle, "query", with_no_outcome_journal())
+            assert (await fork_status(env.client, carried)).receipt == receipt
+            with pytest.raises(Exception) as unread:
+                await fork_stream(env.client, carried, attempt=1)
+        assert fork_refusal(unread.value) == FORK_UNREADABLE_PARENT
+        assert fork_can_be_retried(unread.value)
+
+        # Asked again once the journal reads, that identifier answers with what it was answered
+        # with, and a genuinely fresh one is still owed the fork that went through.
+        with pytest.raises(Exception) as again:
+            await fork_stream(env.client, carried, attempt=1)
+        assert fork_refusal(again.value) == FORK_REPAIRABLE_ABSENCE
+        assert await fork_stream(env.client, carried, attempt=3) == receipt
 
 
 async def test_a_forked_parent_answers_the_same_children_and_names_a_changed_request_a_conflict(
@@ -3628,3 +3773,1914 @@ async def test_a_controller_carries_one_frozen_parent_through_to_two_children_th
     finally:
         for one in opened:
             await one.close()
+
+
+# The composed proof: the endings a fork can come to on a service that keeps a real clock, the
+# three contracts a child is held to against a parent and against a twin, every physical history
+# of the lineage replayed, and one whole run from a continuation boundary to a relocated read-back.
+
+
+#: The child ordinals whose start creates its child and then loses the answer. The Worker registers
+#: this instead of the real start, because two Activities of one name are refused, and an effect
+#: that happened over an answer that never arrived is exactly what an unconfirmed child is.
+_LOST_REPLIES: set = set()
+
+
+@activity.defn(name=START_FORK_CHILD)
+async def _a_lost_reply(request: StartForkChildInput) -> ForkChildStarted:
+    """Create every child for real, and answer nothing about the ones that are named."""
+    started = await start_fork_child_activity(request)
+    if request.child_ordinal not in _LOST_REPLIES:
+        return started
+    raise ApplicationError(
+        f"the service answered nothing about child {request.child_ordinal}", non_retryable=True
+    )
+
+
+#: The child ordinals whose start answers nothing and leaves no execution behind it, which is the
+#: fork that created no child at all. The Worker registers this instead of the real start, because
+#: two Activities of one name are refused.
+_SILENT_STARTS: set = set()
+
+
+@activity.defn(name=START_FORK_CHILD)
+async def _a_start_that_creates_nothing(request: StartForkChildInput) -> ForkChildStarted:
+    """Create nothing and answer nothing for the named child, and every other one for real."""
+    if request.child_ordinal in _SILENT_STARTS:
+        raise ApplicationError(
+            f"nothing was created for child {request.child_ordinal}", non_retryable=True
+        )
+    return await start_fork_child_activity(request)
+
+
+async def a_fork_left_incomplete(
+    env: Any,
+    world: ServedEpisode,
+    blobs: Path,
+    tmp_path: Path,
+    workflow_id: str,
+    *,
+    attempts: int,
+) -> Tuple[ForkRequest, List[Exception]]:
+    """Fork with the second child's reply lost every time, ``attempts`` times over.
+
+    Each try creates the child it names and then fails, so the barrier stands, one child is
+    confirmed, the other is attempted with its existence unconfirmed, and the fork never completes.
+    """
+    contract = contract_of(world.env)
+    composed = fork_capable(start_for(world, contract, blobs))
+    caller = await worked(env, composed, blobs, workflow_id, filing_of(world.env))
+    request = await a_fork_request(env.client, caller, composed, tmp_path)
+    refused: List[Exception] = []
+    for attempt in range(1, attempts + 1):
+        with pytest.raises(Exception) as raised:
+            await fork_stream(env.client, request, attempt=attempt)
+        refused.append(raised.value)
+    return request, refused
+
+
+async def closed_at_ms(client: Client, workflow_id: str) -> int:
+    """When one execution actually closed, waited out on the clock the service keeps.
+
+    It is read off the execution rather than awaited as a result, because a test that is moving
+    this service's own clock must not also be unlocking it by waiting on one.
+    """
+    for _ in range(1200):
+        described = await client.get_workflow_handle(workflow_id).describe()
+        if described.close_time is not None:
+            return int(described.close_time.timestamp() * 1000)
+        await asyncio.sleep(0.05)
+    raise AssertionError(f"{workflow_id} never closed")
+
+
+async def now_ms(env: Any) -> int:
+    """The moment this service is at, on the clock it keeps rather than on this process's."""
+    return int((await env.get_current_time()).timestamp() * 1000)
+
+
+async def slept_past(env: Any, moment_ms: int) -> None:
+    """Move the service's own clock past one recorded moment, by a minute."""
+    ahead = moment_ms - await now_ms(env)
+    await env.sleep(timedelta(milliseconds=max(ahead, 0) + 60_000))
+
+
+async def slept_until(env: Any, moment_ms: int) -> None:
+    """Move the service's own clock to one recorded moment and no further.
+
+    A window is enforced on the moment a question is asked, so the last instant it admits one is
+    a moment to stand at rather than a moment to pass: a test that only ever asked before the end
+    and after it would never have read the boundary itself.
+    """
+    ahead = moment_ms - await now_ms(env)
+    if ahead > 0:
+        await env.sleep(timedelta(milliseconds=ahead))
+
+
+async def test_a_fork_whose_reserve_is_spent_is_abandoned_and_replaces_no_child(
+    env: Any,
+    world: ServedEpisode,
+    tmp_path: Path,
+    turnover_at: Any,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Exhaustion, driven at the last admissible slot with the final start's reply lost.
+
+    The reserve bounds accepted calls rather than elapsed time, so it is spent by sending the fork
+    again under fresh identifiers until the last admissible one, and that last try is the one whose
+    start creates its child and answers nothing. The abandonment waits for that outcome to settle:
+    an ending committed while a start was still running would record an outcome the parent has not
+    seen. What stands afterwards is the terminal status with the reason it was committed for, both
+    children preserved, and the one that was never confirmed recorded as attempted rather than as
+    never created.
+
+    The number is lowered here for the same reason a boundary's trigger is, so that the last
+    admissible slot is a slot a test can reach and stop on. The reserve at the number this build
+    declares is driven whole against a service that enforces a cap of its own, below.
+    """
+    blobs = tmp_path / "blobs"
+    turnover_at(10_000)
+    monkeypatch.setattr(kernel_workflow, "FORK_RESERVE", 3)
+    _LOST_REPLIES.clear()
+    _LOST_REPLIES.add(2)
+    parent = "stream/fork-spent/1"
+    async with stream_worker(
+        env.client, activities=[*activities_of(world), _a_lost_reply]
+    ):
+        request, refused = await a_fork_left_incomplete(
+            env, world, blobs, tmp_path, parent, attempts=4
+        )
+        # None of the four was a decision about the request: each one is a start that happened and
+        # an answer that did not arrive. The first commits the barrier the reserve is counted from,
+        # so the three after it are the three slots this parent had.
+        assert [fork_refusal(one) for one in refused] == [None] * 4
+        await closed_at_ms(env.client, parent)
+
+        answer = await fork_status(env.client, request)
+        assert answer.found and answer.record is not None
+        record = answer.record
+        assert record.status == FORK_ABANDONED
+        assert record.abandoned_reason == SPENT_RECOVERY_RESERVE
+        assert record.children == 2
+        assert [row.existence for row in record.child_records] == [
+            CONFIRMED_EXISTING,
+            EXISTENCE_UNCONFIRMED,
+        ]
+
+        # The derived identity of the child nobody confirmed is retained, the execution behind it
+        # is preserved, and nothing may be created under that identity in its place.
+        [_first, second] = record.child_records
+        assert second.child_workflow_id == child_workflow_id(
+            identity_namespace=env.client.namespace,
+            parent_workflow_id=parent,
+            fork_id=FORK,
+            child_ordinal=2,
+        )
+        assert await env.client.get_workflow_handle(second.child_workflow_id).describe()
+        with pytest.raises(Exception) as raised:
+            await start_stream(
+                env.client,
+                fork_capable(start_for(world, contract_of(world.env), blobs)),
+                workflow_id=second.child_workflow_id,
+            )
+        assert fork_refusal(raised.value) is None
+
+        # The last outcome settled before the ending was committed, so the exact identifier that
+        # met the loss keeps its own failure and a fresh one is refused by the ending rather than
+        # answered with a receipt. A decision is what a spent reserve is, so nothing retries it.
+        with pytest.raises(Exception) as raised:
+            await fork_stream(env.client, request, attempt=5)
+        assert fork_refusal(raised.value) == SPENT_RECOVERY_RESERVE
+        assert not fork_can_be_retried(raised.value)
+        with pytest.raises(Exception) as raised:
+            await fork_stream(env.client, request, attempt=4)
+        assert fork_refusal(raised.value) is None
+
+        # And the identity of the child that was never confirmed is retained past the moment the
+        # window would have closed, because retention bounds what can be read and never grants a
+        # permission to create something else under a name a fork already used.
+        await slept_past(env, record.authority_horizon_at)
+        after = await fork_status(env.client, request)
+        assert after.record is not None
+        assert [row.child_workflow_id for row in after.record.child_records] == [
+            row.child_workflow_id for row in record.child_records
+        ]
+        assert after.record.status == FORK_ABANDONED
+
+
+async def test_a_worker_away_across_the_deadline_expires_the_fork_on_the_clock_it_recorded(
+    env: Any,
+    world: ServedEpisode,
+    tmp_path: Path,
+    turnover_at: Any,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The deadline is a bound on the parent's own work and never a bound on when it closes.
+
+    The SDK runs a durable timer's callback only inside a Worker activation, so a parent whose
+    Worker is away commits nothing when its deadline becomes due. A Worker that comes back after it
+    records the expiry against the recorded due time and restarts neither clock, and the
+    consequence is stated rather than hidden: the close is late, the horizon is where the barrier
+    put it, and the window ends at the horizon rather than at that late close plus the answer
+    window.
+
+    The bound is lowered to seconds and the horizon is lowered with it, so the two keep the
+    relation this build declares and the Worker can be away across a due time that a test can
+    actually wait out. Both are the real clocks otherwise: the timer is the parent's own durable
+    timer, the absence is a Worker that is not there, and the close is the one the service recorded.
+    """
+    blobs = tmp_path / "blobs"
+    turnover_at(10_000)
+    monkeypatch.setattr(kernel_workflow, "FORK_PREPARATION_BOUND_MS", 15_000)
+    monkeypatch.setattr(
+        kernel_workflow, "FORK_AUTHORITY_HORIZON_MS", 15_000 + FORK_ANSWER_WINDOW_MS
+    )
+    _SILENT_STARTS.clear()
+    _SILENT_STARTS.add(1)
+    _LOST_REPLIES.clear()
+    parent = "stream/fork-away/1"
+    async with stream_worker(
+        env.client,
+        activities=[*activities_of(world), _a_start_that_creates_nothing],
+        cached_workflows=0,
+    ):
+        request, _refused = await a_fork_left_incomplete(
+            env, world, blobs, tmp_path, parent, attempts=1
+        )
+        standing = await fork_status(env.client, request)
+        assert standing.record is not None
+        record = standing.record
+        assert record.status == FORK_PREPARED
+        assert record.authority_horizon_at == (
+            record.preparation_deadline_at + FORK_ANSWER_WINDOW_MS
+        )
+
+    # The Worker is away and the due time arrives with nobody to run the callback, so the parent
+    # commits nothing: the timer is due, the execution stands, and no ending is recorded.
+    assert await now_ms(env) < record.preparation_deadline_at, (
+        "this is about a Worker that was away when the time came, so it has to leave before it"
+    )
+    while await now_ms(env) < record.preparation_deadline_at + 2_000:
+        assert (
+            await env.client.get_workflow_handle(parent).describe()
+        ).close_time is None, "a parent whose Worker is away commits nothing when its time comes"
+        await asyncio.sleep(0.25)
+
+    async with stream_worker(
+        env.client,
+        activities=[*activities_of(world), _a_start_that_creates_nothing],
+        cached_workflows=0,
+    ):
+        closed = await closed_at_ms(env.client, parent)
+        answer = await fork_status(env.client, request)
+        assert answer.record is not None
+        expired = answer.record
+        assert expired.status == FORK_ABANDONED
+        assert expired.abandoned_reason == EXPIRED_PREPARATION
+
+        # Neither clock restarted: both moments are the ones the barrier recorded.
+        assert expired.preparation_deadline_at == record.preparation_deadline_at
+        assert expired.authority_horizon_at == record.authority_horizon_at
+
+        # The close is late, so the window is shorter rather than later. It ends at the horizon,
+        # which is absolute, and not at this close plus the answer window.
+        assert closed > expired.preparation_deadline_at
+        assert closed + FORK_ANSWER_WINDOW_MS > expired.authority_horizon_at
+        assert fork_answer_window_ends(expired, closed) == expired.authority_horizon_at
+
+        # And a controller writing to it is told the decision rather than an infrastructure state.
+        with pytest.raises(Exception) as raised:
+            await fork_stream(env.client, request, attempt=2)
+        assert fork_refusal(raised.value) == EXPIRED_PREPARATION
+        assert not fork_can_be_retried(raised.value)
+
+
+#: The origin reading, held so a test can put it after the window its parent's answers stand in.
+#: The Worker registers this instead of the real reading, because two Activities of one name are
+#: refused, and it reads the parent for real once the test stops holding it.
+_ORIGIN_HELD: dict = {}
+
+
+@activity.defn(name=VERIFY_FORK_ORIGIN)
+async def _an_origin_read_the_test_places(request: VerifyForkOriginInput) -> ForkOriginVerified:
+    """Answer nothing while the test holds this, and read the parent for real once it does not.
+
+    Holding it is how a reading is put after the horizon rather than before it. The window is
+    enforced on the moment the question is actually asked, so an attempt that starts while the
+    test is holding is an attempt that started too early to say anything about the window, and the
+    one that reads the parent is the one that starts after the test has moved the clock.
+    """
+    if _ORIGIN_HELD.get("held"):
+        _ORIGIN_HELD["reached"] = True
+        raise ApplicationError("the parent could not be read yet")
+    return await verify_fork_origin_activity(request)
+
+
+async def test_a_child_whose_answer_window_closed_reports_that_to_the_attachment(
+    env: Any,
+    world: ServedEpisode,
+    frozen_bundle: Path,
+    tmp_path: Path,
+    turnover_at: Any,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Expired authority reaching a controller as itself, from the child that met it.
+
+    A parent nobody can reach is infrastructure and the reading is asked again while the child
+    waits behind its gate. A window that has closed is not that: the horizon is absolute, so no
+    later reading reaches an answer and a child that waited would wait for ever. What the child
+    does instead is record the state, keep its identity and its objects, and answer the call that
+    would own it with the reason. The attachment reports that rather than the temporary
+    unreadability it would otherwise time out into, and the child it names is still there.
+
+    The horizon is lowered to seconds and the reading is retried under a short interval, so this
+    is the real clock the service keeps rather than a value substituted for one.
+    """
+    blobs = tmp_path / "blobs"
+    turnover_at(10_000)
+    monkeypatch.setattr(kernel_workflow, "FORK_AUTHORITY_HORIZON_MS", 20_000)
+    monkeypatch.setattr(
+        kernel_workflow,
+        "_ORIGIN_RETRY",
+        RetryPolicy(
+            initial_interval=timedelta(seconds=1),
+            backoff_coefficient=1.0,
+            maximum_interval=timedelta(seconds=1),
+        ),
+    )
+    composed = fork_capable(start_for(world, contract_of(world.env), blobs))
+    _ORIGIN_HELD.clear()
+    _ORIGIN_HELD["held"] = True
+    own = await a_world_at(frozen_bundle, tmp_path, 0, "expired-origin")
+    try:
+        async with stream_worker(
+            env.client, activities=[*a_closing_worker(world), _an_origin_read_the_test_places]
+        ):
+            request, receipt, _starts = await forked(
+                env, world, composed, blobs, tmp_path, "stream/child-expired/1"
+            )
+            close_the_capture()
+            standing = await fork_status(env.client, request)
+            assert standing.record is not None
+            horizon = standing.record.authority_horizon_at
+
+            for _ in range(1_000):
+                if _ORIGIN_HELD.get("reached"):
+                    break
+                await asyncio.sleep(0.02)
+            assert _ORIGIN_HELD.get("reached"), "the origin reading never reached the Worker"
+            await slept_past(env, horizon)
+            _ORIGIN_HELD["held"] = False
+
+            child = receipt.child_receipts[0]
+            with pytest.raises(Exception) as raised:
+                await attach_child(
+                    env.client,
+                    own,
+                    ForkOperations.under(tmp_path / "expired"),
+                    fork_id=FORK,
+                    child=child,
+                    source=FilesystemBlobStore(blobs),
+                    database_root="..",
+                )
+            assert fork_refusal(raised.value) == FORK_EXPIRED_AUTHORITY
+            assert not fork_can_be_retried(raised.value)
+            assert child.child_workflow_id in str(raised.value)
+
+            # The child kept its identity and everything it holds, and it is still there: an
+            # expired window is a limit on what can be read and never a licence to replace it.
+            described = await env.client.get_workflow_handle(
+                child.child_workflow_id
+            ).describe()
+            assert described.close_time is None
+            assert described.run_id == child.child_run_id
+    finally:
+        await own.close()
+        _ORIGIN_HELD.clear()
+
+
+#: One child's start, held so a test can reach the parent's deadline while that start is still in
+#: flight. The Worker registers this instead of the real start, because two Activities of one name
+#: are refused, and it answers nothing: what ends it is the timeout the parent scheduled it under.
+_HELD_START: dict = {}
+
+
+@activity.defn(name=START_FORK_CHILD)
+async def _a_start_that_never_answers(request: StartForkChildInput) -> ForkChildStarted:
+    """Hold the named child's start open, and create every other child for real."""
+    if request.child_ordinal not in _HELD_START.get("ordinals", ()):
+        return await start_fork_child_activity(request)
+    _HELD_START["reached"].set()
+    await _HELD_START["release"].wait()
+    raise ApplicationError(
+        f"the start of child {request.child_ordinal} was let go rather than answered",
+        non_retryable=True,
+    )
+
+
+def a_start_held_for(*ordinals: int) -> None:
+    """Arm the two events one held start is driven by, for the children that are named."""
+    _HELD_START.clear()
+    _HELD_START.update(
+        {"ordinals": set(ordinals), "reached": asyncio.Event(), "release": asyncio.Event()}
+    )
+
+
+async def test_a_start_in_flight_when_the_deadline_arrives_leaves_its_child_unconfirmed(
+    env: Any,
+    world: ServedEpisode,
+    tmp_path: Path,
+    turnover_at: Any,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Expiry with work still pending, which is the state a spent reserve arrives at too.
+
+    The parent admits no further work and schedules no new start work, the start already dispatched
+    is bounded by the timeout it was scheduled under rather than left behind, and the abandonment is
+    committed only after that last outcome settles. A timeout is never proof that no child exists,
+    so the child it named stays attempted with its existence unconfirmed, its derived identity is
+    retained, and nothing may be created under that identity afterwards.
+    """
+    blobs = tmp_path / "blobs"
+    turnover_at(10_000)
+    monkeypatch.setattr(kernel_workflow, "FORK_PREPARATION_BOUND_MS", 6_000)
+    monkeypatch.setattr(
+        kernel_workflow, "FORK_AUTHORITY_HORIZON_MS", 6_000 + FORK_ANSWER_WINDOW_MS
+    )
+    monkeypatch.setattr(kernel_workflow, "_FORK_START_TIMEOUT", timedelta(seconds=12))
+    a_start_held_for(1)
+    contract = contract_of(world.env)
+    composed = fork_capable(start_for(world, contract, blobs))
+    parent = "stream/fork-pending/1"
+    async with stream_worker(
+        env.client, activities=[*activities_of(world), _a_start_that_never_answers]
+    ):
+        try:
+            caller = await worked(env, composed, blobs, parent, filing_of(world.env))
+            request = await a_fork_request(env.client, caller, composed, tmp_path)
+            forking = asyncio.ensure_future(fork_stream(env.client, request))
+            await asyncio.wait_for(_HELD_START["reached"].wait(), timeout=30)
+
+            # The deadline arrives with that start still in flight, and what ends it is the bound
+            # the parent gave it rather than an answer from a service that never came back.
+            with pytest.raises(Exception) as raised:
+                await asyncio.wait_for(forking, timeout=60)
+            assert fork_refusal(raised.value) is None
+            closed = await closed_at_ms(env.client, parent)
+        finally:
+            _HELD_START["release"].set()
+
+        answer = await fork_status(env.client, request)
+        assert answer.record is not None
+        expired = answer.record
+        assert expired.status == FORK_ABANDONED
+        assert expired.abandoned_reason == EXPIRED_PREPARATION
+        assert closed >= expired.preparation_deadline_at
+
+        # The child that start named is attempted and unconfirmed rather than never created, its
+        # derived identity is retained, and no history under it is evidence that it never existed.
+        [first, second] = expired.child_records
+        assert first.existence == EXISTENCE_UNCONFIRMED
+        assert second.existence == NEVER_ATTEMPTED
+        assert first.child_workflow_id == child_workflow_id(
+            identity_namespace=env.client.namespace,
+            parent_workflow_id=parent,
+            fork_id=FORK,
+            child_ordinal=1,
+        )
+        with pytest.raises(RPCError):
+            await env.client.get_workflow_handle(first.child_workflow_id).describe()
+
+        # The exact identifier that failed keeps its own outcome, and a fresh one is told the
+        # ending rather than being given a slot the parent no longer has.
+        with pytest.raises(Exception) as raised:
+            await fork_stream(env.client, request)
+        assert fork_refusal(raised.value) is None
+        with pytest.raises(Exception) as raised:
+            await fork_stream(env.client, request, attempt=2)
+        assert fork_refusal(raised.value) == EXPIRED_PREPARATION
+        assert not fork_can_be_retried(raised.value)
+
+
+async def configured_retention_ms(client: Client) -> int:
+    """How long this run's own service keeps a closed execution's history."""
+    answer = await client.service_client.workflow_service.describe_namespace(
+        DescribeNamespaceRequest(namespace=client.namespace)
+    )
+    return int(answer.config.workflow_execution_retention_ttl.ToTimedelta() / timedelta(
+        milliseconds=1
+    ))
+
+
+async def original_start_of(client: Client, row: Any) -> StreamStart:
+    """The start one child's own first execution was created with, read off that execution."""
+    handle = client.get_workflow_handle(row.child_workflow_id, run_id=row.child_run_id)
+    history = await handle.fetch_history()
+    started = history.events[0].workflow_execution_started_event_attributes
+    return CONVERTER.from_payload(started.input.payloads[0], StreamStart)
+
+
+async def test_a_lineage_answers_for_as_long_as_the_retention_a_deployment_owes(
+    env: Any, world: ServedEpisode, tmp_path: Path, turnover_at: Any
+) -> None:
+    """The retention relation, exercised on the clock the service keeps rather than stated.
+
+    A child that failed early is deleted on its own close clock while its parent is still prepared,
+    which is why the horizon is recorded at the barrier and not derived from a close. The window
+    this build promises is the earlier of that horizon and the parent's close plus the answer
+    window, and the retention a deployment owes is the horizon plus a margin above the service's own
+    deletion jitter, so every original execution of the fork is still readable at every moment the
+    window admits a question.
+
+    The preparation bound expires the fork on the way, while the parent is still prepared, which is
+    the ending it commits itself rather than waiting for a controller that stopped asking.
+    """
+    blobs = tmp_path / "blobs"
+    turnover_at(10_000)
+    _LOST_REPLIES.clear()
+    _LOST_REPLIES.add(2)
+    _SILENT_STARTS.clear()
+    parent = "stream/fork-retained/1"
+    async with stream_worker(
+        env.client, activities=[*activities_of(world), _a_lost_reply]
+    ):
+        request, _refused = await a_fork_left_incomplete(
+            env, world, blobs, tmp_path, parent, attempts=1
+        )
+        standing = await fork_status(env.client, request, now_ms=await now_ms(env))
+        assert standing.record is not None
+        record = standing.record
+        assert record.status == FORK_PREPARED
+
+        # The child that exists is ended before its parent is, which is the case the two clocks
+        # are kept apart for: a child that stopped an hour after the barrier is deleted on its own
+        # close clock while the parent is still prepared, so what a deployment owes is measured
+        # from the horizon rather than from any close.
+        [confirmed] = [
+            row for row in record.child_records if row.existence == CONFIRMED_EXISTING
+        ]
+        await env.client.get_workflow_handle(
+            confirmed.child_workflow_id, run_id=confirmed.child_run_id
+        ).terminate("this child of the fork stopped before its parent did")
+        child_closed = await closed_at_ms(env.client, confirmed.child_workflow_id)
+        assert child_closed <= await now_ms(env)
+
+        # What a deployment owes is the whole window plus a margin above the service's own
+        # deletion jitter. That relation is between the constants here; what an actual service is
+        # configured to keep is read off a service that reports one, which the time-skipping
+        # server does not, so it is proved where a run's own service is started instead.
+        assert FORK_AUTHORITY_HORIZON_MS == FORK_PREPARATION_BOUND_MS + FORK_ANSWER_WINDOW_MS
+        assert FORK_RETENTION_FLOOR_MS > FORK_AUTHORITY_HORIZON_MS
+
+        # The bound expires the fork while the parent is still prepared, and the parent commits
+        # that ending itself.
+        await slept_past(env, record.preparation_deadline_at)
+        closed = await closed_at_ms(env.client, parent)
+        expired = (
+            await fork_status(env.client, request, now_ms=await now_ms(env))
+        ).record
+        assert expired is not None
+        assert expired.status == FORK_ABANDONED
+        assert expired.abandoned_reason == EXPIRED_PREPARATION
+        assert closed > child_closed
+
+        # The window ends where the two clocks say, and at the last moment it admits a question
+        # both the parent's record and each child's own original execution are still readable.
+        # The child that closed first is read there too, on its own clock, which is what the
+        # retention floor is above the horizon for.
+        window = fork_answer_window_ends(expired, closed)
+        assert window == min(expired.authority_horizon_at, closed + FORK_ANSWER_WINDOW_MS)
+        await slept_until(env, window)
+        assert await now_ms(env) >= window
+        answered = await fork_status(env.client, request, now_ms=window)
+        assert answered.found and answered.record is not None
+        read = 0
+        for row in answered.record.child_records:
+            if row.child_run_id is None:
+                continue
+            start = await original_start_of(env.client, row)
+            assert complete_start_digest(start) == row.complete_start_digest
+            read += 1
+        assert read == 1
+
+        # Past it, the question is outside the window rather than about a child that was not
+        # created, and the history the service still holds is not what makes an answer stand:
+        # retention bounds what can be read and grants no permission, so the real parent answers
+        # this the same way a deleted one does. The identities the record holds stand either way.
+        await slept_past(env, window)
+        asked_at = await now_ms(env)
+        assert asked_at > fork_answer_window_ends(expired, closed)
+        for named in (request, replace(request, parent_workflow_id="stream/deleted-by-then/1")):
+            with pytest.raises(Exception) as raised:
+                await fork_status(env.client, named, now_ms=asked_at)
+            assert fork_refusal(raised.value) == FORK_EXPIRED_AUTHORITY
+            assert not fork_can_be_retried(raised.value)
+        still = await fork_status(env.client, request, now_ms=window)
+        assert still.record is not None
+        assert [row.child_workflow_id for row in still.record.child_records] == [
+            row.child_workflow_id for row in answered.record.child_records
+        ]
+
+
+async def test_a_child_that_closed_without_serving_is_adopted_rather_than_restarted(
+    env: Any, world: ServedEpisode, tmp_path: Path, turnover_at: Any
+) -> None:
+    """A child that exists and has stopped is an existing child, and never a free identity.
+
+    The reuse policy is set rather than left to the default, so a start under a derived identity
+    that already has an execution is resolved rather than issued again, and what is resolved is
+    verified to be this child before it is adopted. A closed child therefore stays closed: the fork
+    confirms the execution that is there, keeps its original run, and creates nothing.
+
+    A history the service cannot produce is the other half of the same rule. It is expired
+    authority rather than evidence that a child was never created, so it licenses no replacement
+    under an identity a fork already used.
+    """
+    blobs = tmp_path / "blobs"
+    turnover_at(10_000)
+    _LOST_REPLIES.clear()
+    _LOST_REPLIES.add(1)
+    _SILENT_STARTS.clear()
+    contract = contract_of(world.env)
+    composed = fork_capable(start_for(world, contract, blobs))
+    parent = "stream/fork-closed-child/1"
+    async with stream_worker(
+        env.client, activities=[*activities_of(world), _a_lost_reply]
+    ):
+        caller = await worked(env, composed, blobs, parent, filing_of(world.env))
+        request = await a_fork_request(env.client, caller, composed, tmp_path)
+        with pytest.raises(Exception):
+            await fork_stream(env.client, request)
+
+        # The child was created and the answer was lost, so the record says attempted and
+        # unconfirmed while an execution stands under that identity.
+        standing = await fork_status(env.client, request)
+        assert standing.record is not None
+        [first, second] = standing.record.child_records
+        assert first.existence == EXISTENCE_UNCONFIRMED and first.child_run_id is None
+        assert second.existence == NEVER_ATTEMPTED
+        described = await env.client.get_workflow_handle(first.child_workflow_id).describe()
+        original = described.raw_info.first_run_id or described.run_id
+
+        # It stops without ever having served, which is what a failed activation leaves behind.
+        await env.client.get_workflow_handle(first.child_workflow_id).terminate(
+            "this child stopped before it served anything"
+        )
+        _LOST_REPLIES.clear()
+
+        # The same fork under a fresh identifier adopts it rather than creating a second, and the
+        # run it names is the run that was already there.
+        receipt = await fork_stream(env.client, request, attempt=2)
+        assert receipt.child_receipts[0].child_run_id == original
+        assert receipt.child_receipts[1].child_run_id
+        after = await env.client.get_workflow_handle(
+            receipt.child_receipts[0].child_workflow_id
+        ).describe()
+        assert after.close_time is not None
+        assert (after.raw_info.first_run_id or after.run_id) == original
+
+        # And the start that execution was created with is the one this fork recorded for it.
+        start = await child_start(env.client, child=receipt.child_receipts[0])
+        assert complete_start_digest(start) == receipt.child_receipts[0].complete_start_digest
+
+        # A history that cannot be produced at all is expired authority, and the identity stands.
+        with pytest.raises(Exception) as raised:
+            await child_start(
+                env.client,
+                child=replace(receipt.child_receipts[1], child_run_id=original),
+            )
+        assert fork_refusal(raised.value) == FORK_EXPIRED_AUTHORITY
+        assert not fork_can_be_retried(raised.value)
+        answer = await fork_status(env.client, request)
+        assert answer.record is not None
+        assert [row.child_workflow_id for row in answer.record.child_records] == [
+            child.child_workflow_id for child in receipt.child_receipts
+        ]
+
+
+async def test_a_latched_generation_refuses_a_fork_and_its_successor_takes_the_same_one(
+    env: Any, world: ServedEpisode, tmp_path: Path, turnover_at: Any
+) -> None:
+    """Precedence between a fork and a turnover, driven where the two actually meet.
+
+    A generation that has latched for a turnover refuses a fork as retryable until its successor
+    exists, and the controller then forks the successor. The latch is reached while the fork's one
+    await is in flight, which is the only window a fork has in which the stream can still move, and
+    the turnover cannot happen until that handler finishes: the boundary waits for every accepted
+    handler, so what the fork meets on the way back is the latch itself.
+
+    The resubmission is the same logical fork rather than a second one. The frozen checkpoint
+    survives a boundary, because a continuation preserves the cursor and the projection digest byte
+    identical either side of it, and the canonical request digest excludes the exact run id.
+
+    A generation that has committed a barrier is the other direction of the same rule: it never
+    turns over, and the status a controller polls costs it nothing at all.
+    """
+    blobs = tmp_path / "blobs"
+    contract = contract_of(world.env)
+    turnover_at(10_000)
+    held_open()
+    composed = fork_capable(start_for(world, contract, blobs))
+    parent = "stream/fork-latched/1"
+    async with stream_worker(
+        env.client, activities=[*activities_of(world), _a_held_availability]
+    ):
+        caller = await worked(env, composed, blobs, parent, filing_of(world.env))
+        request = await a_fork_request(env.client, caller, composed, tmp_path)
+        before = (await caller.stream.stream_state()).turnovers
+        forking = asyncio.ensure_future(fork_stream(env.client, request))
+        await asyncio.wait_for(_HELD["reached"].wait(), timeout=30)
+
+        # The generation latches while the fork's own read is in flight, and it cannot cross while
+        # that handler is unfinished, so the fork meets the latch rather than a moved execution.
+        turnover_at(await accepted_updates(env.client, parent) + 1)
+        await caller.stream.confirm_state()
+        assert (await caller.stream.stream_state()).turnover_requested
+        _HELD["release"].set()
+        with pytest.raises(Exception) as raised:
+            await forking
+        assert fork_refusal(raised.value) == FORK_NOT_QUIET
+        assert fork_can_be_retried(raised.value)
+        assert "turnover" in str(raised.value.__cause__)
+        assert (await fork_status(env.client, request)).found is False
+
+        # The successor arrives, and it is what the controller forks. The same fork id over the
+        # same checkpoint and the same plans is the same logical fork.
+        for _ in range(400):
+            if (await caller.stream.stream_state()).turnovers > before:
+                break
+            await asyncio.sleep(0.02)
+        else:
+            raise AssertionError("the latched generation never crossed its boundary")
+        turnover_at(10_000)
+        answered = await caller.stream.checkpoint_evidence()
+        assert answered.found and answered.evidence is not None
+        moved = replace(
+            request,
+            parent_run_id=answered.evidence.parent_run_id,
+            parent_execution_ordinal=answered.evidence.execution_ordinal,
+        )
+        assert fork_request_digest(moved) == fork_request_digest(request)
+        assert answered.evidence.acknowledged_cursor == request.acknowledged_cursor
+        assert answered.evidence.projection_digest == request.projection_digest
+
+        # The identifier that met the latch keeps the refusal it was answered with, because the
+        # journal crosses the boundary with everything else, so progress is a fresh one.
+        with pytest.raises(Exception) as raised:
+            await fork_stream(env.client, moved)
+        assert fork_refusal(raised.value) == FORK_NOT_QUIET
+        receipt = await fork_stream(env.client, moved, attempt=2)
+        assert receipt.children == 2
+
+        # And a generation that has committed a barrier never turns over. Polling where it stands
+        # is a Query, so it charges the parent nothing and cannot spend what finishes the fork.
+        accepted = await accepted_updates(env.client, receipt.parent_workflow_id)
+        for _ in range(6):
+            assert (await fork_status(env.client, moved)).found
+        assert await accepted_updates(env.client, receipt.parent_workflow_id) == accepted
+        state = await env.client.get_workflow_handle(parent).query(StreamWorkflow.stream_state)
+        assert state.generation_state == "forked"
+        assert state.turnovers == before + 1
+        assert state.turnover_requested is False
+
+
+async def test_a_fork_bound_to_one_checkpoint_answers_another_as_a_conflict(
+    env: Any, world: ServedEpisode, tmp_path: Path, turnover_at: Any
+) -> None:
+    """Three answers a controller has to be able to tell apart, driven one after another.
+
+    A fork id is bound to the checkpoint and the ordered plans together, so the same id over
+    another checkpoint is a conflict and never a match. A parent nobody can replay is an
+    infrastructure state that is retried. A parent whose history the service does not hold is
+    expired authority, which is neither, and the run is recorded incomplete under it.
+    """
+    blobs = tmp_path / "blobs"
+    contract = contract_of(world.env)
+    turnover_at(10_000)
+    composed = fork_capable(start_for(world, contract, blobs))
+    parent = "stream/fork-bound/1"
+    async with stream_worker(env.client, activities=activities_of(world)):
+        caller = await worked(env, composed, blobs, parent, filing_of(world.env))
+        request = await a_fork_request(env.client, caller, composed, tmp_path)
+        receipt = await fork_stream(env.client, request)
+        assert receipt.children == 2
+
+        elsewhere = replace(
+            request,
+            checkpoint_manifest_reference=sha256(b"another checkpoint entirely").hexdigest(),
+        )
+        assert fork_request_digest(elsewhere) != fork_request_digest(request)
+        assert (await fork_status(env.client, elsewhere)).conflict is True
+        with pytest.raises(Exception) as raised:
+            await fork_stream(env.client, elsewhere)
+        assert fork_refusal(raised.value) == FORK_REQUEST_CONFLICT
+        assert not fork_can_be_retried(raised.value)
+
+    # A Query is answered by the code and not by the service alone, so a parent no Worker can
+    # replay is a parent that answered nothing rather than one that disagreed.
+    with pytest.raises(Exception) as raised:
+        await fork_status(env.client, request)
+    assert fork_refusal(raised.value) == FORK_UNREADABLE_PARENT
+    assert fork_can_be_retried(raised.value)
+
+    with pytest.raises(Exception) as raised:
+        await fork_status(env.client, replace(request, parent_workflow_id="stream/nobody/1"))
+    assert fork_refusal(raised.value) == FORK_EXPIRED_AUTHORITY
+    assert not fork_can_be_retried(raised.value)
+
+
+#: Every field a child and an unforked twin may differ in, and none of them is dropped from the
+#: comparison. The first five differ by construction: the configuration hash folds in the consumer
+#: claim hash and the hidden execution id, the projection hash folds in the configuration hash, the
+#: consumer and the token it holds are the child's own, and the disposition map is keyed by the
+#: branch each row is served for. The last five are given exact values beside the comparison
+#: instead: the ownership pair starts from a first claim, the verification count is ahead by that
+#: claim, the turnover count starts at zero, and the evidence behind the inherited seal is compared
+#: against the parent that produced it rather than against a twin that sealed its own.
+#:
+#: Every one of the ten is given the value the rule gives it below. An exclusion nobody states an
+#: expectation for is a field the comparison stopped looking at, which is the opposite of what a
+#: differential is for.
+_A_FORK_APART = (
+    "configuration_hash",
+    "stream_state_sha256",
+    "consumer_id",
+    "fencing_token_hash",
+    "dispositions",
+    "ownership_epoch",
+    "ownership_claims",
+    "verification_batches",
+    "turnovers",
+    "graded_evidence",
+)
+
+
+def token_hash(token: str) -> str:
+    """What a generation keeps of a fencing token, which is the hash of it and not it."""
+    return sha256(token.encode("utf-8")).hexdigest()
+
+
+def projection_of(state: Any, records: Any, *, claim_epoch: int) -> Dict[str, Any]:
+    """The mapping a generation's projection digest is taken over, rebuilt from what it publishes.
+
+    Every operand of that digest is named here, so a comparison of two generations over it is a
+    comparison that accounts for each of them rather than one that happens not to notice a
+    difference. The claim epoch is the one operand no read publishes, and it is given by the
+    caller, which knows how many consumers each generation has bound.
+    """
+    return {
+        "generation_state": state.generation_state,
+        "cursor": state.cursor,
+        "configuration_hash": state.configuration_hash,
+        "release_plan_id": state.release_plan_id,
+        "consumer_id": state.consumer_id,
+        "claim_epoch": claim_epoch,
+        "ownership_epoch": state.ownership_epoch,
+        "queue_closed": state.queue_closed,
+        "capacity_in_use": state.capacity_in_use,
+        "pending_message_id": state.pending_message_id,
+        "attempts": state.attempts,
+        "final_failures": state.final_failures,
+        "deadline_expired": sorted(state.deadline_expired),
+        "obligations": state.obligations,
+        "presented": [row.message_id for row in records.presentations],
+        "materializations": state.materialization_count,
+        "eligibilities": state.eligibility_count,
+        "offers": state.offer_count,
+        "seal_ordinal": max((row.seal_ordinal or 0) for row in records.attempts),
+    }
+
+
+def projection_digest_of(state: Any, records: Any, *, claim_epoch: int) -> str:
+    """The digest that mapping comes to, computed rather than read off the generation."""
+    return sha256(
+        canonical_json(projection_of(state, records, claim_epoch=claim_epoch))
+    ).hexdigest()
+
+
+def what_it_serves(state: Any) -> Dict[str, Any]:
+    """One generation's state, minus the fields the comparison gives values of their own."""
+    return {
+        row.name: getattr(state, row.name)
+        for row in dataclass_fields(state)
+        if row.name not in _A_FORK_APART
+    }
+
+
+def source_facts(row: Any) -> Dict[str, Any]:
+    """What one sealed attempt is, as opposed to what any generation later did about it."""
+    return {
+        "submission_digest": row.submission_digest,
+        "canonicalization_version": row.canonicalization_version,
+        "score": row.score,
+        "decode_state": row.decode_state,
+        "seal_ordinal": row.seal_ordinal,
+        "state": row.state,
+        "receipt_contract_id": row.receipt_contract_id,
+        "source_provenance": row.source_provenance,
+        "source_generation": row.source_generation,
+    }
+
+
+async def took_it_over(client: Client, caller: Caller, start: StreamStart, identity: str) -> None:
+    """Replace one generation's writer, which is what an ownership change is."""
+    caller.stream = await resume_stream(
+        client, workflow_id=identity, configuration_hash=configuration_hash(start)
+    )
+
+
+async def worked_the_second_task_and_gave_up(caller: Caller) -> None:
+    """Take the second task, present it, and end it without a filing, in both generations."""
+    task = await caller.pull()
+    assert task.attempt_id == SILENT
+    await caller.present(task)
+    await caller.stream.finalize(
+        FinalizeRequest(request_id=caller.next_id(), attempt_id=SILENT, reason=STEP_CAP)
+    )
+
+
+async def test_a_child_and_an_unforked_twin_differ_only_where_a_fork_must(
+    env: Any, world: ServedEpisode, tmp_path: Path, turnover_at: Any
+) -> None:
+    """The differential proof, as the three contracts it actually is.
+
+    One twin is impossible, because a child's configuration hash differs from its parent's by
+    construction and the parent never delivers the payload the child was cut to deliver. So the
+    inherited half is compared against the parent that produced it, with its original hashes, and
+    the future half is compared against a generation that did the same work and was never forked.
+
+    The parent changes owners before the cut, which is what makes the reset visible: the twin
+    carries two ownership claims and the child carries one, because a child's first claim is a
+    first claim. The verification count is ahead by exactly that claim. The second task fails in
+    both, so the comparison covers an ending as well as a delivery.
+    """
+    blobs = tmp_path / "blobs"
+    contract = contract_of(world.env)
+    turnover_at(10_000)
+    composed = fork_capable(start_for(world, contract, blobs, silent=True))
+    # The twin declares no fork and seals under an identity of its own, because two generations
+    # sharing a hidden execution id would mint one seal id for one attempt in both.
+    twin_start = replace(composed, forkable_slots=[], hidden_execution_id="execution-of-the-twin")
+    route = WorldRoute()
+    parent = "stream/differential/1"
+    twin = "stream/differential-twin/1"
+    route.record(parent, ATTEMPT, world, 1)
+    route.record(twin, ATTEMPT, world, 1)
+    async with stream_worker(env.client, activities=a_routed_worker(world, route)):
+        # The parent works the first task and changes owners on the way, which is the state a
+        # child's own first claim has to be told apart from.
+        caller = await opened(env, composed, blobs, parent)
+        await took_it_over(env.client, caller, composed, parent)
+        await caller.present(await caller.pull())
+        await caller.present(await caller.seal(filing_of(world.env)))
+        before = await env.client.get_workflow_handle(parent).query(
+            StreamWorkflow.generation_records
+        )
+        request = await a_fork_request(env.client, caller, composed, tmp_path)
+        receipt = await fork_stream(env.client, request)
+        start = await started_with(env.client, receipt.child_receipts[0].child_workflow_id)
+        identity = receipt.child_receipts[0].child_workflow_id
+
+        # The child delivers the cell it was cut for and then works and loses the second task.
+        stream, _ready = await a_ready_child(env.client, start, identity, blobs)
+        child = await a_child_caller(stream, start)
+        await child.present(await child.pull())
+        await worked_the_second_task_and_gave_up(child)
+
+        # The twin does all of it in one generation, with the same owner change and the same
+        # ending, and is never forked.
+        other = await opened(env, twin_start, blobs, twin)
+        await took_it_over(env.client, other, twin_start, twin)
+        await other.present(await other.pull())
+        await other.present(await other.seal(filing_of(world.env)))
+        await other.present(await other.pull())
+        await worked_the_second_task_and_gave_up(other)
+
+        # The first contract: what the child inherited is what the parent produced, exactly.
+        after = await child_records(env.client, identity)
+        inherited = {row.message_id: row for row in before.presentations}
+        assert inherited
+        held = {row.message_id: row for row in after.presentations}
+        for message_id, row in inherited.items():
+            assert held[message_id] == row
+        [in_parent] = [one for one in before.attempts if one.attempt_id == ATTEMPT]
+        [in_child] = [one for one in after.attempts if one.attempt_id == ATTEMPT]
+        assert source_facts(in_child) == source_facts(in_parent)
+        assert in_child.source_generation == parent
+
+        # The second contract: what the child did afterwards is what an unforked generation did,
+        # field by field, with the counters a fork moves given the values the rule gives them.
+        standing = await stream.stream_state()
+        unforked = await other.stream.stream_state()
+        assert what_it_serves(standing) == what_it_serves(unforked)
+        assert standing.ownership_epoch == 1 and standing.ownership_claims == 1
+        assert unforked.ownership_epoch == 2 and unforked.ownership_claims == 2
+        assert standing.verification_batches == unforked.verification_batches + 1
+        assert standing.turnovers == 0 and unforked.turnovers == 0
+        assert standing.configuration_hash != unforked.configuration_hash
+
+        # The disposition map is keyed by the branch each row is served for, so a child's is its
+        # own branch's rows and a twin's is the branch its parent served. Neither is a summary:
+        # each one is the map its own start declares, and that is what is compared against.
+        assert standing.dispositions == {
+            disposition_key(row): describe_disposition(row) for row in start.dispositions
+        }
+        assert unforked.dispositions == {
+            disposition_key(row): describe_disposition(row)
+            for row in twin_start.dispositions
+        }
+        assert set(standing.dispositions) != set(unforked.dispositions)
+        assert {row.branch_slot for row in start.dispositions} == {FIRST_SLOT}
+        assert {row.branch_slot for row in twin_start.dispositions} == {SINGLETON_SLOT}
+
+        # The consumer and the token are the ones each generation's own first claim installed.
+        assert standing.consumer_id == f"harness-{start.served_slot}"
+        assert unforked.consumer_id == "harness-1"
+        assert standing.consumer_id != unforked.consumer_id
+        assert standing.fencing_token_hash == token_hash(stream.writer.fencing_token)
+        assert unforked.fencing_token_hash == token_hash(other.stream.writer.fencing_token)
+        assert standing.fencing_token_hash != unforked.fencing_token_hash
+
+        # And the projection hash, which is the digest of one declared mapping and of nothing
+        # else. Both digests are computed from that whole mapping rather than compared with each
+        # other, because an inequality between two of them would stand whatever the digest
+        # actually covered. Three operands differ here and each of them is the child's own: the
+        # configuration it was built with, the consumer its own claim installed and the epoch that
+        # claim installed it at.
+        twin_records = await env.client.get_workflow_handle(twin).query(
+            StreamWorkflow.generation_records
+        )
+        mine = projection_of(standing, after, claim_epoch=1)
+        theirs = projection_of(unforked, twin_records, claim_epoch=1)
+        assert standing.stream_state_sha256 == projection_digest_of(
+            standing, after, claim_epoch=1
+        )
+        assert unforked.stream_state_sha256 == projection_digest_of(
+            unforked, twin_records, claim_epoch=1
+        )
+        assert {name for name in mine if mine[name] != theirs[name]} == {
+            "configuration_hash",
+            "consumer_id",
+            "ownership_epoch",
+        }
+        assert (mine["consumer_id"], mine["ownership_epoch"]) == (
+            f"harness-{start.served_slot}",
+            1,
+        )
+        assert (theirs["consumer_id"], theirs["ownership_epoch"]) == ("harness-1", 2)
+        assert standing.stream_state_sha256 != unforked.stream_state_sha256
+        assert standing.stream_state_sha256 == (await stream.stream_state()).stream_state_sha256
+        assert standing.graded_evidence[ATTEMPT] == (
+            await env.client.get_workflow_handle(parent).query(StreamWorkflow.stream_state)
+        ).graded_evidence[ATTEMPT]
+
+        # And the rows either generation reports about that second task are the same rows, down
+        # to the ending it failed with and the identifiers it was served under.
+        theirs = await env.client.get_workflow_handle(twin).query(
+            StreamWorkflow.generation_records
+        )
+        [failed_in_child] = [one for one in after.attempts if one.attempt_id == SILENT]
+        [failed_in_twin] = [one for one in theirs.attempts if one.attempt_id == SILENT]
+        assert replace(failed_in_child, source_generation=None) == replace(
+            failed_in_twin, source_generation=None
+        )
+        assert failed_in_child.source_generation == identity
+        assert failed_in_twin.source_generation == twin
+        assert [
+            (row.order, row.kind, row.message_id, row.visible_bytes_sha256)
+            for row in after.presentations
+        ] == [
+            (row.order, row.kind, row.message_id, row.visible_bytes_sha256)
+            for row in theirs.presentations
+        ]
+
+
+async def test_the_request_tables_are_a_generations_own_and_a_child_judges_a_replay_fresh(
+    env: Any, world: ServedEpisode, tmp_path: Path, turnover_at: Any
+) -> None:
+    """The third contract: the difference in request scope, which is intentional and complete.
+
+    An identifier the parent answered is owed to the parent's caller, and a child answering it
+    would hand a fenced transport bytes a different generation produced. So the child's carrier
+    drops the three request binding tables and the outcome journal, and a request the parent
+    answered from its own table is judged fresh in a child against the state the child is actually
+    in.
+
+    A child's own identifiers are the other half of it. They are kept by the child, and they keep
+    the exact outcome they were answered with across an ownership change and across a boundary,
+    because that is what the tables the child does build are for.
+    """
+    blobs = tmp_path / "blobs"
+    contract = contract_of(world.env)
+    turnover_at(10_000)
+    composed = fork_capable(start_for(world, contract, blobs))
+    parent = "stream/request-scope/1"
+    async with stream_worker(env.client, activities=activities_of(world)):
+        caller = await opened(env, composed, blobs, parent)
+        await caller.present(await caller.pull())
+        sealing = SealRequest(
+            metadata=TerminalMetadata(
+                request_id=caller.next_id(),
+                last_presented_cursor=caller.cursor,
+                attempt_id=ATTEMPT,
+            ),
+            public_tool_name=TERMINAL,
+            native_terminal_name=TERMINAL,
+            native_arguments={"filing": filing_of(world.env)},
+        )
+        acknowledged = await caller.stream.seal(sealing)
+        await caller.present(acknowledged)
+
+        # The parent answers its own identifier with what it answered before, which is what makes
+        # it owed to the parent's caller rather than to whoever asks next.
+        assert await caller.stream.seal(sealing) == acknowledged
+
+        request = await a_fork_request(env.client, caller, composed, tmp_path)
+        receipt = await fork_stream(env.client, request)
+        identity = receipt.child_receipts[0].child_workflow_id
+        start = await started_with(env.client, identity)
+        stream, _ready = await a_ready_child(env.client, start, identity, blobs)
+        child = await a_child_caller(stream, start)
+
+        # The same request in the child is judged against the state the child is in rather than
+        # answered from a table it does not have.
+        with pytest.raises(Exception) as raised:
+            await stream.seal(sealing)
+        assert protocol_error_code(raised.value) is not None
+        assert protocol_error_code(raised.value) != "invalid_message"
+
+        # The child's own identifier is the child's, and it keeps its exact outcome under a new
+        # owner and on the far side of a boundary. Each reading is taken under a fresh owner,
+        # because an owner asking again under its own epoch is answered by the service out of its
+        # record of that Update rather than by the generation holding the request.
+        pulling = PullRequest(request_id=child.next_id(), last_presented_cursor=child.cursor)
+        offered = await stream.pull(pulling)
+        assert offered.kind == "payload"
+        await took_it_over(env.client, child, start, identity)
+        assert await child.stream.pull(pulling) == offered
+
+        await child.present(offered)
+        await took_it_over(env.client, child, start, identity)
+        with pytest.raises(Exception) as raised:
+            await child.stream.pull(pulling)
+        assert protocol_error_code(raised.value) == "already_presented"
+
+        await cross_a_boundary(child, turnover_at, identity, env.client)
+        await took_it_over(env.client, child, start, identity)
+        with pytest.raises(Exception) as raised:
+            await child.stream.pull(pulling)
+        assert protocol_error_code(raised.value) == "already_presented"
+
+
+async def every_execution(client: Client, workflow_id: str) -> List[str]:
+    """Every execution one generation has run in, from the first, by following each close event.
+
+    A replay of the latest execution alone can pass while a predecessor's own continuation command
+    was nondeterministic, because that command is not in the successor's history at all.
+    """
+    described = await client.get_workflow_handle(workflow_id).describe()
+    run_id = described.raw_description.workflow_execution_info.first_run_id
+    chain = [run_id]
+    while True:
+        history = await client.get_workflow_handle(workflow_id, run_id=run_id).fetch_history()
+        successor = history.events[-1].workflow_execution_continued_as_new_event_attributes
+        if not successor.new_execution_run_id:
+            return chain
+        run_id = successor.new_execution_run_id
+        chain.append(run_id)
+
+
+async def crossed_where_its_trigger_puts_it(caller: Caller) -> None:
+    """Spend confirmations until this generation crosses the boundary its own trigger sets.
+
+    The trigger is left where the test set it rather than moved to meet the generation, because a
+    history recorded at one number and replayed at another reads its own continuation marker as
+    something this code did not do.
+    """
+    before = (await caller.stream.stream_state()).turnovers
+    for _ in range(60):
+        if (await caller.stream.stream_state()).turnovers > before:
+            return
+        try:
+            await caller.stream.confirm_state()
+        except Exception as error:  # noqa: BLE001 - a boundary being reached is not a failure
+            if not turnover_pending(error):
+                raise
+        await asyncio.sleep(0.05)
+    raise AssertionError("the generation never reached the boundary its trigger set")
+
+
+async def test_every_physical_execution_of_one_lineage_replays_on_its_own(
+    env: Any, world: ServedEpisode, tmp_path: Path, turnover_at: Any
+) -> None:
+    """The whole entry matrix, driven in both directions and then replayed execution by execution.
+
+    The parent crosses a boundary and is then forked, one child is claimed, prepared, served,
+    crossed, taken over and crossed again, and the other is left where a fork leaves it. Every
+    execution of every generation is then fetched by its own run identifier and replayed against
+    this build, because a replay of the latest execution can pass while a predecessor's own
+    continuation command could not be reproduced at all.
+
+    The replayer itself brings no Worker and reaches no service: it is handed a history and runs
+    the workflow against it, which is what the origin verification has to survive. The reading is
+    recorded in the child's own history as an Activity result, so replaying it performs no fresh
+    reading of the parent and reaches the answer it reached the first time. The service and the
+    Worker that produced those histories are still up around it, because the histories are fetched
+    from the one and the lineage was served by the other.
+
+    The trigger is lowered once and left there for the whole run, boundaries and replays alike,
+    because the branch that continues a generation is behind a marker and a replay reads that
+    marker against the code it is replayed by rather than against the number it was recorded at.
+    """
+    blobs = tmp_path / "blobs"
+    contract = contract_of(world.env)
+    turnover_at(6)
+    composed = fork_capable(start_for(world, contract, blobs))
+    parent = "stream/replayed/1"
+    async with stream_worker(env.client, activities=a_closing_worker(world)):
+        caller = await worked(env, composed, blobs, parent, filing_of(world.env))
+        await crossed_where_its_trigger_puts_it(caller)
+        request = await a_fork_request(env.client, caller, composed, tmp_path)
+        receipt = await fork_stream(env.client, request)
+        starts = [
+            await started_with(env.client, child.child_workflow_id)
+            for child in receipt.child_receipts
+        ]
+        close_the_capture()
+        first, second = receipt.child_receipts
+        stream, _ready = await a_ready_child(
+            env.client, starts[0], first.child_workflow_id, blobs
+        )
+        served = await a_child_caller(stream, starts[0])
+        await served.present(await served.pull())
+        await crossed_where_its_trigger_puts_it(served)
+        await took_it_over(env.client, served, starts[0], first.child_workflow_id)
+        await crossed_where_its_trigger_puts_it(served)
+        await a_ready_child(env.client, starts[1], second.child_workflow_id, blobs)
+
+        # The origin question and its answer are in each child's own first execution, which is
+        # what a replay reads instead of asking the parent again.
+        for child in receipt.child_receipts:
+            history = await env.client.get_workflow_handle(
+                child.child_workflow_id, run_id=child.child_run_id
+            ).fetch_history()
+            assert f"fork.{FORK}.origin.1" in [
+                event.activity_task_scheduled_event_attributes.activity_id
+                for event in history.events
+                if event.event_type == EventType.EVENT_TYPE_ACTIVITY_TASK_SCHEDULED
+            ]
+
+        lineage = [parent, first.child_workflow_id, second.child_workflow_id]
+        chains = {one: await every_execution(env.client, one) for one in lineage}
+        assert len(chains[parent]) >= 2
+        assert len(chains[first.child_workflow_id]) >= 3
+        assert len(chains[second.child_workflow_id]) == 1
+        for identity, chain in chains.items():
+            for run_id in chain:
+                handle = env.client.get_workflow_handle(identity, run_id=run_id)
+                await stream_replayer().replay_workflow(await handle.fetch_history())
+
+
+async def test_a_pull_racing_one_fork_leaves_one_transition_and_no_partial_fork(
+    env: Any, world: ServedEpisode, tmp_path: Path, turnover_at: Any
+) -> None:
+    """The next pull against the fork, in both orders, with one transition winning either way.
+
+    The barrier does not stand while the fork's one await is running, so that window is the only
+    one in which the stream can still move, and a pull that takes it wins: the final recheck sees
+    a message pending and refuses, installing no barrier and creating no child. Once the barrier is
+    committed the order is the other way round, and what the pull meets is a parent that admits
+    nothing and has served nothing since the acknowledgement.
+    """
+    blobs = tmp_path / "blobs"
+    contract = contract_of(world.env)
+    turnover_at(10_000)
+    composed = fork_capable(start_for(world, contract, blobs))
+    held_open()
+    async with stream_worker(
+        env.client, activities=[*activities_of(world), _a_held_availability]
+    ):
+        # The pull wins: it commits inside the window the fork's own read leaves open.
+        first = "stream/fork-raced-pull/1"
+        caller = await worked(env, composed, blobs, first, filing_of(world.env))
+        request = await a_fork_request(env.client, caller, composed, tmp_path)
+        forking = asyncio.ensure_future(fork_stream(env.client, request))
+        await asyncio.wait_for(_HELD["reached"].wait(), timeout=30)
+        payload = await caller.pull()
+        _HELD["release"].set()
+        with pytest.raises(Exception) as raised:
+            await forking
+        assert fork_refusal(raised.value) == FORK_NOT_QUIET
+        assert (await fork_status(env.client, request)).found is False
+        for ordinal in (1, 2):
+            with pytest.raises(RPCError):
+                await env.client.get_workflow_handle(
+                    child_workflow_id(
+                        identity_namespace=env.client.namespace,
+                        parent_workflow_id=first,
+                        fork_id=FORK,
+                        child_ordinal=ordinal,
+                    )
+                ).describe()
+        await caller.present(payload)
+
+    async with stream_worker(env.client, activities=activities_of(world)):
+        # The barrier wins: what the pull meets is a parent that has stopped, and the obligation
+        # this parent never offered is the one both children are cut to deliver.
+        second = "stream/fork-raced-barrier/1"
+        other = await worked(env, composed, blobs, second, filing_of(world.env))
+        before = await other.stream.stream_state()
+        request = await a_fork_request(env.client, other, composed, tmp_path)
+        receipt = await fork_stream(env.client, request)
+        with pytest.raises(Exception) as raised:
+            await other.pull()
+        assert protocol_error_code(raised.value) is None
+        assert fork_barrier_stands(raised.value) or isinstance(raised.value, RPCError)
+
+        answer = await fork_status(env.client, request)
+        assert answer.found and answer.record is not None
+        assert answer.record.status == FORK_COMPLETE
+        assert [row.existence for row in answer.record.child_records] == [
+            CONFIRMED_EXISTING,
+            CONFIRMED_EXISTING,
+        ]
+        after = await env.client.get_workflow_handle(second).query(StreamWorkflow.stream_state)
+        assert after.offer_count == before.offer_count
+        assert after.payload_delivery_count == before.payload_delivery_count
+        assert after.obligations == before.obligations
+        for child in receipt.child_receipts:
+            start = await started_with(env.client, child.child_workflow_id)
+            [owed] = [
+                one for one in carried(start).obligations if one.attempt_id == ATTEMPT
+            ]
+            assert owed.pending_preparation and owed.candidate is None
+
+
+# The shipping case, on the dev service: one run that crosses a boundary, is frozen, forks, serves
+# two cells and two filings, crosses another boundary, and reads back as one lineage from a copy.
+
+
+DEV_SERVER_ONLY = pytest.mark.skipif(
+    not os.environ.get("SHOGYM_DEV_SERVER_TESTS"),
+    reason="the dev service is slow and runs in real time; set SHOGYM_DEV_SERVER_TESTS to run it",
+)
+
+
+class AService:
+    """The one service a run has, in the shape the helpers in this file are handed."""
+
+    def __init__(self, client: Client) -> None:
+        self.client = client
+
+
+def sealed_by(read: Any) -> Dict[str, set]:
+    """Which attempts each generation of a lineage actually filed, by whose work each row is."""
+    filed: Dict[str, set] = {}
+    for row in read.records:
+        if row.submission_digest is None:
+            continue
+        filed.setdefault(row.source_generation or "", set()).add(row.attempt_id)
+    return filed
+
+
+@DEV_SERVER_ONLY
+@pytest.mark.dev_server
+@pytest.mark.network
+async def test_a_run_crosses_a_boundary_forks_serves_two_cells_and_reads_back_as_one_lineage(
+    world: ServedEpisode,
+    frozen_bundle: Path,
+    tmp_path: Path,
+    turnover_at: Any,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The whole transition, composed, on the service a run is actually served by.
+
+    A parent is driven past a continuation boundary with a lowered trigger, works the first task
+    to its acknowledgement, and is frozen there: the harness persists what it decoded and commits
+    the checkpoint that binds the two witnesses, and the controller reads both and forks. Each
+    child is given its objects, its directory and its transport, builds the body it was selected
+    for, is restored, compared and bound, and is let go.
+
+    What the two children then do is ordinary. Each pulls the cell its own disposition names,
+    against the one message identifier they both inherited, and each works the same second task in
+    a world of its own and files it. One of them crosses a boundary of its own on the way.
+
+    The run is then copied somewhere else and read back from the copy, which is the whole of what
+    relocation promises: the lineage names what cut each generation, the first task is one piece of
+    work held by three generations, and the second is two pieces of work held by one each.
+    """
+    monkeypatch.delenv(TEMPORAL_ADDRESS_ENV, raising=False)
+    root = tmp_path / "run"
+    blobs = root / "blobs"
+    contract = contract_of(world.env)
+    turnover_at(10_000)
+    composed = fork_capable(start_for(world, contract, blobs, silent=True))
+    parent = "stream/the-whole-run/1"
+    create_run_directory(
+        root,
+        workflow_id=parent,
+        task_queue=STREAM_TASK_QUEUE,
+        configuration_hash=configuration_hash(composed),
+    )
+    route = WorldRoute()
+    route.record(parent, ATTEMPT, world, 1)
+    version, activities, digest = world.env.protocol_v2_terminal(route)
+    environment = EnvironmentTerminal(version, list(activities), digest, route, RECEIPTS_GRADE)
+    operations = ForkOperations.under(root)
+    filing = filing_of(world.env)
+    worlds: List[ServedEpisode] = []
+    gateways: List[Any] = []
+    try:
+        async with durable_client(run_directory=root) as client:
+            service = AService(client)
+            async with stream_worker(client, activities=list(activities)):
+                # A parent driven past a boundary first, and only then worked to its
+                # acknowledgement and frozen. The order is the shipping condition rather than a
+                # detail of it: a fork over a prefix that never crossed one would prove nothing
+                # about a carrier that has already been rebuilt once.
+                caller = await opened(service, composed, blobs, parent)
+                await caller.present(await caller.pull())
+                await cross_a_boundary(caller, turnover_at, parent, client)
+                assert (await caller.stream.stream_state()).turnovers == 1
+                await caller.present(await caller.seal(filing))
+                harness = Harness(tmp_path / "containers", caller)
+
+                retrieval = await retrieve_checkpoint(caller.stream, harness, operations)
+                request = await fork_request_for(
+                    caller.stream,
+                    retrieval=retrieval,
+                    fork_id=FORK,
+                    plans=[
+                        plan_for(composed, FIRST_SLOT, GRADED_CELL, root / "child-1"),
+                        plan_for(composed, SECOND_SLOT, PLACEBO_CELL, root / "child-2"),
+                    ],
+                )
+                receipt = await fork_stream(client, request)
+                children = [child.child_workflow_id for child in receipt.child_receipts]
+                assert (
+                    receipt.child_receipts[0].next_assignment_id
+                    == receipt.child_receipts[1].next_assignment_id
+                    == assignment_id_for(SILENT)
+                )
+
+                # Each child: its objects, its directory, its transport, its body, its container.
+                turnover_at(8)
+                for index, child in enumerate(receipt.child_receipts):
+                    own = await a_world_at(frozen_bundle, tmp_path, 0, f"world-{index}")
+                    worlds.append(own)
+
+                    async def open_one(attempt_id: str, at: int = index) -> ServedEpisode:
+                        """A world of its own for the task this child works next."""
+                        made = await a_world_at(
+                            frozen_bundle, tmp_path, 0, f"world-{at}-{attempt_id}"
+                        )
+                        worlds.append(made)
+                        return made
+
+                    gateway, attachment = await attach_child(
+                        client,
+                        own,
+                        operations,
+                        fork_id=FORK,
+                        child=child,
+                        source=FilesystemBlobStore(blobs),
+                        database_root="..",
+                        consumer_id=f"the-transport-of-{child.branch_slot}",
+                        environment=environment,
+                        open_episode=open_one,
+                    )
+                    gateways.append(gateway)
+                    harness.transports[child.child_workflow_id] = gateway
+                    prepared = await prepare_child(gateway, operations, attachment=attachment)
+                    assert prepared.ready is not None
+                    assert prepared.ready.selected_cell == child.target_cell
+                    comparison = await compare_child(
+                        harness, operations, retrieval=retrieval, preparation=prepared
+                    )
+                    assert comparison.equal
+                    await bind_child(
+                        harness, operations, attachment=attachment, comparison=comparison
+                    )
+
+                released = await release_children(harness, operations, receipt=receipt)
+                assert [one.resumed for one in released] == [True, True]
+
+                # Both children delivered their own cell against the one inherited identifier,
+                # and what each of them delivered is the exact reference its own plan selected
+                # rather than a body that merely differs from its sibling's.
+                bodies = [harness.pulled[one]["body"] for one in children]
+                assert len({one.first_message_id for one in released}) == 1
+                assert bodies[0] != bodies[1]
+                assert len(bodies[0].encode("ascii")) == len(bodies[1].encode("ascii"))
+                assert [
+                    sha256(body.encode("ascii")).hexdigest() for body in bodies
+                ] == [child.selected_body_reference for child in receipt.child_receipts]
+
+                # And both work the same second task, each in a world of its own, and file it.
+                for identity, gateway in zip(children, gateways):
+                    task = json.loads(await gateway.pull({}))
+                    assert task["kind"] == "task"
+                    assert task["attempt_id"] == SILENT
+                    answered = json.loads(
+                        await gateway.terminal(
+                            {"attempt_id": SILENT, "arguments": {"filing": filing}}
+                        )
+                    )
+                    assert answered["kind"] == "seal_ack"
+                assert len({one.session_id for one in worlds}) == 2
+
+                crossings = [
+                    (await gateway.stream_state()).turnovers for gateway in gateways
+                ]
+                assert max(crossings) >= 1, "no child crossed a boundary of its own"
+                for gateway in gateways:
+                    await gateway.aclose()
+                gateways.clear()
+    finally:
+        for one in worlds:
+            await one.close()
+        for gateway in gateways:
+            await gateway.aclose()
+
+    # The run is copied somewhere else, and every generation of it reads back from the copy.
+    elsewhere = tmp_path / "archive" / "run"
+    shutil.copytree(root, elsewhere)
+    reads = [
+        await read_records(elsewhere),
+        await read_records(elsewhere / "child-1"),
+        await read_records(elsewhere / "child-2"),
+    ]
+    assert [read.workflow_id for read in reads] == [parent, *children]
+    assert reads[0].origin is None
+    for read, child in zip(reads[1:], receipt.child_receipts):
+        assert read.origin is not None
+        assert read.origin.parent_workflow_id == parent
+        assert read.origin.fork_id == FORK
+        assert read.origin.branch_slot == child.branch_slot
+        assert read.origin.acknowledged_cursor == request.acknowledged_cursor
+        assert [row.attempt_id for row in inherited_work(read)] == [ATTEMPT]
+        assert sorted(row.attempt_id for row in local_work(read)) == [SILENT]
+        written = (read.root / MANIFEST_FILE).read_text(encoding="utf-8")
+        assert str(root) not in written
+
+    # The first task is one piece of work three generations hold, and the second is two pieces of
+    # work held by one generation each. Each child's delivery of the first is its own.
+    filed: Dict[str, set] = {}
+    for read in reads:
+        for whose, attempts in sealed_by(read).items():
+            filed.setdefault(whose, set()).update(attempts)
+    assert filed == {parent: {ATTEMPT}, children[0]: {SILENT}, children[1]: {SILENT}}
+
+    delivered = []
+    for read in reads:
+        [inherited] = [row for row in read.records if row.attempt_id == ATTEMPT]
+        delivered.append((inherited.payload_delivered, inherited.payload_visible_sha256))
+    assert delivered[0][0] is False
+    assert delivered[1][0] is True and delivered[2][0] is True
+    assert delivered[1][1] != delivered[2][1]
+
+
+async def test_two_retries_of_one_fork_in_flight_at_once_leave_one_answering(
+    env: Any, world: ServedEpisode, tmp_path: Path, turnover_at: Any
+) -> None:
+    """The same logical fork under two identifiers at once, which is what a controller can do.
+
+    A retry is a fresh Update identifier carrying the same fork id, the same checkpoint and the
+    same plans. Sent while the first is still in flight it meets the first in the ledger of
+    accepted handlers and is refused as retryable, and the one that was already running answers
+    with the complete receipt. What stands afterwards is one fork and one pair of children.
+    """
+    blobs = tmp_path / "blobs"
+    contract = contract_of(world.env)
+    turnover_at(10_000)
+    held_open()
+    composed = fork_capable(start_for(world, contract, blobs))
+    parent = "stream/fork-twice-at-once/1"
+    async with stream_worker(
+        env.client, activities=[*activities_of(world), _a_held_availability]
+    ):
+        caller = await worked(env, composed, blobs, parent, filing_of(world.env))
+        request = await a_fork_request(env.client, caller, composed, tmp_path)
+        first = asyncio.ensure_future(fork_stream(env.client, request))
+        await asyncio.wait_for(_HELD["reached"].wait(), timeout=30)
+
+        with pytest.raises(Exception) as raised:
+            await fork_stream(env.client, request, attempt=2)
+        assert fork_refusal(raised.value) == FORK_NOT_QUIET
+        assert fork_can_be_retried(raised.value)
+
+        _HELD["release"].set()
+        receipt = await first
+        assert receipt.fork_id == FORK
+        assert receipt.children == 2
+        answer = await fork_status(env.client, request)
+        assert answer.found and answer.record is not None
+        assert answer.record.status == FORK_COMPLETE
+        assert answer.record.children == 2
+        scheduled = await scheduled_activities(env.client, parent)
+        assert [one for one in scheduled if one.startswith("fork.")] == [
+            f"fork.{FORK}.availability.1",
+            f"fork.{FORK}.start.1",
+            f"fork.{FORK}.start.2",
+        ]
+
+
+@asynccontextmanager
+async def a_dev_service(*settings: str) -> AsyncIterator[Any]:
+    """The local dev service, with the limits one test is about configured down.
+
+    The time-skipping server accepts Updates past the cap and takes no dynamic configuration, so a
+    reserve driven against it proves nothing about the cap it is kept under. This is the service
+    that enforces one.
+    """
+    extra: List[str] = []
+    for setting in settings:
+        extra += ["--dynamic-config-value", setting]
+    try:
+        environment = await WorkflowEnvironment.start_local(
+            download_dest_dir=str(temporal_home()), dev_server_extra_args=extra
+        )
+    except Exception as error:  # noqa: BLE001 - an absent dev service is a skip, not a failure
+        pytest.skip(f"the local dev service is unavailable: {error}")
+    try:
+        yield environment
+    finally:
+        await environment.shutdown()
+
+
+@DEV_SERVER_ONLY
+@pytest.mark.dev_server
+@pytest.mark.network
+async def test_a_runs_own_service_keeps_a_history_for_as_long_as_a_fork_can_be_asked_about_it(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The retention relation, against the configuration an actual service reports.
+
+    A fork's answers stand until an absolute horizon, and answering inside that window needs the
+    history the question is about: the parent's, and each child's own original execution, which
+    the service deletes from that execution's own close rather than from the parent's. So what a
+    deployment owes is the horizon plus a margin above the service's own deletion jitter, and a
+    service configured under it would delete a child that stopped early while its parent was
+    still prepared and still answerable.
+
+    The service a run is actually served by starts under that floor, so this is a configuration
+    rather than a declaration: the run's own service is read for what it keeps before anything is
+    served on it, and what it reports is the floor rather than the number it started with.
+    """
+    monkeypatch.delenv(TEMPORAL_ADDRESS_ENV, raising=False)
+    root = tmp_path / "run"
+    root.mkdir()
+    try:
+        async with durable_client(run_directory=root) as client:
+            kept = await configured_retention_ms(client)
+    except Exception as error:  # noqa: BLE001 - an absent dev service is a skip, not a failure
+        pytest.skip(f"the local dev service is unavailable: {error}")
+    assert kept >= FORK_RETENTION_FLOOR_MS, (
+        "a service that deletes a history sooner than the floor cannot answer a question the "
+        "window still admits"
+    )
+    assert FORK_RETENTION_FLOOR_MS == FORK_AUTHORITY_HORIZON_MS + FORK_RETENTION_MARGIN_MS
+
+
+async def deleted_execution(client: Client, workflow_id: str, run_id: str) -> None:
+    """Ask the service to delete one exact execution, and wait until it cannot be read.
+
+    The deletion is asynchronous, so what is waited for is the history being gone rather than the
+    call returning: what this is about is a history the service can no longer produce, and the
+    call alone is not that yet.
+    """
+    await client.service_client.workflow_service.delete_workflow_execution(
+        DeleteWorkflowExecutionRequest(
+            namespace=client.namespace,
+            workflow_execution=WorkflowExecution(workflow_id=workflow_id, run_id=run_id),
+        )
+    )
+    for _ in range(600):
+        try:
+            await client.get_workflow_handle(workflow_id, run_id=run_id).fetch_history()
+        except RPCError as error:
+            if error.status is RPCStatusCode.NOT_FOUND:
+                return
+            raise
+        await asyncio.sleep(0.1)
+    raise AssertionError(f"the service never stopped producing the history of {run_id}")
+
+
+@DEV_SERVER_ONLY
+@pytest.mark.dev_server
+@pytest.mark.network
+async def test_a_deleted_child_execution_is_expired_authority_and_frees_no_identity(
+    world: ServedEpisode, tmp_path: Path, turnover_at: Any
+) -> None:
+    """The deletion the retention relation is about, performed rather than waited out.
+
+    A child's own original execution is deleted from that execution's close rather than from its
+    parent's, which is what a deployment owes a retention above the whole window for. What happens
+    when one is gone is the rule this checks, and it checks it on the execution the fork actually
+    recorded: the service is asked to delete that exact run, the read of what the child was created
+    with comes back as expired authority rather than as a child that was never created, and the
+    identity the record holds still stands afterwards.
+
+    It is a service test because the deletion is the service's own operation, and the local dev
+    service is the one that has it.
+    """
+    blobs = tmp_path / "blobs"
+    turnover_at(10_000)
+    _LOST_REPLIES.clear()
+    _SILENT_STARTS.clear()
+    parent = "stream/fork-deleted-child/1"
+    async with a_dev_service() as env:
+        composed = fork_capable(start_for(world, contract_of(world.env), blobs))
+        async with stream_worker(env.client, activities=activities_of(world)):
+            caller = await worked(env, composed, blobs, parent, filing_of(world.env))
+            request = await a_fork_request(env.client, caller, composed, tmp_path)
+            receipt = await fork_stream(env.client, request)
+            child = receipt.child_receipts[0]
+            assert child.child_run_id
+
+            # The execution the record names is the one that goes, under that identifier and that
+            # run and no other.
+            await env.client.get_workflow_handle(
+                child.child_workflow_id, run_id=child.child_run_id
+            ).terminate("this child stopped before its history was deleted")
+            await deleted_execution(env.client, child.child_workflow_id, child.child_run_id)
+
+            with pytest.raises(Exception) as raised:
+                await child_start(env.client, child=child)
+            assert fork_refusal(raised.value) == FORK_EXPIRED_AUTHORITY
+            assert not fork_can_be_retried(raised.value)
+
+            # The record still names that child and that run, so nothing about the identity was
+            # freed: a history the service cannot produce bounds what can be read and grants no
+            # permission to create anything under the name it belonged to.
+            answer = await fork_status(env.client, request)
+            assert answer.record is not None
+            assert [row.child_workflow_id for row in answer.record.child_records] == [
+                one.child_workflow_id for one in receipt.child_receipts
+            ]
+            [row] = [
+                one
+                for one in answer.record.child_records
+                if one.child_workflow_id == child.child_workflow_id
+            ]
+            assert row.child_run_id == child.child_run_id
+            assert row.existence == CONFIRMED_EXISTING
+
+            # And the sibling, whose history was not touched, is read exactly as it was.
+            other = receipt.child_receipts[1]
+            assert complete_start_digest(
+                await child_start(env.client, child=other)
+            ) == other.complete_start_digest
+
+
+@DEV_SERVER_ONLY
+@pytest.mark.dev_server
+@pytest.mark.network
+async def test_a_parked_parents_whole_reserve_is_spendable_under_the_cap_it_fits_inside(
+    world: ServedEpisode, tmp_path: Path, turnover_at: Any
+) -> None:
+    """The reserve at the number this build declares, against a service that enforces a cap.
+
+    What the reserve is for is that the one call which can finish a fork stays admissible while a
+    parked parent is asked again, and what bounds it is the service's own limit on accepted
+    Updates. So the cap is configured down to a number the whole reserve fits under, the fork is
+    retried until the parent has spent it, and the ending is the parent's own decision rather than
+    the service refusing a call the parent would have taken.
+
+    The suggestion the service publishes is pinned to the cap, so the only thing that can act early
+    is this package's own counting.
+    """
+    cap = 40
+    blobs = tmp_path / "blobs"
+    turnover_at(10_000)
+    _LOST_REPLIES.clear()
+    _LOST_REPLIES.add(2)
+    _SILENT_STARTS.clear()
+    parent = "stream/fork-reserve/1"
+    async with a_dev_service(
+        f"history.maxTotalUpdates={cap}",
+        "history.maxTotalUpdates.suggestContinueAsNewThreshold=1.0",
+    ) as env:
+        composed = fork_capable(start_for(world, contract_of(world.env), blobs))
+        async with stream_worker(
+            env.client, activities=[*activities_of(world), _a_lost_reply]
+        ):
+            caller = await worked(env, composed, blobs, parent, filing_of(world.env))
+            worked_for = await accepted_updates(env.client, parent)
+            request = await a_fork_request(env.client, caller, composed, tmp_path)
+            refused: List[Exception] = []
+            for attempt in range(1, FORK_RESERVE + 2):
+                with pytest.raises(Exception) as raised:
+                    await fork_stream(env.client, request, attempt=attempt)
+                refused.append(raised.value)
+                assert (await fork_status(env.client, request)).found
+
+            # Every one of them reached a handler and failed on the start, and none of them was
+            # the service refusing the call.
+            assert [fork_refusal(one) for one in refused] == [None] * (FORK_RESERVE + 1)
+            assert all("updates" not in str(one).lower() for one in refused)
+            await closed_at_ms(env.client, parent)
+
+            answer = await fork_status(env.client, request)
+            assert answer.record is not None
+            assert answer.record.status == FORK_ABANDONED
+            assert answer.record.abandoned_reason == SPENT_RECOVERY_RESERVE
+
+            # One more is refused by the reserve rather than by the cap, and the whole run stayed
+            # inside the number the service was configured with.
+            with pytest.raises(Exception) as raised:
+                await fork_stream(env.client, request, attempt=FORK_RESERVE + 2)
+            assert fork_refusal(raised.value) == SPENT_RECOVERY_RESERVE
+            # The fork's own call and one retry per slot of the reserve, and no more: the status
+            # polled between them is a Query and charged the parent nothing.
+            accepted = await accepted_updates(env.client, parent)
+            assert accepted == worked_for + FORK_RESERVE + 1
+            assert accepted < cap
+
+
+@DEV_SERVER_ONLY
+@pytest.mark.dev_server
+@pytest.mark.network
+async def test_a_fork_meeting_a_latch_under_a_real_cap_is_taken_by_the_successor(
+    world: ServedEpisode, tmp_path: Path, turnover_at: Any
+) -> None:
+    """Precedence between a fork and a turnover, driven where the budget they share is real.
+
+    The two allowances only ever meet under the service's own limit on accepted Updates, and the
+    time-skipping server enforces none, so this is the same race against a cap configured down
+    with the boundary trigger set under it. The generation crosses because this package counted
+    and never because the service refused, and every refusal on the way is this package's own.
+
+    The fork's one await is held open until the latch is in place, so what the fork meets coming
+    back is the latch itself. The successor is then what the controller forks, under the same
+    fork id, the same checkpoint and the same plans, and what it commits leaves the reserve the
+    barrier keeps standing under the same limit.
+    """
+    cap = 40
+    blobs = tmp_path / "blobs"
+    held_open()
+    parent = "stream/fork-latched-capped/1"
+    async with a_dev_service(
+        f"history.maxTotalUpdates={cap}",
+        "history.maxTotalUpdates.suggestContinueAsNewThreshold=1.0",
+    ) as env:
+        composed = fork_capable(start_for(world, contract_of(world.env), blobs))
+        async with stream_worker(
+            env.client, activities=[*activities_of(world), _a_held_availability]
+        ):
+            caller = await worked(env, composed, blobs, parent, filing_of(world.env))
+            request = await a_fork_request(env.client, caller, composed, tmp_path)
+            before = (await caller.stream.stream_state()).turnovers
+            forking = asyncio.ensure_future(fork_stream(env.client, request))
+            await asyncio.wait_for(_HELD["reached"].wait(), timeout=30)
+
+            # The trigger is the next Update and it is under the cap, so the latch is this
+            # package's own counting rather than the service running out of room.
+            trigger = await accepted_updates(env.client, parent) + 1
+            assert trigger < cap
+            turnover_at(trigger)
+            await caller.stream.confirm_state()
+            assert (await caller.stream.stream_state()).turnover_requested
+            _HELD["release"].set()
+            with pytest.raises(Exception) as raised:
+                await forking
+            assert fork_refusal(raised.value) == FORK_NOT_QUIET
+            assert fork_can_be_retried(raised.value)
+            assert "turnover" in str(raised.value.__cause__)
+            assert "updates" not in str(raised.value).lower()
+
+            for _ in range(600):
+                if (await caller.stream.stream_state()).turnovers > before:
+                    break
+                await asyncio.sleep(0.05)
+            else:
+                raise AssertionError("the latched generation never crossed its boundary")
+
+            # The successor takes the same logical fork: the checkpoint crossed byte identical
+            # and the canonical digest excludes the exact run id.
+            turnover_at(cap - FORK_RESERVE)
+            answered = await caller.stream.checkpoint_evidence()
+            assert answered.found and answered.evidence is not None
+            moved = replace(
+                request,
+                parent_run_id=answered.evidence.parent_run_id,
+                parent_execution_ordinal=answered.evidence.execution_ordinal,
+            )
+            assert fork_request_digest(moved) == fork_request_digest(request)
+            # The identifier that met the latch keeps the refusal it was answered with, because
+            # the journal crossed the boundary too, so progress is a fresh one.
+            with pytest.raises(Exception) as raised:
+                await fork_stream(env.client, moved)
+            assert fork_refusal(raised.value) == FORK_NOT_QUIET
+            receipt = await fork_stream(env.client, moved, attempt=2)
+            assert receipt.children == 2
+
+            # A generation that has committed a barrier never turns over, so what it has already
+            # spent plus the whole reserve is what the service has to leave it room for.
+            accepted = await accepted_updates(env.client, receipt.parent_workflow_id)
+            assert accepted + FORK_RESERVE < cap
+            state = await env.client.get_workflow_handle(parent).query(
+                StreamWorkflow.stream_state
+            )
+            assert state.generation_state == "forked"
+            assert state.turnovers == before + 1
+            assert state.turnover_requested is False

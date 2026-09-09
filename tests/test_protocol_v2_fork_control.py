@@ -22,11 +22,11 @@ from __future__ import annotations
 import json
 import shutil
 import zlib
-from dataclasses import dataclass, field, replace
+from dataclasses import dataclass, field, fields, replace
 from hashlib import sha256
 from pathlib import Path
 from types import SimpleNamespace
-from typing import Any, Callable, Dict, List, Optional, Sequence
+from typing import Any, Callable, Dict, List, Optional, Sequence, get_args
 
 import pytest
 
@@ -38,6 +38,7 @@ from temporalio.exceptions import ApplicationError  # noqa: E402
 
 from shogym.serve.protocol_v2.blobs import BlobRef, FilesystemBlobStore  # noqa: E402
 from shogym.serve.protocol_v2.errors import WireFormatError  # noqa: E402
+from shogym.serve.protocol_v2.gateway import _Idle, _Recovery  # noqa: E402
 from shogym.serve.protocol_v2.fork import (  # noqa: E402
     FORK_OPERATION_SCHEMA_VERSION,
     ChildAttached,
@@ -299,11 +300,13 @@ class AHarness:
     ) -> RestoredContainer:
         self._supported("restore a container")
         path = self.container(child_workflow_id)
-        assert not path.exists(), f"{child_workflow_id} was restored a second time"
-        shutil.copytree(self.parent, path)
-        if self.restored_as is not None:
-            self.restored_as(path)
-        self.restores.append(child_workflow_id)
+        # Keyed by the child rather than by the call, so a controller that crashed between this
+        # and its own record is answered with the copy that exists rather than given a second one.
+        if not path.exists():
+            shutil.copytree(self.parent, path)
+            if self.restored_as is not None:
+                self.restored_as(path)
+            self.restores.append(child_workflow_id)
         transcript = path / "transcript.jsonl"
         return RestoredContainer(
             container_id=path.name,
@@ -345,7 +348,11 @@ class AHarness:
         self._supported("resume a container")
         if self.crash_after is not None and len(self.resumed) >= self.crash_after:
             raise RuntimeError(f"the process resuming {child_workflow_id} went away")
-        self.resumed.append(child_workflow_id)
+        # A container that is already running is answered with the state it is running in, which
+        # is what makes the interval between the resumption and its record survivable: the effect
+        # is outside the controller, so what recovers it is an outcome that can be read back.
+        if child_workflow_id not in self.resumed:
+            self.resumed.append(child_workflow_id)
         return ResumedContainer(
             container_id=container_id, first_message_id=self.pull(child_workflow_id)
         )
@@ -1513,6 +1520,97 @@ async def test_a_controller_that_crashed_after_the_first_release_resumes_only_th
     assert all(one.resumed for one in released)
 
 
+class ALosingJournal(ForkOperations):
+    """A journal that performs one write and then loses the process that was making it.
+
+    It is the interval nothing else reaches: the adapter has already changed something outside
+    this controller and the record of it has not reached the disk. What recovers it is not a
+    smaller window, because there is no window small enough; it is the operation being one an
+    outcome can be read back from.
+    """
+
+    def record(self, key: str, result: Any) -> Any:
+        if key.startswith("release."):
+            raise RuntimeError(f"the process recording {key} went away")
+        return super().record(key, result)
+
+
+async def test_a_release_that_happened_and_was_never_recorded_is_read_back_rather_than_repeated(
+    tmp_path: Path,
+) -> None:
+    """The interval between an effect outside this process and the record of it.
+
+    A container resumed and not written down is the worst crash a release has: the agent inside it
+    is already working, and a controller that came back and simply resumed again would either
+    restore over that work or record a second resumption of it. So the operation is one an outcome
+    can be read back from, and the recovery is asking it again and being answered with the
+    resumption that already happened.
+    """
+    operations = ForkOperations.under(tmp_path)
+    harness = AHarness(tmp_path / "containers")
+    retrieval = await retrieve_checkpoint(AParent(), harness, operations)
+    bound = await a_bound_fork(harness, operations, retrieval)
+
+    with pytest.raises(RuntimeError):
+        await release_children(
+            harness,
+            ALosingJournal(operations.root),
+            receipt=a_fork_receipt(*CHILDREN),
+        )
+    assert harness.resumed == [FIRST]
+    assert operations.all_of(ChildReleased) == []
+
+    came_back = ForkOperations.under(tmp_path)
+    released = await release_children(harness, came_back, receipt=a_fork_receipt(*CHILDREN))
+
+    # One resumption per child, and the container each of them names is the one it was bound to.
+    assert harness.resumed == [FIRST, SECOND]
+    assert [one.container_id for one in released] == [one.container_id for one in bound]
+    assert all(one.resumed for one in released)
+    assert len(came_back.all_of(ChildReleased)) == 2
+
+
+async def test_a_restore_that_happened_and_was_never_recorded_is_read_back_rather_than_repeated(
+    tmp_path: Path,
+) -> None:
+    """The same interval one step earlier, where the copy exists and the record does not.
+
+    A second copy over a child that already has one would be a second mutable state for one
+    generation, which is the whole thing the copies exist to prevent, so the adapter answers with
+    the copy that exists and this side records it once.
+    """
+    operations = ForkOperations.under(tmp_path)
+    harness = AHarness(tmp_path / "containers")
+    retrieval = await retrieve_checkpoint(AParent(), harness, operations)
+    prepared = await prepare_child(
+        AChild(a_readiness(FIRST)), operations, attachment=an_attachment(FIRST)
+    )
+
+    class ALosingEquality(ForkOperations):
+        def record(self, key: str, result: Any) -> Any:
+            if key.startswith("equality."):
+                raise RuntimeError(f"the process recording {key} went away")
+            return super().record(key, result)
+
+    with pytest.raises(RuntimeError):
+        await compare_child(
+            harness,
+            ALosingEquality(operations.root),
+            retrieval=retrieval,
+            preparation=prepared,
+        )
+    assert harness.restores == [FIRST]
+    assert operations.all_of(ChildCompared) == []
+
+    came_back = ForkOperations.under(tmp_path)
+    comparison = await compare_child(
+        harness, came_back, retrieval=retrieval, preparation=prepared
+    )
+    assert harness.restores == [FIRST]
+    assert comparison.container_id == harness.container(FIRST).name
+    assert comparison.equal
+
+
 @pytest.mark.parametrize("failing", [FIRST, SECOND])
 async def test_a_child_whose_container_did_not_compare_equal_holds_the_whole_fork(
     tmp_path: Path, failing: str
@@ -1647,3 +1745,90 @@ async def test_each_child_owns_the_files_memory_buffers_and_weights_it_was_given
         assert (working / name).read_bytes() != (harness.parent / name).read_bytes()
     assert not (sibling / "notes.txt").exists()
     assert not (harness.parent / "notes.txt").exists()
+
+
+#: Every record a continuation's own inventory keeps, and the member of a checkpoint's settled half
+#: that says that record is finished. The freeze is over the harness's whole state and not over its
+#: transcript alone, so one entry here is one thing a crash can leave owed.
+THE_RECORD_UNION = ("transport", "recovery", "provider", "model", "compaction")
+
+#: And every state the gateway's own recovery record can be in, which is what the recovery member
+#: above is an attestation about. Eight of the nine are a call or an effect this transport still
+#: owes and the ninth is the settled one, so the inventory is held against the union itself rather
+#: than against a part of it somebody chose: a record added later fails this rather than quietly
+#: becoming a state no freeze accounts for.
+THE_RECOVERY_UNION = (
+    "_Idle",
+    "_RequestUncertain",
+    "_PullRecovered",
+    "_LeaseHeld",
+    "_HorizonOwed",
+    "_Offered",
+    "_PresentationUncertain",
+    "_PresentationRefused",
+    "_ResultOwed",
+)
+
+
+async def test_no_unfinished_state_of_a_harness_yields_accepted_freeze_evidence(
+    tmp_path: Path,
+) -> None:
+    """The inventory a freeze is attested over, and the manifest check that reads it.
+
+    The harness settles and then the platform fences, so what a checkpoint is over is the whole of
+    the harness's state. The settled half is exhaustive against that inventory rather than a chosen
+    part of it: five records, five members, and a manifest owing any one of them is refused where
+    it is read. The recovery member is an attestation about the transport's own record, so the
+    inventory it answers for is held against that union rather than against a chosen part of it.
+
+    What is proved here is the check and its inventory. The four moments a freeze can actually be
+    interrupted at are driven through a real transport where that transport lives, because a
+    boolean set by a test says nothing about what a gateway holding an unfinished call would
+    attest.
+    """
+    assert [row.name for row in fields(SettledHarness)] == list(THE_RECORD_UNION)
+    # The recovery member is an attestation about the transport's own record, so the inventory it
+    # answers for is held against that union rather than against a chosen part of it. A state this
+    # list does not name is a state no checkpoint accounts for, and it fails here.
+    assert tuple(one.__name__ for one in get_args(_Recovery)) == THE_RECOVERY_UNION
+    assert _Idle.__name__ == THE_RECOVERY_UNION[0]
+    for owed in THE_RECORD_UNION:
+        settled = {name: name != owed for name in THE_RECORD_UNION}
+        with pytest.raises(ApplicationError) as raised:
+            await retrieve_checkpoint(
+                AParent(),
+                AHarness(
+                    tmp_path / f"owing-{owed}",
+                    manifest=a_manifest(settled=SettledHarness(**settled)),
+                ),
+                ForkOperations.under(tmp_path / f"journal-{owed}"),
+            )
+        assert raised.value.type == "invalid_checkpoint"
+        assert owed in str(raised.value)
+
+    # The acknowledgement is decoded and not yet in a transcript, so the harness has no freeze to
+    # commit and says which capability it cannot supply rather than committing something near it.
+    with pytest.raises(UnsupportedCapability) as unsupported:
+        await retrieve_checkpoint(
+            AParent(),
+            AHarness(tmp_path / "unwritten", unsupported="commit a checkpoint"),
+            ForkOperations.under(tmp_path / "journal-unwritten"),
+        )
+    assert unsupported.value.capability == "commit a checkpoint"
+
+    # The transcript is persisted and the snapshot is not, so the manifest names no component and
+    # nothing in it asserts that anything restores that transcript.
+    with pytest.raises(ApplicationError) as raised:
+        await retrieve_checkpoint(
+            AParent(),
+            AHarness(tmp_path / "unpublished", manifest=a_manifest(components=[])),
+            ForkOperations.under(tmp_path / "journal-unpublished"),
+        )
+    assert raised.value.type == "invalid_checkpoint"
+
+    # And the freeze itself, which is the only one of the four that is kept.
+    kept = ForkOperations.under(tmp_path / "journal-settled")
+    retrieval = await retrieve_checkpoint(AParent(), AHarness(tmp_path / "settled"), kept)
+    assert retrieval.transcript_reference == TRANSCRIPT
+    assert retrieval.components == a_manifest().components
+    assert kept.all_of(CheckpointRetrieved) == [retrieval]
