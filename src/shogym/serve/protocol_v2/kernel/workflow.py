@@ -574,6 +574,11 @@ class _Obligation:
     # the projection every presentation attests against and has to hold for the life of the
     # generation, and the bytes are needed only while an offer could still carry them.
     materialized: bool = False
+    # Whether this obligation is a fork child's, selected against the parent's committed source
+    # and waiting for the child's own preparation to build its body. It is the one state in which
+    # an offerable obligation lawfully carries no candidate: the parent writes it into the child's
+    # start, and preparation clears it in the transition that installs the candidate.
+    pending_preparation: bool = False
 
 
 @dataclass
@@ -1030,6 +1035,7 @@ class StreamWorkflow:
             obligation.state = owed.state
             obligation.materialized = owed.materialized
             obligation.candidate = owed.candidate
+            obligation.pending_preparation = owed.pending_preparation
         self._presented = {row.message_id: row for row in carry.presented}
         self._committed_blobs = list(carry.committed_blobs)
         self._pull_requests = _bindings(carry.pull_requests)
@@ -1552,6 +1558,7 @@ class StreamWorkflow:
                         if obligation.state in _OFFERABLE_OBLIGATION
                         else None
                     ),
+                    pending_preparation=obligation.pending_preparation,
                 )
                 for attempt_id, obligation in sorted(self._obligations.items())
             ],
@@ -4481,6 +4488,115 @@ def _read_carried_source(row: CarriedAttempt) -> _CarriedSource:
         ) from error
 
 
+@dataclass(frozen=True)
+class ChildSelection:
+    """What one fork child delivers from a source its parent committed.
+
+    The attempt is the inherited one both children read, and the cell and the policy digest are
+    the child's own row's rather than the parent's.
+    """
+
+    attempt_id: str
+    cell: str
+    policy_digest: str
+
+
+def transformed_child_selection(
+    projection: CarriedProjection,
+    *,
+    selections: Sequence[ChildSelection],
+) -> CarriedProjection:
+    """Return one parent's projection as a child's, the named deliveries transformed once.
+
+    Source evidence is immutable and crosses exactly as it stands: the descriptor as the mapping
+    it was written as, its commitment, the origin its seal was minted under, the seal id, the
+    submission digest, the score, the decode state, the graded evidence, the seal ordinal and the
+    attempt's own presentation references. Selected delivery evidence is transformed here and
+    nowhere else: the cell becomes the child's target cell, the policy digest becomes the child's
+    own row's, and the body reference becomes the descriptor's own entry for that cell. The
+    contract id does not move, because both cells are the pair one contract declares.
+
+    The transformation is pure. The descriptor is carried whole in state, so naming the opposite
+    cell's reference reads no blob, renders nothing and needs no world.
+
+    The candidate is dropped in the same construction and the obligation is marked pending
+    preparation, so the child restores with a transformed selection, no candidate and the one
+    state its own preparation clears. Dropping the candidate and leaving the selection alone would
+    hand a placebo child the parent's graded selection, which its own restore refuses; dropping
+    both would lose the selection a presented obligation is required to keep.
+
+    The configuration identity stays the parent's, because a fresh child holds its parent's carry
+    and nothing else: the hash inside it is the one that child's own origin records as its
+    parent's, and a child's own hash reaches a carrier only at the child's own turnover.
+
+    Nothing else moves. What a child must not inherit and what its counters become are the
+    transformation the child's start is built by, and this is the half of it that is about the
+    source and the delivery.
+    """
+    wanted: Dict[str, ChildSelection] = {}
+    for selection in selections:
+        if selection.attempt_id in wanted:
+            raise ValueError(
+                f"attempt {selection.attempt_id} is selected twice for one child, and one "
+                "obligation is delivered once"
+            )
+        if selection.cell not in ELIGIBLE_CELLS:
+            raise ValueError(
+                f"a child is served {sorted(ELIGIBLE_CELLS)} and this selection names "
+                f"{selection.cell!r}"
+            )
+        wanted[selection.attempt_id] = selection
+    unknown = sorted(set(wanted) - {row.attempt_id for row in projection.attempts})
+    if unknown:
+        raise ValueError(
+            f"the parent holds no attempt {unknown[0]}, and a child's selection is the "
+            "transformation of one its parent made"
+        )
+    owing = sorted(set(wanted) - {owed.attempt_id for owed in projection.obligations})
+    if owing:
+        raise ValueError(
+            f"the parent owes no payload against attempt {owing[0]}, and a child inherits the "
+            "obligation it delivers against"
+        )
+    return replace(
+        projection,
+        attempts=[
+            _child_attempt(row, wanted[row.attempt_id]) if row.attempt_id in wanted else row
+            for row in projection.attempts
+        ],
+        obligations=[
+            _child_obligation(owed) if owed.attempt_id in wanted else owed
+            for owed in projection.obligations
+        ],
+    )
+
+
+def _child_attempt(row: CarriedAttempt, selection: ChildSelection) -> CarriedAttempt:
+    """Return one inherited attempt with the child's own selection in place of the parent's."""
+    if row.source_artifact is None or not row.selected_cell:
+        raise ValueError(
+            f"the attempt {row.attempt_id} carries no committed selection, and a child's is the "
+            "transformation of the one its parent made"
+        )
+    manifest = read_source_artifact(row.source_artifact)
+    return replace(
+        row,
+        selected_cell=selection.cell,
+        selected_body_reference=manifest.cells[selection.cell].sha256,
+        selected_policy_digest=selection.policy_digest,
+    )
+
+
+def _child_obligation(owed: CarriedObligation) -> CarriedObligation:
+    """Return one inherited obligation gated on the child's own preparation, its body dropped."""
+    if owed.state not in _OFFERABLE_OBLIGATION:
+        raise ValueError(
+            f"the obligation for attempt {owed.attempt_id} is {owed.state}, and a child is cut "
+            "over a payload nothing has delivered"
+        )
+    return replace(owed, candidate=None, pending_preparation=True)
+
+
 def _provenance(attempt: _Attempt) -> Optional[SourceProvenance]:
     """Return what one attempt's committed source was, or nothing where none was committed.
 
@@ -4829,10 +4945,13 @@ def _check_carried_receipts(
     attempt's own claim depends on is required beside them.
     """
     contracts = {contract.contract_id: contract for contract in start.receipt_contracts}
+    # The rows this generation serves, on the branch it declares it serves them on. A fork child
+    # serves a slot of its own, and reading the default here instead would leave its inherited
+    # source with no matching disposition and no capture contract to be validated against.
     resolved = {
         row.attempt_id: row
         for row in start.dispositions
-        if row.branch_slot == SINGLETON_SLOT
+        if row.branch_slot == start.served_slot
     }
     items = {item.attempt_id: item for item in start.tasks}
     inventory = set(projection.committed_blobs)
@@ -4847,7 +4966,13 @@ def _check_carried_receipts(
     for row in projection.attempts:
         _check_carried_attempt(start, row, read[row.attempt_id], contracts, resolved, inventory)
     for owed in projection.obligations:
-        _check_carried_candidate(owed, attempts.get(owed.attempt_id), resolved, items)
+        _check_carried_candidate(
+            owed,
+            attempts.get(owed.attempt_id),
+            resolved,
+            items,
+            forked=start.fork_origin is not None,
+        )
     for failure in projection.operation_failures:
         _check_carried_failure(failure, items)
     return read
@@ -4877,6 +5002,33 @@ def _check_carried_failure(row: OperationFailure, items: Dict[str, TaskItem]) ->
             f"a carried operation failure names the attempt {row.attempt_id}, which is not one "
             "of this generation's"
         )
+
+
+def _authorized_origins(start: StreamStart) -> Tuple[SourceOriginContext, ...]:
+    """Return the identities a carried source may name, per attempt rather than per generation.
+
+    An ordinary generation's source origin is its own: a continuation hands the same start on, so
+    the only source it can hold is one it captured itself, and a foreign origin is refused on
+    sight. A fork child's is one of two, and which of them a row names is a fact about that
+    attempt: a source it inherited was sealed under the parent's identity, which the child's own
+    fork origin records, and one it captured locally was sealed under the child's own exactly as
+    an ordinary generation's is. Both values sit inside the child's own start, so the comparison
+    is pure; the authority of the origin record itself is established afterwards, before the child
+    owns or serves anything.
+    """
+    here = SourceOriginContext(
+        hidden_execution_id=start.hidden_execution_id,
+        execution_ordinal=start.execution_ordinal,
+    )
+    if start.fork_origin is None:
+        return (here,)
+    return (
+        here,
+        SourceOriginContext(
+            hidden_execution_id=start.fork_origin.parent_hidden_execution_id,
+            execution_ordinal=start.fork_origin.parent_execution_ordinal,
+        ),
+    )
 
 
 def _check_carried_attempt(
@@ -4974,18 +5126,10 @@ def _check_carried_attempt(
             f"the source carried for attempt {row.attempt_id} names no origin, and the seal id "
             "is recomputed from the identity that seal was minted under rather than assumed"
         )
-    here = SourceOriginContext(
-        hidden_execution_id=start.hidden_execution_id,
-        execution_ordinal=start.execution_ordinal,
-    )
-    # A continuation hands the same start on, so an ordinary one carries this generation's own
-    # identity here. The field is compared rather than assumed because an inherited source is a
-    # thing a later build admits, and admitting one is a decision that has to be made rather than
-    # arrived at by a value nobody looked at.
-    if origin != here:
+    if origin not in _authorized_origins(start):
         raise _refuse_carrier(
             f"the source carried for attempt {row.attempt_id} names an origin this generation is "
-            "not, and no other origin is admitted here"
+            "not and no fork origin of its own vouches for"
         )
     checks = (
         (commitment, source_commitment(manifest), "commitment"),
@@ -5088,6 +5232,8 @@ def _check_carried_candidate(
     row: Optional[CarriedAttempt],
     resolved: Dict[str, PayloadDisposition],
     items: Dict[str, TaskItem],
+    *,
+    forked: bool,
 ) -> None:
     """Hold one carried obligation to the selection its attempt carries, where it delivers one.
 
@@ -5097,12 +5243,12 @@ def _check_carried_candidate(
     carrier that dropped either would restore into a generation whose next pull for that position
     has nothing to answer with and no reason to give.
 
-    There is one state where a selection stands with no candidate, and this build never produces
-    it: a gated fork child's obligation, selected against the parent's committed source and
-    unbuilt until the child builds it. No start this build admits declares a fork origin, so an
-    obligation arriving here selected and unbuilt is refused rather than admitted on the strength
-    of a state nothing here can have reached. The build that admits that origin is the build that
-    admits this, and it will have the child's own preparation record to tell the two apart by.
+    There is one state where a selection stands with no candidate: a fork child's obligation,
+    selected against the parent's committed source and unbuilt until the child builds it. It is
+    admitted by the preparation gate the parent wrote into the child's start rather than by the
+    absence of a candidate, either of which a damaged carry also has, and rather than by the fork
+    origin alone, which a child retains for the whole of its life. So the gate is what is asked
+    for here, and a generation holding no fork origin never carries one at all.
 
     An obligation this generation resolves to no artifact policy is asked for one thing before it
     is let past: that its candidate says nothing about a source. The row above it is already held
@@ -5114,7 +5260,17 @@ def _check_carried_candidate(
     """
     declared = resolved.get(owed.attempt_id)
     policy = _policy_of(declared)
+    if owed.pending_preparation and not forked:
+        raise _refuse_carrier(
+            f"the obligation for attempt {owed.attempt_id} is waiting on a preparation and this "
+            "generation was cut from no fork, so nothing here has an inherited body to build"
+        )
     if policy is None or policy.exposure != ARTIFACT:
+        if owed.pending_preparation:
+            raise _refuse_carrier(
+                f"the obligation for attempt {owed.attempt_id} is waiting on a preparation and "
+                "this generation resolves it to no committed cell to prepare one from"
+            )
         if owed.candidate is not None and resolved_echo(owed.candidate):
             raise _refuse_carrier(
                 f"the candidate carried for attempt {owed.attempt_id} describes a source it "
@@ -5135,11 +5291,25 @@ def _check_carried_candidate(
                 f"{policy.policy_name} and its attempt holds no selection to say which committed "
                 "cell an offer of it would carry"
             )
-        if candidate is None:
+        if candidate is None and not owed.pending_preparation:
             raise _refuse_carrier(
                 f"the obligation for attempt {owed.attempt_id} is {owed.state} under "
                 f"{policy.policy_name} and carries no candidate, and an obligation an offer could "
                 "still be made from keeps the body that offer would carry"
+            )
+    # A gate stands on an obligation an offer is still owed from, and only while its body is
+    # unbuilt: preparation installs the candidate and clears the gate in one transition, so a
+    # carry holding both is state nothing wrote.
+    if owed.pending_preparation:
+        if owed.state not in _OFFERABLE_OBLIGATION:
+            raise _refuse_carrier(
+                f"the obligation for attempt {owed.attempt_id} is {owed.state} and waiting on a "
+                "preparation, and only an obligation an offer could still be made from waits"
+            )
+        if candidate is not None:
+            raise _refuse_carrier(
+                f"the obligation for attempt {owed.attempt_id} carries the body of a preparation "
+                "it is still waiting on, and a preparation clears its gate where it installs one"
             )
     if candidate is None:
         return

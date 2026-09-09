@@ -6,11 +6,16 @@ cross in the carrier, and are checked again on the far side against the start th
 them. That checking is what these tests are about, and it is pure: nothing here opens a store,
 reaches a world or runs an Activity, because a restore may do none of those either.
 
-Two numbers name two dispositions. A generation declaring a receipt contract writes the later
-carrier from its first boundary, before it has captured anything; one declaring none of it writes
-the earlier one, and writes exactly the bytes the code before this one wrote. That second promise
-is held by a recorded history rather than by a round trip: a build agreeing with itself is not
-evidence that it agrees with the build it replaced.
+Three numbers name three dispositions. A generation declaring a fork writes the highest carrier
+from its first boundary, before any child exists; one declaring a receipt contract writes the
+middle one from its first boundary, before it has captured anything; one declaring neither writes
+the earliest, and writes exactly the bytes the code before it wrote. That last promise is held by
+recorded bytes rather than by a round trip: a build agreeing with itself is not evidence that it
+agrees with the build it replaced.
+
+The last section is the fork's own pure slice, which is the same subject read forwards: what a
+parent's committed source becomes in a child that delivers the opposite cell of it, and what a
+child's restore accepts and refuses about the state it arrives in.
 """
 
 from __future__ import annotations
@@ -64,13 +69,17 @@ from shogym.serve.protocol_v2.artifact import (  # noqa: E402
 from shogym.serve.protocol_v2.blobs import BlobRef  # noqa: E402
 from shogym.serve.protocol_v2.errors import WireFormatError  # noqa: E402
 from shogym.serve.protocol_v2.kernel import (  # noqa: E402
+    FORK_CARRIER_SCHEMA_VERSION,
     LEGACY_CARRIER_SCHEMA_VERSION,
     RECEIPT_CARRIER_SCHEMA_VERSION,
     CarriedProjection,
+    ChildSelection,
+    ForkOrigin,
     OfferedMessage,
     PayloadCandidate,
     PresentedMessage,
     SourceOriginContext,
+    StartDifference,
     StreamStart,
     TaskItem,
     TerminalTool,
@@ -78,8 +87,10 @@ from shogym.serve.protocol_v2.kernel import (  # noqa: E402
     configuration_hash,
     continuation_argument,
     derived_selection,
+    fork_configuration,
     hidden_seal_id,
     stream_replayer,
+    transformed_child_selection,
 )
 from shogym.serve.protocol_v2.kernel import workflow as kernel_workflow  # noqa: E402
 from shogym.serve.protocol_v2.kernel.messages import (  # noqa: E402
@@ -91,8 +102,13 @@ from shogym.serve.protocol_v2.kernel.messages import (  # noqa: E402
     legacy_start_members,
     origin_fields,
     pack_carrier,
+    receipt_projection_members,
+    receipt_start_members,
     resolved_echo,
     unpack_carrier,
+)
+from shogym.serve.protocol_v2.kernel.runtime import (  # noqa: E402
+    refuse_a_carried_projection,
 )
 from shogym.serve.protocol_v2.policy import (  # noqa: E402
     BLINDED_RECEIPT_V1_DIGEST,
@@ -104,6 +120,7 @@ from shogym.serve.protocol_v2.policy import (  # noqa: E402
     PLACEBO_RECEIPT_ARTIFACT_V1_DIGEST,
     POLICIES,
     REGISTERED,
+    SINGLETON_SLOT,
     WITHHOLD,
     PayloadDisposition,
     PolicyProvenance,
@@ -611,6 +628,9 @@ def test_the_legacy_carrier_drops_every_member_this_build_added_and_the_later_on
     assert legacy_start_members(encoded_start).keys() == encoded_start.keys() - {
         "receipt_contracts",
         "receipt_source",
+        "served_slot",
+        "forkable_slots",
+        "fork_origin",
     }
 
     # And the later version keeps all of it, losslessly.
@@ -659,13 +679,15 @@ async def test_a_history_continued_before_this_build_replays_and_is_written_the_
     await stream_replayer().replay_workflow(history)
 
 
-def test_a_receipt_generation_hands_its_own_start_on_with_the_contract_and_the_source_in_it(
+def test_a_receipt_generation_hands_the_contract_and_the_source_on_and_nothing_it_never_declared(
 ) -> None:
-    """The current version changes nothing about the start: it is handed on as it is."""
+    """Its own number keeps the contract and the source and drops the members added after them.
+
+    The receipt number is a serialization adapter too, now that a later one exists: it emits the
+    member set that version had, which is this generation's whole start apart from the three names
+    the fork added. A generation on the current number hands its own start over untouched.
+    """
     start = a_start()
-    assert (
-        continuation_argument(start, CONVERTER, RECEIPT_CARRIER_SCHEMA_VERSION) is start
-    )
     written = json.loads(
         CONVERTER.to_payloads(
             [continuation_argument(start, CONVERTER, RECEIPT_CARRIER_SCHEMA_VERSION)]
@@ -673,6 +695,8 @@ def test_a_receipt_generation_hands_its_own_start_on_with_the_contract_and_the_s
     )
     assert written["receipt_source"] == SOURCE
     assert written["receipt_contracts"][0]["contract_id"] == CONTRACT
+    assert not {"served_slot", "forkable_slots", "fork_origin"} & set(written)
+    assert continuation_argument(start, CONVERTER, FORK_CARRIER_SCHEMA_VERSION) is start
 
 
 # What a restore accepts, and what it refuses whole.
@@ -837,11 +861,12 @@ def test_a_carrier_naming_a_commitment_the_descriptor_does_not_hash_to_is_refuse
 
 def test_a_carried_source_from_another_origin_is_refused_because_no_other_origin_is_admitted(
 ) -> None:
-    """The origin is a field rather than an assumption, and this build admits one value for it.
+    """The origin is a field rather than an assumption, and a generation cut from no fork admits
+    one value for it.
 
     A continuation hands the same start on, so an ordinary one carries this generation's own
     identity. Reading the seal id back out of the carried origin rather than out of the start is
-    what lets a later build admit an inherited source without the check quietly rebinding to
+    what lets a fork child admit an inherited source without the check quietly rebinding to
     whichever generation the source arrived at.
     """
     start = a_start()
@@ -1312,9 +1337,9 @@ def test_an_obligation_an_offer_could_still_be_made_from_carries_both_halves_of_
     on its own, because either can go missing without the other.
 
     The one state where a selection stands with no candidate is a gated fork child's obligation,
-    selected against the parent's committed source and unbuilt until the child builds it. No start
-    this build admits declares a fork origin, so nothing here produces that state and it is
-    refused rather than admitted on the strength of a state that cannot have been reached.
+    selected against the parent's committed source and unbuilt until the child builds it. It is
+    admitted by the preparation gate the parent wrote into the child's start, and this generation
+    was cut from no fork and carries no gate, so every one of these stays refused.
     """
     start = a_start()
 
@@ -2005,3 +2030,718 @@ def test_the_module_this_runs_under_needs_no_event_loop_of_its_own() -> None:
     with pytest.raises(RuntimeError):
         asyncio.get_running_loop()
     kernel_workflow._check_carried_receipts(a_start(), a_projection(a_start()))
+
+
+# The fork's pure slice: what a parent's committed source becomes in a child, what number a
+# generation that declares a fork writes, and what a child's restore accepts and refuses.
+
+#: The two slots one parent's fork may create, and the one its child below serves. They are
+#: internal names for branches and say nothing about what either branch is for.
+FIRST_SLOT = "first"
+SECOND_SLOT = "second"
+CHILD_EXECUTION = "execution-child-1"
+FORK = "fork-1"
+
+#: Which registered policy each eligible cell is delivered under.
+CELL_POLICIES = {
+    GRADED_CELL: GRADED_RECEIPT_ARTIFACT_V1_DIGEST,
+    PLACEBO_CELL: PLACEBO_RECEIPT_ARTIFACT_V1_DIGEST,
+}
+
+
+def a_fork_parent(*, silent: bool = False, **changes: Any) -> StreamStart:
+    """The generation A is sealed in, declaring the slots its fork may create.
+
+    It serves the one slot every generation serves and has forked nothing yet, which is the state
+    a fork-capable parent is in from its first boundary.
+    """
+    declared = replace(a_start(silent=silent), forkable_slots=[FIRST_SLOT, SECOND_SLOT])
+    return replace(declared, **changes) if changes else declared
+
+
+def a_fork_origin(child_hash: str, *, slot: str = SECOND_SLOT, **changes: Any) -> ForkOrigin:
+    """The lineage one child carries: which parent, cut where, over which source."""
+    manifest = a_manifest()
+    declared = ForkOrigin(
+        parent_workflow_id="stream/the-parent/1",
+        parent_run_id="the-parent-run",
+        parent_configuration_hash=configuration_hash(a_fork_parent()),
+        child_configuration_hash=child_hash,
+        parent_execution_ordinal=0,
+        parent_hidden_execution_id=EXECUTION,
+        acknowledged_cursor=oid(9),
+        projection_digest=digest_of("the projection at the cut"),
+        attestation_id=oid(0x201),
+        acknowledged_visible_sha256=digest_of("the acknowledgement as it was presented"),
+        checkpoint_manifest_reference=digest_of("the checkpoint manifest"),
+        source_attempt_id=ATTEMPT,
+        source_seal_id=hidden_seal_id(EXECUTION, 0, ATTEMPT),
+        source_submission_digest="e" * 64,
+        source_canonicalization_version="kernel.1",
+        source_score=1.0,
+        source_seal_ordinal=1,
+        source_graded_evidence="9" * 64,
+        source_commitment=source_commitment(manifest),
+        source_artifact_references=sorted(
+            reference.sha256 for reference in manifest.cells.values()
+        ),
+        branch_slot=slot,
+        dispositions_digest=digest_of(f"the rows of {slot}"),
+        start_differences=[
+            StartDifference(field_name="served_slot", value_digest=digest_of(slot)),
+            StartDifference(
+                field_name="hidden_execution_id", value_digest=digest_of(CHILD_EXECUTION)
+            ),
+        ],
+        parent_turnovers=0,
+        fork_id=FORK,
+        child_ordinal=1,
+        children=2,
+    )
+    return replace(declared, **changes) if changes else declared
+
+
+def a_child_start(
+    *,
+    cell: str = PLACEBO_CELL,
+    slot: str = SECOND_SLOT,
+    origin: bool = True,
+    silent: bool = False,
+    **changes: Any,
+) -> StreamStart:
+    """One child of that parent: its own slot, its own row, its own identity, its parent's lineage.
+
+    Everything the transformation is allowed to move is moved here and nothing else is: the child
+    resolves the same obligation on a branch of its own, under the policy for the cell it
+    delivers, with a hidden execution id of its own and its parent's origin beside its carry.
+    """
+    parent = a_fork_parent(silent=silent)
+    rows = [
+        replace(row, branch_slot=slot, policy_digest=CELL_POLICIES[cell], cell=cell)
+        if row.kind == DELIVER
+        else replace(row, branch_slot=slot)
+        for row in parent.dispositions
+    ]
+    without = replace(
+        parent,
+        hidden_execution_id=CHILD_EXECUTION,
+        consumer_claim_hash="f" * 64,
+        served_slot=slot,
+        dispositions=rows,
+        provenance=PolicyProvenance(
+            authority=REGISTERED,
+            roster_digest=roster_digest(rows),
+            experiment_id="the_subject_of_this_run",
+        ),
+    )
+    declared = replace(
+        without,
+        fork_origin=(
+            a_fork_origin(configuration_hash(without), slot=slot) if origin else None
+        ),
+    )
+    return replace(declared, **changes) if changes else declared
+
+
+def a_child_projection(
+    *, cell: str = PLACEBO_CELL, parent: Optional[StreamStart] = None
+) -> CarriedProjection:
+    """The projection one parent hands a child that delivers this cell.
+
+    It is the parent's carry with the delivery transformed, so it holds the parent's own
+    configuration identity and says nothing about which child is about to read it.
+    """
+    source = a_fork_parent() if parent is None else parent
+    return transformed_child_selection(
+        a_projection(source),
+        selections=[
+            ChildSelection(attempt_id=ATTEMPT, cell=cell, policy_digest=CELL_POLICIES[cell])
+        ],
+    )
+
+
+def test_a_fork_capable_parent_writes_the_highest_carrier_before_any_child_exists() -> None:
+    """The number follows the declaration, exactly as the receipt number does.
+
+    A parent that declares the slots its fork may create writes the highest carrier from its first
+    boundary, before any fork exists and whether or not it has captured anything, and a child
+    writes it because it holds an origin. Both hand their own start on untouched, so the
+    configuration identity the next execution rebuilds from that start is the one the carrier
+    repeats.
+    """
+    parent = a_fork_parent()
+    nothing_yet = a_projection(
+        parent,
+        attempts=[CarriedAttempt(attempt_id=ATTEMPT, state="active")],
+        obligations=[],
+        committed_blobs=[],
+    )
+    assert carrier_version(parent, nothing_yet) == FORK_CARRIER_SCHEMA_VERSION
+    assert fork_configuration(parent)
+
+    child = a_child_start()
+    assert not fork_configuration(replace(child, served_slot=SINGLETON_SLOT, forkable_slots=[]))
+    assert (
+        carrier_version(replace(child, served_slot=SINGLETON_SLOT, forkable_slots=[]), nothing_yet)
+        == FORK_CARRIER_SCHEMA_VERSION
+    )
+
+    for start in (parent, child):
+        argument = continuation_argument(start, CONVERTER, FORK_CARRIER_SCHEMA_VERSION)
+        assert argument is start
+        written = json.loads(CONVERTER.to_payloads([argument])[0].data.decode("utf-8"))
+        assert written["served_slot"] == start.served_slot
+        assert written["forkable_slots"] == start.forkable_slots
+        assert (written["fork_origin"] is None) == (start.fork_origin is None)
+        rebuilt = CONVERTER.from_payload(CONVERTER.to_payloads([argument])[0], StreamStart)
+        assert rebuilt == start
+        assert configuration_hash(rebuilt) == configuration_hash(start)
+
+
+def test_a_defaulted_served_slot_and_an_empty_forkable_set_promote_no_generation() -> None:
+    """The default is the slot every row carries today, so reading it as a declaration would
+    promote every legacy and receipt-only start to a codec that had never read it.
+
+    Both lower numbers stay eligible: a generation declaring a receipt contract writes the middle
+    one, and a generation declaring neither route writes the earliest.
+    """
+    for start in (a_start(), a_start(contract=False), a_legacy_start()):
+        assert (start.served_slot, start.forkable_slots) == (SINGLETON_SLOT, [])
+        assert not fork_configuration(start)
+    receipt = a_start()
+    assert carrier_version(receipt, a_projection(receipt)) == RECEIPT_CARRIER_SCHEMA_VERSION
+    plain = a_start(contract=False)
+    empty = a_projection(
+        plain,
+        attempts=[CarriedAttempt(attempt_id=ATTEMPT, state="active")],
+        obligations=[],
+        committed_blobs=[],
+    )
+    assert carrier_version(plain, empty) == LEGACY_CARRIER_SCHEMA_VERSION
+
+
+def test_a_lower_carrier_would_strip_the_fields_a_forked_identity_is_rebuilt_from() -> None:
+    """Which is why the number is selected from what a start declares and not from its evidence.
+
+    An adapter run over a fork-capable start drops the two slots from the one copy the next
+    execution rebuilds its configuration identity from, restore compares that rebuilt identity
+    against the carried one, and the parent would refuse its own lawful continuation.
+
+    Both slots are inside that identity, which is what makes the loss one. The two starts here
+    differ in the branch they serve and in nothing else, so a generation serving a branch of its
+    own is a different generation from one serving the default.
+    """
+    parent = a_fork_parent()
+    serving_its_own = a_fork_parent(served_slot=FIRST_SLOT)
+    assert configuration_hash(serving_its_own) != configuration_hash(parent)
+    for start in (parent, serving_its_own):
+        written = json.loads(CONVERTER.to_payloads([start])[0].data.decode("utf-8"))
+        for adapted in (receipt_start_members(written), legacy_start_members(written)):
+            assert "served_slot" not in adapted
+            assert "forkable_slots" not in adapted
+            stripped = CONVERTER.from_payload(CONVERTER.to_payloads([adapted])[0], StreamStart)
+            assert (stripped.served_slot, stripped.forkable_slots) == (SINGLETON_SLOT, [])
+            assert configuration_hash(stripped) != configuration_hash(start)
+
+
+def test_a_receipt_continuation_is_written_as_the_bytes_the_build_before_the_fork_wrote() -> None:
+    """The middle number is an adapter now, and this is the bytes it has to keep writing.
+
+    The fixture was recorded from the build that shipped the receipt route, before a fork member
+    existed. A round trip through this build's own code would only show that it agrees with
+    itself, so what is compared is the recorded outer start and the recorded carrier string.
+    """
+    recorded = json.loads(
+        (Path(__file__).parent / "_fixtures" / "recorded_receipt_carrier.json").read_text(
+            encoding="utf-8"
+        )
+    )
+    assert recorded["carrier_schema_version"] == RECEIPT_CARRIER_SCHEMA_VERSION
+    start = a_start()
+    projection = a_projection(start)
+    assert carrier_version(start, projection) == RECEIPT_CARRIER_SCHEMA_VERSION
+    packed = pack_carrier(projection, CONVERTER, version=RECEIPT_CARRIER_SCHEMA_VERSION)
+    assert (packed.encoding, packed.data) == (recorded["encoding"], recorded["carrier"])
+    argument = continuation_argument(
+        replace(start, carry=packed), CONVERTER, RECEIPT_CARRIER_SCHEMA_VERSION
+    )
+    assert CONVERTER.to_payloads([argument])[0].data.decode("utf-8") == recorded["outer_start"]
+    # And the recorded carrier still reads back as the projection this build builds, which is what
+    # a deployment does to a generation that crossed a boundary under the build before it.
+    fixed = replace(packed, data=recorded["carrier"])
+    assert unpack_carrier(fixed, CONVERTER) == projection
+
+
+def test_the_preparation_gate_crosses_the_highest_carrier_and_no_lower_one() -> None:
+    """A member the lower numbers had no name for is dropped by their adapters and nothing else.
+
+    The gate is the one member a child's carried obligation holds, so a projection holding one can
+    never be written as a record that had no room for it, and the two lower adapters emit the
+    obligation the member set they had.
+    """
+    child = a_child_start()
+    projection = a_child_projection()
+    assert carrier_version(child, projection) == FORK_CARRIER_SCHEMA_VERSION
+    # The gate alone is enough, with nothing about the start declaring anything.
+    declaring_nothing = replace(
+        child, served_slot=SINGLETON_SLOT, forkable_slots=[], fork_origin=None
+    )
+    assert not fork_configuration(declaring_nothing)
+    assert carrier_version(declaring_nothing, projection) == FORK_CARRIER_SCHEMA_VERSION
+    packed = pack_carrier(projection, CONVERTER, version=FORK_CARRIER_SCHEMA_VERSION)
+    assert unpack_carrier(packed, CONVERTER) == projection
+
+    written = json.loads(CONVERTER.to_payloads([projection])[0].data.decode("utf-8"))
+    assert written["obligations"][0]["pending_preparation"] is True
+    for adapted in (receipt_projection_members(written), legacy_projection_members(written)):
+        assert "pending_preparation" not in adapted["obligations"][0]
+        assert adapted["obligations"][0]["state"] == written["obligations"][0]["state"]
+
+
+def test_the_child_selection_moves_three_values_and_preserves_every_other_thing_the_source_says(
+) -> None:
+    """Source evidence is immutable and selected delivery evidence is transformed once.
+
+    The cell becomes the child's, the policy digest becomes its own row's and the body reference
+    becomes the descriptor's own entry for that cell. The contract id does not move, because both
+    cells are the pair one contract declares, and neither does anything the seal committed. The
+    descriptor and the origin cross as the mappings they were written as, so the value the child's
+    restore reads through the strict readers is the value the parent committed to.
+    """
+    # The inherited row cites a presentation, so the eighth receipt field is compared against a
+    # value the parent wrote rather than against a default both sides would hold anyway, and the
+    # inventory names the object it cited, which is what makes this a projection a carrier admits.
+    transcript = "7" * 64
+    parents = a_projection(
+        a_fork_parent(),
+        attempts=[a_row(presentation_references=[transcript])],
+        committed_blobs=an_inventory(
+            source_commitment(a_manifest()), digest_of(SUBMISSION), "9" * 64, transcript
+        ),
+    )
+    kernel_workflow._check_carried_receipts(a_fork_parent(), parents)
+    childs = transformed_child_selection(
+        parents,
+        selections=[
+            ChildSelection(
+                attempt_id=ATTEMPT,
+                cell=PLACEBO_CELL,
+                policy_digest=PLACEBO_RECEIPT_ARTIFACT_V1_DIGEST,
+            )
+        ],
+    )
+    before, after = parents.attempts[0], childs.attempts[0]
+
+    assert (after.selected_cell, after.selected_policy_digest) == (
+        PLACEBO_CELL,
+        PLACEBO_RECEIPT_ARTIFACT_V1_DIGEST,
+    )
+    assert after.selected_body_reference == digest_of(BODIES[PLACEBO_CELL])
+    assert before.selected_body_reference == digest_of(BODIES[GRADED_CELL])
+    assert after.receipt_contract_id == before.receipt_contract_id
+    # The two mappings are the ones that crossed, not a second writing of them.
+    assert after.source_artifact is before.source_artifact
+    assert after.source_origin is before.source_origin
+    # And every other value the seal committed is the parent's, byte for byte.
+    for name in ("source_commitment", "seal_id", "submission_digest", "score", "decode_state",
+                 "graded_evidence", "seal_ordinal", "presentation_references", "state"):
+        assert getattr(after, name) == getattr(before, name)
+
+    owed = childs.obligations[0]
+    assert (owed.candidate, owed.pending_preparation, owed.materialized) == (None, True, True)
+    assert owed.state == parents.obligations[0].state
+    assert parents.obligations[0].candidate is not None
+    # The identity in the carrier is still the parent's, which is what a fresh child carries.
+    assert childs.configuration_hash == parents.configuration_hash
+    assert childs.configuration_hash == configuration_hash(a_fork_parent())
+    # The parent's own projection is untouched, which is what makes two children of one value.
+    assert parents.attempts[0] is before
+
+
+def test_a_child_projection_this_build_composed_restores_into_a_gated_child() -> None:
+    """The whole of this step, in one shape: composed by the transformation, read by the restore.
+
+    Both children are the same construction over one parent's projection: the one that delivers
+    the cell its parent delivered and the one that delivers the other. Each restores against its
+    own start, through the carrier it would actually cross in, with a transformed selection, no
+    candidate and the gate its own preparation clears.
+
+    What the carrier says it was composed against is the parent, because a fresh child holds its
+    parent's carry, and that is the value a fresh child's own door compares against the hash its
+    origin records for its parent.
+    """
+    for cell, slot in ((GRADED_CELL, FIRST_SLOT), (PLACEBO_CELL, SECOND_SLOT)):
+        child = a_child_start(cell=cell, slot=slot)
+        projection = a_child_projection(cell=cell)
+        kernel_workflow._check_carried_receipts(child, projection)
+        packed = pack_carrier(projection, CONVERTER, version=FORK_CARRIER_SCHEMA_VERSION)
+        read_back = unpack_carrier(packed, CONVERTER)
+        origin = child.fork_origin
+        assert origin is not None
+        assert read_back.configuration_hash == origin.parent_configuration_hash
+        assert read_back.configuration_hash != configuration_hash(child)
+        kernel_workflow._check_carried_receipts(child, read_back)
+
+
+def test_the_public_doors_still_refuse_a_caller_supplied_carry_to_a_child() -> None:
+    """A child's carry is the platform's to compose, and a caller's is refused as it always was.
+
+    The origin changes nothing about that: the two doors a caller comes in through refuse a start
+    that already holds a projection, and a constructor started fresh refuses one too.
+    """
+    child = a_child_start()
+    refuse_a_carried_projection(child)
+    carried = replace(
+        child,
+        carry=pack_carrier(a_child_projection(), CONVERTER, version=FORK_CARRIER_SCHEMA_VERSION),
+    )
+    with pytest.raises(ValueError, match="no earlier execution"):
+        refuse_a_carried_projection(carried)
+
+
+def test_a_placebo_child_that_kept_the_graded_parents_selection_is_refused_at_restore(
+) -> None:
+    """Which is why dropping the candidate is not the transformation.
+
+    A child built by dropping the body and leaving the selection alone holds its parent's graded
+    cell under its own placebo row, and the refusal comes at restore rather than at delivery: the
+    selection a child carries has to be the one its own row resolves.
+    """
+    child = a_child_start()
+    parent = a_projection(a_fork_parent())
+    kept = replace(
+        parent,
+        obligations=[
+            replace(parent.obligations[0], candidate=None, pending_preparation=True)
+        ],
+    )
+    assert "does not resolve" in refused(child, kept)
+
+
+def test_a_child_that_kept_the_parents_candidate_is_refused_either_way() -> None:
+    """The body a parent rendered is the parent's, and a child renders its own or serves nothing.
+
+    With the gate standing it is refused as a preparation that already has what it is waiting for;
+    with the gate cleared it is refused as a candidate naming a cell its attempt's selection does
+    not, which is the ordinary binding check doing its ordinary work.
+    """
+    child = a_child_start()
+    projection = a_child_projection()
+    kept = replace(
+        projection,
+        obligations=[replace(projection.obligations[0], candidate=a_candidate())],
+    )
+    assert "still waiting on" in refused(child, kept)
+    assert "does not" in refused(
+        child,
+        replace(
+            kept, obligations=[replace(kept.obligations[0], pending_preparation=False)]
+        ),
+    )
+
+
+def a_child_candidate() -> PayloadCandidate:
+    """The body a child's own preparation installs for the cell that child delivers."""
+    return a_candidate(
+        body=BODIES[PLACEBO_CELL],
+        cell=PLACEBO_CELL,
+        policy_digest=PLACEBO_RECEIPT_ARTIFACT_V1_DIGEST,
+        body_reference=digest_of(BODIES[PLACEBO_CELL]),
+    )
+
+
+def test_a_child_whose_obligation_lost_its_gate_is_refused_like_any_damaged_carry() -> None:
+    """The gate is what admits an unbuilt obligation, and its absence is the ordinary refusal.
+
+    A child missing it is indistinguishable from a carrier that dropped a body, which is exactly
+    the state the ordinary rule exists to refuse, so the ordinary rule refuses it.
+    """
+    child = a_child_start()
+    projection = a_child_projection()
+    ungated = replace(
+        projection,
+        obligations=[replace(projection.obligations[0], pending_preparation=False)],
+    )
+    assert "carries no candidate" in refused(child, ungated)
+
+
+def test_a_prepared_child_stands_without_its_gate_and_is_refused_once_its_body_is_gone() -> None:
+    """The gate is read before installation and after it, and it says different things.
+
+    Preparation installs the candidate and clears the gate in one transition, so the prepared
+    child carries a body and no gate. Take the body away afterwards and nothing excuses it: a
+    retained origin is not a licence for a missing candidate.
+    """
+    child = a_child_start()
+    projection = a_child_projection()
+    prepared = replace(
+        projection,
+        obligations=[
+            replace(
+                projection.obligations[0],
+                candidate=a_child_candidate(),
+                pending_preparation=False,
+            )
+        ],
+    )
+    kernel_workflow._check_carried_receipts(child, prepared)
+    assert "carries no candidate" in refused(
+        child,
+        replace(prepared, obligations=[replace(prepared.obligations[0], candidate=None)]),
+    )
+
+
+def test_a_preparation_gate_is_refused_wherever_nothing_could_have_written_one() -> None:
+    """Three places: no fork behind it, no committed cell to prepare, and no offer left to owe.
+
+    The gate is a value a parent committed to rather than a shape a carrier can assert, so every
+    generation that could not have been handed one refuses it whole.
+    """
+    # A generation cut from no fork, which is every generation this build serves today. Its own
+    # source is its own, so the gate is the only thing wrong with what it is handed.
+    parent = a_fork_parent()
+    parents = a_projection(parent)
+    assert "cut from no fork" in refused(
+        parent,
+        replace(
+            parents,
+            obligations=[
+                replace(parents.obligations[0], candidate=None, pending_preparation=True)
+            ],
+        ),
+    )
+
+    # A child whose row resolves the position to no committed cell at all.
+    scalar = a_start(contract=False)
+    forked = replace(scalar, fork_origin=a_fork_origin(configuration_hash(scalar)))
+    blinded = a_scalar_projection(scalar, a_blinded_candidate())
+    assert "no committed cell to prepare" in refused(
+        forked,
+        replace(
+            blinded,
+            obligations=[replace(blinded.obligations[0], pending_preparation=True)],
+        ),
+    )
+
+    # And an obligation that has been presented, which no offer is owed from any more.
+    child = a_child_start()
+    projection = a_child_projection()
+    presented = replace(
+        projection,
+        obligations=[
+            replace(projection.obligations[0], state="presented", pending_preparation=True)
+        ],
+    )
+    assert "only an obligation an offer could still be made from waits" in refused(
+        child, presented
+    )
+
+
+def a_local_row(**changes: Any) -> CarriedAttempt:
+    """One attempt a child sealed itself, under its own identity rather than its parent's."""
+    manifest = a_manifest(
+        source_attempt_id=SILENT,
+        source_seal_id=hidden_seal_id(CHILD_EXECUTION, 0, SILENT),
+        kernel_submission_digest="d" * 64,
+    )
+    declared: Dict[str, Any] = {
+        "attempt_id": SILENT,
+        "seal_id": hidden_seal_id(CHILD_EXECUTION, 0, SILENT),
+        "submission_digest": "d" * 64,
+        "score": 0.5,
+        "graded_evidence": "8" * 64,
+        "seal_ordinal": 2,
+        "source_artifact": manifest,
+        "source_commitment": source_commitment(manifest),
+        "source_origin": SourceOriginContext(
+            hidden_execution_id=CHILD_EXECUTION, execution_ordinal=0
+        ),
+        "selected_cell": None,
+        "selected_body_reference": None,
+        "selected_policy_digest": None,
+    }
+    declared.update(changes)
+    return a_row(**declared)
+
+
+def a_mixed_projection(rows: List[CarriedAttempt]) -> CarriedProjection:
+    """One child's projection holding an inherited attempt and one it captured itself."""
+    local = source_commitment(
+        a_manifest(
+            source_attempt_id=SILENT,
+            source_seal_id=hidden_seal_id(CHILD_EXECUTION, 0, SILENT),
+            kernel_submission_digest="d" * 64,
+        )
+    )
+    return transformed_child_selection(
+        a_projection(
+            a_fork_parent(silent=True),
+            attempts=rows,
+            committed_blobs=an_inventory(
+                source_commitment(a_manifest()),
+                digest_of(SUBMISSION),
+                "9" * 64,
+                local,
+                "8" * 64,
+            ),
+        ),
+        selections=[
+            ChildSelection(
+                attempt_id=ATTEMPT,
+                cell=PLACEBO_CELL,
+                policy_digest=PLACEBO_RECEIPT_ARTIFACT_V1_DIGEST,
+            )
+        ],
+    )
+
+
+def test_a_child_carrying_an_inherited_source_and_one_it_captured_itself_is_accepted() -> None:
+    """Source authority is a fact about the attempt rather than about the generation.
+
+    The inherited attempt was sealed under the parent's hidden execution identity, which the
+    child's own origin records, and the attempt the child captured was sealed under its own. Each
+    seal id is recomputed from the context that actually produced it rather than from whichever
+    start it arrived at, so one carrier holds both and neither is checked against the other's
+    identity.
+    """
+    child = a_child_start(silent=True)
+    kernel_workflow._check_carried_receipts(child, a_mixed_projection([a_row(), a_local_row()]))
+
+
+def test_each_carried_origin_is_substituted_independently_and_refused() -> None:
+    """Two authorized identities are not one identity, and neither vouches for the other's rows.
+
+    A third identity is refused as an origin nothing vouches for. The two authorized ones are
+    refused where they are on the wrong row, by the seal id recomputed from the context the row
+    now names, which is the check the origin field exists for.
+    """
+    child = a_child_start(silent=True)
+    elsewhere = SourceOriginContext(hidden_execution_id="another-execution", execution_ordinal=0)
+    inherited = SourceOriginContext(hidden_execution_id=EXECUTION, execution_ordinal=0)
+    local = SourceOriginContext(hidden_execution_id=CHILD_EXECUTION, execution_ordinal=0)
+
+    assert "vouches for" in refused(
+        child, a_mixed_projection([a_row(source_origin=elsewhere), a_local_row()])
+    )
+    assert "vouches for" in refused(
+        child, a_mixed_projection([a_row(), a_local_row(source_origin=elsewhere)])
+    )
+    assert "recomputed seal" in refused(
+        child, a_mixed_projection([a_row(source_origin=local), a_local_row()])
+    )
+    assert "recomputed seal" in refused(
+        child, a_mixed_projection([a_row(), a_local_row(source_origin=inherited)])
+    )
+
+
+def test_a_generation_with_no_fork_origin_admits_its_own_identity_and_nothing_else() -> None:
+    """Which is the rule this build already had, kept exactly where no origin stands.
+
+    The same inherited attempt that a child's own origin vouches for is refused on sight in a
+    generation that was cut from nothing, because the identity that sealed it is not one that
+    generation can have been.
+    """
+    child = a_child_start(silent=True)
+    projection = a_mixed_projection([a_row(), a_local_row()])
+    assert "vouches for" in refused(replace(child, fork_origin=None), projection)
+
+
+def test_the_child_transformation_refuses_every_selection_a_parent_could_not_have_made() -> None:
+    """It composes a child or it refuses, and it never composes one a restore would turn away.
+
+    The oracle is refused here rather than at the far end, which is what keeps it unselectable
+    from the plan rather than from a search of the bytes: all three cells share wrapper bytes, so
+    nothing downstream could tell one from another by shape.
+    """
+    parent = a_projection(a_fork_parent())
+
+    def composed(*selections: ChildSelection, source: Optional[CarriedProjection] = None) -> None:
+        transformed_child_selection(
+            parent if source is None else source,
+            selections=list(selections),
+        )
+
+    placebo = ChildSelection(
+        attempt_id=ATTEMPT, cell=PLACEBO_CELL, policy_digest=PLACEBO_RECEIPT_ARTIFACT_V1_DIGEST
+    )
+    composed(placebo)
+    with pytest.raises(ValueError, match="a child is served"):
+        composed(replace(placebo, cell=ORACLE_CELL))
+    with pytest.raises(ValueError, match="selected twice"):
+        composed(placebo, placebo)
+    with pytest.raises(ValueError, match="holds no attempt"):
+        composed(replace(placebo, attempt_id=SILENT))
+    with pytest.raises(ValueError, match="no committed selection"):
+        composed(
+            placebo,
+            source=replace(
+                parent,
+                attempts=[
+                    a_row(
+                        source_artifact=None,
+                        source_commitment=None,
+                        source_origin=None,
+                        selected_cell=None,
+                        selected_body_reference=None,
+                        selected_policy_digest=None,
+                        receipt_contract_id=None,
+                    )
+                ],
+            ),
+        )
+    with pytest.raises(ValueError, match="nothing has delivered"):
+        composed(
+            placebo,
+            source=replace(
+                parent,
+                obligations=[
+                    replace(parent.obligations[0], state="presented", candidate=None)
+                ],
+            ),
+        )
+    with pytest.raises(ValueError, match="owes no payload"):
+        composed(placebo, source=replace(parent, obligations=[]))
+
+
+def test_a_gated_child_projection_is_written_over_the_state_its_start_rebuilt(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Admitting the gate is half of it: the obligation has to come back holding it.
+
+    The door a fresh child comes in through is the one this build still closes, a start handed a
+    carrier being legal only where the service says an execution continued another, and the
+    composed carry holds the identity of the parent it was cut from rather than the child's. So
+    the whole constructor is driven over that same composed projection under the identity a
+    child's own turnover writes, which is the door this build has. The obligation is materialized,
+    unbuilt and gated afterwards, its attempt holds the child's own selection, and the gate leaves
+    again in the carrier this child would hand on.
+    """
+    monkeypatch.setattr(kernel_workflow.workflow, "payload_converter", lambda: CONVERTER)
+    monkeypatch.setattr(
+        kernel_workflow.workflow,
+        "info",
+        lambda: SimpleNamespace(
+            workflow_id="stream/the-child/1", continued_run_id="the-parent-run"
+        ),
+    )
+    child = a_child_start(slot=SINGLETON_SLOT)
+    projection = replace(a_child_projection(), configuration_hash=configuration_hash(child))
+    packed = pack_carrier(projection, CONVERTER, version=FORK_CARRIER_SCHEMA_VERSION)
+    restored = kernel_workflow.StreamWorkflow(replace(child, carry=packed))
+
+    owed = restored._obligations[ATTEMPT]
+    assert (owed.pending_preparation, owed.candidate, owed.materialized) == (True, None, True)
+    attempt = restored._attempts[ATTEMPT]
+    assert attempt.selected_cell == PLACEBO_CELL
+    assert attempt.selected_body_reference == digest_of(BODIES[PLACEBO_CELL])
+    assert attempt.selected_policy_digest == PLACEBO_RECEIPT_ARTIFACT_V1_DIGEST
+    # And the source it inherited is the parent's, read back through the strict readers.
+    assert attempt.source_origin == SourceOriginContext(
+        hidden_execution_id=EXECUTION, execution_ordinal=0
+    )
+    assert attempt.seal_id == hidden_seal_id(EXECUTION, 0, ATTEMPT)
+    # And the gate is written back out. A child that reaches a boundary before its preparation
+    # lands hands its successor an obligation still holding it, rather than one that reads as a
+    # carry that lost its candidate.
+    handed_on = restored._projection().obligations
+    assert [(owed.attempt_id, owed.pending_preparation) for owed in handed_on] == [(ATTEMPT, True)]
