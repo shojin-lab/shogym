@@ -7,8 +7,8 @@ surface form defeats the exact-match fast path must be graded ``correct``, and a
 wrong answer ``incorrect``. The task is injected (a well-known fact), so this needs no gated
 ``cais/hle`` download — only an OpenAI key for the judge.
 
-Skipped when ``OPENAI_API_KEY`` is absent, so offline CI stays green; run it with a key to
-confirm real-judge fidelity.
+Skipped when ``OPENAI_API_KEY`` is absent, and marked ``network`` besides, so the offline suite
+deselects it on a machine that has one; run it with a key to confirm real-judge fidelity.
 """
 
 from __future__ import annotations
@@ -22,6 +22,11 @@ pytest.importorskip("openai", reason="hle extra not installed")
 
 if not os.getenv("OPENAI_API_KEY"):
     pytest.skip("OPENAI_API_KEY not set; keyed HLE judge test skipped", allow_module_level=True)
+
+# The skip above is what a keyless machine does, and it is not the same statement as the mark.
+# A machine that has a key runs a real request to a third party, so the suite that promises to
+# reach none has to deselect these by name rather than by trusting that nobody exported one.
+pytestmark = pytest.mark.network
 
 from shogym.serve import ServedEpisode  # noqa: E402
 

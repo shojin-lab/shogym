@@ -3486,6 +3486,10 @@ def _domains_can_be_stood_up() -> bool:
     return _images_are_here() and (sandbox.default_cache() / "automationbench").is_dir()
 
 
+# Marked for the fetch rather than for the images: an empty cache is the subject here, so this
+# test downloads the pinned benchmark source and the durable service's own binary while it runs.
+# Nothing prepares those for it, and preparing them would delete the thing it checks.
+@pytest.mark.network
 @pytest.mark.skipif(
     not _images_are_here(),
     reason="the live cold-cache check needs both images built here",

@@ -1,4 +1,4 @@
-"""The four jobs collect what one job collected, test by test.
+"""Every job collects what one job collected, test by test.
 
 :mod:`tests.test_ci_shards` reads the partition in files: every test file on disk is named by
 exactly one shard. That is the cheap claim, and it runs in every job. It is not the claim CI rests
@@ -7,15 +7,15 @@ tests inside it are collected by nobody: a marker expression that deselects more
 own, a path spelled for a file that moved, a parametrization that only exists when something else
 is imported first.
 
-So this holds the four selections against the suite itself, in identities. The whole tests tree is
-collected once, each of the four selections is collected once, and the four are held against the
-one: nothing the suite collects is missing from all four, nothing appears in two of them, and
-nothing appears in a shard that the suite does not collect at all. Collection only, so the audit
-costs seconds rather than the run it describes.
+So this holds the selections against the suite itself, in identities. The whole tests tree is
+collected once, each selection is collected once, and they are held against the one: nothing the
+suite collects is missing from all of them, nothing appears in two of them, and nothing appears
+in a shard that the suite does not collect at all. Collection only, so the audit costs seconds
+rather than the run it describes.
 
 :data:`~tests.ci_shards.GUARD` is the one deliberate repetition and is checked as such: every
-selection carries it, because a check made in one job is a check the other three never made, so
-its identities are expected in all four and in exactly all four.
+selection carries it, because a check made in one job is a check the other jobs never made, so
+its identities are expected in every selection and in exactly every one of them.
 
 This file runs in one job rather than in every job, and the reason is the tree it collects. Ten
 modules bind a pinned upstream source while they are being collected, so the whole tree collects
@@ -50,7 +50,7 @@ _PREPARED = (
 
 @pytest.fixture(scope="module")
 def suite() -> Tuple[str, ...]:
-    """Every identity the suite collects, which is the one thing the four are held against."""
+    """Every identity the suite collects, which is the one thing the selections are held against."""
     try:
         return collect_ids((TESTS_DIR,))
     except CollectionFailed as failure:
@@ -69,7 +69,7 @@ def by_shard() -> Dict[str, Tuple[str, ...]]:
     return collected
 
 
-def test_the_four_jobs_collect_every_test_the_suite_collects(
+def test_the_jobs_together_collect_every_test_the_suite_collects(
     suite: Tuple[str, ...], by_shard: Dict[str, Tuple[str, ...]]
 ) -> None:
     """A test the suite collects and no shard collects is a test CI stopped running."""
@@ -82,7 +82,7 @@ def test_the_four_jobs_collect_every_test_the_suite_collects(
     )
 
 
-def test_the_four_jobs_collect_nothing_the_suite_does_not(
+def test_the_jobs_collect_nothing_the_suite_does_not(
     suite: Tuple[str, ...], by_shard: Dict[str, Tuple[str, ...]]
 ) -> None:
     """A test a shard collects and the suite does not is a job running something else."""

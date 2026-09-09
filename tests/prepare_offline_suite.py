@@ -16,10 +16,10 @@ almost nothing.
     uv run python tests/prepare_offline_suite.py
 
 That prepares everything, which is what a developer wants and what one job running the whole
-suite wanted. CI runs the suite in four jobs now (see :mod:`tests.ci_shards`), and most of them
-need almost none of this: the receipt shards bind no upstream, read no domain data and start no
-test server, and only one shard runs a task container. So the groups are selectable, and each job
-asks for the ones its own modules need:
+suite wanted. CI runs the suite in one job per shard now (see :mod:`tests.ci_shards`), and most
+of them need almost none of this: the receipt shards bind no upstream and read no domain data,
+and only one shard runs a task container. So the groups are selectable, and each job asks for
+the ones its own modules need:
 
     uv run python tests/prepare_offline_suite.py --assets sources,tau2-data
 

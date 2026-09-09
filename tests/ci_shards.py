@@ -1,21 +1,23 @@
-"""The four selections CI runs the suite in, in the one place the workflow and a test both read.
+"""The selections CI runs the suite in, in the one place the workflow and a test both read.
 
 CI is the suite: one job running every test takes about forty five minutes, and ninety nine
 percent of that is pytest. The seconds are not spread evenly over the tree. One offline run
 measured 1402s in total, of which two receipt modules and one frontier_bench module hold more
 than half. Splitting by count would therefore split nothing, so the suite is split by module into
-four selections, and each is a job that checks out, installs, prepares only the assets its own
+five selections, and each is a job that checks out, installs, prepares only the assets its own
 modules need and runs only its own paths. The run then costs what its slowest shard costs
-instead of what all four cost together.
+instead of what all five cost together.
 
 The partition below is that measurement, in the seconds it printed for phases of a second or
 more (1316s of the 1402s; the remaining 86s is thousands of shorter phases and collection, which
-falls mostly on the shard holding the most files, so the numbers below understate ``rest``):
+falls mostly on the shard holding the most files, so the numbers below understate ``rest``). The
+``durable`` row is a later measurement of its own selection, whole rather than by phase:
 
     receipt-attacks   350s   the attack surface of a bundle, and the cells a seal publishes
     frontier          311s   the vendored task oracles, their containers and their verifiers
     receipt-serving   363s   the receipt environment, its bank, and the operator's CLI
-    rest              292s   every other module, which is most of the files and few of the seconds
+    durable           146s   the kernel and the rest of protocol v2, on the test server
+    rest              289s   every other module, which is most of the files and few of the seconds
 
 The selections live here rather than in the workflow because two readers need the same answer.
 The workflow asks which paths a shard runs, which assets it needs prepared and whether it carries
@@ -23,15 +25,22 @@ the lint and type checks. :mod:`tests.test_ci_shards` asks for the same partitio
 against the test files on disk and against what its own job collected, so a file that no shard
 names fails a test in every job rather than quietly running in none of them.
 
+:data:`SUITE_MARKER` is the other half of what a job runs. ``network`` is what it deselects, and
+that is a statement about third parties: a model API, a live oracle, a cold download. A test that
+drives a real workflow on the prepared Temporal test server reaches none of those, so it carries
+``durable`` instead and this expression selects it like any unmarked test. That is what the
+``durable`` shard is: a layer of the kernel that used to be deselected on every run, now running
+on a binary the preparation stage fetches.
+
 Two rules keep the partition honest, and both are checked there rather than trusted here: no file
 is named by two shards, so nothing is paid for twice, and every test file on disk is named by
 exactly one, so nothing is lost. :data:`GUARD` is the single deliberate exception, and it is the
-file holding those checks: a check that ran in one job is a check the other three never made.
+file holding those checks: a check that ran in one job is a check the other jobs never made.
 
 Files are what a shard names, and identities are what a job runs, so the deeper claim is made in
-identities: :mod:`tests.test_ci_partition` collects the whole tests tree and each of the four
-selections through :func:`collect_ids` and holds the four against the one. It runs where the
-whole tree can be collected, which is the job that prepares the pinned upstream sources.
+identities: :mod:`tests.test_ci_partition` collects the whole tests tree and each of the
+selections through :func:`collect_ids` and holds them against the one. It runs where the whole
+tree can be collected, which is the job that prepares the pinned upstream sources.
 
 This module imports the standard library only. The workflow reads it with the runner's own
 interpreter, before the project is installed, and a shard that is renamed or added here reaches
@@ -63,19 +72,21 @@ TESTS_DIR = "tests"
 #: means the same set pytest means.
 TEST_FILE_PATTERNS = ("test_*.py", "*_test.py")
 
-#: The one test file every job runs: it is the check that these four selections are still the whole
+#: The one test file every job runs: it is the check that these selections are still the whole
 #: suite, and it is in no shard's ``paths`` so that the partition stays a partition.
 GUARD = "tests/test_ci_shards.py"
 
 #: The marker expression the offline suite is selected with, which the workflow's pytest step
 #: spells for itself. A collection made here is made with this one and compared against what the
 #: job collected, so the two spellings drifting apart is a failed check in every job rather than a
-#: difference nobody sees.
+#: difference nobody sees. It names ``network`` and nothing else: ``durable`` is selected by it
+#: the way an unmarked test is, which is the whole point of that mark being a different word.
 SUITE_MARKER = "not network"
 
 # The asset groups tests/prepare_offline_suite.py provisions, named here because a shard declares
 # which ones its modules need and its job prepares those and nothing else. The receipt shards need
-# no upstream at all; only the frontier shard needs a task image built.
+# no upstream at all; only the frontier shard needs a task image built; two shards start a test
+# server, so two of them ask for the binary.
 SOURCES = "sources"
 TAU2_DATA = "tau2-data"
 DURABLE_SERVICE = "durable-service"
@@ -132,10 +143,32 @@ SHARDS: Tuple[Shard, ...] = (
             "tests/envs/test_receipts_served.py",
         ),
     ),
+    # Protocol v2's own tests, which drive real workflows on the Temporal test server. They used
+    # to carry ``network`` for the download that server was, so they ran in no job at all; the
+    # binary is prepared now and they carry ``durable``, so this is where they run. It is a shard
+    # rather than a share of ``rest`` because of what it measured: 146s for its whole selection,
+    # of which 143s is the set that used to be deselected and 3s is what ``rest`` was already
+    # paying for these files. Folding it in would put all 143s on the job that holds most of the
+    # tree, and the rule this partition follows is to make the slowest job as fast as it can be.
+    Shard(
+        name="durable",
+        paths=(
+            "tests/test_protocol_v2_finalize.py",
+            "tests/test_protocol_v2_gateway_schedules.py",
+            "tests/test_protocol_v2_kernel.py",
+            "tests/test_protocol_v2_policy.py",
+            "tests/test_protocol_v2_reader.py",
+            "tests/test_protocol_v2_resume.py",
+            "tests/test_protocol_v2_scheduled_stream.py",
+            "tests/test_protocol_v2_turnover.py",
+        ),
+        assets=(DURABLE_SERVICE,),
+    ),
     # Everything else, which is most of the files and few of the seconds. It is the only shard
-    # whose modules bind a pinned upstream, read tau2's domains or start a test server, so it is
-    # the only one that prepares them, and for the same reason it is the one job in which the
-    # whole tests tree can be collected: the identity audit is therefore one of its files.
+    # whose modules bind a pinned upstream or read tau2's domains, so it is the only one that
+    # prepares those, and for the same reason it is the one job in which the whole tests tree can
+    # be collected: the identity audit is therefore one of its files. It asks for the test server
+    # as well, because four receipt modules serve a real generation over one.
     Shard(
         name="rest",
         paths=(
@@ -191,20 +224,12 @@ SHARDS: Tuple[Shard, ...] = (
             "tests/test_protocol_v2_artifact.py",
             "tests/test_protocol_v2_artifact_carry.py",
             "tests/test_protocol_v2_blobs.py",
-            "tests/test_protocol_v2_finalize.py",
             "tests/test_protocol_v2_gateway.py",
-            "tests/test_protocol_v2_gateway_schedules.py",
-            "tests/test_protocol_v2_kernel.py",
             "tests/test_protocol_v2_operation_failures.py",
-            "tests/test_protocol_v2_policy.py",
-            "tests/test_protocol_v2_reader.py",
             "tests/test_protocol_v2_receipt_policies.py",
             "tests/test_protocol_v2_receipt_read_back.py",
             "tests/test_protocol_v2_recovery.py",
-            "tests/test_protocol_v2_resume.py",
             "tests/test_protocol_v2_schedule_model.py",
-            "tests/test_protocol_v2_scheduled_stream.py",
-            "tests/test_protocol_v2_turnover.py",
             "tests/test_protocol_v2_wire.py",
             "tests/test_quickstart_claude_code.py",
             "tests/test_quickstart_codex.py",

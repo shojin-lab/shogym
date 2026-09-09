@@ -15,9 +15,9 @@ concurrency:
 
 jobs:
   # CI is the suite, and the suite does not divide by count: a few modules hold most of its
-  # seconds. So it runs as four jobs over the four selections in tests/ci_shards.py, each with its
-  # own checkout, its own install and only the preparation its own modules need, and a run costs
-  # what its slowest selection costs rather than what all four cost together.
+  # seconds. So it runs as one job per selection in tests/ci_shards.py, each with its own
+  # checkout, its own install and only the preparation its own modules need, and a run costs
+  # what its slowest selection costs rather than what all of them cost together.
   #
   # The names come from that module rather than from this file, so a shard added or renamed there
   # reaches CI without a second edit here, and no selection can be left out by a workflow nobody
@@ -56,10 +56,10 @@ jobs:
       # The shard says what this job runs, what it needs prepared and whether it carries the lint
       # and type checks. Every step below reads those variables and names no selection of its own,
       # which is what keeps the partition a single fact: tests/test_ci_shards.py holds the same
-      # four selections against the tests on disk and against what this job collected, in every
+      # selections against the tests on disk and against what this job collected, in every
       # one of these jobs, so a file no shard names and a job given the wrong paths both fail a
-      # test rather than quietly running in no job at all. tests/test_ci_partition.py holds the
-      # four collections against the suite's own, in the one job that can collect the whole tree.
+      # test rather than quietly running in no job at all. tests/test_ci_partition.py holds every
+      # selection's collection against the suite's own, in the one job that can collect the tree.
       - name: Read this shard's selection
         run: python3 tests/ci_shards.py github-env "${{ matrix.shard }}" >> "$GITHUB_ENV"
 
@@ -88,18 +88,27 @@ jobs:
       # It prepares this shard's assets and no others. Most of that material belongs to modules
       # one shard holds: only the frontier selection runs a task container, and the receipt
       # selections bind no upstream, read no domain data and start no test server, so their jobs
-      # ask for nothing and pay for nothing.
+      # ask for nothing and pay for nothing. The test server binary is the exception, asked for by
+      # two jobs, because the durable selection and four of the receipt modules in `rest` both
+      # serve a real generation over one.
       - name: Prepare this shard's upstream sources, data and task images (networked)
         run: |
           env -u OPENAI_API_KEY SHOGYM_PROVISIONING=prepare \
             uv run python tests/prepare_offline_suite.py --assets "$SHOGYM_CI_ASSETS"
 
       # The offline suite runs keyless: keyed tests (tau2 user-sim, hle judge) self-skip
-      # without OPENAI_API_KEY. Unset it explicitly so nothing here depends on a secret.
+      # without OPENAI_API_KEY, and carry the `network` mark besides, so a runner that had one
+      # would still not reach a model. Unset it explicitly so nothing here depends on a secret.
       # `-m "not network"` is the other half of the same promise: it deselects the tests that
       # reach a third-party service while they run (see NETWORK_ORACLE_TASKS in
       # tests/envs/test_frontier_bench_served.py), so a PR cannot go red because someone else's
       # server had a bad minute. A plain `uv run pytest` still selects them.
+      #
+      # It is the same expression it was, and that is what brings the `durable` tests in: they
+      # drive a real workflow on the Temporal test server the step above prepared, which is not a
+      # third party, so they are marked with a word this expression does not name and are selected
+      # here like any unmarked test. The expression stays `not network` rather than growing a
+      # second clause, because `network` is the one thing this step promises not to do.
       #
       # SHOGYM_PROVISIONING=offline is what makes "offline" a property of this run rather than a
       # description of it: no pinned source is downloaded and no task image is built here, so
@@ -123,7 +132,7 @@ jobs:
             | tee "$RUNNER_TEMP/pytest.log"
 
       # Once, in the shard that prepares nothing and finishes first, because the answer is about
-      # the checkout rather than about any selection and four of it would be three too many.
+      # the checkout rather than about any selection and one answer is all it has.
       - name: Lint (ruff)
         if: env.SHOGYM_CI_QUALITY == 'true'
         run: uv run ruff check .
@@ -132,7 +141,7 @@ jobs:
         if: env.SHOGYM_CI_QUALITY == 'true'
         run: uv run pyright
 
-      # What each shard ran, on the run's own summary page, so four jobs still read as one result.
+      # What each shard ran, on the run's own summary page, so the jobs still read as one result.
       - name: Report this shard's outcome
         if: always()
         run: |

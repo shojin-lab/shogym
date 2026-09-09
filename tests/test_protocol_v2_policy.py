@@ -9,7 +9,8 @@ under something other than what was resolved does not become an acknowledgement,
 carries the policy it served under where a reader can find it.
 
 The stream tests drive a real workflow on Temporal's time-skipping environment, like the rest of
-the kernel's, and skip when that server is not there.
+the kernel's, and are marked ``durable``: that server is prepared before the suite is, so they run
+in the offline suite.
 """
 
 from __future__ import annotations
@@ -107,6 +108,9 @@ from shogym.serve.protocol_v2.policy import (  # noqa: E402
     render_body,
     roster_digest,
 )
+
+from tests._fixtures.temporal_server import time_skipping_environment  # noqa: E402
+from tests._fixtures.upstream_gate import environmental_skip  # noqa: E402
 
 CLAIM_HASH = "d" * 64
 CONSUMER = ConsumerClaim(consumer_id="harness-1", claim_hash=CLAIM_HASH)
@@ -889,9 +893,9 @@ def _bundle_request(
 @pytest_asyncio.fixture
 async def env() -> AsyncIterator[WorkflowEnvironment]:
     try:
-        environment = await WorkflowEnvironment.start_time_skipping()
-    except Exception as error:  # noqa: BLE001 - an absent test server is a skip, not a failure
-        pytest.skip(f"the Temporal test server is unavailable: {error}")
+        environment = await time_skipping_environment()
+    except Exception as error:  # noqa: BLE001 - an unusable server is the machine's, not the test's
+        environmental_skip(f"the Temporal test server is unavailable: {error}")
     async with environment:
         yield environment
 
@@ -1093,7 +1097,7 @@ async def a_grade_that_writes_under_its_own_resolution(
     )
 
 
-@pytest.mark.network
+@pytest.mark.durable
 async def test_an_ordinary_generation_tells_the_agent_the_score_it_committed(
     env: WorkflowEnvironment,
 ) -> None:
@@ -1134,7 +1138,7 @@ async def test_an_ordinary_generation_tells_the_agent_the_score_it_committed(
         )
 
 
-@pytest.mark.network
+@pytest.mark.durable
 async def test_a_candidate_from_the_wrong_renderer_ends_the_attempt(
     env: WorkflowEnvironment,
 ) -> None:
@@ -1180,7 +1184,7 @@ async def test_a_candidate_from_the_wrong_renderer_ends_the_attempt(
         assert (await caller.pull()).kind == "done"
 
 
-@pytest.mark.network
+@pytest.mark.durable
 @pytest.mark.parametrize("substitution", ["honest_echo_blinded_body", "blinded_echo_honest_body"])
 async def test_a_candidate_whose_body_is_not_its_policys_ends_the_attempt(
     env: WorkflowEnvironment, substitution: str
@@ -1226,7 +1230,7 @@ async def test_a_candidate_whose_body_is_not_its_policys_ends_the_attempt(
         assert state.materialization_count == 0
 
 
-@pytest.mark.network
+@pytest.mark.durable
 async def test_a_grade_from_another_grader_is_not_published_under_this_ones_name(
     env: WorkflowEnvironment,
 ) -> None:
@@ -1253,7 +1257,7 @@ async def test_a_grade_from_another_grader_is_not_published_under_this_ones_name
         assert state.materialization_count == 0
 
 
-@pytest.mark.network
+@pytest.mark.durable
 async def test_a_number_the_environment_never_declared_is_not_served(
     env: WorkflowEnvironment,
 ) -> None:
@@ -1281,7 +1285,7 @@ async def test_a_number_the_environment_never_declared_is_not_served(
         assert state.materialization_count == 0
 
 
-@pytest.mark.network
+@pytest.mark.durable
 async def test_a_score_finer_than_the_grader_declared_is_not_served(
     env: WorkflowEnvironment,
 ) -> None:
@@ -1314,7 +1318,7 @@ async def test_a_score_finer_than_the_grader_declared_is_not_served(
         assert (record.score, record.final_failure) == (0.0, SEAL_UNUSABLE)
 
 
-@pytest.mark.network
+@pytest.mark.durable
 async def test_the_body_carries_the_fraction_the_seal_committed(
     env: WorkflowEnvironment,
 ) -> None:
@@ -1349,7 +1353,7 @@ async def test_the_body_carries_the_fraction_the_seal_committed(
         assert float(printed["ledger_fraction"]) == 0.6667
 
 
-@pytest.mark.network
+@pytest.mark.durable
 async def test_a_stand_in_grade_is_not_published_as_a_verdict(env: WorkflowEnvironment) -> None:
     """A generation that resolved to publish the grade refuses the stand-in's number.
 
@@ -1368,7 +1372,7 @@ async def test_a_stand_in_grade_is_not_published_as_a_verdict(env: WorkflowEnvir
         assert state.capacity_in_use == 0
 
 
-@pytest.mark.network
+@pytest.mark.durable
 @pytest.mark.parametrize("exposure", ["blinded", "withheld"])
 async def test_the_grader_is_checked_for_a_seal_no_body_publishes(
     env: WorkflowEnvironment, exposure: str
@@ -1419,7 +1423,7 @@ async def test_the_grader_is_checked_for_a_seal_no_body_publishes(
             assert (record.score, record.final_failure) == (0.0, SEAL_UNUSABLE)
 
 
-@pytest.mark.network
+@pytest.mark.durable
 @pytest.mark.parametrize("malformed", ["score", "component", "roster", "boolean"])
 async def test_a_grade_that_is_not_numbers_ends_the_attempt_rather_than_the_decoding(
     env: WorkflowEnvironment, malformed: str
@@ -1469,7 +1473,7 @@ async def test_a_grade_that_is_not_numbers_ends_the_attempt_rather_than_the_deco
         assert (await caller.pull()).kind == "done"
 
 
-@pytest.mark.network
+@pytest.mark.durable
 @pytest.mark.parametrize(
     "malformed",
     [
@@ -1644,7 +1648,7 @@ async def test_a_history_recorded_before_policies_replays_to_what_it_recorded() 
     await stream_replayer().replay_workflow(history)
 
 
-@pytest.mark.network
+@pytest.mark.durable
 @pytest.mark.parametrize(
     "unresolved",
     [
@@ -1750,7 +1754,7 @@ async def test_a_generation_that_has_not_resolved_what_it_delivers_does_not_star
         assert protocol_error_code(caught.value.cause) == "configuration_mismatch"
 
 
-@pytest.mark.network
+@pytest.mark.durable
 async def test_a_generation_created_now_says_what_it_delivers(env: WorkflowEnvironment) -> None:
     """The legacy profile is a decode of an old history and not a shape a new run may take.
 
@@ -2046,7 +2050,7 @@ def test_a_roster_name_a_body_could_split_or_shadow_is_refused() -> None:
             )
 
 
-@pytest.mark.network
+@pytest.mark.durable
 async def test_a_registered_honest_cell_and_a_stamped_one_read_back_apart(
     env: WorkflowEnvironment,
 ) -> None:
@@ -2073,7 +2077,7 @@ async def test_a_registered_honest_cell_and_a_stamped_one_read_back_apart(
         assert (record.profile, record.payload_resolution_source) == (EXPERIMENT, REGISTERED)
 
 
-@pytest.mark.network
+@pytest.mark.durable
 async def test_a_cell_that_does_not_come_to_its_familys_shape_ends_the_attempt(
     env: WorkflowEnvironment,
 ) -> None:
@@ -2145,7 +2149,7 @@ async def test_a_cell_that_does_not_come_to_its_familys_shape_ends_the_attempt(
         assert state.materialization_count == 0
 
 
-@pytest.mark.network
+@pytest.mark.durable
 @pytest.mark.parametrize("malformed", ["score", "component"])
 async def test_a_verdict_outside_what_the_grader_declared_ends_the_attempt(
     env: WorkflowEnvironment, malformed: str
@@ -2182,7 +2186,7 @@ async def test_a_verdict_outside_what_the_grader_declared_ends_the_attempt(
         assert (record.score, record.final_failure) == (0.0, SEAL_UNUSABLE)
 
 
-@pytest.mark.network
+@pytest.mark.durable
 async def test_the_descriptor_a_generation_named_is_read_back_before_it_is_handed_on(
     env: WorkflowEnvironment, tmp_path: Path
 ) -> None:
@@ -2225,7 +2229,7 @@ async def test_the_descriptor_a_generation_named_is_read_back_before_it_is_hande
         assert receipt.ownership_epoch == 2
 
 
-@pytest.mark.network
+@pytest.mark.durable
 async def test_a_generation_whose_descriptor_was_never_installed_does_not_start(
     env: WorkflowEnvironment, tmp_path: Path
 ) -> None:
@@ -2259,7 +2263,7 @@ async def test_a_generation_whose_descriptor_was_never_installed_does_not_start(
         assert protocol_error_code(caught.value.cause) == "invalid_message"
 
 
-@pytest.mark.network
+@pytest.mark.durable
 async def test_the_counterpart_a_matched_arm_names_is_kept_and_read_back(
     env: WorkflowEnvironment, tmp_path: Path
 ) -> None:
@@ -2332,7 +2336,7 @@ async def test_the_counterpart_a_matched_arm_names_is_kept_and_read_back(
         assert receipt.ownership_epoch == 2
 
 
-@pytest.mark.network
+@pytest.mark.durable
 async def test_a_resume_composed_for_another_resolution_is_refused_before_it_owns_anything(
     env: WorkflowEnvironment,
 ) -> None:
@@ -2399,7 +2403,7 @@ def test_wordle_scores_the_game_that_was_played() -> None:
     assert late["guesses_used"] == 6.0
 
 
-@pytest.mark.network
+@pytest.mark.durable
 @pytest.mark.parametrize("found", [True, False])
 async def test_a_wordle_play_that_uses_every_guess_is_still_filed_and_scored(
     env: WorkflowEnvironment, found: bool

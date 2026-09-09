@@ -6,8 +6,9 @@ one payload; under Never there is no payload to follow it; and under a plan with
 served order is the leg automaton's rather than the queue's.
 
 Every test drives a real workflow through the same Updates a gateway sends, on Temporal's
-time-skipping environment. They are marked ``network`` because that environment downloads a
-test server on first use, and they skip rather than fail when it is not there.
+time-skipping environment. They are marked ``durable``: the test server that environment runs
+on is prepared before the suite is, so these run in the offline suite, and a machine that was
+prepared and has no binary fails naming it rather than skipping.
 """
 
 from __future__ import annotations
@@ -50,6 +51,8 @@ from shogym.serve.protocol_v2.kernel import (  # noqa: E402
     stream_worker,
 )
 from tests._fixtures.policy_rows import registering_the_receipt  # noqa: E402
+from tests._fixtures.temporal_server import time_skipping_environment  # noqa: E402
+from tests._fixtures.upstream_gate import environmental_skip  # noqa: E402
 
 DOSE = 12
 CLAIM_HASH = "d" * 64
@@ -131,9 +134,9 @@ LEG_WITHOUT_PAYLOAD = (attempt(1), attempt(2))
 @pytest_asyncio.fixture
 async def env() -> AsyncIterator[WorkflowEnvironment]:
     try:
-        environment = await WorkflowEnvironment.start_time_skipping()
-    except Exception as error:  # noqa: BLE001 - an absent test server is a skip, not a failure
-        pytest.skip(f"the Temporal test server is unavailable: {error}")
+        environment = await time_skipping_environment()
+    except Exception as error:  # noqa: BLE001 - an unusable server is the machine's, not the test's
+        environmental_skip(f"the Temporal test server is unavailable: {error}")
     async with environment:
         yield environment
 
@@ -226,7 +229,7 @@ async def served(caller: Caller, *, limit: int = 200) -> List[OfferedMessage]:
     raise AssertionError("the generation never reached Done")
 
 
-@pytest.mark.network
+@pytest.mark.durable
 async def test_every_task_is_followed_by_one_payload_under_immediate(env) -> None:
     """Twelve tasks, twelve payloads, one Done, and each payload against its own attempt."""
     async with stream_worker(env.client):
@@ -265,7 +268,7 @@ async def test_every_task_is_followed_by_one_payload_under_immediate(env) -> Non
         assert state.wait_count == 0
 
 
-@pytest.mark.network
+@pytest.mark.durable
 async def test_never_creates_no_obligation_to_deliver(env) -> None:
     """The same twelve tasks under Never: no payload is built, released, offered, or shown."""
     start = make_start(bodies=dose_bodies(), release=NEVER)
@@ -290,7 +293,7 @@ async def test_never_creates_no_obligation_to_deliver(env) -> None:
         assert state.presentation_count == DOSE * 2 + 1
 
 
-@pytest.mark.network
+@pytest.mark.durable
 async def test_a_gate_serves_the_leg_order_rather_than_the_queue_order(env) -> None:
     """After the first payload only the filler is eligible, and B waits for the filler's seal."""
     async with stream_worker(env.client):
@@ -330,7 +333,7 @@ async def test_a_gate_serves_the_leg_order_rather_than_the_queue_order(env) -> N
         assert state.wait_count == 0
 
 
-@pytest.mark.network
+@pytest.mark.durable
 async def test_done_waits_for_a_live_task_and_for_an_unpresented_result(env) -> None:
     """A closed and empty queue is not enough, and a payload nobody has read is not either."""
     async with stream_worker(env.client):
@@ -375,7 +378,7 @@ async def test_done_waits_for_a_live_task_and_for_an_unpresented_result(env) -> 
         assert (await caller.stream.handle.result()).generation_state == "done"
 
 
-@pytest.mark.network
+@pytest.mark.durable
 async def test_positions_hold_through_retries_and_waits(env) -> None:
     """A replayed request and a run of Waits change no position and no public identifier."""
     async with stream_worker(env.client):
@@ -415,7 +418,7 @@ async def test_positions_hold_through_retries_and_waits(env) -> None:
             assert [message.message_id for message in seen if message.kind == kind] == fixed
 
 
-@pytest.mark.network
+@pytest.mark.durable
 async def test_two_generations_under_one_plan_wait_alike(env) -> None:
     """A blinded comparison matches the whole Wait pattern, so one plan has to produce one."""
     async with stream_worker(env.client):
@@ -435,7 +438,7 @@ async def test_two_generations_under_one_plan_wait_alike(env) -> None:
         assert patterns[0][2] == {"queue_open": 3}
 
 
-@pytest.mark.network
+@pytest.mark.durable
 async def test_a_generation_whose_schedule_does_not_hold_together_never_starts(env) -> None:
     """The manifest, the roster, and the plan describe one generation, or nothing runs."""
     async with stream_worker(env.client):

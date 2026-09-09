@@ -4,7 +4,8 @@ scripted judge; this proves the **real LLM judge** distinguishes right from wron
 episode. Tasks + an in-memory searcher are injected, so this needs no encrypted-dataset download,
 no corpus, and no Java — only an OpenAI key for the judge.
 
-Skipped when ``OPENAI_API_KEY`` is absent, so offline CI stays green.
+Skipped when ``OPENAI_API_KEY`` is absent, and marked ``network`` besides, so the offline suite
+deselects it on a machine that has one.
 """
 
 from __future__ import annotations
@@ -21,6 +22,11 @@ if not os.getenv("OPENAI_API_KEY"):
         "OPENAI_API_KEY not set; keyed browsecomp_plus judge test skipped",
         allow_module_level=True,
     )
+
+# The skip above is what a keyless machine does, and it is not the same statement as the mark.
+# A machine that has a key runs a real request to a third party, so the suite that promises to
+# reach none has to deselect these by name rather than by trusting that nobody exported one.
+pytestmark = pytest.mark.network
 
 from shogym.envs.browsecomp_plus.searcher import InMemorySearcher  # noqa: E402
 from shogym.serve import ServedEpisode  # noqa: E402

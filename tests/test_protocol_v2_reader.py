@@ -4,12 +4,14 @@ The protocol keeps the score in the one place it can be authoritative: the gener
 durable history. So a record is read by asking that history rather than by parsing anything a
 run wrote down while it served, and the file a reader leaves behind is a view of the answer.
 
-The live half needs a service, so it is marked ``network`` and downloads one on first use. What
-the Query answers is asked of the time-skipping environment, which is quick; the two tests of
-the reader itself serve onto the database a run directory keeps and read that directory back,
-because a run directory holding its own history is the arrangement the reader exists for. The
-offline half is the part that has no history to ask: a directory whose database is not there is
-not a failure, it is a directory with nothing to read.
+The live half needs a service. Most of it is marked ``durable`` and runs on the prepared test
+server; the reads that need the dev service a run directory holds keep ``network``, because that
+binary is a download and no stage prepares it. What the Query answers is asked of the
+time-skipping environment, which is quick; the two tests of the reader itself serve onto the
+database a run directory keeps and read that directory back, because a run directory holding its
+own history is the arrangement the reader exists for. The offline half is the part that has no
+history to ask: a directory whose database is not there is not a failure, it is a directory with
+nothing to read.
 
 Three distinctions the rows exist to keep get tests of their own. An offer is a reservation and
 a presentation is what the model saw, so every message here is asked about while it is offered
@@ -123,6 +125,8 @@ from shogym.serve.protocol_v2.schedule import (
 )
 from tests._fixtures.history import the_activity_that_failed
 from tests._fixtures.policy_rows import registering_the_receipt
+from tests._fixtures.temporal_server import time_skipping_environment
+from tests._fixtures.upstream_gate import environmental_skip
 
 #: How long an attempt of a generation that declares a deadline gets, and a deadline no test
 #: here is meant to reach: the second one is armed so that a row can say a clock is running.
@@ -360,9 +364,9 @@ ENVIRONMENT_ACTIVITIES = [
 @pytest_asyncio.fixture
 async def env() -> AsyncIterator[WorkflowEnvironment]:
     try:
-        environment = await WorkflowEnvironment.start_time_skipping()
-    except Exception as error:  # noqa: BLE001 - an absent test server is a skip, not a failure
-        pytest.skip(f"the Temporal test server is unavailable: {error}")
+        environment = await time_skipping_environment()
+    except Exception as error:  # noqa: BLE001 - an unusable server is the machine's, not the test's
+        environmental_skip(f"the Temporal test server is unavailable: {error}")
     async with environment:
         yield environment
 
@@ -513,7 +517,7 @@ def queries_asked(monkeypatch: pytest.MonkeyPatch) -> List[Any]:
     return asked
 
 
-@pytest.mark.network
+@pytest.mark.durable
 async def test_a_run_says_what_each_attempt_filed_and_scored(env: WorkflowEnvironment) -> None:
     """Two sealed attempts and one nobody pulled, read back as three rows."""
     async with stream_worker(env.client):
@@ -574,7 +578,7 @@ async def test_a_run_says_what_each_attempt_filed_and_scored(env: WorkflowEnviro
     assert untouched.payload_state == "assigned"
 
 
-@pytest.mark.network
+@pytest.mark.durable
 async def test_an_offer_is_not_a_presentation_for_any_of_the_three_messages(
     env: WorkflowEnvironment,
 ) -> None:
@@ -614,7 +618,7 @@ async def test_an_offer_is_not_a_presentation_for_any_of_the_three_messages(
         assert (await driver.records())[0].payload_state == "presented"
 
 
-@pytest.mark.network
+@pytest.mark.durable
 async def test_a_row_keeps_its_assigned_position_and_not_the_one_it_was_served_in(
     env: WorkflowEnvironment,
 ) -> None:
@@ -646,7 +650,7 @@ async def test_a_row_keeps_its_assigned_position_and_not_the_one_it_was_served_i
     assert [record.task_message_id for record in records] == [oid(0x101), oid(0x105)]
 
 
-@pytest.mark.network
+@pytest.mark.durable
 async def test_a_row_that_was_owed_no_payload_is_not_a_row_that_missed_one(
     env: WorkflowEnvironment,
 ) -> None:
@@ -678,7 +682,7 @@ async def test_a_row_that_was_owed_no_payload_is_not_a_row_that_missed_one(
     assert owed.payload_state == "eligible"
 
 
-@pytest.mark.network
+@pytest.mark.durable
 async def test_a_run_says_why_each_attempt_that_never_filed_ended(env: WorkflowEnvironment) -> None:
     """A finished generation whose three attempts all ended without a filing, read row by row.
 
@@ -759,7 +763,7 @@ async def test_a_run_says_why_each_attempt_that_never_filed_ended(env: WorkflowE
     assert [record.payload_state for record in records] == ["final_failed"] * 3
 
 
-@pytest.mark.network
+@pytest.mark.durable
 async def test_the_file_a_read_leaves_behind_holds_exactly_those_rows(
     env: WorkflowEnvironment, tmp_path: Path
 ) -> None:
@@ -965,7 +969,7 @@ async def test_a_commitment_stands_although_nobody_ever_received_those_bytes(
     assert run.records[0].task_delivered
 
 
-@pytest.mark.network
+@pytest.mark.durable
 async def test_the_rows_and_the_commitments_come_back_from_one_moment(
     env: WorkflowEnvironment,
 ) -> None:
@@ -1003,7 +1007,7 @@ async def test_the_rows_and_the_commitments_come_back_from_one_moment(
         )
 
 
-@pytest.mark.network
+@pytest.mark.durable
 async def test_the_file_explains_a_row_whose_seal_failed(
     env: WorkflowEnvironment, tmp_path: Path
 ) -> None:
