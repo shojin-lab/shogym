@@ -101,20 +101,49 @@ with workflow.unsafe.imports_passed_through():
         source_commitment,
     )
     from shogym.serve.protocol_v2.kernel.activities import (
+        EXPIRED_AUTHORITY_FAILURE,
         GENERATE_PAYLOAD_BUNDLE,
+        ORIGIN_DISAGREEMENT_FAILURE,
+        fork_availability_activity,
         generate_payload_bundle_activity,
         grade_attempt_activity,
         seal_attempt_activity,
+        start_fork_child_activity,
         verify_blobs_activity,
+        verify_fork_origin_activity,
     )
     from shogym.serve.protocol_v2.kernel.messages import (
         ABANDONED,
         CARRIER_SCHEMA_VERSIONS,
+        CONFIRMED_EXISTING,
         CONTINUED_FIRST_DELIVERY,
         CONTRACT_DRIFT,
         CORRUPT_EVIDENCE,
         DEADLINE,
+        EXISTENCE_UNCONFIRMED,
+        EXPIRED_PREPARATION,
         FINAL_FAILURE_REASONS,
+        FORK_ABANDONED,
+        FORK_AVAILABILITY_STEP,
+        FORK_CHILDREN_CONFIRMED,
+        FORK_COMPLETE,
+        FORK_CONFIGURATION_VIOLATION,
+        FORK_CONFLICTED,
+        FORK_EXPIRED_AUTHORITY,
+        FORK_IN_FLIGHT,
+        FORK_NOT_QUIET,
+        FORK_MOVED_EXECUTION,
+        FORK_ORIGIN_DISAGREEMENT,
+        FORK_ORIGIN_STEP,
+        FORK_PREPARED,
+        FORK_REPAIRABLE_ABSENCE,
+        FORK_REQUEST_CONFLICT,
+        FORK_START_STEP,
+        FORK_UNDECLARED_BRANCH,
+        FORK_UNRECOVERABLE_EVIDENCE,
+        FORK_WITNESS_MISMATCH,
+        RETRYABLE_FORK_REFUSALS,
+        SPENT_RECOVERY_RESERVE,
         OPERATION_OUTCOMES,
         OPERATION_PHASES,
         OPERATION_REASONS,
@@ -143,7 +172,17 @@ with workflow.unsafe.imports_passed_through():
         EnvironmentLease,
         FinalizeRequest,
         finalize_request_identity,
+        ForkAvailability,
+        ForkAvailabilityInput,
+        ForkChildPlan,
+        ForkChildReceipt,
+        ForkChildStarted,
         ForkOrigin,
+        ForkOriginVerified,
+        ForkReceipt,
+        ForkRequest,
+        ForkStatusAnswer,
+        ForkStatusQuestion,
         GeneratePayloadBundleInput,
         GenerationRecords,
         GradeAttemptInput,
@@ -155,6 +194,7 @@ with workflow.unsafe.imports_passed_through():
         PayloadCandidate,
         PayloadCandidateResult,
         PreparedChild,
+        PreparedFork,
         PresentedMessage,
         QueueClosed,
         SealAttemptInput,
@@ -165,23 +205,43 @@ with workflow.unsafe.imports_passed_through():
         StreamCarry,
         StreamOutcome,
         StreamStart,
+        StartForkChildInput,
         StreamState,
         TaskItem,
         VerifyBlobsInput,
+        VerifyForkOriginInput,
         Writer,
         assignments_for,
         carrier_version,
+        check_child_configuration,
         check_complete_start_authorization,
         check_fork_origin,
+        check_fork_request,
+        check_origin_reply_within_bound,
+        check_origin_within_bound,
+        check_receipt_within_bound,
+        check_start_within_bound,
+        check_transmitted_size,
+        canonical_location,
+        child_blob_root,
+        child_workflow_id,
+        complete_start_digest,
         configuration_hash,
         continuation_argument,
         derived_selection,
+        fork_activity_id,
+        fork_origin_bound,
+        fork_receipt_bound,
+        fork_start_bound,
+        fork_request_digest,
         hidden_seal_id,
+        origin_digest,
         origin_fields,
         ownership_claim_operation_identity,
         read_source_origin,
         resolved_echo,
         source_seal_id,
+        start_difference_projection,
         CarriedProjection,
         pack_carrier,
         unpack_carrier,
@@ -194,7 +254,6 @@ with workflow.unsafe.imports_passed_through():
         LEGACY,
         POLICIES,
         PROFILES,
-        SINGLETON_SLOT,
         GradeIdentity,
         MatchedFamily,
         PayloadDisposition,
@@ -210,6 +269,7 @@ with workflow.unsafe.imports_passed_through():
         policy_name_of,
         published_grade,
         render_body,
+        roster_digest,
     )
     from shogym.serve.protocol_v2.schedule import PAYLOAD, TASK
 
@@ -246,6 +306,10 @@ FLOOR = 0.0
 
 OPEN = "open"
 DONE = "done"
+# And the third, which is a parent that has forked. It is terminal like Done and it is not Done: a
+# generation that presented Done told its agent its work was over, and a generation that was forked
+# told its agent nothing at all.
+FORKED = "forked"
 
 _ACTIVITY_TIMEOUT = timedelta(seconds=60)
 # What the seal and the grade are given instead. They are the two Activities that reach an
@@ -259,6 +323,16 @@ _ACTIVITY_RETRY = RetryPolicy(
     backoff_coefficient=2.0,
     maximum_interval=timedelta(seconds=10),
     maximum_attempts=3,
+)
+# What a gated child's origin question is retried under, and why it has no attempt limit. An
+# unavailable parent, an unavailable Worker, an unreadable history and a closed answer window are
+# all infrastructure, and the child stays gated while they last: it owns nothing, serves nothing
+# and costs nothing while it waits. An authenticated disagreement is not retried at all, because
+# the answer that carries it is non-retryable and the row came from the parent's own record.
+_ORIGIN_RETRY = RetryPolicy(
+    initial_interval=timedelta(seconds=1),
+    backoff_coefficient=2.0,
+    maximum_interval=timedelta(seconds=60),
 )
 
 # How much of an Activity's failure a row keeps, in bytes, and the mark left where the cap cut a
@@ -317,6 +391,55 @@ assert (
     TURNOVER_TRIGGER + ADMISSION_LEAD + ADMISSION_RESERVE + TURNOVER_MARGIN < SERVICE_UPDATE_CAP
 ), "the trigger, the admission lead, the reserve and the margin have to fit under the cap"
 
+# What a parent admits once it has committed a fork barrier, and why it is a number of its own.
+#
+# The fork reserve replaces the post-latch reserve rather than adding to it: a generation that has
+# latched for a turnover refuses a fork, and one that has committed a barrier never turns over, so
+# the two allowances are never both in force. Twenty four leaves the same inequality standing under
+# the smallest supported cap.
+#
+# All of them are the fork's own class, which is what the reserve is kept for. Nothing else can
+# take one: status is read by Query, which charges nothing, and the barrier's whitelist admits no
+# other writing class at all, so repeated reads and repeated recovery work cannot lock out the one
+# call that can finish the fork. A build that widens that whitelist owes this class an allowance of
+# its own inside this number.
+FORK_RESERVE = 24
+assert (
+    TURNOVER_TRIGGER + ADMISSION_LEAD + FORK_RESERVE + TURNOVER_MARGIN < SERVICE_UPDATE_CAP
+), "the trigger, the admission lead, the fork reserve and the margin have to fit under the cap"
+
+# How long the parent's own fork work has to finish, and how long the answers it owes stand.
+#
+# The bound is a deadline on the parent's own work and never a bound on when it actually closes,
+# because the SDK runs a durable timer's callback only inside a Worker activation: a parent whose
+# Worker is away commits nothing when its deadline becomes due, and a Worker that comes back after
+# it records the expiry against the recorded due time and restarts neither clock.
+#
+# The horizon is recorded at the barrier because the close cannot be bounded and the deletion clock
+# is not the close clock either: the service schedules each execution's history for deletion from
+# that execution's own close time, so a child that failed an hour after the barrier is deleted on
+# its own clock while the parent is still prepared. The window is the earlier of the horizon and
+# the parent's actual close plus the answer window, which is why a late close shortens the recovery
+# window rather than extending the retention a deployment owes.
+FORK_PREPARATION_BOUND_MS = 12 * 60 * 60 * 1000
+FORK_ANSWER_WINDOW_MS = 24 * 60 * 60 * 1000
+FORK_AUTHORITY_HORIZON_MS = FORK_PREPARATION_BOUND_MS + FORK_ANSWER_WINDOW_MS
+
+# What one child start Activity is bounded by. The SDK defines this as covering the scheduling and
+# every retry rather than one run, so the last in-flight outcome settles at a time the parent
+# declared rather than at one an unavailable service chooses. A timeout is never proof that no
+# child exists: the child it named moves into the attempted-unconfirmed class and never into never
+# attempted or into proven absent.
+_FORK_START_TIMEOUT = timedelta(hours=1)
+
+# The endings a fork never moves out of once it stands at one, and every state its parent stops
+# waiting at. An abandonment is the ending a spent reserve or an expired bound commits, and a
+# conflict is the ending a permanent decision reached after the barrier: both retain every child
+# the fork made, and neither is ever rewritten by a later status. A parent parks until the fork is
+# at one of those or has finished, because there is nothing left for it to wait for at any of them.
+_FORK_ENDINGS = (FORK_ABANDONED, FORK_CONFLICTED)
+_FORK_SETTLED = (FORK_COMPLETE, *_FORK_ENDINGS)
+
 # The refusal an arriving Update is rejected with once the latch is set. It is not a protocol
 # error the agent is ever shown: the transport waits for the boundary and sends the same request,
 # under the same Update ID, at the execution that comes next.
@@ -327,6 +450,11 @@ TURNOVER_PENDING = "turnover_pending"
 # the caller sent is wrong, and the verification the child owes is its own first work, so the same
 # call reaches a generation that has done it.
 ORIGIN_UNVERIFIED = "origin_unverified"
+
+# What a parked parent rejects an Update with once its barrier stands. It is not a protocol code
+# the agent is ever shown, and neither is a fork refusal, which names its own reason as its type
+# rather than sharing one.
+FORK_BARRIER = "fork_barrier"
 
 # Why a generation gave up on a boundary it had decided to take. Both are recorded where a
 # launcher can read them, because both leave the generation serving out the execution it is in
@@ -460,6 +588,60 @@ class OriginUnverified(ApplicationError):
             "this generation has still to authorize the lineage it was cut from, and it owns "
             "nothing and serves nothing until it has",
             type=ORIGIN_UNVERIFIED,
+            non_retryable=True,
+        )
+
+
+class ForkRefused(ApplicationError):
+    """A fork this generation will not take, naming the clause that failed.
+
+    It is a controller refusal and never joins the agent-visible set: no fork failure is ever
+    mapped onto a protocol code, and nothing about one reaches a model. ``reason`` is one of the
+    closed refusal reasons and ``clause`` says which condition under it did not hold, so a fork
+    that did not happen is diagnosable without reading a history.
+
+    Retryable and permanent are kept apart because the experiment treats them differently: it
+    retries infrastructure and never retries a decision, so a permanent refusal is recorded with
+    its reason rather than attempted again.
+
+    The reason is the failure's own type rather than a detail beside a shared one, because a
+    refusal has to keep its reason wherever the failure is kept: the outcome journal holds a type
+    and a message and no details, and an exact identifier answered from that journal after a
+    boundary or from a closed parent has to say the same thing the live refusal said.
+    """
+
+    def __init__(self, reason: str, clause: str) -> None:
+        self.reason = reason
+        self.clause = clause
+        super().__init__(
+            f"this fork is refused: {clause}",
+            reason,
+            clause,
+            type=reason,
+            non_retryable=reason not in RETRYABLE_FORK_REFUSALS,
+        )
+
+
+class ForkBarrier(ApplicationError):
+    """This generation has committed a fork barrier, so this Update was not admitted.
+
+    A barriered parent is fenced and parked and never advances again. The whitelist of what it
+    still accepts is smaller than a turnover's, because the parent is already quiet rather than
+    working towards quiet: it admits the fork request under its own identity and the fresh logical
+    retries that can finish an incomplete fork, and everything a controller wants to read is a
+    Query, which reaches none of this and charges nothing.
+
+    It is deliberately not a turnover's refusal, and not a protocol code. A caller told a turnover
+    is pending waits for an execution that is coming; there is no such execution here, and a caller
+    that waited for one would wait for ever.
+    """
+
+    def __init__(self, clause: str) -> None:
+        self.clause = clause
+        super().__init__(
+            f"this generation has forked and accepts no further work: {clause}",
+            clause,
+            type=FORK_BARRIER,
             non_retryable=True,
         )
 
@@ -626,6 +808,20 @@ class _Eligibility:
     order_key: Tuple[int, int, str]
 
 
+@dataclass(frozen=True)
+class _ReplyBounds:
+    """The proved encoded upper bounds of the three replies one fork transmits.
+
+    They are measured together and before the barrier, and every one of them is retained in the
+    record the barrier commits, because a bound recomputed later from the value it is meant to
+    bound is not a bound at all.
+    """
+
+    receipt: int
+    origin: int
+    start: int
+
+
 @dataclass
 class _Bound:
     """A logical request, its canonical identity, and the immutable result bound to it."""
@@ -705,6 +901,10 @@ CLOSE = "close_queue"
 GRANT = "begin_environment_call"
 RELEASE = "end_environment_call"
 CONFIRM = "confirm_state"
+# And the twelfth, which no agent reaches and no gateway sends. A fork is a platform operation over
+# two generations rather than a call in the protocol, and the exact Update returns the complete
+# receipt, which is what makes the outcome journal a usable recovery path for it.
+FORK = "fork_generation"
 
 # What each of them answers with. A journal entry says which handler wrote it, and that is
 # enough to read the value back as the thing it is rather than as an untyped map.
@@ -720,6 +920,7 @@ ANSWER_TYPES: Dict[str, Any] = {
     GRANT: EnvironmentLease,
     RELEASE: EnvironmentLease,
     CONFIRM: StreamState,
+    FORK: ForkReceipt,
 }
 
 # How a journal entry says where its answer is. A value the generation keeps nowhere else is
@@ -808,12 +1009,12 @@ class StreamWorkflow:
         )
         # What each obligation was resolved to on the branch this generation serves, which is
         # the only branch it may resolve: a row for a slot nothing has created is refused at the
-        # start. The key keeps its branch anyway, because the fork that will create those slots
-        # is the reason two rows can share one obligation.
+        # start. The key keeps its branch anyway, because two children of one fork sharing one
+        # obligation is the reason two rows can carry it.
         self._served: Dict[str, PayloadDisposition] = {
             row.attempt_id: row
             for row in start.dispositions
-            if row.branch_slot == SINGLETON_SLOT and row.kind == DELIVER
+            if row.branch_slot == start.served_slot and row.kind == DELIVER
         }
         # Every row of the branch this generation serves, delivering or withholding. The seal
         # reads this one rather than the deliveries: which contract a capture is validated
@@ -822,7 +1023,7 @@ class StreamWorkflow:
         self._resolved: Dict[str, PayloadDisposition] = {
             row.attempt_id: row
             for row in start.dispositions
-            if row.branch_slot == SINGLETON_SLOT
+            if row.branch_slot == start.served_slot
         }
         # The matched arms this generation's rows are cells of, by the name a row claims.
         self._families: Dict[str, MatchedFamily] = {
@@ -961,12 +1162,46 @@ class StreamWorkflow:
         # so this is that record made to cross. Several identifiers may name one logical row, and
         # every one of them keeps working.
         self._journal: Dict[str, _Answer] = {}
-        # How many accepted handlers are running. A boundary waits for all of them, and a caller
-        # held off for that boundary has to be able to see that it is waiting for something: an
-        # owner replaced while its filing was still grading leaves work the projection no longer
-        # names anywhere, and a transport comparing projections would read that as a generation
-        # that had stopped.
-        self._unfinished = 0
+        # Which accepted handlers are running, by the exact Update identifier each was reached
+        # under. A boundary waits for all of them, and a caller held off for that boundary has to
+        # be able to see that it is waiting for something: an owner replaced while its filing was
+        # still grading leaves work the projection no longer names anywhere, and a transport
+        # comparing projections would read that as a generation that had stopped.
+        #
+        # The identifier is what makes it a ledger rather than a count. The SDK inserts an Update
+        # into its own in-progress map before it runs that Update's validator and removes it in the
+        # handler's finally, so a request that waited for the SDK's predicate in its own validator
+        # or its own handler would wait for itself for ever. The public predicate takes no
+        # exclusion argument, so the exclusion is this generation's to keep: an entry is made in
+        # the accepted handler's prologue, which is after every validator has run, so a validator
+        # sees exactly the handlers that were accepted and have not finished and never sees itself,
+        # and a handler excludes its own identifier by name.
+        #
+        # This kernel registers no signal handler at all, so the signal half of the SDK's predicate
+        # is empty by construction, and any signal handler added later joins this ledger under the
+        # same rule.
+        self._handlers: Dict[str, str] = {}
+        # The fork this generation has committed a barrier for, if it has committed one, and the
+        # receipt it answered with. The record is immutable provenance about the children and their
+        # starts; the parent never advances again once it stands.
+        self._fork: Optional[PreparedFork] = None
+        self._fork_receipt: Optional[ForkReceipt] = None
+        # When the parent's own fork work is due, and the absolute moment after which it can answer
+        # nothing. Both are recorded at the barrier's commit, from the clock this generation reads,
+        # because the close cannot be bounded and the deletion clock is not the close clock either.
+        self._fork_deadline_at = 0
+        self._fork_horizon_at = 0
+        # What has been accepted since the barrier, which is what the reserve bounds. The gate
+        # reads it rather than inferring it from the work this generation guessed at.
+        self._post_barrier = 0
+        # Whether the parent has stopped admitting fork work, which expiry and exhaustion both
+        # reach: it admits no further work and schedules no new start work, it bounds the start
+        # work already pending, and it closes only after the ledger settles.
+        self._fork_admits_nothing = False
+        # How many times each step of a fork has been dispatched, so every fork-only invocation
+        # takes its identifier from the fork's own namespace and a child's ordinary Activity
+        # numbering equals the number its inherited prefix left.
+        self._fork_steps: Dict[str, int] = {}
         # Whether this execution was continued from another one of the same generation. It is
         # what makes a carrier legal, and it is also what tells the profile marker below that
         # this is not a generation being created.
@@ -978,6 +1213,12 @@ class StreamWorkflow:
         # state and is never carried: what it gates is the comparison of a child against the
         # parent it was cut from, which is asked once, at the entry that was cut.
         self._origin_unverified = start.fork_origin is not None and not self._continued
+        # And whether the reading that opens that gate came back saying the window it had to be
+        # asked in has closed. It is a state of its own rather than a longer wait, because the
+        # horizon a parent's answers stand behind is absolute: no later reading reaches an answer,
+        # so a child that met it keeps its identity, owns and serves nothing for good, and says
+        # which of the two it is to whatever asks it for something.
+        self._origin_expired = False
         self._restore(start.carry)
 
     def _restore(self, carry: Optional[StreamCarry]) -> None:
@@ -1135,7 +1376,18 @@ class StreamWorkflow:
         It is read in the validator, where a rejection costs the generation nothing, and read
         again in the two handler-side places a call that got past it would take effect: the claim
         that installs ownership and the writer check every stream-affecting call makes.
+
+        A child whose reading came back expired says so instead. The two are different answers to
+        the same caller: the gate is a wait, and a closed window is the end of the reading, so a
+        controller told the first comes back and a controller told the second stops.
         """
+        if self._origin_expired:
+            raise ForkRefused(
+                FORK_EXPIRED_AUTHORITY,
+                f"the child {workflow.info().workflow_id} asked the parent its lineage names for "
+                "the record it verifies against and the window that parent's answers stood in had "
+                "closed, so it owns nothing and serves nothing",
+            )
         if self._origin_unverified:
             raise OriginUnverified()
 
@@ -1252,7 +1504,14 @@ class StreamWorkflow:
             and workflow.patched("profile-required-at-creation")
         ):
             raise StreamProtocolError("configuration_mismatch")
-        while not self._done_presented:
+        if self._origin_unverified:
+            await self._verify_the_lineage()
+        if self._origin_expired:
+            # There is no reading that opens this gate now, so there is nothing for this
+            # generation to work towards. It keeps its identity and its objects, answers what it
+            # is asked with the reason, and the link it belongs to is recorded incomplete.
+            await workflow.wait_condition(lambda: not self._origin_expired)
+        while not self._done_presented and self._fork is None:
             await self._wait_for_done_or_a_deadline()
             # Every deadline that has come due is applied before a boundary is even considered.
             # The wait above can end on the turnover term rather than on the clock, and an
@@ -1265,6 +1524,8 @@ class StreamWorkflow:
                 self._give_up_on_the_boundary(out_of_reach)
             elif self._turnover_ready():
                 self._turn_over()
+        if self._fork is not None:
+            await self._park_for_the_fork()
         await workflow.wait_condition(workflow.all_handlers_finished)
         return StreamOutcome(
             generation_state=self._generation_state,
@@ -1288,6 +1549,9 @@ class StreamWorkflow:
         is applied at the top of every pass, so the wait below can end on the stream falling
         quiet as well as on the clock.
 
+        A generation that has committed a fork barrier leaves here without waiting at all, because
+        it is fenced and parked and the wait it belongs in is the fork's own.
+
         A generation that has decided to continue as new waits here for its boundary, which is
         the third thing. The expiry is applied first, so a deadline that came due never crosses
         unapplied, and the boundary is only ever reached from the wait rather than from inside
@@ -1298,6 +1562,7 @@ class StreamWorkflow:
         if not armed:
             await workflow.wait_condition(
                 lambda: self._done_presented
+                or self._fork is not None
                 or bool(self._armed_deadlines())
                 or self._expiry_can_be_applied()
                 or self._turnover_ready()
@@ -1310,6 +1575,7 @@ class StreamWorkflow:
             try:
                 await workflow.wait_condition(
                     lambda: self._done_presented
+                    or self._fork is not None
                     or self._armed_deadlines() != armed
                     or self._expiry_can_be_applied()
                     or self._turnover_ready()
@@ -1445,6 +1711,12 @@ class StreamWorkflow:
         reads it rather than the latch.
         """
         self._updates += 1
+        # And the same counting once a barrier stands, which is a separate allowance rather than a
+        # share of the one above: a generation that has latched for a turnover refuses a fork, and
+        # one that has committed a barrier never turns over, so the two are never both in force.
+        if self._fork is not None:
+            self._post_barrier += 1
+            return
         if self._turnover_requested:
             self._post_latch += 1
             if repeatable:
@@ -1478,7 +1750,14 @@ class StreamWorkflow:
         """
         return self._turnover_available and self._turnover_refused is None
 
-    def _admit(self, progress: bool, *, repeatable: bool = False, claim: bool = False) -> None:
+    def _admit(
+        self,
+        progress: bool,
+        *,
+        repeatable: bool = False,
+        claim: bool = False,
+        completion: bool = False,
+    ) -> None:
         """Reject an Update that cannot bring this generation to its boundary.
 
         Once the generation is reaching for a boundary, the only Updates worth accepting are the
@@ -1509,6 +1788,7 @@ class StreamWorkflow:
         two and only the handler's reading decides anything.
         """
         self._require_authorized_lineage()
+        self._admit_after_a_barrier(completion=completion)
         if not self._reaching_for_a_boundary():
             return
         if not progress or self._post_latch >= ADMISSION_RESERVE:
@@ -1517,6 +1797,31 @@ class StreamWorkflow:
             raise TurnoverPending()
         if claim and self._post_latch_claims >= ADMISSION_CLAIMS:
             raise TurnoverPending()
+
+    def _admit_after_a_barrier(self, *, completion: bool) -> None:
+        """Bound what a parked parent accepts, and keep the reserve for the class that can spend it.
+
+        The whitelist is smaller than a turnover's, because the parent is already quiet rather than
+        working towards quiet: it admits the fork request under its own identity and the fresh
+        logical retries that can finish an incomplete fork, and nothing else. Everything a
+        controller wants to read is a Query, which reaches none of this and charges nothing, so a
+        permanently unavailable child service cannot turn polling into exhaustion of the reserve.
+
+        The reserve therefore bounds the whole of what that one class may spend rather than capping
+        the class inside it. Its slots are kept for the work this parent is named for, the way a
+        turnover's are kept for the presentation commit and the end of a held grant, and nothing
+        else here can take one. The counter is charged at the top of every accepted handler and read
+        here, so what bounds the reserve is the work the service admitted rather than the work this
+        generation guessed at.
+        """
+        if self._fork is None:
+            return
+        if not completion:
+            raise ForkBarrier("this generation has forked and serves nothing further")
+        if self._fork_admits_nothing:
+            raise ForkBarrier("this fork admits no further work")
+        if self._post_barrier >= FORK_RESERVE:
+            raise ForkBarrier("this fork has spent its recovery reserve")
 
     def _turnover_ready(self) -> bool:
         """Whether this generation may continue as new at this exact moment.
@@ -1609,23 +1914,42 @@ class StreamWorkflow:
 
     def _at_a_boundary(self) -> bool:
         """Whether nothing about this generation is part way through."""
-        if self._generation_state != OPEN or self._draining or self._done_presented:
-            return False
-        if self._pending is not None or self._operation_in_flight:
-            return False
+        return self._boundary_clause() is None
+
+    def _boundary_clause(self) -> Optional[str]:
+        """Which condition of a quiet boundary does not hold, or nothing where they all do.
+
+        The clause is named rather than counted because a caller that asked for one and was
+        refused has to be able to say which condition failed without reading a history. What is
+        checked is unchanged: the generation is open, not draining, has not presented Done, holds
+        no pending message, has no operation in flight, holds no environment grant, has no attempt
+        sealing, and has no deadline due or overdue.
+        """
+        if self._generation_state != OPEN:
+            return "generation_state"
+        if self._draining:
+            return "draining"
+        if self._done_presented:
+            return "done_presented"
+        if self._pending is not None:
+            return "pending_message"
+        if self._operation_in_flight:
+            return "operation_in_flight"
         if self._environment_call is not None:
-            return False
+            return "environment_grant"
         # A deadline that has come due is not something to carry across, whether or not its
         # expiry has been written down yet. The flag is the record of a clock that was read;
         # the comparison beside it is the clock itself, and a boundary that trusted only the
         # record would cross with an ending owed and let the next execution write it.
         now = self._now_ms()
-        return not any(
-            attempt.state == SEALING
-            or attempt.deadline_expired
-            or (attempt.deadline_at is not None and attempt.deadline_at <= now)
-            for attempt in self._attempts.values()
-        )
+        for attempt in self._attempts.values():
+            if attempt.state == SEALING:
+                return "attempt_sealing"
+            if attempt.deadline_expired or (
+                attempt.deadline_at is not None and attempt.deadline_at <= now
+            ):
+                return "deadline_due"
+        return None
 
     def _turn_over(self) -> None:
         """Hand this generation to a fresh execution, or record why it could not be handed on.
@@ -2231,6 +2555,1326 @@ class StreamWorkflow:
         # and it spends the allowance the repeats share rather than the reserve at large.
         self._admit(True, repeatable=True)
 
+    # The fork: one platform operation over two generations, which no agent reaches.
+
+    @workflow.update
+    async def fork_generation(self, request: ForkRequest) -> ForkReceipt:
+        """Fence this generation, prepare two children from its whole observed prefix, start them.
+
+        The request's own handler makes the barrier transition, against the ledger of accepted
+        handlers this generation keeps. The alternative is coordinating from the run method, which
+        forces the exact Update to answer with admission rather than with the receipt and then needs
+        a second public operation to deliver the receipt; the exact Update answers with the complete
+        receipt instead, which is what makes the outcome journal a usable recovery path.
+
+        Admission is decided in the validator, synchronously and without writing. Everything the
+        validator read is read again here, then the one stage that has to be awaited runs, then the
+        whole boundary is read a third time, and only then are the starts built and the barrier and
+        the prepared record committed in one transition. There is no await anywhere between that
+        final reading and the commit.
+        """
+        self._count_update()
+        return await self._answering(
+            FORK, self._ownership_epoch, lambda: self._fork_the_generation(request)
+        )
+
+    @fork_generation.validator
+    def _fork_generation_admitted(self, request: ForkRequest) -> None:
+        # A fork is the one call a parked parent still admits, and it is not on the turnover
+        # whitelist: a generation that has latched refuses a fork as retryable until its successor
+        # exists, and the clause below is what says so. Everything the handler decides is decided
+        # again there; nothing here writes.
+        self._admit(True, completion=True)
+        self._refuse_a_fork(request)
+
+    async def _fork_the_generation(self, request: ForkRequest) -> ForkReceipt:
+        """Run one fork, in the order the barrier's own safety depends on.
+
+        A retry that finds the barrier already standing skips straight to the children, because the
+        record is what says which children this fork is: the starts are rebuilt from the same
+        request over a parent that has not moved since, and each rebuilt start is held to the digest
+        the record committed for it. Recovery preserves children that were created and replaces
+        none that was.
+        """
+        self._refuse_a_fork(request, excluding=(self._update_id(),))
+        if self._fork is None:
+            available = await self._read_the_fork_evidence(request)
+            # The stream could move while that ran, because the barrier does not stand yet, so the
+            # whole boundary is read again here and the commit below follows with no await between.
+            self._refuse_a_fork(request, excluding=(self._update_id(),))
+            self._refuse_unavailable_evidence(available)
+            children = self._built_children(request)
+            self._commit_the_barrier(
+                request, children, self._measured_replies(request, children)
+            )
+        built = self._built_children(request)
+        await self._start_the_children(request, built)
+        return self._fork_answer(request, built)
+
+    async def _read_the_fork_evidence(self, request: ForkRequest) -> ForkAvailability:
+        """Read the three objects one fork requires, before the barrier and nowhere else.
+
+        An ordinary claim reads the manifest and deliberately verifies neither eligible body, so
+        without this the fork would commit a barrier over two references whose bytes nobody had
+        read. The manifest is named among the reads rather than left implicit in the commitment it
+        binds to, because a carried descriptor is a value in state and says nothing about whether
+        the object under its digest is still in the store.
+
+        It takes its identifier from the fork's own namespace, like every other fork-only
+        invocation, so a child's ordinary Activity numbering equals the number its inherited prefix
+        left and maps onto an unforked twin's.
+
+        Both shapes it transmits are measured as the configured converter would encode them, the
+        question before it goes and the answer as it arrives, because every shape one fork
+        transmits is measured before the barrier commits.
+        """
+        attempt = self._attempts[request.source_attempt_id]
+        manifest = self._source_descriptor(request.source_attempt_id)
+        if not attempt.source_commitment:
+            raise ForkRefused(
+                FORK_UNRECOVERABLE_EVIDENCE,
+                f"the attempt {request.source_attempt_id} committed no source to fork over",
+            )
+        root = self._start.blob_root
+        if root is None:
+            raise ForkRefused(
+                FORK_CONFIGURATION_VIOLATION,
+                "a fork copies an object closure and this generation keeps no store",
+            )
+        converter = workflow.payload_converter()
+        asked = ForkAvailabilityInput(
+            blob_root=root,
+            source_commitment=attempt.source_commitment,
+            body_references=[
+                manifest.cells[cell].sha256 for cell in sorted(ELIGIBLE_CELLS)
+            ],
+        )
+        _fork_shape_measured(
+            "the prebarrier availability read",
+            asked,
+            converter,
+            ceiling=TURNOVER_PAYLOAD_CEILING_BYTES,
+        )
+        available: ForkAvailability = await workflow.execute_activity(
+            fork_availability_activity,
+            asked,
+            start_to_close_timeout=_ACTIVITY_TIMEOUT,
+            retry_policy=_ACTIVITY_RETRY,
+            activity_id=self._fork_activity(request.fork_id, FORK_AVAILABILITY_STEP),
+        )
+        _fork_shape_measured(
+            "what the prebarrier availability read returned",
+            available,
+            converter,
+            ceiling=TURNOVER_PAYLOAD_CEILING_BYTES,
+        )
+        return available
+
+    def _source_descriptor(self, attempt_id: str) -> SourceArtifactManifest:
+        """The descriptor one attempt committed, which a fork reads its cells out of."""
+        manifest = self._attempts[attempt_id].source_artifact
+        if manifest is None:
+            raise ForkRefused(
+                FORK_UNRECOVERABLE_EVIDENCE,
+                f"the attempt {attempt_id} carries no committed descriptor",
+            )
+        return manifest
+
+    def _refuse_unavailable_evidence(self, available: ForkAvailability) -> None:
+        """Refuse a barrier over an object nobody could read, and say which one."""
+        if available.missing:
+            raise ForkRefused(
+                FORK_REPAIRABLE_ABSENCE,
+                f"the store could not produce {sorted(available.missing)}",
+            )
+
+    def _measured_replies(
+        self, request: ForkRequest, built: List[Tuple[PreparedChild, StreamStart]]
+    ) -> _ReplyBounds:
+        """Measure the shapes this fork answers with, and return the bounds proved for them.
+
+        Every shape one fork transmits is measured before the barrier commits, and three of them
+        are replies rather than requests: the receipt this Update returns, the result each child's
+        own start answers with, and the proof a child's origin verification asks for and is
+        answered with. Measuring any of them only once it exists would be measuring it after the
+        barrier that made it inevitable.
+
+        None can be measured exactly, because each carries a value the service has still to
+        generate and because the proof goes on being answered while the fork moves. So the rule is
+        exact preflight for every known value and a proved encoded upper bound for everything else:
+        each run id is allowed its declared ceiling, the proof's state members and the start's own
+        observation of what it did are taken at their widest, the converter's own wrapper is
+        measured empty for the receipt, and those bounds are what have to fit. They are returned so
+        the record can retain them, and each reply that actually arrives is measured against the
+        retained value rather than against one derived from itself.
+        """
+        converter = workflow.payload_converter()
+        origin = 0
+        start_reply = 0
+        for row, _start in built:
+            _fork_shape_measured(
+                f"the origin verification question of child {row.child_ordinal}",
+                VerifyForkOriginInput(
+                    parent_workflow_id=workflow.info().workflow_id,
+                    parent_run_id=workflow.info().run_id,
+                    fork_id=request.fork_id,
+                    child_ordinal=row.child_ordinal,
+                    child_workflow_id=row.child_workflow_id,
+                ),
+                converter,
+                ceiling=TURNOVER_PAYLOAD_CEILING_BYTES,
+            )
+            widest = fork_origin_bound(request.fork_id, row, converter)
+            if widest > TURNOVER_PAYLOAD_CEILING_BYTES:
+                raise ForkRefused(
+                    FORK_CONFIGURATION_VIOLATION,
+                    f"what the origin verification answers for child {row.child_ordinal} is "
+                    f"bounded at {widest} bytes once the run id and the states this parent can "
+                    f"answer in are allowed for, and one shape this operation transmits may be "
+                    f"{TURNOVER_PAYLOAD_CEILING_BYTES}",
+                )
+            origin = max(origin, widest)
+            answered = fork_start_bound(row, converter)
+            if answered > TURNOVER_PAYLOAD_CEILING_BYTES:
+                raise ForkRefused(
+                    FORK_CONFIGURATION_VIOLATION,
+                    f"what the start of child {row.child_ordinal} answers with is bounded at "
+                    f"{answered} bytes once the run id and either observation of what it did are "
+                    f"allowed for, and one shape this operation transmits may be "
+                    f"{TURNOVER_PAYLOAD_CEILING_BYTES}",
+                )
+            start_reply = max(start_reply, answered)
+        known = self._the_receipt(request, built)
+        _fork_shape_measured(
+            "the known parts of the fork receipt",
+            known,
+            converter,
+            ceiling=TURNOVER_PAYLOAD_CEILING_BYTES,
+        )
+        bound = fork_receipt_bound(known, converter)
+        if bound > TURNOVER_PAYLOAD_CEILING_BYTES:
+            raise ForkRefused(
+                FORK_CONFIGURATION_VIOLATION,
+                f"the fork receipt is bounded at {bound} bytes once every child's run id is "
+                f"allowed for, and one shape this operation transmits may be "
+                f"{TURNOVER_PAYLOAD_CEILING_BYTES}",
+            )
+        return _ReplyBounds(receipt=bound, origin=origin, start=start_reply)
+
+    def _commit_the_barrier(
+        self,
+        request: ForkRequest,
+        built: List[Tuple[PreparedChild, StreamStart]],
+        bounds: _ReplyBounds,
+    ) -> None:
+        """Fence the parent and record the fork, in one transition with no await inside it.
+
+        The barrier, the fence and the prepared record are one thing, so a crash between two of them
+        is impossible: a parent that is fenced has a record naming the children it prepared, and a
+        record that exists names a parent nothing can move.
+
+        The horizon is recorded here rather than derived from the close, because the close cannot
+        be bounded: the service schedules each execution's history for deletion from that
+        execution's own close time, so a child that failed an hour from now is deleted on its own
+        clock while this parent is still prepared. The deadline beside it is a bound on this
+        parent's own work and never a bound on when it actually closes.
+        """
+        self._fork = PreparedFork(
+            fork_id=request.fork_id,
+            request_digest=fork_request_digest(request),
+            checkpoint_manifest_reference=request.checkpoint_manifest_reference,
+            parent_workflow_id=workflow.info().workflow_id,
+            parent_run_id=workflow.info().run_id,
+            children=len(built),
+            child_records=[row for row, _ in built],
+            receipt_bound=bounds.receipt,
+            origin_bound=bounds.origin,
+            start_bound=bounds.start,
+            status=FORK_PREPARED,
+        )
+        self._generation_state = FORKED
+        self._fencing_token_hash = None
+        now = self._now_ms()
+        self._fork_deadline_at = now + FORK_PREPARATION_BOUND_MS
+        self._fork_horizon_at = now + FORK_AUTHORITY_HORIZON_MS
+
+    async def _start_the_children(
+        self, request: ForkRequest, built: List[Tuple[PreparedChild, StreamStart]]
+    ) -> None:
+        """Create every child the record names, one at a time and never twice.
+
+        The parent builds the starts and an Activity creates the children, rather than a controller
+        creating them from a value the parent returned, because a controller that could compose a
+        start could compose a projection holding a score nothing filed.
+
+        The class a child is in is written before its start is dispatched, so a start whose reply is
+        lost leaves that child attempted with its existence unconfirmed rather than never attempted.
+        A timeout and a failure are never proof that no child exists, and neither of them ever moves
+        a child into the class that would let a replacement be created under its identity.
+
+        One thing a start can come back with is a decision rather than a failure. Something else
+        running under a child's derived identity is authenticated and permanent, so it is turned
+        into this fork's own refusal here, before the outcome is journalled, and the ending is
+        retained with the fork: the journal keeps a type and a message and no details, and a reason
+        that arrived as an Activity's own failure would be a reason nothing downstream could read.
+        """
+        for row, start in built:
+            if self._child_row(row.child_ordinal).existence == CONFIRMED_EXISTING:
+                continue
+            if self._fork_admits_nothing:
+                # The parent has stopped admitting fork work, so no new start is scheduled and
+                # this Update fails rather than answering with a receipt naming a child nobody
+                # created. The failure is journalled and stands under this identifier for ever.
+                raise ForkBarrier(
+                    f"this fork admits no further work and child {row.child_ordinal} is unstarted"
+                )
+            self._note_child(row.child_ordinal, EXISTENCE_UNCONFIRMED)
+            try:
+                started: ForkChildStarted = await workflow.execute_activity(
+                    start_fork_child_activity,
+                    StartForkChildInput(
+                        fork_id=request.fork_id,
+                        child_ordinal=row.child_ordinal,
+                        child_workflow_id=row.child_workflow_id,
+                        task_queue=workflow.info().task_queue,
+                        start=start,
+                    ),
+                    schedule_to_close_timeout=_FORK_START_TIMEOUT,
+                    retry_policy=_ACTIVITY_RETRY,
+                    activity_id=self._fork_activity(request.fork_id, FORK_START_STEP),
+                )
+            except ActivityError as failure:
+                raise self._what_the_start_decided(row, failure) from failure
+            self._within_the_start_bound(started)
+            self._note_child(
+                row.child_ordinal, CONFIRMED_EXISTING, run_id=started.child_run_id
+            )
+        self._move_the_fork(FORK_CHILDREN_CONFIRMED)
+
+    def _what_the_start_decided(
+        self, row: PreparedChild, failure: ActivityError
+    ) -> BaseException:
+        """Return what one failed start is: a decision this fork ends on, or the failure it was.
+
+        A start that could not be made is infrastructure and stays exactly what it was, retried by
+        the policy it was made under and journalled as itself. A start that found another execution
+        under this child's derived identity is neither: the reading is authenticated, no later
+        reading reaches another answer, and replacing what is there is the one move a fork never
+        makes. So that one is the fork's own permanent refusal, recorded with the fork before the
+        outcome is kept, and the child it names keeps its identity and its class.
+        """
+        cause = failure.cause
+        if (
+            not isinstance(cause, ApplicationError)
+            or cause.type != ORIGIN_DISAGREEMENT_FAILURE
+        ):
+            return failure
+        return self._fork_ends_permanently(
+            FORK_ORIGIN_DISAGREEMENT,
+            f"the identity of child {row.child_ordinal} is held by another execution: "
+            f"{cause.message}",
+        )
+
+    def _fork_ends_permanently(self, reason: str, clause: str) -> ForkRefused:
+        """Retain one permanent ending with the fork, and return the refusal that says it.
+
+        A decision is never retried, so what a controller meets afterwards is this decision rather
+        than the work that would reach it again: the status a closed parent answers with carries
+        it, and a fresh logical retry that still reaches a handler is refused from the record
+        before anything is scheduled. The children the fork already made are left exactly as they
+        are, because an ending is not a claim that they never existed.
+        """
+        assert self._fork is not None
+        if self._fork.conflict_reason is None:
+            self._fork = replace(
+                self._fork, conflict_reason=reason, conflict_clause=clause
+            )
+        self._move_the_fork(FORK_CONFLICTED)
+        assert self._fork.conflict_reason is not None
+        return ForkRefused(self._fork.conflict_reason, self._fork.conflict_clause)
+
+    def _within_the_start_bound(self, started: ForkChildStarted) -> None:
+        """Hold what a start answered with to the bound proved for it before the barrier."""
+        assert self._fork is not None
+        try:
+            check_start_within_bound(
+                started, self._fork.start_bound, workflow.payload_converter()
+            )
+        except WireFormatError as oversize:
+            raise ForkRefused(FORK_CONFIGURATION_VIOLATION, str(oversize)) from oversize
+
+    def _the_receipt(
+        self, request: ForkRequest, built: List[Tuple[PreparedChild, StreamStart]]
+    ) -> ForkReceipt:
+        """The complete evidence one fork answers with, from the rows it was handed.
+
+        Before the barrier the rows are the ones just built and their run ids are empty, which is
+        what the bound is proved over; afterwards they are the record's own, run ids and all. The
+        shape is the same either way, which is what makes the earlier measurement a bound on the
+        later value rather than a measurement of a different thing.
+        """
+        return ForkReceipt(
+            fork_id=request.fork_id,
+            parent_workflow_id=workflow.info().workflow_id,
+            parent_run_id=workflow.info().run_id,
+            checkpoint_manifest_reference=request.checkpoint_manifest_reference,
+            children=len(built),
+            child_receipts=[
+                self._child_receipt(row, start, request.source_attempt_id)
+                for row, start in built
+            ],
+            boundary_evidence=sorted(self._fork_boundary_evidence(request)),
+        )
+
+    def _fork_answer(
+        self, request: ForkRequest, built: List[Tuple[PreparedChild, StreamStart]]
+    ) -> ForkReceipt:
+        """Build the complete receipt, measure it against the bound proved before the barrier."""
+        assert self._fork is not None
+        receipt = self._the_receipt(
+            request,
+            [(self._child_row(row.child_ordinal), start) for row, start in built],
+        )
+        try:
+            check_receipt_within_bound(
+                receipt, self._fork.receipt_bound, workflow.payload_converter()
+            )
+        except WireFormatError as oversize:
+            raise ForkRefused(FORK_CONFIGURATION_VIOLATION, str(oversize)) from oversize
+        self._fork_receipt = receipt
+        self._move_the_fork(FORK_COMPLETE)
+        return receipt
+
+    def _child_receipt(
+        self, row: PreparedChild, start: StreamStart, source_attempt_id: str
+    ) -> ForkChildReceipt:
+        """What the fork says about one child, read from that child's own start.
+
+        The next task is read from the child rather than from the parent, so a reader can check that
+        both children are about to work the same bytes rather than being told that they are. Same B
+        is an identity here and not a comparison: neither child may change the manifest, the
+        assignments or the release plan, so both carry the identical item.
+
+        The roster row the schedule selected is what names that task, because the roster row is
+        what a reader joining this receipt to a child's own schedule holds: the attempt the row
+        stands for is a second identity of the same selection and finding it is the roster's job
+        rather than a reader's.
+        """
+        roster_row, item = self._child_next_task(start, source_attempt_id) or (None, None)
+        return ForkChildReceipt(
+            child_ordinal=row.child_ordinal,
+            child_workflow_id=row.child_workflow_id,
+            child_run_id=row.child_run_id or "",
+            configuration_hash=configuration_hash(start),
+            complete_start_digest=row.complete_start_digest,
+            origin_digest=row.origin_digest,
+            branch_slot=row.branch_slot,
+            target_cell=row.target_cell,
+            selected_body_reference=row.selected_body_reference,
+            acknowledged_cursor=self._cursor,
+            projection_digest=(
+                "" if start.fork_origin is None else start.fork_origin.projection_digest
+            ),
+            start_differences=list(row.start_differences),
+            next_task_body_sha256=(
+                "" if item is None else sha256(item.body.encode("utf-8")).hexdigest()
+            ),
+            next_assignment_id="" if roster_row is None else roster_row.assignment_id,
+        )
+
+    def _child_next_task(
+        self, start: StreamStart, source_attempt_id: str
+    ) -> Optional[Tuple[Assignment, TaskItem]]:
+        """The task one child serves next, asked of that child's own schedule.
+
+        The roster is not the queue of what is left. An attempt may end where it was planned,
+        never offered and never handed out, and a controller may ask for exactly that: the task
+        is on the roster for ever afterwards and no pull will ever be given it. So the first
+        item nobody was handed is not the task a child works, and a receipt naming it would be
+        telling a reader to compare two children against a task neither will see.
+
+        What is asked instead is the plan, at the point a child stands at once the inherited
+        payload has been presented: the declared gate, the declared order and the states each
+        child carries. The attempt and obligation states are read from this generation, because
+        those are the states the child is built to carry and the transformation moves none of
+        them; the schedule, the roster and the item are read from the child's own start, which
+        is what makes two receipts something a reader can compare rather than one value copied
+        twice. Capacity does not enter it: the boundary refuses a fork with any live attempt, so
+        nothing is in flight at the cut and nothing the child inherits is holding a slot.
+
+        Both halves of the selection come back, because they are two identities of it and each
+        one answers a different question: the roster row is what the schedule chose and what a
+        receipt names it by, and the item behind it is the bytes that row hands over. A row whose
+        task the manifest does not hold is no selection at all.
+        """
+        roster = list(start.assignments) or assignments_for(start.tasks, start.release)
+        presented = {
+            obligation.item.payload_position
+            for obligation in self._obligations.values()
+            if obligation.state == PRESENTED
+        }
+        inherited = self._obligations.get(source_attempt_id)
+        if inherited is not None:
+            presented.add(inherited.item.payload_position)
+        ready = eligible_tasks(
+            start.release,
+            roster,
+            ScheduleView(
+                offered_attempts=frozenset(
+                    key for key, value in self._attempts.items() if value.state != PLANNED
+                ),
+                sealed_attempts=frozenset(
+                    key
+                    for key, value in self._attempts.items()
+                    if value.state in (SEALED, ACK_PRESENTED)
+                ),
+                presented_payload_positions=frozenset(presented),
+            ),
+        )
+        if not ready:
+            return None
+        serves = min(ready, key=lambda row: order_key(start.release, TASK, row))
+        item = next(
+            (one for one in start.tasks if one.attempt_id == serves.attempt_id), None
+        )
+        return None if item is None else (serves, item)
+
+    def _fork_boundary_evidence(self, request: ForkRequest) -> List[str]:
+        """The clauses the parent actually checked, named so a reader need not read a history."""
+        return [
+            f"acknowledged_cursor={request.acknowledged_cursor}",
+            f"attestation={request.attestation_id}",
+            f"projection_digest={request.projection_digest}",
+            f"source_attempt={request.source_attempt_id}",
+        ]
+
+    # Building one child, which is pure and produces the same two starts every time it runs.
+
+    def _built_children(
+        self, request: ForkRequest
+    ) -> List[Tuple[PreparedChild, StreamStart]]:
+        """Build both children's complete starts and the rows the parent commits about them.
+
+        Each plan, each child start and the input that starts a child are measured here, as the
+        configured converter would encode it, which is before the barrier on the first pass and
+        before any child is started on every pass after it. A wrapper can exceed the limit while
+        everything it wraps fits, so what is measured is the converter's actual output for each
+        shape that crosses. The other shapes this operation transmits are measured where they
+        cross: the request in the validator that admits it and again in the runtime that sends it,
+        the availability read and the origin question at their own Activities, and the receipt as
+        it is built. Every one of those measurements refuses the fork rather than raising, because
+        bytes the service would never carry are a decision about a request.
+
+        The build is pure and the parent does not move once its barrier stands, so a recovery run
+        derives the same two starts. Where a record already stands, each rebuilt start is held to
+        the digest that record committed for it, which is what makes recovery a resumption of the
+        same fork rather than a second one.
+        """
+        projection = self._projection()
+        converter = workflow.payload_converter()
+        built: List[Tuple[PreparedChild, StreamStart]] = []
+        for ordinal, plan in enumerate(request.child_plans, start=1):
+            _fork_shape_measured(
+                f"the plan of child {ordinal}",
+                plan,
+                converter,
+                ceiling=TURNOVER_PAYLOAD_CEILING_BYTES,
+            )
+            start, origin = self._one_child(request, plan, ordinal, projection)
+            _fork_shape_measured(
+                f"the start of child {ordinal}",
+                start,
+                converter,
+                ceiling=TURNOVER_PAYLOAD_CEILING_BYTES,
+            )
+            row = PreparedChild(
+                child_ordinal=ordinal,
+                child_workflow_id=child_workflow_id(
+                    identity_namespace=workflow.info().namespace,
+                    parent_workflow_id=workflow.info().workflow_id,
+                    fork_id=request.fork_id,
+                    child_ordinal=ordinal,
+                ),
+                complete_start_digest=complete_start_digest(start),
+                origin_digest=origin_digest(origin),
+                branch_slot=plan.branch_slot,
+                target_cell=plan.target_cell,
+                selected_body_reference=self._child_body_reference(request, plan),
+                consumer_claim_hash=plan.consumer_claim_hash,
+                hidden_execution_id=plan.hidden_execution_id,
+                start_differences=list(origin.start_differences),
+            )
+            _fork_shape_measured(
+                f"the start request for child {ordinal}",
+                StartForkChildInput(
+                    fork_id=request.fork_id,
+                    child_ordinal=ordinal,
+                    child_workflow_id=row.child_workflow_id,
+                    task_queue=workflow.info().task_queue,
+                    start=start,
+                ),
+                converter,
+                ceiling=TURNOVER_PAYLOAD_CEILING_BYTES,
+            )
+            built.append((self._agreed_child(row), start))
+        self._refuse_two_children_of_one_store(built)
+        return built
+
+    def _refuse_two_children_of_one_store(
+        self, built: List[Tuple[PreparedChild, StreamStart]]
+    ) -> None:
+        """Refuse a pair of children the request kept apart and the build brought together.
+
+        Each child is given a store of its own, and what makes two stores two is the place the
+        children are actually created in rather than the text the plans were written in. Neither
+        derivation on the way there is injective over strings: a directory keeps its objects under
+        a fixed name beneath it, and what opens that place drops a separator at the end, an empty
+        component and a component naming the directory it already stands in. So two directories
+        that differ as text can name one store, and they are compared as the place they are.
+
+        A parent that committed a barrier over such a pair would have fenced itself to create two
+        generations promised separate objects and a manifest each, and the second attachment would
+        find the first one's manifest already published in the place its own belongs. So the built
+        values are compared here, before anything is committed, where a refusal installs no barrier
+        and creates no child. The store's own directory is its parent, so comparing the stores
+        compares the directories with them.
+        """
+        seen: Dict[str, int] = {}
+        for row, start in built:
+            store = self._one_store(start.blob_root or "")
+            first = seen.get(store)
+            if first is not None:
+                raise ForkRefused(
+                    FORK_CONFIGURATION_VIOLATION,
+                    f"the children {first} and {row.child_ordinal} were given directories that "
+                    f"name one store, {store}, and each child of one fork keeps its objects and "
+                    "its manifest in a place of its own",
+                )
+            seen[store] = row.child_ordinal
+
+    def _one_store(self, location: str) -> str:
+        """The place one store is, as the one spelling two of them are compared as."""
+        try:
+            return canonical_location(location)
+        except WireFormatError as error:
+            raise ForkRefused(FORK_CONFIGURATION_VIOLATION, str(error)) from error
+
+    def _agreed_child(self, row: PreparedChild) -> PreparedChild:
+        """Hold a rebuilt row to the one the record committed, and keep what the record knows."""
+        if self._fork is None:
+            return row
+        recorded = self._child_row(row.child_ordinal)
+        for name in ("child_workflow_id", "complete_start_digest", "origin_digest"):
+            if getattr(recorded, name) != getattr(row, name):
+                raise ForkRefused(
+                    FORK_REQUEST_CONFLICT,
+                    f"the record for child {row.child_ordinal} names a {name} this request does "
+                    "not rebuild",
+                )
+        return recorded
+
+    def _one_child(
+        self,
+        request: ForkRequest,
+        plan: ForkChildPlan,
+        ordinal: int,
+        projection: CarriedProjection,
+    ) -> Tuple[StreamStart, ForkOrigin]:
+        """Return one child's complete start and the lineage record that rides in it."""
+        provenance = self._start.provenance
+        if provenance is None:
+            raise ForkRefused(
+                FORK_CONFIGURATION_VIOLATION,
+                "a child keeps the authority its parent's rows were registered under, and this "
+                "generation names none",
+            )
+        attempt = self._attempts[request.source_attempt_id]
+        manifest = self._source_descriptor(request.source_attempt_id)
+        rows = list(plan.dispositions)
+        digest = roster_digest(rows)
+        bare = replace(
+            self._start,
+            consumer_claim_hash=plan.consumer_claim_hash,
+            hidden_execution_id=plan.hidden_execution_id,
+            blob_root=child_blob_root(plan.run_directory),
+            served_slot=plan.branch_slot,
+            dispositions=rows,
+            provenance=replace(provenance, roster_digest=digest),
+            carry=None,
+            fork_origin=None,
+        )
+        try:
+            check_child_configuration(self._start, bare)
+        except WireFormatError as error:
+            raise ForkRefused(FORK_CONFIGURATION_VIOLATION, str(error)) from error
+        origin = ForkOrigin(
+            parent_workflow_id=workflow.info().workflow_id,
+            parent_run_id=workflow.info().run_id,
+            parent_configuration_hash=self._configuration_hash,
+            child_configuration_hash=configuration_hash(bare),
+            parent_execution_ordinal=self._start.execution_ordinal,
+            parent_hidden_execution_id=self._start.hidden_execution_id,
+            acknowledged_cursor=self._cursor,
+            projection_digest=request.projection_digest,
+            attestation_id=request.attestation_id,
+            acknowledged_visible_sha256=request.acknowledged_visible_sha256,
+            checkpoint_manifest_reference=request.checkpoint_manifest_reference,
+            source_attempt_id=attempt.item.attempt_id,
+            source_seal_id=attempt.seal_id or "",
+            source_submission_digest=attempt.submission_digest or "",
+            source_canonicalization_version=self._start.canonicalization_version,
+            source_score=attempt.score,
+            source_seal_ordinal=attempt.seal_ordinal or 0,
+            source_graded_evidence=attempt.graded_evidence or "",
+            source_commitment=attempt.source_commitment or "",
+            source_artifact_references=sorted(
+                reference.sha256 for reference in manifest.cells.values()
+            ),
+            branch_slot=plan.branch_slot,
+            dispositions_digest=digest,
+            start_differences=start_difference_projection(self._start, bare),
+            parent_turnovers=self._turnovers,
+            fork_id=request.fork_id,
+            child_ordinal=ordinal,
+            children=len(request.child_plans),
+        )
+        carrier = child_carrier(
+            projection,
+            selections=[
+                ChildSelection(
+                    attempt_id=request.source_attempt_id,
+                    cell=plan.target_cell,
+                    policy_digest=self._child_policy(plan, request.source_attempt_id),
+                )
+            ],
+        )
+        holding = replace(bare, fork_origin=origin)
+        composed = replace(
+            holding,
+            carry=pack_carrier(
+                carrier,
+                workflow.payload_converter(),
+                version=carrier_version(holding, carrier),
+            ),
+        )
+        self._refuse_a_child_its_own_restore_would(ordinal, composed, origin, carrier)
+        return composed, origin
+
+    def _refuse_a_child_its_own_restore_would(
+        self,
+        ordinal: int,
+        start: StreamStart,
+        origin: ForkOrigin,
+        carrier: CarriedProjection,
+    ) -> None:
+        """Hold a start this parent built to the checks the child's own constructor makes of it.
+
+        The structural transformation says the fields a child may change and what each of them
+        becomes; it says nothing about whether the result is a generation. A plan whose target cell
+        and whose own delivering row name different cells passes every classification and is
+        refused by the child's restore, and a parent that committed a barrier over it would have
+        fenced itself to create a generation nothing can start.
+
+        So the reusable pure checks are run here, over the complete start with its carrier, before
+        anything is committed: an invalid future configuration is a clean refusal that installs no
+        barrier and creates no child, and it is the same code the child runs rather than a second
+        opinion about it.
+
+        The ordinary admission every constructor makes comes first, for the same reason and against
+        the same objection. The classification says which fields a child may change and what each
+        of them becomes; it does not say the schedule and the policy still describe a generation
+        afterwards. A row saying the platform stamped it inside an experiment is one such start:
+        the transformation admits it, the fork's own clauses admit it, and no generation is ever
+        created from it.
+        """
+        try:
+            _check_start(start)
+        except StreamProtocolError as refusal:
+            raise ForkRefused(
+                FORK_CONFIGURATION_VIOLATION,
+                f"the start this fork would build for child {ordinal} is one no generation is "
+                f"created from: {refusal.code}",
+            ) from refusal
+        try:
+            check_fork_origin(origin)
+            _check_carried_receipts(start, carrier)
+        except (WireFormatError, ApplicationError) as error:
+            raise ForkRefused(
+                FORK_CONFIGURATION_VIOLATION,
+                f"the start this fork would build for child {ordinal} is one that child's own "
+                f"restore refuses: {error}",
+            ) from error
+
+    def _child_policy(self, plan: ForkChildPlan, attempt_id: str) -> str:
+        """The policy digest of the row this child resolves the inherited obligation under."""
+        for row in plan.dispositions:
+            if row.attempt_id == attempt_id and row.branch_slot == plan.branch_slot:
+                return row.policy_digest or ""
+        raise ForkRefused(
+            FORK_CONFIGURATION_VIOLATION,
+            f"the plan for {plan.branch_slot} resolves nothing for {attempt_id}",
+        )
+
+    def _child_body_reference(self, request: ForkRequest, plan: ForkChildPlan) -> str:
+        """The committed entry one child delivers, read off the descriptor carried in state."""
+        manifest = self._source_descriptor(request.source_attempt_id)
+        return manifest.cells[plan.target_cell].sha256
+
+    # The record the parent keeps about its children, and the two states it can move through.
+
+    def _child_row(self, ordinal: int) -> PreparedChild:
+        """One child's row out of the record this fork committed."""
+        assert self._fork is not None
+        for row in self._fork.child_records:
+            if row.child_ordinal == ordinal:
+                return row
+        raise ForkRefused(
+            FORK_REQUEST_CONFLICT, f"this fork prepared no child {ordinal}"
+        )
+
+    def _note_child(
+        self, ordinal: int, existence: str, *, run_id: Optional[str] = None
+    ) -> None:
+        """Move one child into the class the evidence puts it in, and never out of one.
+
+        The row that comes out of this is the one the parent answers a gated child's origin
+        question with for as long as its window admits one, and the run id in it is the first value
+        of that proof the service rather than this generation produced. So it is measured here,
+        where it arrives, against the bound proved for it before the barrier: a reply over its
+        bound is a recorded failure carrying the measurement rather than a silent oversize.
+        """
+        assert self._fork is not None
+        moved = [
+            replace(row, existence=existence, child_run_id=run_id or row.child_run_id)
+            if row.child_ordinal == ordinal
+            else row
+            for row in self._fork.child_records
+        ]
+        for row in moved:
+            if row.child_ordinal == ordinal and row.child_run_id:
+                try:
+                    check_origin_within_bound(
+                        self._fork.fork_id,
+                        row,
+                        self._fork.origin_bound,
+                        workflow.payload_converter(),
+                    )
+                except WireFormatError as oversize:
+                    raise ForkRefused(
+                        FORK_CONFIGURATION_VIOLATION, str(oversize)
+                    ) from oversize
+        self._fork = replace(self._fork, child_records=moved)
+
+    def _move_the_fork(self, status: str) -> None:
+        """Record where this fork now stands, without ever rewriting an ending."""
+        assert self._fork is not None
+        if self._fork.status in _FORK_ENDINGS:
+            return
+        self._fork = replace(self._fork, status=status)
+
+    def _fork_activity(self, fork_id: str, step: str) -> str:
+        """The identifier one fork-only Activity invocation is scheduled under.
+
+        It comes from the fork's own namespace rather than from this generation's Activity ordinal,
+        so a child's ordinary numbering equals the number its inherited prefix left and can be
+        mapped onto an unforked twin's. The ordinal counts the attempts at one step of one fork, so
+        two children and a logical retry of either are told apart.
+        """
+        key = f"{fork_id}.{step}"
+        self._fork_steps[key] = self._fork_steps.get(key, 0) + 1
+        return fork_activity_id(fork_id=fork_id, step=step, ordinal=self._fork_steps[key])
+
+    # What a parent does after its barrier stands, and the two endings it commits itself.
+
+    async def _park_for_the_fork(self) -> None:
+        """Wait for the fork to finish, its reserve to be spent, or its preparation to expire.
+
+        The parent returns once every child start is confirmed and the fork's own outcome is
+        settled, so the Worker stops holding it and its records stay readable from the closed
+        execution. Keeping it open for the life of the link would hold an execution and a workflow
+        cache slot for the whole link, and it is not what this does.
+
+        Expiry and exhaustion are one transition. The parent admits no further work and schedules
+        no new start work, the start work already pending is bounded by its own schedule-to-close
+        timeout, every accepted Update settles with a journalled outcome, and the abandonment is
+        committed only after the ledger settles: an abandonment committed while a start Activity
+        was still running would record an outcome the parent has not seen.
+        """
+        assert self._fork is not None
+        while self._fork.status not in _FORK_SETTLED:
+            remaining = self._fork_deadline_at - self._now_ms()
+            if remaining <= 0:
+                await self._abandon_the_fork(EXPIRED_PREPARATION)
+                return
+            if self._post_barrier >= FORK_RESERVE:
+                await self._abandon_the_fork(SPENT_RECOVERY_RESERVE)
+                return
+            try:
+                await workflow.wait_condition(
+                    lambda: self._fork is not None
+                    and self._fork.status in _FORK_SETTLED
+                    or self._post_barrier >= FORK_RESERVE,
+                    timeout=timedelta(milliseconds=remaining),
+                )
+            except asyncio.TimeoutError:
+                pass
+
+    async def _abandon_the_fork(self, reason: str) -> None:
+        """Commit the terminal abandoned status, after the last in-flight outcome has settled."""
+        self._fork_admits_nothing = True
+        await workflow.wait_condition(workflow.all_handlers_finished)
+        assert self._fork is not None
+        if self._fork.status in _FORK_SETTLED:
+            return
+        self._fork = replace(self._fork, status=FORK_ABANDONED, abandoned_reason=reason)
+
+    # A child's own first work, which happens before it owns or serves anything.
+
+    async def _verify_the_lineage(self) -> None:
+        """Read the parent's row for this child, and open the gate on what it says.
+
+        The read is an Activity rather than a workflow call because the SDK's external workflow
+        handle exposes signal and cancel and no Query at all, and it is recorded in this child's own
+        history so a replay performs no fresh client I/O and reaches the same answer. It never waits
+        for the parent to complete: creating a child confirms that the service created it, and
+        readiness is a later state read separately.
+
+        The question and the answer are both measured, like every other shape one fork transmits,
+        which is why the answer is one row and never the parent's state.
+
+        The one failure it keeps rather than raises is a window that has closed. A parent's answers
+        stand behind an absolute horizon, so a reading that arrives after it is not a reading to
+        try again: this child records that state, keeps its identity and everything it holds, and
+        refuses every call that would own or serve it with the reason rather than with the wait.
+        """
+        origin = self._start.fork_origin
+        assert origin is not None
+        converter = workflow.payload_converter()
+        question = VerifyForkOriginInput(
+            parent_workflow_id=origin.parent_workflow_id,
+            parent_run_id=origin.parent_run_id,
+            fork_id=origin.fork_id,
+            child_ordinal=origin.child_ordinal,
+            child_workflow_id=workflow.info().workflow_id,
+        )
+        _fork_shape_measured(
+            "the origin verification question",
+            question,
+            converter,
+            ceiling=TURNOVER_PAYLOAD_CEILING_BYTES,
+        )
+        try:
+            answer: ForkOriginVerified = await workflow.execute_activity(
+                verify_fork_origin_activity,
+                question,
+                start_to_close_timeout=_ACTIVITY_TIMEOUT,
+                retry_policy=_ORIGIN_RETRY,
+                activity_id=self._fork_activity(origin.fork_id, FORK_ORIGIN_STEP),
+            )
+        except ActivityError as error:
+            if not _authority_expired(error):
+                raise
+            self._origin_expired = True
+            return
+        _fork_shape_measured(
+            "what the origin verification answered",
+            answer,
+            converter,
+            ceiling=TURNOVER_PAYLOAD_CEILING_BYTES,
+        )
+        self._admit_lineage(answer.record)
+
+    # What a controller and a child read, both of which are Queries and cost the parent nothing.
+
+    @workflow.query(name="fork_status")
+    def fork_status(self, question: ForkStatusQuestion) -> ForkStatusAnswer:
+        """Where one fork stands, answered from an execution that may already have closed.
+
+        A closed workflow accepts no Update at all, refused by the service before any validator or
+        handler runs, so a logical retry under a fresh identifier cannot reach a handler and a
+        custom refusal cannot be raised from one. This is the route that stays: it is keyed by the
+        fork id and the canonical request digest, it returns the recorded children for a matching
+        request, it names a conflict for a changed one, and it says which state a controller write
+        would now meet.
+
+        A fork that finished is answered with the receipt it finished with, and that is the point
+        of the route rather than a convenience of it. A retry under a fresh identifier cannot reach
+        the outcome journal that holds the original Update's answer, so a completed fork read
+        through here would otherwise come back as still in flight from a parent that can accept
+        nothing: the evidence exists, and this is what returns it.
+
+        It is a Query, so it charges nothing against the reserve: a permanently unavailable child
+        service cannot turn controller polling into exhaustion of the one thing that can finish the
+        fork.
+        """
+        standing = self._fork
+        if standing is None or standing.fork_id != question.fork_id:
+            return ForkStatusAnswer(
+                found=False, conflict=False, parent_state=self._generation_state
+            )
+        conflict = standing.request_digest != question.request_digest
+        return ForkStatusAnswer(
+            found=True,
+            conflict=conflict,
+            parent_state=self._generation_state,
+            record=standing,
+            receipt=None if conflict else self._fork_receipt,
+        )
+
+    @workflow.query(name="fork_child")
+    def fork_child(self, fork_id: str, child_ordinal: int) -> ForkOriginVerified:
+        """The row this parent committed about one child, and nothing else.
+
+        The answer is small and bounded on purpose: it is recorded in the child's own history, and a
+        row that carried the parent's state would put a second copy of that state in every child.
+
+        A question this parent has no answer to is answered rather than refused, with a row naming
+        no child, because the caller has to be able to tell an authenticated disagreement from a
+        parent it could not read at all.
+
+        The reply is held to the bound the barrier proved for it, here, where it is given. The
+        bound was proved over every reply this parent could ever answer with, so the one it
+        actually answers with is measured against a value derived from something other than
+        itself, and a reply over it says so with the measurement rather than crossing anyway.
+        """
+        standing = self._fork
+        if standing is None or standing.fork_id != fork_id:
+            return ForkOriginVerified(
+                fork_id=fork_id, fork_status="", record=_no_such_child(child_ordinal)
+            )
+        for row in standing.child_records:
+            if row.child_ordinal == child_ordinal:
+                return self._within_the_origin_bound(
+                    ForkOriginVerified(
+                        fork_id=fork_id, fork_status=standing.status, record=row
+                    )
+                )
+        return self._within_the_origin_bound(
+            ForkOriginVerified(
+                fork_id=fork_id, fork_status=standing.status, record=_no_such_child(child_ordinal)
+            )
+        )
+
+    def _within_the_origin_bound(self, answer: ForkOriginVerified) -> ForkOriginVerified:
+        """Return one origin reply, having measured it against the bound the barrier retained."""
+        assert self._fork is not None
+        check_origin_reply_within_bound(
+            answer, self._fork.origin_bound, workflow.payload_converter()
+        )
+        return answer
+
+    # The predicate, read in the validator, in the handler, and once more after the one await.
+
+    def _refuse_a_fork(
+        self, request: ForkRequest, *, excluding: Sequence[str] = ()
+    ) -> None:
+        """Refuse a fork this generation will not take, naming the clause that failed.
+
+        The order is the order the clauses depend on each other in. What the request says about
+        itself comes first, because a request this build cannot serve is refused before anything
+        reads a generation, and its own encoded size comes with it: admission is decided here, and
+        a request whose bytes the service would never carry is a decision this generation can make
+        without reading a thing. The execution scope comes next, because a turnover between the
+        moment a controller read the checkpoint evidence and the moment it submitted is an ordinary
+        event and the answer to it is to read again and resubmit. A barrier that already stands
+        comes next, because a fork that has been accepted is answered from its record rather than
+        judged again.
+
+        Then the conditions a boundary is, which are the continuation's own plus the ones a fork
+        needs and a continuation does not. ``excluding`` is how a handler leaves itself out of the
+        ledger: the SDK inserts an Update into its own map before its validator runs and removes it
+        in the handler's finally, so a request that waited on the public predicate would wait for
+        itself for ever, and the exclusion is this generation's to keep.
+
+        A request arriving when any of this does not hold is refused rather than queued, because a
+        fork that waited would hold the generation open against an agent still working.
+        """
+        try:
+            check_fork_request(request)
+        except WireFormatError as error:
+            raise ForkRefused(FORK_CONFIGURATION_VIOLATION, str(error)) from error
+        _fork_shape_measured(
+            "the fork request",
+            request,
+            workflow.payload_converter(),
+            ceiling=TURNOVER_PAYLOAD_CEILING_BYTES,
+        )
+        info = workflow.info()
+        if request.parent_workflow_id != info.workflow_id:
+            raise ForkRefused(
+                FORK_MOVED_EXECUTION,
+                f"this request was prepared against {request.parent_workflow_id!r} and this "
+                f"generation is {info.workflow_id!r}",
+            )
+        if request.parent_run_id != info.run_id:
+            raise ForkRefused(
+                FORK_MOVED_EXECUTION,
+                "this request was prepared against an execution other than the one running",
+            )
+        if request.parent_execution_ordinal != self._start.execution_ordinal:
+            raise ForkRefused(
+                FORK_MOVED_EXECUTION,
+                f"this request was prepared at execution {request.parent_execution_ordinal} and "
+                f"this generation is at {self._start.execution_ordinal}",
+            )
+        if request.parent_configuration_hash != self._configuration_hash:
+            raise ForkRefused(
+                FORK_CONFIGURATION_VIOLATION,
+                "this request was prepared against another generation's configuration",
+            )
+        outstanding = sorted(set(self._handlers) - set(excluding))
+        if self._fork is not None:
+            if self._fork.fork_id != request.fork_id:
+                raise ForkRefused(
+                    FORK_IN_FLIGHT,
+                    f"this generation holds a barrier for the fork {self._fork.fork_id}",
+                )
+            if self._fork.request_digest != fork_request_digest(request):
+                raise ForkRefused(
+                    FORK_REQUEST_CONFLICT,
+                    f"the fork {request.fork_id} is bound to another checkpoint or other plans",
+                )
+            # A matching retry is answered from the record rather than judged again, and that is
+            # not permission to run beside the handler already finishing this fork. Two handlers
+            # admitted here would schedule the same child's start work and spend the same reserve,
+            # so a fresh identifier arriving while one is in flight is refused as retryable and
+            # comes back when the fork it would have raced is settled.
+            racing = sorted(name for name in outstanding if self._handlers[name] == FORK)
+            if racing:
+                raise ForkRefused(
+                    FORK_IN_FLIGHT,
+                    f"the handler for {racing[0]} is finishing this fork and has not returned",
+                )
+            if self._fork.conflict_reason is not None:
+                # A fork that ended on a decision is answered with that decision. Sending it again
+                # under a fresh identifier is not a second chance at it: nothing a later reading
+                # could find would change what was authenticated, so the recorded ending is what
+                # comes back rather than the work that would reach it again.
+                raise ForkRefused(
+                    self._fork.conflict_reason, self._fork.conflict_clause
+                )
+            return
+        if outstanding:
+            raise ForkRefused(
+                FORK_NOT_QUIET,
+                f"the handler for {outstanding[0]} has been accepted and has not finished",
+            )
+        if self._reaching_for_a_boundary() and self._turnover_requested:
+            raise ForkRefused(
+                FORK_NOT_QUIET, "this generation has latched for a turnover"
+            )
+        clause = self._boundary_clause()
+        if clause is not None:
+            raise ForkRefused(FORK_NOT_QUIET, clause)
+        self._refuse_the_fork_clauses(request)
+        self._refuse_the_witnesses(request)
+        self._refuse_the_plans(request)
+
+    def _refuse_the_fork_clauses(self, request: ForkRequest) -> None:
+        """The conditions a fork needs that quiescence does not give it."""
+        attempt = self._attempts.get(request.source_attempt_id)
+        if attempt is None or attempt.state != ACK_PRESENTED:
+            raise ForkRefused(
+                FORK_NOT_QUIET,
+                f"the attempt {request.source_attempt_id} is not one whose acknowledgement has "
+                "been presented",
+            )
+        for other in self._attempts.values():
+            if other.state in (TASK_OFFERED, ACTIVE):
+                raise ForkRefused(
+                    FORK_NOT_QUIET,
+                    f"the attempt {other.item.attempt_id} is {other.state}, so a successor has "
+                    "been admitted or a world is open",
+                )
+        if self._start.capacity != 1:
+            # Slots nobody is standing in are not the declared condition. A fork above capacity
+            # one would clone attempts with live worlds, and cloning a world needs a world
+            # snapshot contract this build does not write, so the declaration is what is read.
+            raise ForkRefused(
+                FORK_CONFIGURATION_VIOLATION,
+                f"a fork is cut from a generation declaring one live attempt and this one "
+                f"declares {self._start.capacity}",
+            )
+        if self._capacity_in_use() != 0:
+            raise ForkRefused(FORK_NOT_QUIET, "this generation is serving a live attempt")
+        for attempt_id in self._inherited_receipt_attempts(request):
+            if self._last_row_for(attempt_id) is not None:
+                raise ForkRefused(
+                    FORK_UNRECOVERABLE_EVIDENCE,
+                    f"the inherited attempt {attempt_id} reads unavailable, and a fork over "
+                    "evidence the parent could not produce hands both children a dependency "
+                    "neither can resolve",
+                )
+        self._refuse_the_inherited_obligation(request)
+
+    def _inherited_receipt_attempts(self, request: ForkRequest) -> List[str]:
+        """Every attempt whose receipt evidence both children inherit whole.
+
+        The attempt a fork is cut over is one of them and never all of them. A prefix that withheld
+        an earlier receipt keeps that attempt's committed source under the merged contract, both
+        children carry it, and neither of them can produce a body of it that the parent could not.
+        The prebarrier read opens the source of the one cell a child is selected for, so it
+        discharges nothing about the others; what does is the last row naming each of them.
+        """
+        return sorted(
+            {request.source_attempt_id}
+            | {
+                attempt.item.attempt_id
+                for attempt in self._attempts.values()
+                if attempt.source_artifact is not None
+            }
+        )
+
+    def _last_row_for(self, attempt_id: str) -> Optional[OperationFailure]:
+        """The standing refusal over one attempt's evidence, where the last row naming it is one.
+
+        A reader takes an attempt's availability from the last row naming it in commit order, so
+        that is what is read here rather than the presence of any row at all: an operation that was
+        refused and then recovered reads available.
+        """
+        latest: Optional[OperationFailure] = None
+        for row in self._operation_failures:
+            if row.attempt_id == attempt_id:
+                latest = row
+        if latest is None or latest.outcome not in (
+            REFUSED_OPERATION,
+            UNRECOVERABLE_OPERATION,
+        ):
+            return None
+        return latest
+
+    def _refuse_the_inherited_obligation(self, request: ForkRequest) -> None:
+        """Refuse a prefix whose payload obligations are not the one shape a child can inherit.
+
+        Quiet at capacity one does not imply the inherited payload is what a child pulls first: the
+        schedule ranks eligible tasks and eligible obligations together, and a plan that puts tasks
+        first would serve the next task before the receipt. So the inherited obligation has to be
+        the sole unresolved one, materialized and offerable and unpresented, and the schedule's next
+        selection has to be precisely that payload.
+
+        A fork over a prefix that already delivered a payload is refused too, so no child has to
+        reconcile a new branch slot against a delivered row and the slot provenance question stays
+        closed for this build.
+        """
+        unresolved = sorted(
+            attempt_id
+            for attempt_id, owed in self._obligations.items()
+            if owed.state in UNFULFILLED_OBLIGATION
+        )
+        if unresolved != [request.source_attempt_id]:
+            raise ForkRefused(
+                FORK_NOT_QUIET,
+                f"a child inherits one unresolved payload and this generation owes {unresolved}",
+            )
+        owed = self._obligations[request.source_attempt_id]
+        if owed.state != ELIGIBLE or not owed.materialized:
+            raise ForkRefused(
+                FORK_NOT_QUIET,
+                f"the inherited payload is {owed.state} and a child is cut over one that is "
+                f"{ELIGIBLE}",
+            )
+        delivered = sorted(
+            attempt_id
+            for attempt_id, other in self._obligations.items()
+            if other.state == PRESENTED
+        )
+        if delivered:
+            raise ForkRefused(
+                FORK_CONFIGURATION_VIOLATION,
+                f"this generation already delivered the payloads of {delivered}, and this build "
+                "forks only a prefix that delivered none",
+            )
+        selected = self._first_eligible()
+        if selected != (PAYLOAD, request.source_attempt_id):
+            raise ForkRefused(
+                FORK_NOT_QUIET,
+                f"the next selection of this generation's schedule is {selected} rather than the "
+                "inherited payload",
+            )
+
+    def _refuse_the_witnesses(self, request: ForkRequest) -> None:
+        """Compare the stream side of the freeze against this generation's own state.
+
+        The message id must be the acknowledgement of the attempt this fork is cut over, the
+        visible byte digest must be the one in the presented row, the cursor must be the current
+        cursor, and the projection digest must be the current projection hash. The platform
+        validates this half and the adapter attests the other; neither side proves the other's, and
+        the origin records which manifest the comparison was made against.
+
+        The two records are joined rather than read one beside the other. A presented row and an
+        attestation both existing says nothing about whether either is about the other, so the row
+        is required to be the named attempt's own acknowledgement and the attestation is required
+        to be the one that committed that presentation. Read independently, an attestation of some
+        other presentation would pass every one of these comparisons while attesting to nothing
+        this fork is being cut at.
+
+        The projection is compared against this generation's own rather than against the one the
+        attestation recorded, and the difference is deliberate. The attestation holds the digest at
+        the moment the acknowledgement committed, and a lawful ownership resume after that moves
+        the digest without touching the acknowledgement, its bytes, its cursor or the attestation,
+        because the ownership epoch is inside the projection. The answer to that is the one the
+        precedence rule gives: the controller reads the checkpoint evidence again and resubmits
+        against what this generation now stands at.
+        """
+        acknowledgement = self._attempts[request.source_attempt_id].item.ack_message_id
+        if request.acknowledgement_message_id != acknowledgement:
+            raise ForkRefused(
+                FORK_WITNESS_MISMATCH,
+                f"this checkpoint names {request.acknowledgement_message_id} and the "
+                f"acknowledgement of {request.source_attempt_id} is {acknowledgement}",
+            )
+        presented = self._presented.get(request.acknowledgement_message_id)
+        if presented is None:
+            raise ForkRefused(
+                FORK_WITNESS_MISMATCH,
+                f"this generation presented no message {request.acknowledgement_message_id}",
+            )
+        if presented.visible_bytes_sha256 != request.acknowledged_visible_sha256:
+            raise ForkRefused(
+                FORK_WITNESS_MISMATCH,
+                "the acknowledgement this checkpoint names went as other bytes than the ones this "
+                "generation presented",
+            )
+        attested = self._attestations.get(request.attestation_id)
+        if attested is None or self._attestation_identities.get(request.attestation_id) is None:
+            raise ForkRefused(
+                FORK_WITNESS_MISMATCH,
+                f"this generation holds no attestation {request.attestation_id}",
+            )
+        if attested.cursor != request.acknowledgement_message_id:
+            raise ForkRefused(
+                FORK_WITNESS_MISMATCH,
+                f"the attestation {request.attestation_id} committed the presentation of "
+                f"{attested.cursor} and this checkpoint names {request.acknowledgement_message_id}",
+            )
+        if request.acknowledged_cursor != self._cursor:
+            raise ForkRefused(
+                FORK_WITNESS_MISMATCH,
+                f"this checkpoint was taken at {request.acknowledged_cursor} and this generation "
+                f"stands at {self._cursor}",
+            )
+        if request.projection_digest != self._projection_hash():
+            raise ForkRefused(
+                FORK_WITNESS_MISMATCH,
+                "this checkpoint names a projection digest other than this generation's own",
+            )
+
+    def _refuse_the_plans(self, request: ForkRequest) -> None:
+        """Hold each child plan to the branches this generation declared before it forked."""
+        for plan in request.child_plans:
+            if plan.branch_slot not in self._start.forkable_slots:
+                raise ForkRefused(
+                    FORK_UNDECLARED_BRANCH,
+                    f"this generation declared {sorted(self._start.forkable_slots)} and a plan "
+                    f"names {plan.branch_slot!r}",
+                )
+            if plan.branch_slot == self._start.served_slot:
+                raise ForkRefused(
+                    FORK_UNDECLARED_BRANCH,
+                    f"a child serves a branch of its own and a plan names {plan.branch_slot!r}, "
+                    "which is the branch its parent serves",
+                )
+
     @workflow.query
     def stream_state(self) -> StreamState:
         """Report the generation's state to the harness. Queries write nothing.
@@ -2338,7 +3982,7 @@ class StreamWorkflow:
             turnover_refused=self._turnover_refused,
             verifying=self._verifying,
             verification_batches=self._verification_batches,
-            unfinished_handlers=self._unfinished,
+            unfinished_handlers=len(self._handlers),
             turnover_refused_bytes=self._turnover_refused_bytes,
         )
 
@@ -2493,7 +4137,8 @@ class StreamWorkflow:
             (
                 row
                 for row in self._start.dispositions
-                if row.attempt_id == item.attempt_id and row.branch_slot == SINGLETON_SLOT
+                if row.attempt_id == item.attempt_id
+                and row.branch_slot == self._start.served_slot
             ),
             None,
         )
@@ -3856,13 +5501,16 @@ class StreamWorkflow:
         service records no outcome for those, so neither does this: they are raised on, and the
         Task fails as it would have.
 
-        The count of unfinished handlers is kept around the same body, in a finally, because a
+        The ledger of unfinished handlers is kept around the same body, in a finally, because a
         boundary waits for these and a caller waiting for the boundary has to be able to see them.
+        The entry is made here, in the prologue and before the first suspension point, and it is
+        keyed by the exact Update identifier, so a request that has to exclude itself from the
+        ledger can name itself and a validator never sees the handler it is about to admit.
         """
         replayed = self._replayed()
         if replayed is not None:
             return self._give_back(replayed)
-        self._unfinished += 1
+        self._handlers[self._update_id()] = handler
         try:
             result = await body()
         except StreamProtocolError as refusal:
@@ -3886,7 +5534,7 @@ class StreamWorkflow:
             )
             raise
         finally:
-            self._unfinished -= 1
+            self._handlers.pop(self._update_id(), None)
         self._remember(handler, epoch, self._answer_for(handler, epoch, result))
         return result
 
@@ -4601,6 +6249,27 @@ def _refuse_carrier(complaint: str) -> ApplicationError:
     return ApplicationError(complaint, type="CarrierRefused", non_retryable=True)
 
 
+def _no_such_child(ordinal: int) -> PreparedChild:
+    """A row naming no child, which is what a parent answers a question it has no answer to with.
+
+    A refused Query would be indistinguishable from a parent nobody could read, and the two are
+    different facts: one is authenticated and permanent, the other is infrastructure the child waits
+    out while it stays gated. So the answer comes back and the caller compares.
+    """
+    return PreparedChild(
+        child_ordinal=ordinal,
+        child_workflow_id="",
+        complete_start_digest="",
+        origin_digest="",
+        branch_slot="",
+        target_cell="",
+        selected_body_reference="",
+        consumer_claim_hash="",
+        hidden_execution_id="",
+        start_differences=[],
+    )
+
+
 def _refuse_origin(complaint: str) -> ApplicationError:
     """The failure a child whose parent's record does not name it is refused with.
 
@@ -4610,6 +6279,35 @@ def _refuse_origin(complaint: str) -> ApplicationError:
     entirely and is retryable infrastructure while the child stays gated.
     """
     return ApplicationError(complaint, type="OriginRefused", non_retryable=True)
+
+
+def _authority_expired(error: ActivityError) -> bool:
+    """Whether one origin reading failed because the window it had to be asked in had closed.
+
+    It is read off the Activity's own failure rather than inferred from how often the reading was
+    tried, because the two are different facts: a parent nobody could reach is retried until it
+    answers, and a horizon that has passed is an answer of its own.
+    """
+    cause = error.cause
+    return isinstance(cause, ApplicationError) and cause.type == EXPIRED_AUTHORITY_FAILURE
+
+
+def _fork_shape_measured(name: str, value: Any, converter: Any, *, ceiling: int) -> int:
+    """Measure one shape a fork transmits, and refuse the fork where the bytes will not fit.
+
+    An oversize is a decision about the request rather than a fault in the generation, and the
+    difference matters here more than anywhere else this measurement is taken. The wire failure a
+    measurement raises is an ordinary Python error, so an accepted Update that let one out would
+    not fail: the service would fail the Workflow Task instead, and this generation would replay
+    the same activation for ever with nothing journalled, no barrier installed and no refusal
+    anybody could read. So every shape one fork measures is measured through here, and what a
+    caller gets back is a refusal of its own type, permanent, carrying the measurement it was
+    refused over, with no barrier and no child behind it.
+    """
+    try:
+        return check_transmitted_size(name, value, converter, ceiling=ceiling)
+    except WireFormatError as oversize:
+        raise ForkRefused(FORK_CONFIGURATION_VIOLATION, str(oversize)) from oversize
 
 
 def _bindings(rows: List[CarriedBinding]) -> Dict[str, _Bound]:
@@ -5135,6 +6833,7 @@ def _check_policy(start: StreamStart) -> None:
             provenance=start.provenance,
             families=list(start.families),
             contract_ids=[contract.contract_id for contract in start.receipt_contracts],
+            served_slot=start.served_slot,
         )
         # And the shapes it admits an environment's own bodies under, with the rows that name
         # them. It is a second call rather than a field of the first because the record it admits

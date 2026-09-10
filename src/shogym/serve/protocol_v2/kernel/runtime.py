@@ -71,7 +71,7 @@ from shogym.serve.protocol_v2 import (
     pull_request_identity,
     terminal_request_identity,
 )
-from shogym.serve.protocol_v2.kernel.activities import kernel_activities
+from shogym.serve.protocol_v2.kernel.activities import fork_activities, kernel_activities
 from shogym.serve.protocol_v2.kernel.messages import (
     AnsweredUpdate,
     AttemptFinalized,
@@ -79,20 +79,38 @@ from shogym.serve.protocol_v2.kernel.messages import (
     ConsumerReceipt,
     EnvironmentCall,
     EnvironmentLease,
+    FORK_EXPIRED_AUTHORITY,
+    FORK_IN_FLIGHT,
+    FORK_REFUSALS,
+    FORK_REQUEST_CONFLICT,
+    FORK_UNREADABLE_PARENT,
     FinalizeRequest,
     finalize_request_identity,
+    ForkReceipt,
+    ForkRequest,
+    ForkStatusAnswer,
+    ForkStatusQuestion,
     OfferedMessage,
     OwnershipClaim,
     OwnershipReceipt,
     QueueClosed,
+    RETRYABLE_FORK_REFUSALS,
     SealRequest,
     StreamStart,
     StreamState,
     Writer,
+    check_fork_receipt,
+    check_fork_request,
+    check_prepared_fork,
+    check_transmitted_size,
     configuration_hash,
+    fork_request_digest,
 )
 from shogym.serve.protocol_v2.kernel.workflow import (
+    FORK_BARRIER,
     TURNOVER_PENDING,
+    TURNOVER_PAYLOAD_CEILING_BYTES,
+    ForkRefused,
     StreamProtocolError,
     StreamWorkflow,
 )
@@ -137,6 +155,14 @@ _TURNOVER_STALLED_AFTER = 300.0
 # deployment whose Workers cannot answer a Query leaves the caller with the failure it had, at the
 # speed of this timeout, instead of holding it for as long as the read takes to be given up on.
 _ANSWER_READ_TIMEOUT = timedelta(seconds=10)
+
+# And how many times one of the fork's reads is asked before the failure it met is the answer. A
+# Query is served by a Worker replaying the generation, so a question that arrives while that
+# generation is closing is left with the Worker that has just evicted it: nothing answers it and
+# the deadline above is what ends it, while the very next ask is routed afresh and answered at
+# once. A read that got no answer is therefore asked again rather than reported as a parent nobody
+# can read, which is the difference between a lost question and an absent Worker.
+_ANSWER_READ_TRIES = 3
 STREAM_TASK_QUEUE = "shogym-stream-v2"
 
 #: The file one run's embedded service keeps that run's history in.
@@ -260,7 +286,7 @@ def stream_worker(
     the beginning. That costs throughput and buys a stream that keeps serving the moment a
     Worker is replaced, which is the trade a short run wants.
     """
-    served = list(activities) if activities is not None else kernel_activities()
+    served = _registered(activities)
     runner = SandboxedWorkflowRunner(restrictions=_RESTRICTIONS)
     if cached_workflows is None:
         return Worker(
@@ -278,6 +304,32 @@ def stream_worker(
         workflow_runner=runner,
         max_cached_workflows=cached_workflows,
     )
+
+
+def _registered(activities: Optional[Sequence[Any]]) -> list:
+    """Return what a Worker serves: what it was handed, and the fork's own beside it.
+
+    A Worker takes whatever Activity list it is given wholesale, and an environment that brings its
+    own terminal hands over only its seal, its grade, the payload bundle Activity and the blob
+    verification Activity. The fork's three are none of those and a caller composing a list has no
+    reason to know about them, so they are added here rather than left to be remembered. A caller
+    that supplied one of them itself keeps its own, because the SDK refuses two Activities of one
+    name in a Worker.
+
+    A caller handing an empty list is saying the other thing: this Worker serves no Activity at
+    all. That is a read, replaying a generation to answer a Query beside the Worker already
+    serving the run, and an Activity registered there would make it a second Worker offering to
+    work the run's task queue, which the SDK refuses.
+    """
+    if activities is not None and not activities:
+        return []
+    served = list(activities) if activities is not None else kernel_activities()
+    named = {getattr(one, "__temporal_activity_definition").name for one in served}
+    return served + [
+        one
+        for one in fork_activities()
+        if getattr(one, "__temporal_activity_definition").name not in named
+    ]
 
 
 def stream_replayer() -> Replayer:
@@ -576,6 +628,284 @@ def turnover_pending(error: BaseException) -> bool:
     """
     cause = error.__cause__ if isinstance(error, WorkflowUpdateFailedError) else error
     return isinstance(cause, ApplicationError) and cause.type == TURNOVER_PENDING
+
+
+def fork_refusal(error: BaseException) -> Optional[str]:
+    """Return the reason one fork was refused for, or ``None`` for anything else.
+
+    A fork refusal is a controller refusal and never a protocol answer: it says which clause of the
+    boundary, the witnesses or the plans did not hold, and none of it is a code the agent has ever
+    seen. Anything that is not one is a fault, and a caller must not read it as a decision.
+
+    The reason is the failure's own type, which is what makes it survive the outcome journal: an
+    exact identifier answered out of that journal keeps a type and a message and carries no
+    details, and a refusal read back after a boundary or from a closed parent has to name the same
+    clause the live one named.
+    """
+    cause = error.__cause__ if isinstance(error, WorkflowUpdateFailedError) else error
+    if not isinstance(cause, ApplicationError) or cause.type not in FORK_REFUSALS:
+        return None
+    return cause.type
+
+
+def fork_can_be_retried(error: BaseException) -> bool:
+    """Whether this refusal is infrastructure rather than a decision.
+
+    The experiment retries infrastructure and never retries a decision, so this is the line it
+    reads: a decision refusal is recorded with its reason rather than attempted again.
+    """
+    reason = fork_refusal(error)
+    return reason is not None and reason in RETRYABLE_FORK_REFUSALS
+
+
+def fork_barrier_stands(error: BaseException) -> bool:
+    """Whether this failure says the parent has forked and admits no further work."""
+    cause = error.__cause__ if isinstance(error, WorkflowUpdateFailedError) else error
+    return isinstance(cause, ApplicationError) and cause.type == FORK_BARRIER
+
+
+async def fork_stream(
+    client: Client, request: ForkRequest, *, attempt: int = 1
+) -> ForkReceipt:
+    """Fork one generation into the two children ``request`` plans, and return its typed evidence.
+
+    The request is preflighted here before it is sent, because parent-side validation cannot
+    produce a typed refusal for bytes the service would never admit: a request over the limit would
+    come back as a transport fault naming nothing.
+
+    ``attempt`` is which try at this fork is being sent, and it is the only thing that moves
+    between two tries of one logical fork. An Update that completed keeps returning what it was
+    answered with under its exact identifier for ever, refusals included, so a fork refused over a
+    body the store had lost goes on being refused under the identifier that met the loss however
+    thoroughly the object is repaired; progress is a fresh identifier carrying the same fork id and
+    the same checkpoint. Repeating one attempt is the other half of that contract: the same number
+    reaches the same identifier, so a caller whose reply was lost reads its own outcome rather than
+    opening a second try.
+
+    The request is measured as this client's own converter would encode it rather than as the
+    default one would, because what the service admits is what this client sends: a caller that
+    configured a codec of its own would otherwise be preflighted against bytes nobody transmits.
+
+    Where the Update did not dispatch at all, the fork status Query is consulted rather than the
+    request being sent again. Two things stop a dispatch, and both of them are places where the
+    answer exists and only the route to it is missing: a parent that has forked and admits no
+    further work, and a parent that has closed and accepts no Update at all. The typed contract is
+    that Query rather than raw Update behaviour, and it charges the parent nothing.
+
+    That reading comes first on the recovery path, because it is the one that says whether the
+    parent still answers at all. Then the exact identifier's own outcome, which is immutable and
+    stands however thoroughly the thing it refused over was repaired. Then the recorded receipt,
+    which is what a fresh identifier for a fork that already completed is owed: a completed fork
+    has an answer, and reporting it as still in flight would send a controller back to a parent
+    that accepts nothing.
+
+    The last of those is reached only where the parent said it holds no outcome under this
+    identifier. A reading that could not be served says nothing about what the identifier was
+    answered with, and taking it for nothing is how one try's caller ends up holding another
+    try's success: a failure the parent accepted crosses a boundary in the carried journal, a
+    fresh identifier goes on to complete the same logical fork, and the try that failed would
+    then be answered with the fork that went through.
+    """
+    check_fork_request(request)
+    converter = client.data_converter.payload_converter
+    check_transmitted_size(
+        "the fork request", request, converter, ceiling=TURNOVER_PAYLOAD_CEILING_BYTES
+    )
+    handle = client.get_workflow_handle_for(
+        StreamWorkflow.run, request.parent_workflow_id
+    )
+    update_id = f"fork-{request.fork_id}-{fork_request_digest(request)[:32]}-{attempt}"
+    try:
+        return _admitted_receipt(
+            await handle.execute_update(
+                StreamWorkflow.fork_generation, request, id=update_id
+            )
+        )
+    except Exception as error:
+        if fork_refusal(error) is not None:
+            raise
+        if not fork_barrier_stands(error) and not _nothing_took_it(error):
+            raise
+        recorded = await fork_status(client, request)
+        answered = await _answered_fork(handle, update_id, request.fork_id)
+        if answered is not None:
+            return _admitted_receipt(answered)
+        if recorded.receipt is not None:
+            return _admitted_receipt(recorded.receipt)
+        raise _what_the_record_says(recorded, request) from error
+
+
+def _admitted_receipt(receipt: ForkReceipt) -> ForkReceipt:
+    """Return one received receipt, having refused a version this build does not read.
+
+    The check is made where the receipt is received rather than inside whatever goes on to consume
+    it, and it covers the recovered routes as well as the live one: a receipt read back out of a
+    record or off a status answer is a received receipt too, and a consumer that skipped the check
+    for those would decide over a shape nothing admitted.
+    """
+    check_fork_receipt(receipt)
+    return receipt
+
+
+async def fork_status(client: Client, request: ForkRequest) -> ForkStatusAnswer:
+    """Read where one fork stands, from a parent that may already have closed.
+
+    It is a Query, so it costs the generation nothing, writes nothing, and can be asked of an
+    execution that has closed. What it needs is a Worker able to replay the parent on its task
+    queue and a history the service still retains, which together are the fork's answer window.
+
+    A parent that never answers is the retryable refusal that says so rather than the transport
+    fault the read arrived as, because a controller reads this to decide what to do next and a
+    fault names no clause.
+
+    A history the service no longer holds is the other answer, and it is not a fault to retry: the
+    question was asked outside the window this parent's answers stand in, so it comes back as
+    expired authority and the run is recorded incomplete rather than resolved by guessing.
+
+    Both declared shapes the answer can carry are admitted where the answer is received, before
+    anything reads a field of either and before either is returned. A prepared record and a
+    receipt are each a versioned value a caller decides over, and a route that returned one at a
+    version this build does not read would hand that decision a shape nothing admitted.
+    """
+    handle = client.get_workflow_handle_for(
+        StreamWorkflow.run, request.parent_workflow_id, run_id=request.parent_run_id
+    )
+    question = ForkStatusQuestion(
+        fork_id=request.fork_id, request_digest=fork_request_digest(request)
+    )
+    try:
+        answer: ForkStatusAnswer = await _asked_again(
+            lambda: handle.query(
+                StreamWorkflow.fork_status, question, rpc_timeout=_ANSWER_READ_TIMEOUT
+            )
+        )
+    except RPCError as error:
+        if error.status is RPCStatusCode.NOT_FOUND:
+            raise ForkRefused(
+                FORK_EXPIRED_AUTHORITY,
+                f"the execution that prepared {request.fork_id} can no longer be read, so its "
+                "answer window has closed",
+            ) from error
+        raise ForkRefused(
+            FORK_UNREADABLE_PARENT,
+            f"the parent of {request.fork_id} answered none of {_ANSWER_READ_TRIES} reads of "
+            "where its fork stands",
+        ) from error
+    return _admitted_answer(answer)
+
+
+def _admitted_answer(answer: ForkStatusAnswer) -> ForkStatusAnswer:
+    """Return one status answer, having refused the versions this build does not read.
+
+    Both members are checked, because both are declared shapes a caller acts on: the record says
+    which children a fork prepared and where it stands, and the receipt is the fork's own outcome.
+    Neither is admitted by the other's check, and the answer is where both arrive.
+    """
+    if answer.record is not None:
+        check_prepared_fork(answer.record)
+    if answer.receipt is not None:
+        check_fork_receipt(answer.receipt)
+    return answer
+
+
+async def _asked_again(read: Callable[[], Awaitable[Any]]) -> Any:
+    """Ask one read again where it got no answer, because a lost question is not an answer.
+
+    The last try is the one that answers or raises, so a read that cannot be served fails with
+    what the service said rather than with a count of what was tried.
+    """
+    for _try in range(_ANSWER_READ_TRIES - 1):
+        try:
+            return await read()
+        except RPCError:
+            continue
+    return await read()
+
+
+async def _answered_fork(
+    handle: WorkflowHandle, update_id: str, fork_id: str
+) -> Optional[ForkReceipt]:
+    """The receipt this exact identifier was answered with, if the parent still holds one.
+
+    An Update that completed as a failure keeps returning that failure under its exact identifier
+    for ever, so what is raised here is what the parent answered rather than a fresh judgement of
+    it, and progress under a fresh identifier is the caller's next move.
+
+    Nothing recorded and nothing readable are two different facts and only the first of them is
+    ``None``. The parent saying it holds no outcome under this identifier is an answer, and it is
+    the one that lets a fresh identifier be given the fork's own receipt. A read that could not be
+    served is not an answer at all, so it comes back as the typed refusal every other read of this
+    parent is classified under: a history the service can no longer produce is expired authority,
+    and a parent that answered none of the tries is unreadable and stays a retry.
+
+    An outcome this build cannot decode is unread for the same reason. What came back is an
+    answer, and reporting the identifier as unanswered because these bytes could not be read would
+    put a caller on the route reserved for one the parent never answered.
+    """
+    try:
+        answer = await _asked_again(
+            lambda: handle.query(
+                StreamWorkflow.answered_update, update_id, rpc_timeout=_ANSWER_READ_TIMEOUT
+            )
+        )
+    except Exception as error:  # noqa: BLE001 - a read that failed is not an answer
+        if isinstance(error, RPCError) and error.status is RPCStatusCode.NOT_FOUND:
+            raise ForkRefused(
+                FORK_EXPIRED_AUTHORITY,
+                f"the execution that answered this try at {fork_id} can no longer be read, so "
+                "its answer window has closed",
+            ) from error
+        raise ForkRefused(
+            FORK_UNREADABLE_PARENT,
+            f"the parent of {fork_id} answered none of {_ANSWER_READ_TRIES} reads of what this "
+            "try was answered with",
+        ) from error
+    if not answer.found:
+        return None
+    if answer.kind == "protocol":
+        raise StreamProtocolError(answer.code)
+    if answer.kind == "failure":
+        raise ApplicationError(answer.message, type=answer.type_name, non_retryable=True)
+    try:
+        return _decoded(answer, ForkReceipt)
+    except Exception as error:  # noqa: BLE001 - an answer this code cannot read is not an answer
+        raise ForkRefused(
+            FORK_UNREADABLE_PARENT,
+            f"the parent of {fork_id} answered this try with an outcome this build cannot read",
+        ) from error
+
+
+def _what_the_record_says(
+    answer: ForkStatusAnswer, request: ForkRequest
+) -> ApplicationError:
+    """Turn a status reading into the typed refusal a controller acts on.
+
+    A fork the parent never accepted, one bound to another request, one that ended on a decision
+    and one whose parent cannot be asked are four different answers, and none of them is the
+    transport fault the caller arrived with.
+
+    A fork that ended on a decision answers with that decision, which is what the record retains it
+    for. The experiment retries infrastructure and never retries a decision, so what a controller
+    reads here is the reason this fork ended rather than a state to send the same request into
+    again.
+    """
+    if answer.conflict:
+        return ForkRefused(
+            FORK_REQUEST_CONFLICT,
+            f"the fork {request.fork_id} is bound to another checkpoint or other plans",
+        )
+    if not answer.found:
+        return ForkRefused(
+            FORK_EXPIRED_AUTHORITY,
+            f"the parent of {request.fork_id} accepts no Update and holds no record of it",
+        )
+    if answer.record is not None and answer.record.conflict_reason is not None:
+        return ForkRefused(answer.record.conflict_reason, answer.record.conflict_clause)
+    return ForkRefused(
+        FORK_IN_FLIGHT,
+        f"the fork {request.fork_id} stands {answer.record.status if answer.record else ''} and "
+        "the parent accepts no further work under this identifier",
+    )
 
 
 def protocol_error_code(error: BaseException) -> Optional[str]:

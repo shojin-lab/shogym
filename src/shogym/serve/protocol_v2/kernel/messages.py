@@ -35,10 +35,11 @@ from dataclasses import (
     replace,
 )
 from hashlib import sha256
-from typing import Any, Dict, List, Mapping, Optional, Sequence, Tuple
+from typing import Any, Dict, Iterator, List, Mapping, Optional, Sequence, Tuple
 
 from shogym.serve.protocol_v2 import (
     AGENT_FILED,
+    BLOB_DIRECTORY,
     IMMEDIATE,
     PROTOCOL_VERSION,
     SCHEDULE_VERSION,
@@ -2525,6 +2526,52 @@ SPENT_RECOVERY_RESERVE = "spent_recovery_reserve"
 EXPIRED_PREPARATION = "expired_preparation"
 ABANDONED_REASONS = (SPENT_RECOVERY_RESERVE, EXPIRED_PREPARATION)
 
+# Every way a fork is refused, each naming the clause that failed, and none of them mapped onto the
+# agent-visible set. The two kinds are kept apart because the experiment treats them differently:
+# infrastructure is retried and a decision is never retried, so a decision refusal is recorded as a
+# failure with its reason rather than attempted again.
+FORK_NOT_QUIET = "not_quiet"
+FORK_IN_FLIGHT = "fork_in_flight"
+FORK_MOVED_EXECUTION = "moved_execution"
+FORK_UNREADABLE_PARENT = "unreadable_parent"
+FORK_INTERRUPTED_COPY = "interrupted_copy"
+FORK_REPAIRABLE_ABSENCE = "repairable_absence"
+RETRYABLE_FORK_REFUSALS = (
+    FORK_NOT_QUIET,
+    FORK_IN_FLIGHT,
+    FORK_MOVED_EXECUTION,
+    FORK_UNREADABLE_PARENT,
+    FORK_INTERRUPTED_COPY,
+    FORK_REPAIRABLE_ABSENCE,
+)
+FORK_WITNESS_MISMATCH = "witness_mismatch"
+FORK_INVALID_CHECKPOINT = "invalid_checkpoint"
+FORK_CONFIGURATION_VIOLATION = "configuration_violation"
+FORK_UNDECLARED_BRANCH = "undeclared_branch_slot"
+FORK_REQUEST_CONFLICT = "request_conflict"
+FORK_WRONG_SOURCE = "wrong_source"
+FORK_CONTRACT_DRIFT = "contract_drift"
+FORK_ORIGIN_DISAGREEMENT = "origin_disagreement"
+FORK_UNRECOVERABLE_EVIDENCE = "unrecoverable_evidence"
+PERMANENT_FORK_REFUSALS = (
+    FORK_WITNESS_MISMATCH,
+    FORK_INVALID_CHECKPOINT,
+    FORK_CONFIGURATION_VIOLATION,
+    FORK_UNDECLARED_BRANCH,
+    FORK_REQUEST_CONFLICT,
+    FORK_WRONG_SOURCE,
+    FORK_CONTRACT_DRIFT,
+    FORK_ORIGIN_DISAGREEMENT,
+    FORK_UNRECOVERABLE_EVIDENCE,
+    SPENT_RECOVERY_RESERVE,
+    EXPIRED_PREPARATION,
+)
+
+# And the result that is neither. It says the answer window closed, which is a limit of what can be
+# read rather than a disagreement, and the run is recorded incomplete under it.
+FORK_EXPIRED_AUTHORITY = "expired_authority"
+FORK_REFUSALS = (*RETRYABLE_FORK_REFUSALS, *PERMANENT_FORK_REFUSALS, FORK_EXPIRED_AUTHORITY)
+
 #: The shape of a prepared fork record this build writes and admits.
 PREPARED_FORK_SCHEMA_VERSION = 1
 
@@ -2576,6 +2623,25 @@ class PreparedFork:
     ``children`` is what the fork set out to create and the rows below are what it knows about
     them, which are different facts: an abandoned fork names both, so a reader can say a child was
     attempted and unconfirmed rather than inferring absence from a shorter list.
+
+    ``receipt_bound`` is the proved encoded upper bound of the receipt this fork answers with,
+    measured before the barrier over every known part with a declared allowance for each run id
+    the service has still to mint. It is retained here rather than recomputed later, because a
+    bound derived from the value it is meant to bound is not a bound at all.
+
+    ``origin_bound`` is the same thing for the other reply this operation transmits, the proof one
+    gated child asks its parent for. That reply evolves after the barrier, so the bound is over the
+    widest state the parent can ever answer in rather than over the row as it stood when the
+    measurement was made.
+
+    ``start_bound`` is the third, and it is over the wrapper a child's start answers with rather
+    than over the identifier inside it: a wrapper can exceed a limit while everything it wraps
+    fits, so what is bounded is the result the Activity hands back.
+
+    ``conflict_reason`` and ``conflict_clause`` are the permanent ending a fork came to after its
+    barrier stood. A decision is never retried, so it is retained here beside the children it was
+    reached over: a status read and a fresh logical retry are answered with the decision this fork
+    already made rather than with the work that would make it again.
     """
 
     fork_id: str
@@ -2585,6 +2651,11 @@ class PreparedFork:
     parent_run_id: str
     children: int
     child_records: List[PreparedChild]
+    receipt_bound: int = 0
+    origin_bound: int = 0
+    start_bound: int = 0
+    conflict_reason: Optional[str] = None
+    conflict_clause: str = ""
     status: str = FORK_PREPARED
     abandoned_reason: Optional[str] = None
     schema_version: int = PREPARED_FORK_SCHEMA_VERSION
@@ -2601,6 +2672,11 @@ class ForkChildReceipt:
     ``next_task_body_sha256`` and ``next_assignment_id`` are read from that child's own start
     rather than from the parent's, so a reader can check the two children agree on the task they
     are both about to work rather than being told they do.
+
+    ``next_assignment_id`` is the roster row that task was selected as, which is the identity a
+    reader joins this receipt to the child's own roster by. The attempt the row stands for is a
+    second identity of the same selection and the roster is where one is derived from the other,
+    so naming the attempt here would leave that join to be worked out from the wrong end.
     """
 
     child_ordinal: int
@@ -2737,6 +2813,17 @@ def check_prepared_fork(record: PreparedFork) -> None:
         raise WireFormatError(
             f"a fork that is {record.status!r} was not abandoned, and this one carries "
             f"{record.abandoned_reason!r}"
+        )
+    if record.status == FORK_CONFLICTED:
+        if record.conflict_reason not in PERMANENT_FORK_REFUSALS:
+            raise WireFormatError(
+                f"a conflicted fork carries one of {list(PERMANENT_FORK_REFUSALS)}, and this one "
+                f"carries {record.conflict_reason!r}"
+            )
+    elif record.conflict_reason is not None:
+        raise WireFormatError(
+            f"a fork that is {record.status!r} came to no permanent ending, and this one carries "
+            f"{record.conflict_reason!r}"
         )
     for child in record.child_records:
         if child.existence not in CHILD_EXISTENCE:
@@ -2942,6 +3029,53 @@ def child_workflow_id(
     return ".".join((parent_workflow_id, FORK_ID_TOKEN, str(child_ordinal), derived[:32]))
 
 
+def child_blob_root(run_directory: str) -> str:
+    """Return where one child keeps its objects inside the directory it was given.
+
+    It is the layout every generation already has and a reader already resolves: a run directory
+    holds its manifest and a store beneath a fixed name, so a child whose store were the directory
+    itself would be one whose objects the run directory's own accessor reads past. The name is
+    fixed here rather than resolved, because this runs where a path cannot be walked.
+    """
+    return "/".join((run_directory.rstrip("/"), BLOB_DIRECTORY))
+
+
+def canonical_location(location: str) -> str:
+    """Return the one spelling of a store or a directory that two of them are compared as.
+
+    Two places are one place when what opens them opens one thing, and what opens them takes a
+    path rather than the text a plan was written in: an empty component, a component naming the
+    directory it already stands in, and a separator at the end are dropped on the way there. So
+    spellings that differ as text name one store, and a comparison made over the text would call
+    them two. The collapse is lexical because this runs where a path cannot be walked.
+
+    A location that does not say where it starts from is refused before it is collapsed at all.
+    Such a text names one place in the process that opens it and another in the next, so two of
+    them are neither equal nor unequal here, and the reading that would settle it is the directory
+    a process happens to stand in, which a replayed transition has no business asking for and
+    would not be answered the same way twice. Refusing it is what leaves every location this
+    compares concrete.
+
+    A component naming the directory above is refused rather than collapsed. Dropping it is sound
+    only where nothing on the way is a link, which is exactly what cannot be settled from here,
+    and keeping it would leave the alias this exists to close. A location written that way is a
+    refusal before anything is committed rather than a place two children might turn out to share.
+    """
+    if not location.startswith("/"):
+        raise WireFormatError(
+            f"the location {location!r} says where it starts from nowhere in itself, and where "
+            "one is read from is not settled without asking a process where it stands"
+        )
+    parts = [part for part in location.split("/") if part not in ("", ".")]
+    if ".." in parts:
+        raise WireFormatError(
+            f"the location {location!r} names the directory above one of its own components, and "
+            "where that leads is not settled without reading a filesystem"
+        )
+    return "/" + "/".join(parts)
+
+
+
 def fork_request_digest(request: ForkRequest) -> str:
     """Return what binds one fork id to the request it was accepted under.
 
@@ -3067,11 +3201,19 @@ def check_child_configuration(parent: StreamStart, child: StreamStart) -> None:
             raise WireFormatError(
                 f"a child is given its own {name}, and this one carries {given!r}"
             )
-        if classification == CHILD_LOCATION and (not given or given == held):
-            raise WireFormatError(
-                f"a child keeps its bytes in a durable {name} of its own, and this one keeps "
-                f"them in {given!r}"
-            )
+        if classification == CHILD_LOCATION:
+            # Compared as the place each one is rather than as the text each one is written in,
+            # because a child given its parent's store under another spelling would be a child
+            # whose objects and manifest go where its parent's already are. Each side is made
+            # concrete before either is compared, so a side that says nowhere where it starts
+            # from is refused there rather than compared: one rooted text and one that is not
+            # pass any comparison and still open one store.
+            place = canonical_location(given) if given else ""
+            if not place or (held and place == canonical_location(held)):
+                raise WireFormatError(
+                    f"a child keeps its bytes in a durable {name} of its own, and this one keeps "
+                    f"them in {given!r}"
+                )
     if child.served_slot not in parent.forkable_slots:
         raise WireFormatError(
             f"a child serves a branch its parent declared, and {child.served_slot!r} is not one "
@@ -3280,3 +3422,280 @@ def check_receipt_within_bound(receipt: ForkReceipt, bound: int, converter: Any)
             f"the barrier was {bound}"
         )
     return measured
+
+
+# The Activity namespace a fork's own invocations take their identifiers from, and what a step of
+# one is called. A child's ordinary Activity numbering has to equal the number its inherited prefix
+# left, so that it maps onto an unforked twin's, and every fork-only call takes an identifier from
+# here rather than consuming the generation's own ordinal. That covers the calls of the existing
+# blob verification and payload Activities a fork makes as well as the three types it adds.
+FORK_AVAILABILITY_STEP = "availability"
+FORK_START_STEP = "start"
+FORK_ORIGIN_STEP = "origin"
+FORK_PREPARATION_STEP = "preparation"
+FORK_STEPS = (
+    FORK_AVAILABILITY_STEP,
+    FORK_START_STEP,
+    FORK_ORIGIN_STEP,
+    FORK_PREPARATION_STEP,
+)
+
+
+def fork_activity_id(*, fork_id: str, step: str, ordinal: int) -> str:
+    """Return the identifier one fork-only Activity invocation is scheduled under."""
+    if step not in FORK_STEPS:
+        raise WireFormatError(f"{step!r} is not a step of a fork this build performs")
+    return ".".join((FORK_ID_TOKEN, fork_id, step, str(ordinal)))
+
+
+@dataclass(frozen=True)
+class ForkAvailabilityInput:
+    """What the parent asks the store for before it commits a barrier.
+
+    Three objects and not two: the source manifest under its commitment, and both eligible cell
+    bodies under that manifest's own entries. The manifest is named among the reads rather than
+    left implicit in the commitment it binds to, because a carried descriptor is a value in state
+    and says nothing about whether the object under its digest is still in the store.
+    """
+
+    blob_root: str
+    source_commitment: str
+    body_references: List[str]
+
+
+@dataclass(frozen=True)
+class ForkAvailability:
+    """What the store could produce, measured rather than asserted."""
+
+    present: List[str]
+    missing: List[str]
+    measured_bytes: List[int]
+
+
+@dataclass(frozen=True)
+class StartForkChildInput:
+    """One child start, and the identity the service is asked to create it under.
+
+    The parent builds the start and an Activity starts the child, rather than a controller
+    starting it from a value the parent returned, because a controller that could compose a start
+    could compose a projection holding a score nothing filed.
+    """
+
+    fork_id: str
+    child_ordinal: int
+    child_workflow_id: str
+    task_queue: str
+    start: StreamStart
+
+
+@dataclass(frozen=True)
+class ForkChildStarted:
+    """The child one start Activity confirms, and its original execution.
+
+    ``created`` says whether this call created the child or found it already created, which is an
+    observation of one call rather than part of the stable receipt: an exact outcome replay returns
+    the original outcome including its original flags.
+    """
+
+    child_ordinal: int
+    child_workflow_id: str
+    child_run_id: str
+    created: bool
+
+
+def _every_start_answer(
+    record: PreparedChild, child_run_id: str
+) -> Iterator[ForkChildStarted]:
+    """Every result one child's start Activity can answer with, in turn.
+
+    The wrapper is what crosses and not the identifier inside it, and the two things about it that
+    are not known before the barrier are the run id the service mints and whether this call was the
+    one that created the child. Both are enumerated through the configured converter, because a
+    converter that makes more bytes of one of those than of the other is a converter a preflight
+    over the other would measure the wrong result of.
+    """
+    for created in (True, False):
+        yield ForkChildStarted(
+            child_ordinal=record.child_ordinal,
+            child_workflow_id=record.child_workflow_id,
+            child_run_id=child_run_id,
+            created=created,
+        )
+
+
+def fork_start_bound(record: PreparedChild, converter: Any) -> int:
+    """Return the proved encoded upper bound of what one child's start answers with.
+
+    The known parts are measured exactly and the run id the service has still to mint is allowed
+    its declared ceiling, which is the same rule every other reply this operation carries is
+    bounded under.
+    """
+    return max(
+        encoded_size(answer, converter)
+        for answer in _every_start_answer(record, "0" * RUN_ID_CEILING_BYTES)
+    )
+
+
+def check_start_within_bound(
+    started: ForkChildStarted, bound: int, converter: Any
+) -> int:
+    """Measure the result one child's start actually answered with against its retained bound."""
+    measured = encoded_size(started, converter)
+    if measured > bound:
+        raise WireFormatError(
+            f"the start of child {started.child_ordinal} answered with {measured} bytes and the "
+            f"bound proved for it before the barrier was {bound}"
+        )
+    return measured
+
+
+@dataclass(frozen=True)
+class VerifyForkOriginInput:
+    """The question a gated child asks the parent its lineage names.
+
+    It is pinned to the exact preparing parent execution, so a parent that has since been replaced
+    under the same identity answers for the execution that prepared this child rather than for
+    whatever runs there now.
+    """
+
+    parent_workflow_id: str
+    parent_run_id: str
+    fork_id: str
+    child_ordinal: int
+    child_workflow_id: str
+
+
+@dataclass(frozen=True)
+class ForkOriginVerified:
+    """The parent's row for one child, and nothing else.
+
+    The result is small and bounded on purpose: it is recorded in the child's own history, so a
+    replay performs no fresh client I/O and reaches the same answer, and a row that carried the
+    parent's state would put a second copy of that state in every child.
+    """
+
+    fork_id: str
+    fork_status: str
+    record: PreparedChild
+
+
+def _every_origin_answer(
+    fork_id: str, record: PreparedChild, child_run_id: str
+) -> Iterator[ForkOriginVerified]:
+    """Every legal reply one child's origin question can be answered with, in turn.
+
+    The proof is not the value the parent measured. The row it carries gains the class the start
+    response settled the child into and the exact run id the service minted for it, and the fork
+    moves through its own statuses while the row stays the same. Every one of those crosses, so
+    what a bound is over is the whole set of replies rather than one of them.
+
+    The row with no run id in it is one of those replies rather than a state before them. A record
+    starts with the identifier absent, a child may ask its origin question before any start reply
+    is recorded, and that question is answered from the row as it stands: a bound that allowed only
+    for an identifier the service had minted would be a bound over replies this parent gives after
+    a reply it gives first.
+
+    They are enumerated rather than reduced to a single longest one, because the size of a reply
+    is what the configured converter makes of it and not the length of the strings inside it: a
+    converter that encodes one state into more bytes than a state with longer words in it is a
+    converter a longest-string preflight would measure the wrong reply of.
+    """
+    for status in FORK_STATUSES:
+        for existence in CHILD_EXISTENCE:
+            for run_id in (None, child_run_id):
+                yield ForkOriginVerified(
+                    fork_id=fork_id,
+                    fork_status=status,
+                    record=replace(record, existence=existence, child_run_id=run_id),
+                )
+
+
+def _widest_origin_answer(
+    fork_id: str, record: PreparedChild, child_run_id: str, converter: Any
+) -> int:
+    """The largest number of bytes any legal reply about this child encodes to."""
+    return max(
+        encoded_size(answer, converter)
+        for answer in _every_origin_answer(fork_id, record, child_run_id)
+    )
+
+
+def fork_origin_bound(fork_id: str, record: PreparedChild, converter: Any) -> int:
+    """Return the proved encoded upper bound of the origin proof one child will be answered with.
+
+    Every known value is measured exactly, the run id the service has still to mint is allowed its
+    declared ceiling, and every state this parent can answer in is measured through the configured
+    converter, so the bound stands whatever the fork goes on to do and whichever identifier the
+    service returns.
+    """
+    return _widest_origin_answer(fork_id, record, "0" * RUN_ID_CEILING_BYTES, converter)
+
+
+def check_origin_within_bound(
+    fork_id: str, record: PreparedChild, bound: int, converter: Any
+) -> int:
+    """Measure the origin proof of a child whose run id the service has now minted.
+
+    What is measured is every reply this child can still be answered with rather than the one
+    state the fork is in at this moment, because the row is committed once and answered from for
+    as long as the window admits a question.
+    """
+    measured = _widest_origin_answer(fork_id, record, record.child_run_id or "", converter)
+    if measured > bound:
+        raise WireFormatError(
+            f"the origin proof of child {record.child_ordinal} encodes to {measured} bytes and "
+            f"the bound proved for it before the barrier was {bound}"
+        )
+    return measured
+
+
+def check_origin_reply_within_bound(
+    answer: ForkOriginVerified, bound: int, converter: Any
+) -> int:
+    """Measure the reply a parent is about to answer one origin question with.
+
+    The bound was proved before the barrier over every reply this parent could ever give, so the
+    one it actually gives is held to it where it is given: a reply over its bound is a refusal
+    carrying the measurement rather than a silent oversize on the wire.
+    """
+    measured = encoded_size(answer, converter)
+    if measured > bound:
+        raise WireFormatError(
+            f"the origin proof of child {answer.record.child_ordinal} encodes to {measured} "
+            f"bytes and the bound proved for it before the barrier was {bound}"
+        )
+    return measured
+
+
+@dataclass(frozen=True)
+class ForkStatusQuestion:
+    """What a controller asks a parent about a fork it cannot send an Update to.
+
+    The digest is what binds a fork id to the request it was accepted under, so the same id over a
+    different checkpoint or different plans is named a conflict rather than answered with children
+    that were prepared for something else.
+    """
+
+    fork_id: str
+    request_digest: str
+
+
+@dataclass(frozen=True)
+class ForkStatusAnswer:
+    """Where one fork stands, read from a parent that may already have closed.
+
+    ``parent_state`` is what a controller write would now meet, because a closed execution accepts
+    no Update at all: the service refuses it before any validator runs, so a logical retry under a
+    fresh identifier cannot reach a handler and a refusal cannot be raised from one.
+
+    ``receipt`` is the complete evidence a finished fork answered with, carried here so that the
+    one route a retry under a fresh identifier can still reach returns the children rather than a
+    state. A fork that completed has an answer, and reporting it as still in flight because the
+    identifier is new would send a controller back to a parent that can accept nothing.
+    """
+
+    found: bool
+    conflict: bool
+    parent_state: str
+    record: Optional[PreparedFork] = None
+    receipt: Optional[ForkReceipt] = None

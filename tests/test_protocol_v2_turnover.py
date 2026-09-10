@@ -768,14 +768,18 @@ def test_every_handler_writes_its_answer_into_the_journal() -> None:
 
     What a repeated Update identifier is answered with used to be kept for a chosen few
     operations, and every review found another one that had been left out. It is kept for all of
-    them now, and this is the check that keeps it that way: the eleven registered Updates are
+    them now, and this is the check that keeps it that way: the twelve registered Updates are
     read off the workflow, and every one of them has to name a result type the journal can decode
     an answer back into. A handler added later fails this rather than being quietly uncovered.
+
+    The twelfth is the fork, which no gateway sends and no agent reaches. It is here for the same
+    reason as the eleven: its exact Update returns the complete receipt, and the exact outcome
+    journal is a usable recovery path for it only if the answer decodes back.
     """
     from temporalio import workflow as temporal_workflow
 
     registered = set(temporal_workflow._Definition.must_from_class(StreamWorkflow).updates)
-    assert len(registered) == 11, sorted(registered)
+    assert len(registered) == 12, sorted(registered)
     assert registered == set(kernel_workflow.ANSWER_TYPES), (
         registered ^ set(kernel_workflow.ANSWER_TYPES)
     )

@@ -23,10 +23,11 @@ from __future__ import annotations
 import asyncio
 import json
 from dataclasses import replace
+from datetime import datetime, timezone
 from hashlib import sha256
 from pathlib import Path
 from types import SimpleNamespace
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, Tuple
 
 import pytest
 
@@ -34,13 +35,15 @@ pytest.importorskip("temporalio")
 
 from temporalio.client import WorkflowHistory  # noqa: E402
 from temporalio.converter import default as default_converter  # noqa: E402
-from temporalio.exceptions import ApplicationError  # noqa: E402
+from temporalio.exceptions import ActivityError, ApplicationError  # noqa: E402
+from temporalio.service import RPCError, RPCStatusCode  # noqa: E402
 
 from shogym.serve.protocol_v2 import (  # noqa: E402
     BY_POSITION,
     IMMEDIATE,
     RELEASE_AT_SEAL,
     TASK_FIRST,
+    EligibilityGate,
     Payload,
     PresentationAck,
     PullRequest,
@@ -70,13 +73,40 @@ from shogym.serve.protocol_v2.artifact import (  # noqa: E402
 from shogym.serve.protocol_v2.blobs import BlobRef  # noqa: E402
 from shogym.serve.protocol_v2.errors import WireFormatError  # noqa: E402
 from shogym.serve.protocol_v2.kernel import (  # noqa: E402
+    EXPIRED_PREPARATION,
+    FORK_ABANDONED,
+    FORK_ANSWER_WINDOW_MS,
+    FORK_AUTHORITY_HORIZON_MS,
+    FORK_AVAILABILITY_STEP,
     FORK_CARRIER_SCHEMA_VERSION,
+    FORK_CHILDREN_CONFIRMED,
+    FORK_CONFLICTED,
+    FORK_PREPARATION_BOUND_MS,
+    FORK_PREPARED,
+    FORK_RESERVE,
+    FORK_EXPIRED_AUTHORITY,
+    FORK_REFUSALS,
+    FORK_START_STEP,
+    FORK_UNREADABLE_PARENT,
     LEGACY_CARRIER_SCHEMA_VERSION,
     ORIGIN_UNVERIFIED,
+    PERMANENT_FORK_REFUSALS,
     RECEIPT_CARRIER_SCHEMA_VERSION,
+    RETRYABLE_FORK_REFUSALS,
+    SPENT_RECOVERY_RESERVE,
+    TURNOVER_PAYLOAD_CEILING_BYTES,
+    AnsweredUpdate,
     CarriedProjection,
     ChildSelection,
+    ForkChildPlan,
+    ForkChildReceipt,
+    ForkChildStarted,
     ForkOrigin,
+    ForkOriginVerified,
+    ForkReceipt,
+    ForkRequest,
+    ForkStatusAnswer,
+    ForkStatusQuestion,
     OfferedMessage,
     OwnershipClaim,
     PayloadCandidate,
@@ -88,26 +118,53 @@ from shogym.serve.protocol_v2.kernel import (  # noqa: E402
     TaskItem,
     TerminalTool,
     Writer,
+    assignments_for,
     carrier_version,
     child_carrier,
     child_workflow_id,
     complete_start_digest,
     configuration_hash,
+    fork_activities,
+    fork_activity_id,
+    fork_availability_activity,
+    fork_request_digest,
     continuation_argument,
     derived_selection,
     fork_configuration,
     hidden_seal_id,
     origin_digest,
+    seal_attempt_activity,
     start_difference_projection,
     stream_replayer,
     transformed_child_selection,
+    verify_blobs_activity,
 )
+from shogym.serve.protocol_v2.kernel import runtime as kernel_runtime  # noqa: E402
 from shogym.serve.protocol_v2.kernel import workflow as kernel_workflow  # noqa: E402
 from shogym.serve.protocol_v2.kernel.messages import (  # noqa: E402
+    OperationFailure,
+    FORK_CONFIGURATION_VIOLATION,
+    FORK_IN_FLIGHT,
+    FORK_MOVED_EXECUTION,
+    FORK_NOT_QUIET,
+    FORK_REPAIRABLE_ABSENCE,
+    FORK_ORIGIN_DISAGREEMENT,
+    FORK_UNDECLARED_BRANCH,
+    FORK_UNRECOVERABLE_EVIDENCE,
+    FORK_WITNESS_MISMATCH,
     CarriedAttempt,
     CarriedAttestation,
     CarriedBinding,
     CarriedObligation,
+    CHILD_EXISTENCE,
+    FORK_STATUSES,
+    RUN_ID_CEILING_BYTES,
+    check_prepared_fork,
+    child_blob_root,
+    encoded_size,
+    fork_origin_bound,
+    fork_receipt_bound,
+    fork_start_bound,
     legacy_projection_members,
     legacy_start_members,
     origin_fields,
@@ -116,6 +173,9 @@ from shogym.serve.protocol_v2.kernel.messages import (  # noqa: E402
     receipt_start_members,
     resolved_echo,
     unpack_carrier,
+)
+from shogym.serve.protocol_v2.kernel.activities import (  # noqa: E402
+    ORIGIN_DISAGREEMENT_FAILURE,
 )
 from shogym.serve.protocol_v2.kernel.runtime import (  # noqa: E402
     refuse_a_carried_projection,
@@ -128,6 +188,7 @@ from shogym.serve.protocol_v2.policy import (  # noqa: E402
     KERNEL_STAND_IN_GRADE,
     LEGACY,
     PLACEBO_RECEIPT_ARTIFACT_V1_DIGEST,
+    PLATFORM_DEFAULT,
     POLICIES,
     REGISTERED,
     SINGLETON_SLOT,
@@ -140,6 +201,8 @@ from shogym.serve.protocol_v2.policy import (  # noqa: E402
 
 ATTEMPT = "b" * 32
 SILENT = "c" * 32
+#: The moment a constructed generation reads its clock at, so a deadline comparison is a value.
+A_MOMENT = datetime(2026, 9, 8, 12, 0, tzinfo=timezone.utc)
 EXECUTION = "execution-1"
 CONTRACT = "ledger_receipt"
 SOURCE = "a" * 64
@@ -2831,12 +2894,24 @@ def a_recorded_row(child: StreamStart, **changes: Any) -> PreparedChild:
 def serving_as(
     monkeypatch: pytest.MonkeyPatch, *, workflow_id: str, continued: Optional[str] = None
 ) -> None:
-    """Run the constructor as the service would: under this identity, continuing that run."""
+    """Run the constructor as the service would: under this identity, continuing that run.
+
+    The clock and the rest of the execution's identity are here because a fork reads them: the
+    boundary compares deadlines against the generation's own clock, and the request names the exact
+    execution it was prepared against.
+    """
     monkeypatch.setattr(kernel_workflow.workflow, "payload_converter", lambda: CONVERTER)
+    monkeypatch.setattr(kernel_workflow.workflow, "now", lambda: A_MOMENT)
     monkeypatch.setattr(
         kernel_workflow.workflow,
         "info",
-        lambda: SimpleNamespace(workflow_id=workflow_id, continued_run_id=continued),
+        lambda: SimpleNamespace(
+            workflow_id=workflow_id,
+            continued_run_id=continued,
+            run_id=PARENT_RUN,
+            namespace="default",
+            task_queue="the task queue of this run",
+        ),
     )
 
 
@@ -3221,3 +3296,2299 @@ def test_a_carried_row_altered_off_the_boundary_fails_the_complete_start_authori
     )
     assert complete_start_digest(reference) != a_recorded_row(child).complete_start_digest
     assert "other than its source's own entry" in refused_start(reference)
+
+
+# The parent side of a fork, as the pure predicate a validator and a handler both read.
+#
+# What is driven here is a constructed generation rather than a running one, because every clause
+# below is a comparison against state and none of it awaits anything. The Update itself is driven
+# on a real service, where the ledger's own self-counting problem is visible; nothing that runs in
+# process can see that at all.
+
+PARENT_ID = "stream/the-parent/1"
+PARENT_RUN = "the-parent-run"
+
+
+def a_quiet_parent(
+    monkeypatch: pytest.MonkeyPatch, *, start: Optional[StreamStart] = None, **moved: Any
+) -> Any:
+    """One fork-capable generation standing exactly where a fork may be taken.
+
+    The attempt is acknowledged, its payload is eligible and undelivered, the acknowledgement is in
+    the presented rows with the attestation that committed it, and nothing is part way through.
+    """
+    declared = a_fork_parent() if start is None else start
+    committed = PresentedMessage(
+        order=0,
+        kind="seal_ack",
+        message_id=oid(0x102),
+        attempt_id=ATTEMPT,
+        visible_bytes_sha256=digest_of("the acknowledgement as it was presented"),
+    )
+    inventory = an_inventory(
+        source_commitment(a_manifest()),
+        digest_of(SUBMISSION),
+        "9" * 64,
+        source_commitment(
+            a_manifest(
+                source_attempt_id=SILENT, source_seal_id=hidden_seal_id(EXECUTION, 0, SILENT)
+            )
+        ),
+    )
+    projection = replace(
+        a_projection(declared, committed_blobs=inventory),
+        cursor=oid(0x102),
+        presented=[committed],
+        attestations=[
+            CarriedAttestation(
+                attestation_id=oid(0x201),
+                identity=oid(0x202),
+                ack=PresentationAck(
+                    attestation_id=oid(0x201),
+                    cursor=oid(0x102),
+                    stream_state_sha256=digest_of("the state that was attested to"),
+                ),
+            )
+        ],
+        **moved,
+    )
+    serving_as(monkeypatch, workflow_id=PARENT_ID, continued="the execution before")
+    return kernel_workflow.StreamWorkflow(
+        replace(
+            declared,
+            carry=pack_carrier(projection, CONVERTER, version=FORK_CARRIER_SCHEMA_VERSION),
+        )
+    )
+
+
+def a_two_position_parent(**changes: Any) -> StreamStart:
+    """The same parent with a second position, so a prefix can owe more than one payload."""
+    base = a_fork_parent()
+    assert base.provenance is not None
+    items = [
+        *base.tasks,
+        TaskItem(
+            task_position=1,
+            attempt_id=SILENT,
+            task_message_id=oid(0x105),
+            ack_message_id=oid(0x106),
+            payload_position=1,
+            payload_message_id=oid(0x107),
+            body="file the second report",
+        ),
+    ]
+    rows = [
+        *base.dispositions,
+        replace(base.dispositions[0], attempt_id=SILENT, payload_position=1),
+    ]
+    declared = replace(
+        base,
+        tasks=items,
+        dispositions=rows,
+        provenance=replace(base.provenance, roster_digest=roster_digest(rows)),
+    )
+    return replace(declared, **changes) if changes else declared
+
+
+def a_second_row() -> CarriedAttempt:
+    """The second position's own sealed attempt, over a source committed for that attempt."""
+    manifest = a_manifest(
+        source_attempt_id=SILENT, source_seal_id=hidden_seal_id(EXECUTION, 0, SILENT)
+    )
+    return a_row(
+        attempt_id=SILENT,
+        seal_id=hidden_seal_id(EXECUTION, 0, SILENT),
+        seal_ordinal=2,
+        source_artifact=manifest,
+        source_commitment=source_commitment(manifest),
+    )
+
+
+def a_plan(slot: str, cell: str, **changes: Any) -> ForkChildPlan:
+    """One child a controller asks for: its branch, its rows, its cell, its own identities."""
+    rows = [
+        replace(row, branch_slot=slot, policy_digest=CELL_POLICIES[cell], cell=cell)
+        if row.kind == DELIVER
+        else replace(row, branch_slot=slot)
+        for row in a_fork_parent().dispositions
+    ]
+    declared = ForkChildPlan(
+        branch_slot=slot,
+        dispositions=rows,
+        target_cell=cell,
+        run_directory=f"/runs/{slot}",
+        consumer_claim_hash=digest_of(f"the consumer of {slot}"),
+        hidden_execution_id=f"execution-{slot}",
+        frozen_plan_digest=digest_of("the frozen plan both children are parked under"),
+    )
+    return replace(declared, **changes) if changes else declared
+
+
+def a_plan_over(parent: Any, slot: str, cell: str) -> ForkChildPlan:
+    """One child plan resolving the rows the generation being forked actually holds."""
+    rows = [
+        replace(row, branch_slot=slot, policy_digest=CELL_POLICIES[cell], cell=cell)
+        if row.kind == DELIVER
+        else replace(row, branch_slot=slot)
+        for row in parent._start.dispositions
+    ]
+    return replace(a_plan(slot, cell), dispositions=rows)
+
+
+def a_fork_request(parent: Any, **changes: Any) -> ForkRequest:
+    """The typed fork a controller submits, carrying both witnesses and the ordered plans."""
+    declared = ForkRequest(
+        parent_workflow_id=PARENT_ID,
+        parent_run_id=PARENT_RUN,
+        parent_execution_ordinal=parent._start.execution_ordinal,
+        parent_configuration_hash=configuration_hash(parent._start),
+        source_attempt_id=ATTEMPT,
+        attestation_id=oid(0x201),
+        acknowledgement_message_id=oid(0x102),
+        acknowledged_visible_sha256=digest_of("the acknowledgement as it was presented"),
+        acknowledged_cursor=oid(0x102),
+        projection_digest=parent._projection_hash(),
+        checkpoint_manifest_reference=digest_of("the checkpoint manifest"),
+        fork_id=FORK,
+        child_plans=[a_plan(FIRST_SLOT, GRADED_CELL), a_plan(SECOND_SLOT, PLACEBO_CELL)],
+    )
+    return replace(declared, **changes) if changes else declared
+
+
+def fork_refusal(parent: Any, request: ForkRequest, **arguments: Any) -> Any:
+    """Read this fork against this generation, and return the refusal it raised."""
+    with pytest.raises(kernel_workflow.ForkRefused) as raised:
+        parent._refuse_a_fork(request, **arguments)
+    return raised.value
+
+
+def test_a_quiet_fork_capable_parent_refuses_nothing_about_a_well_formed_fork(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The predicate holds where every clause of it holds, which is what the refusals move off."""
+    parent = a_quiet_parent(monkeypatch)
+    parent._refuse_a_fork(a_fork_request(parent))
+
+
+def test_a_fork_is_refused_by_the_one_clause_of_a_quiet_boundary_that_failed(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """One refusal per clause, each naming the condition rather than saying it is not quiet.
+
+    The boundary a fork is taken at is the continuation's own: the generation is open, not
+    draining, has not presented Done, holds no pending message, has no operation in flight, holds
+    no environment grant, has no attempt sealing and has no deadline due. A fork arriving when any
+    of them fails is refused rather than queued, because a fork that waited would hold the
+    generation open against an agent still working.
+    """
+    moved = {
+        "generation_state": lambda parent: setattr(parent, "_generation_state", "done"),
+        "draining": lambda parent: setattr(parent, "_draining", True),
+        "done_presented": lambda parent: setattr(parent, "_done_presented", True),
+        # A message offered and not attested to is the clause a fork meets most often, because it
+        # is what a generation holds for the whole of the moment an agent is being answered.
+        "pending_message": lambda parent: setattr(
+            parent,
+            "_pending",
+            kernel_workflow._Pending(
+                message=OfferedMessage(
+                    message_id=oid(0x103),
+                    kind="task",
+                    visible_text="the task nobody has attested to yet",
+                    attempt_id=SILENT,
+                ),
+                origin=kernel_workflow.PULL,
+                request_id=a_transport_id("a pull still being answered"),
+            ),
+        ),
+        "operation_in_flight": lambda parent: setattr(parent, "_operation_in_flight", True),
+        "environment_grant": lambda parent: setattr(parent, "_environment_call", "call-1"),
+        "attempt_sealing": lambda parent: setattr(
+            parent._attempts[ATTEMPT], "state", "sealing"
+        ),
+        "deadline_due": lambda parent: setattr(
+            parent._attempts[ATTEMPT], "deadline_expired", True
+        ),
+    }
+    for clause, break_it in moved.items():
+        parent = a_quiet_parent(monkeypatch)
+        break_it(parent)
+        refusal = fork_refusal(parent, a_fork_request(parent))
+        assert refusal.reason == FORK_NOT_QUIET, clause
+        assert refusal.clause == clause, clause
+    # And the ninth, which is the one clause a generation reaches through its own machinery rather
+    # than through a field: a latch is a decision to hand this generation on, and a fork of a
+    # generation that has decided that is refused until its successor exists.
+    parent = a_quiet_parent(monkeypatch)
+    parent._turnover_requested = True
+    parent._turnover_available = True
+    refusal = fork_refusal(parent, a_fork_request(parent))
+    assert refusal.reason == FORK_NOT_QUIET
+    assert "latched for a turnover" in refusal.clause
+
+
+def test_a_handler_that_was_accepted_and_has_not_finished_refuses_a_fork_but_never_itself(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The ledger, and the exclusion that keeps a fork from waiting for itself for ever.
+
+    The SDK inserts an Update into its own map before that Update's validator runs and removes it
+    in the handler's finally, so a request that waited for the public predicate in its own
+    validator or its own handler would wait for itself for ever. The ledger is this generation's
+    own: a validator sees exactly the handlers that were accepted and have not finished, and a
+    handler names itself and is left out.
+    """
+    parent = a_quiet_parent(monkeypatch)
+    parent._handlers = {"present-4": "commit_presentation"}
+    refusal = fork_refusal(parent, a_fork_request(parent))
+    assert refusal.reason == FORK_NOT_QUIET
+    assert "present-4" in refusal.clause
+
+    parent._handlers = {"fork-1": kernel_workflow.FORK}
+    parent._refuse_a_fork(a_fork_request(parent), excluding=("fork-1",))
+    # And a second fork under another identity, arriving while the first is still in flight, is
+    # exactly the case the exclusion must not widen to.
+    refusal = fork_refusal(
+        parent, a_fork_request(parent), excluding=("fork-2",)
+    )
+    assert refusal.reason == FORK_NOT_QUIET
+    assert "fork-1" in refusal.clause
+
+
+def test_a_matching_retry_never_runs_beside_the_handler_already_finishing_that_fork(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A barrier that stands answers a retry from its record, and never beside a live handler.
+
+    A matching request arriving after the barrier is the recovery path, so it is not judged against
+    a boundary the parent has already left. That is not permission to run two of them at once: two
+    handlers admitted here would schedule the same child's start work and spend the same reserve on
+    it, so a fresh identifier arriving while one is in flight is refused as retryable and comes
+    back once the fork it would have raced has settled.
+
+    The clause is about another fork handler and about nothing else, so a ledger row for any other
+    handler does not hold a retry off. What this generation admits after its barrier is narrower
+    still: the fork's own class and nothing more, so such a row is a value this clause is read
+    against rather than a state a parked parent reaches.
+    """
+    parent, request = a_barrier(monkeypatch)
+    parent._handlers = {"fork-1": kernel_workflow.FORK}
+    # The handler that is finishing this fork reads the boundary again and never sees itself.
+    parent._refuse_a_fork(request, excluding=("fork-1",))
+    refusal = fork_refusal(parent, request, excluding=("fork-2",))
+    assert refusal.reason == FORK_IN_FLIGHT
+    assert not refusal.non_retryable
+    assert "fork-1" in refusal.clause
+    assert "finishing this fork" in refusal.clause
+
+    # A row for a handler that is not this fork, read against the clause rather than reached: a
+    # parked parent admits the fork's own class alone, so nothing else is accepted after a barrier.
+    parent._handlers = {"confirm-9": "confirm_state"}
+    parent._refuse_a_fork(request, excluding=("fork-2",))
+    with pytest.raises(kernel_workflow.ForkBarrier):
+        parent._admit_after_a_barrier(completion=False)
+
+
+def test_a_fork_is_refused_by_the_one_witness_that_did_not_match(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """One refusal per compared field, and one per join between the two records.
+
+    The stream's witness is the acknowledged cursor and the projection digest at it, and the
+    identifiers around them are what say which acknowledgement is meant. The platform validates
+    this half and the adapter attests the other; neither side proves the other's, and a mismatch in
+    any of them installs no barrier and creates no child.
+    """
+    parent = a_quiet_parent(monkeypatch)
+    for name, value, said in (
+        ("acknowledgement_message_id", oid(0x999), "the acknowledgement of"),
+        ("acknowledged_visible_sha256", digest_of("other bytes"), "went as other bytes"),
+        ("attestation_id", oid(0x998), "holds no attestation"),
+        ("acknowledged_cursor", oid(0x997), "stands at"),
+        ("projection_digest", digest_of("another projection"), "other than this generation's"),
+    ):
+        refusal = fork_refusal(parent, a_fork_request(parent, **{name: value}))
+        assert refusal.reason == FORK_WITNESS_MISMATCH, name
+        assert said in refusal.clause, name
+
+    # A message this generation never presented, named as the acknowledgement it does owe. The
+    # first comparison passes and the row is what is missing, which is a different refusal from a
+    # request naming somebody else's message.
+    unpresented = a_quiet_parent(monkeypatch)
+    unpresented._presented.pop(oid(0x102))
+    refusal = fork_refusal(unpresented, a_fork_request(unpresented))
+    assert refusal.reason == FORK_WITNESS_MISMATCH
+    assert "presented no message" in refusal.clause
+
+    # And the join, which is what a checkpoint naming a record that exists and is about something
+    # else meets. No collision and no altered history is needed: the attestation below is a real
+    # record of this generation, and it is not a record of the presentation this fork is cut at.
+    elsewhere = a_quiet_parent(monkeypatch)
+    elsewhere._attestation_identities[oid(0x301)] = oid(0x302)
+    elsewhere._attestations[oid(0x301)] = PresentationAck(
+        attestation_id=oid(0x301),
+        cursor=oid(0x101),
+        stream_state_sha256=digest_of("the state at some other presentation"),
+    )
+    refusal = fork_refusal(
+        elsewhere, a_fork_request(elsewhere, attestation_id=oid(0x301))
+    )
+    assert refusal.reason == FORK_WITNESS_MISMATCH
+    assert "committed the presentation of" in refusal.clause
+
+
+def test_a_prefix_that_owes_more_than_the_inherited_payload_is_never_forked(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Quiet at capacity one does not mean the inherited payload is what a child pulls first.
+
+    The schedule ranks eligible tasks and eligible obligations together under one declared key, so
+    a plan that puts tasks first would serve the next task before the inherited receipt. The rule
+    is therefore stated over the obligations rather than inferred from the capacity: the inherited
+    one is the sole unresolved obligation, it is eligible and undelivered, and the schedule's next
+    selection is precisely that payload.
+    """
+    older = a_quiet_parent(
+        monkeypatch,
+        start=a_two_position_parent(),
+        obligations=[
+            CarriedObligation(
+                attempt_id=ATTEMPT, state="eligible", materialized=True, candidate=a_candidate()
+            ),
+            CarriedObligation(
+                attempt_id=SILENT,
+                state="materialized",
+                materialized=True,
+                candidate=a_candidate(
+                    message_id=oid(0x107),
+                    attempt_id=SILENT,
+                    commitment=source_commitment(
+                        a_manifest(
+                            source_attempt_id=SILENT,
+                            source_seal_id=hidden_seal_id(EXECUTION, 0, SILENT),
+                        )
+                    ),
+                ),
+            ),
+        ],
+        attempts=[a_row(), a_second_row()],
+    )
+    refusal = fork_refusal(older, a_fork_request(older))
+    assert refusal.reason == FORK_NOT_QUIET
+    assert "inherits one unresolved payload" in refusal.clause
+
+    # An obligation nothing has released is the same refusal at the next clause: the row exists,
+    # because the start creates one per assigned position, and what is missing is the release.
+    missing = a_quiet_parent(monkeypatch, obligations=[])
+    refusal = fork_refusal(missing, a_fork_request(missing))
+    assert refusal.reason == FORK_NOT_QUIET
+    assert "is assigned and a child is cut over one that is eligible" in refusal.clause
+
+    unready = a_quiet_parent(
+        monkeypatch,
+        obligations=[
+            CarriedObligation(
+                attempt_id=ATTEMPT,
+                state="materialized",
+                materialized=True,
+                candidate=a_candidate(),
+            )
+        ],
+    )
+    refusal = fork_refusal(unready, a_fork_request(unready))
+    assert refusal.reason == FORK_NOT_QUIET
+    assert "is materialized and a child is cut over one that is eligible" in refusal.clause
+
+    # And the clause the rule exists for, which the three above never reach: the inherited payload
+    # is the sole unresolved obligation and the schedule still puts something else first. The
+    # second position here delivers nothing, so it creates no obligation at all and owes nothing,
+    # while its task is eligible and a task-first plan ranks it ahead of the receipt.
+    ahead = a_fork_parent(silent=True)
+    later = a_quiet_parent(
+        monkeypatch,
+        start=replace(
+            ahead,
+            release=TASK_AHEAD_OF_PAYLOAD,
+            assignments=assignments_for(
+                ahead.tasks, TASK_AHEAD_OF_PAYLOAD, without_payload=[SILENT]
+            ),
+        ),
+    )
+    assert sorted(later._obligations) == [ATTEMPT]
+    assert later._first_eligible() == (kernel_workflow.TASK, SILENT)
+    refusal = fork_refusal(later, a_fork_request(later))
+    assert refusal.reason == FORK_NOT_QUIET
+    assert "next selection of this generation's schedule" in refusal.clause
+    assert SILENT in refusal.clause
+    # The same generation under the plan its parent actually declared serves the receipt first,
+    # so what refuses the fork is the schedule rather than the second position.
+    served = a_quiet_parent(
+        monkeypatch,
+        start=replace(
+            ahead,
+            assignments=assignments_for(ahead.tasks, IMMEDIATE, without_payload=[SILENT]),
+        ),
+    )
+    assert served._first_eligible() == (kernel_workflow.PAYLOAD, ATTEMPT)
+    served._refuse_a_fork(a_fork_request(served))
+
+
+def test_a_prefix_that_already_delivered_a_payload_is_outside_what_this_build_forks(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The admissible prefix, restricted so the slot provenance question stays closed.
+
+    A child that changed anything the prefix already delivered would be claiming its inherited
+    transcript was produced under rules it was not, so a fork over a prefix that presented a
+    payload is refused rather than reconciled against a new branch slot.
+    """
+    delivered = a_quiet_parent(
+        monkeypatch,
+        start=a_two_position_parent(),
+        obligations=[
+            CarriedObligation(
+                attempt_id=ATTEMPT, state="eligible", materialized=True, candidate=a_candidate()
+            ),
+            CarriedObligation(attempt_id=SILENT, state="presented", materialized=True),
+        ],
+        attempts=[a_row(), a_second_row()],
+    )
+    refusal = fork_refusal(delivered, a_fork_request(delivered))
+    assert refusal.reason == FORK_CONFIGURATION_VIOLATION
+    assert "already delivered the payloads" in refusal.clause
+
+
+def test_a_successor_that_has_been_admitted_or_a_world_that_is_open_refuses_a_fork(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """No attempt is offered or active, so no successor is admitted and no live world is open."""
+    for state in ("task_offered", "active"):
+        parent = a_quiet_parent(
+            monkeypatch,
+            start=a_two_position_parent(),
+            attempts=[a_row(), CarriedAttempt(attempt_id=SILENT, state=state)],
+            obligations=[
+                CarriedObligation(
+                    attempt_id=ATTEMPT,
+                    state="eligible",
+                    materialized=True,
+                    candidate=a_candidate(),
+                ),
+                CarriedObligation(attempt_id=SILENT, state="assigned"),
+            ],
+        )
+        refusal = fork_refusal(parent, a_fork_request(parent))
+        assert refusal.reason == FORK_NOT_QUIET, state
+        assert "a successor has been admitted or a world is open" in refusal.clause, state
+
+
+def test_an_inherited_attempt_whose_evidence_reads_unavailable_is_never_forked_over(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A fork over evidence the parent could not produce hands both children a dependency neither
+    can resolve, and the availability axis is the last row naming the attempt rather than any row.
+    """
+    refused = OperationFailure(
+        operation="the delivery that could not read its evidence",
+        phase="continued_first_delivery",
+        reason="unavailable_evidence",
+        outcome="refused",
+        generation=PARENT_ID,
+        refused_epoch=1,
+        attempt_id=ATTEMPT,
+    )
+    standing = a_quiet_parent(monkeypatch, operation_failures=[refused])
+    refusal = fork_refusal(standing, a_fork_request(standing))
+    assert refusal.reason == FORK_UNRECOVERABLE_EVIDENCE
+    assert "reads unavailable" in refusal.clause
+
+    recovered = a_quiet_parent(
+        monkeypatch,
+        operation_failures=[refused, replace(refused, outcome="recovered", recovered_epoch=2)],
+    )
+    recovered._refuse_a_fork(a_fork_request(recovered))
+
+    # And the rule is over every inherited receipt attempt rather than over the one a fork is cut
+    # at. An earlier withheld receipt keeps its own committed source, both children inherit it
+    # whole, and the prebarrier read opens the source of the selected cell alone, so a claim that
+    # could not produce that earlier source leaves a refusal nothing this fork discharges.
+    ahead = replace(
+        a_fork_parent(silent=True),
+        assignments=assignments_for(
+            a_fork_parent(silent=True).tasks, IMMEDIATE, without_payload=[SILENT]
+        ),
+    )
+    kept = replace(
+        a_second_row(),
+        selected_cell=None,
+        selected_body_reference=None,
+        selected_policy_digest=None,
+    )
+    predecessor = a_quiet_parent(monkeypatch, start=ahead, attempts=[a_row(), kept])
+    assert sorted(predecessor._obligations) == [ATTEMPT]
+    predecessor._refuse_a_fork(a_fork_request(predecessor))
+
+    withheld = a_quiet_parent(
+        monkeypatch,
+        start=ahead,
+        attempts=[a_row(), kept],
+        operation_failures=[
+            replace(
+                refused,
+                operation="the claim that could not read the source it required",
+                phase="ownership_claim",
+                attempt_id=SILENT,
+            )
+        ],
+    )
+    refusal = fork_refusal(withheld, a_fork_request(withheld))
+    assert refusal.reason == FORK_UNRECOVERABLE_EVIDENCE
+    assert f"the inherited attempt {SILENT} reads unavailable" in refusal.clause
+
+
+def test_a_child_plan_naming_a_branch_its_parent_never_declared_is_refused(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The slots a fork may create are the parent's declaration, inside its configuration hash.
+
+    A child plan naming an undeclared slot is refused against a value the parent committed to
+    before it forked, and a plan naming the branch the parent itself serves is refused too: two
+    generations serving one slot is two rows for one exposure.
+    """
+    parent = a_quiet_parent(monkeypatch)
+    undeclared = a_fork_request(
+        parent, child_plans=[a_plan("third", GRADED_CELL), a_plan(SECOND_SLOT, PLACEBO_CELL)]
+    )
+    refusal = fork_refusal(parent, undeclared)
+    assert refusal.reason == FORK_UNDECLARED_BRANCH
+    assert "third" in refusal.clause
+
+    served = a_quiet_parent(
+        monkeypatch, start=a_fork_parent(forkable_slots=[SINGLETON_SLOT, SECOND_SLOT])
+    )
+    refusal = fork_refusal(
+        served,
+        a_fork_request(
+            served,
+            child_plans=[
+                a_plan(SINGLETON_SLOT, GRADED_CELL),
+                a_plan(SECOND_SLOT, PLACEBO_CELL),
+            ],
+        ),
+    )
+    assert refusal.reason == FORK_UNDECLARED_BRANCH
+    assert "the branch its parent serves" in refusal.clause
+
+
+def test_a_request_prepared_against_an_execution_that_moved_is_retried_rather_than_decided(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A turnover between reading the checkpoint evidence and submitting is an ordinary event.
+
+    The answer is to read the evidence again and resubmit the same fork id under the same
+    checkpoint and plans, which is the same logical fork, so this refusal is infrastructure and not
+    a decision the experiment records and stops on.
+    """
+    parent = a_quiet_parent(monkeypatch)
+    for name, value in (
+        ("parent_workflow_id", "stream/somebody-else/1"),
+        ("parent_run_id", "another-run"),
+        ("parent_execution_ordinal", 7),
+    ):
+        refusal = fork_refusal(parent, a_fork_request(parent, **{name: value}))
+        assert refusal.reason == FORK_MOVED_EXECUTION, name
+        assert refusal.non_retryable is False, name
+    configuration = fork_refusal(
+        parent, a_fork_request(parent, parent_configuration_hash="c" * 64)
+    )
+    assert configuration.reason == FORK_CONFIGURATION_VIOLATION
+    assert configuration.non_retryable is True
+
+
+def test_the_two_kinds_of_fork_refusal_are_kept_apart_by_the_reason_they_carry() -> None:
+    """The experiment retries infrastructure and never retries a decision, and this is that line."""
+    for reason in RETRYABLE_FORK_REFUSALS:
+        assert kernel_workflow.ForkRefused(reason, "a clause").non_retryable is False, reason
+    for reason in PERMANENT_FORK_REFUSALS:
+        assert kernel_workflow.ForkRefused(reason, "a clause").non_retryable is True, reason
+    assert set(FORK_REFUSALS) == {
+        *RETRYABLE_FORK_REFUSALS,
+        *PERMANENT_FORK_REFUSALS,
+        FORK_EXPIRED_AUTHORITY,
+    }
+    # And each of them reads back as the reason it is, because the reason is the type the failure
+    # carries: a reason this set gained that the reader could not name would be a refusal a
+    # controller met as a fault.
+    for reason in FORK_REFUSALS:
+        assert kernel_runtime.fork_refusal(kernel_workflow.ForkRefused(reason, "a clause")) == (
+            reason
+        )
+
+
+async def test_a_fork_refusal_kept_in_the_outcome_journal_still_names_its_clause(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A refusal has to say the same thing wherever the failure that carries it is kept.
+
+    What the journal keeps of a failed Update is a type and a message, and nothing else, so an
+    exact identifier answered out of it after a boundary or from a closed parent is raised again
+    from those two alone. A reason kept beside them as a detail would be gone by then, and a
+    controller would read a fork that was refused for an infrastructure reason as neither a
+    decision nor something to try again.
+    """
+    parent = a_quiet_parent(monkeypatch)
+    monkeypatch.setattr(
+        kernel_workflow.workflow,
+        "current_update_info",
+        lambda: SimpleNamespace(id="fork-9"),
+    )
+
+    async def refuse() -> None:
+        raise kernel_workflow.ForkRefused(
+            FORK_REPAIRABLE_ABSENCE, "the store could not produce the placebo body"
+        )
+
+    with pytest.raises(kernel_workflow.ForkRefused):
+        await parent._answering(kernel_workflow.FORK, 1, refuse)
+
+    kept = parent.answered_update("fork-9")
+    assert kept.found is True
+    assert kept.kind == "failure"
+    raised = ApplicationError(kept.message, type=kept.type_name, non_retryable=True)
+    assert kernel_runtime.fork_refusal(raised) == FORK_REPAIRABLE_ABSENCE
+    assert kernel_runtime.fork_can_be_retried(raised) is True
+    assert "the placebo body" in kept.message
+
+
+class AnsweringHandle:
+    """A parent handle that answers one fork Update with the receipt it was given."""
+
+    def __init__(self, receipt: Any) -> None:
+        self.receipt = receipt
+
+    async def execute_update(self, *_arguments: Any, **_named: Any) -> Any:
+        return self.receipt
+
+
+class AnsweringClient:
+    """A client whose parent answers with one receipt, so the receiving check can be read."""
+
+    def __init__(self, receipt: Any) -> None:
+        self.data_converter = default_converter()
+        self.receipt = receipt
+
+    def get_workflow_handle_for(self, *_arguments: Any, **_named: Any) -> AnsweringHandle:
+        return AnsweringHandle(self.receipt)
+
+
+def a_receipt(**changes: Any) -> ForkReceipt:
+    """One complete fork receipt of the shape a parent answers with."""
+    declared = ForkReceipt(
+        fork_id=FORK,
+        parent_workflow_id=PARENT_ID,
+        parent_run_id=PARENT_RUN,
+        checkpoint_manifest_reference=digest_of("the checkpoint manifest"),
+        children=1,
+        child_receipts=[
+            ForkChildReceipt(
+                child_ordinal=1,
+                child_workflow_id=a_child_id(1),
+                child_run_id="r" * 36,
+                configuration_hash="c" * 64,
+                complete_start_digest="d" * 64,
+                origin_digest="e" * 64,
+                branch_slot=FIRST_SLOT,
+                target_cell=GRADED_CELL,
+                selected_body_reference=digest_of(BODIES[GRADED_CELL]),
+                acknowledged_cursor=oid(0x102),
+                projection_digest=digest_of("the projection at the cut"),
+                start_differences=[],
+                next_task_body_sha256="f" * 64,
+                next_assignment_id=SILENT,
+            )
+        ],
+        boundary_evidence=[],
+    )
+    return replace(declared, **changes) if changes else declared
+
+
+async def test_a_receipt_at_a_version_this_build_does_not_read_is_refused_where_it_arrives(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The version a receipt declares is checked at the boundary the receipt is received at.
+
+    A receipt is evidence a consumer decides over, so the one thing that says whether this build
+    may read it at all is checked before any of it is read. The check belongs here rather than
+    inside whichever operation goes on to consume the receipt, because a route that skipped it
+    would hand a consumer a shape nothing admitted.
+    """
+    parent = a_quiet_parent(monkeypatch)
+    request = a_fork_request(parent)
+    assert (
+        await kernel_runtime.fork_stream(AnsweringClient(a_receipt()), request) == a_receipt()
+    )
+
+    with pytest.raises(WireFormatError) as raised:
+        await kernel_runtime.fork_stream(AnsweringClient(a_receipt(schema_version=999)), request)
+    assert "999" in str(raised.value)
+
+
+def test_a_worker_serves_the_environments_own_activities_and_the_forks_three_beside_them() -> None:
+    """The registration a fork depends on, which nothing else would have supplied.
+
+    A Worker takes whatever Activity list it is handed wholesale, and an environment that brings
+    its own terminal hands over only its seal, its grade, the payload bundle Activity and the blob
+    verification Activity. The fork's three are none of those, so they are registered explicitly
+    beside whatever an environment supplied.
+    """
+    supplied = [seal_attempt_activity, verify_blobs_activity]
+    served = [
+        getattr(one, "__temporal_activity_definition").name
+        for one in kernel_runtime._registered(supplied)
+    ]
+    assert served[: len(supplied)] == [
+        "shogym.protocol_v2.SealAttemptActivity",
+        "shogym.protocol_v2.VerifyBlobsActivity",
+    ]
+    assert served[len(supplied) :] == [
+        getattr(one, "__temporal_activity_definition").name for one in fork_activities()
+    ]
+    assert len(set(served)) == len(served)
+    # A caller that supplied one of them itself keeps its own, because a Worker refuses two
+    # Activities of one name.
+    both = kernel_runtime._registered([*supplied, fork_availability_activity])
+    assert len(both) == len(served)
+
+
+def test_a_worker_a_read_stands_up_to_answer_a_query_serves_no_activity() -> None:
+    """A caller handing no Activity at all is not composing a Worker that serves a generation.
+
+    A read replays the generation to answer a Query and registers nothing, beside the Worker
+    already serving the run. An Activity registered there would make it a second Worker offering
+    to work the run's task queue, which the SDK refuses.
+    """
+    assert kernel_runtime._registered([]) == []
+
+
+def test_every_fork_only_activity_takes_its_identifier_from_the_forks_own_namespace(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A child's ordinary Activity numbering has to equal the number its inherited prefix left.
+
+    So a fork-only invocation never consumes the generation's own ordinal, and the identifier it
+    takes names the fork, the step and which attempt at that step it is. The ordinary counter is
+    untouched by any of it, which is what lets a child be compared with an unforked twin.
+    """
+    parent = a_quiet_parent(monkeypatch)
+    ordinal = parent._activity_ordinal
+    taken = [
+        parent._fork_activity(FORK, step)
+        for step in (FORK_AVAILABILITY_STEP, FORK_START_STEP, FORK_START_STEP)
+    ]
+    assert taken == [
+        f"fork.{FORK}.availability.1",
+        f"fork.{FORK}.start.1",
+        f"fork.{FORK}.start.2",
+    ]
+    assert parent._activity_ordinal == ordinal
+    assert parent._next_activity_id() == str(ordinal)
+    with pytest.raises(WireFormatError):
+        fork_activity_id(fork_id=FORK, step="a step this build does not perform", ordinal=1)
+
+
+def test_a_request_the_service_would_never_carry_is_refused_where_admission_is_decided(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A request the service would never admit is a decision, and decisions are made here.
+
+    Admission is settled synchronously and without writing, and what the request says about itself
+    includes how many bytes of it there are: a generation asked to fork over a shape nothing could
+    carry can answer without reading a single one of its own conditions. The refusal is permanent,
+    it carries the measurement it was refused over, and no barrier stands behind it.
+    """
+    parent = a_quiet_parent(monkeypatch)
+    request = a_fork_request(parent)
+    parent._refuse_a_fork(request)
+    [first, second] = request.child_plans
+    oversized = replace(
+        request,
+        child_plans=[
+            replace(first, run_directory="/runs/one/" + "d" * TURNOVER_PAYLOAD_CEILING_BYTES),
+            second,
+        ],
+    )
+    refusal = fork_refusal(parent, oversized)
+    assert refusal.reason == FORK_CONFIGURATION_VIOLATION
+    assert refusal.non_retryable
+    assert "the fork request" in refusal.clause
+    assert str(TURNOVER_PAYLOAD_CEILING_BYTES) in refusal.clause
+    assert parent._fork is None
+
+
+def test_a_child_start_this_generation_could_not_hand_on_refuses_the_fork_before_its_barrier(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A shape one fork transmits that will not fit is a refusal, never a fault of the parent.
+
+    The cap here is the parent's own complete start, measured, so this is a generation sitting at
+    the exact edge of what the service will carry for it. A child start is that start plus the
+    lineage record, which is why building one crosses a limit its parent did not, and it is also
+    why the refusal has to arrive as a decision: an oversize let out of an accepted call as the
+    plain wire failure it is raised as would fail the Workflow Task rather than the call, and the
+    generation would replay it for ever with no barrier installed and no refusal to read.
+
+    The plan is measured first and fits, so what is named is the shape that did not, and nothing
+    was committed: no barrier, no prepared record and no child.
+    """
+    parent = a_quiet_parent(monkeypatch)
+    request = a_fork_request(parent)
+    edge = encoded_size(parent._start, CONVERTER)
+    monkeypatch.setattr(kernel_workflow, "TURNOVER_PAYLOAD_CEILING_BYTES", edge)
+    with pytest.raises(kernel_workflow.ForkRefused) as raised:
+        parent._built_children(request)
+    refusal = raised.value
+    assert refusal.reason == FORK_CONFIGURATION_VIOLATION
+    assert refusal.non_retryable
+    assert "the start of child 1" in refusal.clause
+    assert str(edge) in refusal.clause
+    assert parent._fork is None
+    assert parent._generation_state == "open"
+    assert parent._fencing_token_hash is not None
+    # The parent's own start is what the cap was taken from, so the shape that crossed it is the
+    # child's alone, and the plan the child was built from is well inside it.
+    assert encoded_size(request.child_plans[0], CONVERTER) < edge
+
+
+def test_a_generation_declaring_more_than_one_live_attempt_is_never_forked(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Capacity one is a declaration, and slots nobody is standing in are not that declaration.
+
+    A fork above capacity one would clone attempts with live worlds, and cloning a world needs a
+    world snapshot contract this build does not write. A generation declaring two and serving none
+    is quiet, has no offered or active attempt and occupies no slot, so nothing about what it is
+    doing says it may be forked; what says so is the number it declared.
+    """
+    roomy = a_quiet_parent(monkeypatch, start=a_fork_parent(capacity=2))
+    assert roomy._capacity_in_use() == 0
+    refusal = fork_refusal(roomy, a_fork_request(roomy))
+    assert refusal.reason == FORK_CONFIGURATION_VIOLATION
+    assert refusal.non_retryable
+    assert "declaring one live attempt and this one declares 2" in refusal.clause
+    assert roomy._fork is None
+
+
+def test_a_child_whose_plan_its_own_restore_would_refuse_never_reaches_a_barrier(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The classification says what a child may change; it does not say the result is a generation.
+
+    A plan whose target cell and whose own delivering row name different cells is a well formed
+    request over a well classified transformation, and the start it produces is one the child's own
+    constructor refuses. A parent that committed a barrier over it would have fenced itself for
+    ever in order to create a generation nothing can start, so the child's own pure checks are run
+    over both completed starts here, before anything is committed.
+    """
+    parent = a_quiet_parent(monkeypatch)
+    request = a_fork_request(
+        parent,
+        child_plans=[
+            a_plan(FIRST_SLOT, GRADED_CELL, target_cell=PLACEBO_CELL),
+            a_plan(SECOND_SLOT, PLACEBO_CELL),
+        ],
+    )
+    # Nothing about the request, the boundary, the witnesses or the declared branches is wrong.
+    parent._refuse_a_fork(request)
+    with pytest.raises(kernel_workflow.ForkRefused) as raised:
+        parent._built_children(request)
+    refusal = raised.value
+    assert refusal.reason == FORK_CONFIGURATION_VIOLATION
+    assert refusal.non_retryable
+    assert "child 1 is one that child's own restore refuses" in refusal.clause
+    assert "does not resolve" in refusal.clause
+    assert parent._fork is None
+    assert parent._generation_state == "open"
+    assert parent._fencing_token_hash is not None
+    # And the second plan, which is the lawful one, is what the same build accepts.
+    parent._built_children(a_fork_request(parent))
+
+
+def test_a_child_start_no_ordinary_constructor_would_admit_never_reaches_a_barrier(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The admission every generation is created through runs over both completed starts.
+
+    A plan can be well formed, well classified and refused by no clause the fork itself checks, and
+    still compose a start nothing can be created from. A row saying the platform stamped it inside
+    an experiment is such a plan: the branch, the cell, the policy, the contract and the payload
+    position are all the parent's own, the child transformation admits it, and the schedule and
+    policy admission every constructor runs refuses it. So both starts are held to that admission
+    here, where a refusal installs no barrier and creates no child.
+    """
+    parent = a_quiet_parent(monkeypatch)
+    stamped = a_plan(FIRST_SLOT, GRADED_CELL)
+    request = a_fork_request(
+        parent,
+        child_plans=[
+            replace(
+                stamped,
+                dispositions=[
+                    replace(row, resolution_source=PLATFORM_DEFAULT)
+                    for row in stamped.dispositions
+                ],
+            ),
+            a_plan(SECOND_SLOT, PLACEBO_CELL),
+        ],
+    )
+    # Nothing about the request, the boundary, the witnesses or the declared branches is wrong.
+    parent._refuse_a_fork(request)
+    with pytest.raises(kernel_workflow.ForkRefused) as raised:
+        parent._built_children(request)
+    refusal = raised.value
+    assert refusal.reason == FORK_CONFIGURATION_VIOLATION
+    assert refusal.non_retryable
+    assert "child 1 is one no generation is created from" in refusal.clause
+    assert "configuration_mismatch" in refusal.clause
+    assert parent._fork is None
+    assert parent._generation_state == "open"
+    assert parent._fencing_token_hash is not None
+    # And the same generation under the rows a child may lawfully carry builds both starts.
+    parent._built_children(a_fork_request(parent))
+
+
+def test_the_receipt_a_fork_will_answer_with_is_bounded_before_its_barrier(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The reply is measured before the barrier, and the arriving one against what was proved.
+
+    A receipt cannot be measured exactly before the children exist, because a child's initial exact
+    run id comes back in its start response. So the known parts are measured with the run ids
+    empty, each run id is allowed its declared ceiling, the converter's own wrapper is measured
+    empty, and that bound is what has to fit. Comparing the receipt against a bound computed from
+    that same receipt would compare a value with itself and admit any size at all.
+
+    The origin verification's question and its answer are measured here too, because they are the
+    other two shapes this operation transmits that are replies rather than requests.
+    """
+    parent = a_quiet_parent(monkeypatch)
+    request = a_fork_request(parent)
+    built = parent._built_children(request)
+    known = parent._the_receipt(request, built)
+    assert all(row.child_run_id == "" for row in known.child_receipts)
+    bounds = parent._measured_replies(request, built)
+    assert bounds.receipt == fork_receipt_bound(known, CONVERTER)
+    assert bounds.receipt > encoded_size(known, CONVERTER)
+
+    # A bound that does not fit is a decision about the request, taken before anything is fenced.
+    monkeypatch.setattr(kernel_workflow, "TURNOVER_PAYLOAD_CEILING_BYTES", bounds.receipt - 1)
+    with pytest.raises(kernel_workflow.ForkRefused) as raised:
+        parent._measured_replies(request, built)
+    assert raised.value.reason == FORK_CONFIGURATION_VIOLATION
+    assert "the fork receipt is bounded at" in raised.value.clause
+    assert parent._fork is None
+    monkeypatch.undo()
+
+
+#: The task nobody was ever offered, and the one both children go on to work.
+FINISHED = "e" * 32
+NEXT = "d" * 32
+
+
+def a_parent_holding_a_finished_task() -> StreamStart:
+    """A roster whose next runnable task stands behind one that ended before it was offered.
+
+    The middle task is finalized where it was planned, which a controller may ask for and the
+    boundary admits: the fork clauses read live attempts and unresolved payloads, and an attempt
+    that ended without ever being handed out is neither. The last task is the one both children
+    work, held by the gate this generation's plan declares until the payload the fork hands them
+    has been presented, which is the gate a child keeps.
+    """
+    base = a_fork_parent()
+    assert base.provenance is not None
+    items = [
+        *base.tasks,
+        TaskItem(
+            task_position=1,
+            attempt_id=FINISHED,
+            task_message_id=oid(0x105),
+            ack_message_id=oid(0x106),
+            payload_position=1,
+            payload_message_id=oid(0x107),
+            body="file the report nobody was asked for",
+        ),
+        TaskItem(
+            task_position=2,
+            attempt_id=NEXT,
+            task_message_id=oid(0x108),
+            ack_message_id=oid(0x109),
+            payload_position=2,
+            payload_message_id=oid(0x10A),
+            body="file the second report",
+        ),
+    ]
+    rows = [
+        *base.dispositions,
+        *(
+            PayloadDisposition(
+                attempt_id=attempt_id,
+                payload_position=position,
+                kind=WITHHOLD,
+                reason="this position delivers nothing",
+                resolution_source=REGISTERED,
+                family_id=CONTRACT,
+            )
+            for attempt_id, position in ((FINISHED, 1), (NEXT, 2))
+        ),
+    ]
+    release = replace(
+        IMMEDIATE, gates=[EligibilityGate(attempt_id=NEXT, after_payload_position=0)]
+    )
+    return replace(
+        base,
+        tasks=items,
+        dispositions=rows,
+        release=release,
+        assignments=assignments_for(items, release, without_payload=[FINISHED, NEXT]),
+        provenance=replace(base.provenance, roster_digest=roster_digest(rows)),
+    )
+
+
+def test_the_receipt_names_the_task_a_child_serves_and_not_one_that_already_ended(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Same B is read out of each child's schedule rather than off the front of its roster.
+
+    A roster is not a queue of what is left: an attempt may end where it was planned, never
+    offered and never handed out, and the schedule then passes over it exactly as it passes over
+    one that was worked. So the receipt asks the child's own plan what it would serve after the
+    inherited payload, gate and declared order included, rather than naming the first task no
+    pull has taken. A reader comparing the two children is comparing the task they will work.
+
+    What the receipt names it by is the roster row the schedule selected, which is the identity
+    the join is made on: the attempt that row stands for is derived from it and not the other way
+    round, so a receipt naming the attempt would leave a reader holding neither end of the join.
+    """
+    parent = a_quiet_parent(
+        monkeypatch,
+        start=a_parent_holding_a_finished_task(),
+        attempts=[
+            a_row(),
+            CarriedAttempt(attempt_id=FINISHED, state="final_failed", final_failure="abandoned"),
+            CarriedAttempt(attempt_id=NEXT, state="planned"),
+        ],
+    )
+    request = a_fork_request(
+        parent,
+        child_plans=[
+            a_plan_over(parent, FIRST_SLOT, GRADED_CELL),
+            a_plan_over(parent, SECOND_SLOT, PLACEBO_CELL),
+        ],
+    )
+    # The generation is one a fork may be cut from: the ending is behind it, and nothing about it
+    # is live, offered or owed beyond the one payload a child inherits.
+    parent._refuse_a_fork(request)
+    assert FINISHED not in parent._handed_out()
+    assert parent._attempts[FINISHED].state == "final_failed"
+
+    built = parent._built_children(request)
+    receipt = parent._the_receipt(request, built)
+
+    bodies = {item.attempt_id: item.body for item in parent._start.tasks}
+    assert [row.next_task_body_sha256 for row in receipt.child_receipts] == [
+        sha256(bodies[NEXT].encode("utf-8")).hexdigest()
+    ] * 2
+
+    # And that is the task each child actually serves, joined to the child's own roster by the
+    # identity the receipt names and to its schedule by the attempt that row stands for. Each
+    # child offers the inherited payload first, and the task its own gate opens for once that
+    # payload has been presented.
+    for (row, start), receipt_row in zip(built, receipt.child_receipts):
+        [roster_row] = [
+            one for one in start.assignments if one.assignment_id == receipt_row.next_assignment_id
+        ]
+        assert roster_row.attempt_id == NEXT
+        assert receipt_row.next_assignment_id != NEXT
+        serving_as(monkeypatch, workflow_id=row.child_workflow_id)
+        child = kernel_workflow.StreamWorkflow(start)
+        assert child._first_eligible() == ("payload", ATTEMPT)
+        child._obligations[ATTEMPT].state = "presented"
+        assert child._first_eligible() == ("task", roster_row.attempt_id)
+
+
+def test_the_origin_proof_is_bounded_over_every_state_its_parent_can_answer_it_in(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The other reply this fork transmits, measured over what it becomes and not over what it is.
+
+    The row a parent measures before its barrier names no run id and stands in the class a child is
+    in before it exists, and the fork it names has not moved through any of its own statuses. Every
+    one of those changes in the proof the parent goes on answering with, and none of them is
+    measured by a preflight over the row as it stands. So the bound is over the widest legal reply,
+    the run id at its declared ceiling among them, and the row that arrives with a minted run id is
+    measured against the retained value.
+    """
+    parent = a_quiet_parent(monkeypatch)
+    request = a_fork_request(parent)
+    built = parent._built_children(request)
+    bounds = parent._measured_replies(request, built)
+    assert bounds.origin == max(
+        fork_origin_bound(request.fork_id, row, CONVERTER) for row, _start in built
+    )
+    # The state the preflight would have measured had it measured the row as it stood.
+    prestart = encoded_size(
+        ForkOriginVerified(fork_id=request.fork_id, fork_status=FORK_PREPARED, record=built[0][0]),
+        CONVERTER,
+    )
+    assert bounds.origin > prestart
+
+    parent._commit_the_barrier(request, built, bounds)
+    assert parent._fork is not None
+    assert parent._fork.origin_bound == bounds.origin
+    parent._note_child(1, "confirmed_existing", run_id="r" * 36)
+    answered = parent.fork_child(request.fork_id, 1)
+    assert answered.record.child_run_id == "r" * 36
+    assert encoded_size(answered, CONVERTER) > prestart
+    assert encoded_size(answered, CONVERTER) <= bounds.origin
+
+    # A ceiling that admits the row as it stood and not the reply it becomes refuses the fork
+    # before its barrier, because what has to fit is the widest reply and not the narrowest.
+    narrow = a_quiet_parent(monkeypatch)
+    theirs = narrow._built_children(request)
+    monkeypatch.setattr(kernel_workflow, "TURNOVER_PAYLOAD_CEILING_BYTES", prestart)
+    with pytest.raises(kernel_workflow.ForkRefused) as raised:
+        narrow._measured_replies(request, theirs)
+    assert raised.value.reason == FORK_CONFIGURATION_VIOLATION
+    assert "what the origin verification answers for child 1 is bounded at" in raised.value.clause
+    assert narrow._fork is None
+    monkeypatch.undo()
+
+
+def test_an_origin_proof_over_the_bound_the_barrier_retained_is_refused_where_it_arrives(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The run id is the service's, so the reply carrying one is measured against the kept bound."""
+    parent, request = a_barrier(monkeypatch)
+    assert parent._fork is not None
+    assert parent._fork.origin_bound == max(
+        fork_origin_bound(request.fork_id, row, CONVERTER)
+        for row in parent._fork.child_records
+    )
+    parent._fork = replace(parent._fork, origin_bound=32)
+    with pytest.raises(kernel_workflow.ForkRefused) as raised:
+        parent._note_child(1, "confirmed_existing", run_id="r" * 36)
+    assert raised.value.reason == FORK_CONFIGURATION_VIOLATION
+    assert "the bound proved for it before the barrier was 32" in raised.value.clause
+    # Nothing was moved by the refusal: the row is the one the barrier committed.
+    assert parent._fork.child_records[0].child_run_id is None
+
+
+class AConverterHeavyInOneState:
+    """A configured converter whose encoded size does not follow the length of its strings.
+
+    Every measurement this build takes is taken through the converter a deployment configured,
+    because what the service admits is what that converter produces. Nothing says the mapping from
+    a value to its bytes is monotone in the words inside it: a converter may attach whatever it
+    likes to whatever it recognizes, and this one recognizes an origin proof in the state a
+    barrier commits in.
+
+    It is a delegate rather than a reimplementation, so everything else this fork encodes crosses
+    exactly as it would have.
+    """
+
+    def __init__(self, padding: int) -> None:
+        self.padding = padding
+
+    def to_payloads(self, values: Any) -> Any:
+        encoded = CONVERTER.to_payloads(values)
+        for value, payload in zip(values, encoded):
+            if isinstance(value, ForkOriginVerified) and value.fork_status == FORK_PREPARED:
+                payload.metadata["the state this converter is heavy in"] = b"0" * self.padding
+        return encoded
+
+    def from_payloads(self, payloads: Any, type_hints: Any = None) -> Any:
+        return CONVERTER.from_payloads(payloads, type_hints)
+
+
+def test_the_origin_bound_is_measured_through_the_converter_that_encodes_the_reply(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The widest reply is the widest as the configured converter encodes it, not as text.
+
+    A bound taken over the longest status and existence words assumes the encoded size of a reply
+    follows the length of the strings in it, and a configured converter owes nobody that. So every
+    legal reply is encoded and the largest is kept, which is a measurement rather than an
+    assumption about one, and the reply the parent actually answers with is held to that value
+    where it answers.
+    """
+    parent = a_quiet_parent(monkeypatch)
+    request = a_fork_request(parent)
+    built = parent._built_children(request)
+    row = built[0][0]
+    heavy = AConverterHeavyInOneState(1 << 13)
+
+    # The reply with the longest words in it is not the reply this converter makes the most bytes
+    # of, and the one it does is the state a barrier commits in.
+    longest = encoded_size(
+        ForkOriginVerified(
+            fork_id=request.fork_id,
+            fork_status=max(FORK_STATUSES, key=len),
+            record=replace(
+                row,
+                existence=max(CHILD_EXISTENCE, key=len),
+                child_run_id="0" * RUN_ID_CEILING_BYTES,
+            ),
+        ),
+        heavy,
+    )
+    prepared = ForkOriginVerified(
+        fork_id=request.fork_id,
+        fork_status=FORK_PREPARED,
+        record=replace(row, existence="confirmed_existing", child_run_id="r" * 36),
+    )
+    assert encoded_size(prepared, heavy) > longest
+    assert fork_origin_bound(request.fork_id, row, heavy) >= encoded_size(prepared, heavy)
+
+    # And through the fork: the bound the barrier retains is the one the reply it goes on
+    # answering with fits inside, measured through the converter that will carry it.
+    monkeypatch.setattr(kernel_workflow.workflow, "payload_converter", lambda: heavy)
+    bounds = parent._measured_replies(request, built)
+    parent._commit_the_barrier(request, built, bounds)
+    assert parent._fork is not None
+    parent._note_child(1, "confirmed_existing", run_id="r" * 36)
+    answered = parent.fork_child(request.fork_id, 1)
+    assert answered.fork_status == FORK_PREPARED
+    assert encoded_size(answered, heavy) > longest
+    assert encoded_size(answered, heavy) <= bounds.origin
+
+    # A reply that outgrew the bound its barrier proved says so where it is answered, carrying
+    # the measurement, rather than crossing the wire as a silent oversize.
+    parent._fork = replace(parent._fork, origin_bound=32)
+    with pytest.raises(WireFormatError) as oversize:
+        parent.fork_child(request.fork_id, 1)
+    assert "the bound proved for it before the barrier was 32" in str(oversize.value)
+    monkeypatch.undo()
+
+
+class AConverterHeavyOnAnAbsentRunId:
+    """A configured converter that is heavy exactly where a prepared row starts.
+
+    A record's run id is absent until a start reply is recorded, and the row is answered from all
+    the same, so this is the state of a reply rather than a state before them.
+    """
+
+    def __init__(self, padding: int) -> None:
+        self.padding = padding
+
+    def to_payloads(self, values: Any) -> Any:
+        encoded = CONVERTER.to_payloads(values)
+        for value, payload in zip(values, encoded):
+            if (
+                isinstance(value, ForkOriginVerified)
+                and value.record.child_run_id is None
+            ):
+                payload.metadata["the state this converter is heavy in"] = b"0" * self.padding
+        return encoded
+
+    def from_payloads(self, payloads: Any, type_hints: Any = None) -> Any:
+        return CONVERTER.from_payloads(payloads, type_hints)
+
+
+def test_the_reply_a_child_that_asks_before_its_start_gets_is_bounded_before_the_barrier(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A child may ask its origin question before any start reply is recorded.
+
+    The row it is answered with is the row as it stands, which is the class the record was written
+    in and no run id at all. Starting a child does not wait for the parent to finish and a child's
+    activation does not wait for the fork to complete, so that reply is one this parent gives
+    first rather than one it never gives, and a bound that allowed only for an identifier the
+    service had already minted would be a bound over the wrong set of replies.
+    """
+    parent = a_quiet_parent(monkeypatch)
+    request = a_fork_request(parent)
+    built = parent._built_children(request)
+    row = built[0][0]
+    heavy = AConverterHeavyOnAnAbsentRunId(1 << 13)
+
+    unrecorded = ForkOriginVerified(
+        fork_id=request.fork_id,
+        fork_status=FORK_PREPARED,
+        record=replace(row, existence="existence_unconfirmed", child_run_id=None),
+    )
+    assert fork_origin_bound(request.fork_id, row, heavy) >= encoded_size(unrecorded, heavy)
+
+    # And through the fork: the barrier is committed over a bound that covers it, and the parent
+    # answers the question that arrives before the start reply from inside that bound.
+    monkeypatch.setattr(kernel_workflow.workflow, "payload_converter", lambda: heavy)
+    bounds = parent._measured_replies(request, built)
+    parent._commit_the_barrier(request, built, bounds)
+    assert parent._fork is not None
+    parent._note_child(1, "existence_unconfirmed")
+    asked_early = parent.fork_child(request.fork_id, 1)
+    assert asked_early.record.child_run_id is None
+    assert encoded_size(asked_early, heavy) <= bounds.origin
+    monkeypatch.undo()
+
+
+class AConverterHeavyOnAStartResult:
+    """A configured converter that is heavy around the result one child's start answers with.
+
+    A wrapper can exceed a limit while everything it wraps fits, so what a preflight of the
+    identifier inside it measures is a different shape from the one that crosses.
+    """
+
+    def __init__(self, padding: int) -> None:
+        self.padding = padding
+
+    def to_payloads(self, values: Any) -> Any:
+        encoded = CONVERTER.to_payloads(values)
+        for value, payload in zip(values, encoded):
+            if isinstance(value, ForkChildStarted):
+                payload.metadata["the result this converter is heavy in"] = b"0" * self.padding
+        return encoded
+
+    def from_payloads(self, payloads: Any, type_hints: Any = None) -> Any:
+        return CONVERTER.from_payloads(payloads, type_hints)
+
+
+def test_what_a_childs_start_answers_with_is_bounded_before_the_barrier_and_held_to_it(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The result a start comes back with is a shape this operation transmits like any other.
+
+    It cannot be measured exactly before the barrier either: the run id comes back inside it, and
+    whether this call created the child or found it already created is not known until it answers.
+    Both are allowed for before anything is fenced, the bound is retained with the fork, and the
+    result that actually arrives is measured against the retained value rather than against one
+    derived from itself.
+    """
+    parent = a_quiet_parent(monkeypatch)
+    request = a_fork_request(parent)
+    built = parent._built_children(request)
+    row = built[0][0]
+    heavy = AConverterHeavyOnAStartResult(1 << 13)
+    both = [
+        encoded_size(
+            ForkChildStarted(
+                child_ordinal=row.child_ordinal,
+                child_workflow_id=row.child_workflow_id,
+                child_run_id="r" * 36,
+                created=created,
+            ),
+            heavy,
+        )
+        for created in (True, False)
+    ]
+    assert fork_start_bound(row, heavy) >= max(both)
+
+    # A bound that does not fit is a decision about the request, taken before anything is fenced.
+    monkeypatch.setattr(kernel_workflow.workflow, "payload_converter", lambda: heavy)
+    bounds = parent._measured_replies(request, built)
+    assert bounds.start == max(
+        fork_start_bound(one, heavy) for one, _start in built
+    )
+    monkeypatch.setattr(kernel_workflow, "TURNOVER_PAYLOAD_CEILING_BYTES", bounds.start - 1)
+    with pytest.raises(kernel_workflow.ForkRefused) as raised:
+        parent._measured_replies(request, built)
+    assert raised.value.reason == FORK_CONFIGURATION_VIOLATION
+    assert "what the start of child 1 answers with is bounded at" in raised.value.clause
+    assert parent._fork is None
+    monkeypatch.undo()
+
+    # And the result that arrives is held to the value the barrier retained.
+    parent = a_quiet_parent(monkeypatch)
+    request = a_fork_request(parent)
+    built = parent._built_children(request)
+    parent._commit_the_barrier(request, built, parent._measured_replies(request, built))
+    assert parent._fork is not None
+    assert parent._fork.start_bound == max(
+        fork_start_bound(one, CONVERTER) for one, _start in built
+    )
+    parent._fork = replace(parent._fork, start_bound=32)
+
+    async def answered(*_arguments: Any, **named: Any) -> Any:
+        asked = named["arg"] if "arg" in named else _arguments[1]
+        return ForkChildStarted(
+            child_ordinal=asked.child_ordinal,
+            child_workflow_id=asked.child_workflow_id,
+            child_run_id="r" * 36,
+            created=True,
+        )
+
+    monkeypatch.setattr(kernel_workflow.workflow, "execute_activity", answered)
+    with pytest.raises(kernel_workflow.ForkRefused) as oversize:
+        asyncio.run(parent._start_the_children(request, built))
+    assert oversize.value.reason == FORK_CONFIGURATION_VIOLATION
+    assert "the bound proved for it before the barrier was 32" in oversize.value.clause
+    # Nothing was moved by the refusal: the child stays attempted with its existence unconfirmed
+    # rather than confirmed over a reply this parent would not carry.
+    assert parent._fork.child_records[0].existence == "existence_unconfirmed"
+    assert parent._fork.child_records[0].child_run_id is None
+    monkeypatch.undo()
+
+
+def test_two_child_directories_that_name_one_store_never_reach_a_barrier(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Each child keeps its objects and its manifest in a place of its own, and this is that check.
+
+    A directory is a string in the plans and a store is a value a child is created with, and the
+    derivation from the first to the second is not injective over strings: the store sits under a
+    fixed name inside the directory and a trailing separator is dropped on the way. So two
+    directories that differ as text can name one store, and every check made of the request as a
+    value passes.
+
+    A parent that committed a barrier over that pair would have fenced itself for good to create
+    two children promised separate objects, and the second child's attachment would find the
+    first's manifest already published where its own belongs.
+    """
+    parent = a_quiet_parent(monkeypatch)
+    request = a_fork_request(
+        parent,
+        child_plans=[
+            a_plan(FIRST_SLOT, GRADED_CELL, run_directory="/runs/one/shared"),
+            a_plan(SECOND_SLOT, PLACEBO_CELL, run_directory="/runs/one/shared/"),
+        ],
+    )
+    # Nothing about the request as a value is wrong: the two directories are distinct strings, and
+    # nothing about the boundary, the witnesses or the declared branches is wrong either.
+    assert len({plan.run_directory for plan in request.child_plans}) == 2
+    parent._refuse_a_fork(request)
+
+    with pytest.raises(kernel_workflow.ForkRefused) as raised:
+        parent._built_children(request)
+    refusal = raised.value
+    assert refusal.reason == FORK_CONFIGURATION_VIOLATION
+    assert refusal.non_retryable
+    assert "the children 1 and 2 were given directories that name one store" in refusal.clause
+    assert child_blob_root("/runs/one/shared") in refusal.clause
+    assert parent._fork is None
+    assert parent._generation_state == "open"
+    assert parent._fencing_token_hash is not None
+    # And the two directories a controller ordinarily gives still build both starts.
+    parent._built_children(a_fork_request(parent))
+
+
+@pytest.mark.parametrize(
+    "alias",
+    ["/runs/one/./shared", "/runs/one//shared", "/runs/one/shared/./"],
+)
+def test_two_child_directories_spelled_apart_and_opened_alike_reach_no_barrier_either(
+    monkeypatch: pytest.MonkeyPatch, alias: str
+) -> None:
+    """A separator at the end is one spelling of one place and it is not the only one.
+
+    What opens a store takes a path, and a path drops an empty component and a component naming
+    the directory it already stands in exactly as it drops a separator at the end. So the pair is
+    compared as the place each one is, and every spelling that arrives at one place is refused
+    where the trailing separator is, before anything is fenced and before a child exists.
+    """
+    parent = a_quiet_parent(monkeypatch)
+    request = a_fork_request(
+        parent,
+        child_plans=[
+            a_plan(FIRST_SLOT, GRADED_CELL, run_directory="/runs/one/shared"),
+            a_plan(SECOND_SLOT, PLACEBO_CELL, run_directory=alias),
+        ],
+    )
+    assert len({plan.run_directory for plan in request.child_plans}) == 2
+    parent._refuse_a_fork(request)
+
+    with pytest.raises(kernel_workflow.ForkRefused) as raised:
+        parent._built_children(request)
+    assert raised.value.reason == FORK_CONFIGURATION_VIOLATION
+    assert "name one store" in raised.value.clause
+    assert parent._fork is None
+    assert parent._generation_state == "open"
+
+
+def test_a_child_directory_that_names_its_parents_own_store_reaches_no_barrier(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A child is given a store of its own, and one spelling of its parent's is not one.
+
+    The parent's own objects and manifest are already in that place. A child created there would
+    keep its bytes where its parent keeps its, and its attachment would meet the manifest its
+    parent published where its own belongs, so the comparison is of the place rather than of the
+    text and the refusal lands where a plan naming the same directory outright lands.
+    """
+    parent = a_quiet_parent(
+        monkeypatch, start=a_fork_parent(blob_root="/runs/one/blobs")
+    )
+    request = a_fork_request(
+        parent,
+        child_plans=[
+            a_plan(FIRST_SLOT, GRADED_CELL, run_directory="/runs/one/."),
+            a_plan(SECOND_SLOT, PLACEBO_CELL, run_directory="/runs/one/two"),
+        ],
+    )
+    assert parent._start.blob_root not in {
+        child_blob_root(plan.run_directory) for plan in request.child_plans
+    }
+    parent._refuse_a_fork(request)
+
+    with pytest.raises(kernel_workflow.ForkRefused) as raised:
+        parent._built_children(request)
+    assert raised.value.reason == FORK_CONFIGURATION_VIOLATION
+    assert "a child keeps its bytes in a durable blob_root of its own" in raised.value.clause
+    assert parent._fork is None
+    assert parent._generation_state == "open"
+
+    # A directory naming the place above one of its own components is refused rather than
+    # collapsed, because where that leads is not settled without reading a filesystem.
+    above = a_fork_request(
+        parent,
+        child_plans=[
+            a_plan(FIRST_SLOT, GRADED_CELL, run_directory="/runs/one/two/../three"),
+            a_plan(SECOND_SLOT, PLACEBO_CELL, run_directory="/runs/one/four"),
+        ],
+    )
+    with pytest.raises(kernel_workflow.ForkRefused) as named:
+        parent._built_children(above)
+    assert named.value.reason == FORK_CONFIGURATION_VIOLATION
+    assert "names the directory above" in named.value.clause
+    assert parent._fork is None
+
+
+def test_two_child_directories_one_rooted_and_one_not_reach_no_barrier(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A location that says where it starts from is the only one two of them are compared as.
+
+    A location written from wherever a process happens to stand names one place in that process
+    and another in the next, and the transition that would have to settle it is a replayed one
+    with no directory of its own to read. So the pair below is the sibling alias every other
+    spelling in this section is: two texts that arrive at one store the moment anything opens
+    them. It is refused where the others are, before the parent is fenced and before a child
+    exists, rather than admitted because the two texts are not equal.
+    """
+    parent = a_quiet_parent(monkeypatch)
+    request = a_fork_request(
+        parent,
+        child_plans=[
+            a_plan(FIRST_SLOT, GRADED_CELL, run_directory="/runs/one/shared"),
+            a_plan(SECOND_SLOT, PLACEBO_CELL, run_directory="runs/one/shared"),
+        ],
+    )
+    # The request is admitted: nothing about the boundary, the witnesses or the declared branches
+    # is wrong, and the two directories are distinct strings.
+    assert len({plan.run_directory for plan in request.child_plans}) == 2
+    parent._refuse_a_fork(request)
+
+    with pytest.raises(kernel_workflow.ForkRefused) as raised:
+        parent._built_children(request)
+    assert raised.value.reason == FORK_CONFIGURATION_VIOLATION
+    assert raised.value.non_retryable
+    assert "runs/one/shared" in raised.value.clause
+    assert "says where it starts from" in raised.value.clause
+    assert parent._fork is None
+    assert parent._generation_state == "open"
+    assert parent._fencing_token_hash is not None
+    # And the comparison the pair would have reached refuses the same text for the same reason,
+    # so neither gate is the only one holding this pair apart.
+    with pytest.raises(kernel_workflow.ForkRefused) as compared:
+        parent._one_store(child_blob_root("runs/one/shared"))
+    assert compared.value.reason == FORK_CONFIGURATION_VIOLATION
+    assert "says where it starts from" in compared.value.clause
+
+
+def test_a_child_directory_that_says_nothing_about_where_it_starts_reaches_no_barrier(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The same rule against the parent's own store, which is the other place two become one.
+
+    A child given its parent's store under a spelling that starts from wherever the reader stands
+    would keep its objects and its manifest where its parent keeps its, and the comparison that
+    would catch it has one rooted operand and one that is not. Neither operand is resolved here,
+    because resolving one would read the directory the process happens to stand in and this runs
+    where a replay has to reach the same answer. So it is refused for what it does not say.
+    """
+    parent = a_quiet_parent(monkeypatch, start=a_fork_parent(blob_root="/runs/one/blobs"))
+    request = a_fork_request(
+        parent,
+        child_plans=[
+            a_plan(FIRST_SLOT, GRADED_CELL, run_directory="runs/one"),
+            a_plan(SECOND_SLOT, PLACEBO_CELL, run_directory="/runs/one/two"),
+        ],
+    )
+    # As text the child's store and its parent's are two, which is why the comparison alone admits
+    # this pair: the parent's is rooted and the child's is not.
+    assert child_blob_root("runs/one") != parent._start.blob_root
+    parent._refuse_a_fork(request)
+
+    with pytest.raises(kernel_workflow.ForkRefused) as raised:
+        parent._built_children(request)
+    assert raised.value.reason == FORK_CONFIGURATION_VIOLATION
+    assert "says where it starts from" in raised.value.clause
+    assert parent._fork is None
+    assert parent._generation_state == "open"
+    assert parent._fencing_token_hash is not None
+
+
+class AStatusHandle:
+    """A parent handle that answers the status Query with one recorded answer."""
+
+    def __init__(self, answer: Any) -> None:
+        self.answer = answer
+
+    async def query(self, *_arguments: Any, **_named: Any) -> Any:
+        return self.answer
+
+
+class AStatusClient:
+    """A client whose parent says where its fork stands, so the receiving check can be read."""
+
+    def __init__(self, answer: Any) -> None:
+        self.data_converter = default_converter()
+        self.answer = answer
+
+    def get_workflow_handle_for(self, *_arguments: Any, **_named: Any) -> AStatusHandle:
+        return AStatusHandle(self.answer)
+
+
+async def test_a_status_answer_at_a_version_this_build_does_not_read_is_refused_where_it_arrives(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Both declared shapes a status answer carries are admitted where the answer is received.
+
+    The status route is a documented controller operation and not a step inside another one, so a
+    caller reading it directly gets the same admission a caller that went on to the stream route
+    would. The record and the receipt are two declared types and neither is admitted by the
+    other's check: one says which children a fork prepared and where it stands, and the other is
+    the fork's own outcome.
+    """
+    parent, request = a_barrier(monkeypatch)
+    assert parent._fork is not None
+    standing = parent._fork
+    answered = ForkStatusAnswer(
+        found=True,
+        conflict=False,
+        parent_state=parent._generation_state,
+        record=standing,
+        receipt=a_receipt(),
+    )
+    assert await kernel_runtime.fork_status(AStatusClient(answered), request) == answered
+
+    with pytest.raises(WireFormatError) as record:
+        await kernel_runtime.fork_status(
+            AStatusClient(replace(answered, record=replace(standing, schema_version=999))),
+            request,
+        )
+    assert "999" in str(record.value)
+
+    with pytest.raises(WireFormatError) as receipt:
+        await kernel_runtime.fork_status(
+            AStatusClient(replace(answered, receipt=a_receipt(schema_version=999))), request
+        )
+    assert "999" in str(receipt.value)
+
+
+class AnOutcomeHandle:
+    """A parent handle asked what one exact identifier was answered with.
+
+    It answers with what it was given or raises it, and it counts the asking, so a read this
+    build tried as often as it tries one can be told from a read it tried once.
+    """
+
+    def __init__(self, outcome: Any) -> None:
+        self.outcome = outcome
+        self.reads = 0
+
+    async def query(self, *_arguments: Any, **_named: Any) -> Any:
+        self.reads += 1
+        if isinstance(self.outcome, BaseException):
+            raise self.outcome
+        return self.outcome
+
+
+async def test_an_outcome_that_could_not_be_read_is_not_an_identifier_that_was_never_answered(
+) -> None:
+    """Nothing recorded and nothing readable are two answers, and only one of them is a receipt.
+
+    The parent saying it holds no outcome under an identifier is what lets a fresh identifier be
+    given the fork's own receipt: a completed fork has an answer, and a caller that never reached
+    a handler is owed it. A read that could not be served says nothing about that identifier at
+    all, and taking it for nothing recorded is how one try's caller ends up holding another try's
+    success once a failure has crossed a boundary in the carried journal.
+
+    So a read that failed comes back as the typed refusal every other read of this parent is
+    classified under, and an outcome whose bytes this build cannot read comes back the same way:
+    what arrived was an answer, and reporting the identifier as unanswered because of it would
+    put the caller on the route kept for one the parent never answered.
+    """
+    identifier = "fork-1-over-a-body-that-was-lost-1"
+
+    absent = AnOutcomeHandle(AnsweredUpdate(found=False))
+    assert await kernel_runtime._answered_fork(absent, identifier, FORK) is None
+    assert absent.reads == 1
+
+    unreadable = AnOutcomeHandle(
+        RPCError("the parent could not be reached", RPCStatusCode.UNAVAILABLE, b"")
+    )
+    with pytest.raises(kernel_workflow.ForkRefused) as raised:
+        await kernel_runtime._answered_fork(unreadable, identifier, FORK)
+    assert raised.value.reason == FORK_UNREADABLE_PARENT
+    assert kernel_runtime.fork_can_be_retried(raised.value) is True
+    assert unreadable.reads == 3
+
+    gone = AnOutcomeHandle(
+        RPCError("no execution under that identity", RPCStatusCode.NOT_FOUND, b"")
+    )
+    with pytest.raises(kernel_workflow.ForkRefused) as expired:
+        await kernel_runtime._answered_fork(gone, identifier, FORK)
+    assert expired.value.reason == FORK_EXPIRED_AUTHORITY
+    assert kernel_runtime.fork_can_be_retried(expired.value) is False
+
+    undecodable = AnOutcomeHandle(
+        AnsweredUpdate(found=True, kind="value", value={"fork_id": 5})
+    )
+    with pytest.raises(kernel_workflow.ForkRefused) as unread:
+        await kernel_runtime._answered_fork(undecodable, identifier, FORK)
+    assert unread.value.reason == FORK_UNREADABLE_PARENT
+    assert kernel_runtime.fork_can_be_retried(unread.value) is True
+
+    # And the refusal a parent did record under that identifier is raised as the refusal it
+    # recorded, which is the answer the whole distinction exists to keep reachable.
+    refused = AnOutcomeHandle(
+        AnsweredUpdate(
+            found=True,
+            kind="failure",
+            type_name=FORK_REPAIRABLE_ABSENCE,
+            message="the placebo body is not in the store this fork reads",
+        )
+    )
+    with pytest.raises(ApplicationError) as answered_with:
+        await kernel_runtime._answered_fork(refused, identifier, FORK)
+    assert kernel_runtime.fork_refusal(answered_with.value) == FORK_REPAIRABLE_ABSENCE
+
+
+async def test_an_origin_window_that_has_closed_is_recorded_rather_than_asked_again(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A closed answer window is its own state, and the child keeps everything but the gate.
+
+    An unreachable parent is infrastructure and the reading is tried again while the child waits.
+    A window that has closed is not that: the horizon a parent's answers stand behind is absolute,
+    so no later reading reaches an answer and asking again for ever would spend a Worker on a
+    question with no answer left. So the child records the state, keeps its identity and its
+    objects, owns and serves nothing, and answers every call that would own or serve it with the
+    reason rather than with the wait.
+    """
+    serving_as(monkeypatch, workflow_id=a_child_id(1))
+    child = a_fresh_child()
+    gated = kernel_workflow.StreamWorkflow(child)
+    asked: List[Any] = []
+
+    async def closed(*arguments: Any, **named: Any) -> Any:
+        asked.append(named.get("activity_id"))
+        raise ActivityError(
+            "the origin reading",
+            scheduled_event_id=1,
+            started_event_id=2,
+            identity="the worker that asked",
+            activity_type="shogym.protocol_v2.VerifyForkOriginActivity",
+            activity_id="the reading",
+            retry_state=None,
+        ) from ApplicationError(
+            "the execution that prepared this child can no longer be read, so its answer window "
+            "has closed",
+            type="ExpiredAuthority",
+            non_retryable=True,
+        )
+
+    monkeypatch.setattr(kernel_workflow.workflow, "execute_activity", closed)
+    await gated._verify_the_lineage()
+    assert len(asked) == 1
+    assert gated._origin_expired is True
+    # The gate is still shut and the child is still the child it was: nothing about it moved.
+    assert gated._origin_unverified is True
+    assert gated._start.fork_origin is not None
+
+    writer = Writer(ownership_epoch=0, fencing_token="c" * 64)
+    for refused_call in (
+        lambda: gated._claim_ownership_admitted(a_claim(child)),
+        lambda: gated._check_claim(a_claim(child)),
+        lambda: gated._require_writer(writer),
+    ):
+        with pytest.raises(kernel_workflow.ForkRefused) as raised:
+            refused_call()
+        assert raised.value.reason == FORK_EXPIRED_AUTHORITY
+        assert kernel_runtime.fork_can_be_retried(raised.value) is False
+        assert a_child_id(1) in raised.value.clause
+
+    # An unreachable parent is the other case and is untouched: it is raised, and the retry
+    # policy the reading is made under is what asks again.
+    other = kernel_workflow.StreamWorkflow(child)
+
+    async def unreachable(*_arguments: Any, **_named: Any) -> Any:
+        raise ActivityError(
+            "the origin reading",
+            scheduled_event_id=1,
+            started_event_id=2,
+            identity="the worker that asked",
+            activity_type="shogym.protocol_v2.VerifyForkOriginActivity",
+            activity_id="the reading",
+            retry_state=None,
+        ) from ApplicationError("the parent could not be reached", type="RPCError")
+
+    monkeypatch.setattr(kernel_workflow.workflow, "execute_activity", unreachable)
+    with pytest.raises(ActivityError):
+        await other._verify_the_lineage()
+    assert other._origin_expired is False
+    with pytest.raises(ApplicationError) as still:
+        other._check_claim(a_claim(child))
+    assert still.value.type == ORIGIN_UNVERIFIED
+    monkeypatch.undo()
+
+
+def test_a_receipt_over_the_bound_the_barrier_retained_is_refused_rather_than_answered(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The record keeps the bound, and the reply that arrives is held to the kept value."""
+    parent, request = a_barrier(monkeypatch)
+    assert parent._fork is not None
+    built = parent._built_children(request)
+    assert parent._fork.receipt_bound == fork_receipt_bound(
+        parent._the_receipt(request, built), CONVERTER
+    )
+    parent._fork = replace(parent._fork, receipt_bound=32)
+    with pytest.raises(kernel_workflow.ForkRefused) as raised:
+        parent._fork_answer(request, built)
+    assert raised.value.reason == FORK_CONFIGURATION_VIOLATION
+    assert "the bound proved for it before the barrier was 32" in raised.value.clause
+    assert parent._fork_receipt is None
+
+
+def a_barrier(monkeypatch: pytest.MonkeyPatch) -> Any:
+    """One barriered generation and the exact request its barrier was committed under.
+
+    The request is returned rather than rebuilt, because the barrier moves the generation into its
+    terminal forked state and the projection digest a rebuilt request would carry is the one it
+    stands at now rather than the one it was cut at.
+    """
+    parent = a_quiet_parent(monkeypatch)
+    request = a_fork_request(parent)
+    built = parent._built_children(request)
+    parent._commit_the_barrier(request, built, parent._measured_replies(request, built))
+    return parent, request
+
+
+def a_barriered_parent(monkeypatch: pytest.MonkeyPatch) -> Any:
+    """One generation with a fork barrier standing, which is where its reserve starts counting."""
+    return a_barrier(monkeypatch)[0]
+
+
+def test_a_barrier_fences_the_parent_and_records_the_horizon_its_answers_stand_until(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """One transition: the record, the terminal state, the fence and the two clocks.
+
+    The horizon is recorded at the commit because the close cannot be bounded and the deletion
+    clock is not the close clock either: the service schedules each execution's history for
+    deletion from that execution's own close time, so a child that failed an hour after the
+    barrier is deleted on its own clock while the parent is still prepared. The deadline beside it
+    bounds the parent's own work and never says when it actually closes.
+    """
+    parent = a_barriered_parent(monkeypatch)
+    assert parent._fork is not None
+    assert parent._fork.status == "prepared"
+    assert parent._fork.children == 2
+    assert [row.existence for row in parent._fork.child_records] == [
+        "never_attempted",
+        "never_attempted",
+    ]
+    assert parent._generation_state == "forked"
+    assert parent._fencing_token_hash is None
+    with pytest.raises(ApplicationError) as raised:
+        parent._require_writer(Writer(ownership_epoch=1, fencing_token="a" * 64))
+    assert raised.value.message == "fenced_writer"
+
+    at = int(A_MOMENT.timestamp() * 1000)
+    assert parent._fork_deadline_at == at + FORK_PREPARATION_BOUND_MS
+    assert parent._fork_horizon_at == at + FORK_AUTHORITY_HORIZON_MS
+    assert FORK_AUTHORITY_HORIZON_MS == FORK_PREPARATION_BOUND_MS + FORK_ANSWER_WINDOW_MS
+    # A boundary is out of reach of a generation that has taken one, so nothing latches after it.
+    assert parent._boundary_clause() == "generation_state"
+
+
+def test_a_parked_parent_bounds_what_it_accepts_and_keeps_the_reserve_for_the_fork(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The reserve, charged where the service charges and read where admission is decided.
+
+    Everything a controller wants to read is a Query, which reaches none of this and charges
+    nothing, so a permanently unavailable child service cannot turn polling into exhaustion. The
+    only class that reaches the counter at all is the fork's own, which is the work the reserve is
+    kept for: a fifth logical retry of one fork is admitted like the fourth, and what ends the
+    reserve is the twenty fourth accepted call rather than the class it belonged to.
+    """
+    parent = a_barriered_parent(monkeypatch)
+    with pytest.raises(kernel_workflow.ForkBarrier):
+        parent._admit(True)
+    for spent in range(FORK_RESERVE):
+        parent._admit(True, completion=True)
+        parent._count_update()
+        assert parent._post_barrier == spent + 1
+    with pytest.raises(kernel_workflow.ForkBarrier) as raised:
+        parent._admit(True, completion=True)
+    assert "spent its recovery reserve" in str(raised.value)
+
+    # And once the parent has stopped admitting fork work, expiry and exhaustion are one rule.
+    stopped = a_barriered_parent(monkeypatch)
+    stopped._fork_admits_nothing = True
+    with pytest.raises(kernel_workflow.ForkBarrier) as raised:
+        stopped._admit(True, completion=True)
+    assert "admits no further work" in str(raised.value)
+
+
+def parked(
+    monkeypatch: pytest.MonkeyPatch, parent: Any, *, unfinished: int
+) -> List[Tuple[str, bool]]:
+    """Run this parent's own parking loop here, and return what it stood at while it drained.
+
+    The two exits the loop can take need no service at all: the deadline is compared against the
+    generation's own clock and the reserve is a counter it charges itself. What a Worker supplies
+    is the settling of the handler ledger, and that is what the list returned here reads: the
+    fork's status and whether it was still admitting fork work, recorded once for every time the
+    parent asked whether the ledger had settled. An ending committed before the last outcome
+    settled would show up here as a status no controller could still have been answered under,
+    and a gate still open while it drained would show up as a parent taking on work it has
+    already decided it will never finish.
+    """
+    seen: List[Tuple[str, bool]] = []
+    settling = unfinished
+
+    def all_handlers_finished() -> bool:
+        nonlocal settling
+        assert parent._fork is not None
+        seen.append((parent._fork.status, parent._fork_admits_nothing))
+        if settling:
+            settling -= 1
+            return False
+        return True
+
+    async def wait_condition(condition: Any, timeout: Any = None) -> None:
+        while not condition():
+            continue
+
+    monkeypatch.setattr(
+        kernel_workflow.workflow, "all_handlers_finished", all_handlers_finished
+    )
+    monkeypatch.setattr(kernel_workflow.workflow, "wait_condition", wait_condition)
+    asyncio.run(parent._park_for_the_fork())
+    return seen
+
+
+def test_a_parent_ends_a_fork_its_reserve_or_its_deadline_ran_out_on_and_admits_nothing_after(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Exhaustion and expiry are one ending, committed by the parent rather than waited out.
+
+    A fork that failed part way leaves the parent parked and the children it made intact, and the
+    supported next move is the same fork under the same checkpoint until the reserve is spent or
+    the preparation bound expires. After that the abandoned status stands: it carries which of the
+    two ended it, it is terminal, and the parent admits no further fork work and schedules no
+    further start, so no Update can answer with a receipt naming a child nobody created.
+
+    The ending waits for the ledger. An abandonment committed while a start Activity was still
+    running would record an outcome the parent has not seen, so the status is still the one a
+    controller could be answered under every time the ledger is asked, and moves only after.
+    """
+    for reason, run_it_out in (
+        (
+            EXPIRED_PREPARATION,
+            lambda parent: setattr(parent, "_fork_deadline_at", parent._now_ms()),
+        ),
+        (
+            SPENT_RECOVERY_RESERVE,
+            lambda parent: setattr(parent, "_post_barrier", FORK_RESERVE),
+        ),
+    ):
+        # Built the way the handler builds, so the starts the record was committed over are the
+        # ones the ending is then asked to schedule.
+        parent = a_quiet_parent(monkeypatch)
+        request = a_fork_request(parent)
+        built = parent._built_children(request)
+        parent._commit_the_barrier(
+            request, built, parent._measured_replies(request, built)
+        )
+        run_it_out(parent)
+        assert parent._fork is not None and parent._fork.status == FORK_PREPARED
+        assert parent._fork.abandoned_reason is None
+
+        seen = parked(monkeypatch, parent, unfinished=2)
+        assert seen == [(FORK_PREPARED, True)] * 3, reason
+        assert parent._fork.status == FORK_ABANDONED
+        assert parent._fork.abandoned_reason == reason
+        # Both children stay exactly as the record left them: an abandonment is an ending, not a
+        # claim that they never existed.
+        assert [row.existence for row in parent._fork.child_records] == [
+            "never_attempted",
+            "never_attempted",
+        ]
+
+        # And the gate the ending installs, read where the next call would take effect.
+        assert parent._fork_admits_nothing
+        with pytest.raises(kernel_workflow.ForkBarrier) as refused:
+            parent._admit(True, completion=True)
+        assert "admits no further work" in str(refused.value)
+        with pytest.raises(kernel_workflow.ForkBarrier) as unstarted:
+            asyncio.run(parent._start_the_children(request, built))
+        assert "child 1 is unstarted" in str(unstarted.value)
+        assert [row.existence for row in parent._fork.child_records] == [
+            "never_attempted",
+            "never_attempted",
+        ]
+        # The status is terminal, so parking again is a parent that has already finished.
+        assert parked(monkeypatch, parent, unfinished=0) == []
+
+
+def a_start_that_disagrees(calls: List[str]) -> Any:
+    """A start Activity that finds another execution under this child's derived identity."""
+
+    async def started(*_arguments: Any, **named: Any) -> Any:
+        calls.append(named.get("activity_id", ""))
+        raise ActivityError(
+            "the start of a child",
+            scheduled_event_id=1,
+            started_event_id=2,
+            identity="the worker that asked",
+            activity_type="shogym.protocol_v2.StartForkChildActivity",
+            activity_id="the start",
+            retry_state=None,
+        ) from ApplicationError(
+            "'stream/the-parent/1.fork.1.abcd' was created as 'SomethingElseEntirely'",
+            type=ORIGIN_DISAGREEMENT_FAILURE,
+            non_retryable=True,
+        )
+
+    return started
+
+
+def answering_as(
+    monkeypatch: pytest.MonkeyPatch, parent: Any, request: ForkRequest, update_id: str
+) -> Any:
+    """Run one fork under one exact Update identifier, the way an accepted handler runs."""
+    monkeypatch.setattr(
+        kernel_workflow.workflow,
+        "current_update_info",
+        lambda: SimpleNamespace(id=update_id),
+    )
+    return asyncio.run(
+        parent._answering(
+            kernel_workflow.FORK,
+            parent._ownership_epoch,
+            lambda: parent._fork_the_generation(request),
+        )
+    )
+
+
+def test_a_child_identity_another_execution_holds_ends_this_fork_with_its_own_decision(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """An authenticated disagreement is this fork's ending and keeps its reason everywhere.
+
+    Something else running under a child's derived identity is read once and never differently:
+    no later reading reaches another answer, and replacing what is there is the one move a fork
+    never makes. So it is the fork's own permanent refusal rather than an Activity's failure, and
+    it is that before the outcome is journalled, because the journal keeps a type and a message
+    and no details and a controller reads the reason out of them.
+
+    What the ending is worth is that it is not repeated. A fresh identifier carrying the same fork
+    is answered from the record without scheduling the start again, the status a controller reads
+    says the same thing, and the parent stops waiting for a fork that has finished.
+    """
+    parent, request = a_barrier(monkeypatch)
+    calls: List[str] = []
+    monkeypatch.setattr(
+        kernel_workflow.workflow, "execute_activity", a_start_that_disagrees(calls)
+    )
+
+    with pytest.raises(kernel_workflow.ForkRefused) as raised:
+        answering_as(monkeypatch, parent, request, "fork-1")
+
+    assert raised.value.reason == FORK_ORIGIN_DISAGREEMENT
+    assert raised.value.non_retryable
+    assert kernel_runtime.fork_refusal(raised.value) == FORK_ORIGIN_DISAGREEMENT
+    assert not kernel_runtime.fork_can_be_retried(raised.value)
+    assert "the identity of child 1 is held by another execution" in raised.value.clause
+    assert len(calls) == 1
+
+    # The ending is retained with the fork, and every child it made is left exactly as it is.
+    assert parent._fork is not None
+    assert parent._fork.status == FORK_CONFLICTED
+    assert parent._fork.conflict_reason == FORK_ORIGIN_DISAGREEMENT
+    assert "another execution" in parent._fork.conflict_clause
+    check_prepared_fork(parent._fork)
+    assert [row.existence for row in parent._fork.child_records] == [
+        "existence_unconfirmed",
+        "never_attempted",
+    ]
+
+    # The exact identifier keeps that decision, with its reason, out of the application's journal.
+    journalled = parent.answered_update("fork-1")
+    assert journalled.found and journalled.kind == "failure"
+    assert journalled.type_name == FORK_ORIGIN_DISAGREEMENT
+    assert "another execution" in journalled.message
+
+    # A fresh logical retry is answered from the record rather than by asking again.
+    with pytest.raises(kernel_workflow.ForkRefused) as again:
+        answering_as(monkeypatch, parent, request, "fork-2")
+    assert again.value.reason == FORK_ORIGIN_DISAGREEMENT
+    assert "another execution" in again.value.clause
+    assert len(calls) == 1
+
+    # And so is a controller that reads the status of a parent it can no longer write to.
+    answer = parent.fork_status(
+        ForkStatusQuestion(fork_id=FORK, request_digest=fork_request_digest(request))
+    )
+    assert answer.found and not answer.conflict
+    assert answer.record is not None and answer.record.status == FORK_CONFLICTED
+    told = kernel_runtime._what_the_record_says(answer, request)
+    assert isinstance(told, kernel_workflow.ForkRefused)
+    assert told.reason == FORK_ORIGIN_DISAGREEMENT
+    assert "another execution" in told.clause
+
+    # The fork has ended, so the parent waits for nothing further and never rewrites the ending.
+    assert parked(monkeypatch, parent, unfinished=0) == []
+    parent._move_the_fork(FORK_CHILDREN_CONFIRMED)
+    assert parent._fork.status == FORK_CONFLICTED
+
+
+def test_a_start_that_could_not_be_made_stays_the_failure_it_was(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A start nobody could make is infrastructure, and infrastructure is not an ending.
+
+    The fork stays prepared, the child stays attempted with its existence unconfirmed, and the
+    same fork under a fresh identifier is the supported next move: turning that into a decision
+    would record an ending over work that never happened.
+    """
+    parent, request = a_barrier(monkeypatch)
+
+    async def unreachable(*_arguments: Any, **_named: Any) -> Any:
+        raise ActivityError(
+            "the start of a child",
+            scheduled_event_id=1,
+            started_event_id=2,
+            identity="the worker that asked",
+            activity_type="shogym.protocol_v2.StartForkChildActivity",
+            activity_id="the start",
+            retry_state=None,
+        ) from ApplicationError("the service could not be reached", type="RPCError")
+
+    monkeypatch.setattr(kernel_workflow.workflow, "execute_activity", unreachable)
+    with pytest.raises(ActivityError):
+        answering_as(monkeypatch, parent, request, "fork-1")
+
+    assert parent._fork is not None
+    assert parent._fork.status == FORK_PREPARED
+    assert parent._fork.conflict_reason is None
+    assert parent._fork.child_records[0].existence == "existence_unconfirmed"
+    parent._refuse_a_fork(request, excluding=("fork-1",))
+
+
+def test_a_parents_record_answers_a_child_that_asks_and_a_controller_that_asks(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The two Queries a closed execution still answers, and the answer neither of them refuses.
+
+    A refused Query would be indistinguishable from a parent nobody could read, and the two are
+    different facts: one is authenticated and permanent, the other is infrastructure a child waits
+    out while it stays gated. So a question this parent has no answer to comes back as a row
+    naming no child, and the caller compares.
+
+    Neither of them charges the reserve. Everything a controller wants to read is one of these
+    two, so a permanently unavailable child service cannot turn polling into exhaustion of the
+    slots the fork's own completion is kept in.
+    """
+    parent, request = a_barrier(monkeypatch)
+    digest = fork_request_digest(request)
+
+    answer = parent.fork_status(ForkStatusQuestion(fork_id=FORK, request_digest=digest))
+    assert answer.found and not answer.conflict
+    assert answer.parent_state == "forked"
+    assert answer.record is not None and answer.record.fork_id == FORK
+    changed = parent.fork_status(
+        ForkStatusQuestion(fork_id=FORK, request_digest="0" * 64)
+    )
+    assert changed.found and changed.conflict
+    unknown = parent.fork_status(
+        ForkStatusQuestion(fork_id="fork-2", request_digest=digest)
+    )
+    assert not unknown.found and not unknown.conflict
+
+    told = parent.fork_child(FORK, 1)
+    assert told.fork_id == FORK
+    assert told.fork_status == "prepared"
+    assert told.record.child_ordinal == 1
+    assert told.record.child_workflow_id == child_workflow_id(
+        identity_namespace="default",
+        parent_workflow_id=PARENT_ID,
+        fork_id=FORK,
+        child_ordinal=1,
+    )
+    for question in ((FORK, 3), ("fork-2", 1)):
+        nothing = parent.fork_child(*question)
+        assert nothing.record.child_workflow_id == ""
+        assert nothing.record.complete_start_digest == ""
+    # Seven reads of a barriered parent, and the reserve is where the barrier left it.
+    assert parent._post_barrier == 0
+
+    # A fork that has finished answers with what it finished with, because a retry under a fresh
+    # identifier cannot reach the outcome journal the original Update's answer is kept in and a
+    # closed parent accepts no Update at all. Until it finishes there is nothing to hand over, and
+    # a request bound to something else is never handed this one's evidence.
+    assert answer.receipt is None
+    built = parent._built_children(request)
+    for row, _start in built:
+        parent._note_child(row.child_ordinal, "confirmed_existing", run_id="the-child-run")
+    receipt = parent._fork_answer(request, built)
+    finished = parent.fork_status(ForkStatusQuestion(fork_id=FORK, request_digest=digest))
+    assert finished.receipt == receipt
+    assert finished.record is not None and finished.record.status == "complete"
+    other = parent.fork_status(ForkStatusQuestion(fork_id=FORK, request_digest="0" * 64))
+    assert other.conflict and other.receipt is None
+
+
+def test_a_child_this_parent_prepared_authorizes_its_own_complete_start_against_that_row(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """What the parent builds is what the child's own restore and gate are held to.
+
+    The row maps the exact child workflow id and the child ordinal to that child's complete start
+    digest, carrier included, and the child compares its actual service identity and its own start
+    against it. This is the parent's half of that comparison, built here and read there.
+    """
+    parent = a_quiet_parent(monkeypatch)
+    request = a_fork_request(parent)
+    built = parent._built_children(request)
+    assert len(built) == 2
+    for (row, start), plan in zip(built, request.child_plans):
+        assert start.fork_origin is not None
+        assert start.served_slot == plan.branch_slot
+        # The store is the run directory's own, under the fixed name every generation's reader
+        # resolves through, so an object installed for this child is one the reopened directory's
+        # own accessor reads rather than one it reads past.
+        assert start.blob_root == child_blob_root(plan.run_directory)
+        assert start.blob_root == f"{plan.run_directory}/blobs"
+        assert start.hidden_execution_id == plan.hidden_execution_id
+        assert start.consumer_claim_hash == plan.consumer_claim_hash
+        assert row.complete_start_digest == complete_start_digest(start)
+        assert row.origin_digest == origin_digest(start.fork_origin)
+        assert row.branch_slot == plan.branch_slot
+        assert row.target_cell == plan.target_cell
+        serving_as(monkeypatch, workflow_id=row.child_workflow_id)
+        kernel_workflow.check_complete_start_authorization(
+            start, workflow_id=row.child_workflow_id, record=row
+        )
+    # Both children carry their parent's whole observed prefix and differ where the plans say.
+    [first, second] = [start for _, start in built]
+    assert first.tasks == second.tasks == parent._start.tasks
+    assert first.carry is not None and second.carry is not None
+    assert first.carry.carrier_schema_version == FORK_CARRIER_SCHEMA_VERSION
+    assert configuration_hash(first) != configuration_hash(second)
+    # And the build is pure, so a recovery run of the same fork derives the same two starts.
+    again = a_quiet_parent(monkeypatch)._built_children(a_fork_request(parent))
+    assert [row for row, _ in again] == [row for row, _ in built]
+    assert [start for _, start in again] == [start for _, start in built]
