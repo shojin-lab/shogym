@@ -105,6 +105,7 @@ with workflow.unsafe.imports_passed_through():
         GENERATE_PAYLOAD_BUNDLE,
         ORIGIN_DISAGREEMENT_FAILURE,
         fork_availability_activity,
+        fork_preparation_activity,
         generate_payload_bundle_activity,
         grade_attempt_activity,
         seal_attempt_activity,
@@ -126,15 +127,18 @@ with workflow.unsafe.imports_passed_through():
         FORK_ABANDONED,
         FORK_AVAILABILITY_STEP,
         FORK_CHILDREN_CONFIRMED,
+        FORK_CLAIM_STEP,
         FORK_COMPLETE,
         FORK_CONFIGURATION_VIOLATION,
-        FORK_CONFLICTED,
+        FORK_CONFLICTED,        FORK_CONTRACT_DRIFT,
         FORK_EXPIRED_AUTHORITY,
         FORK_IN_FLIGHT,
         FORK_NOT_QUIET,
         FORK_MOVED_EXECUTION,
         FORK_ORIGIN_DISAGREEMENT,
         FORK_ORIGIN_STEP,
+        FORK_PREPARATION,
+        FORK_PREPARATION_STEP,
         FORK_PREPARED,
         FORK_REPAIRABLE_ABSENCE,
         FORK_REQUEST_CONFLICT,
@@ -142,6 +146,7 @@ with workflow.unsafe.imports_passed_through():
         FORK_UNDECLARED_BRANCH,
         FORK_UNRECOVERABLE_EVIDENCE,
         FORK_WITNESS_MISMATCH,
+        FORK_WRONG_SOURCE,
         RETRYABLE_FORK_REFUSALS,
         SPENT_RECOVERY_RESERVE,
         OPERATION_OUTCOMES,
@@ -166,6 +171,7 @@ with workflow.unsafe.imports_passed_through():
         CarriedBinding,
         CarriedFinalization,
         CarriedObligation,
+        ChildReady,
         ConsumerClaim,
         ConsumerReceipt,
         EnvironmentCall,
@@ -179,6 +185,8 @@ with workflow.unsafe.imports_passed_through():
         ForkChildStarted,
         ForkOrigin,
         ForkOriginVerified,
+        ForkPreparation,
+        ForkPreparationInput,
         ForkReceipt,
         ForkRequest,
         ForkStatusAnswer,
@@ -231,6 +239,7 @@ with workflow.unsafe.imports_passed_through():
         derived_selection,
         fork_activity_id,
         fork_origin_bound,
+        fork_preparation_operation_identity,
         fork_receipt_bound,
         fork_start_bound,
         fork_request_digest,
@@ -242,6 +251,7 @@ with workflow.unsafe.imports_passed_through():
         resolved_echo,
         source_seal_id,
         start_difference_projection,
+        verified_set_digest,
         CarriedProjection,
         pack_carrier,
         unpack_carrier,
@@ -523,6 +533,15 @@ _EVIDENCE_REASONS: Dict[str, str] = {
     "UnavailableEvidence": UNAVAILABLE_EVIDENCE,
 }
 
+# Which refusal a preparation episode that already ended is answered with, by the reason its own
+# ending was recorded under. A permanent preparation failure is terminal for the episode and not
+# for the attempt that met it, so every later owner of the same episode is answered with the
+# decision the episode already made rather than being allowed to make a second one.
+_PREPARATION_ENDINGS: Dict[str, str] = {
+    WRONG_SOURCE: FORK_WRONG_SOURCE,
+    CONTRACT_DRIFT: FORK_CONTRACT_DRIFT,
+}
+
 
 class StreamProtocolError(ApplicationError):
     """A refusal carrying one code from the protocol's closed set.
@@ -795,6 +814,12 @@ class _Obligation:
     # an offerable obligation lawfully carries no candidate: the parent writes it into the child's
     # start, and preparation clears it in the transition that installs the candidate.
     pending_preparation: bool = False
+    # The ownership epoch this child's first preparation of the obligation was created under. It
+    # is written once, at that first attempt and before anything the attempt can be refused on,
+    # and it is what the preparation operation's identity is minted from ever after: a repair
+    # under a later owner repeats one logical preparation rather than opening a second one. Zero
+    # is an obligation whose child has opened no episode.
+    preparation_epoch: int = 0
 
 
 @dataclass
@@ -901,10 +926,12 @@ CLOSE = "close_queue"
 GRANT = "begin_environment_call"
 RELEASE = "end_environment_call"
 CONFIRM = "confirm_state"
-# And the twelfth, which no agent reaches and no gateway sends. A fork is a platform operation over
+# And two more, which no agent reaches and no gateway sends. A fork is a platform operation over
 # two generations rather than a call in the protocol, and the exact Update returns the complete
-# receipt, which is what makes the outcome journal a usable recovery path for it.
+# receipt, which is what makes the outcome journal a usable recovery path for it. A preparation is
+# the last thing a gated child does before it is ready, and its answer is that readiness.
 FORK = "fork_generation"
+PREPARE = "prepare_child"
 
 # What each of them answers with. A journal entry says which handler wrote it, and that is
 # enough to read the value back as the thing it is rather than as an untyped map.
@@ -921,6 +948,7 @@ ANSWER_TYPES: Dict[str, Any] = {
     RELEASE: EnvironmentLease,
     CONFIRM: StreamState,
     FORK: ForkReceipt,
+    PREPARE: ChildReady,
 }
 
 # How a journal entry says where its answer is. A value the generation keeps nowhere else is
@@ -1293,10 +1321,15 @@ class StreamWorkflow:
     def _check_lineage(self, origin: ForkOrigin) -> None:
         """Hold the lineage a start carries to what this build reads and to this child's identity.
 
-        Both run at every entry, fresh or continued, because a lineage record is immutable
+        All three run at every entry, fresh or continued, because a lineage record is immutable
         provenance rather than an authorization of anything: a child that has continued twice
         still says which generation it was cut from, and still has to be the child that record was
         written about.
+
+        The store is required here rather than left to the operation that would miss it. A
+        generation given none verifies its committed objects by returning without reading
+        anything, so a child without one would claim over a closure nobody checked and prepare a
+        body out of a store that is not there.
         """
         try:
             check_fork_origin(origin)
@@ -1308,6 +1341,11 @@ class StreamWorkflow:
             raise _refuse_carrier(
                 "the lineage this start carries records another generation's identity as this "
                 "child's, and a child is what its own start says it is"
+            )
+        if self._start.blob_root is None:
+            raise _refuse_carrier(
+                "a child inherits a closure of objects and reads its own body out of one, and "
+                "this start was cut from a fork and given no store"
             )
 
     def _authorize_carry(
@@ -1437,6 +1475,7 @@ class StreamWorkflow:
             obligation.materialized = owed.materialized
             obligation.candidate = owed.candidate
             obligation.pending_preparation = owed.pending_preparation
+            obligation.preparation_epoch = owed.preparation_epoch
         self._presented = {row.message_id: row for row in carry.presented}
         self._committed_blobs = list(carry.committed_blobs)
         self._pull_requests = _bindings(carry.pull_requests)
@@ -2040,6 +2079,7 @@ class StreamWorkflow:
                         else None
                     ),
                     pending_preparation=obligation.pending_preparation,
+                    preparation_epoch=obligation.preparation_epoch,
                 )
                 for attempt_id, obligation in sorted(self._obligations.items())
             ],
@@ -3384,6 +3424,24 @@ class StreamWorkflow:
         self._fork_steps[key] = self._fork_steps.get(key, 0) + 1
         return fork_activity_id(fork_id=fork_id, step=step, ordinal=self._fork_steps[key])
 
+    def _first_claim_activity(self) -> Optional[str]:
+        """The identifier a gated child's own first claim reads the store under, where it is one.
+
+        A child inherits a whole prefix and only then claims for the first time, which is a read
+        no unforked twin makes at that point, so it takes an identifier from the fork's own
+        namespace and the child's ordinary numbering stays where the inherited prefix left it.
+        The verification batch count still moves, because it counts reads and this is one: a
+        child is a batch ahead of the twin and level with it on the ordinal. Every later claim of
+        a child is an ordinary resume that the twin makes too, and it reads under the ordinary
+        ordinal like any other.
+
+        ``None`` is every other claim, which is what an ordinary read is scheduled under.
+        """
+        origin = self._start.fork_origin
+        if origin is None or self._ownership_epoch != 0:
+            return None
+        return self._fork_activity(origin.fork_id, FORK_CLAIM_STEP)
+
     # What a parent does after its barrier stands, and the two endings it commits itself.
 
     async def _park_for_the_fork(self) -> None:
@@ -3483,6 +3541,442 @@ class StreamWorkflow:
             ceiling=TURNOVER_PAYLOAD_CEILING_BYTES,
         )
         self._admit_lineage(answer.record)
+
+    # And a child's own preparation, which is the last thing it does before it is ready.
+
+    @workflow.update
+    async def prepare_child(self, writer: Writer) -> ChildReady:
+        """Build the body this child was selected for, install it, and certify the child.
+
+        It is one operation however many attempts it takes. The identity is frozen at the first
+        attempt, so a preparation refused over an object the store had lost and the preparation
+        that repeats it after a repair, under a fresh owner and a different Update, are one
+        operation with two rows rather than two operations with one each.
+
+        A child builds its own body in its own history rather than being handed one its parent
+        built, so what a child was served sits in that child's record and the parent renders
+        nothing it does not serve. Preparing on the first pull instead would make the agent pay
+        for and diagnose an initialization it is not allowed to see.
+        """
+        self._count_update()
+        return await self._answering(
+            PREPARE, writer.ownership_epoch, lambda: self._prepare_the_child(writer)
+        )
+
+    @prepare_child.validator
+    def _prepare_child_admitted(self, writer: Writer) -> None:
+        # A preparation is progress by construction. A gated child owes exactly this before it can
+        # answer anything, so holding it off for a boundary would hold off the readiness that
+        # boundary is waiting for. Everything it decides is decided again in the handler.
+        self._admit(True)
+
+    async def _prepare_the_child(self, writer: Writer) -> ChildReady:
+        """Run one preparation, in the order the record it leaves depends on.
+
+        The owner is checked before anything is read and again on the way back, before either
+        outcome is recorded rather than only before the good one, which is the ordering the
+        route's own delivery check already keeps: a claimant a resume replaced while the store was
+        being read must not leave a refusal standing over an obligation its replacement has since
+        prepared.
+
+        A child that finds its body already installed publishes its readiness again and installs
+        no second one. That is the crash this operation cannot tell from a lost reply, and one
+        candidate under one frozen identity is what both of them have to come to.
+        """
+        origin = self._start.fork_origin
+        if origin is None:
+            raise ForkRefused(
+                FORK_CONFIGURATION_VIOLATION,
+                "a preparation builds the body a fork selected, and this generation was cut from "
+                "no fork",
+            )
+        self._require_writer(writer)
+        attempt = self._attempts.get(origin.source_attempt_id)
+        obligation = self._obligations.get(origin.source_attempt_id)
+        if attempt is None or obligation is None:
+            raise ForkRefused(
+                FORK_UNRECOVERABLE_EVIDENCE,
+                f"this child's lineage names {origin.source_attempt_id} as the attempt it "
+                "inherited, and it owes no payload for one",
+            )
+        if obligation.preparation_epoch == 0:
+            # The episode opens here, at this child's first attempt at it and before anything the
+            # attempt can be refused on, and what it opens is a record rather than a value in this
+            # execution's memory. A first attempt that succeeds writes no failure row, and one
+            # fenced after its Activity writes none either, so an identity reconstructed from rows
+            # would be reconstructed from evidence that need not exist.
+            obligation.preparation_epoch = writer.ownership_epoch
+        operation = fork_preparation_operation_identity(
+            origin.fork_id, workflow.info().workflow_id, obligation.preparation_epoch
+        )
+        self._refuse_a_preparation_that_ended(operation)
+        if not obligation.pending_preparation:
+            self._note_recovery(operation, FORK_PREPARATION, writer.ownership_epoch)
+            return self._readiness(origin, attempt, operation)
+        selected = self._inherited_selection(operation, attempt, writer)
+        prepared = await self._read_the_child_evidence(origin, attempt, selected)
+        # The store was read outside this transition, so the owner is checked again on the way
+        # back in, before any returned result is classified and before any outcome is recorded.
+        self._require_writer(writer)
+        self._what_came_back_can_be_carried(operation, attempt, selected, prepared, writer)
+        if prepared.missing:
+            self._note_preparation_refusal(
+                operation,
+                attempt,
+                writer,
+                reason=UNAVAILABLE_EVIDENCE,
+                outcome=REFUSED_OPERATION,
+                references=list(prepared.missing),
+            )
+            raise ForkRefused(
+                FORK_REPAIRABLE_ABSENCE,
+                f"this child's preparation was not given {sorted(prepared.missing)}",
+            )
+        candidate = self._prepared_candidate(operation, attempt, selected, prepared, writer)
+        # One transition, no await inside it: the body, the gate and this execution's own mark on
+        # the obligation become authoritative together, so no candidate ever stands beside a
+        # selection it does not match and no mark ever stands over an object nobody read. The
+        # obligation was materialized and released by the generation this child inherited, so
+        # nothing here counts a second materialization or a second release.
+        obligation.candidate = candidate
+        obligation.pending_preparation = False
+        self._verified_deliveries.add(attempt.item.attempt_id)
+        self._note_recovery(operation, FORK_PREPARATION, writer.ownership_epoch)
+        return self._readiness(origin, attempt, operation)
+
+    def _frozen_preparation_epoch(self) -> int:
+        """The epoch this child's preparation episode was created under, or zero for none.
+
+        The identity is frozen at the first attempt and never recomputed from the epoch the child
+        holds now, so a repair that steps the owner repeats one logical preparation rather than
+        opening a second operation nothing joins to the first. It is read out of the child's own
+        obligation, which is where the first attempt wrote it and which crosses a continuation in
+        the carrier, so a success, a refusal, a fencing and a lost reply all leave the same answer
+        behind. A child that opened no episode is zero, and that is a different fact from a child
+        whose episode this generation cannot name.
+        """
+        origin = self._start.fork_origin
+        if origin is None:
+            return 0
+        owed = self._obligations.get(origin.source_attempt_id)
+        return 0 if owed is None else owed.preparation_epoch
+
+    def _refuse_a_preparation_that_ended(self, operation: str) -> None:
+        """Refuse every later attempt at an episode that has already failed for good.
+
+        A failed preparation is a terminal state rather than a pause. A wrong source and contract
+        drift are recorded permanent because no bytes put back anywhere change either answer, and
+        an episode that ended in one ends there for every owner that comes after it: a fresh owner
+        handed a candidate that passes would otherwise publish readiness over an episode whose
+        last row still reads unrecoverable, and the candidate, the readiness and the failure rows
+        would disagree about the same child.
+
+        Repairable absence is the other case and keeps exactly the behaviour it had. It stays open
+        for the transition that answers it, that transition appends the recovered row, and the
+        attempt's availability moves back with it.
+        """
+        ended: Optional[OperationFailure] = None
+        for row in self._operation_failures:
+            if row.operation == operation and row.phase == FORK_PREPARATION:
+                ended = row
+        if ended is None or ended.outcome != UNRECOVERABLE_OPERATION:
+            return
+        raise ForkRefused(
+            _PREPARATION_ENDINGS.get(ended.reason, FORK_UNRECOVERABLE_EVIDENCE),
+            f"this child's preparation ended under {ended.reason} and no candidate any later "
+            "owner is handed changes that",
+        )
+
+    def _inherited_selection(
+        self, operation: str, attempt: _Attempt, writer: Writer
+    ) -> SelectedSourceReference:
+        """The one committed cell this child was selected for, derived from what it inherited.
+
+        The origin is the attempt's own rather than this generation's, because the seal id that
+        keys the capture was minted under the parent's hidden execution identity: a derivation
+        recomputing it from this start would be checking an inherited source against the
+        generation it arrived at rather than against the one that produced it. The descriptor is
+        carried whole in state, so naming the entry for this child's cell reads no blob, renders
+        nothing and needs no world.
+
+        A source that cannot produce this child's selection is the wrong source for it, and that
+        is permanent: no bytes put back anywhere change the answer. The row it leaves names no
+        object, because nothing was read to be found missing.
+        """
+        manifest = attempt.source_artifact
+        context = attempt.source_origin
+        root = self._start.blob_root
+        if manifest is None or context is None or root is None:
+            raise ForkRefused(
+                FORK_UNRECOVERABLE_EVIDENCE,
+                f"this child inherited {attempt.item.attempt_id} without the source, the origin "
+                "or the store a body of it is derived from",
+            )
+        try:
+            return derived_selection(
+                source=manifest,
+                origin=context,
+                commitment=attempt.source_commitment or "",
+                cell=attempt.selected_cell or "",
+                policy_digest=attempt.selected_policy_digest or "",
+                blob_root=root,
+            )
+        except WireFormatError as error:
+            self._note_preparation_refusal(
+                operation,
+                attempt,
+                writer,
+                reason=WRONG_SOURCE,
+                outcome=UNRECOVERABLE_OPERATION,
+                references=[],
+            )
+            raise ForkRefused(FORK_WRONG_SOURCE, str(error)) from error
+
+    async def _read_the_child_evidence(
+        self, origin: ForkOrigin, attempt: _Attempt, selected: SelectedSourceReference
+    ) -> ForkPreparation:
+        """Read this child's two objects, through the recorded Activity that reads them.
+
+        The manifest is read afresh under its commitment beside the body, because the claim that
+        came earlier is evidence of an earlier read and not of this one: the resolver on its own
+        opens the store for the selected body alone, and a manifest lost in the window between
+        them would let a child publish readiness over a source object nobody could produce.
+
+        It takes its identifier from the fork's own namespace, like every other fork-only
+        invocation, and it is not the blob verification Activity, so a preparation adds no
+        verification batch to the count this child inherited.
+
+        What it asks for is measured here, as the configured converter would encode it, because a
+        request whose bytes the service would never carry is a decision that can be taken before
+        anything runs. What comes back is measured by the caller instead, after that caller has
+        checked its owner again: a result is a completion like any other, and every completion of
+        this operation is classified in one place under one owner.
+        """
+        converter = workflow.payload_converter()
+        asked = ForkPreparationInput(
+            blob_root=selected.blob_root,
+            source_commitment=selected.source_commitment,
+            payload=GeneratePayloadBundleInput(
+                attempt_id=attempt.item.attempt_id,
+                payload_position=attempt.item.payload_position,
+                payload_message_id=attempt.item.payload_message_id,
+                submission_digest=attempt.submission_digest or "",
+                policy_digest=attempt.selected_policy_digest or "",
+                cell=attempt.selected_cell or "",
+                selected=selected,
+            ),
+        )
+        _fork_shape_measured(
+            "this child's preparation",
+            asked,
+            converter,
+            ceiling=TURNOVER_PAYLOAD_CEILING_BYTES,
+        )
+        prepared: ForkPreparation = await workflow.execute_activity(
+            fork_preparation_activity,
+            asked,
+            start_to_close_timeout=_ACTIVITY_TIMEOUT,
+            retry_policy=_ACTIVITY_RETRY,
+            activity_id=self._fork_activity(origin.fork_id, FORK_PREPARATION_STEP),
+        )
+        return prepared
+
+    def _what_came_back_can_be_carried(
+        self,
+        operation: str,
+        attempt: _Attempt,
+        selected: SelectedSourceReference,
+        prepared: ForkPreparation,
+        writer: Writer,
+    ) -> None:
+        """Measure what one preparation returned, and end the episode where it will not fit.
+
+        It is measured here rather than where it arrived, because the owner is checked between the
+        two and a result classified before that check would let a superseded writer be told about
+        the result instead of about the owner that replaced it. Every completion of this operation
+        passes the same point for the same reason: one of them is refused, one of them is a
+        candidate, and both of them are decisions this child records under the episode it froze.
+
+        A result whose bytes this child could never carry is an ending rather than a wait, so it
+        writes the permanent row the declared failure model has for it: the result itself says
+        which of the two permanent reasons that is, exactly as it does for a candidate that fails a
+        check, and no bytes put back anywhere change either answer.
+        """
+        try:
+            check_transmitted_size(
+                "what this child's preparation returned",
+                prepared,
+                workflow.payload_converter(),
+                ceiling=TURNOVER_PAYLOAD_CEILING_BYTES,
+            )
+        except WireFormatError as oversize:
+            bundle = prepared.bundle
+            returned = (
+                bundle.candidates[0]
+                if bundle is not None and len(bundle.candidates) == 1
+                else None
+            )
+            reason = _preparation_reason(returned, selected)
+            self._note_preparation_refusal(
+                operation,
+                attempt,
+                writer,
+                reason=reason,
+                outcome=UNRECOVERABLE_OPERATION,
+                references=(
+                    []
+                    if reason == WRONG_SOURCE
+                    else [selected.source_commitment, selected.body_sha256]
+                ),
+            )
+            raise ForkRefused(
+                FORK_WRONG_SOURCE if reason == WRONG_SOURCE else FORK_CONTRACT_DRIFT,
+                str(oversize),
+            ) from oversize
+
+    def _prepared_candidate(
+        self,
+        operation: str,
+        attempt: _Attempt,
+        selected: SelectedSourceReference,
+        prepared: ForkPreparation,
+        writer: Writer,
+    ) -> PayloadCandidate:
+        """Read what the preparation returned, and hold it to what this child already holds.
+
+        The sequence is the route's own and it is run in the route's own order, with the bundle's
+        identity checked before anything inside it is read: a malformed value has to end the
+        operation with a recorded outcome rather than fail an activation where nothing is
+        recorded. Every check after that is pure and every value it is made against is one this
+        child inherited, the selected committed entry among them.
+
+        The body is measured against the same ceiling a continuation measures against, because a
+        candidate's bytes cross this child's own later boundary inline.
+
+        What separates the two permanent reasons is the result itself. A candidate naming a source
+        or a reference other than the one this obligation was selected from is a wrong source; one
+        naming this source and failing a check of what it is, is contract drift. Neither becomes a
+        repair, because no bytes put back anywhere change either answer.
+        """
+        returned: Optional[PayloadCandidateResult] = None
+        try:
+            bundle = prepared.bundle
+            if bundle is None or len(bundle.candidates) != 1:
+                raise _UnusableResult(
+                    "a preparation resolves exactly one committed cell",
+                    type="IncompleteCandidateBundle",
+                    non_retryable=True,
+                )
+            if (
+                bundle.attempt_id != attempt.item.attempt_id
+                or bundle.payload_position != attempt.item.payload_position
+                or bundle.submission_digest != attempt.submission_digest
+            ):
+                raise _unusable("the candidate bundle is not the one this child asked for")
+            returned = bundle.candidates[0]
+            candidate = _read_candidate(returned)
+            _check_candidate(attempt.item, candidate)
+            disposition = self._served.get(attempt.item.attempt_id)
+            _check_echo(
+                candidate,
+                disposition,
+                _policy_of(disposition),
+                attempt.item,
+                attempt.submission_digest or "",
+                None,
+                selected=selected,
+                source=attempt.source_artifact,
+            )
+            _check_family(
+                candidate,
+                None
+                if disposition is None or not disposition.family_id
+                else self._families.get(disposition.family_id),
+            )
+            try:
+                check_transmitted_size(
+                    "this child's installed candidate",
+                    candidate,
+                    workflow.payload_converter(),
+                    ceiling=TURNOVER_PAYLOAD_CEILING_BYTES,
+                )
+            except WireFormatError as oversize:
+                raise _unusable(str(oversize)) from oversize
+        except _UnusableResult as unusable:
+            reason = _preparation_reason(returned, selected)
+            self._note_preparation_refusal(
+                operation,
+                attempt,
+                writer,
+                reason=reason,
+                outcome=UNRECOVERABLE_OPERATION,
+                references=(
+                    []
+                    if reason == WRONG_SOURCE
+                    else [selected.source_commitment, selected.body_sha256]
+                ),
+            )
+            raise ForkRefused(
+                FORK_WRONG_SOURCE if reason == WRONG_SOURCE else FORK_CONTRACT_DRIFT,
+                str(unusable),
+            ) from unusable
+        return candidate
+
+    def _note_preparation_refusal(
+        self,
+        operation: str,
+        attempt: _Attempt,
+        writer: Writer,
+        *,
+        reason: str,
+        outcome: str,
+        references: List[str],
+    ) -> None:
+        """Record one preparation that could not build the body its child was selected for.
+
+        The row carries the frozen preparation identity rather than the Update that met the
+        failure, which is what joins a refusal to the recovery of the same logical preparation
+        across a fresh owner and a different Update. A repairable absence names the objects the
+        operation could not produce and stays open for the transition that answers it; a permanent
+        one is the ending, because no bytes put back anywhere change it.
+        """
+        self._note_operation(
+            operation=operation,
+            phase=FORK_PREPARATION,
+            reason=reason,
+            outcome=outcome,
+            refused_epoch=writer.ownership_epoch,
+            attempt_id=attempt.item.attempt_id,
+            payload_position=attempt.item.payload_position,
+            references=references,
+        )
+
+    def _readiness(self, origin: ForkOrigin, attempt: _Attempt, operation: str) -> ChildReady:
+        """Certify one child, at one checkpoint, with one candidate and one ownership state.
+
+        This is what releases a container, and nothing a reader computes is: the lifecycle a
+        reader reports labels a selected, materialized or eligible row as built without consulting
+        a candidate at all, so that label is a position in a lifecycle and never this.
+
+        The closure is named by the digest of what this child's own claim read back, so the
+        evidence says which objects were proved rather than that some were.
+        """
+        return ChildReady(
+            fork_id=origin.fork_id,
+            child_workflow_id=workflow.info().workflow_id,
+            child_run_id=workflow.info().run_id,
+            checkpoint_manifest_reference=origin.checkpoint_manifest_reference,
+            origin_digest=origin_digest(origin),
+            verified_set_digest=verified_set_digest(self._committed_blobs),
+            source_attempt_id=attempt.item.attempt_id,
+            selected_cell=attempt.selected_cell or "",
+            selected_body_reference=attempt.selected_body_reference or "",
+            selected_policy_digest=attempt.selected_policy_digest or "",
+            receipt_contract_id=attempt.receipt_contract_id or "",
+            ownership_epoch=self._ownership_epoch,
+            consumer_id=self._consumer_id or "",
+            preparation_operation=operation,
+        )
 
     # What a controller and a child read, both of which are Queries and cost the parent nothing.
 
@@ -5841,7 +6335,9 @@ class StreamWorkflow:
             ]
             if not outstanding:
                 return
-            missing = await self._unverified(root, outstanding)
+            missing = await self._unverified(
+                root, outstanding, activity_id=self._first_claim_activity()
+            )
             if missing:
                 # The read happened outside this transition, so the claim is checked again
                 # before its failure is recorded. A claimant that another one overtook while
@@ -5914,7 +6410,9 @@ class StreamWorkflow:
         if await self._unverified(root, references):
             raise StreamProtocolError(code)
 
-    async def _unverified(self, root: str, references: List[str]) -> List[str]:
+    async def _unverified(
+        self, root: str, references: List[str], *, activity_id: Optional[str] = None
+    ) -> List[str]:
         """Read the store and return the names it cannot produce the exact bytes for.
 
         The read is counted while it is happening and again when it finishes. Neither number is
@@ -5924,10 +6422,17 @@ class StreamWorkflow:
         and a claim that is working through them is making progress that a projection hash
         cannot show. A caller held off for the boundary reads these and keeps waiting.
 
+        ``activity_id`` is what a fork-only read is scheduled under. This call is one of the two
+        that consume the generation's Activity ordinal, ordinary payload generation being the
+        other, so a read no unforked twin performs takes an identifier from the fork's own
+        namespace instead and leaves that ordinal where the inherited prefix left it. The batch
+        count moves either way, because it counts reads and a fork-only read really is one.
+
         What comes back is the list rather than a refusal, because the operation that asked is
         the one that knows what a name it cannot produce means: which refusal to raise, and which
         row to write about the objects it could not get.
         """
+        identifier = self._next_activity_id() if activity_id is None else activity_id
         self._verifying += 1
         try:
             verified = await workflow.execute_activity(
@@ -5935,7 +6440,7 @@ class StreamWorkflow:
                 VerifyBlobsInput(blob_root=root, references=references),
                 start_to_close_timeout=_ACTIVITY_TIMEOUT,
                 retry_policy=_ACTIVITY_RETRY,
-                activity_id=self._next_activity_id(),
+                activity_id=identifier,
             )
         finally:
             self._verifying -= 1
@@ -6268,6 +6773,24 @@ def _no_such_child(ordinal: int) -> PreparedChild:
         hidden_execution_id="",
         start_differences=[],
     )
+
+
+def _preparation_reason(
+    returned: Optional[PayloadCandidateResult], selected: SelectedSourceReference
+) -> str:
+    """Which permanent reason one refused preparation result is recorded under.
+
+    The result is what says it. A candidate naming a source or a reference other than the one this
+    obligation was selected from is about the source; anything else about it is about the shape the
+    contract fixed. A result too malformed to read a candidate out of names no source at all, so it
+    is the second of those.
+    """
+    if returned is None:
+        return CONTRACT_DRIFT
+    named = (returned.source_commitment, returned.body_reference)
+    if named != (selected.source_commitment, selected.body_sha256):
+        return WRONG_SOURCE
+    return CONTRACT_DRIFT
 
 
 def _refuse_origin(complaint: str) -> ApplicationError:

@@ -1,4 +1,4 @@
-"""The Activities the stream depends on: two stand-ins, two that are not, and the fork's three.
+"""The Activities the stream depends on: two stand-ins, two that are not, and the fork's four.
 
 The seal and the grade compute deterministically from their inputs, hold no state between calls,
 and reach no environment. What is not a stand-in is their shape: each already carries the attempt
@@ -19,11 +19,12 @@ all.
 hashing it, and the workflow may not open a file, so the read lives here and the decision the
 read supports lives there.
 
-The fork's three are real and none of them is a stand-in. One reads the objects a fork requires
+The fork's four are real and none of them is a stand-in. One reads the objects a fork requires
 before its barrier commits, one creates a child under its derived identity and never a second one,
-and one asks a parent for the row it committed about a child. The last two reach the service
-rather than the store, which is the other reason they are here: a workflow may open no file and it
-may call no client either.
+one asks a parent for the row it committed about a child, and one reads a child's own two objects
+and resolves the cell that child was selected for. Two of them reach the service rather than the
+store, which is the other reason they are here: a workflow may open no file and it may call no
+client either.
 
 Everything that will one day be I/O is already on this side of the line. The workflow computes
 the submission digest from what :func:`seal_attempt_activity` returns and never opens a file,
@@ -66,6 +67,8 @@ from shogym.serve.protocol_v2.kernel.messages import (
     ForkAvailabilityInput,
     ForkChildStarted,
     ForkOriginVerified,
+    ForkPreparation,
+    ForkPreparationInput,
     GeneratePayloadBundleInput,
     GradeAttemptInput,
     GradeAttemptResult,
@@ -87,6 +90,7 @@ VERIFY_BLOBS = "shogym.protocol_v2.VerifyBlobsActivity"
 FORK_AVAILABILITY = "shogym.protocol_v2.ForkAvailabilityActivity"
 START_FORK_CHILD = "shogym.protocol_v2.StartForkChildActivity"
 VERIFY_FORK_ORIGIN = "shogym.protocol_v2.VerifyForkOriginActivity"
+PREPARE_FORK_CHILD = "shogym.protocol_v2.PrepareForkChildActivity"
 
 #: The workflow type a fork creates its children as, named rather than imported: the workflow
 #: module reads this one, so a name imported the other way would close the cycle.
@@ -104,6 +108,10 @@ EXPIRED_AUTHORITY_FAILURE = "ExpiredAuthority"
 #: literal because the parent that receives it decides on it: the reading is permanent, so the fork
 #: ends on it rather than asking again or replacing what is already there.
 ORIGIN_DISAGREEMENT_FAILURE = "OriginDisagreement"
+#: What a read of a name the store cannot produce the bytes for comes back as. It is a fact about
+#: the store rather than about the obligation, which is why a preparation turns it into the name it
+#: could not produce rather than letting it out as a failure of the call.
+UNAVAILABLE_EVIDENCE_FAILURE = "UnavailableEvidence"
 
 #: How long an origin question waits for an answer before it is retried.
 _QUERY_TIMEOUT = timedelta(seconds=10)
@@ -300,7 +308,7 @@ def _decoded(selected: SelectedSourceReference) -> str:
         raw = store.read(selected.body_sha256)
     except WireFormatError as error:
         raise ApplicationError(
-            str(error), type="UnavailableEvidence", non_retryable=True
+            str(error), type=UNAVAILABLE_EVIDENCE_FAILURE, non_retryable=True
         ) from error
     if len(raw) != selected.body_size:
         raise ApplicationError(
@@ -547,6 +555,58 @@ async def verify_fork_origin_activity(request: VerifyForkOriginInput) -> ForkOri
     return answer
 
 
+@activity.defn(name=PREPARE_FORK_CHILD)
+async def fork_preparation_activity(request: ForkPreparationInput) -> ForkPreparation:
+    """Read one child's two objects, and resolve the cell its parent selected for it.
+
+    The manifest is read again here under its own commitment, which is what a bare call of the
+    resolver would not do: the resolver opens the store for the selected body alone, so a manifest
+    lost after the child's successful claim would let a child publish readiness over a source
+    object nobody could produce. The earlier claim is evidence of an earlier read and not of this
+    one.
+
+    What resolves the body is the payload route's own resolver, wrapped rather than reimplemented,
+    so a child's candidate comes back through the same code a fresh capture's does and the checks
+    on the way back are the ones that route already names.
+
+    Nothing here decides anything. A name the store cannot produce comes back as a name, and the
+    child that asked is what says which refusal that is and which row to write about it. That
+    holds whichever of the two reads meets the absence: the objects are checked once before the
+    resolver runs and the selected body is opened again inside it, and an object lost in between
+    is the same fact about the store as one lost before either.
+    """
+    selected = request.payload.selected
+    if selected is None:
+        raise ApplicationError(
+            "a child prepares one committed cell and this request selected none",
+            type="SelectedSourceRequired",
+            non_retryable=True,
+        )
+    policy = _renderer_for(request.payload.policy_digest)
+    if policy.exposure != ARTIFACT:
+        raise ApplicationError(
+            f"a child's body is an environment's own committed bytes and {policy.policy_name} "
+            "renders one instead",
+            type="PolicyViolation",
+            non_retryable=True,
+        )
+    store = FilesystemBlobStore(Path(request.blob_root))
+    missing = store.unverified([request.source_commitment, selected.body_sha256])
+    if missing:
+        return ForkPreparation(missing=missing)
+    try:
+        bundle = _resolved_bundle(request.payload, policy)
+    except ApplicationError as error:
+        if error.type != UNAVAILABLE_EVIDENCE_FAILURE:
+            raise
+        # The object was there when this read the store and gone when the resolver read it again.
+        # That window is the one a repair covers, and what a repair answers is a name: an object
+        # lost between the two reads is the same absence as one lost before the first, so it comes
+        # back as the name it could not produce rather than as a failure of the call.
+        return ForkPreparation(missing=[selected.body_sha256])
+    return ForkPreparation(missing=[], bundle=bundle)
+
+
 def kernel_activities() -> list:
     """Return the Activities a stream Worker registers."""
     return [
@@ -562,11 +622,12 @@ def fork_activities() -> list:
 
     A Worker takes whatever Activity list it is handed wholesale, and an environment that brings
     its own terminal hands over only its seal, its grade, the payload bundle Activity and the blob
-    verification Activity. These three are none of those, so they are added beside whatever an
+    verification Activity. These four are none of those, so they are added beside whatever an
     environment supplied rather than being left to a caller to remember.
     """
     return [
         fork_availability_activity,
         start_fork_child_activity,
         verify_fork_origin_activity,
+        fork_preparation_activity,
     ]
