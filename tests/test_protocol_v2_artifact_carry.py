@@ -174,6 +174,10 @@ from shogym.serve.protocol_v2.kernel.messages import (  # noqa: E402
     resolved_echo,
     unpack_carrier,
 )
+from shogym.serve.protocol_v2.fork import (  # noqa: E402
+    CheckpointRetrieved,
+    fork_request_for,
+)
 from shogym.serve.protocol_v2.kernel.activities import (  # noqa: E402
     ORIGIN_DISAGREEMENT_FAILURE,
 )
@@ -5739,3 +5743,178 @@ def test_a_child_this_parent_prepared_authorizes_its_own_complete_start_against_
     again = a_quiet_parent(monkeypatch)._built_children(a_fork_request(parent))
     assert [row for row, _ in again] == [row for row, _ in built]
     assert [start for _, start in again] == [start for _, start in built]
+
+
+def test_a_quiet_generation_answers_with_the_freeze_a_fork_is_prepared_against(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The documented read, answered out of recorded state and out of nothing else.
+
+    Every value in it is something this generation committed: the attempt whose acknowledgement was
+    presented, the row that presentation committed, the attestation that committed it, and the
+    cursor and projection digest that attestation was answered with. A controller holding these has
+    the stream's half of a freeze without having read a private field of a transport, and the
+    execution scope beside them is what the request it composes is prepared against.
+    """
+    parent = a_quiet_parent(monkeypatch)
+
+    answered = parent.checkpoint_evidence()
+
+    assert answered.found and answered.reason == ""
+    evidence = answered.evidence
+    assert evidence is not None
+    assert (evidence.parent_workflow_id, evidence.parent_run_id) == (PARENT_ID, PARENT_RUN)
+    assert evidence.execution_ordinal == parent._start.execution_ordinal
+    assert evidence.configuration_hash == configuration_hash(parent._start)
+    assert evidence.capacity_in_use == 0
+    assert evidence.source_attempt_id == ATTEMPT
+    assert evidence.attestation_id == oid(0x201)
+    assert evidence.acknowledgement_message_id == oid(0x102)
+    assert evidence.acknowledged_visible_sha256 == digest_of(
+        "the acknowledgement as it was presented"
+    )
+    # The cursor and the digest are where the generation stands, which at this quiet point is
+    # where the acknowledgement left it, and they are what a request is then compared against.
+    assert evidence.acknowledged_cursor == parent._cursor == oid(0x102)
+    assert evidence.projection_digest == parent._projection_hash()
+    parent._refuse_a_fork(a_fork_request(parent))
+
+
+def test_a_generation_with_no_acknowledgement_standing_answers_with_the_reason_instead(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A controller that asked early asked a question with no answer yet, which is not a fault."""
+    parent = a_quiet_parent(monkeypatch)
+    parent._attempts[ATTEMPT].state = kernel_workflow.SEALED
+
+    answered = parent.checkpoint_evidence()
+
+    assert not answered.found and answered.evidence is None
+    assert "presented acknowledgement" in answered.reason
+
+
+class AParentBeingRead:
+    """The handle a controller reads one generation's half of a freeze through."""
+
+    def __init__(self, parent: Any) -> None:
+        self.parent = parent
+
+    async def checkpoint_evidence(self) -> Any:
+        return self.parent.checkpoint_evidence()
+
+
+def a_withholding_prefix(monkeypatch: pytest.MonkeyPatch) -> Any:
+    """A generation standing where a fork is cut, over a prefix that withheld an earlier receipt.
+
+    The earlier attempt was acknowledged and its payload was never owed, so it holds a presented
+    acknowledgement of its own and resolves nothing. The attempt the fork is cut over is the one
+    the cursor stands at and the one owing the single unresolved payload.
+    """
+    ahead = replace(
+        a_fork_parent(silent=True),
+        assignments=assignments_for(
+            a_fork_parent(silent=True).tasks, IMMEDIATE, without_payload=[SILENT]
+        ),
+    )
+    withheld = replace(
+        a_second_row(),
+        selected_cell=None,
+        selected_body_reference=None,
+        selected_policy_digest=None,
+    )
+    return a_quiet_parent(monkeypatch, start=ahead, attempts=[a_row(), withheld])
+
+
+async def test_a_prefix_that_withheld_an_earlier_receipt_reads_the_freeze_it_is_forked_at(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The read names the acknowledgement at the cut, which is what the boundary itself reads.
+
+    A withheld receipt is admitted by the scope this build forks: the earlier attempt keeps its
+    own committed source, both children inherit it whole, and nothing about it is unresolved. Its
+    acknowledgement is presented all the same, so a read that counted every acknowledgement this
+    generation has ever presented would refuse to compose the request for a prefix the parent goes
+    on to accept, and the controller would have no supported way to cut a lawful fork at all.
+
+    The whole route is driven here rather than the read alone, because the read exists to compose
+    a request: the request built from what it answers is the one this parent admits.
+    """
+    parent = a_withholding_prefix(monkeypatch)
+    assert sorted(
+        one.item.attempt_id
+        for one in parent._attempts.values()
+        if one.state == kernel_workflow.ACK_PRESENTED
+    ) == sorted([ATTEMPT, SILENT])
+
+    answered = parent.checkpoint_evidence()
+
+    assert answered.found and answered.reason == ""
+    evidence = answered.evidence
+    assert evidence is not None
+    assert evidence.source_attempt_id == ATTEMPT
+    assert evidence.acknowledgement_message_id == oid(0x102)
+    assert evidence.acknowledged_cursor == parent._cursor
+    assert evidence.projection_digest == parent._projection_hash()
+
+    composed = await fork_request_for(
+        AParentBeingRead(parent),
+        retrieval=a_retrieval(evidence),
+        fork_id=FORK,
+        plans=[
+            a_plan_over(parent, FIRST_SLOT, GRADED_CELL),
+            a_plan_over(parent, SECOND_SLOT, PLACEBO_CELL),
+        ],
+    )
+    assert composed.source_attempt_id == ATTEMPT
+    parent._refuse_a_fork(composed)
+    assert len(parent._built_children(composed)) == 2
+
+    # And the source is the obligation's rather than the cursor's, because a lawful presentation
+    # after the acknowledgement moves where this generation stands without moving what it owes.
+    moved = a_withholding_prefix(monkeypatch)
+    moved._cursor = oid(0x109)
+    answered = moved.checkpoint_evidence()
+    assert answered.found and answered.evidence is not None
+    assert answered.evidence.source_attempt_id == ATTEMPT
+    assert answered.evidence.acknowledgement_message_id == oid(0x102)
+    assert answered.evidence.acknowledged_cursor == oid(0x109)
+
+
+def a_retrieval(evidence: Any) -> CheckpointRetrieved:
+    """The harness's half of the same freeze, as a controller kept it beside the stream's."""
+    return CheckpointRetrieved(
+        parent_workflow_id=evidence.parent_workflow_id,
+        source_attempt_id=evidence.source_attempt_id,
+        attestation_id=evidence.attestation_id,
+        checkpoint_manifest_reference=digest_of("the checkpoint manifest"),
+        components=[],
+        transcript_reference=digest_of("the transcript the acknowledgement is in"),
+        acknowledgement_entry_sha256=digest_of("the entry inside it"),
+        acknowledgement_message_id=evidence.acknowledgement_message_id,
+        acknowledged_visible_sha256=evidence.acknowledged_visible_sha256,
+        acknowledged_cursor=evidence.acknowledged_cursor,
+        projection_digest=evidence.projection_digest,
+    )
+
+
+def test_a_generation_owing_more_than_the_payload_a_child_inherits_answers_with_the_reason(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A prefix owing two payloads is one the boundary refuses, and this read says so first."""
+    parent = a_quiet_parent(
+        monkeypatch,
+        start=a_two_position_parent(),
+        attempts=[a_row(), a_second_row()],
+        obligations=[
+            CarriedObligation(
+                attempt_id=ATTEMPT, state="eligible", materialized=True, candidate=a_candidate()
+            ),
+            CarriedObligation(attempt_id=SILENT, state="assigned"),
+        ],
+    )
+
+    answered = parent.checkpoint_evidence()
+
+    assert not answered.found and answered.evidence is None
+    assert "the one unresolved payload" in answered.reason
+    assert SILENT in answered.reason

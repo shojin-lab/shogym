@@ -107,6 +107,8 @@ from shogym.serve.protocol_v2 import (
 from shogym.serve.protocol_v2.kernel import (
     STEP_CAP,
     STREAM_TASK_QUEUE,
+    CheckpointEvidenceAnswer,
+    ChildReady,
     ConsumerClaim,
     EnvironmentCall,
     FinalizeRequest,
@@ -1746,6 +1748,30 @@ class StreamGateway:
         withhold.
         """
         return await self._stream.stream_state()
+
+    async def checkpoint_evidence(self) -> CheckpointEvidenceAnswer:
+        """Read the stream's half of a freeze off the generation this transport is bound to.
+
+        A controller that has frozen a container asks the generation what it committed, and this
+        is the documented way to it. Nothing about the answer comes from this transport: the
+        cursor, the visible digest and the attestation are what the generation recorded, so a
+        controller comparing its own transcript against them is comparing two records rather than
+        one record against a memory of it.
+        """
+        return await self._stream.checkpoint_evidence()
+
+    async def prepare_child(self, *, fork_id: str) -> ChildReady:
+        """Build the body this child owes for the obligation it inherited, and read its readiness.
+
+        A child of a fork comes up owning nothing and serving nothing, and it is claimed by the
+        attachment that made this transport. Preparation is the step after that claim and before
+        anything is resumed: the child derives its own selected body from committed evidence, and
+        what it publishes is the evidence a controller releases a container on.
+
+        It is here rather than reached through a private field, because the owner that prepares is
+        the owner this transport installed.
+        """
+        return await self._stream.prepare_child(fork_id=fork_id)
 
     @property
     def refused_pulls(self) -> Tuple[str, ...]:
