@@ -125,6 +125,7 @@ with workflow.unsafe.imports_passed_through():
         EXPIRED_PREPARATION,
         FINAL_FAILURE_REASONS,
         FORK_ABANDONED,
+        FORK_ANSWER_WINDOW_MS,
         FORK_AVAILABILITY_STEP,
         FORK_CHILDREN_CONFIRMED,
         FORK_CLAIM_STEP,
@@ -435,9 +436,20 @@ assert (
 # its own clock while the parent is still prepared. The window is the earlier of the horizon and
 # the parent's actual close plus the answer window, which is why a late close shortens the recovery
 # window rather than extending the retention a deployment owes.
+#
+# The retention below is a deployment obligation rather than a package one, and it is the horizon
+# plus a margin above the service's own deletion jitter. It is declared here because the window is
+# only as long as the history behind it: a namespace that keeps less than this deletes an original
+# execution the window still admits a question about, and that question is answered as expired
+# authority rather than as evidence a child never existed.
 FORK_PREPARATION_BOUND_MS = 12 * 60 * 60 * 1000
-FORK_ANSWER_WINDOW_MS = 24 * 60 * 60 * 1000
 FORK_AUTHORITY_HORIZON_MS = FORK_PREPARATION_BOUND_MS + FORK_ANSWER_WINDOW_MS
+FORK_RETENTION_MARGIN_MS = 12 * 60 * 60 * 1000
+FORK_RETENTION_FLOOR_MS = FORK_AUTHORITY_HORIZON_MS + FORK_RETENTION_MARGIN_MS
+assert FORK_RETENTION_FLOOR_MS >= FORK_AUTHORITY_HORIZON_MS, (
+    "a deployment has to keep every original execution of a fork for as long as the window "
+    "admits a question about it"
+)
 
 # What one child start Activity is bounded by. The SDK defines this as covering the scheduling and
 # every retry rather than one run, so the last in-flight outcome settles at a time the parent
@@ -2663,8 +2675,13 @@ class StreamWorkflow:
             self._refuse_a_fork(request, excluding=(self._update_id(),))
             self._refuse_unavailable_evidence(available)
             children = self._built_children(request)
+            # The barrier's own clocks are read once, here, because the horizon the record is
+            # about to carry is also an operand of the proof this parent will answer children
+            # with, and a bound measured against one reading and committed beside another would
+            # be a bound over a different value.
+            now = self._now_ms()
             self._commit_the_barrier(
-                request, children, self._measured_replies(request, children)
+                request, children, self._measured_replies(request, children, now), now
             )
         built = self._built_children(request)
         await self._start_the_children(request, built)
@@ -2748,7 +2765,7 @@ class StreamWorkflow:
             )
 
     def _measured_replies(
-        self, request: ForkRequest, built: List[Tuple[PreparedChild, StreamStart]]
+        self, request: ForkRequest, built: List[Tuple[PreparedChild, StreamStart]], now: int
     ) -> _ReplyBounds:
         """Measure the shapes this fork answers with, and return the bounds proved for them.
 
@@ -2783,7 +2800,9 @@ class StreamWorkflow:
                 converter,
                 ceiling=TURNOVER_PAYLOAD_CEILING_BYTES,
             )
-            widest = fork_origin_bound(request.fork_id, row, converter)
+            widest = fork_origin_bound(
+                request.fork_id, row, now + FORK_AUTHORITY_HORIZON_MS, converter
+            )
             if widest > TURNOVER_PAYLOAD_CEILING_BYTES:
                 raise ForkRefused(
                     FORK_CONFIGURATION_VIOLATION,
@@ -2825,6 +2844,7 @@ class StreamWorkflow:
         request: ForkRequest,
         built: List[Tuple[PreparedChild, StreamStart]],
         bounds: _ReplyBounds,
+        now: int,
     ) -> None:
         """Fence the parent and record the fork, in one transition with no await inside it.
 
@@ -2850,12 +2870,13 @@ class StreamWorkflow:
             origin_bound=bounds.origin,
             start_bound=bounds.start,
             status=FORK_PREPARED,
+            preparation_deadline_at=now + FORK_PREPARATION_BOUND_MS,
+            authority_horizon_at=now + FORK_AUTHORITY_HORIZON_MS,
         )
         self._generation_state = FORKED
         self._fencing_token_hash = None
-        now = self._now_ms()
-        self._fork_deadline_at = now + FORK_PREPARATION_BOUND_MS
-        self._fork_horizon_at = now + FORK_AUTHORITY_HORIZON_MS
+        self._fork_deadline_at = self._fork.preparation_deadline_at
+        self._fork_horizon_at = self._fork.authority_horizon_at
 
     async def _start_the_children(
         self, request: ForkRequest, built: List[Tuple[PreparedChild, StreamStart]]
@@ -3418,6 +3439,7 @@ class StreamWorkflow:
                     check_origin_within_bound(
                         self._fork.fork_id,
                         row,
+                        self._fork.authority_horizon_at,
                         self._fork.origin_bound,
                         workflow.payload_converter(),
                     )
@@ -4151,12 +4173,18 @@ class StreamWorkflow:
             if row.child_ordinal == child_ordinal:
                 return self._within_the_origin_bound(
                     ForkOriginVerified(
-                        fork_id=fork_id, fork_status=standing.status, record=row
+                        fork_id=fork_id,
+                        fork_status=standing.status,
+                        record=row,
+                        authority_horizon_at=standing.authority_horizon_at,
                     )
                 )
         return self._within_the_origin_bound(
             ForkOriginVerified(
-                fork_id=fork_id, fork_status=standing.status, record=_no_such_child(child_ordinal)
+                fork_id=fork_id,
+                fork_status=standing.status,
+                record=_no_such_child(child_ordinal),
+                authority_horizon_at=standing.authority_horizon_at,
             )
         )
 

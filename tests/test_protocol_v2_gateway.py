@@ -24,7 +24,7 @@ from dataclasses import replace
 from hashlib import sha256
 from pathlib import Path
 from types import SimpleNamespace
-from typing import Any, AsyncIterator, Dict, List, Optional
+from typing import Any, AsyncIterator, Dict, List, Optional, Tuple, get_args
 
 import pytest
 
@@ -34,6 +34,7 @@ import pytest_asyncio  # noqa: E402
 from fastmcp import Client  # noqa: E402
 from fastmcp.client.transports import StdioTransport  # noqa: E402
 from mcp.shared.exceptions import McpError  # noqa: E402
+from temporalio.exceptions import ApplicationError  # noqa: E402
 from temporalio.service import RPCError, RPCStatusCode  # noqa: E402
 from temporalio.testing import ActivityEnvironment  # noqa: E402
 
@@ -75,18 +76,34 @@ from shogym.serve.protocol_v2.gateway import (  # noqa: E402
     terminal_manifest,
     wrapped_manifests,
 )
+from shogym.serve.protocol_v2.fork import (  # noqa: E402
+    ForkOperations,
+    CheckpointRetrieved,
+    UnsupportedCapability,
+    retrieve_checkpoint,
+)
 from shogym.serve.protocol_v2.gateway import (  # noqa: E402
     _check_graded_horizon,
     _configuration_hash,
+    _EVIDENCE_UNAVAILABLE,
+    _HorizonOwed,
     _Idle,
     _LeaseHeld,
+    _Offered,
     _PresentationRefused,
     _PresentationUncertain,
+    _PullRecovered,
+    _Recovery,
     _RequestUncertain,
     _ResultOwed,
 )
 from shogym.serve.protocol_v2.kernel import (  # noqa: E402
+    CheckpointComponent,
+    CheckpointEvidence,
+    CheckpointEvidenceAnswer,
+    CheckpointManifest,
     OfferedMessage,
+    SettledHarness,
     StreamProtocolError,
     StreamStart,
     configuration_hash,
@@ -126,6 +143,12 @@ CURSOR = "00000000000000000000000000000001"
 
 #: What the service calls the generation these tests serve.
 GENERATION = "stream/one/1"
+
+#: The execution that generation is in, and the projection digest it stands at when a fork is cut
+#: over it. Both are the stream's own to state, and a harness that made either up would be
+#: comparing a value against itself.
+GENERATION_RUN = "11111111-1111-4111-8111-111111111111"
+PROJECTION_AT_THE_CUT = "b" * 64
 
 
 def offered(record: Any, attempt_id: Optional[str] = None) -> OfferedMessage:
@@ -325,6 +348,48 @@ class ScriptedStream:
             raise StreamProtocolError("fenced_writer")
         self.state_reads += 1
         return ScriptedProjection(self, self.state_reads)
+
+    async def checkpoint_evidence(self) -> CheckpointEvidenceAnswer:
+        """The stream's half of a freeze, out of the rows this generation actually holds.
+
+        A fork is cut over exactly one presented acknowledgement, so a generation holding none or
+        holding two answers with the reason rather than failing. Every value in the answer is
+        recorded state: the attempt whose acknowledgement was presented, the attestation that
+        committed it, and the cursor and projection digest it left behind.
+        """
+        sealed = [
+            attempt for attempt, state in self.attempts.items() if state == "ack_presented"
+        ]
+        if len(sealed) != 1:
+            return CheckpointEvidenceAnswer(
+                found=False,
+                reason=f"{len(sealed)} of this generation's attempts hold a presented "
+                "acknowledgement, and a fork is cut over exactly one",
+            )
+        committed = [one for one in self.commits if one.message_id == self.cursor]
+        if not committed:
+            return CheckpointEvidenceAnswer(
+                found=False,
+                reason=f"the acknowledgement of {sealed[0]} is not one this generation holds "
+                "the commitment for",
+            )
+        commit = committed[-1]
+        return CheckpointEvidenceAnswer(
+            found=True,
+            evidence=CheckpointEvidence(
+                parent_workflow_id=GENERATION,
+                parent_run_id=GENERATION_RUN,
+                execution_ordinal=0,
+                configuration_hash=sha256(GENERATION.encode("utf-8")).hexdigest(),
+                capacity_in_use=0,
+                source_attempt_id=sealed[0],
+                attestation_id=commit.attestation_id,
+                acknowledgement_message_id=commit.message_id,
+                acknowledged_visible_sha256=commit.visible_bytes_sha256,
+                acknowledged_cursor=self.cursor,
+                projection_digest=PROJECTION_AT_THE_CUT,
+            ),
+        )
 
     async def close_queue(self) -> Any:
         self._hold()
@@ -3295,6 +3360,541 @@ async def test_the_stream_stays_held_while_a_world_it_cannot_see_is_changing(
         await gateway.environment("guess", GUESS)
     assert stream.held is None
     assert isinstance(gateway._recovery, _Idle)
+
+
+# The freeze, from the transport's side: the four moments a harness's own record of it can be
+# interrupted at, driven through a real gateway rather than described.
+
+
+class AFreezingHarness:
+    """The harness's half of one freeze, attested from the transport it is actually holding.
+
+    An adapter answers for its own runtime and for nothing the generation records, so the settled
+    half of a manifest is read off this gateway's recovery record rather than stated: a transport
+    holding a call it has not finished is a transport that has not settled, whatever a boolean
+    beside it says. The stream side of the manifest is echoed from what the acknowledgement
+    committed, which is what an adapter that persisted the acknowledgement holds.
+
+    The two later moments of the same sequence are two durable writes and they are performed
+    rather than declared: the acknowledgement is decoded into a transcript, and a snapshot that
+    restores that transcript is published beside it. Interrupting the freeze is stopping that
+    sequence after one of them, and what a manifest says afterwards is read off what is actually
+    on disk: a harness that wrote no transcript has no freeze to commit, and one that wrote a
+    transcript and published no snapshot names a manifest nothing can restore.
+    """
+
+    def __init__(
+        self, gateway: StreamGateway, stream: ScriptedStream, root: Path
+    ) -> None:
+        self.gateway = gateway
+        self.stream = stream
+        self.root = root
+        self.transcript_path = root / "transcript"
+        self.snapshot_path = root / "snapshot"
+
+    def freeze(self, *, through: str = "published") -> "AFreezingHarness":
+        """Run the freeze this harness is, stopping where a crash is being put.
+
+        ``decoded`` is the acknowledgement read and nothing written down, ``persisted`` is the
+        transcript on disk and no snapshot beside it, and ``published`` is the whole of it.
+        """
+        self.root.mkdir(parents=True, exist_ok=True)
+        if through == "decoded":
+            return self
+        self.transcript_path.write_bytes(b"the transcript this harness persisted")
+        if through == "persisted":
+            return self
+        self.snapshot_path.write_bytes(b"the snapshot of the container")
+        return self
+
+    @property
+    def persisted(self) -> bool:
+        """Whether the transcript this freeze is over reached the disk."""
+        return self.transcript_path.exists()
+
+    @property
+    def published(self) -> bool:
+        """Whether the snapshot that restores that transcript reached it too."""
+        return self.snapshot_path.exists()
+
+    @property
+    def transcript(self) -> str:
+        """The reference the transcript actually on disk is named by."""
+        return sha256(self.transcript_path.read_bytes()).hexdigest()
+
+    def settled(self) -> SettledHarness:
+        """What this harness owes, with the transport's half read off the transport.
+
+        The two halves are two states rather than one reading used twice. A transport settles when
+        it holds no call it has not finished; the record settles when a recovery has nothing left
+        to hand over; and this gateway passes through the state where a call is in flight and the
+        record is still idle, because the operation is installed before the call it belongs to has
+        read the generation and written the record it will own. Reading the record for both would
+        call that settled and commit a checkpoint over a pull nobody has answered.
+        """
+        return SettledHarness(
+            transport=self.gateway._operation is None,
+            recovery=isinstance(self.gateway._recovery, _Idle),
+            provider=True,
+            model=True,
+            compaction=True,
+        )
+
+    async def checkpoint(
+        self, *, parent_workflow_id: str, attestation_id: str
+    ) -> CheckpointManifest:
+        if not self.persisted:
+            raise UnsupportedCapability(
+                "commit a checkpoint",
+                "the acknowledgement is decoded and is not in a transcript yet",
+            )
+        commit = [one for one in self.stream.commits if one.attestation_id == attestation_id][-1]
+        return CheckpointManifest(
+            transcript_reference=self.transcript,
+            acknowledgement_locator="entry 1",
+            acknowledgement_entry_sha256=sha256(b"the entry inside it").hexdigest(),
+            components=[
+                CheckpointComponent(
+                    component_id="the container",
+                    sha256=sha256(self.snapshot_path.read_bytes()).hexdigest(),
+                    size=self.snapshot_path.stat().st_size,
+                    media_type="application/octet-stream",
+                    restores_transcript=self.transcript,
+                )
+            ]
+            if self.published
+            else [],
+            adapter_version="the adapter of this run",
+            container_image_digest=sha256(b"the image it runs").hexdigest(),
+            harness_configuration=sha256(b"the configuration it holds").hexdigest(),
+            settled=self.settled(),
+            frozen_plan_digest=sha256(b"the plan both children are parked under").hexdigest(),
+            acknowledgement_message_id=commit.message_id,
+            acknowledged_visible_sha256=commit.visible_bytes_sha256,
+            acknowledged_cursor=commit.message_id,
+            projection_digest=PROJECTION_AT_THE_CUT,
+        )
+
+    async def restore(self, **_named: Any) -> Any:
+        raise AssertionError("nothing here restores a container")
+
+    async def compare(self, **_named: Any) -> Any:
+        raise AssertionError("nothing here compares a container")
+
+    async def bind(self, **_named: Any) -> Any:
+        raise AssertionError("nothing here binds a container")
+
+    async def release(self, **_named: Any) -> Any:
+        raise AssertionError("nothing here releases a container")
+
+
+async def an_acknowledged_gateway(
+    episode: ServedEpisode,
+) -> Tuple[StreamGateway, ScriptedStream]:
+    """One real transport standing where a fork is cut: the acknowledgement presented, nothing owed."""
+    stream = ScriptedStream(TASK_OFFER, ACK_OFFER)
+    gateway = graded_gateway(episode, stream, horizon=1)
+    await gateway.pull({})
+    return gateway, stream
+
+
+async def test_no_unfinished_state_of_a_real_transport_yields_accepted_freeze_evidence(
+    episode: ServedEpisode, tmp_path: Path
+) -> None:
+    """The four moments a freeze can be interrupted at, driven through the transport itself.
+
+    The harness settles and then the platform fences, so what a checkpoint is over is the whole of
+    the harness's state. A crash after the presentation commits leaves this transport owing the
+    acknowledgement it holds, in one of the two shapes that can stand at an acknowledged point: the
+    commit whose answer was lost, and the answer that never reached the call that asked. A crash
+    after that result is handed over leaves the acknowledgement decoded and unwritten, so there is
+    no checkpoint to commit at all. A crash after the transcript is persisted and before the
+    snapshot is published leaves a manifest naming nothing that could restore it. Only the fourth
+    is a freeze.
+
+    The two later moments are two durable writes and they are interrupted rather than declared:
+    the harness writes its transcript and publishes its snapshot for real, and a crash between
+    them is that sequence stopped after the first. What the manifest says afterwards is read off
+    what is on the disk.
+
+    The settled half is read off this gateway's own record rather than asserted beside it, which is
+    what makes the first two of those refusals the transport's rather than a test's. The inventory
+    of records that half answers for is held against the union itself, so a record added later
+    fails this rather than quietly becoming a state no freeze accounts for. The idle one is the
+    settled state; every other record is driven, four of them here and beside this and three more
+    where the call they belong to is held open.
+    """
+    unfinished = [one.__name__ for one in get_args(_Recovery) if one is not _Idle]
+    assert _PresentationUncertain.__name__ in unfinished
+    assert _ResultOwed.__name__ in unfinished
+
+    # The first moment, in the shape where the commit landed and its answer was lost.
+    gateway, stream = await an_acknowledged_gateway(episode)
+    stream.lose_next_ack = True
+    with pytest.raises(RuntimeError, match="the acknowledgement never arrived"):
+        await gateway.environment("guess", GUESS)
+    assert isinstance(gateway._recovery, _PresentationUncertain)
+    assert stream.attempts[ATTEMPT] == "ack_presented"
+    harness = AFreezingHarness(gateway, stream, tmp_path / "harness").freeze()
+    with pytest.raises(ApplicationError) as raised:
+        await retrieve_checkpoint(
+            gateway, harness, ForkOperations.under(tmp_path / "uncertain")
+        )
+    assert raised.value.type == "invalid_checkpoint"
+    # The record is what is unfinished here and the transport holds no call, which are two
+    # states rather than one: what refuses this freeze is the record, by name.
+    assert "recovery" in str(raised.value) and "transport" not in str(raised.value)
+
+    # And in the shape where the answer landed and the call that asked for it had gone.
+    stream.state_gate = asyncio.Event()
+    collecting = asyncio.create_task(gateway.environment("guess", GUESS))
+    await asyncio.sleep(0.05)
+    collecting.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await collecting
+    stream.state_gate.set()
+    await asyncio.sleep(0.05)
+    assert isinstance(gateway._recovery, _ResultOwed)
+    with pytest.raises(ApplicationError) as raised:
+        await retrieve_checkpoint(gateway, harness, ForkOperations.under(tmp_path / "owed"))
+    assert raised.value.type == "invalid_checkpoint"
+    assert "recovery" in str(raised.value)
+
+    # The second moment: the result is handed over and the transport owes nothing, and the
+    # harness has decoded an acknowledgement it has not written down.
+    result = await gateway.environment("guess", GUESS)
+    assert json.loads(result.content[1].text)["kind"] == "seal_ack"
+    assert isinstance(gateway._recovery, _Idle)
+    with pytest.raises(UnsupportedCapability) as unsupported:
+        await retrieve_checkpoint(
+            gateway,
+            AFreezingHarness(gateway, stream, tmp_path / "decoded").freeze(
+                through="decoded"
+            ),
+            ForkOperations.under(tmp_path / "unwritten"),
+        )
+    assert unsupported.value.capability == "commit a checkpoint"
+
+    # The third: the transcript is persisted and the snapshot is not, so the manifest names no
+    # component and nothing in it asserts that anything restores that transcript.
+    with pytest.raises(ApplicationError) as raised:
+        await retrieve_checkpoint(
+            gateway,
+            AFreezingHarness(gateway, stream, tmp_path / "persisted").freeze(
+                through="persisted"
+            ),
+            ForkOperations.under(tmp_path / "unpublished"),
+        )
+    assert raised.value.type == "invalid_checkpoint"
+    assert "names none" in str(raised.value)
+
+    # And the fourth, which is the only one of them that is a freeze. Both witnesses are read and
+    # compared, and what is kept is the pair.
+    kept = ForkOperations.under(tmp_path / "settled")
+    retrieval = await retrieve_checkpoint(gateway, harness, kept)
+    assert retrieval.source_attempt_id == ATTEMPT
+    assert retrieval.acknowledged_cursor == ACK_ID
+    assert retrieval.projection_digest == PROJECTION_AT_THE_CUT
+    assert kept.all_of(CheckpointRetrieved) == [retrieval]
+
+
+async def test_every_unfinished_call_a_transport_can_hold_at_a_freeze_refuses_the_checkpoint(
+    episode: ServedEpisode, tmp_path: Path
+) -> None:
+    """The other records that can stand while an acknowledgement is presented, driven for real.
+
+    The acknowledgement of one attempt stays presented while a later attempt is worked, so the
+    stream's half of a freeze is answerable throughout and what changes is what this transport is
+    holding. Each of these is a call it has not finished: a filing whose answer never arrived, and
+    an attestation the stream refused with the message it names still held. Neither of them settles
+    a transport, so neither of them yields freeze evidence, and the same harness answers with a
+    manifest that is refused on the member it reads off this gateway.
+
+    A pull sent again after a repair is the third, and it is the one record here that outlives the
+    call that made it: the recovery returns as soon as the generation has reserved the bytes, so
+    nothing is in flight while it stands and the acknowledgement it stands beside is still
+    presented. It is refused here for what it is, and the agent's own next pull adopts it.
+
+    The three the union has left are driven beside this, each where the call it belongs to is held
+    open: a grant this transport has not given back, a filing the last step owes, and a message
+    offered while the world its acknowledgement closes is still being let go of. The idle record is
+    the settled state.
+    """
+    held = {one.__name__ for one in get_args(_Recovery)}
+    assert held == {
+        _Idle.__name__,
+        _RequestUncertain.__name__,
+        _PullRecovered.__name__,
+        _LeaseHeld.__name__,
+        _HorizonOwed.__name__,
+        _Offered.__name__,
+        _PresentationUncertain.__name__,
+        _PresentationRefused.__name__,
+        _ResultOwed.__name__,
+    }
+    owed = offered(
+        Payload(message_id="0" * 31 + "9", attempt_id=ATTEMPT, body="receipt 0"), ATTEMPT
+    )
+    stream = ScriptedStream(TASK_OFFER, ACK_OFFER, owed)
+    gateway = graded_gateway(episode, stream, horizon=1)
+    await gateway.pull({})
+    result = await gateway.environment("guess", GUESS)
+    assert json.loads(result.content[1].text)["kind"] == "seal_ack"
+    assert stream.attempts[ATTEMPT] == "ack_presented"
+    assert isinstance(gateway._recovery, _Idle)
+    harness = AFreezingHarness(gateway, stream, tmp_path / "harness").freeze()
+    settled = await retrieve_checkpoint(
+        gateway, harness, ForkOperations.under(tmp_path / "before")
+    )
+    assert settled.source_attempt_id == ATTEMPT
+
+    # A request whose answer never arrived. The stream reserved the message for the request that
+    # asked and it is reachable through no other, so this transport is the only thing that can
+    # collect it, and the acknowledgement it is holding beside it has not moved.
+    stream.lose_next_result = True
+    with pytest.raises(RuntimeError, match="the result never arrived"):
+        await gateway.pull({})
+    assert isinstance(gateway._recovery, _RequestUncertain)
+    assert stream.attempts[ATTEMPT] == "ack_presented"
+    with pytest.raises(ApplicationError) as raised:
+        await retrieve_checkpoint(
+            gateway, harness, ForkOperations.under(tmp_path / "uncertain-request")
+        )
+    assert raised.value.type == "invalid_checkpoint"
+    # The record is what is unfinished here and the transport holds no call, which are two
+    # states rather than one: what refuses this freeze is the record, by name.
+    assert "recovery" in str(raised.value) and "transport" not in str(raised.value)
+
+    # An attestation the stream refused. It is decisive about the attestation and about nothing
+    # else, so the message stays held and this transport still owes the presentation.
+    stream.refuse_next_commit = True
+    assert await refused(gateway.pull({})) == "invalid_message"
+    assert isinstance(gateway._recovery, _PresentationRefused)
+    with pytest.raises(ApplicationError) as raised:
+        await retrieve_checkpoint(
+            gateway, harness, ForkOperations.under(tmp_path / "refused-attestation")
+        )
+    assert raised.value.type == "invalid_checkpoint"
+    assert "recovery" in str(raised.value)
+
+    # The same call again attests the message the stream is still holding, and with nothing owed
+    # a freeze is a freeze again. It is over where the generation now stands rather than where it
+    # stood, because presenting that payload moved the cursor and the attestation with it.
+    assert (await gateway.pull({})) == owed.visible_text
+    assert isinstance(gateway._recovery, _Idle)
+    assert stream.attempts[ATTEMPT] == "ack_presented"
+    after = await retrieve_checkpoint(
+        gateway, harness, ForkOperations.under(tmp_path / "after")
+    )
+    assert after.source_attempt_id == ATTEMPT
+    assert after.acknowledged_cursor == owed.message_id
+    assert after.attestation_id != settled.attestation_id
+
+    # A pull sent again after a repair, which is the one record here that outlives the call that
+    # made it: the controller's recovery returns as soon as the generation has reserved the bytes,
+    # and what it left behind is a reservation the agent has not collected. The acknowledgement is
+    # still presented throughout, so what refuses the freeze is this transport rather than the
+    # stream having nothing to be cut over.
+    repaired = offered(
+        Payload(message_id="0" * 31 + "a", attempt_id=ATTEMPT, body="receipt 1"), ATTEMPT
+    )
+    stream.offers.extend([StreamProtocolError(_EVIDENCE_UNAVAILABLE), repaired])
+    assert await refused(gateway.pull({})) == _EVIDENCE_UNAVAILABLE
+    assert isinstance(gateway._recovery, _Idle)
+    [identity] = gateway.refused_pulls
+    assert await gateway.recover_refused_pull(identity) is True
+    assert isinstance(gateway._recovery, _PullRecovered)
+    assert gateway.refused_pulls == ()
+    assert stream.attempts[ATTEMPT] == "ack_presented"
+    with pytest.raises(ApplicationError) as raised:
+        await retrieve_checkpoint(
+            gateway, harness, ForkOperations.under(tmp_path / "recovered-pull")
+        )
+    assert raised.value.type == "invalid_checkpoint"
+    # The record is what is unfinished here and the transport holds no call, which are two
+    # states rather than one: what refuses this freeze is the record, by name.
+    assert "recovery" in str(raised.value) and "transport" not in str(raised.value)
+
+    # The agent's own next pull adopts it, collects the bytes the generation reserved and presents
+    # them, and with nothing owed the freeze is a freeze again.
+    assert (await gateway.pull({})) == repaired.visible_text
+    assert isinstance(gateway._recovery, _Idle)
+    recovered = await retrieve_checkpoint(
+        gateway, harness, ForkOperations.under(tmp_path / "recovered")
+    )
+    assert recovered.acknowledged_cursor == repaired.message_id
+
+
+class AWorldThatWontLetGo(BlockingEpisode):
+    """A world whose cleanup is held, so a delivery can be caught between two of its own steps.
+
+    Closing the world one attempt is done with happens before the attestation that reports the
+    acknowledgement, because a Presentation is durable the moment it is committed and everything
+    that can fail belongs on the side of that commit where failing costs nothing. So this is where
+    an offered message stands while the call carrying it is still unfinished.
+    """
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.closing = asyncio.Event()
+        self.let_go = asyncio.Event()
+
+    async def close(self, *, finalize: bool = True) -> None:
+        self.closing.set()
+        await self.let_go.wait()
+        await super().close(finalize=finalize)
+
+
+def a_graded_gateway_over(
+    episode: ServedEpisode, stream: ScriptedStream, world: Any, *, horizon: int = 1
+) -> StreamGateway:
+    """The graded-ending gateway of these tests, over a world a test can hold."""
+    spec = episode.describe().model_copy(update={"horizon": horizon})
+    return StreamGateway(
+        stream,  # type: ignore[arg-type]
+        world,  # type: ignore[arg-type]
+        spec,
+        terminal_manifest(spec),
+        initial_cursor=CURSOR,
+        generation=composition(spec),
+        environment=environment_terminal(episode)._replace(horizon_ending="graded"),
+    )
+
+
+async def test_every_record_a_transport_can_stand_in_is_driven_and_each_one_settles(
+    episode: ServedEpisode, tmp_path: Path
+) -> None:
+    """The three records left, driven through the transport rather than named, and settled.
+
+    Each of them is a call this transport has not finished, and each is reached by holding the one
+    thing inside that call which reaches outside this process: the world the call is in, the stream
+    the filing goes to, and the world the acknowledgement closes. While one stands the transport
+    has not settled, which is the half of a manifest an adapter attests and the half no freeze is
+    accepted without.
+
+    Where each of them stands, the acknowledgement a fork would be cut over has not been presented
+    yet, so the refusal names that rather than the transport. That is the exclusion argument made
+    executable instead of asserted: these records cannot stand at a moment a fork is cut at, and
+    what says so is the generation's own answer rather than a claim about the code. The settlement
+    is driven afterwards, and the freeze that follows it is a freeze.
+    """
+    for held, reach in (
+        ("the world a call is in", "lease"),
+        ("the filing the last step owes", "horizon"),
+        ("the world an acknowledgement closes", "offer"),
+    ):
+        world = AWorldThatWontLetGo()
+        stream = ScriptedStream(TASK_OFFER, ACK_OFFER)
+        gateway = a_graded_gateway_over(episode, stream, world, horizon=1)
+        await gateway.pull({})
+        harness = AFreezingHarness(gateway, stream, tmp_path / f"{reach}-harness").freeze()
+        if reach != "lease":
+            world.gate.set()
+        if reach == "offer":
+            world.let_go.clear()
+        else:
+            world.let_go.set()
+        if reach == "horizon":
+            stream.gate = asyncio.Event()
+        calling = asyncio.create_task(gateway.environment("guess", GUESS))
+        for _ in range(500):
+            await asyncio.sleep(0.01)
+            if reach == "lease" and isinstance(gateway._recovery, _LeaseHeld):
+                break
+            if reach == "horizon" and isinstance(gateway._recovery, _HorizonOwed):
+                break
+            if reach == "offer" and isinstance(gateway._recovery, _Offered):
+                break
+        standing = gateway._recovery
+        assert isinstance(
+            standing, {"lease": _LeaseHeld, "horizon": _HorizonOwed, "offer": _Offered}[reach]
+        ), f"holding {held} did not leave the record it is held for"
+        assert not calling.done()
+        assert harness.settled().transport is False
+        with pytest.raises(ApplicationError) as raised:
+            await retrieve_checkpoint(
+                gateway, harness, ForkOperations.under(tmp_path / f"{reach}-held")
+            )
+        assert raised.value.type == "not_quiet"
+        assert "presented acknowledgement" in str(raised.value)
+        if reach == "offer":
+            assert standing.message.kind == "seal_ack"
+            assert stream.attempts[ATTEMPT] != "ack_presented"
+
+        # And the settlement of that same call, which is what the record is waiting on.
+        world.gate.set()
+        world.let_go.set()
+        if stream.gate is not None:
+            stream.gate.set()
+            stream.gate = None
+        result = await calling
+        assert json.loads(result.content[1].text)["kind"] == "seal_ack"
+        assert isinstance(gateway._recovery, _Idle)
+        assert harness.settled().transport is True
+        assert stream.attempts[ATTEMPT] == "ack_presented"
+        kept = await retrieve_checkpoint(
+            gateway, harness, ForkOperations.under(tmp_path / f"{reach}-settled")
+        )
+        assert kept.source_attempt_id == ATTEMPT
+
+
+async def test_a_call_in_flight_beside_an_idle_record_is_not_a_settled_transport(
+    episode: ServedEpisode, tmp_path: Path
+) -> None:
+    """The transport's half of a freeze is a second state and not a second reading of the record.
+
+    A gateway takes a call by installing the operation and only then reads the generation, so
+    between those two there is a call in flight and a recovery record that is still idle: the
+    record the call will own has not been written, because nothing has been read yet. Every record
+    in the union is driven elsewhere, and driving them cannot reach this: it is a state of the
+    other half.
+
+    A freeze taken there would be a freeze over a pull nobody has answered, which is exactly what
+    the settlement rule exists to stop: the harness inhibits the next pull, finishes what it has
+    open and only then may the fork be cut. So the harness is asked what it owes rather than
+    reading one field twice, the checkpoint is refused while the call stands, and the same call
+    goes on to finish afterwards and the freeze that follows it is a freeze.
+    """
+    owed = offered(
+        Payload(message_id="0" * 31 + "9", attempt_id=ATTEMPT, body="receipt 0"), ATTEMPT
+    )
+    stream = ScriptedStream(TASK_OFFER, ACK_OFFER, owed)
+    gateway = graded_gateway(episode, stream, horizon=1)
+    await gateway.pull({})
+    result = await gateway.environment("guess", GUESS)
+    assert json.loads(result.content[1].text)["kind"] == "seal_ack"
+    harness = AFreezingHarness(gateway, stream, tmp_path / "harness").freeze()
+    assert harness.settled().transport is True
+
+    # The next pull is held where a gateway holds one: the operation is installed and the first
+    # reading of the generation has not come back.
+    stream.state_gate = asyncio.Event()
+    pulling = asyncio.create_task(gateway.pull({}))
+    await asyncio.sleep(0.05)
+    assert not pulling.done()
+    assert gateway._operation is not None
+    assert isinstance(gateway._recovery, _Idle)
+
+    assert harness.settled().transport is False
+    assert harness.settled().recovery is True
+    with pytest.raises(ApplicationError) as raised:
+        await retrieve_checkpoint(
+            gateway, harness, ForkOperations.under(tmp_path / "in-flight")
+        )
+    assert raised.value.type == "invalid_checkpoint"
+    assert "transport" in str(raised.value)
+
+    # And the same call finishes, which is what a harness that inhibits the next pull waits for.
+    stream.state_gate.set()
+    assert (await pulling) == owed.visible_text
+    assert gateway._operation is None
+    assert isinstance(gateway._recovery, _Idle)
+    assert harness.settled().transport is True
+    kept = await retrieve_checkpoint(
+        gateway, harness, ForkOperations.under(tmp_path / "settled")
+    )
+    assert kept.source_attempt_id == ATTEMPT
+    assert kept.acknowledged_cursor == owed.message_id
 
 
 async def test_a_result_this_gateway_kept_is_still_handed_over_by_asking_the_stream(

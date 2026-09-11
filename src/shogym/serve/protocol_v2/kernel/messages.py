@@ -2774,6 +2774,12 @@ class PreparedFork:
     barrier stood. A decision is never retried, so it is retained here beside the children it was
     reached over: a status read and a fresh logical retry are answered with the decision this fork
     already made rather than with the work that would make it again.
+
+    ``preparation_deadline_at`` and ``authority_horizon_at`` are the two moments the barrier
+    recorded, in milliseconds since the epoch. The first bounds this parent's own fork work and
+    says nothing about when it closes; the second is absolute, and a late close shortens the window
+    the answers this parent owes stand in rather than moving it. A controller reads both here
+    instead of deriving either from a close it did not see.
     """
 
     fork_id: str
@@ -2790,7 +2796,38 @@ class PreparedFork:
     conflict_clause: str = ""
     status: str = FORK_PREPARED
     abandoned_reason: Optional[str] = None
+    preparation_deadline_at: int = 0
+    authority_horizon_at: int = 0
     schema_version: int = PREPARED_FORK_SCHEMA_VERSION
+
+
+#: How long a parent's answers stand after it actually closed, in milliseconds. It is here rather
+#: than beside the workflow's other clocks because the routes that enforce it are outside the
+#: workflow: a controller reading a status and a gated child reading its own origin both hold a
+#: recorded horizon and an execution's close, and neither of them is the generation.
+FORK_ANSWER_WINDOW_MS = 24 * 60 * 60 * 1000
+
+
+def answer_window_ends(horizon_at_ms: int, closed_at_ms: int) -> int:
+    """Return the moment after which a fork's parent answers nothing, in milliseconds.
+
+    It is the earlier of the horizon the barrier recorded and the parent's actual close plus the
+    answer window, and the two are different clocks on purpose. The horizon is absolute, so a
+    parent that closed late has a shorter window rather than a later one, and a parent that closed
+    after the horizon has none at all. A question asked outside it is expired authority, which is a
+    limit on what can be read rather than a disagreement, and the run is recorded incomplete under
+    it rather than resolved by guessing.
+
+    ``closed_at_ms`` of zero is a parent that has not closed, whose window is the horizon.
+    """
+    if closed_at_ms <= 0:
+        return horizon_at_ms
+    return min(horizon_at_ms, closed_at_ms + FORK_ANSWER_WINDOW_MS)
+
+
+def fork_answer_window_ends(record: "PreparedFork", closed_at_ms: int) -> int:
+    """The same moment, from the record a parent committed at its barrier."""
+    return answer_window_ends(record.authority_horizon_at, closed_at_ms)
 
 
 #: The shape of a fork receipt this build writes and admits.
@@ -3728,22 +3765,29 @@ class ForkOriginVerified:
     The result is small and bounded on purpose: it is recorded in the child's own history, so a
     replay performs no fresh client I/O and reaches the same answer, and a row that carried the
     parent's state would put a second copy of that state in every child.
+
+    ``authority_horizon_at`` is the absolute moment the barrier recorded, and it is here because a
+    question asked after this parent's answers stopped standing is expired authority rather than a
+    row about a child. One number is what that comparison needs, and a reader with the horizon and
+    the execution's close has the window without holding the parent's record.
     """
 
     fork_id: str
     fork_status: str
     record: PreparedChild
+    authority_horizon_at: int = 0
 
 
 def _every_origin_answer(
-    fork_id: str, record: PreparedChild, child_run_id: str
+    fork_id: str, record: PreparedChild, child_run_id: str, horizon_at_ms: int
 ) -> Iterator[ForkOriginVerified]:
     """Every legal reply one child's origin question can be answered with, in turn.
 
     The proof is not the value the parent measured. The row it carries gains the class the start
-    response settled the child into and the exact run id the service minted for it, and the fork
-    moves through its own statuses while the row stays the same. Every one of those crosses, so
-    what a bound is over is the whole set of replies rather than one of them.
+    response settled the child into and the exact run id the service minted for it, the fork moves
+    through its own statuses while the row stays the same, and the horizon the barrier is about to
+    record rides beside all of it. Every one of those crosses, so what a bound is over is the whole
+    set of replies rather than one of them.
 
     The row with no run id in it is one of those replies rather than a state before them. A record
     starts with the identifier absent, a child may ask its origin question before any start reply
@@ -3763,20 +3807,27 @@ def _every_origin_answer(
                     fork_id=fork_id,
                     fork_status=status,
                     record=replace(record, existence=existence, child_run_id=run_id),
+                    authority_horizon_at=horizon_at_ms,
                 )
 
 
 def _widest_origin_answer(
-    fork_id: str, record: PreparedChild, child_run_id: str, converter: Any
+    fork_id: str,
+    record: PreparedChild,
+    child_run_id: str,
+    horizon_at_ms: int,
+    converter: Any,
 ) -> int:
     """The largest number of bytes any legal reply about this child encodes to."""
     return max(
         encoded_size(answer, converter)
-        for answer in _every_origin_answer(fork_id, record, child_run_id)
+        for answer in _every_origin_answer(fork_id, record, child_run_id, horizon_at_ms)
     )
 
 
-def fork_origin_bound(fork_id: str, record: PreparedChild, converter: Any) -> int:
+def fork_origin_bound(
+    fork_id: str, record: PreparedChild, horizon_at_ms: int, converter: Any
+) -> int:
     """Return the proved encoded upper bound of the origin proof one child will be answered with.
 
     Every known value is measured exactly, the run id the service has still to mint is allowed its
@@ -3784,11 +3835,13 @@ def fork_origin_bound(fork_id: str, record: PreparedChild, converter: Any) -> in
     converter, so the bound stands whatever the fork goes on to do and whichever identifier the
     service returns.
     """
-    return _widest_origin_answer(fork_id, record, "0" * RUN_ID_CEILING_BYTES, converter)
+    return _widest_origin_answer(
+        fork_id, record, "0" * RUN_ID_CEILING_BYTES, horizon_at_ms, converter
+    )
 
 
 def check_origin_within_bound(
-    fork_id: str, record: PreparedChild, bound: int, converter: Any
+    fork_id: str, record: PreparedChild, horizon_at_ms: int, bound: int, converter: Any
 ) -> int:
     """Measure the origin proof of a child whose run id the service has now minted.
 
@@ -3796,7 +3849,9 @@ def check_origin_within_bound(
     state the fork is in at this moment, because the row is committed once and answered from for
     as long as the window admits a question.
     """
-    measured = _widest_origin_answer(fork_id, record, record.child_run_id or "", converter)
+    measured = _widest_origin_answer(
+        fork_id, record, record.child_run_id or "", horizon_at_ms, converter
+    )
     if measured > bound:
         raise WireFormatError(
             f"the origin proof of child {record.child_ordinal} encodes to {measured} bytes and "

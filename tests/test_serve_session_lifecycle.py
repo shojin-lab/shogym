@@ -191,7 +191,15 @@ async def test_a_cancelled_setup_releases_the_session_exactly_once() -> None:
     # a session `_begin_session` is still in the middle of creating.
     env = _SlowSessionEnv(begin_seconds=0.3)
     opening = asyncio.ensure_future(ServedEpisode.open_env(env, task=0))
-    await asyncio.sleep(0.02)  # inside the hook, before it can have returned
+    # Wait for the hook to be entered rather than for a number of milliseconds. What this is
+    # about is a caller that gives up while the env is inside the hook, and everything `open_env`
+    # does before it gets there is work whose duration nobody promises: a package that imports
+    # more on the way in would otherwise turn this into a test of how fast that import is.
+    for _ in range(1_000):
+        if env.begins:
+            break
+        await asyncio.sleep(0.005)
+    assert env.begins, "the setup hook was never entered"
     assert env.begin_returned is None
     opening.cancel()
     with pytest.raises(asyncio.CancelledError):

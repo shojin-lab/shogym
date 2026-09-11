@@ -38,6 +38,7 @@ from typing import Any, Dict, List, Optional, Protocol, Sequence, Tuple, Type, T
 from temporalio.api.common.v1 import Payload
 from temporalio.client import Client
 from temporalio.converter import default as default_converter
+from temporalio.service import RPCError, RPCStatusCode
 
 from shogym.serve.episode import ServedEpisode
 from shogym.serve.protocol_v2.artifact import read_source_artifact
@@ -256,7 +257,13 @@ class ForkAdapter(Protocol):
     async def restore(
         self, *, fork_id: str, child_workflow_id: str, checkpoint_manifest_reference: str
     ) -> RestoredContainer:
-        """Restore one container copy for that child, and attest what it came back holding."""
+        """Restore one container copy for that child, and attest what it came back holding.
+
+        It is keyed by the fork and the child, and asking again for a copy that exists returns
+        that copy rather than making a second one. That is what a controller that crashed between
+        an operation and its record recovers by: the effect is outside this process, so the
+        operation has to be one an outcome can be read back from rather than one a repeat repeats.
+        """
         ...
 
     async def compare(
@@ -274,7 +281,14 @@ class ForkAdapter(Protocol):
     async def release(
         self, *, fork_id: str, child_workflow_id: str, container_id: str
     ) -> ResumedContainer:
-        """Resume that container, so the agent inside it pulls."""
+        """Resume that container, so the agent inside it pulls.
+
+        Asking again for a container that is already running returns the state it is running in
+        rather than resuming it a second time or restoring anything over the work it has since
+        done. This is the interval a crash is worst in: the container is resumed and nothing here
+        has written that down, so the recovery is this operation being asked again and answering
+        with the resumption that already happened.
+        """
         ...
 
 
@@ -692,9 +706,22 @@ async def child_start(client: Client, *, child: ForkChildReceipt) -> StreamStart
     What makes reading it safe is the comparison against the receipt: the complete start digest
     covers the carrier, the store and the lineage, so a start that is not the one the parent
     committed to for this child fails here rather than being attached to.
+
+    A history the service can no longer produce is expired authority and never evidence that this
+    child was not created: retention bounds what can be read and grants no permission, so a missing
+    history leaves the recorded identity standing rather than licensing a replacement under it.
     """
     handle = client.get_workflow_handle(child.child_workflow_id, run_id=child.child_run_id)
-    history = await handle.fetch_history()
+    try:
+        history = await handle.fetch_history()
+    except RPCError as error:
+        if error.status is not RPCStatusCode.NOT_FOUND:
+            raise
+        raise ForkRefused(
+            FORK_EXPIRED_AUTHORITY,
+            f"the execution {child.child_workflow_id} recorded for this child can no longer be "
+            "read, so what it was created with is outside the window rather than absent",
+        ) from error
     started = history.events[0].workflow_execution_started_event_attributes
     # Through this client's own converter, because that is the converter the child was created
     # through: the Activity that started it encoded the start with the configured one, so a

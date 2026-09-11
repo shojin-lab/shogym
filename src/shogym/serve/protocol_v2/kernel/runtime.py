@@ -52,7 +52,13 @@ from typing import (
     Union,
 )
 
+from google.protobuf.duration_pb2 import Duration
 from temporalio.api.common.v1 import Payload
+from temporalio.api.namespace.v1 import NamespaceConfig
+from temporalio.api.workflowservice.v1 import (
+    DescribeNamespaceRequest,
+    UpdateNamespaceRequest,
+)
 from temporalio.client import Client, WorkflowHandle, WorkflowUpdateFailedError
 from temporalio.converter import default as default_converter
 from temporalio.exceptions import ApplicationError
@@ -81,6 +87,7 @@ from shogym.serve.protocol_v2.kernel.messages import (
     ConsumerReceipt,
     EnvironmentCall,
     EnvironmentLease,
+    FORK_ABANDONED,
     FORK_EXPIRED_AUTHORITY,
     FORK_IN_FLIGHT,
     FORK_REFUSALS,
@@ -101,6 +108,7 @@ from shogym.serve.protocol_v2.kernel.messages import (
     StreamStart,
     StreamState,
     Writer,
+    answer_window_ends,
     check_child_ready,
     check_fork_receipt,
     check_fork_request,
@@ -111,6 +119,7 @@ from shogym.serve.protocol_v2.kernel.messages import (
 )
 from shogym.serve.protocol_v2.kernel.workflow import (
     FORK_BARRIER,
+    FORK_RETENTION_FLOOR_MS,
     ORIGIN_UNVERIFIED,
     TURNOVER_PENDING,
     TURNOVER_PAYLOAD_CEILING_BYTES,
@@ -262,9 +271,46 @@ async def durable_client(
                 download_dest_dir=str(home),
             )
         try:
+            await _the_retention_a_fork_is_answerable_for(environment.client)
             yield environment.client
         finally:
             await environment.shutdown()
+
+
+async def _the_retention_a_fork_is_answerable_for(client: Client) -> None:
+    """Keep this run's own histories for as long as a fork can still be asked about them.
+
+    A fork's answers stand until an absolute horizon the barrier recorded, and answering a
+    question inside that window needs the history the question is about: the parent's, and each
+    child's own original execution, which the service schedules for deletion from that execution's
+    own close time rather than from the parent's. The service starts with less than that, so a
+    child that stopped early would be deleted while its parent was still prepared and still
+    answerable, and a run would lose the evidence its own contract says it can be asked for.
+
+    So the floor is configured here, where the run's service is started, rather than declared and
+    hoped for. It is a floor and never a ceiling: a service already keeping more keeps it, because
+    what a deployment keeps beyond this is a deployment's business and lengthening it changes no
+    answer this build gives.
+
+    Only the embedded service is configured. An address someone else runs is that operator's, and
+    a package that rewrote a namespace it was merely pointed at would be changing a deployment
+    nobody asked it to change.
+    """
+    service = client.service_client.workflow_service
+    described = await service.describe_namespace(
+        DescribeNamespaceRequest(namespace=client.namespace)
+    )
+    owed = timedelta(milliseconds=FORK_RETENTION_FLOOR_MS)
+    if described.config.workflow_execution_retention_ttl.ToTimedelta() >= owed:
+        return
+    keeping = Duration()
+    keeping.FromTimedelta(owed)
+    await service.update_namespace(
+        UpdateNamespaceRequest(
+            namespace=client.namespace,
+            config=NamespaceConfig(workflow_execution_retention_ttl=keeping),
+        )
+    )
 
 
 # The workflow sandbox reimports every module a workflow reaches, which for `shogym` means
@@ -782,7 +828,9 @@ def _admitted_receipt(receipt: ForkReceipt) -> ForkReceipt:
     return receipt
 
 
-async def fork_status(client: Client, request: ForkRequest) -> ForkStatusAnswer:
+async def fork_status(
+    client: Client, request: ForkRequest, *, now_ms: Optional[int] = None
+) -> ForkStatusAnswer:
     """Read where one fork stands, from a parent that may already have closed.
 
     It is a Query, so it costs the generation nothing, writes nothing, and can be asked of an
@@ -796,6 +844,13 @@ async def fork_status(client: Client, request: ForkRequest) -> ForkStatusAnswer:
     A history the service no longer holds is the other answer, and it is not a fault to retry: the
     question was asked outside the window this parent's answers stand in, so it comes back as
     expired authority and the run is recorded incomplete rather than resolved by guessing.
+
+    A history the service still holds is not the window either. Retention bounds what can be read
+    and grants no permission, so a deployment keeping more history than it owes must not lengthen
+    the answers this parent stands behind: the window is the one the barrier recorded and the
+    parent's own close, and a question past it is expired authority whether or not the bytes are
+    still there. ``now_ms`` is the observation of the moment that question is being asked at, the
+    process clock where a caller gives none.
 
     Both declared shapes the answer can carry are admitted where the answer is received, before
     anything reads a field of either and before either is returned. A prepared record and a
@@ -826,7 +881,9 @@ async def fork_status(client: Client, request: ForkRequest) -> ForkStatusAnswer:
             f"the parent of {request.fork_id} answered none of {_ANSWER_READ_TRIES} reads of "
             "where its fork stands",
         ) from error
-    return _admitted_answer(answer)
+    _admitted_answer(answer)
+    await _inside_the_answer_window(handle, request, answer, now_ms)
+    return answer
 
 
 def _admitted_answer(answer: ForkStatusAnswer) -> ForkStatusAnswer:
@@ -841,6 +898,56 @@ def _admitted_answer(answer: ForkStatusAnswer) -> ForkStatusAnswer:
     if answer.receipt is not None:
         check_fork_receipt(answer.receipt)
     return answer
+
+
+async def _inside_the_answer_window(
+    handle: WorkflowHandle,
+    request: ForkRequest,
+    answer: ForkStatusAnswer,
+    now_ms: Optional[int],
+) -> None:
+    """Refuse an answer read after the window this parent's answers stand in had closed.
+
+    The window is the earlier of the horizon recorded at the barrier and the parent's actual close
+    plus the answer window, so a late close shortens it rather than moving it and a parent that
+    closed after the horizon has none at all. The close is read from the service rather than
+    guessed, and a parent still running has no close to cap anything with.
+
+    A fork this parent never accepted has no window to be outside of, so nothing is asked about
+    one: what that answer says is that there is no record, which is the answer either way.
+
+    The close is read under the bound and the classification the status Query is read under, and
+    for the same reason: this is one read operation in two parts, and a transport fault let out of
+    the second half would replace the typed result a controller acts on with an exception naming
+    no clause. A parent that answers and then cannot be described is unreadable and stays a retry;
+    one whose history the service can no longer produce is expired authority, which is what the
+    Query's own missing history already is.
+    """
+    if answer.record is None or answer.record.authority_horizon_at <= 0:
+        return
+    try:
+        described = await _asked_again(lambda: handle.describe(rpc_timeout=_ANSWER_READ_TIMEOUT))
+    except RPCError as error:
+        if error.status is RPCStatusCode.NOT_FOUND:
+            raise ForkRefused(
+                FORK_EXPIRED_AUTHORITY,
+                f"the execution that prepared {request.fork_id} can no longer be read, so its "
+                "answer window has closed",
+            ) from error
+        raise ForkRefused(
+            FORK_UNREADABLE_PARENT,
+            f"the parent of {request.fork_id} answered none of {_ANSWER_READ_TRIES} reads of "
+            "when it closed",
+        ) from error
+    closed = 0 if described.close_time is None else int(described.close_time.timestamp() * 1000)
+    window = answer_window_ends(answer.record.authority_horizon_at, closed)
+    asked = int(time.time() * 1000) if now_ms is None else now_ms
+    if asked > window:
+        raise ForkRefused(
+            FORK_EXPIRED_AUTHORITY,
+            f"the answers the parent of {request.fork_id} owes stood until {window} and this "
+            f"question was asked at {asked}",
+        )
 
 
 async def _asked_again(read: Callable[[], Awaitable[Any]]) -> Any:
@@ -915,14 +1022,16 @@ def _what_the_record_says(
 ) -> ApplicationError:
     """Turn a status reading into the typed refusal a controller acts on.
 
-    A fork the parent never accepted, one bound to another request, one that ended on a decision
-    and one whose parent cannot be asked are four different answers, and none of them is the
-    transport fault the caller arrived with.
+    A fork the parent never accepted, one bound to another request, one that ended on a decision,
+    one the parent has given up on and one whose parent cannot be asked are five different answers,
+    and none of them is the transport fault the caller arrived with.
 
     A fork that ended on a decision answers with that decision, which is what the record retains it
-    for. The experiment retries infrastructure and never retries a decision, so what a controller
-    reads here is the reason this fork ended rather than a state to send the same request into
-    again.
+    for. An abandoned fork answers with the reason it was abandoned for, which is a decision too:
+    the reserve is spent or the preparation bound expired, the status stands, and the experiment
+    records the link incomplete rather than sending the same fork again. The experiment retries
+    infrastructure and never retries a decision, so what a controller reads here is the reason this
+    fork ended rather than a state to send the same request into again.
     """
     if answer.conflict:
         return ForkRefused(
@@ -936,6 +1045,12 @@ def _what_the_record_says(
         )
     if answer.record is not None and answer.record.conflict_reason is not None:
         return ForkRefused(answer.record.conflict_reason, answer.record.conflict_clause)
+    if answer.record is not None and answer.record.status == FORK_ABANDONED:
+        return ForkRefused(
+            answer.record.abandoned_reason or FORK_IN_FLIGHT,
+            f"the fork {request.fork_id} was abandoned and every child it created stands as it "
+            "was left",
+        )
     return ForkRefused(
         FORK_IN_FLIGHT,
         f"the fork {request.fork_id} stands {answer.record.status if answer.record else ''} and "
