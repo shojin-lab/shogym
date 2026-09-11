@@ -198,6 +198,15 @@ from shogym.serve.protocol_v2.policy import (  # noqa: E402
     render_body,
     roster_digest,
 )
+from shogym.serve.protocol_v2.reader import (  # noqa: E402
+    INHERITED_WORK,
+    LOCAL_WORK,
+    LineageOrigin,
+    RunRecords,
+    inherited_work,
+    local_work,
+    write_records,
+)
 
 ATTEMPT = "b" * 32
 SILENT = "c" * 32
@@ -4448,6 +4457,109 @@ def test_the_receipt_names_the_task_a_child_serves_and_not_one_that_already_ende
         assert child._first_eligible() == ("payload", ATTEMPT)
         child._obligations[ATTEMPT].state = "presented"
         assert child._first_eligible() == ("task", roster_row.attempt_id)
+
+
+def test_an_inherited_ending_stays_its_parents_work_in_a_child_and_across_its_boundary(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """Whose work a row is is carried, and it is carried for rows that committed no source.
+
+    An attempt that ended before it filed anything has no source, no seal and no descriptor, and
+    it is still work the parent did: the ending, the floor and the reason are the parent's own
+    outcome, and both children hold that row because both inherit the whole prefix. Reading such
+    a row as local work would total one ending once per generation of the lineage.
+
+    So the parent writes whose work each row is when it builds the children, over what the row
+    had done rather than over what it committed, and the child carries that forward through its
+    own boundary. A row still planned at the cut is nobody's work yet: the child that goes on to
+    work it is the generation it belongs to, which is what makes the inherited task the parent's
+    and the next task each child's own in the same table.
+    """
+    parent = a_quiet_parent(
+        monkeypatch,
+        start=a_parent_holding_a_finished_task(),
+        attempts=[
+            a_row(),
+            CarriedAttempt(attempt_id=FINISHED, state="final_failed", final_failure="abandoned"),
+            CarriedAttempt(attempt_id=NEXT, state="planned"),
+        ],
+    )
+    request = a_fork_request(
+        parent,
+        child_plans=[
+            a_plan_over(parent, FIRST_SLOT, GRADED_CELL),
+            a_plan_over(parent, SECOND_SLOT, PLACEBO_CELL),
+        ],
+    )
+    parent._refuse_a_fork(request)
+    built = parent._built_children(request)
+
+    # The ending is the parent's own, and it has no receipt evidence under it to say so.
+    kept = {row.attempt_id: row for row in parent.attempt_records()}
+    assert kept[FINISHED].source_generation == PARENT_ID
+    assert kept[FINISHED].source_provenance is None
+    assert kept[FINISHED].final_failure == "abandoned"
+
+    for row, start in built:
+        serving_as(monkeypatch, workflow_id=row.child_workflow_id)
+        child = kernel_workflow.StreamWorkflow(start)
+        held = {one.attempt_id: one for one in child.generation_records().attempts}
+        assert held[ATTEMPT].source_generation == PARENT_ID
+        assert held[FINISHED].source_generation == PARENT_ID
+        assert held[FINISHED].final_failure == "abandoned"
+        # And the task neither generation has worked belongs to whichever works it.
+        assert held[NEXT].source_generation == row.child_workflow_id
+
+        root = tmp_path / row.branch_slot
+        root.mkdir()
+        run = RunRecords(
+            root=root,
+            workflow_id=row.child_workflow_id,
+            records=list(held.values()),
+            origin=LineageOrigin(
+                parent_workflow_id=PARENT_ID,
+                parent_run_id=PARENT_RUN,
+                acknowledged_cursor=parent._cursor,
+                branch_slot=row.branch_slot,
+                fork_id=FORK,
+            ),
+        )
+        assert {one.attempt_id for one in inherited_work(run)} == {ATTEMPT, FINISHED}
+        assert {one.attempt_id for one in local_work(run)} == {NEXT}
+        exported = [
+            json.loads(line)
+            for line in write_records(run).read_text(encoding="utf-8").splitlines()
+        ]
+        assert [one["work_provenance"] for one in exported] == [
+            INHERITED_WORK,
+            INHERITED_WORK,
+            LOCAL_WORK,
+        ]
+        assert [one["source_generation"] for one in exported] == [
+            PARENT_ID,
+            PARENT_ID,
+            row.child_workflow_id,
+        ]
+
+        # And a child that crosses a boundary of its own carries the attribution over it.
+        carried = child._projection()
+        serving_as(
+            monkeypatch,
+            workflow_id=row.child_workflow_id,
+            continued="the child's earlier execution",
+        )
+        again = kernel_workflow.StreamWorkflow(
+            replace(
+                start,
+                carry=pack_carrier(
+                    carried, CONVERTER, version=carrier_version(start, carried)
+                ),
+            )
+        )
+        crossed = {one.attempt_id: one for one in again.attempt_records()}
+        assert crossed[ATTEMPT].source_generation == PARENT_ID
+        assert crossed[FINISHED].source_generation == PARENT_ID
+        assert crossed[NEXT].source_generation == row.child_workflow_id
 
 
 def test_the_origin_proof_is_bounded_over_every_state_its_parent_can_answer_it_in(

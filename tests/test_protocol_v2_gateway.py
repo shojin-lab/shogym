@@ -35,6 +35,7 @@ from fastmcp import Client  # noqa: E402
 from fastmcp.client.transports import StdioTransport  # noqa: E402
 from mcp.shared.exceptions import McpError  # noqa: E402
 from temporalio.service import RPCError, RPCStatusCode  # noqa: E402
+from temporalio.testing import ActivityEnvironment  # noqa: E402
 
 from shogym.serve.episode import ServedEpisode  # noqa: E402
 from shogym.serve.protocol_v2 import gateway as gateway_module  # noqa: E402
@@ -60,6 +61,7 @@ from shogym.serve.protocol_v2.gateway import (  # noqa: E402
     GatewayClosed,
     StreamGateway,
     WorldRoute,
+    attach_gateway,
     build_gateway_server,
     declared_argument_names,
     durable_client,
@@ -121,6 +123,9 @@ SECOND_TASK_ID = "00000000000000000000000000000201"
 SECOND_ACK_ID = "00000000000000000000000000000202"
 DONE_ID = "00000000000000000000000000000002"
 CURSOR = "00000000000000000000000000000001"
+
+#: What the service calls the generation these tests serve.
+GENERATION = "stream/one/1"
 
 
 def offered(record: Any, attempt_id: Optional[str] = None) -> OfferedMessage:
@@ -211,6 +216,9 @@ class ScriptedStream:
     def __init__(self, *offers: Any) -> None:
         self.offers: List[Any] = list(offers)
         self.calls: List[str] = []
+        # What the service calls the generation this stands in for. A gateway routes its worlds
+        # by it, because one Worker serves a run that can hold more than one generation.
+        self.handle = SimpleNamespace(id=GENERATION)
         self.requests: List[Any] = []
         self.commits: List[Any] = []
         self.blobs: List[Dict[str, Optional[str]]] = []
@@ -797,7 +805,7 @@ def test_an_environment_is_asked_how_its_attempts_end_and_answers_with_its_own_r
     assert own.activities == ["seal", "grade"]
     assert own.configuration_digest == "config-7"
     assert asked == [own.route]
-    assert own.route("00000000000000000000000000000100") is None
+    assert own.route.resolve(GENERATION, "00000000000000000000000000000100") is None
 
     plain = environment_terminal(SimpleNamespace(env=object(), session_id="session-2"))
     assert plain.canonicalization_version == CANONICALIZATION_VERSION
@@ -1262,6 +1270,40 @@ async def test_a_composed_budget_the_episode_does_not_enforce_is_refused(
         )
 
 
+async def test_attaching_to_several_tasks_without_somewhere_to_record_their_worlds_is_refused(
+    episode: ServedEpisode, tmp_path: Path
+) -> None:
+    """Attaching to a generation is held to what opening one is held to, for the same hazard.
+
+    An environment that ends an attempt in the world that attempt worked in needs a route for
+    the seal to find each world in, and a generation of several tasks attached without one would
+    have every task after the first sealed against the first task's world. The refusal lands
+    before this process takes the generation over.
+    """
+    spec = episode.describe()
+    terminal = terminal_manifest(spec)
+    composed = stream_start(
+        spec,
+        terminal,
+        claim_hash="a" * 64,
+        bodies=["one", "two"],
+        grade=environment_grade(episode),
+    )
+
+    async def opener(attempt_id: str) -> ServedEpisode:
+        raise AssertionError("no world is opened by attaching to a generation")
+
+    with pytest.raises(ValueError, match="sealed against the first"):
+        await attach_gateway(
+            None,  # type: ignore[arg-type]
+            episode,
+            workflow_id="stream/child/1",
+            start=composed,
+            run_directory=tmp_path,
+            open_episode=opener,
+        )
+
+
 def test_a_graded_horizon_this_gateway_could_not_file_for_is_refused(
     episode: ServedEpisode,
 ) -> None:
@@ -1307,9 +1349,20 @@ def test_a_world_belongs_to_the_attempt_it_was_opened_for() -> None:
     """The route says which world each attempt filed in, and answers nothing for the others."""
     route = environment_terminal(SimpleNamespace(env=object(), session_id="session-1")).route
     world = SimpleNamespace(env="env-a", session_id="session-a")
-    route.record("00000000000000000000000000000100", world, 1)
-    assert route("00000000000000000000000000000100") == ("env-a", "session-a")
-    assert route("00000000000000000000000000000200") is None
+    route.record(GENERATION, "00000000000000000000000000000100", world, 1)
+    assert route.resolve(GENERATION, "00000000000000000000000000000100") == (
+        "env-a",
+        "session-a",
+    )
+    assert route.resolve(GENERATION, "00000000000000000000000000000200") is None
+
+    # And a generation asks for its own worlds and no other generation's. The pairing a run's
+    # own bound view answers with is the one written under that run, whichever attempt it is.
+    assert route.bound_to(GENERATION)("00000000000000000000000000000100") == (
+        "env-a",
+        "session-a",
+    )
+    assert route.bound_to("stream/other/1")("00000000000000000000000000000100") is None
 
 
 def test_an_older_epoch_cannot_move_a_still_recorded_newer_pairing() -> None:
@@ -1335,34 +1388,134 @@ def test_an_older_epoch_cannot_move_a_still_recorded_newer_pairing() -> None:
     replaced = SimpleNamespace(env="env-old", session_id="old-world")
     live = SimpleNamespace(env="env-new", session_id="live-world")
 
-    route.record(attempt, live, 2)
-    assert route(attempt) == ("env-new", "live-world")
+    route.record(GENERATION, attempt, live, 2)
+    assert route.resolve(GENERATION, attempt) == ("env-new", "live-world")
 
     # The owner that was replaced comes back and says where it thinks the attempt is working.
-    route.record(attempt, replaced, 1)
-    assert route(attempt) == ("env-new", "live-world")
+    route.record(GENERATION, attempt, replaced, 1)
+    assert route.resolve(GENERATION, attempt) == ("env-new", "live-world")
 
     # The owner that holds the generation may still move its own pairing, and a newer one may
     # take it over, which is the case the comparison must not get in the way of.
-    route.record(attempt, SimpleNamespace(env="env-new", session_id="second-world"), 2)
-    assert route(attempt) == ("env-new", "second-world")
+    route.record(GENERATION, attempt, SimpleNamespace(env="env-new", session_id="second-world"), 2)
+    assert route.resolve(GENERATION, attempt) == ("env-new", "second-world")
     third = SimpleNamespace(env="env-third", session_id="third-world")
-    route.record(attempt, third, 3)
-    assert route(attempt) == ("env-third", "third-world")
+    route.record(GENERATION, attempt, third, 3)
+    assert route.resolve(GENERATION, attempt) == ("env-third", "third-world")
 
     # And letting go is still about the world let go of, not about the attempt alone: the older
     # owner closing the world it was working in leaves the replacement's pairing where it is.
-    route.forget(attempt, replaced)
-    assert route(attempt) == ("env-third", "third-world")
+    route.forget(GENERATION, attempt, replaced)
+    assert route.resolve(GENERATION, attempt) == ("env-third", "third-world")
 
     # What the comparison is not is a memory of every owner there has been. Once the pairing it
     # was guarding is let go of there is nothing standing to compare against, and an attempt with
     # no world recorded is answered the ordinary way. Saying so here is what keeps the rule this
     # test names the rule the code keeps.
-    route.forget(attempt, third)
-    assert route(attempt) is None
-    route.record(attempt, replaced, 1)
-    assert route(attempt) == ("env-old", "old-world")
+    route.forget(GENERATION, attempt, third)
+    assert route.resolve(GENERATION, attempt) is None
+    route.record(GENERATION, attempt, replaced, 1)
+    assert route.resolve(GENERATION, attempt) == ("env-old", "old-world")
+
+
+def test_two_generations_working_one_attempt_each_keep_a_world_of_their_own() -> None:
+    """One run can hold several generations, and a public attempt identifier is theirs together.
+
+    A generation cut from another inherits its attempt identifiers whole, so both of them can be
+    working the identifier at the same time in worlds of their own. Each takes a first claim, so
+    the two owners are at one epoch and neither is older than the other: keyed by the attempt
+    alone the second world recorded replaces the first and the seal that follows reads whichever
+    world was written last. That is shown here rather than argued, and then the key that keeps
+    them apart is shown answering each generation with its own.
+    """
+    attempt = "00000000000000000000000000000100"
+    kept = SimpleNamespace(env="env-kept", session_id="session-kept")
+    placebo = SimpleNamespace(env="env-placebo", session_id="session-placebo")
+
+    # What routing by the attempt alone comes to, at one epoch, with two worlds to record.
+    blind: Dict[str, Any] = {}
+    for world in (kept, placebo):
+        blind[attempt] = world
+    assert blind[attempt] is placebo
+
+    route = environment_terminal(SimpleNamespace(env=object(), session_id="seed")).route
+    route.record("stream/one/1.fork.1.aaaa", attempt, kept, 1)
+    route.record("stream/one/1.fork.2.bbbb", attempt, placebo, 1)
+    assert route.resolve("stream/one/1.fork.1.aaaa", attempt) == ("env-kept", "session-kept")
+    assert route.resolve("stream/one/1.fork.2.bbbb", attempt) == (
+        "env-placebo",
+        "session-placebo",
+    )
+
+    # And a generation that never opened a world for it is answered with nothing, which is what
+    # says the resolution is by the pair and not by whichever entry the attempt happens to have.
+    assert route.resolve(GENERATION, attempt) is None
+
+
+def test_one_generation_letting_a_world_go_leaves_its_siblings_where_they_are() -> None:
+    """Cleanup is about the world the generation that opened it is done with, and no other.
+
+    Sealing an attempt in one generation ends that generation's world for it. The sibling working
+    the same attempt identifier is still in its own world, and an entry cleared across the pair
+    would leave that sibling's seal with nowhere to look.
+    """
+    attempt = "00000000000000000000000000000100"
+    kept = SimpleNamespace(env="env-kept", session_id="session-kept")
+    placebo = SimpleNamespace(env="env-placebo", session_id="session-placebo")
+    route = WorldRoute()
+    route.record("stream/one/1.fork.1.aaaa", attempt, kept, 1)
+    route.record("stream/one/1.fork.2.bbbb", attempt, placebo, 1)
+
+    route.forget("stream/one/1.fork.1.aaaa", attempt, kept)
+    assert route.resolve("stream/one/1.fork.1.aaaa", attempt) is None
+    assert route.resolve("stream/one/1.fork.2.bbbb", attempt) == (
+        "env-placebo",
+        "session-placebo",
+    )
+
+    # A transport of one generation coming back late with the world it was working in is ordered
+    # against that generation's own entries alone. A sibling's first claim is not an older owner
+    # of this one, so it is never what an epoch comparison keeps out.
+    route.record("stream/one/1.fork.2.bbbb", attempt, placebo, 2)
+    late = SimpleNamespace(env="env-late", session_id="session-late")
+    route.record("stream/one/1.fork.2.bbbb", attempt, late, 1)
+    assert route.resolve("stream/one/1.fork.2.bbbb", attempt) == (
+        "env-placebo",
+        "session-placebo",
+    )
+    route.record("stream/one/1.fork.1.aaaa", attempt, late, 1)
+    assert route.resolve("stream/one/1.fork.1.aaaa", attempt) == ("env-late", "session-late")
+
+
+def test_a_world_is_resolved_under_the_generation_the_call_was_scheduled_for() -> None:
+    """The environment is handed something it calls with an attempt, and that stays what it is.
+
+    What supplies the other half of the key is the call itself: the service scheduled this
+    Activity for one generation and says which, so the pairing is read off the dispatch rather
+    than guessed from an identifier two generations share. A call no generation scheduled has no
+    answer here, and it is refused rather than given one of the worlds the run is holding.
+    """
+    attempt = "00000000000000000000000000000100"
+    kept = SimpleNamespace(env="env-kept", session_id="session-kept")
+    placebo = SimpleNamespace(env="env-placebo", session_id="session-placebo")
+    route = WorldRoute()
+    route.record("stream/one/1.fork.1.aaaa", attempt, kept, 1)
+    route.record("stream/one/1.fork.2.bbbb", attempt, placebo, 1)
+
+    for generation, world in (
+        ("stream/one/1.fork.1.aaaa", ("env-kept", "session-kept")),
+        ("stream/one/1.fork.2.bbbb", ("env-placebo", "session-placebo")),
+    ):
+        dispatched = ActivityEnvironment()
+        dispatched.info = replace(dispatched.info, workflow_id=generation)
+        assert dispatched.run(route, attempt) == world
+
+    nobodys = ActivityEnvironment()
+    nobodys.info = replace(nobodys.info, workflow_id=None)
+    with pytest.raises(RuntimeError):
+        nobodys.run(route, attempt)
+    with pytest.raises(RuntimeError):
+        route(attempt)
 
 
 async def test_a_generation_a_controller_composed_ends_the_way_its_environment_does(
@@ -1397,6 +1550,8 @@ async def test_a_generation_a_controller_composed_ends_the_way_its_environment_d
     started: List[Any] = []
 
     class Started:
+        handle = SimpleNamespace(id=GENERATION)
+
         async def claim_consumer(self, claim: Any) -> Any:
             return SimpleNamespace(initial_cursor=CURSOR)
 
@@ -1495,7 +1650,7 @@ async def test_a_world_that_is_not_the_environment_the_generation_declared_is_re
     assert score_mcp.gold(later.session_id) == ""
     # It was never routed, so no seal can reach it, and the task was never presented, so the
     # model never saw work it would have had scored under it.
-    assert environment.route(SECOND_ATTEMPT) is None
+    assert environment.route.resolve(GENERATION, SECOND_ATTEMPT) is None
     assert gateway.cursor == ACK_ID
     assert [commit.message_id for commit in stream.commits] == [TASK_ID, ACK_ID]
     assert stream.pending is SECOND_TASK_OFFER
@@ -1641,7 +1796,7 @@ async def test_two_live_attempts_are_each_worked_in_their_own_world(
         {"tool": "guess", "word": "adieu"},
     ]
     # And each attempt's seal resolves to the world that attempt's own calls reached.
-    route = gateway._route
+    route = gateway._route.bound_to(GENERATION)
     assert route(ATTEMPT) == (first.env, "session-first")
     assert route(SECOND_ATTEMPT) == (second.env, "session-second")
     await gateway.aclose()
@@ -1668,8 +1823,9 @@ async def test_a_seal_closes_the_world_of_the_attempt_it_sealed_and_no_other(
     # Released rather than ended: what the attempt was worth is the generation's to say.
     assert first.closed is False
     assert second.closed is None
-    assert gateway._route(ATTEMPT) is None
-    assert gateway._route(SECOND_ATTEMPT) == (second.env, "session-second")
+    routed = gateway._route.bound_to(GENERATION)
+    assert routed(ATTEMPT) is None
+    assert routed(SECOND_ATTEMPT) == (second.env, "session-second")
 
     # The attempt that is still live is still worked, in the world it has been working in.
     live = {"attempt_id": SECOND_ATTEMPT, "arguments": {"word": "crane"}}
@@ -1760,11 +1916,11 @@ async def test_a_world_handed_over_mid_attempt_is_let_go_of_when_that_attempt_se
     handed = NamedWorld("handed")
     gateway = worlds_gateway(spec, stream, handed, {}, world_attempt=ATTEMPT)
     # What a seal resolving this attempt finds is the world it was handed.
-    assert gateway._route(ATTEMPT) == (handed.env, "session-handed")
+    assert gateway._route.resolve(GENERATION, ATTEMPT) == (handed.env, "session-handed")
 
     assert json.loads(await gateway.terminal(FILING))["kind"] == "seal_ack"
     assert handed.closed is False
-    assert gateway._route(ATTEMPT) is None
+    assert gateway._route.resolve(GENERATION, ATTEMPT) is None
     await gateway.aclose()
 
 
@@ -3303,7 +3459,7 @@ async def test_a_horizon_filing_the_ending_refused_lets_the_world_go_with_the_ob
     stream = ScriptedStream(TASK_OFFER, StreamProtocolError("conflicting_seal"))
     gateway = graded_gateway(episode, stream, horizon=1)
     await gateway.pull({})
-    assert gateway._route(ATTEMPT) is not None
+    assert gateway._route.resolve(GENERATION, ATTEMPT) is not None
     played = episode.call
 
     async def call_the_ending_lands_under(tool_name: str, arguments: Dict[str, Any]) -> Any:
@@ -3322,7 +3478,7 @@ async def test_a_horizon_filing_the_ending_refused_lets_the_world_go_with_the_ob
     # And the world it was made in went with the attempt, by both the ways one is reached.
     assert wordle_server.played(episode.session_id) is None
     assert gateway._worlds == {}
-    assert gateway._route(ATTEMPT) is None
+    assert gateway._route.resolve(GENERATION, ATTEMPT) is None
     assert stream.confirmations == 1
 
 
@@ -4574,13 +4730,20 @@ async def _two_transports_over_one_attempt(client: Client, episode: ServedEpisod
         world_attempt=attempt,
         environment=environment,
     )
-    assert environment.route(attempt) == (restored.env, restored.session_id)
+    serving = stream.handle.id
+    assert environment.route.resolve(serving, attempt) == (
+        restored.env,
+        restored.session_id,
+    )
     assert stream.writer.ownership_epoch > replaced._stream.writer.ownership_epoch
 
     # The first transport retries. It is fenced at the stream, and the pairing the replacement
     # is using is left where it is.
     assert await refused(replaced.pull({})) == "fenced_writer"
-    assert environment.route(attempt) == (restored.env, restored.session_id)
+    assert environment.route.resolve(serving, attempt) == (
+        restored.env,
+        restored.session_id,
+    )
     assert replacement._worlds[attempt] is restored
     # And it did reach the writing, which is what makes this a test of the comparison rather
     # than of a path nothing took: the old transport claimed its own world for the same attempt.
@@ -4590,5 +4753,8 @@ async def _two_transports_over_one_attempt(client: Client, episode: ServedEpisod
     # Letting go is still the old transport's own world, so the replacement's pairing survives
     # the transport that was replaced shutting down.
     await replaced.aclose()
-    assert environment.route(attempt) == (restored.env, restored.session_id)
+    assert environment.route.resolve(serving, attempt) == (
+        restored.env,
+        restored.session_id,
+    )
     await replacement.aclose()

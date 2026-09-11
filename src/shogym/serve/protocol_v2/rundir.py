@@ -18,6 +18,14 @@ exists; the manifest says which generation it holds, and it is written once the 
 A directory left holding only the starting record is a run that died in between, and what it
 names is a generation nothing points at: the next attempt reads it, ends what it names, and
 starts its own.
+
+One run can hold more than one generation. A generation cut from another lives in a directory
+of its own, with its own manifest and its own blobs, under a run root the whole lineage shares:
+one history, one task queue, one service. So a manifest says two more things than it used to. It
+says where the shared history is, as a path relative to the directory holding the manifest, so a
+lineage copied somewhere else resolves inside the copy rather than pointing back at the original.
+And it says where this generation was cut from, which is what makes a directory readable as a
+child rather than as a run that started at a cursor nobody can explain.
 """
 
 from __future__ import annotations
@@ -27,10 +35,11 @@ import os
 import tempfile
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, Dict, Optional, Union
+from typing import TYPE_CHECKING, Any, Dict, Optional, Union
 
 from shogym import __version__ as shogym_version
 from shogym.serve.protocol_v2.blobs import (
+    BLOB_DIRECTORY,
     FilesystemBlobStore,
     create_directory,
     flush_directory,
@@ -38,6 +47,9 @@ from shogym.serve.protocol_v2.blobs import (
 from shogym.serve.protocol_v2.errors import WireFormatError
 from shogym.serve.protocol_v2.records import PROTOCOL_VERSION
 from shogym.serve.protocol_v2.schedule import SCHEDULE_VERSION
+
+if TYPE_CHECKING:  # pragma: no cover - the kernel reaches this module, so the arrow is one way
+    from shogym.serve.protocol_v2.kernel.messages import LineageOrigin
 
 # The manifest one generation writes about itself, once, when it is created.
 MANIFEST_FILE = "generation.json"
@@ -47,8 +59,8 @@ STARTING_FILE = "generation.starting.json"
 
 # What the process serving this run says about itself: the package version whose Worker is
 # polling this run's task queue. It is beside the manifest rather than in it, and nothing reads
-# it to decide anything: the manifest's field set is checked for exact equality, so a directory
-# with a sixth field would be refused by code that predates it, and a fact recorded for an
+# it to decide anything: the manifest holds a closed set of names, so a directory with a name
+# outside it would be refused by code that predates that name, and a fact recorded for an
 # operator must not be a fact that stops a run resuming.
 #
 # What it records is a deployment invariant. A generation may run in more than one execution,
@@ -66,6 +78,24 @@ V1_LOGS = ("dispenses.jsonl", "results.jsonl")
 
 _FIELDS = ("protocol_version", "schedule_version", "workflow_id", "task_queue", "configuration_hash")
 
+# What a manifest may hold beside those five, and what an older one simply does not have. They
+# are optional rather than required because every run directory written before a run could hold
+# more than one generation has neither, and a fact recorded for a lineage must not be a fact that
+# stops an ordinary run resuming.
+_LINEAGE_FIELDS = ("database_root", "origin")
+
+# The members of the origin a child's manifest holds, all of them or none.
+_ORIGIN_FIELDS = (
+    "parent_workflow_id",
+    "parent_run_id",
+    "acknowledged_cursor",
+    "branch_slot",
+    "fork_id",
+)
+
+# Where a generation's own directory says the shared history is, for one that shares nobody's.
+OWN_DATABASE_ROOT = "."
+
 
 class ResumeRefused(WireFormatError):
     """A run directory this protocol will not resume, carrying the code that says why."""
@@ -77,23 +107,51 @@ class ResumeRefused(WireFormatError):
 
 @dataclass(frozen=True)
 class RunManifest:
-    """What one generation says about itself: where it runs, and what it is."""
+    """What one generation says about itself: where it runs, what it is, and where it came from.
+
+    ``database_root`` is where the history this generation's records are read out of lives,
+    written as a path relative to the directory holding this manifest. A generation with a
+    history of its own says so with the current directory, and a generation sharing a lineage's
+    says how to walk to it. It is relative on purpose: an absolute path in a copied lineage would
+    send a read of the copy back to the original's live database.
+
+    ``origin`` is the generation this one was cut from, for one that was cut. A directory holding
+    it is a child, and a table over it says which generation it inherited its prefix from.
+    """
 
     workflow_id: str
     task_queue: str
     configuration_hash: str
     protocol_version: int = PROTOCOL_VERSION
     schedule_version: str = SCHEDULE_VERSION
+    database_root: str = OWN_DATABASE_ROOT
+    origin: Optional["LineageOrigin"] = None
 
     def to_wire(self) -> Dict[str, Any]:
-        """Return the manifest as the JSON object the directory holds."""
-        return {
+        """Return the manifest as the JSON object the directory holds.
+
+        A generation that shares nobody's history and was cut from nothing writes exactly the
+        five fields it always wrote, so a directory this build creates for an ordinary run is
+        the file the build before it created.
+        """
+        payload: Dict[str, Any] = {
             "protocol_version": self.protocol_version,
             "schedule_version": self.schedule_version,
             "workflow_id": self.workflow_id,
             "task_queue": self.task_queue,
             "configuration_hash": self.configuration_hash,
         }
+        if self.database_root != OWN_DATABASE_ROOT:
+            payload["database_root"] = self.database_root
+        if self.origin is not None:
+            payload["origin"] = {
+                "parent_workflow_id": self.origin.parent_workflow_id,
+                "parent_run_id": self.origin.parent_run_id,
+                "acknowledged_cursor": self.origin.acknowledged_cursor,
+                "branch_slot": self.origin.branch_slot,
+                "fork_id": self.origin.fork_id,
+            }
+        return payload
 
 
 @dataclass(frozen=True)
@@ -107,6 +165,17 @@ class RunDirectory:
     def blobs(self) -> FilesystemBlobStore:
         """The store this run installs its blobs in."""
         return FilesystemBlobStore.under(self.root)
+
+    @property
+    def database_root(self) -> Path:
+        """The directory holding the history this generation's records are read out of.
+
+        It is resolved against this directory rather than assumed to be it, because a generation
+        cut from another shares its lineage's history and keeps only its own manifest and blobs.
+        Resolving here is what makes a relocated lineage read: the manifest says how to walk from
+        this directory to the shared one, and the walk lands wherever the copy is.
+        """
+        return (self.root / self.manifest.database_root).resolve()
 
 
 def prepare_run_directory(root: Union[str, Path]) -> Path:
@@ -191,11 +260,6 @@ def create_run_directory(
     check nothing. Writing it says the generation it names exists, so it is written by a caller
     that has one.
 
-    It arrives whole or not at all. A file that exists is what says this directory holds a
-    generation, so a partial one is the worst of both: it names no generation anybody can
-    resume, and the next attempt is refused by it rather than being able to run out of the
-    directory.
-
     The starting record goes once the manifest is there. The directory now holds a generation,
     which is what the record was standing in for, and a record left behind by a crash between
     the two names the generation the manifest names.
@@ -204,17 +268,85 @@ def create_run_directory(
     manifest = RunManifest(
         workflow_id=workflow_id, task_queue=task_queue, configuration_hash=configuration_hash
     )
+    _record_generation(directory, manifest)
+    _discard(directory / STARTING_FILE)
+    return RunDirectory(root=directory, manifest=manifest)
+
+
+def attach_run_directory(
+    root: Union[str, Path],
+    *,
+    workflow_id: str,
+    task_queue: str,
+    configuration_hash: str,
+    database_root: str = OWN_DATABASE_ROOT,
+    origin: Optional["LineageOrigin"] = None,
+) -> RunDirectory:
+    """Adopt the directory a generation somebody else created already lives in, or make it.
+
+    This is the door a generation that was created before its directory comes in by. A fork
+    creates its children gated and unowned and their directories are prepared afterwards, so the
+    stream exists first and there is nothing to stage: the manifest is written for a generation
+    that is already running rather than to reserve a name for one about to start.
+
+    It is idempotent, and that is the point of it rather than a convenience. Publishing a
+    manifest, installing a closure and claiming ownership are three steps a crash can be between,
+    and the repair is to do them again: the ordinary creation path refuses a directory that
+    already holds a manifest, so a retry through it would refuse the child it had just registered.
+    A manifest naming this same generation, hash, history and origin is adopted and the directory
+    is returned as it stands; one naming anything else is refused, because a directory already
+    holding a generation is not somewhere to put a second.
+
+    The store is not made here, the way the creation path makes one. A generation created before
+    its directory names the store it verifies against inside its own start, and installing an
+    object makes what it needs, so a directory laid out for a store the generation does not use
+    would be a directory with an empty one in it.
+    """
+    directory = Path(root)
+    _refuse_v1_logs(directory)
+    manifest = RunManifest(
+        workflow_id=workflow_id,
+        task_queue=task_queue,
+        configuration_hash=configuration_hash,
+        database_root=database_root,
+        origin=origin,
+    )
+    path = directory / MANIFEST_FILE
+    if path.is_file():
+        standing = open_run_directory(directory)
+        if standing.manifest != manifest:
+            raise ResumeRefused(
+                "configuration_mismatch",
+                f"{directory} already holds {standing.manifest.workflow_id}, and this is "
+                f"{workflow_id} being attached to it",
+            )
+        return standing
+    create_directory(directory)
+    _record_generation(directory, manifest)
+    return RunDirectory(root=directory, manifest=manifest)
+
+
+def _record_generation(directory: Path, manifest: RunManifest) -> None:
+    """Write down the generation this directory holds, and the package serving it.
+
+    The manifest arrives whole or not at all. A file that exists is what says this directory
+    holds a generation, so a partial one is the worst of both: it names no generation anybody can
+    resume, and the next attempt is refused by it rather than being able to run out of the
+    directory.
+    """
     _publish(directory / MANIFEST_FILE, json.dumps(manifest.to_wire(), sort_keys=True) + "\n")
     _publish(
         directory / SERVING_FILE,
         json.dumps(
-            {"package": "shogym", "version": shogym_version, "task_queue": task_queue},
+            {
+                "package": "shogym",
+                "version": shogym_version,
+                "task_queue": manifest.task_queue,
+            },
             sort_keys=True,
         )
         + "\n",
     )
-    _discard(directory / STARTING_FILE)
-    return RunDirectory(root=directory, manifest=manifest)
 
 
 def serving_record(root: Union[str, Path]) -> Optional[Dict[str, Any]]:
@@ -263,6 +395,23 @@ def _discard(path: Path) -> None:
     flush_directory(path.parent)
 
 
+def run_directory_of(blob_root: Union[str, Path]) -> Path:
+    """Return the directory a store laid out inside a run directory belongs to.
+
+    It is the inverse of the layout every generation has, and it exists because a generation
+    something else created is authenticated by its start and a start names its store rather than
+    its directory. Deriving the directory from that authenticated value is what keeps a caller
+    attaching to one from being handed a second opinion about where the generation lives.
+    """
+    root = Path(blob_root)
+    if root.name != BLOB_DIRECTORY:
+        raise ValueError(
+            f"{str(root)!r} is not a store this build laid out: a generation keeps its objects "
+            f"under {BLOB_DIRECTORY!r} inside its own directory"
+        )
+    return root.parent
+
+
 def open_run_directory(root: Union[str, Path]) -> RunDirectory:
     """Return the generation this directory holds, or refuse to resume it.
 
@@ -303,7 +452,7 @@ def _manifest(path: Path, payload: Any) -> RunManifest:
             f"code does not serve",
         )
     missing = [name for name in _FIELDS if name not in payload]
-    if missing or set(payload) != set(_FIELDS):
+    if missing or not set(payload) <= set(_FIELDS) | set(_LINEAGE_FIELDS):
         raise ResumeRefused("configuration_mismatch", f"{path} is not a complete manifest")
     return RunManifest(
         workflow_id=payload["workflow_id"],
@@ -311,6 +460,50 @@ def _manifest(path: Path, payload: Any) -> RunManifest:
         configuration_hash=payload["configuration_hash"],
         protocol_version=payload["protocol_version"],
         schedule_version=payload["schedule_version"],
+        database_root=_database_root(path, payload),
+        origin=_origin(path, payload),
+    )
+
+
+def _database_root(path: Path, payload: Dict[str, Any]) -> str:
+    """Where this manifest says the shared history is, refusing anything but a relative walk.
+
+    An absolute path is refused rather than followed, because the whole point of the field is
+    that a copied lineage resolves inside the copy: a manifest carrying the original's own
+    location would send a read of the copy back to the database the original is still serving.
+    """
+    root = payload.get("database_root", OWN_DATABASE_ROOT)
+    if not isinstance(root, str) or not root or Path(root).is_absolute():
+        raise ResumeRefused(
+            "configuration_mismatch",
+            f"{path} names the shared history at {root!r}, and what a manifest holds is where to "
+            f"walk to it from the directory holding the manifest",
+        )
+    return root
+
+
+def _origin(path: Path, payload: Dict[str, Any]) -> Optional["LineageOrigin"]:
+    """The generation this directory was cut from, whole or not at all.
+
+    The type is imported here rather than at the top, because the kernel that declares it is what
+    reaches this module: a run directory is what a kernel resumes out of, so the arrow between
+    them points one way and this is the one place that has to look back along it.
+    """
+    from shogym.serve.protocol_v2.kernel.messages import LineageOrigin
+
+    origin = payload.get("origin")
+    if origin is None:
+        return None
+    if not isinstance(origin, dict) or set(origin) != set(_ORIGIN_FIELDS):
+        raise ResumeRefused(
+            "configuration_mismatch", f"{path} does not name whole the generation it was cut from"
+        )
+    return LineageOrigin(
+        parent_workflow_id=str(origin["parent_workflow_id"]),
+        parent_run_id=str(origin["parent_run_id"]),
+        acknowledged_cursor=str(origin["acknowledged_cursor"]),
+        branch_slot=str(origin["branch_slot"]),
+        fork_id=str(origin["fork_id"]),
     )
 
 

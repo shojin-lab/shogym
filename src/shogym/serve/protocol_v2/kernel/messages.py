@@ -188,10 +188,12 @@ _RECEIPT_CANDIDATE_MEMBERS = (
     "resolver_version",
 )
 _RECEIPT_PROJECTION_MEMBERS = ("operation_failures",)
-# And the fork's own. The two slots and the origin are the start's, and the preparation gate is
-# the one member a child's carried obligation holds that no other generation writes.
+# And the fork's own. The two slots and the origin are the start's, the preparation gate is the
+# one member a child's carried obligation holds that no other generation writes, and the work
+# generation is the one a child's carried attempt holds: only a parent building a child writes it.
 _FORK_START_MEMBERS = ("served_slot", "forkable_slots", "fork_origin")
 _FORK_OBLIGATION_MEMBERS = ("pending_preparation", "preparation_epoch")
+_FORK_ATTEMPT_MEMBERS = ("source_generation",)
 
 
 #: The shape of a fork origin this build writes and admits.
@@ -452,6 +454,15 @@ class CarriedAttempt:
     authority is strict: :func:`shogym.serve.protocol_v2.artifact.read_source_artifact` and
     :func:`read_source_origin` decide what these are, at the restore that refuses the carrier.
 
+    ``source_generation`` is the generation whose work this row is, written by a parent onto every
+    row a child inherits that had already been worked and absent on every row a generation opened
+    itself. It is here rather than derived from the receipt fields beside it because an attempt
+    that ended before it filed anything committed no source and has no descriptor, and its ending,
+    its floor and its reason are still the parent's outcome: a lineage that read such a row as
+    local work would count one ending once per generation holding it. It names the generation that
+    did the work rather than whichever one copied it last, so a further fork and a continuation
+    both carry it unchanged.
+
     ``presentation_references`` is the objects this attempt's own committed presentations cited,
     in commit order. They are among what an ownership claim reads the store for, so a claim
     refused over one of them is refused over an object this attempt requires, and a row that named
@@ -490,6 +501,7 @@ class CarriedAttempt:
     selected_policy_digest: Optional[str] = None
     receipt_contract_id: Optional[str] = None
     presentation_references: List[str] = field(default_factory=list)
+    source_generation: Optional[str] = None
 
 
 @dataclass(frozen=True)
@@ -665,7 +677,13 @@ def carried_fork_evidence(projection: "CarriedProjection") -> bool:
     projection holding either may never be written as a record that had no room for it. The
     episode counts as much as the gate, because a child that has prepared clears the gate and
     keeps the episode for as long as it runs.
+
+    The attempt's work generation is the third: only a parent building a child writes whose work
+    an inherited row is, and a projection written at a version with no room for it would hand the
+    next execution a prefix whose inherited endings read as its own work.
     """
+    if any(row.source_generation for row in projection.attempts):
+        return True
     return any(
         owed.pending_preparation or owed.preparation_epoch > 0
         for owed in projection.obligations
@@ -732,7 +750,8 @@ def legacy_projection_members(written: Dict[str, Any]) -> Dict[str, Any]:
     """
     adapted = _without(written, _RECEIPT_PROJECTION_MEMBERS)
     adapted["attempts"] = [
-        _without(row, _RECEIPT_ATTEMPT_MEMBERS) for row in written.get("attempts", [])
+        _without(row, (*_RECEIPT_ATTEMPT_MEMBERS, *_FORK_ATTEMPT_MEMBERS))
+        for row in written.get("attempts", [])
     ]
     adapted["obligations"] = [
         _without(row, _FORK_OBLIGATION_MEMBERS)
@@ -749,12 +768,16 @@ def legacy_projection_members(written: Dict[str, Any]) -> Dict[str, Any]:
 def receipt_projection_members(written: Dict[str, Any]) -> Dict[str, Any]:
     """Return one encoded projection as the receipt carrier version had it.
 
-    The carried obligation's two preparation members go, and every other name and value crosses as
-    the converter wrote it. A receipt generation neither gates an obligation nor opens a
-    preparation episode against one, so what this removes is those fields' defaults rather than a
+    The carried obligation's two preparation members go and the carried attempt's work generation
+    goes with them, and every other name and value crosses as the converter wrote it. A receipt
+    generation neither gates an obligation, opens a preparation episode against one nor holds a
+    row another generation worked, so what this removes is those fields' defaults rather than a
     state anything held.
     """
     adapted = dict(written)
+    adapted["attempts"] = [
+        _without(row, _FORK_ATTEMPT_MEMBERS) for row in written.get("attempts", [])
+    ]
     adapted["obligations"] = [
         _without(row, _FORK_OBLIGATION_MEMBERS) for row in written.get("obligations", [])
     ]
@@ -1745,14 +1768,24 @@ class AttemptRecord:
     are absent on every row whose seal did not end it. None of it is ever shown to a model: a
     message an environment raised with can name what it was grading.
 
-    The last three are the receipt half, and they are three separate facts rather than one. A row
-    names the contract its capture is validated against from the moment the roster resolved it,
-    before anything is sealed and whether or not it will ever deliver a body, so an attempt that
-    has captured nothing yet is still one somebody expects a source from. The provenance arrives
-    with that source and holds the bindings and the selection made from it. And the visible digest
-    is the join to what was committed: the presentation row for this attempt's payload says which
-    bytes the generation stands behind, and a harness reconciling its own transcript compares
-    against that rather than against anything this row could say about the body itself.
+    ``source_generation`` is whose work this row is. A generation cut from another inherits that
+    generation's rows whole, so a row in a child can be work the child did and work it was handed,
+    and the two count differently: the work happened once and each generation that holds it
+    delivers its own payload for it. What it names is the generation that did the work, written on
+    the row at the cut by the parent that had done it and carried from there, so it stays what it
+    was through a later boundary and through a further fork rather than naming whoever copied it
+    last. A row this generation opened itself names nothing, and neither does a row from a history
+    recorded before the question existed.
+
+    The three before it are the receipt half, and they are three separate facts rather than one.
+    A row names the contract its capture is validated against from the moment the roster resolved
+    it, before anything is sealed and whether or not it will ever deliver a body, so an attempt
+    that has captured nothing yet is still one somebody expects a source from. The provenance
+    arrives with that source and holds the bindings and the selection made from it. And the
+    visible digest is the join to what was committed: the presentation row for this attempt's
+    payload says which bytes the generation stands behind, and a harness reconciling its own
+    transcript compares against that rather than against anything this row could say about the
+    body itself.
     """
 
     attempt_id: str
@@ -1789,6 +1822,7 @@ class AttemptRecord:
     receipt_contract_id: Optional[str] = None
     source_provenance: Optional[SourceProvenance] = None
     payload_visible_sha256: Optional[str] = None
+    source_generation: Optional[str] = None
 
 
 @dataclass(frozen=True)
@@ -1830,6 +1864,27 @@ class PresentedMessage:
 
 
 @dataclass(frozen=True)
+class LineageOrigin:
+    """Which generation this one was cut from, in the words a reader of a run needs.
+
+    It is the small public half of a fork origin: where the cut was made and which branch this
+    generation serves, and none of the identities that origin authorizes anything with. A run
+    directory's manifest holds it and a read of the records carries it, so a table over a child
+    says which generation it came out of without anybody opening the parent's history.
+
+    A generation nobody cut holds none of this, which is what an ordinary run has always looked
+    like from here.
+    """
+
+    parent_workflow_id: str
+    parent_run_id: str
+    acknowledged_cursor: str
+    branch_slot: str
+    fork_id: str
+    protocol_version: int = PROTOCOL_VERSION
+
+
+@dataclass(frozen=True)
 class GenerationRecords:
     """One generation's attempts and its commitments, read out of the same moment.
 
@@ -1842,12 +1897,17 @@ class GenerationRecords:
     The operation failures are the third list, read off that same moment for the same reason: an
     attempt whose evidence went missing reads as delivered in one answer and as refused in
     another, and which of the two is true is a question about one point in the run.
+
+    ``origin`` is where this generation was cut from, for one that was cut. It is answered beside
+    the rows because a child's rows hold work the child did not do, and a reader handed the rows
+    alone would count that work as the child's own.
     """
 
     attempts: List[AttemptRecord]
     presentations: List[PresentedMessage]
     protocol_version: int = PROTOCOL_VERSION
     operation_failures: List[OperationFailure] = field(default_factory=list)
+    origin: Optional[LineageOrigin] = None
 
 
 @dataclass(frozen=True)
@@ -1857,6 +1917,12 @@ class StreamOutcome:
     ``payloads_delivered`` counts the payloads handed to the transport, which is the fact this
     generation holds. Whether a model read one of them is not something a server can know, so
     the count is named for the delivery and not for the reading.
+
+    Every count here describes the prefix this generation holds rather than the work it did. A
+    generation cut from another inherits that prefix whole, so its counts start where its
+    parent's left off, and adding up a lineage's outcomes counts the shared prefix once per
+    generation. A reader totalling a lineage counts the rows instead, by the generation each
+    row's own work belongs to, which :class:`AttemptRecord` names.
     """
 
     generation_state: str

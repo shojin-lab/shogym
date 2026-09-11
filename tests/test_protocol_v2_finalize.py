@@ -1373,7 +1373,9 @@ async def test_a_graded_horizon_whose_seal_ended_the_attempt_leaves_the_transpor
 
             assert wordle_server.played(episode.session_id) is None
             assert gateway._worlds == {}
-            assert environment.route(attempt) is None
+            assert environment.route.bound_to(
+                gateway._stream.handle.id
+            )(attempt) is None
 
             # And the generation serves the next task, in a world of its own.
             second = json.loads(await gateway.pull({}))

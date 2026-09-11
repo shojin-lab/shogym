@@ -17,11 +17,12 @@ from __future__ import annotations
 
 import asyncio
 import json
+import shutil
 from dataclasses import replace
 from datetime import timedelta
 from hashlib import sha256
 from pathlib import Path
-from typing import Any, List, Optional, Sequence, Tuple
+from typing import Any, Dict, List, Optional, Sequence, Tuple
 
 import pytest
 
@@ -68,7 +69,16 @@ from shogym.serve.protocol_v2.artifact import (  # noqa: E402
     source_commitment,
 )
 from shogym.serve.protocol_v2.blobs import FilesystemBlobStore  # noqa: E402
-from shogym.serve.protocol_v2.gateway import install_policies  # noqa: E402
+from shogym.serve.protocol_v2.gateway import (  # noqa: E402
+    EnvironmentTerminal,
+    WorldRoute,
+    attach_gateway,
+    install_policies,
+)
+from shogym.serve.protocol_v2.rundir import (  # noqa: E402
+    open_run_directory,
+    run_directory_of,
+)
 from shogym.serve.protocol_v2.kernel import (  # noqa: E402
     CONFIRMED_EXISTING,
     EXISTENCE_UNCONFIRMED,
@@ -2922,3 +2932,297 @@ async def test_a_child_claims_over_the_closure_it_was_given_and_never_over_less(
         ]
         [attempt] = [one for one in records.attempts if one.attempt_id == ATTEMPT]
         assert receipt_availability(attempt, records.operation_failures) == RECEIPT_AVAILABLE
+
+
+# Two children of one fork, working the second task at the same time, in worlds of their own.
+#
+# One Worker serves a whole run and an environment registers each Activity once under a fixed
+# name, so the two children reach one seal implementation. What tells their worlds apart is the
+# generation the call was scheduled for, and everything below is about that.
+
+
+def a_routed_worker(world: ServedEpisode, route: Any) -> List[Any]:
+    """This environment's own Activities over a route keyed by generation as well as attempt."""
+    _version, activities, _digest = world.env.protocol_v2_terminal(route)
+    return list(activities)
+
+
+async def a_world_at(bundle: Path, root: Path, position: int, name: str) -> ServedEpisode:
+    """One more served world of this environment, opened on the position it names."""
+    return await ServedEpisode.start(
+        "receipts_v1",
+        task=position,
+        env_config={"bundle": str(bundle)},
+        ends_on_horizon=False,
+        trace_path=root / f"{name}.jsonl",
+    )
+
+
+async def test_two_sibling_worlds_run_under_one_worker_and_capture_their_own_filings(
+    env: Any, world: ServedEpisode, frozen_bundle: Path, tmp_path: Path, turnover_at: Any
+) -> None:
+    """Both children work the second task at once, and each seals in the world it worked in.
+
+    The two children inherit the whole prefix, so they carry one public identifier for that task
+    between them and both are working it at the same time. They also take a first claim each, so
+    the owners are at one epoch and neither is older than the other. Routed by the attempt alone
+    the second world recorded would replace the first and both seals would read whichever world
+    was written last; routed by the generation as well, each seal reads the world its own child
+    opened.
+
+    The two worlds are opened on different positions of this environment on purpose. What a seal
+    captures is read off the world it resolves to, so worlds that hold the same instance capture
+    the same thing however badly they were routed, and the number is only evidence when the two
+    worlds are different. The filing is the one that answers the first of them exactly, so the
+    child working that world scores the whole of it and the child working the other does not.
+
+    One of them is taken over on the way, because ownership is the half of the key that stays
+    inside a generation: the replacement's world is newer than the world it replaced and older
+    than nothing at all in its sibling.
+    """
+    blobs = tmp_path / "blobs"
+    contract = contract_of(world.env)
+    turnover_at(10_000)
+    composed = fork_capable(start_for(world, contract, blobs, silent=True))
+    route = WorldRoute()
+    parent = "stream/sibling-worlds/1"
+    route.record(parent, ATTEMPT, world, 1)
+    opened: List[ServedEpisode] = []
+    try:
+        async with stream_worker(env.client, activities=a_routed_worker(world, route)):
+            _request, receipt, starts = await forked(
+                env, world, composed, blobs, tmp_path, parent
+            )
+            callers: List[Tuple[str, Caller]] = []
+            for index, (start, child) in enumerate(zip(starts, receipt.child_receipts)):
+                identity = child.child_workflow_id
+                stream, _ready = await a_ready_child(env.client, start, identity, blobs)
+                caller = await a_child_caller(stream, start)
+                await caller.present(await caller.pull())
+                task = await caller.pull()
+                assert task.attempt_id == SILENT
+                await caller.present(task)
+                own = await a_world_at(frozen_bundle, tmp_path, index, f"sibling-{index}")
+                opened.append(own)
+                route.record(identity, SILENT, own, 1)
+                callers.append((identity, caller))
+
+            # Two worlds, live at once, one attempt identifier, and each child resolves its own.
+            assert len({one.session_id for one in opened}) == 2
+            for (identity, _caller), own in zip(callers, opened):
+                assert route.resolve(identity, SILENT) == (own.env, own.session_id)
+
+            # A transport of one child coming back late with the world it was working in is
+            # ordered against that child's own entry and never against its sibling's.
+            route.record(callers[0][0], SILENT, opened[1], 0)
+            assert route.resolve(callers[0][0], SILENT) == (opened[0].env, opened[0].session_id)
+
+            # One child's transport is replaced, and the replacement opens a world of its own for
+            # the attempt it inherited. The epoch orders the two of them inside that child, the
+            # transport that was replaced cannot write its old world back, and the sibling working
+            # the same attempt identifier is where it was throughout.
+            taken = callers[1][0]
+            again = await a_world_at(frozen_bundle, tmp_path, 1, "sibling-1-again")
+            opened.append(again)
+            route.record(taken, SILENT, again, 2)
+            route.record(taken, SILENT, opened[1], 1)
+            assert route.resolve(taken, SILENT) == (again.env, again.session_id)
+            assert route.resolve(callers[0][0], SILENT) == (opened[0].env, opened[0].session_id)
+
+            answer = filing_of(world.env)
+            for identity, caller in callers:
+                acknowledged = await caller.seal(answer, attempt_id=SILENT)
+                assert acknowledged.kind == "seal_ack"
+                await caller.present(acknowledged)
+
+            scored = {}
+            for identity, _caller in callers:
+                records = await child_records(env.client, identity)
+                scored[identity] = {row.attempt_id: row for row in records.attempts}
+
+                # And the rows say which generation each of them belongs to. The first task is
+                # the parent's work in both children, and the second is each child's own.
+                assert records.origin is not None
+                assert records.origin.parent_workflow_id == parent
+                assert records.origin.fork_id == FORK
+                assert scored[identity][ATTEMPT].source_generation == parent
+                assert scored[identity][SILENT].source_generation == identity
+                assert scored[identity][ATTEMPT].payload_delivered
+
+            first, second = (identity for identity, _caller in callers)
+            assert scored[first][SILENT].score == 1.0
+            assert scored[second][SILENT].score != scored[first][SILENT].score
+
+            # The first task was sealed once, by the parent, and both children carry that one
+            # seal rather than a filing of their own.
+            assert (
+                scored[first][ATTEMPT].submission_digest
+                == scored[second][ATTEMPT].submission_digest
+            )
+            assert scored[first][SILENT].seal_ordinal == scored[second][SILENT].seal_ordinal
+
+            # A lineage totals its work by the generation each row's work belongs to. The
+            # first task was worked once and both children hold it; the second was worked twice
+            # and each child holds its own. Summing what each generation reports would count the
+            # shared prefix once per generation instead.
+            work: Dict[str, set] = {}
+            for identity, _caller in callers:
+                for row in scored[identity].values():
+                    assert row.source_generation is not None
+                    work.setdefault(row.source_generation, set()).add(row.attempt_id)
+            assert work[parent] == {ATTEMPT}
+            assert [work[identity] for identity, _caller in callers] == [{SILENT}, {SILENT}]
+
+            # And what each child delivered against the inherited work is its own delivery.
+            assert (
+                scored[first][ATTEMPT].payload_message_id
+                == scored[second][ATTEMPT].payload_message_id
+            )
+            assert (
+                scored[first][ATTEMPT].payload_visible_sha256
+                != scored[second][ATTEMPT].payload_visible_sha256
+            )
+
+            # Letting one child's world go leaves its sibling's where it is.
+            route.forget(callers[0][0], SILENT, opened[0])
+            assert route.resolve(callers[0][0], SILENT) is None
+            assert route.resolve(callers[1][0], SILENT) is not None
+    finally:
+        for one in opened:
+            await one.close()
+
+
+async def test_a_child_is_attached_to_a_directory_of_its_own_under_one_shared_runtime(
+    env: Any, world: ServedEpisode, frozen_bundle: Path, tmp_path: Path, turnover_at: Any
+) -> None:
+    """The sibling of the door a generation is opened by, for one that already exists.
+
+    A fork creates its children before anything serves them, so there is no stream to start and
+    no composition to complete: what a controller does is prepare the directory, copy the objects
+    in, and attach. The directory is adopted rather than made fresh, because publishing a
+    manifest, installing a closure and claiming ownership are three steps a crash can be between
+    and the repair for any of them is to do it again.
+
+    What the manifest then says is what a reader of that directory alone has to go on: which
+    generation lives here, where the history it shares is, and which generation it was cut from.
+    And closing this transport is a transport closing: the run's service and its Worker are the
+    run's, so the sibling that has not been attached to yet comes up afterwards.
+    """
+    blobs = tmp_path / "blobs"
+    contract = contract_of(world.env)
+    turnover_at(10_000)
+    composed = fork_capable(start_for(world, contract, blobs))
+    route = WorldRoute()
+    parent = "stream/attached-child/1"
+    route.record(parent, ATTEMPT, world, 1)
+    version, activities, digest = world.env.protocol_v2_terminal(route)
+    environment = EnvironmentTerminal(version, list(activities), digest, route, RECEIPTS_GRADE)
+    attached: Optional[ServedEpisode] = None
+    try:
+        async with stream_worker(env.client, activities=list(activities)):
+            _request, receipt, starts = await forked(
+                env, world, composed, blobs, tmp_path, parent
+            )
+            start, child = starts[0], receipt.child_receipts[0]
+            identity = child.child_workflow_id
+            await a_ready_child(env.client, start, identity, blobs)
+
+            attached = await a_world_at(frozen_bundle, tmp_path, 0, "attached")
+            # The directory is derived from the store the authenticated start names rather than
+            # passed beside it, because a directory handed in would be a second opinion about
+            # where this generation lives.
+            directory = run_directory_of(start.blob_root or "")
+            gateway = await attach_gateway(
+                env.client,
+                attached,
+                workflow_id=identity,
+                start=start,
+                run_directory=directory,
+                database_root="..",
+                consumer_id="the-transport-of-this-child",
+                environment=environment,
+            )
+
+            # The directory now says the three things a reader of it needs.
+            held = open_run_directory(directory)
+            assert held.manifest.workflow_id == identity
+            assert held.manifest.database_root == ".."
+            assert held.manifest.origin is not None
+            assert held.manifest.origin.parent_workflow_id == parent
+            assert held.manifest.origin.fork_id == FORK
+            assert held.manifest.origin.branch_slot == start.served_slot
+            assert held.database_root == tmp_path.resolve()
+
+            # And the objects installed for this child are the ones the reopened directory's own
+            # accessor produces, rather than ones it reads past: the store the authenticated start
+            # names and the store a reader resolves from the directory are one place.
+            body = held.blobs.read(child.selected_body_reference)
+            assert sha256(body).hexdigest() == child.selected_body_reference
+            assert held.blobs.root == Path(start.blob_root or "")
+
+            # Its first act is an ordinary pull, and what it answers is the body its parent
+            # selected for it.
+            payload = json.loads(await gateway.pull({}))
+            assert payload["kind"] == "payload"
+            assert payload["attempt_id"] == ATTEMPT
+
+            # Attaching again adopts what is there rather than refusing it or making a second.
+            again = await attach_gateway(
+                env.client,
+                attached,
+                workflow_id=identity,
+                start=start,
+                run_directory=directory,
+                database_root="..",
+                consumer_id="the-transport-of-this-child",
+                environment=environment,
+            )
+            assert open_run_directory(directory).manifest == held.manifest
+            await again.aclose()
+
+            # And a repeat that names no consumer adopts the one this generation holds rather
+            # than minting a second. The documented default is what a caller recovering a lost
+            # reply sends, and a fresh logical consumer is the one thing the generation will not
+            # take: minting one would fence the transport this call had just installed.
+            standing = (await gateway.stream_state()).consumer_id
+            assert standing == "the-transport-of-this-child"
+            recovered = await attach_gateway(
+                env.client,
+                attached,
+                workflow_id=identity,
+                start=start,
+                run_directory=directory,
+                database_root="..",
+                environment=environment,
+            )
+            assert (await recovered.stream_state()).consumer_id == standing
+            await recovered.aclose()
+
+            # A whole lineage copied somewhere else reads its objects back through the copy, which
+            # is the read relocation promises and the one the reader resolves the same way.
+            elsewhere = tmp_path / "archive"
+            shutil.copytree(directory, elsewhere / directory.name)
+            moved = open_run_directory(elsewhere / directory.name)
+            assert moved.blobs.read(child.selected_body_reference) == body
+
+            # A generation moved somewhere else is one this build reads and never serves.
+            with pytest.raises(ValueError):
+                await attach_gateway(
+                    env.client,
+                    attached,
+                    workflow_id=identity,
+                    start=start,
+                    run_directory=tmp_path / "moved",
+                    environment=environment,
+                )
+
+            # And closing a transport of one generation is a transport closing: the sibling is
+            # brought up afterwards on the same service and the same Worker.
+            other = starts[1]
+            _stream, ready = await a_ready_child(
+                env.client, other, receipt.child_receipts[1].child_workflow_id, blobs
+            )
+            assert ready.fork_id == FORK
+    finally:
+        if attached is not None:
+            await attached.close()
