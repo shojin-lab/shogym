@@ -89,10 +89,12 @@ with workflow.unsafe.imports_passed_through():
         visible_bytes,
     )
     from shogym.serve.protocol_v2.artifact import (
-        ELIGIBLE_CELLS,
+        CELL_KINDS,
+        ORACLE_CELL,
         ReceiptContract,
         SourceArtifactManifest,
         check_receipt_contracts,
+        encoded_body_bytes,
         manifest_fields,
         mask_spans,
         masked_body,
@@ -149,6 +151,7 @@ with workflow.unsafe.imports_passed_through():
         FORK_UNRECOVERABLE_EVIDENCE,
         FORK_WITNESS_MISMATCH,
         FORK_WRONG_SOURCE,
+        MOST_FORK_CHILDREN,
         RETRYABLE_FORK_REFUSALS,
         SPENT_RECOVERY_RESERVE,
         OPERATION_OUTCOMES,
@@ -410,15 +413,24 @@ assert (
 #
 # The fork reserve replaces the post-latch reserve rather than adding to it: a generation that has
 # latched for a turnover refuses a fork, and one that has committed a barrier never turns over, so
-# the two allowances are never both in force. Twenty four leaves the same inequality standing under
-# the smallest supported cap.
+# the two allowances are never both in force.
+#
+# What the reserve is spent on is the work that can still finish an incomplete fork, and every
+# child is a start that can be lost and asked for again, so the allowance is twelve for each child
+# a fork of this build may create. That was twenty four while a fork made the pair alone, and it is
+# thirty six now that a fork may make the oracle copy beside them: one thousand seven hundred plus
+# ten plus thirty six plus two hundred is one thousand nine hundred and forty six, under the
+# smallest supported cap. It is the largest roster's number rather than one derived from the roster
+# a given fork asked for, because a bound the validator reads has to be the same number before and
+# after a record exists to read a roster out of.
 #
 # All of them are the fork's own class, which is what the reserve is kept for. Nothing else can
 # take one: status is read by Query, which charges nothing, and the barrier's whitelist admits no
 # other writing class at all, so repeated reads and repeated recovery work cannot lock out the one
 # call that can finish the fork. A build that widens that whitelist owes this class an allowance of
 # its own inside this number.
-FORK_RESERVE = 24
+FORK_RESERVE_PER_CHILD = 12
+FORK_RESERVE = FORK_RESERVE_PER_CHILD * MOST_FORK_CHILDREN
 assert (
     TURNOVER_TRIGGER + ADMISSION_LEAD + FORK_RESERVE + TURNOVER_MARGIN < SERVICE_UPDATE_CAP
 ), "the trigger, the admission lead, the fork reserve and the margin have to fit under the cap"
@@ -2688,13 +2700,20 @@ class StreamWorkflow:
         return self._fork_answer(request, built)
 
     async def _read_the_fork_evidence(self, request: ForkRequest) -> ForkAvailability:
-        """Read the three objects one fork requires, before the barrier and nowhere else.
+        """Read the objects one fork requires, before the barrier and nowhere else.
 
-        An ordinary claim reads the manifest and deliberately verifies neither eligible body, so
-        without this the fork would commit a barrier over two references whose bytes nobody had
-        read. The manifest is named among the reads rather than left implicit in the commitment it
-        binds to, because a carried descriptor is a value in state and says nothing about whether
-        the object under its digest is still in the store.
+        What a fork requires is the manifest and the body of every cell its children deliver, so
+        the reads are the plans' own cells rather than a fixed pair: a fork of the comparison asks
+        for the two eligible bodies, and a fork that makes an oracle copy asks for that copy's body
+        too, because a body no child could be given is a barrier committed over a dependency one of
+        them could never resolve. A cell no child was planned for stays what it was, a retained
+        object no operation reads.
+
+        An ordinary claim reads the manifest and deliberately verifies no cell body at all, so
+        without this the fork would commit a barrier over references whose bytes nobody had read.
+        The manifest is named among the reads rather than left implicit in the commitment it binds
+        to, because a carried descriptor is a value in state and says nothing about whether the
+        object under its digest is still in the store.
 
         It takes its identifier from the fork's own namespace, like every other fork-only
         invocation, so a child's ordinary Activity numbering equals the number its inherited prefix
@@ -2722,7 +2741,8 @@ class StreamWorkflow:
             blob_root=root,
             source_commitment=attempt.source_commitment,
             body_references=[
-                manifest.cells[cell].sha256 for cell in sorted(ELIGIBLE_CELLS)
+                manifest.cells[cell].sha256
+                for cell in sorted({plan.target_cell for plan in request.child_plans})
             ],
         )
         _fork_shape_measured(
@@ -3318,18 +3338,21 @@ class StreamWorkflow:
             child_ordinal=ordinal,
             children=len(request.child_plans),
         )
-        carrier = attributed_child_work(
-            child_carrier(
-                projection,
-                selections=[
-                    ChildSelection(
-                        attempt_id=request.source_attempt_id,
-                        cell=plan.target_cell,
-                        policy_digest=self._child_policy(plan, request.source_attempt_id),
-                    )
-                ],
+        carrier = _child_inventory(
+            attributed_child_work(
+                child_carrier(
+                    projection,
+                    selections=[
+                        ChildSelection(
+                            attempt_id=request.source_attempt_id,
+                            cell=plan.target_cell,
+                            policy_digest=self._child_policy(plan, request.source_attempt_id),
+                        )
+                    ],
+                ),
+                generation=workflow.info().workflow_id,
             ),
-            generation=workflow.info().workflow_id,
+            rows,
         )
         holding = replace(bare, fork_origin=origin)
         composed = replace(
@@ -5742,9 +5765,11 @@ class StreamWorkflow:
         The disposition, the policy's declared cell, the manifest's kind and the reference all
         have to name the same cell, and they are made to here: the cell is the row's, the policy
         declares it, and the reference is the manifest's own entry for that kind rather than one
-        this method chose. The oracle is never among them. It is named by the descriptor,
-        retained with the rest, and is not a cell a live arm may be assigned, so a row naming it
-        is refused before anything is resolved rather than served as a graded body.
+        this method chose. Which of the three a generation may be assigned is settled by that
+        pairing rather than by a list here: an artifact policy declares one cell, the contract
+        registers the pair of the comparison, and the oracle is admitted only under the policy
+        that names it, so a row of the comparison naming the oracle entry is refused before
+        anything is resolved rather than served as a graded body.
         """
         if policy is None or policy.exposure != ARTIFACT or disposition is None:
             return None
@@ -5754,10 +5779,10 @@ class StreamWorkflow:
                 "for it to be a cell of"
             )
         cell = disposition.cell or ""
-        if cell not in ELIGIBLE_CELLS or cell not in policy.cells:
+        if cell not in CELL_KINDS or cell not in policy.cells:
             raise _unusable(
-                f"an arm is served {sorted(ELIGIBLE_CELLS)} and this obligation was assigned "
-                f"{cell!r}"
+                f"a source holds the cells {sorted(CELL_KINDS)} and this obligation was assigned "
+                f"{cell!r} under {policy.policy_name}"
             )
         if self._start.blob_root is None:
             raise _unusable(
@@ -7121,10 +7146,18 @@ def transformed_child_selection(
     attempt's own presentation references. Selected delivery evidence is transformed here and
     nowhere else: the cell becomes the child's target cell, the policy digest becomes the child's
     own row's, and the body reference becomes the descriptor's own entry for that cell. The
-    contract id does not move, because both cells are the pair one contract declares.
+    contract id does not move, because all three cells are cells of the one source that contract
+    admitted.
 
-    The transformation is pure. The descriptor is carried whole in state, so naming the opposite
-    cell's reference reads no blob, renders nothing and needs no world.
+    What this asks of the cell is that the source holds it. Which of the three a given child may
+    be given is closed one step out, where the parent holds that child's own rows and runs the
+    checks the child's own constructor makes: the row's policy has to declare the cell and the row
+    has to resolve the selection this transformation wrote. That comparison is against the plan
+    rather than against a search of the bytes, which is what it has to be, since all three cells
+    share wrapper bytes and nothing downstream could tell them apart by shape.
+
+    The transformation is pure. The descriptor is carried whole in state, so naming another cell's
+    reference reads no blob, renders nothing and needs no world.
 
     The candidate is dropped in the same construction and the obligation is marked pending
     preparation, so the child restores with a transformed selection, no candidate and the one
@@ -7147,9 +7180,9 @@ def transformed_child_selection(
                 f"attempt {selection.attempt_id} is selected twice for one child, and one "
                 "obligation is delivered once"
             )
-        if selection.cell not in ELIGIBLE_CELLS:
+        if selection.cell not in CELL_KINDS:
             raise ValueError(
-                f"a child is served {sorted(ELIGIBLE_CELLS)} and this selection names "
+                f"a source holds the cells {sorted(CELL_KINDS)} and this selection names "
                 f"{selection.cell!r}"
             )
         wanted[selection.attempt_id] = selection
@@ -7202,6 +7235,36 @@ def _child_obligation(owed: CarriedObligation) -> CarriedObligation:
             "over a payload nothing has delivered"
         )
     return replace(owed, candidate=None, pending_preparation=True)
+
+
+def _child_inventory(
+    projection: CarriedProjection, rows: Sequence[PayloadDisposition]
+) -> CarriedProjection:
+    """Return one child's carrier naming the descriptors that child's own rows resolve to.
+
+    A generation's constructor seeds its committed list from its own declaration and the carrier
+    then overwrites it, so a name the parent's inventory never held would be a name the child's
+    claim never reads back. For a child of the comparison there is nothing to add: a contract's
+    pair is in its parent's inventory from the moment that generation was composed, counterpart
+    included, so the union puts back exactly what was already there and the carrier is the bytes it
+    was. For an oracle child there is one name, because no contract registers the policy that
+    delivers the oracle cell and no generation of the comparison ever resolved to it.
+
+    It is a union rather than a replacement, because what the prefix committed is the parent's
+    record and not something a child's declaration may narrow, and it appends rather than reorders
+    for the same reason a child of the comparison has to come out byte identical: the list it
+    inherits is the list the parent wrote, in the order the parent wrote it.
+    """
+    missing = [
+        digest
+        for digest in descriptor_digests(list(rows), [], [])
+        if digest not in projection.committed_blobs
+    ]
+    if not missing:
+        return projection
+    return replace(
+        projection, committed_blobs=[*projection.committed_blobs, *missing]
+    )
 
 
 def transformed_child_counters(projection: CarriedProjection) -> CarriedProjection:
@@ -7886,10 +7949,10 @@ def _check_carried_attempt(
             "a cell, a reference and a policy together"
         )
     cell = row.selected_cell or ""
-    if cell not in ELIGIBLE_CELLS:
+    if cell not in CELL_KINDS:
         raise _refuse_carrier(
-            f"an arm is served {sorted(ELIGIBLE_CELLS)} and the carried attempt {row.attempt_id} "
-            f"holds a selection for {cell!r}"
+            f"a source holds the cells {sorted(CELL_KINDS)} and the carried attempt "
+            f"{row.attempt_id} holds a selection for {cell!r}"
         )
     if row.selected_body_reference != manifest.cells[cell].sha256:
         raise _refuse_carrier(
@@ -8483,12 +8546,24 @@ def _check_resolved(
     Every check here is pure and every value it is made against is one this generation already
     held. The bytes are required to hash to the committed entry for the cell that was selected,
     which is what a candidate matching its own reported digest does not say: a body says what it
-    is and never which cell was chosen. The size and the encoding are the contract's. The mask is
-    expanded from the contract's own geometry and never from anything the candidate proposed, and
-    the masked body is compared with the hash publication took while it held both cells, which
-    makes this a consistency check on the selected body rather than a proof about the other one.
-    And the wire count is the obligation's empty-body wrapper plus the stored count of the body,
-    exactly, which is what makes two cells of one source come to one measurement.
+    is and never which cell was chosen. The size and the encoding are the contract's, and all
+    three cells of a source are published at that one size, so those hold whichever cell was
+    assigned.
+
+    The parity evidence is where the cells part, because it is evidence about the pair and about
+    nothing else. For a cell of the pair the mask is expanded from the contract's own geometry and
+    never from anything the candidate proposed, the masked body is compared with the hash
+    publication took while it held both cells, and the wire count is the obligation's empty-body
+    wrapper plus the stored count publication registered, exactly, which is what makes two cells of
+    one source come to one measurement.
+
+    The oracle cell is held to its own bytes instead, and it is not held to less. There is no
+    published mask over it and no registered count for it, because the pair's evidence says
+    nothing about a third body: what pins it is the committed entry it has already been required to
+    hash to, and the count is taken from the body those bytes are, so the measurement this
+    obligation reports is the measurement of the object the source committed. A count borrowed from
+    the pair would refuse every legal oracle body, and a mask borrowed from the pair would compare
+    it against a body it was never meant to equal.
     """
     if selected is None or source is None:
         raise _unusable(
@@ -8530,21 +8605,25 @@ def _check_resolved(
             f"the contract {contract.contract_id} fixes a body at {contract.body_size} bytes and "
             f"this one is {len(raw)}"
         )
-    masked = sha256(masked_body(raw, mask_spans(contract))).hexdigest()
-    if masked != source.pair_parity.masked_body_sha256:
-        raise _unusable(
-            "the body that came back is not what publication masked under the slots this "
-            "contract registers"
-        )
+    if selected.cell == ORACLE_CELL:
+        counted = encoded_body_bytes(candidate.body)
+    else:
+        masked = sha256(masked_body(raw, mask_spans(contract))).hexdigest()
+        if masked != source.pair_parity.masked_body_sha256:
+            raise _unusable(
+                "the body that came back is not what publication masked under the slots this "
+                "contract registers"
+            )
+        counted = source.pair_parity.encoded_body_bytes
     expected = payload_wire_count(
         payload_message_id=item.payload_message_id,
         attempt_id=item.attempt_id,
-        encoded_body_bytes=source.pair_parity.encoded_body_bytes,
+        encoded_body_bytes=counted,
     )
     if candidate.visible_byte_count != expected:
         raise _unusable(
-            f"this obligation's cells come to {expected} visible bytes and this candidate comes "
-            f"to {candidate.visible_byte_count}"
+            f"this obligation's {selected.cell} cell comes to {expected} visible bytes and this "
+            f"candidate comes to {candidate.visible_byte_count}"
         )
 
 

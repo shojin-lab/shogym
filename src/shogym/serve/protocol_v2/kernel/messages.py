@@ -55,10 +55,13 @@ from shogym.serve.protocol_v2 import (
 from temporalio.api.common.v1 import Payload
 
 from shogym.serve.protocol_v2.artifact import (
+    CELL_KINDS,
     ELIGIBLE_CELLS,
+    ORACLE_CELL,
     ReceiptContract,
     SourceArtifactManifest,
     check_source_artifact,
+    contract_admits,
     contract_fields,
     mask_spans,
     source_commitment,
@@ -2080,7 +2083,9 @@ class SelectedSourceReference:
     ``masked_body_sha256`` and ``slot_spans`` are the publication's own evidence and the
     registered geometry it was taken under. They cross so the check that the delivered body is
     the pair's is made against what was registered rather than against a layout the resolver
-    proposed.
+    proposed. Both are empty on a selection of the oracle cell, because that evidence is a hash
+    and a geometry over the pair: a body outside the pair has no published mask to be compared
+    against, and carrying the pair's would be offering a comparison that means nothing.
 
     ``blob_root`` is where the controller keeps the run's objects. It is deployment rather than
     identity, which is why it is here beside the reference and nowhere inside a digest.
@@ -2129,10 +2134,17 @@ def derived_selection(
     vouches for.
 
     Everything here refuses rather than repairs. The commitment is recomputed from the
-    descriptor's own canonical bytes, the seal id from the origin, and the cell has to be one an
-    arm may be served, declared by an artifact policy and admitted by the source's own contract.
-    The oracle is refused at the first of those: it is named by the descriptor, retained with the
-    rest, and is not a cell any derivation resolves.
+    descriptor's own canonical bytes, the seal id from the origin, and the cell has to be one the
+    source holds, declared by an artifact policy and admitted for that policy by the source's own
+    contract. The pairing is what closes the three cells against each other: a policy declares one
+    cell, the contract registers the two of the comparison, and the oracle is admitted only under
+    the one policy that names it, so no arm of the comparison resolves the oracle entry and no
+    oracle copy resolves a receipt or a placebo.
+
+    The parity evidence crosses only where it is evidence. It is a hash and a count publication
+    took while it held both cells of the pair, which says nothing about a third body, so an
+    oracle derivation carries neither and the mask a delivery is compared under is the pair's
+    alone.
     """
     check_source_artifact(source)
     if commitment != source_commitment(source):
@@ -2150,18 +2162,23 @@ def derived_selection(
             f"this source names the execution ordinal {source.execution_ordinal} and its origin "
             f"names {origin.execution_ordinal}"
         )
-    if cell not in ELIGIBLE_CELLS:
+    if cell not in CELL_KINDS:
         raise WireFormatError(
-            f"an arm is served {sorted(ELIGIBLE_CELLS)} and this derivation asked for {cell!r}"
+            f"a source holds the cells {sorted(CELL_KINDS)} and this derivation asked for {cell!r}"
         )
     policy = POLICIES.get(policy_digest)
-    if policy is None or policy.exposure != ARTIFACT or cell not in policy.cells:
+    if policy is None or policy.exposure != ARTIFACT:
         raise WireFormatError(
-            f"a committed cell is delivered by a policy this build implements that declares "
-            f"{cell!r}, and this derivation named {policy_digest[:16]!r}"
+            f"a committed cell is delivered by a policy this build implements that declares it, "
+            f"and this derivation named {policy_digest[:16]!r}"
+        )
+    if cell not in policy.cells:
+        raise WireFormatError(
+            f"{policy.policy_name} declares the cells {list(policy.cells)}, and this derivation "
+            f"asked for {cell!r}"
         )
     contract = source.receipt_contract
-    if (policy_digest, cell) not in contract.cells:
+    if not contract_admits(contract, policy_digest, cell):
         raise WireFormatError(
             f"the contract {contract.contract_id} admits {[cell for _d, cell in contract.cells]} "
             f"and this derivation asked for {cell!r} under a policy it does not admit"
@@ -2172,6 +2189,7 @@ def derived_selection(
             "no store to resolve it in"
         )
     reference = source.cells[cell]
+    paired = cell in ELIGIBLE_CELLS
     return SelectedSourceReference(
         source_commitment=commitment,
         cell=cell,
@@ -2180,8 +2198,8 @@ def derived_selection(
         body_size=reference.size,
         body_encoding=contract.body_encoding,
         media_type=reference.media_type,
-        masked_body_sha256=source.pair_parity.masked_body_sha256,
-        slot_spans=mask_spans(contract),
+        masked_body_sha256=source.pair_parity.masked_body_sha256 if paired else "",
+        slot_spans=mask_spans(contract) if paired else (),
         blob_root=blob_root,
     )
 
@@ -2913,10 +2931,15 @@ class ChildReady:
     schema_version: int = CHILD_READY_SCHEMA_VERSION
 
 
-#: How many children one fork of this build creates. More than two at one fork is a roster and a
-#: selector problem this transition does not solve, so a request asking for another number is
-#: refused rather than served by machinery nobody wrote.
+#: How many children one fork of this build creates: the pair of the comparison, or that pair and
+#: the oracle copy beside it. Each roster is the complete set of cells one committed source holds,
+#: which is what makes the number a roster rather than a count: a request asking for any other
+#: number, or for a set of cells that is neither of these, is refused rather than served by
+#: machinery nobody wrote.
 FORK_CHILD_COUNT = 2
+FORK_ORACLE_CHILD_COUNT = 3
+FORK_CHILD_COUNTS = (FORK_CHILD_COUNT, FORK_ORACLE_CHILD_COUNT)
+MOST_FORK_CHILDREN = FORK_ORACLE_CHILD_COUNT
 
 
 def _admitted_version(name: str, declared: Any, admitted: Any) -> None:
@@ -2944,19 +2967,26 @@ def check_fork_request(request: ForkRequest) -> None:
     """Refuse a request this build cannot serve, before anything reads the stream's state.
 
     What is checked here is the request against itself: the version, the number of children, that
-    the plans name eligible cells, and that the branch, the hidden execution, the consumer and the
-    store are each one child's alone. That last one is here because this is the only place the
-    plans are read together: every check after it compares one child against its parent, and two
-    executions under one hidden execution id make :func:`hidden_seal_id` mint one seal id in two
-    places for the same public attempt. Whether the branches are ones the parent declared, whether
-    the witnesses match and whether the boundary holds are questions about a generation rather
-    than about a request, and they are asked where that generation is.
+    the plans name cells a source holds, that the oracle copy is asked for where the number says
+    it is and nowhere else, and that the branch, the hidden execution, the consumer and the store
+    are each one child's alone. That last one is here because this is the only place the plans are
+    read together: every check after it compares one child against its parent, and two executions
+    under one hidden execution id make :func:`hidden_seal_id` mint one seal id in two places for
+    the same public attempt. Whether the branches are ones the parent declared, whether the
+    witnesses match and whether the boundary holds are questions about a generation rather than
+    about a request, and they are asked where that generation is.
+
+    The oracle copy is counted rather than inferred, which is what makes it a thing a request
+    declares. A fork of the pair gives no child the oracle cell and one of three gives it to
+    exactly one, so a request that slipped the oracle in among a pair, or asked for it twice, is
+    refused here: an oracle copy stands beside the comparison and never inside it.
     """
     _admitted_version("a fork request", request.schema_version, FORK_REQUEST_SCHEMA_VERSION)
-    if len(request.child_plans) != FORK_CHILD_COUNT:
+    if len(request.child_plans) not in FORK_CHILD_COUNTS:
         raise WireFormatError(
-            f"one fork of this build creates {FORK_CHILD_COUNT} children, and this request names "
-            f"{len(request.child_plans)}"
+            f"one fork of this build creates "
+            f"{' or '.join(str(count) for count in FORK_CHILD_COUNTS)} children, and this request "
+            f"names {len(request.child_plans)}"
         )
     for name in ("branch_slot", "hidden_execution_id", "consumer_claim_hash", "run_directory"):
         named = [getattr(plan, name) for plan in request.child_plans]
@@ -2965,11 +2995,18 @@ def check_fork_request(request: ForkRequest) -> None:
                 f"each child of one fork is given a {name} of its own, and these name {named}"
             )
     for plan in request.child_plans:
-        if plan.target_cell not in ELIGIBLE_CELLS:
+        if plan.target_cell not in CELL_KINDS:
             raise WireFormatError(
-                f"a child delivers one of {sorted(ELIGIBLE_CELLS)} and the plan for "
+                f"a child delivers one of {sorted(CELL_KINDS)} and the plan for "
                 f"{plan.branch_slot} names {plan.target_cell!r}"
             )
+    oracles = [plan for plan in request.child_plans if plan.target_cell == ORACLE_CELL]
+    wanted = len(request.child_plans) - FORK_CHILD_COUNT
+    if len(oracles) != wanted:
+        raise WireFormatError(
+            f"a fork of {len(request.child_plans)} children gives the {ORACLE_CELL} cell to "
+            f"{wanted} of them, and this request gives it to {len(oracles)}"
+        )
 
 
 def check_prepared_fork(record: PreparedFork) -> None:

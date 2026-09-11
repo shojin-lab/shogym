@@ -75,6 +75,7 @@ from shogym.serve.protocol_v2.artifact import (  # noqa: E402
     ORACLE_CELL,
     PLACEBO_CELL,
     SourceArtifactManifest,
+    encoded_body_bytes,
     mask_spans,
     masked_body,
     payload_wire_count,
@@ -241,6 +242,7 @@ from shogym.serve.protocol_v2.policy import (  # noqa: E402
     DELIVER,
     EXPERIMENT,
     GRADED_RECEIPT_ARTIFACT_V1_DIGEST,
+    ORACLE_RECEIPT_ARTIFACT_V1_DIGEST,
     PLACEBO_RECEIPT_ARTIFACT_V1_DIGEST,
     REGISTERED,
     SINGLETON_SLOT,
@@ -1036,16 +1038,32 @@ async def test_a_receipt_generation_continues_before_its_first_capture_and_seals
 
 FIRST_SLOT = "first"
 SECOND_SLOT = "second"
+THIRD_SLOT = "third"
 FORK = "fork-1"
 CELL_POLICIES = {
     GRADED_CELL: GRADED_RECEIPT_ARTIFACT_V1_DIGEST,
     PLACEBO_CELL: PLACEBO_RECEIPT_ARTIFACT_V1_DIGEST,
+    ORACLE_CELL: ORACLE_RECEIPT_ARTIFACT_V1_DIGEST,
 }
 
 
 def fork_capable(start: StreamStart) -> StreamStart:
     """The same generation, declaring the two branches its fork may create."""
     return replace(start, forkable_slots=[FIRST_SLOT, SECOND_SLOT])
+
+
+def oracle_capable(start: StreamStart) -> StreamStart:
+    """The same generation again, declaring the third branch an oracle copy is created on."""
+    return replace(start, forkable_slots=[FIRST_SLOT, SECOND_SLOT, THIRD_SLOT])
+
+
+def three_plans(start: StreamStart, root: Path) -> List[ForkChildPlan]:
+    """The pair of the comparison and the oracle copy beside them, each with a store of its own."""
+    return [
+        plan_for(start, FIRST_SLOT, GRADED_CELL, root / "child-1"),
+        plan_for(start, SECOND_SLOT, PLACEBO_CELL, root / "child-2"),
+        plan_for(start, THIRD_SLOT, ORACLE_CELL, root / "child-3"),
+    ]
 
 
 def plan_for(start: StreamStart, slot: str, cell: str, directory: Path) -> ForkChildPlan:
@@ -2157,11 +2175,29 @@ def child_closure(start: StreamStart) -> List[str]:
 
 
 def copy_closure(source: Path, destination: str, references: List[str]) -> None:
-    """Install those exact objects in a child's own store, out of the store its parent used."""
+    """Install those exact objects in a child's own store, out of the store its parent used.
+
+    What that child's own declaration already put there is left alone, which is how the copy asks
+    its parent only for objects that parent actually holds.
+    """
     origin = FilesystemBlobStore(source)
     into = FilesystemBlobStore(Path(destination))
-    for reference in references:
+    for reference in into.unverified(references):
         into.put(origin.read(reference))
+
+
+def given_its_objects(blobs: Path, start: StreamStart) -> None:
+    """Fill one child's store the way an attachment does: its own descriptors, then the closure.
+
+    The preimage of every policy a generation's own rows name is computed from that declaration
+    and installed the way a fresh generation's is, and only then is the parent's store asked for
+    what is left. An arm of the comparison changes nothing by it, because a contract's pair is in
+    its parent's inventory from the moment that generation was composed. An oracle copy does: no
+    contract registers the policy that delivers its cell, so its parent was never given those
+    bytes to be asked for.
+    """
+    install_policies(FilesystemBlobStore(Path(start.blob_root or "")), start)
+    copy_closure(blobs, start.blob_root or "", child_closure(start))
 
 
 async def a_claimed_child(client: Client, start: StreamStart, identity: str) -> Any:
@@ -2187,7 +2223,7 @@ async def a_ready_child(
     client: Client, start: StreamStart, identity: str, blobs: Path
 ) -> Tuple[Any, ChildReady]:
     """Copy one child's closure into its own store, claim it, and prepare the body it owes."""
-    copy_closure(blobs, start.blob_root or "", child_closure(start))
+    given_its_objects(blobs, start)
     stream = await a_claimed_child(client, start, identity)
     return stream, await stream.prepare_child(fork_id=FORK)
 
@@ -2219,12 +2255,16 @@ async def forked(
     *,
     crossed: bool = False,
     turnover_at: Any = None,
+    plans: Optional[List[ForkChildPlan]] = None,
 ) -> Tuple[ForkRequest, Any, List[StreamStart]]:
-    """Take one generation to its acknowledgement, fork it, and read out both child starts.
+    """Take one generation to its acknowledgement, fork it, and read out every child start.
 
     ``crossed`` takes the parent over a continuation boundary before the fork, which is where a
     child's preparation has to work from: the world behind A is gone with the execution that held
     it and the committed evidence is all there is.
+
+    ``plans`` is the roster the fork is asked for, which is the pair unless a caller asks for the
+    oracle copy beside them.
 
     One Worker serves the whole lineage, which is the deployment invariant, so this runs inside
     the caller's Worker rather than owning one of its own.
@@ -2232,7 +2272,7 @@ async def forked(
     caller = await worked(env, composed, blobs, workflow_id, filing_of(world.env))
     if crossed:
         await cross_a_boundary(caller, turnover_at, workflow_id, env.client)
-    request = await a_fork_request(env.client, caller, composed, tmp_path)
+    request = await a_fork_request(env.client, caller, composed, tmp_path, plans=plans)
     receipt = await fork_stream(env.client, request)
     starts = [
         await started_with(env.client, child.child_workflow_id)
@@ -2368,6 +2408,356 @@ async def test_a_gated_child_prepares_the_cell_it_was_selected_for_and_says_it_i
     )
 
 
+# The third child, which is the oracle copy: the same freeze, given the third rendering the seal
+# committed, at the position the pair are given their receipt and their placebo.
+
+
+async def test_a_fork_of_three_over_the_oracle_body_the_store_lost_creates_no_child_at_all(
+    env: Any, world: ServedEpisode, tmp_path: Path, turnover_at: Any
+) -> None:
+    """What a fork requires is the body of every cell its children deliver, and nothing besides.
+
+    The oracle body is a retained object no operation reads while no child is planned for it, and
+    losing it blocks nothing: the pair forks over this same generation with it gone. A fork that
+    plans an oracle copy is asking for that body, so the prebarrier read covers it, and a barrier
+    committed without it would fence the parent to create a generation holding a dependency it
+    could never resolve.
+    """
+    blobs = tmp_path / "blobs"
+    contract = contract_of(world.env)
+    turnover_at(10_000)
+    composed = oracle_capable(start_for(world, contract, blobs))
+    parent = "stream/fork-lost-oracle/1"
+    async with stream_worker(env.client, activities=activities_of(world)):
+        caller = await worked(env, composed, blobs, parent, filing_of(world.env))
+        manifest = await a_committed_manifest(env.client, parent, blobs)
+        oracle = manifest.cells[ORACLE_CELL].sha256
+        FilesystemBlobStore(blobs).path_for(oracle).unlink()
+
+        three = await a_fork_request(
+            env.client, caller, composed, tmp_path, plans=three_plans(composed, tmp_path)
+        )
+        with pytest.raises(Exception) as raised:
+            await fork_stream(env.client, three)
+        assert fork_refusal(raised.value) == FORK_REPAIRABLE_ABSENCE
+        assert fork_can_be_retried(raised.value)
+        # The refusal names the object the store could not produce, which is the oracle body and
+        # not one of the pair's: a fork of the pair over this same generation reads neither.
+        assert oracle in str(raised.value.__cause__)
+        assert manifest.cells[GRADED_CELL].sha256 not in str(raised.value.__cause__)
+
+        # No barrier stands and no child of that roster exists.
+        answer = await fork_status(env.client, three)
+        assert answer.found is False
+        assert answer.parent_state == "open"
+        for ordinal in (1, 2, 3):
+            with pytest.raises(RPCError):
+                await env.client.get_workflow_handle(
+                    child_workflow_id(
+                        identity_namespace="default",
+                        parent_workflow_id=parent,
+                        fork_id=FORK,
+                        child_ordinal=ordinal,
+                    )
+                ).describe()
+
+        # And the same generation forks into the pair with that body still gone, because no child
+        # of the pair was ever going to be given it.
+        pair = await a_fork_request(
+            env.client, caller, composed, tmp_path, fork_id="fork-2"
+        )
+        receipt = await fork_stream(env.client, pair)
+        assert receipt.children == 2
+        assert [child.target_cell for child in receipt.child_receipts] == [
+            GRADED_CELL,
+            PLACEBO_CELL,
+        ]
+
+
+async def test_a_fork_of_three_serves_each_child_the_rendering_its_own_plan_named(
+    env: Any, world: ServedEpisode, tmp_path: Path, turnover_at: Any
+) -> None:
+    """Three children of one freeze, each given exactly one of the three committed cells.
+
+    Nothing that could rebuild A is available here either, so what each child has is the descriptor
+    its parent committed, the entry in it for the cell its own plan named, and the bytes under that
+    entry. The two arms of the comparison come to one measurement, which is what the pair evidence
+    establishes; the oracle copy comes to its own, because a hash and a count publication took over
+    the pair say nothing about a third body and the count it is held to is the count of the bytes
+    the source committed.
+
+    The oracle copy is a child like the other two in everything the platform does with it: its own
+    derived identity, its own store, its own claim, its own preparation Activity and its own
+    readiness. It also carries one name neither arm does, the descriptor of the policy that
+    delivers its cell, and its claim reads that name back like any other object it depends on.
+    """
+    blobs = tmp_path / "blobs"
+    contract = contract_of(world.env)
+    turnover_at(10_000)
+    composed = oracle_capable(start_for(world, contract, blobs, silent=True))
+    served: Dict[str, Any] = {}
+    async with stream_worker(env.client, activities=a_closing_worker(world)):
+        request, receipt, starts = await forked(
+            env,
+            world,
+            composed,
+            blobs,
+            tmp_path,
+            "stream/three-cells/1",
+            crossed=True,
+            turnover_at=turnover_at,
+            plans=three_plans(composed, tmp_path),
+        )
+        assert receipt.children == 3
+        assert [child.target_cell for child in receipt.child_receipts] == [
+            GRADED_CELL,
+            PLACEBO_CELL,
+            ORACLE_CELL,
+        ]
+        assert [child.branch_slot for child in receipt.child_receipts] == [
+            FIRST_SLOT,
+            SECOND_SLOT,
+            THIRD_SLOT,
+        ]
+        # And all three agree on the task none of them has worked yet, read out of each one's own
+        # start rather than copied from the parent's.
+        assert len({child.next_assignment_id for child in receipt.child_receipts}) == 1
+        assert len({child.next_task_body_sha256 for child in receipt.child_receipts}) == 1
+
+        manifest = carried_source(
+            [one for one in carried(starts[0]).attempts if one.attempt_id == ATTEMPT][0]
+        )
+        close_the_capture()
+        for start, child in zip(starts, receipt.child_receipts):
+            identity = child.child_workflow_id
+            stream, ready = await a_ready_child(env.client, start, identity, blobs)
+            assert ready.selected_cell == child.target_cell
+            assert ready.selected_body_reference == manifest.cells[child.target_cell].sha256
+            assert ready.selected_policy_digest == CELL_POLICIES[child.target_cell]
+            assert start.fork_origin is not None
+            assert start.fork_origin.children == 3
+
+            caller = await a_child_caller(stream, start)
+            payload = await caller.pull()
+            assert payload.kind == "payload"
+            assert payload.message_id == oid(0x103)
+            served[child.target_cell] = payload
+            raw = body_of(payload).encode("ascii")
+            assert sha256(raw).hexdigest() == manifest.cells[child.target_cell].sha256
+            assert len(raw) == BODY_SIZE == contract.body_size
+
+        # The oracle copy's own inventory names the descriptor of the policy it delivers under,
+        # and its claim read that object back out of its own store like any other.
+        [_graded, _placebo, oracle] = starts
+        assert ORACLE_RECEIPT_ARTIFACT_V1_DIGEST in carried(oracle).committed_blobs
+        assert ORACLE_RECEIPT_ARTIFACT_V1_DIGEST not in carried(starts[0]).committed_blobs
+        assert (
+            FilesystemBlobStore(Path(oracle.blob_root or "")).unverified(
+                [ORACLE_RECEIPT_ARTIFACT_V1_DIGEST]
+            )
+            == []
+        )
+
+    # The pair comes to one measurement under the mask publication registered, and the oracle
+    # copy comes to its own count over the bytes its own entry names.
+    spans = mask_spans(contract)
+    pair = [served[GRADED_CELL], served[PLACEBO_CELL]]
+    assert len({len(one.visible_text.encode("utf-8")) for one in pair}) == 1
+    for one in pair:
+        assert sha256(masked_body(body_of(one).encode("ascii"), spans)).hexdigest() == (
+            manifest.pair_parity.masked_body_sha256
+        )
+        assert len(one.visible_text.encode("utf-8")) == payload_wire_count(
+            payload_message_id=oid(0x103),
+            attempt_id=ATTEMPT,
+            encoded_body_bytes=manifest.pair_parity.encoded_body_bytes,
+        )
+    statement = served[ORACLE_CELL]
+    assert body_of(statement) not in {body_of(one) for one in pair}
+    assert len(statement.visible_text.encode("utf-8")) == payload_wire_count(
+        payload_message_id=oid(0x103),
+        attempt_id=ATTEMPT,
+        encoded_body_bytes=encoded_body_bytes(body_of(statement)),
+    )
+    assert request.fork_id == FORK
+
+
+async def test_an_oracle_copy_that_fails_before_its_readout_leaves_the_pair_where_it_was(
+    env: Any, world: ServedEpisode, frozen_bundle: Path, tmp_path: Path, turnover_at: Any
+) -> None:
+    """The oracle copy stands beside the comparison, so its failure is recorded and nothing else.
+
+    Its own body is taken out of its own store after it has claimed, which is the one loss that
+    reaches a preparation and no arm's: the pair's bodies are each their own child's, and one
+    child's preparation never reads another's. What follows is the whole of what an oracle failure
+    is allowed to do. The refusal is a row under that child's own generation, the copy publishes no
+    readiness and serves nothing, and the two arms deliver their exact cells against the identifier
+    they inherited and work the next task in worlds of their own exactly as they would have.
+    """
+    blobs = tmp_path / "blobs"
+    contract = contract_of(world.env)
+    turnover_at(10_000)
+    composed = oracle_capable(start_for(world, contract, blobs, silent=True))
+    route = WorldRoute()
+    parent = "stream/oracle-failed/1"
+    route.record(parent, ATTEMPT, world, 1)
+    opened: List[ServedEpisode] = []
+    try:
+        async with stream_worker(env.client, activities=a_routed_worker(world, route)):
+            _request, receipt, starts = await forked(
+                env,
+                world,
+                composed,
+                blobs,
+                tmp_path,
+                parent,
+                plans=three_plans(composed, tmp_path),
+            )
+            [graded, placebo, oracle] = starts
+            copy = receipt.child_receipts[2].child_workflow_id
+
+            # The oracle copy claims over the closure it was given and then loses its own body.
+            given_its_objects(blobs, oracle)
+            stream = await a_claimed_child(env.client, oracle, copy)
+            reference = selected_reference(oracle)
+            FilesystemBlobStore(Path(oracle.blob_root or "")).path_for(reference).unlink()
+            with pytest.raises(Exception) as raised:
+                await stream.prepare_child(fork_id=FORK)
+            assert fork_refusal(raised.value) == FORK_REPAIRABLE_ABSENCE
+
+            # The row is that copy's own, under that copy's own generation, naming the object it
+            # could not produce, and the copy serves nothing.
+            records = await child_records(env.client, copy)
+            [row] = records.operation_failures
+            assert (row.phase, row.reason, row.outcome) == (
+                FORK_PREPARATION,
+                UNAVAILABLE_EVIDENCE,
+                REFUSED_OPERATION,
+            )
+            assert row.generation == copy
+            assert row.references == [reference]
+
+            # And the pair is where it was: each arm delivers its own cell and works the next task
+            # in a world of its own, with nothing about the copy reaching either of them.
+            answer = filing_of(world.env)
+            for index, (start, child) in enumerate(
+                zip([graded, placebo], receipt.child_receipts[:2])
+            ):
+                identity = child.child_workflow_id
+                arm, ready = await a_ready_child(env.client, start, identity, blobs)
+                assert ready.selected_cell == child.target_cell
+                caller = await a_child_caller(arm, start)
+                payload = await caller.pull()
+                assert sha256(body_of(payload).encode("ascii")).hexdigest() == (
+                    child.selected_body_reference
+                )
+                await caller.present(payload)
+                task = await caller.pull()
+                assert task.attempt_id == SILENT
+                await caller.present(task)
+                own = await a_world_at(frozen_bundle, tmp_path, index, f"arm-{index}")
+                opened.append(own)
+                route.record(identity, SILENT, own, 1)
+                await caller.present(await caller.seal(answer, attempt_id=SILENT))
+
+                held = await child_records(env.client, identity)
+                assert held.operation_failures == []
+                scored = {one.attempt_id: one for one in held.attempts}
+                assert scored[ATTEMPT].payload_delivered
+                assert scored[ATTEMPT].source_generation == parent
+                assert scored[SILENT].source_generation == identity
+                assert scored[SILENT].submission_digest is not None
+
+            # The copy's own record is still the one refusal, and it holds no candidate.
+            still = await child_records(env.client, copy)
+            assert [one.outcome for one in still.operation_failures] == [REFUSED_OPERATION]
+            assert (await stream.stream_state()).obligations[ATTEMPT] == "eligible"
+    finally:
+        for one in opened:
+            await one.close()
+
+
+async def test_an_oracle_copy_recovers_its_own_preparation_after_a_crash(
+    env: Any, world: ServedEpisode, tmp_path: Path, turnover_at: Any
+) -> None:
+    """The repair a crash between a claim and a preparation is answered by, run on the third child.
+
+    The claim, the grade, the source and the selection are intact and only the object is gone, so
+    the exact bytes go back and the same logical preparation runs again under the identity the
+    first attempt froze. A crash between the installation and the answer is a republished readiness
+    rather than a second candidate and a second episode, and what the copy serves afterwards is the
+    entry its parent selected for it.
+
+    The pair is untouched throughout, because a repair is the child's own and one child's
+    preparation reads nothing of another's.
+    """
+    blobs = tmp_path / "blobs"
+    contract = contract_of(world.env)
+    turnover_at(10_000)
+    composed = oracle_capable(start_for(world, contract, blobs))
+    async with stream_worker(env.client, activities=a_closing_worker(world)):
+        _request, receipt, starts = await forked(
+            env,
+            world,
+            composed,
+            blobs,
+            tmp_path,
+            "stream/oracle-repair/1",
+            plans=three_plans(composed, tmp_path),
+        )
+        close_the_capture()
+        oracle = starts[2]
+        copy = receipt.child_receipts[2].child_workflow_id
+        store = FilesystemBlobStore(Path(oracle.blob_root or ""))
+        frozen = fork_preparation_operation_identity(FORK, copy, 1)
+        given_its_objects(blobs, oracle)
+        stream = await a_claimed_child(env.client, oracle, copy)
+        reference = selected_reference(oracle)
+        assert reference == receipt.child_receipts[2].selected_body_reference
+        store.path_for(reference).unlink()
+
+        with pytest.raises(Exception) as raised:
+            await stream.prepare_child(fork_id=FORK)
+        assert fork_refusal(raised.value) == FORK_REPAIRABLE_ABSENCE
+        assert fork_can_be_retried(raised.value)
+        records = await child_records(env.client, copy)
+        [row] = records.operation_failures
+        assert (row.operation, row.outcome, row.generation) == (
+            frozen,
+            REFUSED_OPERATION,
+            copy,
+        )
+        [attempt] = [one for one in records.attempts if one.attempt_id == ATTEMPT]
+        assert receipt_availability(attempt, records.operation_failures) == RECEIPT_UNAVAILABLE
+
+        # The exact bytes back, and the owner that follows runs the same logical preparation.
+        copy_closure(blobs, oracle.blob_root or "", [reference])
+        second = await a_claimed_child(env.client, oracle, copy)
+        ready = await second.prepare_child(fork_id=FORK)
+        assert ready.ownership_epoch == 2
+        assert ready.preparation_operation == frozen
+        assert ready.selected_cell == ORACLE_CELL
+        assert ready.selected_body_reference == reference
+
+        records = await child_records(env.client, copy)
+        assert [
+            (one.operation, one.outcome, one.refused_epoch, one.recovered_epoch)
+            for one in records.operation_failures
+        ] == [(frozen, REFUSED_OPERATION, 1, None), (frozen, RECOVERED_OPERATION, 1, 2)]
+        [attempt] = [one for one in records.attempts if one.attempt_id == ATTEMPT]
+        assert receipt_availability(attempt, records.operation_failures) == RECEIPT_AVAILABLE
+
+        # A crash between the installation and the answer republishes what was installed.
+        third = await a_claimed_child(env.client, oracle, copy)
+        republished = await third.prepare_child(fork_id=FORK)
+        assert republished == replace(ready, ownership_epoch=3)
+        assert len((await child_records(env.client, copy)).operation_failures) == 2
+
+        caller = await a_child_caller(third, oracle)
+        payload = await caller.pull()
+        assert sha256(body_of(payload).encode("ascii")).hexdigest() == reference
+
+
 async def test_a_child_that_lost_its_body_after_claiming_refuses_and_recovers_as_one_operation(
     env: Any, world: ServedEpisode, tmp_path: Path, turnover_at: Any
 ) -> None:
@@ -2393,7 +2783,7 @@ async def test_a_child_that_lost_its_body_after_claiming_refuses_and_recovers_as
         identity = child.child_workflow_id
         store = FilesystemBlobStore(Path(start.blob_root or ""))
         frozen = fork_preparation_operation_identity(FORK, identity, 1)
-        copy_closure(blobs, start.blob_root or "", child_closure(start))
+        given_its_objects(blobs, start)
         stream = await a_claimed_child(env.client, start, identity)
         reference = selected_reference(start)
         store.path_for(reference).unlink()
@@ -2553,7 +2943,7 @@ async def test_a_childs_preparation_episode_is_the_one_it_opened_whatever_its_fi
         held, sibling_child = starts[1], receipt.child_receipts[1]
         theirs = sibling_child.child_workflow_id
         their_episode = fork_preparation_operation_identity(FORK, theirs, 1)
-        copy_closure(blobs, held.blob_root or "", child_closure(held))
+        given_its_objects(blobs, held)
         first_owner = await a_claimed_child(env.client, held, theirs)
         _HELD.update({"held": True, "running": False})
         preparing = asyncio.ensure_future(first_owner.prepare_child(fork_id=FORK))
@@ -2609,7 +2999,7 @@ async def test_a_child_that_lost_its_manifest_names_the_object_it_could_not_prod
         identity = child.child_workflow_id
         store = FilesystemBlobStore(Path(start.blob_root or ""))
         frozen = fork_preparation_operation_identity(FORK, identity, 1)
-        copy_closure(blobs, start.blob_root or "", child_closure(start))
+        given_its_objects(blobs, start)
         stream = await a_claimed_child(env.client, start, identity)
         [row] = [one for one in carried(start).attempts if one.attempt_id == ATTEMPT]
         commitment = row.source_commitment or ""
@@ -2718,7 +3108,7 @@ async def test_a_child_handed_a_result_it_cannot_vouch_for_is_refused_for_good(
         ):
             identity = child.child_workflow_id
             frozen = fork_preparation_operation_identity(FORK, identity, 1)
-            copy_closure(blobs, start.blob_root or "", child_closure(start))
+            given_its_objects(blobs, start)
             stream = await a_claimed_child(env.client, start, identity)
             _SUBSTITUTED.clear()
             _SUBSTITUTED.update(moved)
@@ -2820,7 +3210,7 @@ async def test_a_preparation_result_this_child_cannot_carry_ends_the_episode_it_
         start, child = starts[0], receipt.child_receipts[0]
         identity = child.child_workflow_id
         frozen = fork_preparation_operation_identity(FORK, identity, 1)
-        copy_closure(blobs, start.blob_root or "", child_closure(start))
+        given_its_objects(blobs, start)
         stream = await a_claimed_child(env.client, start, identity)
         _OVERSIZED.update({"size": oversize})
 
@@ -2874,7 +3264,7 @@ async def test_a_preparation_result_this_child_cannot_carry_ends_the_episode_it_
         held, theirs_child = starts[1], receipt.child_receipts[1]
         theirs = theirs_child.child_workflow_id
         their_episode = fork_preparation_operation_identity(FORK, theirs, 1)
-        copy_closure(blobs, held.blob_root or "", child_closure(held))
+        given_its_objects(blobs, held)
         first_owner = await a_claimed_child(env.client, held, theirs)
         _OVERSIZED.update({"size": oversize, "held": True, "running": False})
         preparing = asyncio.ensure_future(first_owner.prepare_child(fork_id=FORK))
@@ -2949,7 +3339,7 @@ async def test_a_body_lost_between_a_preparations_two_reads_is_the_absence_a_rep
         start, child = starts[0], receipt.child_receipts[0]
         identity = child.child_workflow_id
         frozen = fork_preparation_operation_identity(FORK, identity, 1)
-        copy_closure(blobs, start.blob_root or "", child_closure(start))
+        given_its_objects(blobs, start)
         stream = await a_claimed_child(env.client, start, identity)
 
         # The claim read its own set back with the body present, and the body goes missing in the
@@ -3022,7 +3412,7 @@ async def test_a_permanent_preparation_outcome_replayed_from_the_journal_names_i
         start, child = starts[0], receipt.child_receipts[0]
         identity = child.child_workflow_id
         frozen = fork_preparation_operation_identity(FORK, identity, 1)
-        copy_closure(blobs, start.blob_root or "", child_closure(start))
+        given_its_objects(blobs, start)
         stream = await a_claimed_child(env.client, start, identity)
         _SUBSTITUTED.update({"source_commitment": "a" * 64})
 
@@ -5339,6 +5729,190 @@ async def test_a_run_crosses_a_boundary_forks_serves_two_cells_and_reads_back_as
     assert delivered[1][1] != delivered[2][1]
 
 
+@DEV_SERVER_ONLY
+@pytest.mark.dev_server
+@pytest.mark.network
+async def test_a_run_forks_three_ways_and_the_oracle_copy_reads_back_beside_the_pair(
+    world: ServedEpisode,
+    frozen_bundle: Path,
+    tmp_path: Path,
+    turnover_at: Any,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The same transition with the oracle copy in it, on the service a run is served by.
+
+    One freeze becomes three generations. Each is given its objects, its directory and its
+    transport, builds the body its own plan selected, is restored, compared and bound, and is let
+    go, and what each of them then pulls is the one cell its own disposition names. All three go on
+    to work the same second task in a world of their own and file it.
+
+    The read-back is the other half. The lineage names what cut each generation, the first task is
+    one piece of work three children hold, and the second is three pieces of work held by one
+    generation each, so a reader that counts by source identity counts the shared prefix once and
+    the local work three times.
+    """
+    monkeypatch.delenv(TEMPORAL_ADDRESS_ENV, raising=False)
+    root = tmp_path / "run"
+    blobs = root / "blobs"
+    contract = contract_of(world.env)
+    turnover_at(10_000)
+    composed = oracle_capable(start_for(world, contract, blobs, silent=True))
+    parent = "stream/the-whole-run-of-three/1"
+    create_run_directory(
+        root,
+        workflow_id=parent,
+        task_queue=STREAM_TASK_QUEUE,
+        configuration_hash=configuration_hash(composed),
+    )
+    route = WorldRoute()
+    route.record(parent, ATTEMPT, world, 1)
+    version, activities, digest = world.env.protocol_v2_terminal(route)
+    environment = EnvironmentTerminal(version, list(activities), digest, route, RECEIPTS_GRADE)
+    operations = ForkOperations.under(root)
+    filing = filing_of(world.env)
+    worlds: List[ServedEpisode] = []
+    gateways: List[Any] = []
+    try:
+        async with durable_client(run_directory=root) as client:
+            service = AService(client)
+            async with stream_worker(client, activities=list(activities)):
+                caller = await opened(service, composed, blobs, parent)
+                await caller.present(await caller.pull())
+                await caller.present(await caller.seal(filing))
+                harness = Harness(tmp_path / "containers", caller)
+
+                retrieval = await retrieve_checkpoint(caller.stream, harness, operations)
+                request = await fork_request_for(
+                    caller.stream,
+                    retrieval=retrieval,
+                    fork_id=FORK,
+                    plans=three_plans(composed, root),
+                )
+                receipt = await fork_stream(client, request)
+                assert receipt.children == 3
+                children = [child.child_workflow_id for child in receipt.child_receipts]
+                assert len({child.next_assignment_id for child in receipt.child_receipts}) == 1
+
+                turnover_at(8)
+                for index, child in enumerate(receipt.child_receipts):
+                    own = await a_world_at(frozen_bundle, tmp_path, 0, f"three-{index}")
+                    worlds.append(own)
+
+                    async def open_one(attempt_id: str, at: int = index) -> ServedEpisode:
+                        """A world of its own for the task this child works next."""
+                        made = await a_world_at(
+                            frozen_bundle, tmp_path, 0, f"three-{at}-{attempt_id}"
+                        )
+                        worlds.append(made)
+                        return made
+
+                    gateway, attachment = await attach_child(
+                        client,
+                        own,
+                        operations,
+                        fork_id=FORK,
+                        child=child,
+                        source=FilesystemBlobStore(blobs),
+                        database_root="..",
+                        consumer_id=f"the-transport-of-{child.branch_slot}",
+                        environment=environment,
+                        open_episode=open_one,
+                    )
+                    gateways.append(gateway)
+                    harness.transports[child.child_workflow_id] = gateway
+                    prepared = await prepare_child(gateway, operations, attachment=attachment)
+                    assert prepared.ready is not None
+                    assert prepared.ready.selected_cell == child.target_cell
+                    comparison = await compare_child(
+                        harness, operations, retrieval=retrieval, preparation=prepared
+                    )
+                    assert comparison.equal
+                    await bind_child(
+                        harness, operations, attachment=attachment, comparison=comparison
+                    )
+
+                released = await release_children(harness, operations, receipt=receipt)
+                assert [one.resumed for one in released] == [True, True, True]
+
+                # Three cells of one source against the one inherited identifier, each of them
+                # the exact reference its own plan selected.
+                bodies = [harness.pulled[one]["body"] for one in children]
+                assert len({one.first_message_id for one in released}) == 1
+                assert len({body for body in bodies}) == 3
+                assert [
+                    sha256(body.encode("ascii")).hexdigest() for body in bodies
+                ] == [child.selected_body_reference for child in receipt.child_receipts]
+                # The pair comes to one measurement and the oracle copy comes to its own.
+                pair = [len(body.encode("ascii")) for body in bodies[:2]]
+                assert pair[0] == pair[1] == contract.body_size == len(bodies[2].encode("ascii"))
+
+                # And all three work the same second task, each in a world of its own, and file it.
+                for gateway in gateways:
+                    task = json.loads(await gateway.pull({}))
+                    assert task["kind"] == "task"
+                    assert task["attempt_id"] == SILENT
+                    answered = json.loads(
+                        await gateway.terminal(
+                            {"attempt_id": SILENT, "arguments": {"filing": filing}}
+                        )
+                    )
+                    assert answered["kind"] == "seal_ack"
+                assert len({one.session_id for one in worlds}) == 3
+
+                # Each child is read once before its transport closes, so the last workflow task
+                # any of them left is applied while its own Worker is still there. A copy taken
+                # over one that is not is a copy nothing can answer a Query from.
+                for gateway in gateways:
+                    assert (await gateway.stream_state()).cursor
+                for gateway in gateways:
+                    await gateway.aclose()
+                gateways.clear()
+    finally:
+        for one in worlds:
+            await one.close()
+        for gateway in gateways:
+            await gateway.aclose()
+
+    # The run is copied somewhere else, and every generation of it reads back from the copy.
+    elsewhere = tmp_path / "archive" / "run"
+    shutil.copytree(root, elsewhere)
+    reads = [
+        await read_records(elsewhere),
+        await read_records(elsewhere / "child-1"),
+        await read_records(elsewhere / "child-2"),
+        await read_records(elsewhere / "child-3"),
+    ]
+    assert [read.workflow_id for read in reads] == [parent, *children]
+    assert reads[0].origin is None
+    for read, child in zip(reads[1:], receipt.child_receipts):
+        assert read.origin is not None
+        assert read.origin.parent_workflow_id == parent
+        assert read.origin.fork_id == FORK
+        assert read.origin.branch_slot == child.branch_slot
+        assert [row.attempt_id for row in inherited_work(read)] == [ATTEMPT]
+        assert sorted(row.attempt_id for row in local_work(read)) == [SILENT]
+
+    # One piece of work three children hold, and three pieces of work held by one each.
+    filed: Dict[str, set] = {}
+    for read in reads:
+        for whose, attempts in sealed_by(read).items():
+            filed.setdefault(whose, set()).update(attempts)
+    assert filed == {
+        parent: {ATTEMPT},
+        children[0]: {SILENT},
+        children[1]: {SILENT},
+        children[2]: {SILENT},
+    }
+
+    # And each child's delivery of the inherited work is its own, all three of them different.
+    delivered = [
+        [row for row in read.records if row.attempt_id == ATTEMPT][0] for read in reads
+    ]
+    assert delivered[0].payload_delivered is False
+    assert all(row.payload_delivered for row in delivered[1:])
+    assert len({row.payload_visible_sha256 for row in delivered[1:]}) == 3
+
+
 async def test_two_retries_of_one_fork_in_flight_at_once_leave_one_answering(
     env: Any, world: ServedEpisode, tmp_path: Path, turnover_at: Any
 ) -> None:
@@ -5548,8 +6122,12 @@ async def test_a_parked_parents_whole_reserve_is_spendable_under_the_cap_it_fits
 
     The suggestion the service publishes is pinned to the cap, so the only thing that can act early
     is this package's own counting.
+
+    The cap is derived from the reserve rather than written down beside it, because the reserve is
+    a number per child a fork may create and the cap has to be one the whole of it fits under along
+    with the work this parent had already done.
     """
-    cap = 40
+    cap = FORK_RESERVE + 20
     blobs = tmp_path / "blobs"
     turnover_at(10_000)
     _LOST_REPLIES.clear()
@@ -5615,7 +6193,7 @@ async def test_a_fork_meeting_a_latch_under_a_real_cap_is_taken_by_the_successor
     fork id, the same checkpoint and the same plans, and what it commits leaves the reserve the
     barrier keeps standing under the same limit.
     """
-    cap = 40
+    cap = FORK_RESERVE + 20
     blobs = tmp_path / "blobs"
     held_open()
     parent = "stream/fork-latched-capped/1"

@@ -1008,6 +1008,76 @@ def test_a_request_this_build_cannot_serve_is_refused_against_itself() -> None:
     assert ORACLE_CELL in str(caught.value)
 
 
+def an_oracle_plan(**changes: Any) -> ForkChildPlan:
+    """The third child a controller asks for: its own branch, its own identities, the oracle cell."""
+    declared = {
+        "branch_slot": "branch-three",
+        "target_cell": ORACLE_CELL,
+        "run_directory": "/runs/one/child-3",
+        "consumer_claim_hash": sha256(b"claims branch-three").hexdigest(),
+        "hidden_execution_id": "the-execution-of-the-third-child",
+    }
+    return a_plan(1, **{**declared, **changes})
+
+
+def test_a_request_asks_for_the_pair_or_for_the_pair_and_the_oracle_copy() -> None:
+    """A third child is a thing a request declares, and it declares it by asking for three.
+
+    The oracle copy stands beside the comparison rather than inside it, so the count and the cell
+    are read together: a fork of two gives no child the oracle cell, and a fork of three gives it
+    to exactly one. Everything else about the request is what it always was, the identities each
+    child is given of its own included.
+    """
+    check_fork_request(a_request())
+    check_fork_request(a_request(child_plans=[a_plan(0), a_plan(1), an_oracle_plan()]))
+
+    # Three children and no oracle among them is not the roster either.
+    with pytest.raises(WireFormatError) as caught:
+        check_fork_request(
+            a_request(child_plans=[a_plan(0), a_plan(1), an_oracle_plan(target_cell=GRADED_CELL)])
+        )
+    assert ORACLE_CELL in str(caught.value)
+    # And so is three children with two of them holding it.
+    with pytest.raises(WireFormatError) as caught:
+        check_fork_request(
+            a_request(
+                child_plans=[
+                    a_plan(0, target_cell=ORACLE_CELL),
+                    a_plan(1),
+                    an_oracle_plan(),
+                ]
+            )
+        )
+    assert ORACLE_CELL in str(caught.value)
+    # A fourth child is a roster this build does not create, whatever cells it names.
+    with pytest.raises(WireFormatError) as caught:
+        check_fork_request(
+            a_request(
+                child_plans=[
+                    a_plan(0),
+                    a_plan(1),
+                    an_oracle_plan(),
+                    an_oracle_plan(
+                        branch_slot="branch-four",
+                        target_cell=GRADED_CELL,
+                        run_directory="/runs/one/child-4",
+                        consumer_claim_hash=sha256(b"claims branch-four").hexdigest(),
+                        hidden_execution_id="the-execution-of-the-fourth-child",
+                    ),
+                ]
+            )
+        )
+    assert "4" in str(caught.value)
+    # The three still owe each other a branch, a store, a consumer and an execution of their own.
+    for shared in ("hidden_execution_id", "consumer_claim_hash", "run_directory"):
+        held = getattr(a_plan(0), shared)
+        with pytest.raises(WireFormatError) as caught:
+            check_fork_request(
+                a_request(child_plans=[a_plan(0), a_plan(1), an_oracle_plan(**{shared: held})])
+            )
+        assert shared in str(caught.value)
+
+
 def test_two_children_of_one_request_never_share_an_identity_or_a_store() -> None:
     """Two executions under one hidden execution id mint one seal id in two places for one attempt.
 

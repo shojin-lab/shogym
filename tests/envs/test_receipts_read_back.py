@@ -885,9 +885,11 @@ async def test_one_source_serves_a_cell_and_leaves_the_next_position_its_own_sou
     assert json.loads(visible)["body"] == bodies[cell].decode("ascii")
     assert filer["source_provenance"]["selected_body_reference"] == derived[cell].body_sha256
     assert filer["payload_visible_sha256"] == sha256(visible.encode("utf-8")).hexdigest()
-    # The oracle is named by the source, retained beside the rest, and derivable by nobody.
+    # The oracle is named by the source, retained beside the rest, and out of reach of either arm
+    # of the comparison: an artifact policy declares one cell, so the policy this row delivers
+    # under resolves the cell it declares and no other.
     assert ORACLE_CELL in manifest.cells
-    with pytest.raises(Exception, match="an arm is served"):
+    with pytest.raises(Exception, match="declares the cells"):
         derived_selection(
             source=manifest,
             origin=origin,

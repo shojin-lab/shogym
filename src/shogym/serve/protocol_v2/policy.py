@@ -29,6 +29,14 @@ bytes is a different claim. Their exposure is a third class, ``artifact``, so th
 not inherit the blinded label's promise that its body holds no verdict, and their bodies are
 resolved through a store rather than rendered, which is what the resolver identity on them names.
 
+``oracle-receipt-artifact-v1`` is the third cell of the same committed source, and it is a record
+of its own rather than a widening of either of those. What separates it is the cell it declares:
+a generation delivering it is delivering the rule stated in words, which is neither a verdict nor
+a body that withholds one, and the parity a contract publishes is over the pair rather than over
+this. Keeping it apart is what makes the closure hold in both directions, because a row names one
+policy and a policy names one cell: a generation resolved to the pair can no more deliver this
+cell than a generation resolved to this one can deliver a receipt or a placebo.
+
 The projection is the whole of what reaches an honest body. :class:`PublicGrade` is a closed type
 carrying the attempt the authority assigned, one score in the unit interval, and finite numbers
 under token names. A grader's free strings, its evidence, its diagnostics and its private
@@ -322,12 +330,33 @@ PLACEBO_RECEIPT_ARTIFACT_V1 = PayloadPolicy(
     resolver_version="1",
 )
 
+#: The third cell of the same source, delivered on its own terms. It names the same renderer
+#: identity and the same resolver as the pair and declares the one cell neither of them does, so
+#: what a generation resolved to it delivers is the source's oracle entry and nothing else. It is
+#: not part of any contract's registered pair: a contract publishes the parity of two cells that
+#: differ only inside registered slots, and this cell says something else entirely.
+ORACLE_RECEIPT_ARTIFACT_V1 = PayloadPolicy(
+    policy_name="oracle-receipt-artifact-v1",
+    policy_version="1",
+    renderer_id="kernel-receipt-artifact-1",
+    renderer_version="1",
+    exposure=ARTIFACT,
+    cells=("oracle",),
+    projection=(
+        ("source_cell", "selected_cell_reference"),
+        ("contract", "receipt_contract_id"),
+    ),
+    resolver_id="blob-store-artifact-1",
+    resolver_version="1",
+)
+
 HONEST_V1_DIGEST = policy_digest(HONEST_V1)
 BLINDED_RECEIPT_V1_DIGEST = policy_digest(BLINDED_RECEIPT_V1)
 PLACEBO_RECEIPT_V1_DIGEST = policy_digest(PLACEBO_RECEIPT_V1)
 LEGACY_PLACEHOLDER_V1_DIGEST = policy_digest(LEGACY_PLACEHOLDER_V1)
 GRADED_RECEIPT_ARTIFACT_V1_DIGEST = policy_digest(GRADED_RECEIPT_ARTIFACT_V1)
 PLACEBO_RECEIPT_ARTIFACT_V1_DIGEST = policy_digest(PLACEBO_RECEIPT_ARTIFACT_V1)
+ORACLE_RECEIPT_ARTIFACT_V1_DIGEST = policy_digest(ORACLE_RECEIPT_ARTIFACT_V1)
 
 #: The pair a receipt contract admits, by the digests that name the two records. It is the pair
 #: rather than either half: what a contract declares is one graded cell and one placebo cell of
@@ -347,6 +376,7 @@ POLICIES: Dict[str, PayloadPolicy] = {
     LEGACY_PLACEHOLDER_V1_DIGEST: LEGACY_PLACEHOLDER_V1,
     GRADED_RECEIPT_ARTIFACT_V1_DIGEST: GRADED_RECEIPT_ARTIFACT_V1,
     PLACEBO_RECEIPT_ARTIFACT_V1_DIGEST: PLACEBO_RECEIPT_ARTIFACT_V1,
+    ORACLE_RECEIPT_ARTIFACT_V1_DIGEST: ORACLE_RECEIPT_ARTIFACT_V1,
 }
 
 #: The policies a generation created now may select, by name. The placeholder is renderable and
@@ -360,6 +390,7 @@ SELECTABLE: Dict[str, PayloadPolicy] = {
     PLACEBO_RECEIPT_V1.policy_name: PLACEBO_RECEIPT_V1,
     GRADED_RECEIPT_ARTIFACT_V1.policy_name: GRADED_RECEIPT_ARTIFACT_V1,
     PLACEBO_RECEIPT_ARTIFACT_V1.policy_name: PLACEBO_RECEIPT_ARTIFACT_V1,
+    ORACLE_RECEIPT_ARTIFACT_V1.policy_name: ORACLE_RECEIPT_ARTIFACT_V1,
 }
 
 

@@ -41,7 +41,7 @@ from temporalio.converter import default as default_converter
 from temporalio.service import RPCError, RPCStatusCode
 
 from shogym.serve.episode import ServedEpisode
-from shogym.serve.protocol_v2.artifact import read_source_artifact
+from shogym.serve.protocol_v2.artifact import ORACLE_CELL, read_source_artifact
 from shogym.serve.protocol_v2.blobs import FilesystemBlobStore, create_directory, flush_directory
 from shogym.serve.protocol_v2.errors import WireFormatError
 from shogym.serve.protocol_v2.gateway import (
@@ -50,6 +50,7 @@ from shogym.serve.protocol_v2.gateway import (
     RefusalSink,
     StreamGateway,
     attach_gateway,
+    install_policies,
 )
 from shogym.serve.protocol_v2.identity import length_prefixed
 from shogym.serve.protocol_v2.kernel import (
@@ -855,13 +856,22 @@ def _installed(
     read back after it was installed is an interrupted copy, and both of them are the controller's
     to repair. A retained object that never arrived blocks nothing and is reported.
 
+    The preimage of every policy this child's own rows name is installed from that declaration
+    first, exactly the way any generation's is, and only then is the parent asked for what is
+    left. A child of the comparison changes nothing by it: those descriptors are content addressed
+    and its parent held them all along, so the same objects go in under the same names. A child
+    delivering the oracle cell does, because no contract registers the policy that delivers it and
+    its parent's store was never given the bytes: asking the parent for them would report a
+    repairable absence over an object nothing lost.
+
     The absence is the same absence wherever the read finds it. Verifying the source and copying it
-    are two reads of every required object, the objects are files and nothing holds them open in
-    between, so one produced a moment ago can be gone by the time it is installed. That is reported
-    as the repairable absence it is, naming the object, rather than reaching a controller as
-    whatever the store raised: a refusal with no reason on it is one nothing can decide to retry.
-    The objects installed before it stay installed, because copying is idempotent under retry and
-    an installed object is the object its name promises.
+    are two reads of every object it is asked for, the objects are files and nothing holds them
+    open in between, so one produced a moment ago can be gone by the time it is installed. That is
+    reported as the repairable absence it is, naming the object, rather than reaching a controller
+    as whatever the store raised: a refusal with no reason on it is one nothing can decide to
+    retry. The objects installed before it stay installed, because copying is idempotent under
+    retry and an installed object is the object its name promises. What the copy is accepted on is
+    still the whole required set read back out of the store it filled.
     """
     if not start.blob_root:
         raise ForkRefused(
@@ -870,13 +880,15 @@ def _installed(
             "its objects against nothing verifies nothing",
         )
     into = FilesystemBlobStore(Path(start.blob_root))
-    unavailable = source.unverified(required)
+    install_policies(into, start)
+    outstanding = into.unverified(required)
+    unavailable = source.unverified(outstanding)
     if unavailable:
         raise ForkRefused(
             FORK_REPAIRABLE_ABSENCE,
             f"the store this fork copies from cannot produce {sorted(unavailable)}",
         )
-    for reference in required:
+    for reference in outstanding:
         try:
             copied = source.read(reference)
         except WireFormatError as gone:
@@ -1246,26 +1258,33 @@ async def bind_child(
 async def release_children(
     adapter: ForkAdapter, operations: ForkOperations, *, receipt: ForkReceipt
 ) -> List[ChildReleased]:
-    """Resume one container per child, and only where every child of the fork is ready and equal.
+    """Resume one container per child, and only where every child it is compared with is ready.
 
     Release is the asymmetric step, so the policy is stated once and read out of the record rather
     than out of whatever this process remembers. A child that published no readiness, or whose
-    restored container did not compare equal, holds the whole fork: nothing is resumed, the failure
-    stands against the exact child it names, and the child that was fine is held rather than
-    promoted, because a link with one arm running is not the comparison anybody registered.
+    restored container did not compare equal, holds every child it is compared with: nothing in
+    that group is resumed, the failure stands against the exact child it names, and the child that
+    was fine is held rather than promoted, because a link with one arm running is not the
+    comparison anybody registered.
 
     Which children that is over is the fork's own receipt and never a list a caller chose. A
-    subset would make the gate a statement about whichever children were named: passing one child
+    subset would make the gate a statement about whichever children were named: passing one arm
     would leave the other's readiness, comparison and binding out of the decision entirely, and
     the one arm would run against a sibling nobody had established was ready. So the roster is the
-    parent's typed evidence, and every child in it is what the hold is derived from.
+    parent's typed evidence, and the groups below are derived from the cells in it.
+
+    The oracle copy is a group of its own, and that is the whole of what makes it one. It is
+    beside the comparison rather than inside it, never eligible for retention and never named by a
+    coin, so a pair that is ready is released whether or not it is, and its own failure is a row
+    against it that leaves the pair's outcome and continuation exactly as they were. It is held on
+    the same terms in the other direction: a pair that is not ready holds nothing of the oracle's.
 
     A resumption is kept and read back. A controller that crashed between the first release and the
     second recovers the child that is already running from its own record and resumes only the one
     still paused, so nothing is restored over work that happened and no child is created twice.
 
     The receipt's own version is checked before any of it is read, because this is where a receipt
-    becomes a decision about two containers: a shape this build does not admit is refused rather
+    becomes a decision about containers: a shape this build does not admit is refused rather
     than consumed for the one field the refusal would have been read out of.
     """
     check_fork_receipt(receipt)
@@ -1296,39 +1315,67 @@ async def release_children(
             withheld[child] = "its container is bound to no generation"
         else:
             bound[child] = binding
-    if withheld:
-        return [
-            ChildReleased(
-                fork_id=fork_id,
-                child_workflow_id=child,
-                container_id=bound[child].container_id if child in bound else "",
-                resumed=False,
-                held=withheld.get(child)
-                or f"the child {sorted(withheld)[0]} of this fork "
-                f"{withheld[sorted(withheld)[0]]}",
-            )
-            for child in children
-        ]
     released: List[ChildReleased] = []
-    for child in children:
-        key = release_key(fork_id=fork_id, child_workflow_id=child)
-        kept = operations.recorded(key, ChildReleased)
-        if kept is not None and kept.resumed:
-            released.append(kept)
-            continue
-        resumed = await adapter.release(
-            fork_id=fork_id, child_workflow_id=child, container_id=bound[child].container_id
-        )
-        released.append(
-            operations.record(
-                key,
+    for group in _released_together(receipt):
+        holding = sorted(one for one in group if one in withheld)
+        if holding:
+            released.extend(
                 ChildReleased(
                     fork_id=fork_id,
                     child_workflow_id=child,
-                    container_id=resumed.container_id,
-                    resumed=True,
-                    first_message_id=resumed.first_message_id,
-                ),
+                    container_id=bound[child].container_id if child in bound else "",
+                    resumed=False,
+                    held=withheld.get(child)
+                    or f"the child {holding[0]} of this fork {withheld[holding[0]]}",
+                )
+                for child in group
             )
-        )
-    return released
+            continue
+        for child in group:
+            key = release_key(fork_id=fork_id, child_workflow_id=child)
+            kept = operations.recorded(key, ChildReleased)
+            if kept is not None and kept.resumed:
+                released.append(kept)
+                continue
+            resumed = await adapter.release(
+                fork_id=fork_id, child_workflow_id=child, container_id=bound[child].container_id
+            )
+            released.append(
+                operations.record(
+                    key,
+                    ChildReleased(
+                        fork_id=fork_id,
+                        child_workflow_id=child,
+                        container_id=resumed.container_id,
+                        resumed=True,
+                        first_message_id=resumed.first_message_id,
+                    ),
+                )
+            )
+    order = {child: index for index, child in enumerate(children)}
+    return sorted(released, key=lambda one: order[one.child_workflow_id])
+
+
+def _released_together(receipt: ForkReceipt) -> List[List[str]]:
+    """The children of one fork, grouped into the sets whose release is one decision.
+
+    The comparison is one group, because releasing one of its arms against a sibling nobody had
+    established was ready is not the comparison anybody registered. The oracle copy is a group of
+    one, because it stands beside that comparison rather than inside it: the coin never names it,
+    it is never eligible for retention, and a fork that made no oracle copy has one group and the
+    behaviour it always had.
+
+    The grouping is read off the cell each child was given, which is the parent's own typed
+    evidence, rather than off an ordinal or a slot name a controller chose.
+    """
+    pair = [
+        child.child_workflow_id
+        for child in receipt.child_receipts
+        if child.target_cell != ORACLE_CELL
+    ]
+    oracles = [
+        [child.child_workflow_id]
+        for child in receipt.child_receipts
+        if child.target_cell == ORACLE_CELL
+    ]
+    return ([pair] if pair else []) + oracles
