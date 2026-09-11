@@ -191,6 +191,7 @@ from shogym.serve.protocol_v2.policy import (  # noqa: E402
     GRADED_RECEIPT_ARTIFACT_V1_DIGEST,
     KERNEL_STAND_IN_GRADE,
     LEGACY,
+    ORACLE_RECEIPT_ARTIFACT_V1_DIGEST,
     PLACEBO_RECEIPT_ARTIFACT_V1_DIGEST,
     PLATFORM_DEFAULT,
     POLICIES,
@@ -1625,8 +1626,10 @@ def test_a_committed_source_derives_either_eligible_cell_and_never_the_oracle() 
     """What a derivation takes is the source, its origin, a target policy and cell, and a store.
 
     No live world, no canonical answer text, no recovery token, no second seal, no grade and no
-    render. The oracle is refused at the first check: it is named by the descriptor, retained with
-    everything else, and is not a cell any derivation resolves.
+    render. An arm of the comparison never reaches the oracle entry, and the reason is the pairing
+    rather than a list: each artifact policy declares one cell, so the oracle is refused under
+    either policy of the pair the way a receipt is refused under the policy that delivers the
+    oracle.
     """
     source = a_manifest()
     origin = SourceOriginContext(hidden_execution_id=EXECUTION, execution_ordinal=0)
@@ -2121,17 +2124,21 @@ def test_the_module_this_runs_under_needs_no_event_loop_of_its_own() -> None:
 # The fork's pure slice: what a parent's committed source becomes in a child, what number a
 # generation that declares a fork writes, and what a child's restore accepts and refuses.
 
-#: The two slots one parent's fork may create, and the one its child below serves. They are
-#: internal names for branches and say nothing about what either branch is for.
+#: The slots one parent's fork may create, and the one its child below serves. They are internal
+#: names for branches and say nothing about what any branch is for: which cell a child delivers is
+#: its plan's to say and never a name's.
 FIRST_SLOT = "first"
 SECOND_SLOT = "second"
+THIRD_SLOT = "third"
 CHILD_EXECUTION = "execution-child-1"
 FORK = "fork-1"
 
-#: Which registered policy each eligible cell is delivered under.
+#: Which registered policy each cell of a source is delivered under. Each policy declares one
+#: cell, which is what closes the three against each other.
 CELL_POLICIES = {
     GRADED_CELL: GRADED_RECEIPT_ARTIFACT_V1_DIGEST,
     PLACEBO_CELL: PLACEBO_RECEIPT_ARTIFACT_V1_DIGEST,
+    ORACLE_CELL: ORACLE_RECEIPT_ARTIFACT_V1_DIGEST,
 }
 
 
@@ -2738,9 +2745,11 @@ def test_a_generation_with_no_fork_origin_admits_its_own_identity_and_nothing_el
 def test_the_child_transformation_refuses_every_selection_a_parent_could_not_have_made() -> None:
     """It composes a child or it refuses, and it never composes one a restore would turn away.
 
-    The oracle is refused here rather than at the far end, which is what keeps it unselectable
-    from the plan rather than from a search of the bytes: all three cells share wrapper bytes, so
-    nothing downstream could tell one from another by shape.
+    What it asks of a cell is that the source holds it, so all three of them compose. Which of the
+    three a given child may be given is closed one step out, where the parent holds that child's
+    own rows and runs the checks that child's own constructor makes, and it is closed from the
+    plan rather than from a search of the bytes: all three cells share wrapper bytes, so nothing
+    downstream could tell one from another by shape.
     """
     parent = a_projection(a_fork_parent())
 
@@ -2754,8 +2763,15 @@ def test_the_child_transformation_refuses_every_selection_a_parent_could_not_hav
         attempt_id=ATTEMPT, cell=PLACEBO_CELL, policy_digest=PLACEBO_RECEIPT_ARTIFACT_V1_DIGEST
     )
     composed(placebo)
-    with pytest.raises(ValueError, match="a child is served"):
-        composed(replace(placebo, cell=ORACLE_CELL))
+    composed(
+        ChildSelection(
+            attempt_id=ATTEMPT,
+            cell=ORACLE_CELL,
+            policy_digest=ORACLE_RECEIPT_ARTIFACT_V1_DIGEST,
+        )
+    )
+    with pytest.raises(ValueError, match="a source holds the cells"):
+        composed(replace(placebo, cell="the-fourth-cell"))
     with pytest.raises(ValueError, match="selected twice"):
         composed(placebo, placebo)
     with pytest.raises(ValueError, match="holds no attempt"):
@@ -4334,6 +4350,270 @@ def test_the_receipt_a_fork_will_answer_with_is_bounded_before_its_barrier(
         parent._measured_replies(request, built, now)
     assert raised.value.reason == FORK_CONFIGURATION_VIOLATION
     assert "the fork receipt is bounded at" in raised.value.clause
+    assert parent._fork is None
+    monkeypatch.undo()
+
+
+# The third child, which is the oracle copy: a generation of the same freeze, given the oracle
+# rendering at the position the pair are given their receipt and their placebo.
+
+
+def an_oracle_parent(**changes: Any) -> StreamStart:
+    """The same fork-capable generation, declaring the third slot its fork may create."""
+    return a_fork_parent(forkable_slots=[FIRST_SLOT, SECOND_SLOT, THIRD_SLOT], **changes)
+
+
+def an_oracle_request(parent: Any, **changes: Any) -> ForkRequest:
+    """The typed fork for the pair and the oracle copy beside them, in that order."""
+    plans = changes.pop(
+        "child_plans",
+        [
+            a_plan(FIRST_SLOT, GRADED_CELL),
+            a_plan(SECOND_SLOT, PLACEBO_CELL),
+            a_plan(THIRD_SLOT, ORACLE_CELL),
+        ],
+    )
+    return a_fork_request(parent, child_plans=plans, **changes)
+
+
+def test_a_fork_of_three_prepares_the_oracle_copy_beside_the_pair(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """One more child of the same freeze, given the third rendering the seal committed.
+
+    It is a child like the other two and not a special case of one: its own derived identity, its
+    own branch, its own store, its own hidden execution, its own lineage record and its own
+    selected entry, and the entry is the source's own for the cell its plan named. The lineage
+    every child carries says three children now, so a reader of any one of them can say how many
+    the fork made without reading the parent's history.
+
+    What separates it is what it delivers, and that is settled by the pairing rather than by a
+    name: its rows resolve the oracle cell under the one policy that declares it, and the pair's
+    rows resolve theirs under the two policies the contract registered.
+    """
+    parent = a_quiet_parent(monkeypatch, start=an_oracle_parent())
+    request = an_oracle_request(parent)
+    parent._refuse_a_fork(request)
+    built = parent._built_children(request)
+    manifest = a_manifest()
+
+    assert [row.child_ordinal for row, _start in built] == [1, 2, 3]
+    assert [row.branch_slot for row, _start in built] == [FIRST_SLOT, SECOND_SLOT, THIRD_SLOT]
+    assert [row.target_cell for row, _start in built] == [
+        GRADED_CELL,
+        PLACEBO_CELL,
+        ORACLE_CELL,
+    ]
+    assert [row.selected_body_reference for row, _start in built] == [
+        manifest.cells[GRADED_CELL].sha256,
+        manifest.cells[PLACEBO_CELL].sha256,
+        manifest.cells[ORACLE_CELL].sha256,
+    ]
+    for name in ("child_workflow_id", "hidden_execution_id", "consumer_claim_hash"):
+        named = [getattr(row, name) for row, _start in built]
+        assert len(set(named)) == 3
+
+    # Each child's own carrier holds the selection its plan named, transformed once from the
+    # parent's, and its own row resolves exactly that cell under the policy that declares it.
+    for row, start in built:
+        assert start.fork_origin is not None
+        assert start.fork_origin.children == 3
+        assert start.fork_origin.child_ordinal == row.child_ordinal
+        carried = unpack_carrier(start.carry, CONVERTER) if start.carry else None
+        assert carried is not None
+        [inherited] = [one for one in carried.attempts if one.attempt_id == ATTEMPT]
+        assert inherited.selected_cell == row.target_cell
+        assert inherited.selected_body_reference == row.selected_body_reference
+        assert inherited.selected_policy_digest == CELL_POLICIES[row.target_cell]
+        [delivering] = [one for one in start.dispositions if one.kind == DELIVER]
+        assert (delivering.cell, delivering.policy_digest) == (
+            row.target_cell,
+            CELL_POLICIES[row.target_cell],
+        )
+
+    # And the oracle child's own inventory names the descriptor of the policy it delivers under.
+    # No contract registers that policy, so it is a name no generation of the comparison ever
+    # held and the one thing a child of three is given that a child of two is not.
+    inventories = [
+        unpack_carrier(start.carry, CONVERTER).committed_blobs
+        for _row, start in built
+        if start.carry is not None
+    ]
+    assert ORACLE_RECEIPT_ARTIFACT_V1_DIGEST in inventories[2]
+    assert ORACLE_RECEIPT_ARTIFACT_V1_DIGEST not in inventories[0]
+    assert ORACLE_RECEIPT_ARTIFACT_V1_DIGEST not in inventories[1]
+    assert inventories[0] == inventories[1]
+
+
+def test_a_fork_of_two_is_the_fork_it_was_before_the_oracle_copy_existed(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The pair alone still composes the two starts it composed, byte for byte.
+
+    A third child is something a request asks for. A parent that was asked for two builds two, the
+    lineage each of them carries still says two, and neither carrier gains a name, so a fork taken
+    by the build before this one and a fork taken now are the same fork.
+    """
+    parent = a_quiet_parent(monkeypatch)
+    held = parent._projection().committed_blobs
+    built = parent._built_children(a_fork_request(parent))
+    assert [row.child_ordinal for row, _start in built] == [1, 2]
+    for _row, start in built:
+        assert start.fork_origin is not None
+        assert start.fork_origin.children == 2
+        assert start.carry is not None
+        inventory = unpack_carrier(start.carry, CONVERTER).committed_blobs
+        assert ORACLE_RECEIPT_ARTIFACT_V1_DIGEST not in inventory
+        assert inventory == held
+
+
+def test_neither_the_pair_nor_the_oracle_copy_can_be_given_the_other_ones_rendering(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The closure holds in both directions, and it is read off the plan rather than the bytes.
+
+    All three cells travel in one envelope and a store verifies any digest without knowing which
+    cell it is, so nothing downstream tells them apart by shape. What tells them apart is the
+    pairing: a child's rows resolve one cell under the policy that declares it, and the entry its
+    parent selected for it has to be the entry that row resolves.
+
+    There are two ways to ask for the wrong one and each is refused where it is asked. A fork of
+    the pair that names the oracle cell at all is refused at admission, because the oracle copy is
+    asked for by asking for three children and never by giving one of two the third rendering. A
+    fork of three whose plan and whose rows disagree is refused before the barrier, whichever of
+    them it is: an arm whose rows would deliver the oracle rendering, and an oracle copy whose
+    rows would deliver a receipt.
+    """
+    parent = a_quiet_parent(monkeypatch, start=an_oracle_parent())
+    # The pair, with one of them given the third rendering. There is no such fork to take.
+    for plans in (
+        [a_plan(FIRST_SLOT, GRADED_CELL, target_cell=ORACLE_CELL), a_plan(SECOND_SLOT, PLACEBO_CELL)],
+        [a_plan(FIRST_SLOT, GRADED_CELL, target_cell=ORACLE_CELL), a_plan(SECOND_SLOT, ORACLE_CELL)],
+    ):
+        refused = fork_refusal(parent, a_fork_request(parent, child_plans=plans))
+        assert refused.reason == FORK_CONFIGURATION_VIOLATION
+        assert ORACLE_CELL in refused.clause
+
+    # An arm of the comparison whose own rows would deliver the oracle rendering.
+    arm = an_oracle_request(
+        parent,
+        child_plans=[
+            a_plan(FIRST_SLOT, ORACLE_CELL, target_cell=GRADED_CELL),
+            a_plan(SECOND_SLOT, PLACEBO_CELL),
+            a_plan(THIRD_SLOT, ORACLE_CELL),
+        ],
+    )
+    parent._refuse_a_fork(arm)
+    with pytest.raises(kernel_workflow.ForkRefused) as raised:
+        parent._built_children(arm)
+    assert raised.value.reason == FORK_CONFIGURATION_VIOLATION
+    assert "child 1 is one that child's own restore refuses" in raised.value.clause
+    assert "does not resolve" in raised.value.clause
+
+    # And the oracle copy whose own rows would deliver a receipt.
+    copy = an_oracle_request(
+        parent,
+        child_plans=[
+            a_plan(FIRST_SLOT, GRADED_CELL),
+            a_plan(SECOND_SLOT, PLACEBO_CELL),
+            a_plan(THIRD_SLOT, GRADED_CELL, target_cell=ORACLE_CELL),
+        ],
+    )
+    parent._refuse_a_fork(copy)
+    with pytest.raises(kernel_workflow.ForkRefused) as raised:
+        parent._built_children(copy)
+    assert raised.value.reason == FORK_CONFIGURATION_VIOLATION
+    assert "child 3 is one that child's own restore refuses" in raised.value.clause
+    assert "does not resolve" in raised.value.clause
+
+    # None of them fenced anything, and the lawful roster is what the same build accepts.
+    assert parent._fork is None
+    assert parent._generation_state == "open"
+    parent._built_children(an_oracle_request(parent))
+
+
+def test_a_row_of_the_comparison_never_resolves_the_oracle_entry() -> None:
+    """The same closure at the narrow derivation, which is where a body is actually resolved.
+
+    A policy declares one cell. So the oracle is refused under either policy of the pair for the
+    same reason a receipt is refused under the policy that delivers the oracle, and neither of
+    those refusals is a list of cells somebody has to keep in step with the source.
+    """
+    source = a_manifest()
+    origin = SourceOriginContext(hidden_execution_id=EXECUTION, execution_ordinal=0)
+    reference = derived_selection(
+        source=source,
+        origin=origin,
+        commitment=source_commitment(source),
+        cell=ORACLE_CELL,
+        policy_digest=ORACLE_RECEIPT_ARTIFACT_V1_DIGEST,
+        blob_root="/somewhere",
+    )
+    assert reference.body_sha256 == digest_of(BODIES[ORACLE_CELL])
+    assert reference.contract_id == CONTRACT
+    # The parity evidence is over the pair, so an oracle selection carries none of it.
+    assert reference.masked_body_sha256 == ""
+    assert reference.slot_spans == ()
+
+    for cell, policy in (
+        (ORACLE_CELL, PLACEBO_RECEIPT_ARTIFACT_V1_DIGEST),
+        (GRADED_CELL, ORACLE_RECEIPT_ARTIFACT_V1_DIGEST),
+        (PLACEBO_CELL, ORACLE_RECEIPT_ARTIFACT_V1_DIGEST),
+    ):
+        with pytest.raises(WireFormatError, match="declares the cells"):
+            derived_selection(
+                source=source,
+                origin=origin,
+                commitment=source_commitment(source),
+                cell=cell,
+                policy_digest=policy,
+                blob_root="/somewhere",
+            )
+
+
+def test_every_preflight_bound_a_fork_proves_covers_every_child_it_creates(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Three replies are bounded before the barrier, and a third child is inside all three.
+
+    The receipt carries a row per child and an allowance for each run id the service has still to
+    mint, so a roster of three is bounded above a roster of two. The origin proof and the start
+    reply are per child and their bounds are the widest of them, so a third child raises either
+    only where that child is the widest, and the bound covers it whether or not it is.
+
+    Each of them is measured here, where a refusal installs no barrier and creates no child.
+    """
+    parent = a_quiet_parent(monkeypatch, start=an_oracle_parent())
+    request = an_oracle_request(parent)
+    built = parent._built_children(request)
+    known = parent._the_receipt(request, built)
+    assert known.children == 3
+    assert len(known.child_receipts) == 3
+    assert all(row.child_run_id == "" for row in known.child_receipts)
+
+    now = parent._now_ms()
+    bounds = parent._measured_replies(request, built, now)
+    horizon = now + kernel_workflow.FORK_AUTHORITY_HORIZON_MS
+    assert bounds.receipt == fork_receipt_bound(known, CONVERTER)
+    assert bounds.receipt > encoded_size(known, CONVERTER)
+    assert bounds.origin == max(
+        fork_origin_bound(request.fork_id, row, horizon, CONVERTER) for row, _start in built
+    )
+    assert bounds.start == max(fork_start_bound(row, CONVERTER) for row, _start in built)
+
+    # The pair's own bounds are the same measurement over two children, and the receipt's is the
+    # one of the three that a third child always moves.
+    pair = a_quiet_parent(monkeypatch)
+    theirs = pair._built_children(a_fork_request(pair))
+    assert bounds.receipt > pair._measured_replies(
+        a_fork_request(pair), theirs, now
+    ).receipt
+
+    # And a ceiling any one of them will not fit under is a decision about the request.
+    monkeypatch.setattr(kernel_workflow, "TURNOVER_PAYLOAD_CEILING_BYTES", bounds.receipt - 1)
+    with pytest.raises(kernel_workflow.ForkRefused) as raised:
+        parent._measured_replies(request, built, now)
+    assert raised.value.reason == FORK_CONFIGURATION_VIOLATION
     assert parent._fork is None
     monkeypatch.undo()
 

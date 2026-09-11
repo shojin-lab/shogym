@@ -36,6 +36,7 @@ from temporalio.api.common.v1 import Payload, Payloads  # noqa: E402
 from temporalio.converter import DataConverter, PayloadCodec  # noqa: E402
 from temporalio.exceptions import ApplicationError  # noqa: E402
 
+from shogym.serve.protocol_v2.artifact import ORACLE_CELL  # noqa: E402
 from shogym.serve.protocol_v2.blobs import BlobRef, FilesystemBlobStore  # noqa: E402
 from shogym.serve.protocol_v2.errors import WireFormatError  # noqa: E402
 from shogym.serve.protocol_v2.gateway import _Idle, _Recovery  # noqa: E402
@@ -98,7 +99,10 @@ FORK = "the-fork"
 ATTEMPT = "attempt-1"
 FIRST = "stream/the-parent/1.fork.1.aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
 SECOND = "stream/the-parent/1.fork.2.bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
+THIRD = "stream/the-parent/1.fork.3.cccccccccccccccccccccccccccccccc"
 CHILDREN = (FIRST, SECOND)
+#: The pair and the oracle copy beside them, which is the other roster a fork creates.
+ORACLE_CHILDREN = (FIRST, SECOND, THIRD)
 
 
 def digest_of(text: str) -> str:
@@ -1647,6 +1651,71 @@ async def test_a_child_whose_container_did_not_compare_equal_holds_the_whole_for
     other = next(child for child in CHILDREN if child != failing)
     assert failing in held[other]
     assert operations.all_of(ChildReleased) == []
+
+
+def a_fork_with_an_oracle_copy() -> ForkReceipt:
+    """The typed evidence of a fork of three, with the third child given the oracle rendering."""
+    receipt = a_fork_receipt(*ORACLE_CHILDREN)
+    return replace(
+        receipt,
+        child_receipts=[
+            *receipt.child_receipts[:2],
+            replace(receipt.child_receipts[2], target_cell=ORACLE_CELL),
+        ],
+    )
+
+
+async def test_the_pair_is_released_without_its_oracle_copy_and_never_the_other_way_round(
+    tmp_path: Path,
+) -> None:
+    """The oracle copy stands beside the comparison, so it is released on its own terms.
+
+    A pair that is ready is released whether or not the oracle copy is, because the coin never
+    names that copy, it is never eligible for retention and a link with both arms running is the
+    comparison somebody registered whatever else exists beside it. It is held on the same terms in
+    the other direction: an oracle copy that is ready is released while an arm of the pair is not,
+    and neither of them is promoted into the other's decision.
+
+    Which group a child is in is the cell the parent gave it, read out of the fork's own receipt
+    rather than off an ordinal or a slot name a controller chose.
+    """
+    operations = ForkOperations.under(tmp_path)
+    harness = AHarness(tmp_path / "containers")
+    retrieval = await retrieve_checkpoint(AParent(), harness, operations)
+    for child in CHILDREN:
+        comparison = await a_compared_child(harness, operations, child, retrieval)
+        await bind_child(
+            harness, operations, attachment=an_attachment(child), comparison=comparison
+        )
+
+    # The oracle copy has published no readiness at all, and the pair goes.
+    released = await release_children(
+        harness, operations, receipt=a_fork_with_an_oracle_copy()
+    )
+    assert harness.resumed == list(CHILDREN)
+    resumed = {one.child_workflow_id: one for one in released}
+    assert [one.child_workflow_id for one in released] == list(ORACLE_CHILDREN)
+    assert resumed[FIRST].resumed and resumed[SECOND].resumed
+    assert not resumed[THIRD].resumed
+    assert "restored and compared" in (resumed[THIRD].held or "")
+    assert THIRD not in (resumed[FIRST].held or "")
+
+    # And with the pair unready and the oracle copy ready, the copy goes and the pair is held.
+    other = ForkOperations.under(tmp_path / "the-other-way")
+    apart = AHarness(tmp_path / "other-containers")
+    again = await retrieve_checkpoint(AParent(), apart, other)
+    for child in (SECOND, THIRD):
+        comparison = await a_compared_child(apart, other, child, again)
+        await bind_child(apart, other, attachment=an_attachment(child), comparison=comparison)
+
+    released = await release_children(apart, other, receipt=a_fork_with_an_oracle_copy())
+    assert apart.resumed == [THIRD]
+    resumed = {one.child_workflow_id: one for one in released}
+    assert resumed[THIRD].resumed
+    assert not resumed[FIRST].resumed and not resumed[SECOND].resumed
+    # The arm that was ready is held by the arm that was not, and by nothing the oracle did.
+    assert FIRST in (resumed[SECOND].held or "")
+    assert THIRD not in (resumed[SECOND].held or "")
 
 
 async def test_a_release_is_over_the_roster_the_fork_recorded_and_never_a_chosen_part_of_it(

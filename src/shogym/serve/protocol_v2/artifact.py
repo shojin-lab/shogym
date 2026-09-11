@@ -39,6 +39,7 @@ from shogym.serve.protocol_v2.policy import (
     EXPERIMENT,
     GRADED_RECEIPT_ARTIFACT_V1,
     KERNEL_MATCH_GROUP,
+    ORACLE_RECEIPT_ARTIFACT_V1_DIGEST,
     PLACEBO_RECEIPT_ARTIFACT_V1,
     POLICIES,
     SELECTABLE,
@@ -63,9 +64,16 @@ GRADED_CELL = "graded"
 PLACEBO_CELL = "placebo"
 ORACLE_CELL = "oracle"
 CELL_KINDS = (GRADED_CELL, PLACEBO_CELL, ORACLE_CELL)
-#: The two an arm may be served. The oracle is retained and never delivered, so it is named by
-#: the manifest and is not a cell a live arm selects.
+#: The two a contract publishes the parity of, and the two an arm of the comparison is served.
+#: They are the cells whose bodies differ only inside registered slots, which is what makes a
+#: masked hash and one encoded count evidence about either of them.
 ELIGIBLE_CELLS = (GRADED_CELL, PLACEBO_CELL)
+
+#: The third, and the one policy that delivers it. It is admitted by the source that names it
+#: rather than by the contract's registered pair, because a contract's pair is the parity claim
+#: and the oracle cell makes no such claim: its body is the rule stated in words, longer or
+#: shorter than the pair's by however much saying it takes.
+ORACLE_ARTIFACT_CELL = (ORACLE_RECEIPT_ARTIFACT_V1_DIGEST, ORACLE_CELL)
 
 #: How a body is written and what it travels as. Both are declared by the contract and checked
 #: against it, and both have exactly one legal value here: the mask arithmetic is byte offsets
@@ -177,6 +185,21 @@ class SourceArtifactManifest:
     bank_filing_digest: str
     bank_cell_digests: Dict[str, str]
     pair_parity: PairParity
+
+
+def contract_admits(contract: ReceiptContract, policy_digest: str, cell: str) -> bool:
+    """Say whether one committed source's cell may be delivered under ``policy_digest``.
+
+    Two pairings are admitted and no others. A contract's own registered pair, which is what a row
+    of the comparison delivers, and the oracle cell under the one policy that declares it, which
+    every source names and no contract registers. The closure holds in both directions, because a
+    policy declares one cell: a graded or placebo row can never reach the oracle entry, and an
+    oracle row can never reach a receipt or a placebo.
+    """
+    return (policy_digest, cell) in contract.cells or (
+        policy_digest,
+        cell,
+    ) == ORACLE_ARTIFACT_CELL
 
 
 def mask_spans(contract: ReceiptContract) -> Tuple[Tuple[int, int], ...]:
@@ -497,11 +520,11 @@ def check_receipt_contracts(
                 )
         if contract is None or row.kind == WITHHOLD:
             continue
-        if (row.policy_digest, row.cell) not in contract.cells:
+        if not contract_admits(contract, row.policy_digest or "", row.cell or ""):
             raise PolicyViolation(
                 f"the row for attempt {row.attempt_id} names the receipt contract "
                 f"{contract.contract_id}, and what it delivers is not one of that contract's "
-                "cells"
+                "cells, nor the oracle cell under the policy that declares it"
             )
 
 
@@ -920,6 +943,7 @@ __all__ = [
     "GRADED_CELL",
     "MANIFEST_MEDIA_TYPE",
     "MASK_FILL",
+    "ORACLE_ARTIFACT_CELL",
     "ORACLE_CELL",
     "PLACEBO_CELL",
     "PairParity",
@@ -929,6 +953,7 @@ __all__ = [
     "check_receipt_contract",
     "check_receipt_contracts",
     "check_source_artifact",
+    "contract_admits",
     "contract_fields",
     "encoded_body_bytes",
     "grade_fields",

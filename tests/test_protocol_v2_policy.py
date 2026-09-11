@@ -76,15 +76,19 @@ from shogym.serve.protocol_v2.kernel.messages import (  # noqa: E402
     configuration_hash,
 )
 from shogym.serve.protocol_v2.policy import (  # noqa: E402
+    ARTIFACT_POLICY_DIGESTS,
     BLINDED_RECEIPT_V1,
     DELIVER,
     EXPERIMENT,
+    GRADED_RECEIPT_ARTIFACT_V1_DIGEST,
     HONEST_V1,
     KERNEL_STAND_IN_GRADE,
     LEGACY,
     LEGACY_PLACEHOLDER_V1,
     HONEST_V1_DIGEST,
+    ORACLE_RECEIPT_ARTIFACT_V1_DIGEST,
     ORDINARY,
+    PLACEBO_RECEIPT_ARTIFACT_V1_DIGEST,
     PLACEBO_RECEIPT_V1,
     PLATFORM_DEFAULT,
     POLICIES,
@@ -312,7 +316,25 @@ def test_a_policy_is_named_by_the_bytes_that_say_what_it_is() -> None:
         "placebo-receipt-v1",
         "graded-receipt-artifact-v1",
         "placebo-receipt-artifact-v1",
+        "oracle-receipt-artifact-v1",
     }
+    # The three artifact records are three, and each declares one cell of a source. That is what
+    # closes them against each other: a row delivers the cell its own policy declares, so no arm
+    # of the comparison reaches the oracle entry and no oracle copy reaches a receipt.
+    assert [
+        POLICIES[digest].cells
+        for digest in (
+            GRADED_RECEIPT_ARTIFACT_V1_DIGEST,
+            PLACEBO_RECEIPT_ARTIFACT_V1_DIGEST,
+            ORACLE_RECEIPT_ARTIFACT_V1_DIGEST,
+        )
+    ] == [("graded",), ("placebo",), ("oracle",)]
+    # And a contract still admits the pair alone, because the parity it publishes is a claim
+    # about two bodies and the oracle body makes no such claim.
+    assert ARTIFACT_POLICY_DIGESTS == (
+        GRADED_RECEIPT_ARTIFACT_V1_DIGEST,
+        PLACEBO_RECEIPT_ARTIFACT_V1_DIGEST,
+    )
     # The placebo is a record of its own rather than a second name for the concealed cell: two
     # registrations are what a family's byte count is a check over, and one is not.
     assert policy_digest(PLACEBO_RECEIPT_V1) != policy_digest(BLINDED_RECEIPT_V1)
