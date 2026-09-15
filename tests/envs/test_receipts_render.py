@@ -335,6 +335,71 @@ def test_the_oracle_states_the_rule_and_no_answers() -> None:
         assert row.row_id not in text
 
 
+def _flat(lines) -> str:
+    """The cell's prose with its wrapping taken out, which is how a phrase is read."""
+    return " ".join(" ".join(lines).split())
+
+
+def _rule_phrases(convention) -> tuple[str, ...]:
+    return tuple(
+        ledger.ORACLE_TEMPLATE.phrases[axis][option] for axis, option in convention.items()
+    )
+
+
+def test_the_oracle_heads_the_rule_with_the_engagement_it_was_drawn_for() -> None:
+    """The scope the heading claims is the scope the draw gives it, and no wider.
+
+    A rule is drawn per engagement. A heading calling these conventions standing
+    over every schedule puts them and whatever the reader worked out on an earlier
+    engagement in one scope, and a reader that settles that by keeping what it had
+    files under the old rule out of the arm the room is measured against.
+    """
+    instance = _instance()
+    ast = GENERATOR.render_oracle(instance.a.task_id, instance.convention, instance.a.n_rows)
+    text = _flat(ast.body)
+    assert text.startswith("HOUSE CONVENTIONS FOR THIS ENGAGEMENT")
+    assert "they govern the schedule above and the other schedules of this engagement" in text
+    assert "every other engagement draws conventions of its own" in text
+    assert "conventions do not carry from one engagement to another" in text
+    assert "standing" not in text
+    assert "every schedule" not in text
+    # and under that heading, every decision the rule makes
+    for phrase in _rule_phrases(instance.convention):
+        assert _flat([phrase]) in text
+    assert GENERATOR.parse_oracle(ast) == instance.convention
+
+
+def test_no_cell_of_a_fork_states_a_rule_another_schedule_was_drawn() -> None:
+    """The oracle states this schedule's rule; the other two state no rule at all.
+
+    The rule another schedule took is the thing a reader would have to reconcile
+    with this one, so no cell served here may name it, and the graded and placebo
+    cells name no rule whatever.
+    """
+    instance = _instance()
+    other = {
+        axis.name: next(o for o in axis.options if o != instance.convention[axis.name])
+        for axis in GENERATOR.AXES
+    }
+    raw = "\n".join(
+        f"{identifier},{value}"
+        for identifier, value in zip(
+            GENERATOR.row_identifiers(instance.a.table), instance.a.key
+        )
+    )
+    fork = bank_mod.render_fork(GENERATOR, instance, "a", raw)
+    oracle = _flat([fork.oracle.decode()])
+    for phrase in _rule_phrases(other):
+        assert _flat([phrase]) not in oracle
+    for phrase in _rule_phrases(instance.convention):
+        assert _flat([phrase]) in oracle
+    for cell in (fork.graded, fork.placebo):
+        text = _flat([cell.decode()])
+        for convention in (instance.convention, other):
+            for phrase in _rule_phrases(convention):
+                assert _flat([phrase]) not in text
+
+
 # ----- reading a filing -----
 
 
