@@ -623,9 +623,22 @@ PHRASES = {
     "missing": MISSING_WORDS,
 }
 
+#: THE HEADING SAYS WHAT THE RULE GOVERNS, AND THE RULE GOVERNS ONE ENGAGEMENT.
+#: A convention is drawn per engagement, so a heading calling these conventions
+#: standing over every schedule states something the draw does not do: a reader
+#: holding conventions it worked out on an earlier engagement is told that those
+#: and these are claims about the same schedules, and one of them has to give. A
+#: reader that resolves that by keeping what it already had reads the statement of
+#: the rule and files under another rule, which is the arm the room is measured
+#: against filing as though it had been told nothing. So the heading is scoped to
+#: the engagement whose schedule it is stated over, and it says in the same breath
+#: that another engagement draws its own, which leaves the reader nothing to
+#: reconcile and the earlier conventions somewhere to live.
 ORACLE_HEAD: tuple[str, ...] = (
-    "HOUSE CONVENTIONS (standing; they apply to every schedule handled in this",
-    "engagement, not only to the one above)",
+    "HOUSE CONVENTIONS FOR THIS ENGAGEMENT (they govern the schedule above",
+    "and the other schedules of this engagement; every other engagement draws",
+    "conventions of its own, so conventions do not carry from one engagement",
+    "to another)",
     "",
 )
 

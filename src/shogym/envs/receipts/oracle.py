@@ -37,9 +37,11 @@ INDENT = "     "
 class OracleTemplate:
     """What each option means, in words, and the frame the rule is stated in.
 
-    `head` is the standing preamble. `sentences` gives, per axis, the sentence frame
-    with a single `{}` where the option's phrase goes. `phrases` gives the phrase for
-    every option of every axis.
+    `head` is the preamble, and what it is there for is scope: the rule under it was
+    drawn for one engagement, so the preamble says which schedules it governs and
+    that another engagement draws its own. `sentences` gives, per axis, the sentence
+    frame with a single `{}` where the option's phrase goes. `phrases` gives the
+    phrase for every option of every axis.
     """
 
     head: tuple[str, ...]
