@@ -23,7 +23,7 @@ from shogym.cli import main
 from shogym.envs.receipts import admission
 from shogym.envs.receipts import bank as bank_mod
 from shogym.envs.receipts import bundle as bundle_mod
-from shogym.envs.receipts import review, soundchange_review, streams
+from shogym.envs.receipts import review, soundchange_review
 from shogym.envs.receipts import checks, copy_profiles
 from shogym.envs.receipts.generators import ledger, soundchange
 from shogym.envs.receipts.generators import soundchange_audit as audit
@@ -1150,13 +1150,20 @@ def _screen_artifact(pairs: int = 40) -> dict:
     }
 
 
+#: The key this module's bank is built under. FIXED, because a pack carries all seven
+#: worksheet cases and a bank of two instances need not exhibit all seven: under a fresh
+#: key every run, the pack these tests export was a different pack and one key in a few
+#: hundred held no form whose daughter carries a cluster the deletion created. The bank
+#: under this key does, so what is being exercised here is the exporter rather than the
+#: draw, and the bank that exhibits six of the seven has a test of its own.
+PACK_MASTER = hashlib.sha256(b"soundchange-review-pack").digest()
+
+
 @pytest.fixture(scope="module")
 def frozen(tmp_path_factory: pytest.TempPathFactory):
     """One small bank of this genre, its exported pack, and a bundle that verifies."""
     room = tmp_path_factory.mktemp("soundchange")
-    bank, held = bank_mod.materialized(
-        soundchange.GENERATOR, streams.new_master_key(), 2
-    )
+    bank, held = bank_mod.materialized(soundchange.GENERATOR, PACK_MASTER, 2)
     outcomes = room / "screen.json"
     outcomes.write_text(json.dumps(_screen_artifact()), encoding="utf-8")
     pack_root = room / "pack"
@@ -1181,7 +1188,8 @@ def test_the_review_pack_covers_the_family_and_names_no_reviewer(
     It fails if the pack misses a surface template, an option of any axis, a registered
     filing class, the row count the bank holds or a counterfactual render, if the 36
     oracle cells are not all there, if a counterfactual is missing for any axis on any
-    surface, or if the exporter names a reviewer. It also fails if the trace worksheets
+    surface, if the worksheets carry fewer than the seven cases or carry them in another
+    order, or if the exporter names a reviewer. It also fails if the trace worksheets
     are labelled as renders: they are explanatory material for the roster release, they
     are not served tasks, and a bundle that carried them as evidence of what was served
     would be saying something nobody checked.
@@ -1222,6 +1230,8 @@ def test_the_review_pack_covers_the_family_and_names_no_reviewer(
     sheet = json.loads(
         (room / soundchange_review.WORKSHEETS / "cases.json").read_text("utf-8")
     )
+    assert len(sheet) == len(soundchange_review.WORKSHEET_CASES)
+    assert [case["case"] for case in sheet] == list(soundchange_review.WORKSHEET_CASES)
     for case in sheet:
         assert set(case) >= {
             "case", "proto", "after_nasal", "daughter", "skeleton", "oracle",
@@ -1231,6 +1241,29 @@ def test_the_review_pack_covers_the_family_and_names_no_reviewer(
     twice = tmp_path / "twice"
     soundchange_review.export(bank, held, twice)
     assert (twice / soundchange_review.PACK).read_bytes() == pack.read_bytes()
+
+
+def test_a_bank_missing_a_worksheet_case_is_refused_and_no_pack_is_written(
+    tmp_path: Path,
+) -> None:
+    """A pack is all seven cases, and a small bank does not always hold all seven.
+
+    It fails if an export drops a worksheet case the bank does not exhibit, which is how
+    a pack reached a reader with no example of the cluster the deletion creates while
+    the manifest said nothing was missing, and it fails if the refusal does not name the
+    case or leaves a half written pack behind for somebody to read as one. The key here
+    is a bank of two whose rows exhibit six of the seven.
+    """
+    master = hashlib.sha256(b"soundchange-review-missing-case:15").digest()
+    bank, held = bank_mod.materialized(soundchange.GENERATOR, master, 2)
+    assert held.ordinals == (0, 1)
+    room = tmp_path / "pack"
+    with pytest.raises(ValueError) as refused:
+        soundchange_review.export(bank, held, room)
+    said = str(refused.value)
+    assert soundchange_review.WORKSHEET_CASES[6] in said
+    assert "exhibits 6" in said
+    assert not room.exists()
 
 
 def test_a_frozen_bank_rebuilds_and_a_failed_new_check_is_not_dealable(frozen) -> None:
