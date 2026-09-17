@@ -1082,6 +1082,101 @@ def history_attempts(path: Path, generator: str) -> list[dict[str, Any]]:
     return out
 
 
+def import_record(
+    history: Path, path: Path, generator: str, banks: Path | None = None
+) -> list[dict[str, Any]]:
+    """Put the attempts a local record holds into the history. Returns the lines added.
+
+    THE BUILD BEFORE THE HISTORY KEPT ONLY THE RECORD. An evidence directory made by it
+    holds attempts the refusal never sees, because the refusal reads the history, so an
+    upgrade rolls a second key and writes it down as a first. This is the act that
+    reconciles the two, and it is an act with a name rather than something a command
+    does on the way past, because it writes into a chain that is only ever appended to.
+
+    IT IMPORTS WHAT WAS RECORDED AND NOTHING ELSE. The earlier record carried no code
+    pin, no instrument labels and no construction bounds, so the imported lines carry
+    none either and the attempt identity is taken over what is actually there. A retry
+    of an imported attempt is therefore a changed retry, which is the truth of it: the
+    instrument it was made under was never written down, so nothing can say that this
+    build is that instrument.
+
+    An attempt already in the chain is left alone, so importing twice adds nothing, and
+    a key the chain already commits to another genre is refused rather than imported.
+    """
+    known = {str(entry["commitment"]) for entry in read_history(history)}
+    added: list[dict[str, Any]] = []
+    for attempt in read_provenance(path)["attempts"]:
+        if str(attempt.get("generator") or generator) != generator:
+            continue
+        commitment = str(attempt.get("commitment") or "")
+        if not commitment or commitment in known:
+            continue
+        master = bytes.fromhex(str(attempt.get("master") or ""))
+        if key_commitment(master) != commitment:
+            raise ValueError(
+                "the record at %s holds a key whose commitment is not the commitment "
+                "recorded beside it, so it is not a record of what was rolled" % path
+            )
+        refusal = foreign_commitment(history, banks, generator, master)
+        if refusal:
+            raise ValueError(refusal)
+        size = int(attempt.get("size", 0))
+        identity = str(
+            attempt.get("identity")
+            or attempt_identity(generator, master, size, "", {}, {})
+        )
+        imported = "imported from the provenance record at %s" % path
+        added.append(
+            append_history(
+                history,
+                {
+                    "sequence": 0,
+                    "event": STARTED,
+                    "attempt": identity,
+                    "generator": generator,
+                    "commitment": commitment,
+                    "master": master.hex(),
+                    "size": size,
+                    "note": str(attempt.get("note", "")),
+                    "code": "",
+                    "instrument": {},
+                    "bounds": {},
+                    "banks": str(banks) if banks is not None else "",
+                    "detail": imported,
+                    "previous": "",
+                    "digest": "",
+                },
+            )
+        )
+        known.add(commitment)
+        outcome = str(attempt.get("outcome", STARTED))
+        if outcome == STARTED:
+            continue
+        if outcome not in OUTCOMES:
+            raise ValueError(f"an attempt ends as one of {OUTCOMES}, not {outcome!r}")
+        append_history(
+            history,
+            {
+                "sequence": 0,
+                "event": outcome,
+                "attempt": identity,
+                "generator": generator,
+                "commitment": commitment,
+                "master": "",
+                "size": size,
+                "note": str(attempt.get("note", "")),
+                "code": "",
+                "instrument": {},
+                "bounds": {},
+                "banks": "",
+                "detail": "%s; %s" % (str(attempt.get("detail", "")), imported),
+                "previous": "",
+                "digest": "",
+            },
+        )
+    return added
+
+
 def foreign_commitment(
     path: Path, banks: Path | None, generator: str, master: bytes
 ) -> str:
@@ -1394,6 +1489,7 @@ __all__ = [
     "foreign_commitment",
     "history_attempts",
     "history_problems",
+    "import_record",
     "key_commitment",
     "read_history",
     "read_provenance",

@@ -1780,6 +1780,83 @@ def test_a_retry_is_the_recorded_attempt_or_it_is_refused_until_it_is_named(
     assert "--retry" in capsys.readouterr().out
 
 
+def test_a_record_written_before_the_history_is_reconciled_before_it_is_passed(
+    evidence: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """The upgrade case: a local record that already holds an attempt, and no history.
+
+    It fails if a genre whose provenance record records an attempt and whose history
+    records none rolls another master without being told to, if the import invents an
+    instrument the earlier build never recorded, if the imported chain does not verify,
+    or if a retry of an imported attempt claims to reproduce an instrument nobody wrote
+    down. The build before the history kept the record and nothing else, so an upgrade
+    that reads only the history reads an empty one and calls a second key a first.
+    """
+    from shogym.envs.receipts.registry import history_path, provenance_path
+
+    history = history_path()
+    record = provenance_path("soundchange")
+    kept = bytes(range(32))
+    record.parent.mkdir(parents=True, exist_ok=True)
+    # The shape the earlier build wrote: no attempt identity, no instrument, no bounds.
+    record.write_text(
+        json.dumps(
+            {
+                "generator": "soundchange",
+                "attempts": [
+                    {
+                        "attempt": 0,
+                        "generator": "soundchange",
+                        "commitment": bank_mod.key_commitment(kept),
+                        "master": kept.hex(),
+                        "size": 1,
+                        "note": "first attempt",
+                        "outcome": bank_mod.FAILED,
+                        "detail": "this family could not be constructed",
+                    }
+                ],
+            },
+            indent=1,
+            sort_keys=True,
+        ),
+        encoding="utf-8",
+    )
+
+    assert _cli(["receipts", "materialize", "soundchange", "--size", "1"]) == 1
+    said = capsys.readouterr().out
+    assert "--import-record" in said and "1 attempt" in said
+    assert bank_mod.read_history(history) == []
+
+    assert _cli([
+        "receipts", "materialize", "soundchange", "--size", "1", "--import-record",
+    ]) == 1
+    said = capsys.readouterr().out
+    assert "--reroll" in said and "--retry" in said
+    lines = bank_mod.read_history(history)
+    assert [entry["event"] for entry in lines] == [bank_mod.STARTED, bank_mod.FAILED]
+    assert lines[0]["master"] == kept.hex()
+    assert lines[0]["commitment"] == bank_mod.key_commitment(kept)
+    # What the earlier build did not record is not invented here.
+    assert lines[0]["code"] == "" and lines[0]["instrument"] == {}
+    assert lines[0]["bounds"] == {} and "imported" in lines[1]["detail"]
+    assert bank_mod.history_problems(history) == []
+    assert len(bank_mod.history_attempts(history, "soundchange")) == 1
+
+    # A second import adds nothing, because the attempt is already in the chain.
+    assert _cli([
+        "receipts", "materialize", "soundchange", "--size", "1", "--import-record",
+    ]) == 1
+    capsys.readouterr()
+    assert len(bank_mod.read_history(history)) == 2
+
+    # And a retry of an attempt made under an instrument nobody recorded is not that
+    # attempt, which is the same refusal any other changed retry gets.
+    assert _cli([
+        "receipts", "materialize", "soundchange", "--size", "1", "--retry",
+    ]) == 1
+    assert "--changed" in capsys.readouterr().out
+
+
 def test_a_components_bank_refuses_a_key_already_committed_to_another_genre(
     evidence: Path, capsys: pytest.CaptureFixture[str]
 ) -> None:
