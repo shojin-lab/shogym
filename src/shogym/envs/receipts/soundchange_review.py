@@ -187,7 +187,17 @@ def _worksheet_rows(
 
 
 def _case_rows(population: Population) -> list[dict[str, Any]]:
-    """The earliest row in the bank exhibiting each phenomenon the worksheet needs."""
+    """The earliest row in the bank exhibiting each phenomenon the worksheet needs.
+
+    ALL SEVEN, OR THIS BANK IS NOT ONE A PACK CAN BE EXPORTED FROM. A case no row in the
+    bank exhibits used to be left out, and the pack went to the reader with the material
+    for one of the seven missing while the manifest said nothing about it: a small bank
+    can easily hold no form whose daughter carries a cluster the deletion created, which
+    is the case that shows the public pass runs once and never sees that cluster. A
+    reader confirming the stated rule produces the printed answers cannot confirm it for
+    a phenomenon they were not shown, so the shortfall is the bank's and it is named
+    here rather than quietly narrowing what the pack is.
+    """
     found: dict[str, dict[str, Any]] = {}
     for instance in population.instances:
         if len(found) == len(WORKSHEET_CASES):
@@ -230,7 +240,20 @@ def _case_rows(population: Population) -> list[dict[str, Any]]:
                                     row.proto, convention
                                 ),
                             }
-    return [found[case] for case in WORKSHEET_CASES if case in found]
+    missing = [case for case in WORKSHEET_CASES if case not in found]
+    if missing:
+        raise ValueError(
+            "a review pack carries all %d worksheet cases and this bank of %d instances "
+            "exhibits %d. Missing: %s. Materialize more instances of this genre and "
+            "export again"
+            % (
+                len(WORKSHEET_CASES),
+                len(population.instances),
+                len(found),
+                "; ".join(missing),
+            )
+        )
+    return [found[case] for case in WORKSHEET_CASES]
 
 
 def export(bank: Bank, population: Population, directory: str | Path) -> Path:
@@ -243,7 +266,6 @@ def export(bank: Bank, population: Population, directory: str | Path) -> Path:
     counterfactual renders built for them rather than being left out.
     """
     root = Path(directory)
-    root.mkdir(parents=True, exist_ok=True)
     generator = soundchange.GENERATOR
     if bank.generator != generator.name:
         raise ValueError(
@@ -252,6 +274,11 @@ def export(bank: Bank, population: Population, directory: str | Path) -> Path:
         )
     if not population.instances:
         raise ValueError("a review pack is a reading of instances and this bank holds none")
+    # Before anything is written, because a bank that cannot show the reader every
+    # worksheet case is refused rather than exported, and a refusal that had already
+    # written a directory of renders would leave a pack somebody could read as one.
+    cases = _case_rows(population)
+    root.mkdir(parents=True, exist_ok=True)
 
     renders: list[Render] = []
     first = population.instances[0]
@@ -343,7 +370,6 @@ def export(bank: Bank, population: Population, directory: str | Path) -> Path:
                 json.dumps(sheet, indent=1, sort_keys=True),
             )
 
-    cases = _case_rows(population)
     _write(
         root, f"{WORKSHEETS}/cases.json", json.dumps(cases, indent=1, sort_keys=True)
     )
