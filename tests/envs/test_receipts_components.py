@@ -10,6 +10,7 @@ import inspect
 import itertools
 import json
 import random
+import threading
 from functools import lru_cache
 from pathlib import Path
 from types import MappingProxyType
@@ -1427,6 +1428,80 @@ def test_the_key_is_recorded_before_the_bank_is_built_and_the_history_only_grows
     )
     assert bank_mod.history_problems(history)
     monkeypatch.setenv(HISTORY_VAR, str(evidence / "key-history.jsonl"))
+
+
+def test_two_overlapping_attempts_authorize_one_and_leave_a_history_that_verifies(
+    evidence: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """The claim covers the history, because the history is what the refusal reads.
+
+    It fails if two commands pointed at two evidence directories can both pass the
+    history's own refusal and both write themselves into it, if the sequence numbers of
+    the history they leave behind are not contiguous, or if the second command's key is
+    recorded anywhere. The record beside the banks moves with the evidence directory and
+    the history does not, so a claim named for the record leaves the one file the
+    authorization is read from, and appended to, unheld.
+    """
+    from shogym.envs.receipts import cli as cli_mod
+    from shogym.envs.receipts import registry
+    from shogym.envs.receipts.registry import history_path, provenance_path
+
+    history = history_path()
+    elsewhere = evidence / "elsewhere"
+    mine = threading.local()
+
+    def directory() -> Path:
+        return Path(getattr(mine, "banks", evidence / "banks"))
+
+    monkeypatch.setattr(registry, "bank_dir", directory)
+    monkeypatch.setattr(cli_mod, "bank_dir", directory)
+
+    arrived = threading.Event()
+    release = threading.Event()
+    hashed = bank_mod._history_digest
+
+    def waiting(entry: Mapping[str, object]) -> str:
+        """Hold the first append between reading the chain and writing its line."""
+        if not arrived.is_set():
+            arrived.set()
+            assert release.wait(30)
+        return hashed(entry)
+
+    def exhausted(*_: object, **__: object):
+        raise ConstructionExhausted("ordinal 0 could not be constructed, holding 0 of 1")
+
+    monkeypatch.setattr(bank_mod, "_history_digest", waiting)
+    monkeypatch.setattr(bank_mod, "materialized", exhausted)
+    monkeypatch.setattr(bank_mod, "ATTEMPT_WAIT_SECONDS", 0.2)
+
+    codes: list[int] = []
+    first = threading.Thread(
+        target=lambda: codes.append(
+            _cli(["receipts", "materialize", "components", "--size", "1"])
+        )
+    )
+    first.start()
+    try:
+        assert arrived.wait(30)
+        # The first attempt has read the chain and has not written its line. A second
+        # command under another evidence directory arrives now: its own record is empty,
+        # and the history it would authorize itself against is the first one's.
+        mine.banks = elsewhere / "banks"
+        assert _cli(["receipts", "materialize", "components", "--size", "1"]) == 1
+        assert "one at a time" in capsys.readouterr().out
+        assert bank_mod.read_provenance(provenance_path("components"))["attempts"] == []
+        del mine.banks
+    finally:
+        release.set()
+        first.join(30)
+    assert codes == [1]
+    capsys.readouterr()
+
+    lines = bank_mod.read_history(history)
+    assert [entry["sequence"] for entry in lines] == list(range(len(lines)))
+    assert bank_mod.history_problems(history) == []
+    assert [entry["event"] for entry in lines] == [bank_mod.STARTED, bank_mod.FAILED]
+    assert len(bank_mod.history_attempts(history, "components")) == 1
 
 
 def test_a_components_bank_refuses_a_key_already_committed_to_another_genre(
