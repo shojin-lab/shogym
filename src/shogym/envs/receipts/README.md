@@ -945,9 +945,13 @@ Recorded boundaries, held by process rather than by a check:
 
   `materialize` reads the history rather than the local record, so redirecting
   `SHOGYM_RECEIPTS_BANKS` no longer turns a second attempt into a first. A second invocation has
-  the two acts the procedure allows: `--retry` makes the recorded attempt again under the key it
-  kept, and `--reroll REASON` rolls another key and says why. Both leave the first attempt where
-  it was, and so does `--force`. A key already committed to another genre is refused where it is
+  the acts the procedure allows: `--retry` makes the recorded attempt again under the key it
+  kept, `--reroll REASON` rolls another key and says why, and `--retry --changed REASON` makes an
+  attempt under the kept key at a size, a code pin, an instrument or a construction bound that is
+  not the recorded one. The complete recorded identity is compared before construction, so a
+  plain `--retry` that would change any of those four is refused and names which; a changed
+  attempt is recorded with its own identity. All of them leave the first attempt where it was,
+  and so does `--force`. A key already committed to another genre is refused where it is
   recorded, in the history or in a bank file beside it.
 
   Attempts are made one at a time. The claim is a file beside the key history, so two commands
