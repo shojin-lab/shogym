@@ -375,6 +375,17 @@ the key is recorded: `begin_attempt` refuses a commitment the key history alread
 another generator, and a master that is the key of another genre's bank in the same evidence
 directory.
 
+### The review pack for this genre
+
+`components_review.export` writes the first admitted instance's two task texts, all three oracle
+cells, the row count, and the graded, placebo and oracle cells of all seven filing classes on both
+siblings under **each of the three rules**. Each rule's filings are its own, so a canonical filing
+is correct under the rule being shown. The cells taken under the two rules that were not drawn are
+labelled review counterfactuals in the manifest and are offered as coverage of nothing: they show
+what a receipt would have said had that rule been drawn, and no bank member holds them. Beside the
+renders the exporter writes private worksheets, which are not renders and are in no bundle field.
+The pack names no reviewer, so `review.verify` refuses it until a person does.
+
 ### The model room screen for this genre
 
 The `screen` command analyzes recorded outcomes and runs no model. **No model screen has been run
