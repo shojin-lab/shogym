@@ -909,3 +909,72 @@ def test_a_construction_that_runs_out_is_a_named_whole_bank_failure() -> None:
         components.MAX_PROPOSALS = bound
         components.build_pair.cache_clear()
     assert components.build_pair(MASTER, 5)
+
+
+# ----- the registration, and the labels it did not move ----------------------
+
+
+def test_the_roster_carries_the_third_genre_under_the_labels_the_second_one_set() -> None:
+    """Registration, the declared profile, and why neither shared label moved.
+
+    It fails if the genre is not reachable through the one door every command and every
+    bundle reaches a generator through, if it is registered as a gate vector rather than
+    a family, if a generator that declares no copy profile is admitted through that door,
+    or if the executable gate label or the renderer label moved.
+
+    Neither moved, and that is a claim with a reason. A label is what a family was
+    admitted under, and this genre registers the receipt geometry ledger already
+    registers: identifier 12, observed 16, verdict 4, correction 12, and an envelope of
+    2657 bytes. The six checks it adds are dispatched by genre name, so nothing any other
+    family is admitted under changed, and a bank frozen under these labels is still gated
+    on cells of the shape they name.
+    """
+    from shogym.envs.receipts.registry import (
+        FIXTURES,
+        GENRES,
+        is_fixture,
+        load_generator,
+    )
+    from shogym.envs.receipts.generators import ledger, soundchange
+
+    assert GENRES["components"] == "shogym.envs.receipts.generators.components"
+    loaded = load_generator("components")
+    assert loaded is GENERATOR
+    assert loaded.COPY_PROFILE == copy_profiles.ORDERED_TOKENS
+    assert not is_fixture("components")
+    assert "components" not in FIXTURES
+
+    class _Undeclared:
+        name = "undeclared"
+
+    with pytest.raises(ValueError):
+        copy_profiles.require_profile(_Undeclared())
+
+    assert admission.GATE_VERSION == "receipts-gates-v3"
+    assert bank_mod.GATE_LABEL == "receipts-gates-v3"
+    assert bank_mod.RENDERER_CONFIGURATION == "receipts-render-v2"
+    assert (
+        components.IDENTIFIER_WIDTH,
+        components.OBSERVED_WIDTH,
+        components.VERDICT_WIDTH,
+        components.CORRECTION_WIDTH,
+        components.ENVELOPE_SIZE,
+    ) == (
+        ledger.IDENTIFIER_WIDTH,
+        ledger.OBSERVED_WIDTH,
+        ledger.VERDICT_WIDTH,
+        ledger.CORRECTION_WIDTH,
+        ledger.ENVELOPE_SIZE,
+    )
+    assert soundchange.ENVELOPE_SIZE != components.ENVELOPE_SIZE
+
+    # The six added checks reach every admission report of this genre and no other's.
+    assert [name for name, _ in audit.CHECKS] == [
+        "components_semantics", "components_shape", "components_support",
+        "components_bijection_copy", "components_analogy", "components_public_contract",
+    ]
+    assert [name for name, _ in checks.genre_checks(GENERATOR, _drawn(0))] == [
+        name for name, _ in audit.CHECKS
+    ]
+    assert checks.genre_checks(ledger.GENERATOR, _drawn(0)) == []
+    assert checks.genre_checks(soundchange.GENERATOR, _drawn(0)) == []
