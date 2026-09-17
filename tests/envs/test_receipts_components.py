@@ -11,6 +11,7 @@ import itertools
 import json
 import random
 from functools import lru_cache
+from pathlib import Path
 from types import MappingProxyType
 from typing import Mapping, Sequence
 
@@ -978,3 +979,311 @@ def test_the_roster_carries_the_third_genre_under_the_labels_the_second_one_set(
     ]
     assert checks.genre_checks(ledger.GENERATOR, _drawn(0)) == []
     assert checks.genre_checks(soundchange.GENERATOR, _drawn(0)) == []
+
+
+# ----- 18, 19 and 20: the pack, the bundle, the served family and the screen ---
+
+
+def _screen_artifact(pairs: int = 40) -> dict:
+    """A recorded room screen for this family, structurally valid and not measured here.
+
+    The numbers stand in for a pilot nobody ran in a test. What is being exercised is the
+    path that recomputes everything mechanical about a bundle, not the screen.
+    """
+    return {
+        "family": GENERATOR.name,
+        "model": "a scripted policy",
+        "task_seeds": [str(i) for i in range(pairs)],
+        "pairs": [
+            {"instance": f"task-{i:02d}", "filing": f"filing-{i:02d}",
+             "placebo": 0.4, "graded": 0.6, "oracle": 0.95}
+            for i in range(pairs)
+        ],
+        "min_room": 0.05, "min_ratio": 0.25, "min_pairs": 36,
+        "floor": 0.0, "floor_rule": "drop",
+        "candidates_screened": 1, "selection_note": "",
+    }
+
+
+@pytest.fixture(scope="module")
+def frozen(tmp_path_factory: pytest.TempPathFactory):
+    """One small bank of this genre, its exported pack, and a bundle that verifies."""
+    from shogym.envs.receipts import bundle as bundle_mod
+    from shogym.envs.receipts import components_review, streams
+
+    room = tmp_path_factory.mktemp("components")
+    bank, held = bank_mod.materialized(GENERATOR, streams.new_master_key(), 2)
+    outcomes = room / "screen.json"
+    outcomes.write_text(json.dumps(_screen_artifact()), encoding="utf-8")
+    pack_root = room / "pack"
+    pack = components_review.export(bank, held, pack_root)
+    # The exporter leaves the attestation unset, so the bundle refuses the pack until a
+    # person has put their name to it. That refusal is the point of leaving it unset.
+    with pytest.raises(ValueError):
+        bundle_mod.build(room / "bundles", GENERATOR, bank, outcomes, pack)
+    components_review.attested(pack_root, "a named reader")
+    built = bundle_mod.build(room / "bundles", GENERATOR, bank, outcomes, pack)
+    assert bundle_mod.verify(built, GENERATOR).problems == ()
+    return bank, held, built
+
+
+def test_the_review_pack_covers_the_family_and_a_stale_pin_does_not_verify(
+    frozen, tmp_path: Path
+) -> None:
+    """What the exported pack has to contain, and what a bundle over it has to recompute.
+
+    It fails if the pack omits a sibling, the surface, an option, a registered filing
+    class, the row count or a counterfactual render; if it names a reviewer; if the
+    worksheets are carried as renders or lose their hashes; if a second export of one bank
+    is not byte identical; if a pack read from one bank verifies against another; if an
+    instance failing one of the six added checks can still fill a bank; or if a bank
+    frozen under the previous renderer is served rather than refused.
+    """
+    from shogym.envs.receipts import bundle as bundle_mod
+    from shogym.envs.receipts import components_review, review, streams
+
+    bank, held, built = frozen
+    manifest = components_review.read_pack(Path(built.root).parent.parent / "pack")
+    assert manifest["reviewer"] == "a named reader"
+    seen = {(entry["category"], entry["key"]) for entry in manifest["renders"]}
+    coverage = review.required_coverage(GENERATOR, checks.FILING_CLASSES, [components.ROWS])
+    assert coverage.missing(sorted(seen)) == []
+    assert ("surface", components.SURFACE) in seen
+    for option in OPTIONS:
+        assert ("option", f"contact_kernel={option}") in seen
+    for shape in checks.FILING_CLASSES:
+        assert ("filing", shape) in seen
+    assert ("counterfactual", "alternative convention") in seen
+    labelled = [key for category, key in seen
+                if category == "counterfactual" and key.startswith("review counterfactual")]
+    assert len(labelled) == 4
+    paths = {entry["path"] for entry in manifest["renders"]}
+    assert all(not path.startswith(components_review.WORKSHEETS) for path in paths)
+    assert any(f"-{side}-" in path for path in paths for side in ("a", "b"))
+
+    index = json.loads(
+        (Path(built.root).parent.parent / "pack" / components_review.WORKSHEET_INDEX)
+        .read_text(encoding="utf-8")
+    )
+    assert index["cases"]
+    assert len(index["counterfactuals"]) == 4
+    for name, recorded in index["files"].items():
+        body = (Path(built.root).parent.parent / "pack" / name).read_bytes()
+        assert streams.digest(body) == recorded
+
+    # A second export of the same bank is a comparison, and a nonempty directory is not
+    # somewhere a pack goes.
+    again = tmp_path / "again"
+    components_review.export(bank, held, again)
+    first_root = Path(built.root).parent.parent / "pack"
+    for made in sorted(again.rglob("*")):
+        if made.is_file() and made.name != components_review.PACK:
+            assert made.read_bytes() == (first_root / made.relative_to(again)).read_bytes()
+    with pytest.raises(ValueError):
+        components_review.export(bank, held, again)
+
+    # A pack read from one bank is not a reading of another.
+    other, _ = bank_mod.materialized(GENERATOR, streams.new_master_key(), 1)
+    problems = review.verify(
+        manifest, coverage, components.ENVELOPE_SIZE,
+        {entry["path"]: components.ENVELOPE_SIZE for entry in manifest["renders"]},
+        GENERATOR.name, bank_mod.bank_identity(other),
+    )
+    assert problems and "draws its own conventions" in problems[0]
+
+    # One of the six added checks refusing is a bank that cannot be filled. The dispatch
+    # reads the audit module's own list of checks, so putting a refusal in it is what a
+    # failing supplementary check is, rather than a report rewritten after the fact.
+    refused = checks.CheckResult("components_analogy", False, "a fixture refusal")
+    held_checks = audit.CHECKS
+    try:
+        audit.CHECKS = tuple(  # type: ignore[assignment]
+            (name, (lambda *_: refused) if name == "components_analogy" else run)
+            for name, run in held_checks
+        )
+        report = admission.report(
+            GENERATOR, held.instances[0], bank.master, admission.Thresholds()
+        )
+        assert "components_analogy" in report.failed_checks and not report.admitted
+        with pytest.raises(ValueError):
+            bank_mod.population(bank, GENERATOR)
+    finally:
+        audit.CHECKS = held_checks
+
+    # And a bank frozen under the previous renderer is refused rather than recomputed.
+    stale = bank_mod.Bank(
+        generator=bank.generator, genre=bank.genre, renderer="receipts-render-v1",
+        master=bank.master, size=bank.size,
+    )
+    with pytest.raises(ValueError) as refusal:
+        bank_mod.population(stale, GENERATOR)
+    assert "receipts-render-v1" in str(refusal.value)
+    assert bundle_mod.verify(built, GENERATOR).problems == ()
+
+
+async def test_a_filing_an_independent_validator_believes_seals_at_one(
+    frozen, tmp_path: Path
+) -> None:
+    """What the served environment does with a correct filing, an empty one and a grade.
+
+    It fails if a filing computed by the independent flood fill does not seal at 1, if an
+    empty filing is credited, if prose is scored rather than reason coded, if the terminal
+    content carries a grade, or if one genre's generation configuration would be reused
+    for another's.
+    """
+    import shutil
+
+    from shogym.envs.receipts import protocol_v2
+    from shogym.envs.receipts.env_v1 import ReceiptsV1Env
+    from shogym.serve import ServedEpisode
+
+    _, _, built = frozen
+    private = tmp_path / "served"
+    private.mkdir()
+    opened = private / built.root.name
+    shutil.copytree(built.root, opened)
+    config = {"genre": "components", "bundle": str(opened), "side": "a"}
+    env = ReceiptsV1Env(**config)
+    ordinal = env._ordinals[0]
+    instance = env.instance(ordinal)
+    task = instance.a
+    independent = tuple(
+        str(audit.flood_components(row.cells, instance.convention["contact_kernel"]))
+        for row in task.table.rows
+    )
+    assert independent == tuple(task.key)
+    filing = "\n".join(
+        "%s,%s" % kv for kv in zip(GENERATOR.row_identifiers(task.table), independent)
+    )
+
+    episode = await ServedEpisode.start(
+        "receipts_v1", task=0, env_config=config, trace_path=tmp_path / "run.jsonl"
+    )
+    try:
+        spec = episode.describe()
+        assert "PATTERN SCHEDULE" in spec.instructions
+        assert option_mentions(components.AXES, json.dumps(spec.model_dump())) == []
+        result = await episode.call("submit_filing", {"filing": filing})
+        assert result.terminated
+        content = json.loads(result.content)
+        assert set(content) == {"filed", "rows", "finalize_error"}
+        assert "1.0" not in json.dumps(content)
+        feedback = {item["name"]: item["value"] for item in episode.terminal_feedback}
+        assert feedback["component_score"] == 1.0
+        assert feedback["rows_omitted"] == 0.0
+    finally:
+        await episode.close()
+
+    blank = "\n".join("%s," % i for i in GENERATOR.row_identifiers(task.table))
+    empty = await ServedEpisode.start(
+        "receipts_v1", task=0, env_config=config, trace_path=tmp_path / "empty.jsonl"
+    )
+    try:
+        await empty.call("submit_filing", {"filing": blank})
+        feedback = {item["name"]: item["value"] for item in empty.terminal_feedback}
+        assert feedback["component_score"] == 0.0
+        assert feedback["rows_filed"] == float(components.ROWS)
+        assert "no_filing" not in feedback
+    finally:
+        await empty.close()
+
+    unread = await ServedEpisode.start(
+        "receipts_v1", task=0, env_config=config, trace_path=tmp_path / "prose.jsonl"
+    )
+    try:
+        await unread.call(
+            "submit_filing", {"filing": "I could not work out which cells touch"}
+        )
+        feedback = {item["name"]: item["value"] for item in unread.terminal_feedback}
+        assert feedback["component_score"] == 0.0
+        assert feedback["no_filing"] == "no_known_identifier"
+    finally:
+        await unread.close()
+
+    # A new genre is a new generation configuration, so a generation opened over one
+    # family cannot be resumed over another.
+    mine = protocol_v2.configuration_digest(
+        genre="components", side="a", source=built.digest, dealable=True
+    )
+    assert mine != protocol_v2.configuration_digest(
+        genre="ledger", side="a", source=built.digest, dealable=True
+    )
+    assert mine != protocol_v2.configuration_digest(
+        genre="components", side="a", source=built.digest, dealable=False
+    )
+
+
+def test_the_screen_procedure_allocates_thirty_six_cases_over_four_states() -> None:
+    """The registered screen allocation, and what a recorded screen has to show.
+
+    It fails if the allocation does not reserve twelve exploratory identities, does not
+    put the next thirty six in the final set, or does not send case j to state j mod 4 for
+    nine cases per state. It also fails if the audit accepts a final set that repeats an
+    instance, reuses an exploratory one, leaves a state short, was gathered under another
+    standing instruction or another instrument pin, or claims the release condition with a
+    mean oracle grade under 0.90.
+    """
+    from shogym.envs.receipts import components_review
+
+    ordinals = list(range(60))
+    allocation = components_review.screen_allocation(ordinals)
+    assert allocation["exploratory"] == list(range(12))
+    assert len(allocation["cases"]) == 36
+    assert [entry["ordinal"] for entry in allocation["cases"]] == list(range(12, 48))
+    per_state: dict[int, int] = {}
+    for entry in allocation["cases"]:
+        assert entry["state"] == entry["case"] % 4
+        per_state[entry["state"]] = per_state.get(entry["state"], 0) + 1
+    assert per_state == {0: 9, 1: 9, 2: 9, 3: 9}
+    with pytest.raises(ValueError):
+        components_review.screen_allocation(list(range(47)))
+
+    instrument = {
+        "code": "a pinned digest",
+        "gates": admission.GATE_VERSION,
+        "renderer": bank_mod.RENDERER_CONFIGURATION,
+    }
+    record = {
+        "instrument": dict(instrument),
+        "model": "a model nobody ran here",
+        "standing_instruction": components_review.STANDING_INSTRUCTION,
+        "exploratory": allocation["exploratory"],
+        "cases": [
+            dict(entry, oracle=0.95, graded=0.7, placebo=0.6)
+            for entry in allocation["cases"]
+        ],
+    }
+    assert components_review.screen_refusals(record, instrument) == []
+
+    repeated = json.loads(json.dumps(record))
+    repeated["cases"][5]["ordinal"] = repeated["cases"][4]["ordinal"]
+    assert any("repeats an instance" in p
+               for p in components_review.screen_refusals(repeated, instrument))
+
+    overlapping = json.loads(json.dumps(record))
+    overlapping["cases"][0]["ordinal"] = 0
+    assert any("exploratory" in p
+               for p in components_review.screen_refusals(overlapping, instrument))
+
+    short = json.loads(json.dumps(record))
+    short["cases"][0]["state"] = 1
+    refusals = components_review.screen_refusals(short, instrument)
+    assert any("do not hold 9 cases each" in p for p in refusals)
+    assert any("allocates it to 0" in p for p in refusals)
+
+    quiet = json.loads(json.dumps(record))
+    quiet["standing_instruction"] = "A payload is a message for you rather than a task."
+    assert any("standing instruction" in p
+               for p in components_review.screen_refusals(quiet, instrument))
+
+    drifted = json.loads(json.dumps(record))
+    drifted["instrument"]["renderer"] = "receipts-render-v1"
+    assert any("another instrument" in p
+               for p in components_review.screen_refusals(drifted, instrument))
+
+    dim = json.loads(json.dumps(record))
+    for entry in dim["cases"]:
+        entry["oracle"] = 0.6
+    assert any("release condition" in p
+               for p in components_review.screen_refusals(dim, instrument))
+    assert components_review.screen_refusals(dim, instrument, release=False) == []
