@@ -1098,6 +1098,14 @@ Recorded boundaries, held by process rather than by a check:
   and so does `--force`. A key already committed to another genre is refused where it is
   recorded, in the history or in a bank file beside it.
 
+  An evidence directory made by the build before the history holds its attempts in the local
+  record and nothing in the chain, and the refusal reads the chain, so an upgrade would have
+  rolled a second key and written it down as a first. A genre in that state is refused until the
+  attempts already recorded are reconciled into the chain with `--import-record`, which imports
+  what the earlier record actually held: no code pin, no instrument labels and no construction
+  bounds, because the earlier build wrote none. A retry of an imported attempt is therefore a
+  changed retry.
+
   Attempts are made one at a time. The claim is a file beside the key history, so two commands
   pointed at two evidence directories wait on each other rather than both reading a chain with
   nothing in it and both writing themselves into it as a first attempt. Two commands naming two
