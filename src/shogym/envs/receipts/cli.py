@@ -34,7 +34,7 @@ import argparse
 import functools
 import math
 from pathlib import Path
-from typing import Callable
+from typing import Any, Callable, Mapping
 
 from shogym.envs.receipts import admission as admission_mod
 from shogym.envs.receipts import bank as bank_mod
@@ -84,6 +84,13 @@ def add_parser(sub: argparse._SubParsersAction) -> None:
         help="make the attempt this genre's history already records again, under the key "
              "it retained, rather than rolling another. This is the other thing a second "
              "invocation may do: reproduce the recorded attempt, or refuse",
+    )
+    made.add_argument(
+        "--changed", default=None, metavar="REASON",
+        help="qualify a --retry whose size, code pin, instrument or construction bounds "
+             "are not the recorded attempt's, saying why. The key is still the one that "
+             "attempt kept and the result is a SECOND attempt with its own identity, "
+             "recorded beside the first rather than in place of it",
     )
 
     gated = inner.add_parser(
@@ -523,6 +530,47 @@ def _list() -> int:
     return 0
 
 
+def _attempt_differences(
+    recorded: Mapping[str, Any],
+    size: int,
+    code: str,
+    instrument: Mapping[str, str],
+    bounds: Mapping[str, Any],
+) -> list[str]:
+    """Where this invocation is not the attempt the history recorded. Empty when it is.
+
+    One line per part, rather than one line saying the identities differ, because the
+    operator's next act depends on which part moved: a size is a flag they typed, a code
+    pin is the build they are standing in, and an instrument label is a renderer or a
+    gate set that was revised under them.
+    """
+    out: list[str] = []
+    if int(recorded.get("size", -1)) != int(size):
+        out.append(
+            "it records size %r and this invocation asks for %d"
+            % (recorded.get("size"), size)
+        )
+    if str(recorded.get("code", "")) != code:
+        out.append(
+            "it records code pin %s and this build is %s"
+            % (str(recorded.get("code", ""))[:16] or "nothing", code[:16])
+        )
+    stated = dict(recorded.get("instrument") or {})
+    for name in sorted(set(stated) | set(instrument)):
+        if stated.get(name) != instrument.get(name):
+            out.append(
+                "it records %s %r and this build carries %r"
+                % (name, stated.get(name), instrument.get(name))
+            )
+    held = dict(recorded.get("bounds") or {})
+    if held != dict(bounds):
+        out.append(
+            "it records construction bounds %r and this build declares %r"
+            % (held, dict(bounds))
+        )
+    return out
+
+
 def _one_attempt_at_a_time(
     command: Callable[[argparse.Namespace], int],
 ) -> Callable[[argparse.Namespace], int]:
@@ -585,6 +633,13 @@ def _materialize(args: argparse.Namespace) -> int:
             "rolls a new one. They are two different acts, so name one of them"
         )
         return 1
+    if args.changed and not args.retry:
+        print(
+            "--changed qualifies a --retry: it says which part of the attempt the history "
+            "records this invocation changes. On its own it names nothing, so say --retry "
+            "as well or roll a key with --reroll"
+        )
+        return 1
     path = bank_path(args.name)
     if path.is_file() and not args.force:
         print(f"{path} already holds a frozen bank; pass --force to replace it")
@@ -614,6 +669,13 @@ def _materialize(args: argparse.Namespace) -> int:
             % (args.name, len(previous), history, last["outcome"], last["commitment"])
         )
         return 1
+    generator = load_generator(args.name)
+    code = bank_mod.code_pin(generator)["digest"]
+    instrument = {
+        "gates": bank_mod.GATE_LABEL,
+        "renderer": bank_mod.RENDERER_CONFIGURATION,
+    }
+    bounds = dict(getattr(generator, "CONSTRUCTION_BOUNDS", {}))
     if args.retry:
         if not previous:
             print(
@@ -621,21 +683,49 @@ def _materialize(args: argparse.Namespace) -> int:
                 "invocation is its first"
             )
             return 1
-        master = bytes.fromhex(previous[-1]["master"])
-        note = "retry of attempt %s" % str(previous[-1]["attempt"])[:16]
+        last = previous[-1]
+        master = bytes.fromhex(last["master"])
+        # THE KEY IS NOT THE ATTEMPT. What names an attempt is the key AND everything it
+        # was made with, and this invocation supplies all of the rest of that from the
+        # command line and the build: the size asked for, the code pin of the generator
+        # as it is now, the gate and renderer labels this build carries and the
+        # generator's declared construction bounds. Keeping the key while any of them
+        # moved makes a second attempt wearing the first one's name, which is exactly
+        # what the recorded identity exists to tell apart.
+        moved = _attempt_differences(last, args.size, code, instrument, bounds)
+        if moved and not args.changed:
+            print(
+                "%s records attempt %s and this invocation is not it: %s"
+                % (args.name, str(last["attempt"])[:16], "; ".join(moved))
+            )
+            print(
+                "--retry makes the recorded attempt again. An attempt under the key it "
+                "kept at something else is a different attempt, and it is made by naming "
+                "the change with --changed \"the reason\", which records it beside the "
+                "first rather than in place of it"
+            )
+            return 1
+        if args.changed and not moved:
+            print(
+                "--changed says which part of the recorded attempt this invocation "
+                "changes, and this invocation changes none of it. It is the recorded "
+                "attempt, so make it with --retry alone"
+            )
+            return 1
+        note = (
+            "changed retry of attempt %s: %s" % (str(last["attempt"])[:16], args.changed)
+            if args.changed
+            else "retry of attempt %s" % str(last["attempt"])[:16]
+        )
     else:
         master = streams.new_master_key()
         note = args.reroll or "first attempt"
-    generator = load_generator(args.name)
     attempt = bank_mod.begin_attempt(
         record, args.name, master, args.size, note,
         history=history,
-        code=bank_mod.code_pin(generator)["digest"],
-        instrument={
-            "gates": bank_mod.GATE_LABEL,
-            "renderer": bank_mod.RENDERER_CONFIGURATION,
-        },
-        bounds=getattr(generator, "CONSTRUCTION_BOUNDS", {}),
+        code=code,
+        instrument=instrument,
+        bounds=bounds,
         banks=bank_dir(),
     )
     try:
