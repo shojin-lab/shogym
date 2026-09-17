@@ -86,6 +86,13 @@ def add_parser(sub: argparse._SubParsersAction) -> None:
              "invocation may do: reproduce the recorded attempt, or refuse",
     )
     made.add_argument(
+        "--import-record", action="store_true", dest="import_record",
+        help="reconcile the attempts a local provenance record holds into the key "
+             "history before reading it. An evidence directory made before this build "
+             "kept a history holds attempts the history has never seen, and a genre in "
+             "that state is refused until they are in the chain",
+    )
+    made.add_argument(
         "--changed", default=None, metavar="REASON",
         help="qualify a --retry whose size, code pin, instrument or construction bounds "
              "are not the recorded attempt's, saying why. The key is still the one that "
@@ -659,6 +666,45 @@ def _materialize(args: argparse.Namespace) -> int:
     # first attempt again; the history is one file for every directory this machine has
     # used, so the refusal below survives the one thing that used to get past it.
     previous = bank_mod.history_attempts(history, args.name)
+    # AND THE RECORD MAY PREDATE THE HISTORY. An evidence directory made by the build
+    # before it holds its attempts in the local record and nothing in the chain, and the
+    # refusal below reads the chain, so an upgrade would roll a second key and write it
+    # down as a first. The attempts that are there are reconciled into the chain by an
+    # act with a name, and until they are the genre is refused.
+    local = [
+        attempt for attempt in bank_mod.read_provenance(record)["attempts"]
+        if str(attempt.get("generator") or args.name) == args.name
+    ]
+    if local and not previous:
+        if not args.import_record:
+            print(
+                "%s records %d attempt(s) at %s and the key history at %s records none, "
+                "so this evidence directory was made before the history existed"
+                % (args.name, len(local), record, history)
+            )
+            print(
+                "a key that was rolled is a key the next attempt comes after, so the "
+                "attempts already recorded are reconciled into the chain with "
+                "--import-record and this invocation is refused until they are"
+            )
+            return 1
+        try:
+            added = bank_mod.import_record(
+                history, record, args.name, banks=bank_dir()
+            )
+        except ValueError as exc:
+            print(f"the record at {record} was not imported: {exc}")
+            return 1
+        print(
+            "imported %d attempt(s) from %s into the key history at %s"
+            % (len(added), record, history)
+        )
+        previous = bank_mod.history_attempts(history, args.name)
+    elif args.import_record:
+        print(
+            f"there is nothing at {record} the key history does not already hold, so "
+            "this invocation imports nothing"
+        )
     if previous and not (args.reroll or args.retry):
         last = previous[-1]
         print(
