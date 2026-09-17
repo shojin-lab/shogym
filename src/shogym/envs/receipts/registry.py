@@ -19,6 +19,7 @@ from shogym.envs.receipts.protocol import Generator
 #: implementing the protocol; it earns a place in a release by passing admission,
 #: which is a different and later thing.
 GENRES = {
+    "components": "shogym.envs.receipts.generators.components",
     "ledger": "shogym.envs.receipts.generators.ledger",
     "soundchange": "shogym.envs.receipts.generators.soundchange",
 }
