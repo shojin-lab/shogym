@@ -1214,15 +1214,44 @@ async def test_a_filing_an_independent_validator_believes_seals_at_one(
     )
 
 
+def _screen_payload(model: str = "a model nobody ran here") -> dict[str, object]:
+    """A recorded screen of thirty six pairs, in the shape the bundle verifier reads."""
+    return {
+        "family": "components",
+        "model": model,
+        "task_seeds": ["seed-%02d" % j for j in range(36)],
+        "pairs": [
+            {
+                "instance": "case-%02d" % j,
+                "filing": "filing-%02d" % j,
+                "placebo": 0.6,
+                "graded": 0.7,
+                "oracle": 0.95,
+            }
+            for j in range(36)
+        ],
+        "min_room": 0.05,
+        "min_ratio": 0.25,
+        "min_pairs": 36,
+        "floor": 0.0,
+        "floor_rule": "drop",
+        "candidates_screened": 1,
+        "selection_note": "",
+    }
+
+
 def test_the_screen_procedure_allocates_thirty_six_cases_over_four_states() -> None:
     """The registered screen allocation, and what a recorded screen has to show.
 
     It fails if the allocation does not reserve twelve exploratory identities, does not
     put the next thirty six in the final set, or does not send case j to state j mod 4 for
-    nine cases per state. It also fails if the audit accepts a final set that repeats an
-    instance, reuses an exploratory one, leaves a state short, was gathered under another
-    standing instruction or another instrument pin, or claims the release condition with a
-    mean oracle grade under 0.90.
+    nine cases per state. It also fails if the audit accepts a reservation that was never
+    made, a final identity the bank does not hold, cases with no index to read the state
+    rule against, an unnamed or changed model, an unpinned or drifting initial state, an
+    outcome the screen record does not carry, a screen record that is not readable or was
+    taken on another family, a final set that repeats an instance, reuses an exploratory
+    one, leaves a state short, was gathered under another standing instruction or another
+    instrument pin, or claims the release condition with a mean oracle grade under 0.90.
     """
     from shogym.envs.receipts import components_review
 
@@ -1244,50 +1273,141 @@ def test_the_screen_procedure_allocates_thirty_six_cases_over_four_states() -> N
         "gates": admission.GATE_VERSION,
         "renderer": bank_mod.RENDERER_CONFIGURATION,
     }
+    states = {str(state): "a frozen state digest %d" % state for state in range(4)}
+    screen = _screen_payload()
     record = {
         "instrument": dict(instrument),
         "model": "a model nobody ran here",
         "standing_instruction": components_review.STANDING_INSTRUCTION,
         "exploratory": allocation["exploratory"],
+        "states": dict(states),
         "cases": [
-            dict(entry, oracle=0.95, graded=0.7, placebo=0.6)
+            dict(
+                entry,
+                instance="case-%02d" % entry["case"],
+                state_digest=states[str(entry["state"])],
+                oracle=0.95,
+                graded=0.7,
+                placebo=0.6,
+            )
             for entry in allocation["cases"]
         ],
     }
-    assert components_review.screen_refusals(record, instrument) == []
+
+    def refusals(
+        changed: dict[str, object] | None = None,
+        *,
+        held: list[int] | None = None,
+        taken: dict[str, object] | None = None,
+        release: bool = True,
+    ) -> list[str]:
+        return components_review.screen_refusals(
+            changed if changed is not None else record,
+            instrument,
+            ordinals if held is None else held,
+            taken if taken is not None else screen,
+            release=release,
+        )
+
+    assert refusals() == []
 
     repeated = json.loads(json.dumps(record))
     repeated["cases"][5]["ordinal"] = repeated["cases"][4]["ordinal"]
-    assert any("repeats an instance" in p
-               for p in components_review.screen_refusals(repeated, instrument))
+    assert any("repeats an instance" in p for p in refusals(repeated))
 
     overlapping = json.loads(json.dumps(record))
     overlapping["cases"][0]["ordinal"] = 0
-    assert any("exploratory" in p
-               for p in components_review.screen_refusals(overlapping, instrument))
+    assert any("exploratory" in p for p in refusals(overlapping))
 
     short = json.loads(json.dumps(record))
     short["cases"][0]["state"] = 1
-    refusals = components_review.screen_refusals(short, instrument)
-    assert any("do not hold 9 cases each" in p for p in refusals)
-    assert any("allocates it to 0" in p for p in refusals)
+    said = refusals(short)
+    assert any("do not hold 9 cases each" in p for p in said)
+    assert any("allocates it to 0" in p for p in said)
 
     quiet = json.loads(json.dumps(record))
     quiet["standing_instruction"] = "A payload is a message for you rather than a task."
-    assert any("standing instruction" in p
-               for p in components_review.screen_refusals(quiet, instrument))
+    assert any("standing instruction" in p for p in refusals(quiet))
 
     drifted = json.loads(json.dumps(record))
     drifted["instrument"]["renderer"] = "receipts-render-v1"
-    assert any("another instrument" in p
-               for p in components_review.screen_refusals(drifted, instrument))
+    assert any("another instrument" in p for p in refusals(drifted))
+
+    # A reservation that was never made, and one that is not the bank's own first twelve.
+    unreserved = json.loads(json.dumps(record))
+    unreserved["exploratory"] = []
+    assert any("reserves 12" in p for p in refusals(unreserved))
+    moved = json.loads(json.dumps(record))
+    moved["exploratory"] = list(range(1, 13))
+    assert any("not the first 12 the bank admitted" in p for p in refusals(moved))
+
+    # Final identities no bank holds, and a bank too small to allocate at all.
+    invented = json.loads(json.dumps(record))
+    for entry in invented["cases"]:
+        entry["ordinal"] += 10_000
+    assert any("this bank does not hold" in p for p in refusals(invented))
+    assert any("needs 48 admitted identities" in p for p in refusals(held=list(range(20))))
+
+    # Cases in some other order, with nothing in them to read the state rule against.
+    reordered = json.loads(json.dumps(record))
+    reordered["cases"] = [
+        {k: v for k, v in entry.items() if k != "case"}
+        for entry in reversed(reordered["cases"])
+    ]
+    assert any("carry no index" in p for p in refusals(reordered))
+    renumbered = json.loads(json.dumps(record))
+    renumbered["cases"] = list(reversed(renumbered["cases"]))
+    assert any("in the bank's own order" in p for p in refusals(renumbered))
+
+    # The model, named here and named in the record the outcomes come from.
+    unnamed = json.loads(json.dumps(record))
+    del unnamed["model"]
+    assert any("names no model" in p for p in refusals(unnamed))
+    another = json.loads(json.dumps(record))
+    another["model"] = "some other model"
+    assert any("was taken with" in p for p in refusals(another))
+
+    # The four frozen initial states, pinned and carried by every case.
+    unpinned = json.loads(json.dumps(record))
+    del unpinned["states"]["2"]
+    assert any("initial state 2 is not pinned" in p for p in refusals(unpinned))
+    slipped = json.loads(json.dumps(record))
+    slipped["cases"][7]["state_digest"] = "a state nobody pinned"
+    assert any("does not pin" in p for p in refusals(slipped))
+
+    # The outcomes are the screen record's, and a grade that is not a number is not one.
+    invented_grade = json.loads(json.dumps(record))
+    invented_grade["cases"][3]["oracle"] = 0.99
+    assert any("the screen record does not" in p for p in refusals(invented_grade))
+    absent = json.loads(json.dumps(record))
+    for entry in absent["cases"]:
+        entry["instance"] = "a pair nobody ran"
+    assert any("name no pair" in p for p in refusals(absent))
+    nan = json.loads(json.dumps(record))
+    for entry in nan["cases"]:
+        entry["oracle"] = float("nan")
+    assert refusals(nan)
+    assert refusals(nan, release=False)
+    overscored = json.loads(json.dumps(record))
+    beyond = _screen_payload()
+    for entry, row in zip(overscored["cases"], beyond["pairs"]):
+        entry["oracle"] = 2.0
+        row["oracle"] = 2.0
+    assert any("not scores" in p for p in refusals(overscored, taken=beyond))
+
+    # And the record the outcomes are read out of.
+    assert any("not a readable screen" in p for p in refusals(taken={}))
+    elsewhere = _screen_payload()
+    elsewhere["family"] = "ledger"
+    assert any("was taken on" in p for p in refusals(taken=elsewhere))
 
     dim = json.loads(json.dumps(record))
-    for entry in dim["cases"]:
+    faint = _screen_payload()
+    for entry, row in zip(dim["cases"], faint["pairs"]):
         entry["oracle"] = 0.6
-    assert any("release condition" in p
-               for p in components_review.screen_refusals(dim, instrument))
-    assert components_review.screen_refusals(dim, instrument, release=False) == []
+        row["oracle"] = 0.6
+    assert any("release condition" in p for p in refusals(dim, taken=faint))
+    assert refusals(dim, taken=faint, release=False) == []
 
 
 # ----- 17: the key, and the history that outlives the evidence directory ------

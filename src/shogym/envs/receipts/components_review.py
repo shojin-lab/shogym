@@ -31,9 +31,12 @@ exporter that filled that in would be a machine attesting that a human read some
 THE SCREEN PROCEDURE IS AUDITED HERE AND NOT RUN HERE. `screen_refusals` holds a recorded
 allocation against the registered procedure: twelve reserved exploratory identities, the
 next thirty six as the final screen, case j to state j mod 4, nine per state, the common
-standing instruction, one frozen instrument, and the predeclared release condition of a
-mean oracle grade of at least 0.90. No model has been run for this genre and nothing here
-runs one.
+standing instruction, one frozen instrument, one named model, four pinned initial states,
+and the predeclared release condition of a mean oracle grade of at least 0.90. It reads
+the identities against the bank's own admitted order and the outcomes against the
+recorded screen the pilot wrote, because an allocation audited against its own fields is
+an allocation that says whatever it likes. No model has been run for this genre and
+nothing here runs one.
 """
 
 from __future__ import annotations
@@ -514,8 +517,22 @@ def screen_allocation(ordinals: Sequence[int]) -> dict[str, Any]:
     }
 
 
+def _number(value: object) -> float | None:
+    """One recorded score as a float, or nothing when it is not a number at all."""
+    if value is None or isinstance(value, bool) or not isinstance(value, (int, float)):
+        return None
+    try:
+        return float(value)
+    except (OverflowError, ValueError):
+        return None
+
+
 def screen_refusals(
-    record: Mapping[str, Any], instrument: Mapping[str, str], release: bool = True
+    record: Mapping[str, Any],
+    instrument: Mapping[str, str],
+    ordinals: Sequence[int],
+    screen: Mapping[str, Any],
+    release: bool = True,
 ) -> list[str]:
     """What a recorded screen does not establish. Empty when it meets the procedure.
 
@@ -524,30 +541,83 @@ def screen_refusals(
     requirement nor the oracle release condition. This is the companion audit those
     sentences point at: it reads the recorded allocation and says where it departs from
     the registered procedure.
+
+    IT IS READ AGAINST THE BANK AND THE SCREEN RECORD, NOT AGAINST ITSELF. An audit of
+    the allocation's own fields accepts whatever the allocation says: a reservation that
+    was never made, final identities no bank holds, cases in an order with no index to
+    read the state rule against, a model nobody named, and grades that are not numbers.
+    So the identities are held against `ordinals`, the bank's admitted order, and the
+    outcomes against `screen`, the recorded `ScreenRecord` the pilot wrote, which
+    validates its own rows. The oracle mean is computed from that record's own pairs and
+    only once everything above holds, because a mean over self-reported grades is a mean
+    over whatever was typed: `float("nan")` is under no bar and over none either.
     """
+    from shogym.receipts import ScreenRecord
+
     problems: list[str] = []
     cases = list(record.get("cases") or [])
-    exploratory = [int(value) for value in (record.get("exploratory") or [])]
+    exploratory = list(record.get("exploratory") or [])
+    held = [int(value) for value in ordinals]
+
+    # ----- the allocation, against the order the bank admitted -----------------
+    try:
+        registered = screen_allocation(held)
+    except ValueError as exc:
+        problems.append(str(exc))
+        registered = {"exploratory": [], "cases": []}
     if len(cases) != FINAL_CASES:
         problems.append(
             f"the final screen holds {len(cases)} cases and the procedure registers "
             f"{FINAL_CASES}"
         )
-    ordinals = [entry.get("ordinal") for entry in cases]
-    if len(set(ordinals)) != len(ordinals):
+    filed = [entry.get("ordinal") for entry in cases]
+    if len(set(filed)) != len(filed):
         problems.append("the final screen repeats an instance")
-    shared = sorted(set(ordinals) & set(exploratory))
+    shared = sorted(set(filed) & set(exploratory), key=repr)
     if shared:
         problems.append(
             "the final screen reuses %d exploratory identities, the first being %r"
             % (len(shared), shared[0])
         )
-    if len(exploratory) > EXPLORATORY_PREFIX:
+    if len(exploratory) != EXPLORATORY_PREFIX:
         problems.append(
             f"{len(exploratory)} identities were reserved for exploration and the "
             f"procedure reserves {EXPLORATORY_PREFIX}"
         )
-    per_state: dict[int, int] = {}
+    elif registered["exploratory"] and exploratory != registered["exploratory"]:
+        problems.append(
+            "the reserved identities are not the first %d the bank admitted, which are "
+            "%s" % (EXPLORATORY_PREFIX, registered["exploratory"])
+        )
+    outside = [value for value in filed if value not in set(held)]
+    if outside:
+        problems.append(
+            "the final screen names %d identities this bank does not hold, the first "
+            "being %r" % (len(outside), outside[0])
+        )
+    indexed = [entry.get("case") for entry in cases]
+    unindexed = [
+        value for value in indexed
+        if isinstance(value, bool) or not isinstance(value, int)
+    ]
+    if unindexed:
+        problems.append(
+            "%d final cases carry no index, so the state rule is read against an order "
+            "nobody can check" % len(unindexed)
+        )
+    elif indexed != list(range(len(cases))):
+        problems.append(
+            "the final cases are indexed %r and the procedure indexes them 0 to %d in "
+            "the bank's own order" % (indexed[:4], len(cases) - 1)
+        )
+    elif registered["cases"] and filed != [
+        entry["ordinal"] for entry in registered["cases"]
+    ]:
+        problems.append(
+            "the final screen is not the %d identities the bank admitted after the "
+            "reserved ones, in the order it admitted them" % FINAL_CASES
+        )
+    per_state: dict[Any, int] = {}
     for entry in cases:
         state = entry.get("state")
         per_state[state] = per_state.get(state, 0) + 1
@@ -569,6 +639,8 @@ def screen_refusals(
             "states %s do not hold %d cases each (%s)"
             % (short, CASES_PER_STATE, {s: per_state[s] for s in short})
         )
+
+    # ----- the pins: the wording, the instrument, the model, the four states ---
     if str(record.get("standing_instruction") or "") != STANDING_INSTRUCTION:
         problems.append(
             "the recorded standing instruction is not the registered one, so the arms "
@@ -581,8 +653,91 @@ def screen_refusals(
                 "the screen names %s %r and this build is %r, so the evidence was "
                 "gathered under another instrument" % (name, stated.get(name), value)
             )
-    grades = [float(entry.get("oracle", 0.0)) for entry in cases]
-    mean = sum(grades) / len(grades) if grades else 0.0
+    model = str(record.get("model") or "").strip()
+    if not model:
+        problems.append(
+            "the allocation names no model, so nothing in it says what was run"
+        )
+    pinned = dict(record.get("states") or {})
+    frozen: dict[int, str] = {}
+    for state in range(INITIAL_STATES):
+        digest = pinned.get(str(state), pinned.get(state))
+        if not isinstance(digest, str) or not digest.strip():
+            problems.append(
+                "initial state %d is not pinned to a digest, so a case's restoration is "
+                "a label rather than a state" % state
+            )
+        else:
+            frozen[state] = digest
+    drifted = [
+        entry for entry in cases
+        if entry.get("state") in frozen
+        and entry.get("state_digest") != frozen[entry["state"]]
+    ]
+    if drifted:
+        problems.append(
+            "%d cases name an initial state digest the allocation does not pin, the "
+            "first being case %r" % (len(drifted), drifted[0].get("case"))
+        )
+
+    # ----- the outcomes, taken from the screen record rather than from here ----
+    try:
+        validated = ScreenRecord.from_payload(dict(screen))
+    except (TypeError, ValueError) as exc:
+        problems.append(
+            "the screen record these cases are read against is not a readable screen: "
+            "%s" % exc
+        )
+        return problems
+    if validated.run.family != components.GENERATOR.name:
+        problems.append(
+            "the screen record was taken on %r and this audits %r"
+            % (validated.run.family, components.GENERATOR.name)
+        )
+    if model and validated.run.model != model:
+        problems.append(
+            "the allocation names model %r and the screen record was taken with %r"
+            % (model, validated.run.model)
+        )
+    pairs = {pair.instance: pair for pair in validated.run.pairs}
+    if len(validated.run.pairs) != FINAL_CASES:
+        problems.append(
+            "the screen record holds %d pairs and the final screen is %d cases"
+            % (len(validated.run.pairs), FINAL_CASES)
+        )
+    missing = [
+        entry for entry in cases
+        if str(entry.get("instance") or "") not in pairs
+    ]
+    if missing:
+        problems.append(
+            "%d cases name no pair in the screen record, the first being case %r"
+            % (len(missing), missing[0].get("case"))
+        )
+    moved = []
+    for entry in cases:
+        pair = pairs.get(str(entry.get("instance") or ""))
+        if pair is None:
+            continue
+        for branch in ("placebo", "graded", "oracle"):
+            if _number(entry.get(branch)) != getattr(pair, branch):
+                moved.append((entry.get("case"), branch))
+                break
+    if moved:
+        problems.append(
+            "%d cases report an outcome the screen record does not, the first being the "
+            "%s of case %r" % (len(moved), moved[0][1], moved[0][0])
+        )
+    if problems:
+        # The mean is a statement about executed outcomes, and there are none to average
+        # until the cases, the pins and the record agree about what was executed.
+        return problems
+    try:
+        grades = validated.run.outcomes().oracle
+    except ValueError as exc:
+        problems.append("the screen record's branch scores are not scores: %s" % exc)
+        return problems
+    mean = sum(grades) / len(grades)
     if release and mean < MIN_MEAN_ORACLE:
         problems.append(
             "the mean oracle grade is %.6f and the predeclared release condition is "
