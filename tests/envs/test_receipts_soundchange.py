@@ -56,6 +56,7 @@ from shogym.envs.receipts.registry import FIXTURES as FIXTURES_NAMES
 from shogym.envs.receipts.registry import (
     BANK_DIR_VAR,
     GENRES,
+    HISTORY_VAR,
     bank_path,
     load_generator,
     provenance_path,
@@ -1118,6 +1119,7 @@ def test_the_key_is_recorded_before_the_bank_is_built_and_kept_when_it_is_not(
     reroll for a friendlier bank is the one thing an operator can do that no hash sees.
     """
     monkeypatch.setenv(BANK_DIR_VAR, str(tmp_path))
+    monkeypatch.setenv(HISTORY_VAR, str(tmp_path / "key-history.jsonl"))
     record = provenance_path("soundchange")
 
     # A construction that cannot finish: the attempt is refused by name, the key is kept,
@@ -1139,6 +1141,7 @@ def test_the_key_is_recorded_before_the_bank_is_built_and_kept_when_it_is_not(
     # A second attempt under the same record is refused until the reroll is named.
     monkeypatch.undo()
     monkeypatch.setenv(BANK_DIR_VAR, str(tmp_path))
+    monkeypatch.setenv(HISTORY_VAR, str(tmp_path / "key-history.jsonl"))
     assert _cli(["receipts", "materialize", "soundchange", "--size", "1"]) == 1
     assert "--reroll" in capsys.readouterr().out
     assert len(bank_mod.read_provenance(record)["attempts"]) == 1
@@ -1171,6 +1174,7 @@ def test_two_attempts_at_once_keep_both_keys_and_neither_is_an_unnamed_reroll(
     did not happen, which is the whole of what the record is kept for.
     """
     monkeypatch.setenv(BANK_DIR_VAR, str(tmp_path))
+    monkeypatch.setenv(HISTORY_VAR, str(tmp_path / "key-history.jsonl"))
     record = provenance_path("soundchange")
     constructing = threading.Event()
     give_up = threading.Event()

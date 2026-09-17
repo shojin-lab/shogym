@@ -1287,3 +1287,216 @@ def test_the_screen_procedure_allocates_thirty_six_cases_over_four_states() -> N
     assert any("release condition" in p
                for p in components_review.screen_refusals(dim, instrument))
     assert components_review.screen_refusals(dim, instrument, release=False) == []
+
+
+# ----- 17: the key, and the history that outlives the evidence directory ------
+
+
+def _cli(argv: list[str]) -> int:
+    from shogym.cli import main
+
+    try:
+        main(argv)
+    except SystemExit as exc:
+        return int(exc.code or 0)
+    return 0
+
+
+@pytest.fixture
+def evidence(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Path:
+    """One disposable evidence directory, and a key history that is not inside it."""
+    from shogym.envs.receipts.registry import BANK_DIR_VAR, HISTORY_VAR
+
+    monkeypatch.setenv(BANK_DIR_VAR, str(tmp_path / "banks"))
+    monkeypatch.setenv(HISTORY_VAR, str(tmp_path / "key-history.jsonl"))
+    return tmp_path
+
+
+def test_the_key_is_recorded_before_the_bank_is_built_and_the_history_only_grows(
+    evidence: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """What a failed attempt leaves behind, and what a second invocation may do.
+
+    It fails if the commitment is not written before construction begins, if a key is lost
+    when the bank does not fill, if a second invocation rerolls without being told to by
+    name, if pointing the evidence directory somewhere fresh makes a second attempt look
+    like a first, if an outcome rewrites the line that recorded the attempt, if the
+    history is not bound to the code pin, the instrument labels and the construction
+    bounds, or if an edited history is appended to rather than refused.
+    """
+    from shogym.envs.receipts.registry import (
+        BANK_DIR_VAR,
+        HISTORY_VAR,
+        bank_path,
+        history_path,
+        provenance_path,
+    )
+
+    history = history_path()
+    record = provenance_path("components")
+
+    # A construction that cannot finish: the key is kept, the command exits nonzero with a
+    # sentence, and both the local record and the history hold the attempt.
+    components.build_pair.cache_clear()
+    held_bound = components.MAX_PROPOSALS
+    monkeypatch.setattr(components, "MAX_PROPOSALS", 0)
+    assert _cli(["receipts", "materialize", "components", "--size", "1"]) == 1
+    said = capsys.readouterr().out
+    assert "could not be constructed" in said and "ordinal 0" in said
+    monkeypatch.setattr(components, "MAX_PROPOSALS", held_bound)
+    components.build_pair.cache_clear()
+
+    attempts = bank_mod.read_provenance(record)["attempts"]
+    assert len(attempts) == 1 and attempts[0]["outcome"] == bank_mod.FAILED
+    kept = bytes.fromhex(attempts[0]["master"])
+    assert len(kept) == 32
+    assert attempts[0]["commitment"] == bank_mod.key_commitment(kept)
+
+    lines = bank_mod.read_history(history)
+    assert [entry["event"] for entry in lines] == [bank_mod.STARTED, bank_mod.FAILED]
+    assert bank_mod.history_problems(history) == []
+    started = lines[0]
+    assert started["master"] == kept.hex()
+    assert started["code"] == bank_mod.code_pin(GENERATOR)["digest"]
+    assert started["instrument"] == {
+        "gates": bank_mod.GATE_LABEL, "renderer": bank_mod.RENDERER_CONFIGURATION
+    }
+    assert started["bounds"] == components.CONSTRUCTION_BOUNDS
+    assert started["attempt"] == bank_mod.attempt_identity(
+        "components", kept, 1, started["code"], started["instrument"], started["bounds"]
+    )
+    # The outcome is a LINE after it, not a rewrite of it.
+    assert lines[1]["attempt"] == started["attempt"]
+    assert lines[1]["previous"] == started["digest"]
+
+    # A second invocation is refused, and pointing the evidence directory somewhere fresh
+    # does not make it a first one.
+    assert _cli(["receipts", "materialize", "components", "--size", "1"]) == 1
+    said = capsys.readouterr().out
+    assert "--retry" in said and "--reroll" in said
+    elsewhere = evidence / "elsewhere"
+    monkeypatch.setenv(BANK_DIR_VAR, str(elsewhere / "banks"))
+    assert bank_mod.read_provenance(
+        provenance_path("components")
+    )["attempts"] == []
+    assert _cli(["receipts", "materialize", "components", "--size", "1"]) == 1
+    assert "--retry" in capsys.readouterr().out
+    monkeypatch.setenv(BANK_DIR_VAR, str(evidence / "banks"))
+
+    # --retry makes the recorded attempt again under the key it kept.
+    assert _cli(["receipts", "materialize", "components", "--size", "1", "--retry"]) == 0
+    said = capsys.readouterr().out
+    assert bank_mod.key_commitment(kept) in said
+    assert bank_mod.load_bank(bank_path("components")).master == kept
+    assert [entry["event"] for entry in bank_mod.read_history(history)] == [
+        bank_mod.STARTED, bank_mod.FAILED, bank_mod.STARTED, bank_mod.FILLED
+    ]
+
+    # --reroll draws another key, and the first attempt is still in the history.
+    assert _cli([
+        "receipts", "materialize", "components", "--size", "1", "--force",
+        "--reroll", "the first attempt could not construct an instance",
+    ]) == 0
+    capsys.readouterr()
+    rolled = bank_mod.load_bank(bank_path("components")).master
+    assert rolled != kept
+    lines = bank_mod.read_history(history)
+    assert lines[0]["master"] == kept.hex()
+    assert bank_mod.history_problems(history) == []
+    assert len(bank_mod.history_attempts(history, "components")) == 3
+
+    # An edited history is not appended to, and says where it stopped being the record.
+    edited = [json.loads(line) for line in
+              history.read_text(encoding="utf-8").splitlines() if line.strip()]
+    edited[0]["note"] = "a different reason"
+    history.write_text(
+        "\n".join(json.dumps(entry, sort_keys=True) for entry in edited) + "\n",
+        encoding="utf-8",
+    )
+    assert bank_mod.history_problems(history)
+    assert _cli([
+        "receipts", "materialize", "components", "--size", "1", "--force",
+        "--reroll", "after the history was edited",
+    ]) == 1
+    assert "does not verify" in capsys.readouterr().out
+
+    # A removed line is the same refusal, which is what the chain is for.
+    history.write_text(
+        "\n".join(json.dumps(entry, sort_keys=True) for entry in edited[1:]) + "\n",
+        encoding="utf-8",
+    )
+    assert bank_mod.history_problems(history)
+    monkeypatch.setenv(HISTORY_VAR, str(evidence / "key-history.jsonl"))
+
+
+def test_a_components_bank_refuses_a_key_already_committed_to_another_genre(
+    evidence: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """One master key per generator, refused where the key is recorded.
+
+    It fails if a components attempt may be made under a key another genre's bank in the
+    same evidence directory already holds, or under a commitment the history already
+    records for another genre. The convention stream's coordinates are the label and the
+    ordinal and carry no generator name, so two genres under one key draw the SAME rule at
+    every ordinal and nothing downstream can recover that.
+    """
+    from shogym.envs.receipts.registry import bank_path, history_path, provenance_path
+
+    history = history_path()
+    assert _cli(["receipts", "materialize", "components", "--size", "1"]) == 0
+    capsys.readouterr()
+    mine = bank_mod.load_bank(bank_path("components")).master
+
+    # A hand-written bank record for another genre under the same key. The bank file is
+    # the thing an operator can write by hand, and this is what it costs.
+    bank_mod.save_bank(
+        bank_mod.Bank(
+            generator="ledger", genre="date band classification",
+            renderer=bank_mod.RENDERER_CONFIGURATION, master=mine, size=1,
+        ),
+        bank_path("ledger"),
+    )
+    assert _cli([
+        "receipts", "materialize", "components", "--size", "1", "--force", "--retry",
+    ]) == 1
+    said = capsys.readouterr().out
+    assert "'ledger'" in said and "the same rule at every ordinal" in said
+
+    # And the same refusal from the history alone, with no bank file in reach.
+    bank_path("ledger").unlink()
+    refusal = bank_mod.foreign_commitment(history, None, "ledger", mine)
+    assert "components" in refusal
+    assert bank_mod.foreign_commitment(history, None, "components", mine) == ""
+    with pytest.raises(ValueError):
+        bank_mod.begin_attempt(
+            provenance_path("ledger"), "ledger", mine, 1, "",
+            history=history, code="", instrument={}, bounds={},
+        )
+
+
+def test_a_construction_that_runs_out_is_reported_by_the_command_and_keeps_its_key(
+    evidence: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """The exhaustion path through the command line rather than through the library.
+
+    It fails if a bounded construction that runs out reaches the operator as a traceback,
+    if the command exits zero, if the attempt loses its key, or if the failure is recorded
+    as anything but a failed attempt against the line that started it.
+    """
+    from shogym.envs.receipts.registry import bank_path, history_path, provenance_path
+
+    components.build_pair.cache_clear()
+    monkeypatch.setattr(components, "MAX_PROPOSALS", 2)
+    monkeypatch.setattr(audit, "frequency_refusal", lambda *_: "a fixture refusal")
+    assert _cli(["receipts", "materialize", "components", "--size", "4"]) == 1
+    said = capsys.readouterr().out
+    assert "could not be constructed" in said
+    assert "2 proposals" in said and "frequency refused 2" in said
+    assert not bank_path("components").is_file()
+    attempts = bank_mod.read_provenance(provenance_path("components"))["attempts"]
+    assert len(attempts) == 1 and attempts[0]["outcome"] == bank_mod.FAILED
+    assert len(bytes.fromhex(attempts[0]["master"])) == 32
+    lines = bank_mod.read_history(history_path())
+    assert [entry["event"] for entry in lines] == [bank_mod.STARTED, bank_mod.FAILED]
+    assert "frequency refused 2" in lines[1]["detail"]
+    components.build_pair.cache_clear()
