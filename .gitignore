@@ -13,3 +13,4 @@ shogym_logs/
 .DS_Store
 examples/*/runs/
 .evidence-soundchange/
+.evidence-receipt/

@@ -57,8 +57,10 @@ from shogym.envs.receipts.protocol import (
     Axis,
     Column,
     Filing,
+    FULL_RECEIPT,
     ROW_ADDITIVE_EQUAL_WEIGHT,
     PublicTask,
+    ReceiptPolicy,
     RowOutcome,
     Shape,
     Task,
@@ -66,7 +68,7 @@ from shogym.envs.receipts.protocol import (
 from shogym.envs.receipts.oracle import OracleTemplate
 from shogym.envs.receipts.oracle import parse as parse_oracle_cell
 from shogym.envs.receipts.oracle import render as render_oracle_cell
-from shogym.envs.receipts.render import graded_receipt, placebo_receipt
+from shogym.envs.receipts.render import Feedback, graded_receipt, placebo_receipt
 from shogym.receipts import ROW_LABEL
 from shogym.envs.receipts.receipt_ast import (
     Envelope,
@@ -714,6 +716,9 @@ class LedgerGenerator:
     #: two such lists. Declared rather than assumed, because the bar and the family are
     #: one registration and a second genre's answers are not this shape.
     COPY_PROFILE: str = ORDERED_TOKENS
+    #: Which records the receipt reports on. Declared rather than assumed, and refused
+    #: at registration when it is absent.
+    RECEIPT_POLICY: ReceiptPolicy = FULL_RECEIPT
 
     # ----- the instance -----
 
@@ -884,21 +889,24 @@ class LedgerGenerator:
     # ----- the three cells -----
 
     def render_receipt(
-        self, task: Task, canonical: Filing, truth: Sequence[str]
+        self, task: Task, canonical: Filing, truth: Sequence[str], feedback: Feedback
     ) -> ReceiptAST:
-        """One verdict per record, on what the filing did.
+        """One verdict per reported record, on what the filing did.
 
-        The rows are built by the shared grader from the scorer's own outcomes, so
-        what a row says is not a choice this module gets to make. The receipt names
-        records, never axes, and a correction is that row's own answer rather than a
-        value picked for what a reader could deduce from it.
+        The rows are built by the shared grader from the scorer's own outcomes and the
+        committed feedback, so neither what a row says nor which rows say anything is a
+        choice this module gets to make. The receipt names records, never axes, and a
+        correction is that row's own answer rather than a value picked for what a
+        reader could deduce from it.
         """
         graded = Task(
             label=task.label, task_id=task.task_id, surface=task.surface, table=task.table,
-            text=task.text, key=tuple(truth),
+            text=task.text, key=tuple(truth), mask=task.mask,
         )
         _, outcomes = self.score(graded, canonical)
-        return graded_receipt(task.task_id, outcomes, BLANK_TOKEN, UNFILED_TOKEN)
+        return graded_receipt(
+            task.task_id, outcomes, BLANK_TOKEN, UNFILED_TOKEN, feedback
+        )
 
     def render_placebo(
         self, task: PublicTask, canonical: Filing, envelope: Envelope
@@ -912,7 +920,7 @@ class LedgerGenerator:
         """
         blind = Task(
             label=task.label, task_id=task.task_id, surface=task.surface, table=task.table,
-            text="", key=(),
+            text="", key=(), mask=task.mask,
         )
         _, outcomes = self.score(blind, canonical)
         return placebo_receipt(

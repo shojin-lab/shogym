@@ -58,6 +58,7 @@ from shogym.envs.receipts.receipt_ast import (
     row_lines,
     serialize,
 )
+from shogym.envs.receipts.render import feedback_for
 from shogym.receipts.resolution import rowwise_scores
 
 # ----- the registered bars this module reads ---------------------------------
@@ -719,7 +720,9 @@ def _read_back(generator, instance: Instance, side: str) -> str:
         for identifier in generator.row_identifiers(task.table)
     )
     canonical = generator.parse_and_canonicalize(task, raw)
-    ast = generator.render_receipt(task, canonical, task.key)
+    ast = generator.render_receipt(
+        task, canonical, task.key, feedback_for(generator, task, envelope)
+    )
     payload = serialize(ast, envelope)
     identifier_start = len(GAP) + ORDINAL_WIDTH + len(GAP)
     identifier_end = identifier_start + envelope.identifier_width

@@ -231,7 +231,9 @@ def test_graded_and_placebo_differ_only_inside_the_registered_slots() -> None:
         for side in ("a", "b"):
             canonical = _canonical(instance, side)
             task = instance.side(side)
-            graded = GENERATOR.render_receipt(task, canonical, task.key)
+            graded = GENERATOR.render_receipt(
+                task, canonical, task.key, _feedback(instance, task)
+            )
             placebo = GENERATOR.render_placebo(task, canonical, instance.envelope)
             ranges = slot_ranges(graded, instance.envelope)
             first = serialize(graded, instance.envelope)
@@ -255,7 +257,9 @@ def test_no_byte_outside_the_slots_moves_with_the_drawn_convention() -> None:
     for convention in conventions(GENERATOR.AXES):
         key = ledger.key_for(task.table, convention)
         seen_keys.add(key)
-        graded = GENERATOR.render_receipt(task, canonical, key)
+        graded = GENERATOR.render_receipt(
+            task, canonical, key, _feedback(instance, task)
+        )
         payload = serialize(graded, instance.envelope)
         if ranges is None:
             ranges = slot_ranges(graded, instance.envelope)
@@ -304,7 +308,12 @@ def test_a_cell_that_overruns_its_envelope_is_refused() -> None:
     )
     canonical = _canonical(instance, "a")
     with pytest.raises(ValueError, match="registered envelope"):
-        serialize(GENERATOR.render_receipt(instance.a, canonical, instance.a.key), small)
+        serialize(
+            GENERATOR.render_receipt(
+                instance.a, canonical, instance.a.key, _feedback(instance, instance.a)
+            ),
+            small,
+        )
 
 
 def test_a_non_ascii_field_is_refused_rather_than_shifting_every_offset() -> None:
@@ -358,7 +367,10 @@ def test_the_receipt_names_records_and_never_an_axis() -> None:
     instance = _instance()
     canonical = _canonical(instance, "a")
     text = serialize(
-        GENERATOR.render_receipt(instance.a, canonical, instance.a.key), instance.envelope
+        GENERATOR.render_receipt(
+            instance.a, canonical, instance.a.key, _feedback(instance, instance.a)
+        ),
+        instance.envelope,
     ).decode()
     for axis in GENERATOR.AXES:
         assert axis.name not in text
@@ -573,7 +585,8 @@ def test_the_receipt_tells_an_unfiled_row_from_an_empty_one() -> None:
     raw = f"{identifiers[0]},"  # one row, filed empty; the rest unfiled
     canonical = GENERATOR.parse_and_canonicalize(task, raw)
     text = serialize(
-        GENERATOR.render_receipt(task, canonical, task.key), instance.envelope
+        GENERATOR.render_receipt(task, canonical, task.key, _feedback(instance, task)),
+        instance.envelope,
     ).decode()
     assert ledger.BLANK_TOKEN in text
     assert ledger.UNFILED_TOKEN in text
@@ -584,8 +597,16 @@ def _retasked(task, key):
 
     return Task(
         label=task.label, task_id=task.task_id, surface=task.surface, table=task.table,
-        text=task.text, key=tuple(key),
+        text=task.text, key=tuple(key), mask=task.mask,
     )
+
+
+def _feedback(instance, task):
+    """The commitment the shared judge would hand this task's renderer."""
+    from shogym.envs.receipts.receipt_ast import frozen_envelope
+    from shogym.envs.receipts.render import feedback_for
+
+    return feedback_for(GENERATOR, task, frozen_envelope(instance.envelope))
 
 
 def _raw(instance, side: str) -> str:

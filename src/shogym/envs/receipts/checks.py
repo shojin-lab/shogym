@@ -83,7 +83,7 @@ from shogym.envs.receipts.receipt_ast import (
     slot_ranges,
 )
 from shogym.envs.receipts.oracle import render as oracle_render
-from shogym.envs.receipts.render import frozen_template, judge_cells
+from shogym.envs.receipts.render import feedback_for, frozen_template, judge_cells
 from shogym.envs.receipts.render import oracle_difference
 from shogym.receipts import resolution_blocks
 
@@ -448,9 +448,11 @@ def check_envelope(
         # bytes when the whole task is retasked under a different rule.
         retasked = Task(
             label=task.label, task_id=task.task_id, surface=task.surface,
-            table=task.table, text=task.text, key=tuple(truth),
+            table=task.table, text=task.text, key=tuple(truth), mask=task.mask,
         )
-        graded_ast = generator.render_receipt(retasked, canonical, truth)
+        graded_ast = generator.render_receipt(
+            retasked, canonical, truth, feedback_for(generator, retasked, envelope)
+        )
         ranges = slot_ranges(graded_ast, envelope)
         graded = serialize(graded_ast, envelope)
         placebo_ast = generator.render_placebo(retasked.public(), canonical, envelope)
@@ -619,7 +621,7 @@ def check_graded(generator: Generator, instance: Instance, side: str = "a") -> C
         truth = tuple(generator.key_for(task.table, convention))
         retasked = Task(
             label=task.label, task_id=task.task_id, surface=task.surface,
-            table=task.table, text=task.text, key=truth,
+            table=task.table, text=task.text, key=truth, mask=task.mask,
         )
         judged = judge_cells(generator, retasked, canonical, convention, envelope)
         if judged.problems:
@@ -665,7 +667,7 @@ def check_placebo(generator: Generator, instance: Instance, side: str = "a") -> 
             truth = tuple(generator.key_for(task.table, convention))
             retasked = Task(
                 label=task.label, task_id=task.task_id, surface=task.surface,
-                table=task.table, text=task.text, key=truth,
+                table=task.table, text=task.text, key=truth, mask=task.mask,
             )
             canonical = generator.parse_and_canonicalize(retasked, raw)
             judged = judge_cells(generator, retasked, canonical, convention, envelope)
@@ -814,6 +816,7 @@ def _with_convention(
             table=task.table,
             text="",
             key=tuple(generator.key_for(task.table, convention)),
+            mask=task.mask,
         )
         out.append(generator.describe(rebuilt.public()))
     return out[0], out[1]

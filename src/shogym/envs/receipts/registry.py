@@ -13,7 +13,7 @@ import os
 from pathlib import Path
 
 from shogym.envs.receipts.copy_profiles import require_profile
-from shogym.envs.receipts.protocol import Generator
+from shogym.envs.receipts.protocol import Generator, require_policy
 
 #: Genre name to the module that implements it. A module earns a line here by
 #: implementing the protocol; it earns a place in a release by passing admission,
@@ -55,19 +55,30 @@ def load_generator(name: str) -> Generator:
     place for it because it is the one door every command, every check and every bundle
     reaches a generator through, and because the refusal a caller wants is "this module
     is not a generator yet", not a copy maximum taken over maps its answers cannot be.
+
+    AND ITS RECEIPT POLICY, for the same reason and at the same door. Which rows a
+    receipt reports is what the gate prices and what the task text promises, so a
+    family that declared none would be gated against one instrument and served as
+    another. Both refusals are here rather than in the checks, because a module that
+    has not said what it is is not a generator to be checked.
     """
     if name in VECTORS and name in GENRES:
         # Vectors are looked up first, so a collision would silently serve a gate
         # exhibit wherever the family was meant. It is refused rather than resolved.
         raise KeyError(f"{name!r} names both a genre and a gate vector")
     if name in VECTORS:
-        return require_profile(VECTORS[name])
+        return _declared(VECTORS[name])
     if name not in GENRES:
         raise KeyError(
             "no genre or vector named %r; this build carries %s"
             % (name, ", ".join(sorted(set(GENRES) | set(VECTORS))))
         )
-    return require_profile(importlib.import_module(GENRES[name]).GENERATOR)
+    return _declared(importlib.import_module(GENRES[name]).GENERATOR)
+
+
+def _declared(generator: Generator) -> Generator:
+    """The generator, once it has said what it is. Refused when it has not."""
+    return require_policy(require_profile(generator))
 
 
 def is_fixture(name: str) -> bool:

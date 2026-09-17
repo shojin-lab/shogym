@@ -33,8 +33,23 @@ CONVENTION = "convention"
 FILLER = "filler"
 TASK_ID = "task-id"
 REVIEW_FILING = "review-filing"
+#: Which rows of one task the receipt reports on. It has a label of its own, so the
+#: rows a receipt reports are independent of the drawn convention given the master
+#: key: a mask drawn from the convention's stream would be a mask the rule could be
+#: read off, and the whole point of the mask is that it says nothing about the rule.
+#: It is keyed by the generator, the ordinal and the sibling label, so the two
+#: siblings of one family draw independently and a rebuild draws the same rows.
+RECEIPT_MASK = "receipt-mask"
 
-LABELS = (SURFACE_A, SURFACE_B, CONVENTION, FILLER, TASK_ID, REVIEW_FILING)
+LABELS = (
+    SURFACE_A,
+    SURFACE_B,
+    CONVENTION,
+    FILLER,
+    TASK_ID,
+    REVIEW_FILING,
+    RECEIPT_MASK,
+)
 
 #: Bytes of key material. 32 is one SHA-256 block's worth of output.
 KEY_BYTES = 32
@@ -116,6 +131,7 @@ __all__ = [
     "FILLER",
     "KEY_BYTES",
     "LABELS",
+    "RECEIPT_MASK",
     "REVIEW_FILING",
     "SURFACE_A",
     "SURFACE_B",

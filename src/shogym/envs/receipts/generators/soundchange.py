@@ -72,12 +72,14 @@ from shogym.envs.receipts.oracle import OracleTemplate
 from shogym.envs.receipts.oracle import parse as parse_oracle_cell
 from shogym.envs.receipts.oracle import render as render_oracle_cell
 from shogym.envs.receipts.protocol import (
+    FULL_RECEIPT,
     ROW_ADDITIVE_EQUAL_WEIGHT,
     Axis,
     Column,
     ConstructionExhausted,
     Filing,
     PublicTask,
+    ReceiptPolicy,
     RowOutcome,
     Shape,
     Task,
@@ -88,7 +90,7 @@ from shogym.envs.receipts.receipt_ast import (
     SlotSpec,
     envelope_size_for,
 )
-from shogym.envs.receipts.render import graded_receipt, placebo_receipt
+from shogym.envs.receipts.render import Feedback, graded_receipt, placebo_receipt
 from shogym.receipts import ROW_LABEL
 
 # ----- the phone inventory ----------------------------------------------------
@@ -648,6 +650,10 @@ class SoundChangeGenerator:
     #: copy screen prices this family through the character maps rather than through
     #: maps between two published answer orders. See `copy_profiles`.
     COPY_PROFILE: str = SOUNDCHANGE_V1
+    #: The full receipt: a verdict and a same-row correction on every form. This genre
+    #: keeps it until its own arithmetic under the sampled policy has been done, which
+    #: the fixture calculation says will not carry ledger's count.
+    RECEIPT_POLICY: ReceiptPolicy = FULL_RECEIPT
     BLANK_TOKEN = BLANK_TOKEN
     UNFILED_TOKEN = UNFILED_TOKEN
 
@@ -790,7 +796,7 @@ class SoundChangeGenerator:
     # ----- the three cells -----
 
     def render_receipt(
-        self, task: Task, canonical: Filing, truth: Sequence[str]
+        self, task: Task, canonical: Filing, truth: Sequence[str], feedback: Feedback
     ) -> ReceiptAST:
         """One verdict per form, on what the filing did.
 
@@ -801,10 +807,12 @@ class SoundChangeGenerator:
         """
         graded = Task(
             label=task.label, task_id=task.task_id, surface=task.surface,
-            table=task.table, text=task.text, key=tuple(truth),
+            table=task.table, text=task.text, key=tuple(truth), mask=task.mask,
         )
         _, outcomes = self.score(graded, canonical)
-        return graded_receipt(task.task_id, outcomes, BLANK_TOKEN, UNFILED_TOKEN)
+        return graded_receipt(
+            task.task_id, outcomes, BLANK_TOKEN, UNFILED_TOKEN, feedback
+        )
 
     def render_placebo(
         self, task: PublicTask, canonical: Filing, envelope: Envelope
@@ -818,7 +826,7 @@ class SoundChangeGenerator:
         """
         blind = Task(
             label=task.label, task_id=task.task_id, surface=task.surface,
-            table=task.table, text="", key=(),
+            table=task.table, text="", key=(), mask=task.mask,
         )
         _, outcomes = self.score(blind, canonical)
         return placebo_receipt(task.task_id, outcomes, envelope, BLANK_TOKEN, UNFILED_TOKEN)
