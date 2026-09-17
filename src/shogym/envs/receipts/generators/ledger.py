@@ -577,6 +577,8 @@ POLICY EXTRACT ({manual}, section 4)
 
 {hol}
 
+{scope}
+
 SCHEDULE ({fmtnote})
 
 {body}
@@ -584,6 +586,37 @@ SCHEDULE ({fmtnote})
 File one line per record: the record id, a comma, and the band, with no header and
 no other text. File every record, in the order the records appear above.
 """
+
+#: WHICH SCHEDULES SHARE A CONVENTION, SAID IN THE TASK ITSELF.
+#: One convention is drawn for a pair of sibling schedules, and a reader that is
+#: never told so has no reason to carry to the second schedule anything it worked
+#: out on the first. That is what a run of 119 readers measured: 64 of them held a
+#: correct statement of the rule and filed the second schedule under a different
+#: one, because nothing they could see said the two were scored together. So the
+#: task says which schedules share the conventions, by what the reader does with
+#: them rather than by any name printed on them, and says that the pair after them
+#: is scored under conventions of its own. It states that two consecutive schedules
+#: share a rule, which is the design's own premise, and nothing about what that rule
+#: is. It is a function of the sibling label alone, so the same bytes reach every
+#: arm and no arm reads anything here another cannot.
+SCOPE_SENTENCE: dict[str, tuple[str, ...]] = {
+    "A": (
+        "This schedule and the next one you file are scored under the same house",
+        "conventions; the pair after that is scored under conventions of its own.",
+    ),
+    "B": (
+        "This schedule is scored under the same house conventions as the one you filed",
+        "before it.",
+    ),
+}
+
+
+def scope_sentence(label: str) -> str:
+    """The sentence for one sibling, as the description prints it."""
+    lines = SCOPE_SENTENCE.get(label.strip().upper())
+    if lines is None:
+        raise ValueError(f"a family has siblings A and B, not {label!r}")
+    return "\n".join(lines)
 
 
 # --------------------------------------------------------------------------
@@ -623,22 +656,24 @@ PHRASES = {
     "missing": MISSING_WORDS,
 }
 
-#: THE HEADING SAYS WHAT THE RULE GOVERNS, AND THE RULE GOVERNS ONE ENGAGEMENT.
-#: A convention is drawn per engagement, so a heading calling these conventions
-#: standing over every schedule states something the draw does not do: a reader
-#: holding conventions it worked out on an earlier engagement is told that those
-#: and these are claims about the same schedules, and one of them has to give. A
-#: reader that resolves that by keeping what it already had reads the statement of
-#: the rule and files under another rule, which is the arm the room is measured
-#: against filing as though it had been told nothing. So the heading is scoped to
-#: the engagement whose schedule it is stated over, and it says in the same breath
-#: that another engagement draws its own, which leaves the reader nothing to
-#: reconcile and the earlier conventions somewhere to live.
+#: THE HEADING NAMES THE SCOPE BY THE SCHEDULES THE READER FILES.
+#: A heading that scoped the rule to a word for the body of work it was drawn for
+#: was read, and what it did was measured. Of 119 readers given a correct statement
+#: of the rule, 64 restated it correctly and wrote it into their own notes, and then
+#: filed the held-out schedule under a different rule: they had taken the scope word
+#: for the organisation printed at the top of the schedule, and the two sibling
+#: schedules never carry one organisation between them, so the heading told each
+#: reader that the rule it had just been handed did not reach the schedule it was
+#: about to file. A scope word a reader can map onto the surface is therefore a
+#: scope word that names the wrong thing. The heading now names the scope by what
+#: the reader does, which is file this schedule and then the next one, and it says
+#: in the same breath that the schedule after those is scored under conventions of
+#: its own, which leaves conventions worked out earlier somewhere to live.
 ORACLE_HEAD: tuple[str, ...] = (
-    "HOUSE CONVENTIONS FOR THIS ENGAGEMENT (they govern the schedule above",
-    "and the other schedules of this engagement; every other engagement draws",
-    "conventions of its own, so conventions do not carry from one engagement",
-    "to another)",
+    "HOUSE CONVENTIONS FOR THIS SCHEDULE AND THE NEXT ONE YOU FILE (they",
+    "govern the schedule above and the next schedule you are given, whichever",
+    "organisation it names; the schedule after that is scored under",
+    "conventions of its own)",
     "",
 )
 
@@ -939,6 +974,12 @@ class LedgerGenerator:
     # ----- the task text -----
 
     def describe(self, task: PublicTask) -> str:
+        """The schedule, the policy extract, and which schedules share a convention.
+
+        It takes the PUBLIC task, so there is no argument here the drawn rule could
+        arrive through, and the scope sentence is chosen by the sibling label and by
+        nothing else: the same bytes go to every arm of a fork.
+        """
         table: LedgerTable = task.table
         dom = table.dom
         hol = "\n".join(
@@ -947,7 +988,8 @@ class LedgerGenerator:
         return TASK_TEMPLATE.format(
             org=dom["org"], title=dom["title"], ref=dom["refdate"].isoformat(),
             entity=dom["entity"], manual=dom["manual"], table=band_table(dom),
-            unit=dom["unit"], hol=hol, fmtnote=FMT_NOTE[dom["fmt"]], body=table.body,
+            unit=dom["unit"], hol=hol, scope=scope_sentence(task.label),
+            fmtnote=FMT_NOTE[dom["fmt"]], body=table.body,
         )
 
     # ----- the three cells -----
