@@ -38,10 +38,11 @@ class OracleTemplate:
     """What each option means, in words, and the frame the rule is stated in.
 
     `head` is the preamble, and what it is there for is scope: the rule under it was
-    drawn for one engagement, so the preamble says which schedules it governs and
-    that another engagement draws its own. `sentences` gives, per axis, the sentence
-    frame with a single `{}` where the option's phrase goes. `phrases` gives the
-    phrase for every option of every axis.
+    drawn for one pair of sibling schedules, so the preamble names that pair by what
+    the reader does with it rather than by anything printed on it, and says that the
+    pair after it is scored under conventions of its own. `sentences` gives, per
+    axis, the sentence frame with a single `{}` where the option's phrase goes.
+    `phrases` gives the phrase for every option of every axis.
     """
 
     head: tuple[str, ...]

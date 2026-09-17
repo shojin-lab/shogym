@@ -346,21 +346,26 @@ def _rule_phrases(convention) -> tuple[str, ...]:
     )
 
 
-def test_the_oracle_heads_the_rule_with_the_engagement_it_was_drawn_for() -> None:
-    """The scope the heading claims is the scope the draw gives it, and no wider.
+def test_the_oracle_heads_the_rule_with_the_schedules_the_reader_files() -> None:
+    """The scope is named by the schedules the reader files, not by a word it can
+    map onto the organisation printed on one of them.
 
-    A rule is drawn per engagement. A heading calling these conventions standing
-    over every schedule puts them and whatever the reader worked out on an earlier
-    engagement in one scope, and a reader that settles that by keeping what it had
-    files under the old rule out of the arm the room is measured against.
+    A rule is drawn for a pair of sibling schedules, and the two siblings are always
+    different organisations. A heading that scoped the rule by anything printed on
+    the surface therefore told the reader the rule did not reach the schedule it was
+    about to file, and a reader that believed that filed under its own older rule,
+    out of the arm the room is measured against.
     """
     instance = _instance()
     ast = GENERATOR.render_oracle(instance.a.task_id, instance.convention, instance.a.n_rows)
     text = _flat(ast.body)
-    assert text.startswith("HOUSE CONVENTIONS FOR THIS ENGAGEMENT")
-    assert "they govern the schedule above and the other schedules of this engagement" in text
-    assert "every other engagement draws conventions of its own" in text
-    assert "conventions do not carry from one engagement to another" in text
+    assert text.startswith("HOUSE CONVENTIONS FOR THIS SCHEDULE AND THE NEXT ONE YOU FILE")
+    assert (
+        "they govern the schedule above and the next schedule you are given, "
+        "whichever organisation it names" in text
+    )
+    assert "the schedule after that is scored under conventions of its own" in text
+    assert "engagement" not in text
     assert "standing" not in text
     assert "every schedule" not in text
     # and under that heading, every decision the rule makes
