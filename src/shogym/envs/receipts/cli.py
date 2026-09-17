@@ -31,8 +31,10 @@ convention and the answer key. None of this is reachable from a lineage sandbox.
 from __future__ import annotations
 
 import argparse
+import functools
 import math
 from pathlib import Path
+from typing import Callable
 
 from shogym.envs.receipts import admission as admission_mod
 from shogym.envs.receipts import bank as bank_mod
@@ -40,6 +42,7 @@ from shogym.envs.receipts import bundle as bundle_mod
 from shogym.envs.receipts import streams
 from shogym.envs.receipts.receipt_ast import GRADED, ORACLE, PLACEBO
 from shogym.receipts.screen import REGISTERED_MIN_PAIRS
+from shogym.envs.receipts.protocol import ConstructionExhausted
 from shogym.envs.receipts.registry import (
     FIXTURES,
     GENRES,
@@ -48,6 +51,7 @@ from shogym.envs.receipts.registry import (
     bundles,
     is_fixture,
     load_generator,
+    provenance_path,
 )
 
 RULE = "-" * 78
@@ -65,6 +69,13 @@ def add_parser(sub: argparse._SubParsersAction) -> None:
     made.add_argument("--size", type=_count, default=16, help="instances to admit (default: 16)")
     made.add_argument(
         "--force", action="store_true", help="replace a bank that already exists"
+    )
+    made.add_argument(
+        "--reroll", default=None, metavar="REASON",
+        help="roll a second key for this genre, saying why. The whole gate universe is "
+             "a function of the key, so a second roll is an act that has to be named: "
+             "without this a genre whose provenance already records an attempt is "
+             "refused, whether the first one filled or not",
     )
 
     gated = inner.add_parser(
@@ -232,6 +243,13 @@ def run(args: argparse.Namespace) -> int:
         raise ValueError(f"unknown receipts command {command!r}")
     try:
         return handler()
+    except ConstructionExhausted as exc:
+        # A named failure of the family rather than an operator mistake, and the one
+        # exception here that is about the generator: a bounded construction that ran
+        # out says which ordinal, and the key it ran under is in the provenance record
+        # so the same attempt can be made again.
+        print(f"this family could not be constructed: {exc}")
+        return 1
     except (OSError, KeyError, OverflowError, TypeError, ValueError) as exc:
         # A KeyError's own str is the repr of its argument, so it is unwrapped here
         # rather than printed as a quoted blob.
@@ -481,8 +499,49 @@ def _list() -> int:
     return 0
 
 
+def _one_attempt_at_a_time(
+    command: Callable[[argparse.Namespace], int],
+) -> Callable[[argparse.Namespace], int]:
+    """Run a materialization under the claim on its genre's evidence directory.
+
+    THE WHOLE COMMAND, AND NOT ONLY THE CHECK. The refusal that makes a second key an
+    act with a name is a read of the provenance record followed by a write of it, and
+    the attempt itself sits between them: two commands started together both read a
+    record with nothing in it, so neither of them was a reroll, and the key the second
+    one wrote down replaced the first one's. Holding the claim from before the check
+    until after the attempt has been recorded is what leaves the second command reading
+    what the first one wrote.
+
+    A gate vector has no bank, no record and no key, and the command refuses it by name,
+    so it takes no claim.
+    """
+
+    @functools.wraps(command)
+    def under_one_claim(args: argparse.Namespace) -> int:
+        if is_fixture(args.name):
+            return command(args)
+        try:
+            with bank_mod.one_attempt(provenance_path(args.name)):
+                return command(args)
+        except bank_mod.AttemptInProgress as busy:
+            print(str(busy))
+            return 1
+
+    return under_one_claim
+
+
+@_one_attempt_at_a_time
 def _materialize(args: argparse.Namespace) -> int:
-    """Freeze a bank: a generator, a fresh key, and how many passers it holds."""
+    """Freeze a bank: a generator, a key recorded before it is used, and its passers.
+
+    THE KEY IS COMMITTED BEFORE ANYTHING IS BUILT. The whole gate universe is a function
+    of the master key, and nothing in a bank record counts how many were rolled, so an
+    attempt that could not fill used to leave nothing at all behind and a reroll for a
+    friendlier bank was indistinguishable from a first attempt. The key and its
+    commitment are written to the provenance record beside the banks before construction
+    begins and are kept whichever way the attempt goes, and a genre whose record already
+    holds an attempt is refused unless the operator names the reroll.
+    """
     if is_fixture(args.name):
         print(
             f"{args.name} is a gate vector, not a family; vectors are never dealt and have "
@@ -493,22 +552,48 @@ def _materialize(args: argparse.Namespace) -> int:
     if path.is_file() and not args.force:
         print(f"{path} already holds a frozen bank; pass --force to replace it")
         return 1
+    record = provenance_path(args.name)
+    previous = bank_mod.read_provenance(record)["attempts"]
+    if previous and not args.reroll:
+        print(
+            "%s already records %d key attempt(s) at %s, the last one %s. Rolling "
+            "another key draws another gate universe, so say why: "
+            "--reroll \"the reason\""
+            % (args.name, len(previous), record, previous[-1]["outcome"])
+        )
+        return 1
     generator = load_generator(args.name)
+    master = streams.new_master_key()
+    attempt = bank_mod.begin_attempt(
+        record, args.name, master, args.size, args.reroll or "first attempt"
+    )
     try:
         # The population comes back from the fill rather than from a second walk of
         # the same ordinals: admission is what costs, and it has already run.
-        built, found = bank_mod.materialized(
-            generator, streams.new_master_key(), args.size
-        )
+        built, found = bank_mod.materialized(generator, master, args.size)
+    except ConstructionExhausted as exc:
+        bank_mod.finish_attempt(record, attempt, bank_mod.FAILED, str(exc))
+        print(f"this family could not be constructed: {exc}")
+        print(f"the key that attempt was made under is kept at {record}")
+        return 1
     except ValueError as exc:
+        bank_mod.finish_attempt(record, attempt, bank_mod.FAILED, str(exc))
         print(f"this bank cannot be filled: {exc}")
+        print(f"the key that attempt was made under is kept at {record}")
         return 1
     written = bank_mod.save_bank(built, path)
+    bank_mod.finish_attempt(
+        record, attempt, bank_mod.FILLED, f"bank digest {written}"
+    )
     print(f"materialized {built.size} instances of {args.name} at {path}")
     print(f"bank digest {written[:16]}, ordinals {list(found.ordinals)}")
     # In full, because the review pack has to name it and a bundle refuses a pack read
     # from another bank.
     print(f"bank identity {bank_mod.bank_identity(built)}")
+    print(
+        "key commitment %s, attempt %d recorded at %s"
+        % (bank_mod.key_commitment(master), attempt, record)
+    )
     print(
         "%.1f%% of %d ordinals considered passed %s"
         % (100.0 * found.passing_fraction, found.considered, bank_mod.GATE_LABEL)

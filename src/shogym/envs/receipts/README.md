@@ -167,6 +167,115 @@ identifier wins), extras, and omissions. One forgiving reading is registered and
 a filing with no commas anywhere is read positionally **only** when it has exactly one line per
 printed row, so a paragraph of prose cannot be read as an answer to the first rows.
 
+## The genre: `soundchange`, phonological transformation composition
+
+A batch of 24 invented proto forms and the complete public mechanics of a cascade that turns
+each one into a daughter form. The mechanics are deliberately incomplete. Four decisions they
+never make are the hidden convention:
+
+| Axis | Options | The decision |
+|---|---|---|
+| `reflex` | `out_g`, `out_x`, `out_s` | which phone a matching k becomes |
+| `environment` | `vowel_pair`, `right_vowel` | which neighbours a k needs before it is replaced |
+| `loss` | `erase_e`, `erase_i`, `erase_a` | which vowel is deleted between consonants |
+| `sequence` | `replace_then_erase`, `erase_then_replace` | which of the two hidden passes runs first |
+
+36 conventions. Sibling tasks are two disjoint batches of invented words under four
+presentation templates (`field_csv`, `archive_tsv`, `comparative_csv`, `catalogue_tsv`), scored
+under one draw. A public nasal pass runs first, once, and carries no hidden choice.
+
+**Thirty six and not fifty four.** A third environment replacing every k with no condition was
+proposed and is not here. Unconditional replacement of one consonant by another commutes with
+the deletion of a vowel between consonants on every word, so the two order choices under it
+would be the same function on every possible form and no search for better words could separate
+them. Keeping them would have advertised a decision no data can reveal.
+
+**What is easy here, said plainly.** The replacement phones g, x and s never occur in a proto
+form, and the deleted vowel can be read off the difference in vowel counts, so a reader holding
+A's corrected key can name two of the four axes by direct subword correspondence. This family
+does not offer four equally demanding inferences. The `phone_lookup` check gives those two away
+for free and requires room above what is left, which is the two-way environment composed with
+the two-way order.
+
+**A wider correction slot.** The longest proto form is 14 phones and every form carries each of
+the three deletable vowels between consonants, so the longest daughter is 13 bytes and the
+registered correction slot is **16**, not ledger's 12. Registered widths are 12 / 16 / 4 / 16
+with a 1100-byte oracle body allowance, which is a 63-byte row line and a **2757-byte**
+envelope.
+
+### The three checks this genre adds
+
+`copy_profiles` gives it the `soundchange_v1` profile, and that profile brings three checks
+beyond the eleven every family runs. They live in `generators/soundchange_audit.py`, which is a
+second implementation of the cascade by lookaround rather than by scan: `judge_cells` compares
+the renderer with the scorer and cannot catch a scorer that is wrong in both.
+
+| Check | What it asks |
+|---|---|
+| `cascade` | an independently implemented validator recomputes every answer on all 36 draws and both sides, the forms stay inside the declared grammar, and no printed identifier or correction changes under serialize and read back |
+| `phone_lookup` | giving the reflex and the deleted vowel away for free, on top of the lookup observations the floor already concedes, leaves the floor at or under 0.90 and more than 0.05 of room, at every reference draw and in both directions |
+| `analogy` | an optimistic reader who transfers A's own edits to every B form with the same skeleton earns at most 0.50 under every draw, in both directions |
+
+The disjoint final-consonant pools give the two batches disjoint answers without either side
+reading the other, and they establish **nothing** about copying resistance: the registered
+character maps fix them, so the copy screen scores zero on every pair by construction. The
+analogy check is what prices a sibling built by renaming the consonants the rule never looks at,
+and a release that presented the copy score as evidence by itself would be presenting an
+arithmetic fact about the alphabets.
+
+### The model room screen for this genre
+
+The `screen` command analyzes recorded outcomes and runs no model. The procedure, in one place
+for whoever runs it:
+
+1. After the mechanical checks and the human read, use the intended harness and resource limits
+   to execute one A copy and three B copies per case, from a common sealed A state. Receipt,
+   placebo and the registered prose oracle are assigned at the ordinary delivery point. B grades
+   are withheld and every artifact reference and transcript is preserved. No executable solver
+   is inserted into the oracle treatment.
+2. If usability exploration is needed, use the **first 12 admitted cases** as a separately
+   labelled diagnostic and freeze the candidate before any admission measurement. Then use the
+   **next 36 previously unused admitted cases**, fixed before outcomes are inspected. Without
+   exploration, use the first 36.
+3. Allocate **nine cases to each of the four frozen initial states**, in their registered order,
+   cyclically by case position. That allocation and the model configuration live in run
+   provenance: the screen schema has no fields for them.
+4. That is **36 A executions plus 108 B executions, 144 in all**, at zero prior receipt dose
+   within each process. Every assigned case and the registered failure dispositions are kept; a
+   run does not keep only the completed favourable triplets.
+5. Record O, P and G by initial state as well as pooled, with rule-reading mistakes, execution
+   mistakes, omitted rows, tool failures, context use, time and tokens.
+6. Judge it against the registered bars: `min_room=0.05`, `min_ratio=0.25`, `min_pairs=36`,
+   `floor=0.0`, `floor_rule="drop"`, `candidates_screened=1`. **Beside them**, as a predeclared
+   roster-release condition and not a `screen.json` field: **mean executed oracle grade at least
+   0.90**.
+
+A pooled mean can conceal a state-specific uptake failure, which is why the by-state report is
+part of the procedure rather than an extra. A solved reference implementation proves
+attainability and says nothing about model uptake.
+
+### Why a short executable rule, and what that is not an answer to
+
+The rule is three passes over at most 14 phones with at most two k occurrences: no date
+arithmetic, no rounding, no lookup. That is a choice about what a copy has to do once it has the
+rule, and it is **not** a repair for the low oracle grade an earlier engineering run recorded.
+The diagnostic of that run located the loss in **uptake and scope**, not in execution: almost
+every filing was the exact answer key of some convention the family draws from, an independent
+recomputation agreed with the grader on every row, and no copy skipped a row or ran out of
+turns. What went wrong was that copies refused the statement as untrusted content, or read its
+scope word as the name printed on the surface and did not carry the rule to the task they were
+about to file. Those are repairs to registered wording and they were made. A short rule here
+buys a cleaner separation between a copy that did not take the rule and a copy that took it and
+got the arithmetic wrong.
+
+### What this genre does not establish
+
+Passing one-step admission does not establish that this candidate will detect the recursion
+effect. A high graded arm as well as a high oracle arm leaves little scope for later
+improvement, so the mixed-chain pilot has to report the graded arm's ceiling frequency and the
+available gain by initial state. Corrections are not removed to avoid saturation without a
+separately registered change.
+
 ## Tools (served over MCP)
 
 - **`submit_filing(filing: str)`** is the env's **score terminal**: the call validates its args,
@@ -224,7 +333,7 @@ score, and none carries anything that moves with the draw.
   fork. `finalize_error` means the terminal transaction failed; on its own it implies neither
   "no fork" nor "`grade_error` is present".
 
-## The gates: `receipts-gates-v2`
+## The gates: `receipts-gates-v3`
 
 Three questions, all answered controller-side at zero execution cost, per instance, from the
 **serialized bytes** of the receipt the renderer actually produced. Not from the structure
@@ -271,6 +380,15 @@ The gate set is named because it is chain-specific: it implements R, S and H fro
 instrument and deliberately excludes the instrument's later count gate, whose channel is a
 paid mechanism here rather than a defect. Nothing claims the instrument's own verdict.
 
+The name is at **v3** because the copy bar is now read against whichever registered family a
+generator declares, and because a declared profile can bring further checks with it. The
+numbers are the numbers they were; the rule they are read against is not, which is what a named
+version exists to keep apart. A family admitted under an earlier label does not publish under
+this one, and a bundle frozen under an earlier label does not verify. The renderer
+configuration is at `receipts-render-v2` for the same kind of reason: a second genre registers a
+wider correction slot and a larger envelope, and the widths a cell is built at are part of how
+it is built.
+
 ### The vectors
 
 The instrument's hand-checkable vectors ship as real generators (`generators/vectors.py`) so
@@ -287,8 +405,9 @@ them, `materialize` refuses them, and the environment refuses to be constructed 
 
 ## The named checks
 
-`shogym receipts check <name>` runs eleven, each named separately from the gates because
-failing one means something different.
+`shogym receipts check <name>` runs eleven for every family, each named separately from the
+gates because failing one means something different, plus whichever further checks the
+generator's declared copy profile brings with it.
 
 | Check | What it asks |
 |---|---|
@@ -337,6 +456,31 @@ product size and sub-family containment cannot see.
 Every target vocabulary is a published one. A map into the tokens B's drawn key happened to
 realize would price a transfer nobody can perform, because producing it means already knowing
 what the hidden draw did to B.
+
+### Every generator declares its copy profile
+
+Which value maps the screen enumerates depends on what a task publishes, so a generator
+declares `COPY_PROFILE` and `registry.load_generator` **refuses one that does not**. The
+declared profiles live in `copy_profiles.py`:
+
+| Profile | Value maps | Who declares it |
+|---|---|---|
+| `ordered_tokens` | the registered token dictionaries between two published answer orders, closed under composition | `ledger`, the gate vectors |
+| `soundchange_v1` | the 36 global character maps: every permutation of the three deletable vowels crossed with every permutation of the three replacement phones | `soundchange` |
+
+A generator added later declares one of these or is refused at registration, and a profile
+name this build does not register is refused the same way. The refusal is the point: a family
+whose answers are whole invented words has no complete ordered vocabulary, so pricing it under
+`ordered_tokens` would report the maximum of a transfer nobody can perform, and the bar would
+be read against a number that measured nothing. `answer_ranks` may return `None` for a profile
+that consumes no ranks, and only for such a profile; an empty tuple is not a fictitious
+complete vocabulary, and a family that publishes ranks while declaring a profile that consumes
+none is refused rather than quietly priced by fewer maps.
+
+`soundchange_v1` and its bar are a **new registration**. The number 0.50 is carried over as a
+conservative initial ceiling and inherits none of `ordered_tokens`'s empirical calibration, so
+the combined registration is named `receipts-gates-v3` and a bundle frozen under the earlier
+label does not verify against it.
 
 It reports **two** numbers against two thresholds, because they answer different questions. The
 no-induction best is what an agent gets for reusing A's answers. The flip best is what it gets
@@ -609,15 +753,24 @@ position stays controller-side.
 ## Still to build
 
 The frozen manifest release with its pairwise disjointness matrix, the rented-family
-protocol, and the further genres.
+protocol, and the further genres. Two generators are not a roster: the release still needs the
+pairwise semantic matrix over every implemented hidden axis, the independent validator results,
+the independent master-key provenance, and a named human attestation tying all of it to final
+code and bundle hashes. A registry entry is not admission and a verified bundle is not a roster
+place.
 
 Recorded boundaries, held by process rather than by a check:
 
 - **Which bank was frozen.** `bundle` takes no argument pointing at another bank and `draw`
   takes no seed, but that is the command line and not a proof that nobody chose the key.
-  `materialize --force` rerolls the master, the bank directory is redirectable by
-  `SHOGYM_RECEIPTS_BANKS`, and a bank record is five fields anyone can write; nothing counts
-  the rolls. Closing it takes append-only external provenance the v0 hash set does not have.
+  `materialize` now writes the key and its commitment to a provenance record beside the banks
+  before construction begins, keeps them whether or not the bank fills, and refuses a second
+  attempt until `--reroll` names why, so a reroll is an act somebody has to perform on purpose
+  and a failed attempt is no longer invisible. That is not closure: the bank directory is
+  redirectable by `SHOGYM_RECEIPTS_BANKS`, an operator can delete the record, and a bank record
+  is five fields anyone can write. Closing it takes append-only external provenance the v0 hash
+  set does not have, and publishing the commitment before the bank is built is what that record
+  is shaped for.
 
 - **The task text is a stable instance name.** A surface is a pure function of the ordinal, so a
   lineage that remembers a previous link can recognize an instance it has been served before.
@@ -636,7 +789,12 @@ Recorded boundaries, held by process rather than by a check:
 | `protocol.py` | what a genre implements, the published sampler law, and `draw`. |
 | `receipt_ast.py` | the receipt structure, the one canonical serializer, and the envelope. |
 | `streams.py` | keyed domain-separated randomness and the opaque task identifiers. |
+| `filing.py` | the shared line reading, the printable fold, the row parser, the equal-row scorer, and the sentences that say which tasks share a convention. |
+| `copy_profiles.py` | the registered families of maps the copy screen prices, and which generator declares which. |
 | `generators/ledger.py` | the ledger genre: domains, the scoring function, the three renderers, the oracle template. |
+| `generators/soundchange.py` | the sound change genre: the phone inventory, the three passes, the keyed pair construction and its filter, the four surfaces, the oracle template. |
+| `generators/soundchange_audit.py` | a second implementation of that cascade, the predicates the pair is filtered on, and the three checks the profile adds. |
+| `soundchange_review.py` | the deterministic review pack and the private trace worksheets for that genre. |
 | `bank.py` | what is frozen before launch, and the one atomic render after a filing seals. |
 | `bundle.py` | the admission bundle: one addressed directory, and the one verifier over it. |
 | `review.py` | what a review pack has to cover, enumerated from the family's declarations. |

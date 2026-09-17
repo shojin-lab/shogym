@@ -12,3 +12,4 @@ shogym_logs/
 .direnv/
 .DS_Store
 examples/*/runs/
+.evidence-soundchange/

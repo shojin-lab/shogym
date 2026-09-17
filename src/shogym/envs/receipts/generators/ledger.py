@@ -46,20 +46,20 @@ from __future__ import annotations
 import datetime as dt
 import json
 import random
-import re
 from dataclasses import dataclass
 from typing import Any, Mapping, Sequence
 
+from shogym.envs.receipts import filing as shared_filing
 from shogym.envs.receipts import streams
+from shogym.envs.receipts.copy_profiles import ORDERED_TOKENS
+from shogym.envs.receipts.filing import SCOPE_SENTENCE, scope_sentence
 from shogym.envs.receipts.protocol import (
     Axis,
     Column,
     Filing,
     ROW_ADDITIVE_EQUAL_WEIGHT,
-    NoFiling,
     PublicTask,
     RowOutcome,
-    SealedSubmission,
     Shape,
     Task,
 )
@@ -592,31 +592,11 @@ no other text. File every record, in the order the records appear above.
 #: never told so has no reason to carry to the second schedule anything it worked
 #: out on the first. That is what a run of 119 readers measured: 64 of them held a
 #: correct statement of the rule and filed the second schedule under a different
-#: one, because nothing they could see said the two were scored together. So the
-#: task says which schedules share the conventions, by what the reader does with
-#: them rather than by any name printed on them, and says that the pair after them
-#: is scored under conventions of its own. It states that two consecutive schedules
-#: share a rule, which is the design's own premise, and nothing about what that rule
-#: is. It is a function of the sibling label alone, so the same bytes reach every
-#: arm and no arm reads anything here another cannot.
-SCOPE_SENTENCE: dict[str, tuple[str, ...]] = {
-    "A": (
-        "This schedule and the next one you file are scored under the same house",
-        "conventions; the pair after that is scored under conventions of its own.",
-    ),
-    "B": (
-        "This schedule is scored under the same house conventions as the one you filed",
-        "before it.",
-    ),
-}
-
-
-def scope_sentence(label: str) -> str:
-    """The sentence for one sibling, as the description prints it."""
-    lines = SCOPE_SENTENCE.get(label.strip().upper())
-    if lines is None:
-        raise ValueError(f"a family has siblings A and B, not {label!r}")
-    return "\n".join(lines)
+#: one, because nothing they could see said the two were scored together. The two
+#: sentences and the function that chooses between them live in `filing.py`, which
+#: every generator of this shape imports, so the registered string is one string
+#: rather than one per genre. They are named here as well because this module's
+#: readers and its tests reach them through it.
 
 
 # --------------------------------------------------------------------------
@@ -706,45 +686,12 @@ ORACLE_TEMPLATE = OracleTemplate(
 # --------------------------------------------------------------------------
 
 
-def _norm(value: object) -> str:
-    """One filed value as the family reads it: collapsed whitespace, printable ASCII.
-
-    THE FOLD IS PART OF THE READING, not a renderer's afterthought. Every byte the
-    agent types reaches a cell through here, and the serializer refuses a field that
-    is not ASCII, so a value left exactly as typed lets one accented letter decide
-    whether the fork renders at all. Folding here means the scorer and both renderers
-    see one value, and a character that will not fold costs the agent its identifier
-    match, which is a reason-coded outcome rather than an exception out of the seal.
-
-    Control bytes fold for the same reason. ESC, NUL and backspace are ASCII, so the
-    serializer passes them, and the observed column is echoed into the placebo, where
-    an escape sequence is highlighting in the arm that is meant to be inert.
-    """
-    text = re.sub(r"\s+", " ", str(value or "")).strip()
-    return "".join(ch if " " <= ch <= "~" else "?" for ch in text)
-
-
-def _fold(value: object) -> str:
-    return _norm(value).lower()
-
-
-def _lines(raw: object) -> list[str] | None:
-    """The filing as lines, or None when there is nothing readable in it at all."""
-    if raw is None:
-        return None
-    if isinstance(raw, str):
-        return [ln for ln in (line.strip() for line in raw.splitlines()) if ln]
-    if isinstance(raw, (list, tuple)):
-        out: list[str] = []
-        for item in raw:
-            if item is None:
-                out.append("")
-                continue
-            if not isinstance(item, (str, int, float)):
-                return None
-            out.append(str(item).strip())
-        return out
-    return None
+#: The reading and the fold are the shared ones. They were this module's, and every
+#: generator of this shape needs exactly them, so they moved to `filing.py` and these
+#: names are what this module's own readers and tests still reach them through.
+_norm = shared_filing.normalize
+_fold = shared_filing.fold
+_lines = shared_filing.lines_of
 
 
 # --------------------------------------------------------------------------
@@ -760,6 +707,13 @@ class LedgerGenerator:
     SHAPE = SHAPE
     AXES = AXES
     SCORING: str = ROW_ADDITIVE_EQUAL_WEIGHT
+    #: The copy screen prices this family through the ordered-token profile, which is
+    #: the family it was already priced under. Its published vocabulary is the band
+    #: table each sibling task prints, in the order it prints it, so a whole row answer
+    #: is one token of a complete ordered list and the registered maps are maps between
+    #: two such lists. Declared rather than assumed, because the bar and the family are
+    #: one registration and a second genre's answers are not this shape.
+    COPY_PROFILE: str = ORDERED_TOKENS
 
     # ----- the instance -----
 
@@ -880,56 +834,12 @@ class LedgerGenerator:
         printed row. Any other comma-free filing names no identifier and is a
         reason-coded NoFiling, so a paragraph of prose cannot be read as an answer
         to the first rows of the schedule.
+
+        The rules are the shared ones and this reads them out of `filing.py`, so a
+        second family of this shape reads a line the way this one does rather than
+        the way its author remembered.
         """
-        lines = _lines(raw)
-        if lines is None:
-            return NoFiling("unreadable")
-        if not any(line for line in lines):
-            return NoFiling("empty")
-
-        identifiers = self.row_identifiers(task.table)
-        position = {_fold(row_id): i for i, row_id in enumerate(identifiers)}
-        values: list[str] = [""] * len(identifiers)
-        seen: set[int] = set()
-        duplicates: list[str] = []
-        extras: list[str] = []
-        filed = 0
-
-        if not any("," in line for line in lines):
-            if len(lines) != len(identifiers):
-                return NoFiling("no_known_identifier")
-            for i, line in enumerate(lines):
-                if line:
-                    values[i] = _norm(line)
-                    seen.add(i)
-                    filed += 1
-        else:
-            for line in lines:
-                if not line:
-                    continue
-                head, _, tail = line.partition(",")
-                index = position.get(_fold(head))
-                if index is None:
-                    extras.append(_norm(head))
-                    continue
-                filed += 1
-                if index in seen:
-                    duplicates.append(identifiers[index])
-                    continue
-                values[index] = _norm(tail)
-                seen.add(index)
-            if not seen and not any(v for v in values):
-                return NoFiling("no_known_identifier")
-
-        omissions = tuple(identifiers[i] for i in range(len(identifiers)) if i not in seen)
-        return SealedSubmission(
-            values=tuple(values),
-            filed=tuple(i in seen for i in range(len(identifiers))),
-            filed_rows=filed,
-            duplicates=tuple(duplicates),
-            extras=tuple(extras),
-            omissions=omissions,
-        )
+        return shared_filing.parse_rows(self.row_identifiers(task.table), raw)
 
     def score(self, task: Task, canonical: Filing) -> tuple[float, tuple[RowOutcome, ...]]:
         """The sealed scalar and what the filing did on every row.
@@ -946,30 +856,9 @@ class LedgerGenerator:
         """
         identifiers = self.row_identifiers(task.table)
         truth = task.key if task.key else ("",) * len(identifiers)
-        submitted = canonical if isinstance(canonical, SealedSubmission) else None
-        outcomes: list[RowOutcome] = []
-        for i, identifier in enumerate(identifiers):
-            got = ""
-            was_filed = False
-            if submitted is not None:
-                got = submitted.values[i] if i < len(submitted.values) else ""
-                was_filed = submitted.filed[i] if i < len(submitted.filed) else False
-            outcomes.append(
-                RowOutcome(
-                    ordinal=i + 1,
-                    identifier=identifier,
-                    filed=got,
-                    was_filed=was_filed,
-                    correct=truth[i] if i < len(truth) else "",
-                    matched=was_filed
-                    and self.normalize_answer(got)
-                    == self.normalize_answer(truth[i] if i < len(truth) else ""),
-                )
-            )
-        if not outcomes:
-            return 0.0, ()
-        matched = sum(1 for o in outcomes if o.matched)
-        return round(matched / float(len(outcomes)), 6), tuple(outcomes)
+        return shared_filing.score_rows(
+            identifiers, truth, canonical, self.normalize_answer
+        )
 
     # ----- the task text -----
 
@@ -1064,6 +953,7 @@ GENERATOR = LedgerGenerator()
 __all__ = [
     "ALL_CONVENTIONS",
     "AXES",
+    "SCOPE_SENTENCE",
     "BLANK_TOKEN",
     "UNFILED_TOKEN",
     "DOMAINS",
@@ -1082,4 +972,5 @@ __all__ = [
     "daycount",
     "key_for",
     "leverage",
+    "scope_sentence",
 ]

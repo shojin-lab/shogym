@@ -198,6 +198,7 @@ SHARDS: Tuple[Shard, ...] = (
             "tests/envs/test_receipts_read_back.py",
             "tests/envs/test_receipts_recovery.py",
             "tests/envs/test_receipts_render.py",
+            "tests/envs/test_receipts_soundchange.py",
             "tests/envs/test_tau2_domains_served.py",
             "tests/envs/test_tau2_fidelity.py",
             "tests/envs/test_tau2_mock_served.py",

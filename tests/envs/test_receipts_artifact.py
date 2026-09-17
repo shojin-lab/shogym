@@ -728,14 +728,17 @@ async def test_a_renderer_a_contract_or_a_grade_that_drifted_under_a_capture_is_
         assert contract_drift.value.type == "ContractDrift"
 
         # Another renderer, declared by the contract as well, so what refuses is the record.
-        monkeypatch.setattr(bank_mod, "RENDERER_CONFIGURATION", "receipts-render-v2")
+        # The name is built from this build's own, so a later revision cannot make the
+        # drifted value the real one and quietly turn this into a test of nothing.
+        moved = bank_mod.RENDERER_CONFIGURATION + "-moved"
+        monkeypatch.setattr(bank_mod, "RENDERER_CONFIGURATION", moved)
         with pytest.raises(ApplicationError, match="was rendered by") as renderer_drift:
             await _seal(
                 _activities(episode),
                 seal_id=seal_id,
                 filing=filing,
                 blobs=blobs,
-                contract=replace(contract, renderer_configuration="receipts-render-v2"),
+                contract=replace(contract, renderer_configuration=moved),
             )
         assert renderer_drift.value.type == "ContractDrift"
         monkeypatch.undo()
