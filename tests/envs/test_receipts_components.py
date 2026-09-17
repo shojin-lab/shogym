@@ -1690,6 +1690,96 @@ def test_two_overlapping_attempts_authorize_one_and_leave_a_history_that_verifie
     assert len(bank_mod.history_attempts(history, "components")) == 1
 
 
+def test_a_retry_is_the_recorded_attempt_or_it_is_refused_until_it_is_named(
+    evidence: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """What --retry keeps, and what it used to let change underneath the key it kept.
+
+    It fails if a retry at another size, another code pin, another instrument label or
+    another construction bound enters construction as though it were the attempt the
+    history records, if naming the change with --changed does not make it an attempt of
+    its own under the key that was kept, or if --changed is accepted without --retry.
+    A retry that reproduces none of the recorded attempt but its key is a second attempt
+    wearing the first one's name.
+    """
+    from shogym.envs.receipts.registry import history_path
+
+    history = history_path()
+    assert _cli(["receipts", "materialize", "components", "--size", "1"]) == 0
+    capsys.readouterr()
+    recorded = bank_mod.history_attempts(history, "components")[-1]
+    kept = bytes.fromhex(recorded["master"])
+
+    def retry(*extra: str) -> int:
+        return _cli([
+            "receipts", "materialize", "components", "--size", "1", "--force",
+            "--retry", *extra,
+        ])
+
+    # The recorded attempt, made again, is the one thing --retry is for.
+    assert retry() == 0
+    capsys.readouterr()
+    assert len(bank_mod.history_attempts(history, "components")) == 2
+
+    # Each of the four things the identity binds, changed one at a time.
+    assert _cli([
+        "receipts", "materialize", "components", "--size", "2", "--force", "--retry",
+    ]) == 1
+    said = capsys.readouterr().out
+    assert "size" in said and "--changed" in said
+
+    pinned = bank_mod.code_pin
+
+    def moved(generator: object) -> dict[str, object]:
+        return dict(pinned(generator), digest="a" * 64)
+
+    monkeypatch.setattr(bank_mod, "code_pin", moved)
+    assert retry() == 1
+    assert "code pin" in capsys.readouterr().out
+    monkeypatch.setattr(bank_mod, "code_pin", pinned)
+
+    labelled = bank_mod.GATE_LABEL
+    monkeypatch.setattr(bank_mod, "GATE_LABEL", "receipts-gates-somewhere-else")
+    assert retry() == 1
+    assert "gates" in capsys.readouterr().out
+    monkeypatch.setattr(bank_mod, "GATE_LABEL", labelled)
+
+    declared = components.GENERATOR.CONSTRUCTION_BOUNDS
+    monkeypatch.setattr(
+        components.GENERATOR, "CONSTRUCTION_BOUNDS",
+        dict(declared, max_proposals=1),
+    )
+    assert retry() == 1
+    assert "bounds" in capsys.readouterr().out
+    monkeypatch.setattr(components.GENERATOR, "CONSTRUCTION_BOUNDS", declared)
+
+    # Nothing was recorded by any of the four refusals.
+    assert len(bank_mod.history_attempts(history, "components")) == 2
+
+    # Named, the changed attempt is its own attempt under the key that was kept, and
+    # the attempt it was made from is still there.
+    assert _cli([
+        "receipts", "materialize", "components", "--size", "2", "--force", "--retry",
+        "--changed", "a wider bank under the key the first attempt rolled",
+    ]) == 0
+    capsys.readouterr()
+    attempts = bank_mod.history_attempts(history, "components")
+    assert len(attempts) == 3
+    assert attempts[0]["attempt"] == recorded["attempt"]
+    assert attempts[-1]["attempt"] != recorded["attempt"]
+    assert bytes.fromhex(attempts[-1]["master"]) == kept
+    assert attempts[-1]["size"] == 2
+    assert "a wider bank" in attempts[-1]["note"]
+    assert bank_mod.history_problems(history) == []
+
+    # And --changed is a qualification of a retry, not an act of its own.
+    assert _cli([
+        "receipts", "materialize", "components", "--size", "1", "--force",
+        "--changed", "no attempt named",
+    ]) == 1
+    assert "--retry" in capsys.readouterr().out
+
+
 def test_a_components_bank_refuses_a_key_already_committed_to_another_genre(
     evidence: Path, capsys: pytest.CaptureFixture[str]
 ) -> None:
