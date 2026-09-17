@@ -73,6 +73,24 @@ NO_FILING_REASONS = (
 )
 
 
+class ConstructionExhausted(RuntimeError):
+    """A generator's bounded search for a valid instance ran out.
+
+    IT IS NOT A SKIPPED ORDINAL. A generator that searches for a table its own filter
+    accepts can fail to find one, and the two ways of reporting that are not
+    interchangeable. An ordinary exception out of `build_table` reaches `bank.population`
+    outside the admission guard and leaves the caller with a traceback where it was
+    promised a count; treating it as a rejection would silently move the population,
+    because the bank would fill from later ordinals and the passing fraction it prints
+    would be measured against a different rule than the one it says it used.
+
+    So it has a name. Materialization stops on it and says which ordinal exhausted,
+    verification recognises it as the same whole-bank failure rather than as a bundle
+    that cannot be read, and the provenance record beside the bank keeps the key the
+    attempt was made under, so a failed attempt is reproducible instead of lost.
+    """
+
+
 @dataclass(frozen=True)
 class Axis:
     """One hidden decision: a name and an interchangeable option set."""
@@ -531,6 +549,7 @@ def option_mentions(axes: Sequence[Axis], text: str) -> list[tuple[str, str]]:
 __all__ = [
     "NO_FILING_REASONS",
     "Axis",
+    "ConstructionExhausted",
     "Column",
     "Filing",
     "Generator",
