@@ -1857,6 +1857,63 @@ def test_a_record_written_before_the_history_is_reconciled_before_it_is_passed(
     assert "--changed" in capsys.readouterr().out
 
 
+def test_a_history_shorter_than_the_position_retained_outside_it_is_refused(
+    evidence: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """Every valid prefix of a chain is a valid chain, so the position is kept elsewhere.
+
+    It fails if a history whose last lines have been removed verifies, if the genre whose
+    last attempt was in the part removed reads as unattempted, if the position is not
+    retained both beside the history and in the record beside the banks, or if a command
+    enters construction on a chain shorter than either of them.
+    """
+    from shogym.envs.receipts.registry import bank_dir, history_path, provenance_path
+
+    history = history_path()
+    record = provenance_path("components")
+    for key in (bytes(range(32)), bytes(range(1, 33))):
+        index = bank_mod.begin_attempt(
+            record, "components", key, 1, "a recorded attempt", history=history,
+            code="a pinned digest", instrument={"gates": "g", "renderer": "r"},
+            bounds={"max_proposals": 1}, banks=bank_dir(),
+        )
+        bank_mod.finish_attempt(
+            record, index, bank_mod.FAILED, "it ran out", history=history
+        )
+    lines = bank_mod.read_history(history)
+    assert len(lines) == 4
+    assert bank_mod.history_problems(history) == []
+
+    # The position is written down twice, and the two files are in two directories.
+    position = {"sequence": 3, "digest": lines[3]["digest"]}
+    assert bank_mod.read_position(history) == position
+    assert bank_mod.retained_position(record) == position
+    assert bank_mod.position_path(history).parent != record.parent
+
+    # The last attempt removed. What is left is a chain and hashes like one.
+    lopped = "\n".join(json.dumps(entry, sort_keys=True) for entry in lines[:2]) + "\n"
+    history.write_text(lopped, encoding="utf-8")
+    assert bank_mod.read_history(history) == lines[:2]
+    for problem in bank_mod.history_problems(history):
+        assert "position" in problem
+    assert bank_mod.history_problems(history)
+    assert _cli(["receipts", "materialize", "components", "--size", "1"]) == 1
+    assert "does not verify" in capsys.readouterr().out
+
+    # With the file beside the history removed as well, the chain verifies and the genre
+    # reads as having made one attempt rather than two. The record is the other copy.
+    bank_mod.position_path(history).unlink()
+    assert bank_mod.history_problems(history) == []
+    assert len(bank_mod.history_attempts(history, "components")) == 1
+    assert _cli([
+        "receipts", "materialize", "components", "--size", "1",
+        "--reroll", "a third key on a shortened chain",
+    ]) == 1
+    said = capsys.readouterr().out
+    assert "position" in said and "line 4" in said
+    assert bank_mod.read_history(history) == lines[:2]
+
+
 def test_a_components_bank_refuses_a_key_already_committed_to_another_genre(
     evidence: Path, capsys: pytest.CaptureFixture[str]
 ) -> None:

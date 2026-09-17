@@ -645,6 +645,25 @@ def _materialize(args: argparse.Namespace) -> int:
             "top of it would not say where it stopped being the record"
         )
         return 1
+    # AND THE POSITION THE RECORD RETAINED, which is in the evidence directory and not
+    # beside the history. Every valid prefix of a chain is a valid chain, so the lines
+    # removed from the end of one are the lines it cannot say were ever there; the two
+    # retained positions are what say it, and they are checked before construction
+    # because an attempt begun on a shortened chain is an attempt recorded onto it.
+    shortfall = bank_mod.position_problems(
+        history, bank_mod.retained_position(record)
+    )
+    if shortfall:
+        print(
+            "the key history at %s is behind the position %s retains: %s"
+            % (history, record, "; ".join(shortfall))
+        )
+        print(
+            "the record beside the banks and the position beside the history are two "
+            "places the same line is written down, and a chain shorter than both of "
+            "them is not the chain they were written from"
+        )
+        return 1
     # THE HISTORY AND NOT THE LOCAL RECORD. The record beside the banks moves when the
     # evidence directory moves, so a second invocation pointed somewhere fresh would be a
     # first attempt again; the history is one file for every directory this machine has
