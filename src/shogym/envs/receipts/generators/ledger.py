@@ -580,7 +580,7 @@ POLICY EXTRACT ({manual}, section 4)
 {hol}
 
 {scope}
-
+{receipt}
 SCHEDULE ({fmtnote})
 
 {body}
@@ -588,6 +588,36 @@ SCHEDULE ({fmtnote})
 File one line per record: the record id, a comma, and the band, with no header and
 no other text. File every record, in the order the records appear above.
 """
+
+#: WHAT THE RECEIPT WILL SAY, SAID BEFORE THE WORK IS DONE.
+#: A receipt that reports four records of twenty four is a receipt whose silence on the
+#: other twenty means nothing, and a reader who was not told that has been handed twenty
+#: rows of apparent evidence that the schedule was filed correctly. So the task says
+#: which of the two it is, in the same words for every arm of a fork and without naming
+#: which records were selected: the selection is drawn before any filing exists and a
+#: reader can see it in the receipt anyway, while a reader who could see it here could
+#: file the rest at random and lose nothing.
+#:
+#: It is one sentence, it is the same bytes under every convention, and it is printed
+#: only under a policy that samples. Under the full receipt the description is the one
+#: it was, to the byte.
+RECEIPT_SENTENCE: tuple[str, ...] = (
+    "The receipt for this schedule reports the verdict and the correct band for four",
+    "selected records only, and the lines for the other records say nothing about",
+    "whether they were right.",
+)
+
+
+def receipt_sentence(policy: ReceiptPolicy) -> str:
+    """The registered sentence for this policy, as the description prints it.
+
+    Empty under the full receipt, which promises a verdict and a correction on every
+    record and therefore has nothing to qualify.
+    """
+    if not policy.samples:
+        return ""
+    return "\n" + "\n".join(RECEIPT_SENTENCE) + "\n"
+
 
 #: WHICH SCHEDULES SHARE A CONVENTION, SAID IN THE TASK ITSELF.
 #: One convention is drawn for a pair of sibling schedules, and a reader that is
@@ -868,11 +898,13 @@ class LedgerGenerator:
     # ----- the task text -----
 
     def describe(self, task: PublicTask) -> str:
-        """The schedule, the policy extract, and which schedules share a convention.
+        """The schedule, the policy extract, which schedules share a convention, and
+        what the receipt will report on.
 
         It takes the PUBLIC task, so there is no argument here the drawn rule could
-        arrive through, and the scope sentence is chosen by the sibling label and by
-        nothing else: the same bytes go to every arm of a fork.
+        arrive through. The scope sentence is chosen by the sibling label and the
+        receipt sentence by the declared policy, and by nothing else: the same bytes
+        go to every arm of a fork.
         """
         table: LedgerTable = task.table
         dom = table.dom
@@ -883,6 +915,7 @@ class LedgerGenerator:
             org=dom["org"], title=dom["title"], ref=dom["refdate"].isoformat(),
             entity=dom["entity"], manual=dom["manual"], table=band_table(dom),
             unit=dom["unit"], hol=hol, scope=scope_sentence(task.label),
+            receipt=receipt_sentence(self.RECEIPT_POLICY),
             fmtnote=FMT_NOTE[dom["fmt"]], body=table.body,
         )
 
@@ -970,6 +1003,7 @@ __all__ = [
     "ORACLE_TEMPLATE",
     "PENDING_TOKEN",
     "POOL_A",
+    "RECEIPT_SENTENCE",
     "POOL_B",
     "SHAPE",
     "SLOTS",
@@ -980,5 +1014,6 @@ __all__ = [
     "daycount",
     "key_for",
     "leverage",
+    "receipt_sentence",
     "scope_sentence",
 ]

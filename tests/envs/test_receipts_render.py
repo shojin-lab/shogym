@@ -185,8 +185,8 @@ def test_the_description_gained_that_sentence_and_no_other_public_text() -> None
     and in the surface data they already differed in, and in nothing else.
     """
     instance = _instance()
-    bare = ledger.TASK_TEMPLATE.replace("{scope}\n\n", "")
-    assert "{scope}" not in bare
+    bare = ledger.TASK_TEMPLATE.replace("{scope}\n{receipt}\n", "")
+    assert "{scope}" not in bare and "{receipt}" not in bare
     for side, label in (("a", "A"), ("b", "B")):
         task = instance.side(side)
         dom = task.table.dom
@@ -206,8 +206,14 @@ def test_the_description_gained_that_sentence_and_no_other_public_text() -> None
             body=task.table.body,
         )
         sentence = ledger.scope_sentence(label)
+        # The scope sentence and, under a policy that samples, the registered sentence
+        # about what the receipt will report: both are what the description gained, and
+        # the text with both taken out is the text this task printed before either.
+        added = (
+            sentence + "\n" + ledger.receipt_sentence(GENERATOR.RECEIPT_POLICY) + "\n"
+        )
         assert task.text.count(sentence) == 1
-        assert task.text.replace(sentence + "\n\n", "", 1) == before
+        assert task.text.replace(added, "", 1) == before
 
 
 def test_a_sibling_label_the_family_does_not_have_is_refused() -> None:
