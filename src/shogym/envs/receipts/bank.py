@@ -37,6 +37,7 @@ from typing import Any, Iterator, Mapping, Sequence
 
 from shogym.envs.receipts import streams
 from shogym.envs.receipts.protocol import (
+    ConstructionExhausted,
     Filing,
     Generator,
     Instance,
@@ -274,7 +275,21 @@ def population(bank: Bank, generator: Generator, thresholds=None) -> Population:
         if len(held) >= bank.size:
             break
         considered += 1
-        instance = draw(generator, bank.master, ordinal)
+        # A GENERATOR THAT CANNOT BUILD AN INSTANCE IS NOT A REJECTED INSTANCE. A family
+        # whose bounded construction runs out has not produced a candidate for this
+        # ordinal to gate, and treating that as a failed admission would move the
+        # population: the bank would fill from later ordinals and the passing fraction
+        # it prints would be measured against a rule it did not use. It is also not an
+        # exception for the caller to guess at, so it keeps its name and says which
+        # ordinal, which is what makes a failed materialization reproducible rather than
+        # a bad afternoon.
+        try:
+            instance = draw(generator, bank.master, ordinal)
+        except ConstructionExhausted as exc:
+            raise ConstructionExhausted(
+                f"{bank.generator} could not construct ordinal {ordinal} after holding "
+                f"{len(held)} of {bank.size}: {exc}"
+            ) from exc
         if admission_report(generator, instance, bank.master, bars).admitted:
             held.append(instance)
     if len(held) < bank.size:
@@ -752,6 +767,95 @@ def filing_digest(raw: object) -> str:
 # --------------------------------------------------------------------------
 
 
+# --------------------------------------------------------------------------
+# key provenance: what was rolled, before it is known whether it filled
+# --------------------------------------------------------------------------
+#
+# A MATERIALIZATION THAT FAILS USED TO LEAVE NOTHING BEHIND. The key was made inside
+# the command and the bank was written only on success, so a run that could not fill
+# left no trace at all: a second run made a second key, and a reroll to obtain a
+# friendlier bank was indistinguishable from a first attempt. Nothing in the bank record
+# counts rolls, and the whole gate universe is a function of the key, so that is the one
+# thing an operator can move that no hash notices.
+#
+# So the key is committed BEFORE construction begins and retained whichever way the
+# attempt goes. The record sits beside the banks, holds the commitment and the key of
+# every attempt in the order they were made, and says how each one ended. It closes
+# nothing on its own: an operator who deletes the file has deleted the file, and only
+# append-only external provenance would close that. What it does is make a reroll an act
+# that has to be named.
+
+#: What a recorded attempt can have come to.
+STARTED = "started"
+FILLED = "filled"
+FAILED = "failed"
+OUTCOMES = (STARTED, FILLED, FAILED)
+
+
+def key_commitment(master: bytes) -> str:
+    """A binding, non-revealing commitment to one master key.
+
+    Recorded beside the key rather than instead of it: the record is controller-side and
+    the bank next to it carries the key in the clear anyway, so hiding it here would be
+    theatre. The commitment is what an operator publishes elsewhere, before the bank is
+    built, so that the key a bundle was made under can be shown to be the key that was
+    rolled first.
+    """
+    return streams.digest(b"receipts-bank-key", bytes(master))
+
+
+def read_provenance(path: Path) -> dict[str, Any]:
+    """The attempts recorded for one genre, or an empty record."""
+    if not Path(path).is_file():
+        return {"generator": "", "attempts": []}
+    payload = json.loads(Path(path).read_text(encoding="utf-8"))
+    if not isinstance(payload, dict) or not isinstance(payload.get("attempts"), list):
+        raise ValueError(f"the provenance record at {path} is not a record of attempts")
+    return payload
+
+
+def begin_attempt(
+    path: Path, generator: str, master: bytes, size: int, note: str = ""
+) -> int:
+    """Record a key and its commitment before anything is built. Returns its index.
+
+    Written first, and flushed to the file first, because the point of it is the attempt
+    that does not finish.
+    """
+    record = read_provenance(path)
+    record["generator"] = generator
+    attempts = record["attempts"]
+    index = len(attempts)
+    attempts.append(
+        {
+            "attempt": index,
+            "generator": generator,
+            "commitment": key_commitment(master),
+            "master": bytes(master).hex(),
+            "size": int(size),
+            "note": str(note),
+            "outcome": STARTED,
+            "detail": "",
+        }
+    )
+    Path(path).parent.mkdir(parents=True, exist_ok=True)
+    Path(path).write_text(json.dumps(record, indent=1, sort_keys=True), encoding="utf-8")
+    return index
+
+
+def finish_attempt(path: Path, index: int, outcome: str, detail: str = "") -> None:
+    """Say how the attempt at `index` ended, leaving its key where it was."""
+    if outcome not in OUTCOMES:
+        raise ValueError(f"an attempt ends as one of {OUTCOMES}, not {outcome!r}")
+    record = read_provenance(path)
+    attempts = record["attempts"]
+    if not 0 <= index < len(attempts):
+        raise ValueError(f"the provenance record has no attempt {index}")
+    attempts[index]["outcome"] = outcome
+    attempts[index]["detail"] = str(detail)
+    Path(path).write_text(json.dumps(record, indent=1, sort_keys=True), encoding="utf-8")
+
+
 def bank_record(bank: Bank) -> dict[str, Any]:
     """A bank as one canonical value. This is the whole of what a bank persists."""
     return {
@@ -895,8 +999,16 @@ def no_filing_reason(canonical: Filing | None) -> str:
 
 
 __all__ = [
+    "FAILED",
+    "FILLED",
     "FILING_SHAPES",
     "GATE_LABEL",
+    "OUTCOMES",
+    "STARTED",
+    "begin_attempt",
+    "finish_attempt",
+    "key_commitment",
+    "read_provenance",
     "RENDERER_CONFIGURATION",
     "Bank",
     "Fork",

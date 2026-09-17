@@ -90,6 +90,16 @@ def bank_path(name: str) -> Path:
     return bank_dir() / f"{name}.json"
 
 
+def provenance_path(name: str) -> Path:
+    """Where a genre's key provenance lives: beside the banks, one file per genre.
+
+    Beside rather than inside, because it outlives any one bank: a materialization that
+    could not fill writes no bank and still rolled a key, and that is the attempt the
+    record exists for.
+    """
+    return bank_dir() / "provenance" / f"{name}.json"
+
+
 def bundle_dir(name: str) -> Path:
     """Where a genre's admission bundles live, one directory per digest."""
     return bank_dir() / "bundles" / name
@@ -124,5 +134,6 @@ __all__ = [
     "bundle_dir",
     "bundles",
     "load_generator",
+    "provenance_path",
     "module_path",
 ]
