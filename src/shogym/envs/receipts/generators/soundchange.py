@@ -99,7 +99,6 @@ from shogym.receipts import ROW_LABEL
 
 VOWELS = "aeiou"
 CONSONANTS = "bdgkmnpstx"
-PHONES = "abdegikmnopstux"
 #: The consonants a generated cell is drawn from. g, x and s are deliberately absent:
 #: they are what the replacement pass introduces, so their presence in a daughter form
 #: is a consequence of the hidden rule rather than of the surface.
@@ -169,8 +168,6 @@ CLUSTER = "nb"
 MAX_CANDIDATES = 10000
 MAX_ATTEMPTS = 400
 ROWS = SHAPE.rows
-#: What a batch has to contain before anything else is asked of it.
-MIN_CLUSTER_ROWS = 4
 
 # ----- the registered envelope constants -------------------------------------
 # Every one of these is a family maximum or a fixed width. None is read off a

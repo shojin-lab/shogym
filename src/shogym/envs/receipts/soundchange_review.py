@@ -190,9 +190,13 @@ def _case_rows(population: Population) -> list[dict[str, Any]]:
     """The earliest row in the bank exhibiting each phenomenon the worksheet needs."""
     found: dict[str, dict[str, Any]] = {}
     for instance in population.instances:
+        if len(found) == len(WORKSHEET_CASES):
+            break
         for side in ("a", "b"):
             task = instance.side(side)
             for row in task.table.rows:
+                if len(found) == len(WORKSHEET_CASES):
+                    break
                 after = soundchange_audit.audit_nasal(row.proto)
                 for convention in soundchange.ALL_CONVENTIONS:
                     vowel = soundchange_audit.removed_vowel(convention["loss"])
