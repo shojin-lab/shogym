@@ -8,12 +8,14 @@ class, the row count the bank holds, and counterfactual renders under the rules 
 not drawn.
 
 WHAT THIS ADDS BEYOND THE SHARED COVERAGE. The graded, placebo and oracle cells of every
-filing class on BOTH siblings, so the reader follows one correct filing and one incorrect
-one all the way through; both raw task texts; all three oracle cells on one pair, so every
-sentence the oracle arm can state is in front of the reader rather than the one this draw
-produced; and a graded cell on each sibling under each of the two rules that were not
-drawn, labelled in the manifest as a review counterfactual so that nothing here reads as a
-sampled bank member.
+filing class on BOTH siblings under EACH OF THE THREE RULES, so the reader follows one
+correct filing and one incorrect one all the way through the rule this bank drew and then
+sees the same seven classes as they would have printed under the two that were not; both
+raw task texts; all three oracle cells on one pair, so every sentence the oracle arm can
+state is in front of the reader rather than the one this draw produced; and a graded cell
+on each sibling under each of the two rules that were not drawn, filed the same way on
+both. Every cell taken under a rule that was not drawn is labelled in the manifest as a
+review counterfactual, so that nothing here reads as a sampled bank member.
 
 AND A WORKSHEET, WHICH IS NOT A TASK. Beside the renders it writes a private worksheet:
 per row the occupied cells, the island count under each of the three rules, which rule the
@@ -324,17 +326,46 @@ def export(bank: Bank, held: Population, directory: str | Path) -> Path:
         )
         renders.append(Render("surface", task.surface, "task", path))
 
-    # ----- all three cells for every registered filing class, on both siblings --
-    for shape in checks.FILING_CLASSES:
-        for side in ("a", "b"):
-            task = first.side(side)
-            raw = checks.filing_of(generator, first, side, shape)
-            cells = _cells_for(first, task, first.convention, raw)
-            for kind in (GRADED, PLACEBO, ORACLE):
-                path = _write(
-                    root, f"{RENDERS}/filing-{shape}-{side}-{kind}.txt", cells[kind]
-                )
-                renders.append(Render("filing", shape, "cell", path))
+    # ----- every filing class, on both siblings, under EACH of the three rules ---
+    #
+    # The drawn rule is the pack proper; the other two are review counterfactuals and are
+    # labelled as such at every cell. One rule's seven classes tell the reader what this
+    # bank prints; the same seven under the rules that were not drawn are what tells them
+    # that the classes behave the same way whichever rule the family drew, which is the
+    # claim the genre makes and the one a single-rule pack leaves to be taken on trust.
+    # Each rule's filings are that rule's own, so "canonical" means correct under the
+    # rule being shown rather than correct under the one this bank happened to draw.
+    for option in components_audit.OPTIONS:
+        convention = {"contact_kernel": option}
+        counterfactual = option != drawn["contact_kernel"]
+        under = (
+            components_audit.retasked_instance(generator, first, convention)
+            if counterfactual
+            else first
+        )
+        for shape in checks.FILING_CLASSES:
+            for side in ("a", "b"):
+                task = under.side(side)
+                raw = checks.filing_of(generator, under, side, shape)
+                cells = _cells_for(under, task, convention, raw)
+                for kind in (GRADED, PLACEBO, ORACLE):
+                    name = (
+                        f"{RENDERS}/counterfactual-{option}-filing-{shape}-{side}-{kind}.txt"
+                        if counterfactual
+                        else f"{RENDERS}/filing-{shape}-{side}-{kind}.txt"
+                    )
+                    path = _write(root, name, cells[kind])
+                    renders.append(
+                        Render(
+                            "counterfactual",
+                            "review counterfactual under %s, filing %s, side %s"
+                            % (option, shape, side.upper()),
+                            "cell",
+                            path,
+                        )
+                        if counterfactual
+                        else Render("filing", shape, "cell", path)
+                    )
 
     # ----- the row count the bank holds ---------------------------------------
     path = _write(
