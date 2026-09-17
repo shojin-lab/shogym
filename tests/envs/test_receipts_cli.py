@@ -294,7 +294,13 @@ def test_materialize_refuses_to_overwrite_without_force(
     capsys.readouterr()
     assert _run(["receipts", "materialize", "ledger", "--size", "1", *BARS]) == 1
     assert "pass --force" in capsys.readouterr().out
-    assert _run(["receipts", "materialize", "ledger", "--size", "1", "--force", *BARS]) == 0
+    # A second key is a second gate universe, so the reroll is named as well as forced.
+    assert _run(["receipts", "materialize", "ledger", "--size", "1", "--force", *BARS]) == 1
+    assert "--reroll" in capsys.readouterr().out
+    assert _run([
+        "receipts", "materialize", "ledger", "--size", "1", "--force",
+        "--reroll", "the first key filled a bank this test then replaced", *BARS,
+    ]) == 0
 
 
 def test_draw_needs_a_bank_before_it_will_render(

@@ -11,17 +11,31 @@ import inspect
 import itertools
 import json
 import random
+import shutil
 from pathlib import Path
 from types import MappingProxyType
 from typing import Mapping, Sequence
 
 import pytest
 
+from shogym.cli import main
+from shogym.envs.receipts import admission
+from shogym.envs.receipts import bank as bank_mod
+from shogym.envs.receipts import bundle as bundle_mod
+from shogym.envs.receipts import review, soundchange_review, streams
 from shogym.envs.receipts import checks, copy_profiles
 from shogym.envs.receipts.generators import ledger, soundchange
 from shogym.envs.receipts.generators import soundchange_audit as audit
-from shogym.envs.receipts.protocol import Instance, PublicTask, Task, draw
+from shogym.envs.receipts.protocol import option_mentions
+from shogym.envs.receipts.protocol import (
+    ConstructionExhausted,
+    Instance,
+    PublicTask,
+    Task,
+    draw,
+)
 from shogym.envs.receipts.oracle import OracleTemplate
+from shogym.envs.receipts.streams import digest
 from shogym.envs.receipts.receipt_ast import (
     ReceiptAST,
     frozen_envelope,
@@ -31,8 +45,17 @@ from shogym.envs.receipts.receipt_ast import (
     slot_ranges,
 )
 from shogym.envs.receipts.registry import FIXTURES as FIXTURES_NAMES
-from shogym.envs.receipts.registry import GENRES, load_generator
+from shogym.envs.receipts.registry import (
+    BANK_DIR_VAR,
+    GENRES,
+    bank_path,
+    load_generator,
+    provenance_path,
+)
+from shogym.envs.receipts.env_v1 import ReceiptsV1Env
 from shogym.envs.receipts.render import judge_cells
+
+from shogym.serve import ServedEpisode
 
 FIXTURES = Path(__file__).resolve().parents[1] / "_fixtures"
 
@@ -929,3 +952,365 @@ def test_a_sibling_made_by_renaming_inert_consonants_is_refused() -> None:
     copied = max(audit.character_copy_maximum(a_keys[n], b_keys[n]) for n in range(36))
     assert copied <= 0.05 < audit.MAX_TRANSFER
     assert audit.check_analogy(generator, _drawn(0)).passed
+
+
+# ----- the bank, its provenance, and what a bounded search that runs out is ---
+
+
+def test_the_key_is_recorded_before_the_bank_is_built_and_kept_when_it_is_not(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """A failed materialization used to leave nothing behind, and now leaves its key.
+
+    It fails if the key's commitment is not written before construction begins, if a
+    key is lost when the bank does not fill, or if a second attempt under the same
+    evidence directory rolls another key without being told to by name. The whole gate
+    universe is a function of the master key and no bank record counts rolls, so a
+    reroll for a friendlier bank is the one thing an operator can do that no hash sees.
+    """
+    monkeypatch.setenv(BANK_DIR_VAR, str(tmp_path))
+    record = provenance_path("soundchange")
+
+    # A construction that cannot finish: the attempt is refused by name, the key is kept,
+    # and the command exits nonzero with a sentence rather than a traceback.
+    soundchange.build_pair.cache_clear()
+    monkeypatch.setattr(soundchange, "MAX_ATTEMPTS", 0)
+    assert _cli(["receipts", "materialize", "soundchange", "--size", "1"]) == 1
+    said = capsys.readouterr().out
+    assert "could not be constructed" in said and "ordinal 0" in said
+    attempts = bank_mod.read_provenance(record)["attempts"]
+    assert len(attempts) == 1
+    failed = attempts[0]
+    assert failed["outcome"] == bank_mod.FAILED
+    assert failed["note"] == "first attempt"
+    kept = bytes.fromhex(failed["master"])
+    assert len(kept) == 32
+    assert failed["commitment"] == bank_mod.key_commitment(kept)
+
+    # A second attempt under the same record is refused until the reroll is named.
+    monkeypatch.undo()
+    monkeypatch.setenv(BANK_DIR_VAR, str(tmp_path))
+    assert _cli(["receipts", "materialize", "soundchange", "--size", "1"]) == 1
+    assert "--reroll" in capsys.readouterr().out
+    assert len(bank_mod.read_provenance(record)["attempts"]) == 1
+
+    assert _cli([
+        "receipts", "materialize", "soundchange", "--size", "1",
+        "--reroll", "the first attempt could not construct an instance",
+    ]) == 0
+    filled = capsys.readouterr().out
+    assert "key commitment" in filled
+    attempts = bank_mod.read_provenance(record)["attempts"]
+    assert len(attempts) == 2
+    assert attempts[0] == failed
+    assert attempts[1]["outcome"] == bank_mod.FILLED
+    assert attempts[1]["note"] == "the first attempt could not construct an instance"
+    second = bytes.fromhex(attempts[1]["master"])
+    assert second != kept
+    assert bank_mod.load_bank(bank_path("soundchange")).master == second
+
+
+def test_a_construction_that_runs_out_is_a_named_whole_bank_failure() -> None:
+    """Exhaustion is not a skipped ordinal and not an unnamed exception.
+
+    It fails if a bounded construction that cannot produce a pair is reported as an
+    ordinary rejected instance, if it reaches a caller as an exception with no name of
+    its own, or if bundle verification lets it through as something other than a bundle
+    that does not verify. Treating it as a rejection would move the population: the bank
+    would fill from later ordinals and the passing fraction it printed would be measured
+    against a rule it did not use.
+    """
+    generator = soundchange.GENERATOR
+    master = bytes(range(1, 33))
+    with pytest.raises(ConstructionExhausted) as exhausted:
+        with _attempts(0):
+            soundchange.build_pair(master, 7)
+    assert "ordinal 7" in str(exhausted.value)
+
+    bank = bank_mod.Bank(
+        generator=generator.name, genre=generator.genre,
+        renderer=bank_mod.RENDERER_CONFIGURATION, master=master, size=1,
+    )
+    with pytest.raises(ConstructionExhausted) as named:
+        with _attempts(0):
+            bank_mod.population(bank, generator)
+    assert "ordinal 0" in str(named.value)
+    assert "holding 0 of 1" in str(named.value)
+    assert not isinstance(named.value, ValueError)
+
+
+def _cli(argv: list[str]) -> int:
+    """The command line as an exit status, which is what a caller of it reads."""
+    try:
+        main(argv)
+    except SystemExit as exit_code:
+        return int(exit_code.code or 0)
+    return 0
+
+
+class _attempts:
+    """Hold the construction budget at a chosen value, and clear the memoized pairs."""
+
+    def __init__(self, budget: int) -> None:
+        self.budget = budget
+        self.held = soundchange.MAX_ATTEMPTS
+
+    def __enter__(self) -> None:
+        soundchange.build_pair.cache_clear()
+        soundchange.MAX_ATTEMPTS = self.budget
+
+    def __exit__(self, *_: object) -> None:
+        soundchange.MAX_ATTEMPTS = self.held
+        soundchange.build_pair.cache_clear()
+
+
+# ----- a frozen bank, its review pack, its bundle and what it serves ---------
+
+
+def _screen_artifact(pairs: int = 40) -> dict:
+    """A recorded room screen for this family, structurally valid and not measured here.
+
+    The numbers stand in for a pilot nobody ran in a test. What is being exercised is
+    the path that recomputes everything mechanical about a bundle, not the screen.
+    """
+    return {
+        "family": soundchange.GENERATOR.name,
+        "model": "a scripted policy",
+        "task_seeds": [str(i) for i in range(pairs)],
+        "pairs": [
+            {"instance": f"task-{i:02d}", "filing": f"filing-{i:02d}",
+             "placebo": 0.4, "graded": 0.6, "oracle": 0.95}
+            for i in range(pairs)
+        ],
+        "min_room": 0.05, "min_ratio": 0.25, "min_pairs": 36,
+        "floor": 0.0, "floor_rule": "drop",
+        "candidates_screened": 1, "selection_note": "",
+    }
+
+
+@pytest.fixture(scope="module")
+def frozen(tmp_path_factory: pytest.TempPathFactory):
+    """One small bank of this genre, its exported pack, and a bundle that verifies."""
+    room = tmp_path_factory.mktemp("soundchange")
+    bank, held = bank_mod.materialized(
+        soundchange.GENERATOR, streams.new_master_key(), 2
+    )
+    outcomes = room / "screen.json"
+    outcomes.write_text(json.dumps(_screen_artifact()), encoding="utf-8")
+    pack_root = room / "pack"
+    pack = soundchange_review.export(bank, held, pack_root)
+    # The exporter leaves the attestation unset, so the bundle refuses the pack until a
+    # person has put their name to it. That refusal is the point of leaving it unset.
+    with pytest.raises(ValueError):
+        bundle_mod.build(room / "bundles", soundchange.GENERATOR, bank, outcomes, pack)
+    soundchange_review.attested(pack_root, "a named reader")
+    built = bundle_mod.build(
+        room / "bundles", soundchange.GENERATOR, bank, outcomes, pack
+    )
+    assert bundle_mod.verify(built, soundchange.GENERATOR).problems == ()
+    return bank, held, built
+
+
+def test_the_review_pack_covers_the_family_and_names_no_reviewer(
+    frozen, tmp_path: Path
+) -> None:
+    """What the exported pack has to contain, and the one thing it must not.
+
+    It fails if the pack misses a surface template, an option of any axis, a registered
+    filing class, the row count the bank holds or a counterfactual render, if the 36
+    oracle cells are not all there, if a counterfactual is missing for any axis on any
+    surface, or if the exporter names a reviewer. It also fails if the trace worksheets
+    are labelled as renders: they are explanatory material for the roster release, they
+    are not served tasks, and a bundle that carried them as evidence of what was served
+    would be saying something nobody checked.
+    """
+    bank, held, _ = frozen
+    room = tmp_path / "again"
+    pack = soundchange_review.export(bank, held, room)
+    manifest = json.loads(pack.read_text(encoding="utf-8"))
+    assert set(manifest) == set(review.REQUIRED_FIELDS)
+    assert manifest["reviewer"] is None
+    assert manifest["family"] == "soundchange"
+    assert manifest["bank"] == bank_mod.bank_identity(bank)
+    assert manifest["seeds"] == list(held.ordinals)
+
+    coverage = review.required_coverage(
+        soundchange.GENERATOR, checks.FILING_CLASSES, [soundchange.ROWS]
+    )
+    seen = [(e["category"], e["key"]) for e in manifest["renders"]]
+    assert coverage.missing(seen) == []
+    oracles = {e["path"] for e in manifest["renders"] if e["path"].startswith("renders/oracle-")}
+    assert len(oracles) == 36
+    for surface in soundchange.GENERATOR.surface_templates():
+        for axis in soundchange.AXES:
+            assert any(
+                key == f"{surface} {axis.name}=" + option
+                for _, key in seen
+                for option in axis.options
+            ), (surface, axis.name)
+    for entry in manifest["renders"]:
+        assert not entry["path"].startswith(soundchange_review.WORKSHEETS)
+        assert (room / entry["path"]).is_file()
+
+    index = json.loads((room / soundchange_review.WORKSHEET_INDEX).read_text("utf-8"))
+    assert index["cases"] == list(soundchange_review.WORKSHEET_CASES)
+    assert index["files"]
+    for name, hashed in index["files"].items():
+        assert digest((room / name).read_bytes()) == hashed
+    sheet = json.loads(
+        (room / soundchange_review.WORKSHEETS / "cases.json").read_text("utf-8")
+    )
+    for case in sheet:
+        assert set(case) >= {
+            "case", "proto", "after_nasal", "daughter", "skeleton", "oracle",
+        }
+
+    # The exported pack is the same pack twice, so two readers read one document.
+    twice = tmp_path / "twice"
+    soundchange_review.export(bank, held, twice)
+    assert (twice / soundchange_review.PACK).read_bytes() == pack.read_bytes()
+
+
+def test_a_frozen_bank_rebuilds_and_a_failed_new_check_is_not_dealable(frozen) -> None:
+    """Replay, rebuild, and what happens when one of the added checks says no.
+
+    It fails if a small valid frozen bank cannot be rebuilt byte-identically, if an
+    instance that fails one of the three checks this profile adds is still admitted, or
+    if replaying a committed fork changes its cells or answers one filing with another
+    filing's feedback.
+    """
+    bank, held, built = frozen
+    generator = soundchange.GENERATOR
+    again = bank_mod.population(bank, generator)
+    assert again.ordinals == held.ordinals
+    for first, second in zip(held.instances, again.instances):
+        assert bank_mod.instance_digest(first, generator) == bank_mod.instance_digest(
+            second, generator
+        )
+
+    instance = held.instances[0]
+    assert admission.report(generator, instance, bank.master, admission.Thresholds()).admitted
+    refused = checks.CheckResult("analogy", False, "a fixture refusal")
+    with _stub(audit, "check_analogy", lambda *_: refused):
+        report = admission.report(
+            generator, instance, bank.master, admission.Thresholds()
+        )
+        assert "analogy" in report.failed_checks
+        assert not report.admitted
+        with pytest.raises(ValueError):
+            bank_mod.population(bank, generator)
+
+    room = Path(built.root).parent / "forks"
+    source = built.digest
+    task = instance.a
+    identifiers = list(generator.row_identifiers(task.table))
+    perfect = "\n".join("%s,%s" % kv for kv in zip(identifiers, task.key))
+    wrong = "\n".join("%s,%s" % (i, "bbb") for i in identifiers)
+    keyed = bank_mod.filing_digest(perfect)
+    assert bank_mod.load_fork(room, task.task_id, keyed, source) is None
+    first = bank_mod.fork_for(generator, instance, "a", perfect, room, source)
+    assert bank_mod.load_fork(room, task.task_id, keyed, source) is not None
+    replayed = bank_mod.fork_for(generator, instance, "a", perfect, room, source)
+    assert replayed.replayed
+    assert (replayed.graded, replayed.placebo, replayed.oracle) == (
+        first.graded, first.placebo, first.oracle
+    )
+    assert replayed.component_score == first.component_score == 1.0
+    other = bank_mod.fork_for(generator, instance, "a", wrong, room, source)
+    assert other.graded != first.graded
+    assert other.component_score == 0.0
+    assert other.filing_digest != first.filing_digest
+
+
+class _stub:
+    """Put one attribute back where it was, whatever the block did."""
+
+    def __init__(self, module, name: str, value) -> None:
+        self.module, self.name, self.value = module, name, value
+        self.held = getattr(module, name)
+
+    def __enter__(self) -> None:
+        setattr(self.module, self.name, self.value)
+
+    def __exit__(self, *_: object) -> None:
+        setattr(self.module, self.name, self.held)
+
+
+async def test_a_filing_an_independent_validator_believes_seals_at_one(
+    frozen, tmp_path: Path
+) -> None:
+    """What the served environment does with a correct filing, an empty one and a grade.
+
+    It fails if a filing computed by the second implementation of the cascade does not
+    seal at 1, if an empty filing is credited, or if either channel of the terminal
+    result carries a grade: the content the agent reads, or the metadata sidecar its own
+    process reads. What one graded receipt is worth is the quantity this environment
+    exists to measure, so a terminal that handed the grade back would put a receipt in
+    every arm including the one that is meant to carry none.
+    """
+    _, _, built = frozen
+    private = tmp_path / "served"
+    private.mkdir()
+    opened = private / built.root.name
+    shutil.copytree(built.root, opened)
+    config = {"genre": "soundchange", "bundle": str(opened), "side": "a"}
+    env = ReceiptsV1Env(**config)
+    ordinal = env._ordinals[0]
+    instance = env.instance(ordinal)
+    task = instance.a
+    protos = tuple(row.proto for row in task.table.rows)
+    independent = audit.audit_key(protos, instance.convention)
+    assert independent == tuple(task.key)
+    filing = "\n".join(
+        "%s,%s" % kv
+        for kv in zip(soundchange.GENERATOR.row_identifiers(task.table), independent)
+    )
+
+    episode = await ServedEpisode.start(
+        "receipts_v1", task=0, env_config=config, trace_path=tmp_path / "run.jsonl"
+    )
+    try:
+        spec = episode.describe()
+        assert "BATCH (" in spec.instructions
+        assert option_mentions(soundchange.AXES, json.dumps(spec.model_dump())) == []
+        result = await episode.call("submit_filing", {"filing": filing})
+        assert result.terminated
+        content = json.loads(result.content)
+        assert set(content) == {"filed", "rows", "finalize_error"}
+        assert "1.0" not in json.dumps(content)
+        feedback = {item["name"]: item["value"] for item in episode.terminal_feedback}
+        assert feedback["component_score"] == 1.0
+        assert feedback["rows_omitted"] == 0.0
+    finally:
+        await episode.close()
+
+    # A filing that names every row and answers none of them. No correct daughter is
+    # ever the empty string, and a row that was filed empty is still a filed row, so
+    # this is a scorable zero rather than an absent filing.
+    blank = "\n".join(
+        "%s," % identifier
+        for identifier in soundchange.GENERATOR.row_identifiers(task.table)
+    )
+    empty = await ServedEpisode.start(
+        "receipts_v1", task=0, env_config=config, trace_path=tmp_path / "empty.jsonl"
+    )
+    try:
+        await empty.call("submit_filing", {"filing": blank})
+        feedback = {item["name"]: item["value"] for item in empty.terminal_feedback}
+        assert feedback["component_score"] == 0.0
+        assert feedback["rows_filed"] == float(soundchange.ROWS)
+        assert "no_filing" not in feedback
+    finally:
+        await empty.close()
+
+    # And prose, which names no row at all, is reason coded rather than scored low.
+    unread = await ServedEpisode.start(
+        "receipts_v1", task=0, env_config=config, trace_path=tmp_path / "prose.jsonl"
+    )
+    try:
+        await unread.call("submit_filing", {"filing": "I could not work out the cascade"})
+        feedback = {item["name"]: item["value"] for item in unread.terminal_feedback}
+        assert feedback["component_score"] == 0.0
+        assert feedback["no_filing"] == "no_known_identifier"
+    finally:
+        await unread.close()
