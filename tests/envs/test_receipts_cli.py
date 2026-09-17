@@ -18,7 +18,7 @@ import pytest
 from shogym.cli import main
 from shogym.envs.receipts import admission as admission_mod
 from shogym.envs.receipts import bank as bank_mod
-from shogym.envs.receipts.registry import BANK_DIR_VAR
+from shogym.envs.receipts.registry import BANK_DIR_VAR, HISTORY_VAR
 from tests._fixtures.receipts_bundle import private_bundle, screen_artifact
 
 #: The registered parameters, supplied explicitly because there is no default to fall
@@ -38,8 +38,15 @@ def _run(argv: list[str]) -> int:
 
 @pytest.fixture(autouse=True)
 def _banks(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Path:
-    """Every test gets its own bank directory, controller-side and disposable."""
+    """Every test gets its own bank directory and key history, controller-side.
+
+    Both, because they are deliberately not in one place: the record beside the banks moves
+    with the evidence directory and the append-only history does not, which is the whole
+    point of the history, and a test that redirected only the banks would append its
+    attempts to the developer's own.
+    """
     monkeypatch.setenv(BANK_DIR_VAR, str(tmp_path / "banks"))
+    monkeypatch.setenv(HISTORY_VAR, str(tmp_path / "key-history.jsonl"))
     return tmp_path
 
 
