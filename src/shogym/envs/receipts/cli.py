@@ -510,15 +510,22 @@ def _list() -> int:
 def _one_attempt_at_a_time(
     command: Callable[[argparse.Namespace], int],
 ) -> Callable[[argparse.Namespace], int]:
-    """Run a materialization under the claim on its genre's evidence directory.
+    """Run a materialization under the claim on the key history it authorizes itself by.
 
     THE WHOLE COMMAND, AND NOT ONLY THE CHECK. The refusal that makes a second key an
-    act with a name is a read of the provenance record followed by a write of it, and
-    the attempt itself sits between them: two commands started together both read a
-    record with nothing in it, so neither of them was a reroll, and the key the second
-    one wrote down replaced the first one's. Holding the claim from before the check
-    until after the attempt has been recorded is what leaves the second command reading
-    what the first one wrote.
+    act with a name is a read of the history followed by an append to it, and the
+    attempt itself sits between them: two commands started together both read a history
+    with nothing in it, so neither of them was a reroll, and both wrote themselves down
+    as the first attempt. Holding the claim from before the check until after the
+    outcome has been recorded is what leaves the second command reading what the first
+    one wrote.
+
+    THE CLAIM IS THE HISTORY'S AND NOT THE RECORD'S. The record beside the banks moves
+    when the evidence directory moves, and the history is the one file every evidence
+    directory on this machine appends to, so a claim named for the record leaves two
+    commands pointed at two directories authorizing themselves at once against one
+    chain. The foreign-key exclusion, the local record and the append are all inside
+    this one claim rather than under a second one of their own.
 
     A gate vector has no bank, no record and no key, and the command refuses it by name,
     so it takes no claim.
@@ -529,7 +536,7 @@ def _one_attempt_at_a_time(
         if is_fixture(args.name):
             return command(args)
         try:
-            with bank_mod.one_attempt(provenance_path(args.name)):
+            with bank_mod.one_attempt(history_path()):
                 return command(args)
         except bank_mod.AttemptInProgress as busy:
             print(str(busy))

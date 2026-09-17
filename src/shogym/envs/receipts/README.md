@@ -947,6 +947,11 @@ Recorded boundaries, held by process rather than by a check:
   it was, and so does `--force`. A key already committed to another genre is refused where it is
   recorded, in the history or in a bank file beside it.
 
+  Attempts are made one at a time. The claim is a file beside the key history, so two commands
+  pointed at two evidence directories wait on each other rather than both reading a chain with
+  nothing in it and both writing themselves into it as a first attempt. Two commands naming two
+  different histories are two chains and are not serialized by it.
+
   That is still not closure. An operator who deletes the file has deleted the file, and a chain
   that starts from nothing verifies. Closing it takes provenance retained where this process
   cannot reach it, and publishing the commitment before the bank is built is what the record is

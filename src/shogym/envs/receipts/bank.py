@@ -841,31 +841,42 @@ ATTEMPT_WAIT_SECONDS = 900.0
 
 
 class AttemptInProgress(RuntimeError):
-    """Another attempt on this genre holds this evidence directory."""
+    """Another attempt holds the key history this one would authorize itself against."""
 
 
 @contextmanager
-def one_attempt(record: Path, wait: float | None = None) -> Iterator[None]:
-    """Hold the right to make one attempt on one genre in one evidence directory.
+def one_attempt(history: Path, wait: float | None = None) -> Iterator[None]:
+    """Hold the right to make one attempt against one key history.
 
-    TWO ATTEMPTS STARTED TOGETHER BOTH READ AN EMPTY RECORD. The refusal that makes a
-    reroll an act with a name is a read of the record followed later by a write of it,
-    and between the two there was nothing: two materializations begun at once both found
-    no earlier attempt, both rolled a key, both wrote themselves down as the first
-    attempt, and the second key replaced the first in the file. Both keys had drawn a
-    gate universe by then and one of them was recorded, which is exactly what the record
-    exists to prevent, and a reroll needs no name at all when it is done alongside the
-    first attempt rather than after it.
+    TWO ATTEMPTS STARTED TOGETHER BOTH READ A HISTORY WITH NOTHING IN IT. The refusal
+    that makes a reroll an act with a name is a read of the history followed later by an
+    append to it, and between the two there was nothing: two materializations begun at
+    once both found no earlier attempt, both rolled a key, and both wrote themselves down
+    as the first attempt. Both keys had drawn a gate universe by then, which is exactly
+    what the history exists to prevent, and a reroll needs no name at all when it is done
+    alongside the first attempt rather than after it. The append is itself a read of the
+    chain followed by a write of one line onto the end of it, so two appends that
+    interleave both claim the same position and leave a history that no longer verifies.
 
-    So the check and the whole lifecycle it guards are held under one claim. A second
-    attempt waits for the first to finish and then reads the record the first one wrote,
-    which is the sequential case: it is refused unless the reroll is named. The claim is
-    a file beside the record rather than anything inside this process, because the
-    attempts to keep apart are separate commands, and the machine takes it back from a
-    process that died holding it. It is named for the record, so two genres and two
-    evidence directories never wait on each other.
+    So the check and the whole lifecycle it guards are held under one claim, and the
+    claim is named for the HISTORY rather than for the record beside the banks. The
+    record moves when the evidence directory moves and the history does not: a claim
+    named for the record leaves two directories authorizing themselves at once against
+    one file, which is the case the history was separated out to cover. A second attempt
+    waits for the first to finish and then reads what the first one wrote, which is the
+    sequential case: it is refused unless the reroll is named.
+
+    The claim is a file beside the history rather than anything inside this process,
+    because the attempts to keep apart are separate commands, and the machine takes it
+    back from a process that died holding it. Two genres therefore wait on each other,
+    which is what one shared append-only file means.
+
+    WHAT IT DOES NOT COVER. Two commands that name two different histories are two
+    chains, and this does not serialize their writes to a provenance record they happen
+    to share. That is an operator who has pointed the machine's one history somewhere
+    else, and a claim cannot decide it.
     """
-    target = Path(record)
+    target = Path(history)
     target.parent.mkdir(parents=True, exist_ok=True)
     claim = target.with_name(target.name + ".attempt")
     deadline = time.monotonic() + (ATTEMPT_WAIT_SECONDS if wait is None else float(wait))
@@ -878,9 +889,9 @@ def one_attempt(record: Path, wait: float | None = None) -> Iterator[None]:
             except OSError:
                 if time.monotonic() >= deadline:
                     raise AttemptInProgress(
-                        "another attempt on this genre is running and holds %s. Attempts "
-                        "under one evidence directory are made one at a time, so that the "
-                        "key each one rolled is a key the record keeps" % claim
+                        "another attempt is running and holds %s. Attempts against one "
+                        "key history are made one at a time, so that the key each one "
+                        "rolled is a key the history keeps" % claim
                     ) from None
                 time.sleep(0.05)
         yield
