@@ -12,6 +12,7 @@ import itertools
 import json
 import random
 import shutil
+import threading
 from pathlib import Path
 from types import MappingProxyType
 from typing import Mapping, Sequence
@@ -1008,6 +1009,67 @@ def test_the_key_is_recorded_before_the_bank_is_built_and_kept_when_it_is_not(
     second = bytes.fromhex(attempts[1]["master"])
     assert second != kept
     assert bank_mod.load_bank(bank_path("soundchange")).master == second
+
+
+def test_two_attempts_at_once_keep_both_keys_and_neither_is_an_unnamed_reroll(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """The refusal is a read of the record and a write of it, with an attempt between them.
+
+    It fails if a second materialization can start while the first one is constructing,
+    if two attempts under one evidence directory are recorded as one, or if either key
+    is lost when both constructions run out. Both keys drew a gate universe by the time
+    either was written down, so a record holding one of them says a reroll that happened
+    did not happen, which is the whole of what the record is kept for.
+    """
+    monkeypatch.setenv(BANK_DIR_VAR, str(tmp_path))
+    record = provenance_path("soundchange")
+    constructing = threading.Event()
+    give_up = threading.Event()
+
+    def held(*_: object, **__: object) -> None:
+        """A construction that is under way until this test lets it run out."""
+        constructing.set()
+        assert give_up.wait(30)
+        raise ConstructionExhausted("ordinal 0 could not be constructed, holding 0 of 1")
+
+    monkeypatch.setattr(bank_mod, "materialized", held)
+    monkeypatch.setattr(bank_mod, "ATTEMPT_WAIT_SECONDS", 0.2)
+    codes: list[int] = []
+    first = threading.Thread(
+        target=lambda: codes.append(
+            _cli(["receipts", "materialize", "soundchange", "--size", "1"])
+        )
+    )
+    first.start()
+    try:
+        assert constructing.wait(30)
+        # The first attempt has its key written down and is building. A second command
+        # arriving now waits for the claim and then says what it is waiting for, rather
+        # than reading the same empty record and rolling a second key beside it.
+        assert _cli([
+            "receipts", "materialize", "soundchange", "--size", "1",
+            "--reroll", "a second operator at the same moment",
+        ]) == 1
+        assert "one at a time" in capsys.readouterr().out
+        assert len(bank_mod.read_provenance(record)["attempts"]) == 1
+    finally:
+        give_up.set()
+        first.join(30)
+    assert codes == [1]
+
+    # And sequentially, which is the case the claim leaves: two exhausted attempts, two
+    # keys, each with the commitment it was recorded under.
+    assert _cli([
+        "receipts", "materialize", "soundchange", "--size", "1",
+        "--reroll", "the first attempt could not construct an instance",
+    ]) == 1
+    attempts = bank_mod.read_provenance(record)["attempts"]
+    assert [entry["outcome"] for entry in attempts] == [bank_mod.FAILED, bank_mod.FAILED]
+    keys = [bytes.fromhex(entry["master"]) for entry in attempts]
+    assert len(set(keys)) == 2
+    for entry, key in zip(attempts, keys):
+        assert entry["commitment"] == bank_mod.key_commitment(key)
 
 
 def test_a_construction_that_runs_out_is_a_named_whole_bank_failure() -> None:

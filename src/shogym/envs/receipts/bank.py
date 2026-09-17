@@ -30,6 +30,8 @@ import fcntl
 import json
 import os
 import secrets
+import tempfile
+import time
 from contextlib import contextmanager
 from dataclasses import dataclass
 from pathlib import Path
@@ -804,6 +806,92 @@ def key_commitment(master: bytes) -> str:
     return streams.digest(b"receipts-bank-key", bytes(master))
 
 
+#: How long an attempt waits for the one in front of it before it refuses. A whole
+#: attempt is a construction and an admission pass over every ordinal, which is minutes
+#: rather than seconds, so waiting is the ordinary outcome and this is the bound on it.
+ATTEMPT_WAIT_SECONDS = 900.0
+
+
+class AttemptInProgress(RuntimeError):
+    """Another attempt on this genre holds this evidence directory."""
+
+
+@contextmanager
+def one_attempt(record: Path, wait: float | None = None) -> Iterator[None]:
+    """Hold the right to make one attempt on one genre in one evidence directory.
+
+    TWO ATTEMPTS STARTED TOGETHER BOTH READ AN EMPTY RECORD. The refusal that makes a
+    reroll an act with a name is a read of the record followed later by a write of it,
+    and between the two there was nothing: two materializations begun at once both found
+    no earlier attempt, both rolled a key, both wrote themselves down as the first
+    attempt, and the second key replaced the first in the file. Both keys had drawn a
+    gate universe by then and one of them was recorded, which is exactly what the record
+    exists to prevent, and a reroll needs no name at all when it is done alongside the
+    first attempt rather than after it.
+
+    So the check and the whole lifecycle it guards are held under one claim. A second
+    attempt waits for the first to finish and then reads the record the first one wrote,
+    which is the sequential case: it is refused unless the reroll is named. The claim is
+    a file beside the record rather than anything inside this process, because the
+    attempts to keep apart are separate commands, and the machine takes it back from a
+    process that died holding it. It is named for the record, so two genres and two
+    evidence directories never wait on each other.
+    """
+    target = Path(record)
+    target.parent.mkdir(parents=True, exist_ok=True)
+    claim = target.with_name(target.name + ".attempt")
+    deadline = time.monotonic() + (ATTEMPT_WAIT_SECONDS if wait is None else float(wait))
+    descriptor = os.open(str(claim), os.O_CREAT | os.O_RDWR, 0o600)
+    try:
+        while True:
+            try:
+                fcntl.flock(descriptor, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                break
+            except OSError:
+                if time.monotonic() >= deadline:
+                    raise AttemptInProgress(
+                        "another attempt on this genre is running and holds %s. Attempts "
+                        "under one evidence directory are made one at a time, so that the "
+                        "key each one rolled is a key the record keeps" % claim
+                    ) from None
+                time.sleep(0.05)
+        yield
+    finally:
+        os.close(descriptor)
+
+
+def _replace_record(path: Path, payload: Mapping[str, Any]) -> None:
+    """Put this record in place of the one that is there, in one step or not at all.
+
+    The record is read, added to and written back, and writing it back in place is two
+    states a reader can find: the emptied file while the write is under way, and the
+    record after it. A reader that found the first would see a genre that has attempted
+    nothing, which is the one thing this file is kept to contradict, and a write that
+    stops halfway leaves that state behind for good. The replacement is written beside
+    the record, in its own directory so the rename stays inside one filesystem, and the
+    rename is the whole of the change.
+    """
+    target = Path(path)
+    target.parent.mkdir(parents=True, exist_ok=True)
+    handle = tempfile.NamedTemporaryFile(
+        "w",
+        encoding="utf-8",
+        dir=str(target.parent),
+        prefix=target.name + ".",
+        suffix=".part",
+        delete=False,
+    )
+    try:
+        with handle:
+            handle.write(json.dumps(dict(payload), indent=1, sort_keys=True))
+            handle.flush()
+            os.fsync(handle.fileno())
+        os.replace(handle.name, target)
+    except BaseException:
+        Path(handle.name).unlink(missing_ok=True)
+        raise
+
+
 def read_provenance(path: Path) -> dict[str, Any]:
     """The attempts recorded for one genre, or an empty record."""
     if not Path(path).is_file():
@@ -839,7 +927,7 @@ def begin_attempt(
         }
     )
     Path(path).parent.mkdir(parents=True, exist_ok=True)
-    Path(path).write_text(json.dumps(record, indent=1, sort_keys=True), encoding="utf-8")
+    _replace_record(path, record)
     return index
 
 
@@ -853,7 +941,7 @@ def finish_attempt(path: Path, index: int, outcome: str, detail: str = "") -> No
         raise ValueError(f"the provenance record has no attempt {index}")
     attempts[index]["outcome"] = outcome
     attempts[index]["detail"] = str(detail)
-    Path(path).write_text(json.dumps(record, indent=1, sort_keys=True), encoding="utf-8")
+    _replace_record(path, record)
 
 
 def bank_record(bank: Bank) -> dict[str, Any]:
