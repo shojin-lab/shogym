@@ -54,11 +54,18 @@ from shogym.envs.receipts.receipt_ast import (
 
 #: Bumped when anything about how a cell is built changes. It is recorded in every
 #: bank, so a bank built by one renderer cannot be silently served by another.
-RENDERER_CONFIGURATION = "receipts-render-v1"
+#:
+#: v2 BECAUSE THE REGISTERED GEOMETRY GREW. A second genre registers a 16-byte
+#: correction slot and a 2757-byte envelope, and the widths a cell is built at are part
+#: of how it is built: a bank frozen under the earlier revision was gated on cells of
+#: another shape. Bumping it is what refuses a bundle whose rendered task texts and
+#: whose code pin were taken before this build, rather than letting one verify against
+#: an instrument that is no longer the instrument.
+RENDERER_CONFIGURATION = "receipts-render-v2"
 
 #: The one label the settled gate set publishes. Kept here rather than imported so
 #: that building a bank does not depend on the gate module at import time.
-GATE_LABEL = "receipts-gates-v2"
+GATE_LABEL = "receipts-gates-v3"
 
 
 @dataclass(frozen=True)

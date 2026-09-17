@@ -363,7 +363,7 @@ def test_a_failing_check_excludes_an_instance_even_when_the_gates_pass() -> None
 
 
 def test_the_gate_version_is_named_and_excludes_the_count_gate() -> None:
-    assert admission.GATE_VERSION == "receipts-gates-v2"
+    assert admission.GATE_VERSION == "receipts-gates-v3"
 
 
 def test_the_bars_are_registered_and_overridable() -> None:
