@@ -31,12 +31,15 @@ from shogym.receipts import GateResult, gate
 #: The name of this gate set and the rule it publishes under. Recorded in every bank;
 #: nothing claims the instrument's own verdict.
 #:
-#: v2 BECAUSE THE COPY REGISTRATION CHANGED. v1 read its copy bar against three
-#: enumerated maps at 0.40; this reads it against the closure of those maps under
-#: composition at 0.50. Two different rules under one label is exactly what a named
-#: version exists to prevent, so a family admitted under the earlier rule does not
-#: publish under this name and a bundle frozen under the earlier bars does not verify.
-GATE_VERSION = "receipts-gates-v2"
+#: v3 BECAUSE THE COPY REGISTRATION CHANGED AGAIN. v1 read its copy bar against three
+#: enumerated maps at 0.40; v2 read it against the closure of those maps under
+#: composition at 0.50; this reads it against whichever registered family the generator
+#: DECLARES, which for a family of invented words is a different family of maps
+#: entirely, and it runs three further checks for that profile. The numbers are the same
+#: numbers and the rule they are read against is not, which is exactly what a named
+#: version exists to keep apart: a family admitted under an earlier rule does not publish
+#: under this name and a bundle frozen under the earlier label does not verify.
+GATE_VERSION = "receipts-gates-v3"
 #: What that name means, frozen. R's arity and block constants are the settled rule,
 #: not a dial: two blocks is where the agent learns only that it was wrong, and three
 #: options is where an axis can resolve past it at all. A run that moved them and

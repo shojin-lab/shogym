@@ -17,6 +17,7 @@ import pytest
 
 from shogym.cli import main
 from shogym.envs.receipts import admission as admission_mod
+from shogym.envs.receipts import bank as bank_mod
 from shogym.envs.receipts.registry import BANK_DIR_VAR
 from tests._fixtures.receipts_bundle import private_bundle, screen_artifact
 
@@ -124,7 +125,7 @@ def test_materialize_then_list_reports_the_frozen_bank(
     # bundle as though something had checked them.
     assert "a development bank is present, unverified and not dealable" in listed
     assert "bank of 2" not in listed
-    assert "receipts-render-v1" not in listed
+    assert bank_mod.RENDERER_CONFIGURATION not in listed
     assert "NOT DEALABLE: no admission bundle" in listed
     assert "gate vectors (never dealt)" in listed
 
@@ -450,8 +451,29 @@ def test_bundle_then_verify_then_list(
 
     assert _run(["receipts", "list"]) == 0
     listed = capsys.readouterr().out
-    assert "DEALABLE" in listed and "NOT DEALABLE" not in listed
-    assert "screen bars: room 0.05, ratio 0.25, pairs 36 (registered)" in listed
+    # This genre's own lines, not the roster's: another genre with no bundle is listed
+    # here too and says so, which is a different fact from this one being dealable.
+    ledger_lines = _genre_lines(listed, "ledger")
+    assert "DEALABLE" in ledger_lines and "NOT DEALABLE" not in ledger_lines
+    assert "screen bars: room 0.05, ratio 0.25, pairs 36 (registered)" in ledger_lines
+
+
+def _genre_lines(listed: str, name: str) -> str:
+    """The `list` output belonging to one genre: its own line and the lines under it.
+
+    The roster prints one line naming a genre and then its bundles under blank names,
+    so a test about one genre reads its own block rather than the whole page.
+    """
+    out: list[str] = []
+    taking = False
+    for line in listed.splitlines():
+        if line.startswith(name + " ") or line == name:
+            taking = True
+        elif line and not line.startswith(" ") and not line.startswith("%-10s" % ""):
+            taking = line[:10].strip() == ""
+        if taking:
+            out.append(line)
+    return "\n".join(out)
 
 
 def test_verify_refuses_a_bundle_whose_file_was_edited(

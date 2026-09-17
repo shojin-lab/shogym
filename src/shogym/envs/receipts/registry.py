@@ -20,6 +20,7 @@ from shogym.envs.receipts.protocol import Generator
 #: which is a different and later thing.
 GENRES = {
     "ledger": "shogym.envs.receipts.generators.ledger",
+    "soundchange": "shogym.envs.receipts.generators.soundchange",
 }
 
 #: The gate vectors. They wear the generator protocol so the gates can be exercised
