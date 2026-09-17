@@ -33,6 +33,21 @@ narrow the rule rather than only learn that it was wrong. `build_pair` searches 
 pair of batches where that actually happens, over the whole support rather than under
 the convention this instance drew.
 
+WHY A SHORT EXECUTABLE RULE, AND WHAT THAT IS NOT AN ANSWER TO. The rule here is three
+passes over at most fourteen phones with at most two k occurrences: no date arithmetic,
+no rounding, no lookup. That is a deliberate choice about what a copy has to do once it
+has the rule, and it is NOT a repair for the low oracle grade the fourth engineering run
+recorded. The diagnostic of that run located the loss in uptake and in scope, not in
+execution: 350 of its 357 filings were the exact answer key of some convention the
+family draws from, an independent recomputation agreed with the grader on every row, and
+no copy skipped a row or ran out of turns. What went wrong was that copies refused the
+statement as untrusted content or read its scope word as the name printed on the surface
+and did not carry the rule to the task they were about to file. Those are repairs to
+registered wording, and they were made. A short rule here buys a cleaner separation
+between a copy that did not take the rule and a copy that took it and got the arithmetic
+wrong; calling the earlier loss an execution problem would have made this design a fix
+for something that was not broken.
+
 WHAT IS EASY HERE AND WHAT IS NOT, said plainly. The replacement phones g, x and s
 never occur in a proto form, and the deleted vowel can be read off the difference in
 vowel counts, so a reader holding A's corrected key can name two of the four axes
