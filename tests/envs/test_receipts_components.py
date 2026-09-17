@@ -370,6 +370,72 @@ def test_the_room_is_the_same_under_every_reference_rule() -> None:
     assert "moves" in refused.detail or "blocks" in refused.detail
 
 
+class _GenerousUnderCorner(components.ComponentsGenerator):
+    """A scorer that is generous about which rule the agent used, under one reference.
+
+    The sealed scalar is promoted to a pass whenever the filing is right under SOME
+    rule, and only when the truth it is being scored against is the corner rule's. The
+    row outcomes stay honest, so every cell, every receipt and the whole room arithmetic
+    are the ones the real scorer produces and nothing else in admission moves. What
+    moves is the two numbers this fixture exists for: a filing made under another rule
+    earns 1.000000 under that reference, and the axis pays nothing for being got right.
+    """
+
+    def score(self, task: Task, canonical):
+        scalar, outcomes = super().score(task, canonical)
+        corner = tuple(self.key_for(task.table, {"contact_kernel": "corner_contacts"}))
+        if tuple(task.key) != corner:
+            return scalar, outcomes
+        for option in OPTIONS:
+            lenient, _ = super().score(
+                audit._retasked(task, {"contact_kernel": option}, self), canonical
+            )
+            if lenient >= 1.0:
+                return 1.0, outcomes
+        return scalar, outcomes
+
+
+def test_a_reference_rule_that_costs_nothing_to_get_wrong_is_refused() -> None:
+    """The wrong-option grade and the leverage are read at every reference, not printed.
+
+    It fails if a pair whose counterfactual reference carries a wrong-option grade over
+    0.875 or leverage under 0.10 passes `components_support`, or is admitted. The shared
+    copy check reads those two numbers at the rule that was drawn and this genre rebuilds
+    the arithmetic at all three, because every ordinal draws its own rule and a reference
+    that costs nothing to get wrong is a link that cannot be scored whenever it comes up.
+    """
+    generous = _GenerousUnderCorner()
+    ordinal = next(
+        n for n in range(8)
+        if draw(GENERATOR, MASTER, n).convention["contact_kernel"] != "corner_contacts"
+    )
+    instance = draw(generous, MASTER, ordinal)
+    corner = audit.retasked_instance(
+        generous, instance, {"contact_kernel": "corner_contacts"}
+    )
+    assert checks.copy_scores(generous, corner)["option_flip"] == 1.0
+    assert checks.axis_leverage(generous, corner)["contact_kernel"] == 0.0
+
+    refused = audit.check_support(generous, instance)
+    assert not refused.passed
+    assert "under reference corner_contacts" in refused.detail
+    assert "1.000000" in refused.detail and "0.875000" in refused.detail
+
+    # The drawn rule is untouched, so the shared copy check passes and this is the only
+    # thing standing between the pair and admission.
+    drawn = checks.check_copy(
+        generous, instance,
+        admission.REGISTERED_MAX_COPY_SCORE,
+        admission.REGISTERED_MAX_FLIP_SCORE,
+        admission.REGISTERED_MIN_LEVERAGE,
+    )
+    assert drawn.passed, drawn.detail
+    report = admission.report(generous, instance, MASTER, admission.Thresholds())
+    assert not report.admitted
+    assert [r.name for r in report.checks if not r.passed] == ["components_support"]
+    assert audit.check_support(GENERATOR, instance).passed
+
+
 def _replace_rows(
     instance: Instance, side: str, replacements: Mapping[int, tuple[tuple[int, int], ...]]
 ) -> Instance:
