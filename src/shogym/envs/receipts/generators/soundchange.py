@@ -171,6 +171,15 @@ MAX_CANDIDATES = 10000
 MAX_ATTEMPTS = 400
 ROWS = SHAPE.rows
 
+#: What a provenance record says this generator's construction was bounded by. The key
+#: history binds an attempt to these, because the same key under a wider bound is a
+#: different attempt at a different instrument.
+CONSTRUCTION_BOUNDS: dict[str, int] = {
+    "attempts": MAX_ATTEMPTS,
+    "candidates": MAX_CANDIDATES,
+    "rows": ROWS,
+}
+
 # ----- the registered envelope constants -------------------------------------
 # Every one of these is a family maximum or a fixed width. None is read off a
 # particular draw, which is what makes the envelope size convention-independent.
@@ -664,6 +673,7 @@ class SoundChangeGenerator:
     SHAPE = SHAPE
     AXES = AXES
     SCORING: str = ROW_ADDITIVE_EQUAL_WEIGHT
+    CONSTRUCTION_BOUNDS = CONSTRUCTION_BOUNDS
     #: A daughter form is an invented word, not a token of a printed vocabulary, so the
     #: copy screen prices this family through the character maps rather than through
     #: maps between two published answer orders. See `copy_profiles`.
@@ -878,6 +888,7 @@ GENERATOR = SoundChangeGenerator()
 __all__ = [
     "ALL_CONVENTIONS",
     "AXES",
+    "CONSTRUCTION_BOUNDS",
     "BLANK_TOKEN",
     "CELL_CONSONANTS",
     "CONSONANTS",

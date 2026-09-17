@@ -835,6 +835,34 @@ FILLED = "filled"
 FAILED = "failed"
 OUTCOMES = (STARTED, FILLED, FAILED)
 
+#: AND THE RECORD BESIDE THE BANKS IS NOT ENOUGH ON ITS OWN, for two reasons that are
+#: about where it sits and how it is written. It sits INSIDE the evidence directory, so an
+#: operator who points `SHOGYM_RECEIPTS_BANKS` at a fresh one is a first attempt again and
+#: the earlier key is somewhere nothing consults. And it is REWRITTEN in place when an
+#: attempt ends, so the file is a summary of what the last writer believed rather than a
+#: history of what happened.
+#:
+#: So the same two calls also append to a history that is neither. It is one file for every
+#: genre and every evidence directory, it is only ever appended to, each line carries the
+#: digest of the line before it so that a removed or edited line is a chain that does not
+#: verify, and each line binds the attempt to the code pin, the gate and renderer labels,
+#: the generator's declared construction bounds and the evidence directory it was made in.
+#: A new invocation reads it rather than the local record, so a changed directory refuses
+#: exactly as the same one does.
+#:
+#: WHAT IT STILL DOES NOT CLOSE, and this is a boundary rather than an oversight: an
+#: operator who deletes the file has deleted the file, and a chain that starts from nothing
+#: verifies. Only provenance retained somewhere this process cannot reach closes that, and
+#: what this does is make a reroll an act that has to be named and a rewritten history a
+#: thing that fails to verify.
+
+#: The fields one history line carries, and the whole of them. Exactly this set, so a line
+#: with a field nobody reads cannot travel inside a chain asserting something.
+HISTORY_FIELDS = (
+    "sequence", "event", "attempt", "generator", "commitment", "master", "size", "note",
+    "code", "instrument", "bounds", "banks", "detail", "previous", "digest",
+)
+
 
 def key_commitment(master: bytes) -> str:
     """A binding, non-revealing commitment to one master key.
@@ -944,18 +972,213 @@ def read_provenance(path: Path) -> dict[str, Any]:
     return payload
 
 
+def attempt_identity(
+    generator: str,
+    master: bytes,
+    size: int,
+    code: str,
+    instrument: Mapping[str, str],
+    bounds: Mapping[str, Any],
+) -> str:
+    """What names ONE attempt: the key it was made under and everything it was made with.
+
+    The commitment alone would name a key rather than an attempt, and the same key under a
+    later code pin, a later renderer or a wider construction bound is a different attempt
+    at a different instrument. Binding all of them is what lets a release audit say that
+    the bundle in front of it was built by the attempt the history recorded first.
+    """
+    return streams.digest(
+        json.dumps(
+            {
+                "generator": str(generator),
+                "commitment": key_commitment(master),
+                "size": int(size),
+                "code": str(code),
+                "instrument": {k: str(v) for k, v in sorted(dict(instrument).items())},
+                "bounds": {k: bounds[k] for k in sorted(dict(bounds))},
+            },
+            sort_keys=True,
+        ).encode()
+    )
+
+
+def _history_digest(entry: Mapping[str, Any]) -> str:
+    """One line's own hash, over every field of it but the hash."""
+    return streams.digest(
+        json.dumps(
+            {k: v for k, v in entry.items() if k != "digest"}, sort_keys=True
+        ).encode()
+    )
+
+
+def read_history(path: Path) -> list[dict[str, Any]]:
+    """Every line of the append-only history, in the order it was appended.
+
+    A file that is not a history is refused rather than read as an empty one: an absent
+    history and an unreadable one say different things about what has been attempted.
+    """
+    target = Path(path)
+    if not target.is_file():
+        return []
+    out: list[dict[str, Any]] = []
+    for number, line in enumerate(target.read_text(encoding="utf-8").splitlines()):
+        if not line.strip():
+            continue
+        try:
+            entry = json.loads(line)
+        except ValueError as exc:
+            raise ValueError(f"line {number + 1} of the key history at {path} is not a record: {exc}")
+        if not isinstance(entry, dict) or set(entry) != set(HISTORY_FIELDS):
+            raise ValueError(
+                "a key history line carries exactly %s, and line %d of %s carries %s"
+                % (", ".join(HISTORY_FIELDS), number + 1, path,
+                   ", ".join(sorted(entry)) if isinstance(entry, dict) else type(entry).__name__)
+            )
+        out.append(entry)
+    return out
+
+
+def history_problems(path: Path) -> list[str]:
+    """Where the history stops being the one that was written. Empty when it holds.
+
+    Each line hashes itself and names the hash of the line before it, so an edited line
+    fails its own digest and a removed one breaks the next line's link. This is what makes
+    the difference between a history and a file: a summary can be rewritten and say
+    nothing about it, and a chain cannot.
+    """
+    problems: list[str] = []
+    previous = ""
+    for position, entry in enumerate(read_history(path)):
+        if entry["sequence"] != position:
+            problems.append(
+                f"line {position + 1} is sequence {entry['sequence']!r} and should be {position}"
+            )
+        if entry["previous"] != previous:
+            problems.append(
+                f"line {position + 1} does not follow the line before it, so a line was "
+                "removed, reordered or inserted"
+            )
+        if _history_digest(entry) != entry["digest"]:
+            problems.append(f"line {position + 1} does not hash to the digest it carries")
+        previous = str(entry["digest"])
+    return problems
+
+
+def append_history(path: Path, entry: Mapping[str, Any]) -> dict[str, Any]:
+    """Add one event to the end of the history. Nothing here ever rewrites a line.
+
+    The chain is verified before the write, so a history that has been edited is not
+    appended to: continuing one would put an honest line on top of a record that is not
+    the record, and the next reader would have no way to tell where it stopped being one.
+    """
+    broken = history_problems(path)
+    if broken:
+        raise ValueError(
+            "the key history at %s does not verify, so it is not appended to: %s"
+            % (path, "; ".join(broken[:3]))
+        )
+    held = read_history(path)
+    made = dict(entry)
+    made["sequence"] = len(held)
+    made["previous"] = str(held[-1]["digest"]) if held else ""
+    made["digest"] = ""
+    if set(made) != set(HISTORY_FIELDS):
+        raise ValueError(
+            "a key history line carries exactly %s" % ", ".join(HISTORY_FIELDS)
+        )
+    made["digest"] = _history_digest(made)
+    target = Path(path)
+    target.parent.mkdir(parents=True, exist_ok=True)
+    with open(target, "a", encoding="utf-8") as handle:
+        handle.write(json.dumps(made, sort_keys=True) + "\n")
+    return made
+
+
+def history_attempts(path: Path, generator: str) -> list[dict[str, Any]]:
+    """The attempts this genre has started, in order, each with how it ended.
+
+    One entry per `started` line, with the last outcome recorded against it. The events are
+    separate lines because the history only appends; this is the view a caller wants.
+    """
+    outcomes: dict[str, tuple[str, str]] = {}
+    for entry in read_history(path):
+        if entry["event"] != STARTED:
+            outcomes[str(entry["attempt"])] = (str(entry["event"]), str(entry["detail"]))
+    out: list[dict[str, Any]] = []
+    for entry in read_history(path):
+        if entry["event"] != STARTED or entry["generator"] != generator:
+            continue
+        event, detail = outcomes.get(str(entry["attempt"]), (STARTED, ""))
+        out.append(dict(entry, outcome=event, detail=detail))
+    return out
+
+
+def foreign_commitment(
+    path: Path, banks: Path | None, generator: str, master: bytes
+) -> str:
+    """Why this key belongs to another genre, or the empty string.
+
+    A MASTER KEY IS ONE GENRE'S. The convention stream's coordinates are the label and the
+    ordinal and carry no generator name, so two genres under one key draw the SAME
+    convention at every ordinal, and the second one's draws are not independent of the
+    first's however different its surfaces are. That is not a property anything downstream
+    can recover, so it is refused where the key is recorded.
+    """
+    commitment = key_commitment(master)
+    for entry in read_history(path):
+        if entry["commitment"] == commitment and entry["generator"] != generator:
+            return (
+                "this key is already committed to %r in the history at %s; a genre draws "
+                "its conventions from the ordinal alone, so two genres under one key draw "
+                "the same rule at every ordinal" % (entry["generator"], path)
+            )
+    if banks is None:
+        return ""
+    for held in sorted(Path(banks).glob("*.json")):
+        try:
+            other = load_bank(held)
+        except (OSError, ValueError):
+            continue
+        if other.master == bytes(master) and other.generator != generator:
+            return (
+                "this key is the master of the %r bank at %s; a genre draws its "
+                "conventions from the ordinal alone, so two genres under one key draw the "
+                "same rule at every ordinal" % (other.generator, held)
+            )
+    return ""
+
+
 def begin_attempt(
-    path: Path, generator: str, master: bytes, size: int, note: str = ""
+    path: Path,
+    generator: str,
+    master: bytes,
+    size: int,
+    note: str = "",
+    *,
+    history: Path | None = None,
+    code: str = "",
+    instrument: Mapping[str, str] | None = None,
+    bounds: Mapping[str, Any] | None = None,
+    banks: Path | None = None,
 ) -> int:
     """Record a key and its commitment before anything is built. Returns its index.
 
-    Written first, and flushed to the file first, because the point of it is the attempt
-    that does not finish.
+    Written first, and flushed to both files first, because the point of it is the attempt
+    that does not finish. The local record beside the banks is the per-genre summary; the
+    history is the append-only chain, and it is where a second invocation under a DIFFERENT
+    evidence directory still finds the first attempt.
     """
+    labels = dict(instrument or {})
+    limits = dict(bounds or {})
+    if history is not None:
+        refusal = foreign_commitment(history, banks, generator, master)
+        if refusal:
+            raise ValueError(refusal)
     record = read_provenance(path)
     record["generator"] = generator
     attempts = record["attempts"]
     index = len(attempts)
+    identity = attempt_identity(generator, master, size, code, labels, limits)
     attempts.append(
         {
             "attempt": index,
@@ -966,15 +1189,49 @@ def begin_attempt(
             "note": str(note),
             "outcome": STARTED,
             "detail": "",
+            "identity": identity,
         }
     )
     Path(path).parent.mkdir(parents=True, exist_ok=True)
     _replace_record(path, record)
+    if history is not None:
+        append_history(
+            history,
+            {
+                "sequence": 0,
+                "event": STARTED,
+                "attempt": identity,
+                "generator": generator,
+                "commitment": key_commitment(master),
+                "master": bytes(master).hex(),
+                "size": int(size),
+                "note": str(note),
+                "code": str(code),
+                "instrument": {k: str(v) for k, v in sorted(labels.items())},
+                "bounds": {k: limits[k] for k in sorted(limits)},
+                "banks": str(banks) if banks is not None else "",
+                "detail": "",
+                "previous": "",
+                "digest": "",
+            },
+        )
     return index
 
 
-def finish_attempt(path: Path, index: int, outcome: str, detail: str = "") -> None:
-    """Say how the attempt at `index` ended, leaving its key where it was."""
+def finish_attempt(
+    path: Path,
+    index: int,
+    outcome: str,
+    detail: str = "",
+    *,
+    history: Path | None = None,
+) -> None:
+    """Say how the attempt at `index` ended, leaving its key where it was.
+
+    The summary beside the banks is rewritten, because it is a summary. The history gains
+    a LINE, because it is a history: the started line stays exactly as it was written and
+    the outcome sits after it, bound to the same attempt identity.
+    """
     if outcome not in OUTCOMES:
         raise ValueError(f"an attempt ends as one of {OUTCOMES}, not {outcome!r}")
     record = read_provenance(path)
@@ -984,6 +1241,31 @@ def finish_attempt(path: Path, index: int, outcome: str, detail: str = "") -> No
     attempts[index]["outcome"] = outcome
     attempts[index]["detail"] = str(detail)
     _replace_record(path, record)
+    if history is None:
+        return
+    started = attempts[index]
+    append_history(
+        history,
+        {
+            "sequence": 0,
+            "event": outcome,
+            "attempt": str(started.get("identity", "")),
+            "generator": str(started["generator"]),
+            "commitment": str(started["commitment"]),
+            # The key is on the started line and is not repeated: one line holds it, and a
+            # second copy is a second thing to keep in step with the first.
+            "master": "",
+            "size": int(started["size"]),
+            "note": str(started["note"]),
+            "code": "",
+            "instrument": {},
+            "bounds": {},
+            "banks": "",
+            "detail": str(detail),
+            "previous": "",
+            "digest": "",
+        },
+    )
 
 
 def bank_record(bank: Bank) -> dict[str, Any]:
@@ -1133,11 +1415,18 @@ __all__ = [
     "FILLED",
     "FILING_SHAPES",
     "GATE_LABEL",
+    "HISTORY_FIELDS",
     "OUTCOMES",
     "STARTED",
+    "append_history",
+    "attempt_identity",
     "begin_attempt",
     "finish_attempt",
+    "foreign_commitment",
+    "history_attempts",
+    "history_problems",
     "key_commitment",
+    "read_history",
     "read_provenance",
     "RENDERER_CONFIGURATION",
     "Bank",
