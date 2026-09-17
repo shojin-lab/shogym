@@ -46,6 +46,7 @@ from shogym.envs.receipts.protocol import (
     NoFiling,
     RowOutcome,
     draw,
+    policy_of,
 )
 from shogym.envs.receipts.render import judge_cells
 from shogym.envs.receipts.receipt_ast import (
@@ -162,6 +163,12 @@ def instance_record(instance: Instance, generator: Generator) -> dict[str, Any]:
     different bytes for the two branches of one fork, and the digest fixation compares
     stayed equal through all of it: text, identifier and key can all agree while the
     row an agent reads does not.
+
+    AND THE FEEDBACK POLICY WITH EACH SIDE'S MASK. Which rows the receipt reports on is
+    as much a fact about the cell a branch is served as the answers behind it are: two
+    rebuilds that drew different masks would hand two branches of one fork different
+    graded bytes while every other field agreed. The mask is committed here, so a
+    re-render after a crash is held against the rows this instance was frozen with.
     """
     return {
         "generator": instance.generator,
@@ -173,6 +180,7 @@ def instance_record(instance: Instance, generator: Generator) -> dict[str, Any]:
             "surface": instance.a.surface,
             "text": instance.a.text,
             "key": list(instance.a.key),
+            "mask": list(instance.a.mask),
             "table": generator.table_record(instance.a.table),
         },
         "b": {
@@ -180,11 +188,13 @@ def instance_record(instance: Instance, generator: Generator) -> dict[str, Any]:
             "surface": instance.b.surface,
             "text": instance.b.text,
             "key": list(instance.b.key),
+            "mask": list(instance.b.mask),
             "table": generator.table_record(instance.b.table),
         },
         "envelope": envelope_schema(instance.envelope),
         "filler": instance.envelope.filler,
         "neutral": {k: list(v) for k, v in sorted(instance.envelope.neutral.items())},
+        "receipt_policy": policy_of(generator).as_record(),
         "renderer": RENDERER_CONFIGURATION,
     }
 

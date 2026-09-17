@@ -215,6 +215,19 @@ class Observation:
     #: is a self-interpretation whatever it is spelled as.
     slot_grammar: Mapping[str, frozenset[str]] = field(default_factory=dict)
     slot_realized: Mapping[str, frozenset[str]] = field(default_factory=dict)
+    #: The same two, per printed position, for a receipt whose policy reports only
+    #: some of its rows. At a reported position a slot may print what its registered
+    #: grammar allows; at a suppressed one it may print that position's committed
+    #: neutral token and nothing else. The family-wide sets above are the union over
+    #: positions, so a value legal somewhere is not thereby legal everywhere, and a
+    #: receipt that printed a neutral token where it owed a verdict is a violation
+    #: even though every value it printed appears in the union.
+    slot_row_grammar: Mapping[str, tuple[frozenset[str], ...]] = field(
+        default_factory=dict
+    )
+    slot_row_realized: Mapping[str, tuple[frozenset[str], ...]] = field(
+        default_factory=dict
+    )
     #: Every value the scorer can produce as a correct answer on the graded task,
     #: over the whole convention space. A receipt is entitled to print these: they
     #: are what it is grading. Anything else it prints is there to be interpreted.
@@ -472,6 +485,12 @@ def grammar_violations(obs: Observation) -> list[str]:
     not catch one that says `2100`, and a four-digit code is a complete statement of
     the rule to a child that has seen two of them. The defence is not a longer list
     of forbidden words: it is a closed list of permitted ones.
+
+    THE LIST IS PER POSITION WHERE THE POLICY IS. A receipt that reports only the rows
+    a committed mask drew prints that position's committed neutral token at every
+    other one, and those tokens are legal there and nowhere else. Reading one closed
+    list for the whole slot would license a neutral-looking code on a row the receipt
+    owed a verdict on, which is exactly the numeric rule statement this refuses.
     """
     out: list[str] = []
     for name, realized in sorted(obs.slot_realized.items()):
@@ -479,7 +498,19 @@ def grammar_violations(obs: Observation) -> list[str]:
         if allowed is None:
             out.append(f"{name!r} prints values under no registered grammar")
             continue
-        stray = sorted(v for v in realized if v not in allowed)
+        by_row = obs.slot_row_grammar.get(name)
+        seen_by_row = obs.slot_row_realized.get(name)
+        if by_row is not None and seen_by_row is not None:
+            stray = sorted(
+                {
+                    value
+                    for licensed, seen in zip(by_row, seen_by_row)
+                    for value in seen
+                    if value not in licensed
+                }
+            )
+        else:
+            stray = sorted(v for v in realized if v not in allowed)
         if stray:
             shown = ", ".join(repr(v) for v in stray[:4])
             more = "" if len(stray) <= 4 else f" and {len(stray) - 4} more"

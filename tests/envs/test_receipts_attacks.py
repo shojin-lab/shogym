@@ -80,8 +80,8 @@ class _Wrapped:
 class _Ghost(_Wrapped):
     """Registered fields constant; the real verdict in an unregistered slot."""
 
-    def render_receipt(self, task, canonical, truth):
-        ast = self._inner.render_receipt(task, canonical, truth)
+    def render_receipt(self, task, canonical, truth, feedback):
+        ast = self._inner.render_receipt(task, canonical, truth, feedback)
         return ReceiptAST(
             kind=ast.kind, task_id=ast.task_id, row_count=ast.row_count,
             rows=tuple(
@@ -100,8 +100,8 @@ class _Ghost(_Wrapped):
 class _Duplicated(_Wrapped):
     """Two slots of the same registered name, so a dict would let the last one win."""
 
-    def render_receipt(self, task, canonical, truth):
-        ast = self._inner.render_receipt(task, canonical, truth)
+    def render_receipt(self, task, canonical, truth, feedback):
+        ast = self._inner.render_receipt(task, canonical, truth, feedback)
         return ReceiptAST(
             kind=ast.kind, task_id=ast.task_id, row_count=ast.row_count,
             rows=tuple(
@@ -118,8 +118,8 @@ class _Duplicated(_Wrapped):
 class _Truncated(_Wrapped):
     """Two values the registered width truncates to one thing."""
 
-    def render_receipt(self, task, canonical, truth):
-        ast = self._inner.render_receipt(task, canonical, truth)
+    def render_receipt(self, task, canonical, truth, feedback):
+        ast = self._inner.render_receipt(task, canonical, truth, feedback)
         return ReceiptAST(
             kind=ast.kind, task_id=ast.task_id, row_count=ast.row_count,
             rows=tuple(
@@ -180,9 +180,9 @@ class _Stashing(_Wrapped):
         super().__init__()
         self._stash = ""
 
-    def render_receipt(self, task, canonical, truth):
+    def render_receipt(self, task, canonical, truth, feedback):
         self._stash = "".join(truth)
-        return self._inner.render_receipt(task, canonical, truth)
+        return self._inner.render_receipt(task, canonical, truth, feedback)
 
     def render_placebo(self, task, canonical, envelope):
         ast = self._inner.render_placebo(task, canonical, envelope)
@@ -218,7 +218,7 @@ def test_the_honest_placebo_is_identical_under_every_convention() -> None:
         retasked = Task(
             label=task.label, task_id=task.task_id, surface=task.surface,
             table=task.table, text=task.text,
-            key=tuple(GENERATOR.key_for(task.table, convention)),
+            key=tuple(GENERATOR.key_for(task.table, convention)), mask=task.mask,
         )
         seen.add(
             serialize(
@@ -235,8 +235,8 @@ def test_the_honest_placebo_is_identical_under_every_convention() -> None:
 class _Coded(_Wrapped):
     """The correction slot prints the option indices as a short numeric code."""
 
-    def render_receipt(self, task, canonical, truth):
-        ast = self._inner.render_receipt(task, canonical, truth)
+    def render_receipt(self, task, canonical, truth, feedback):
+        ast = self._inner.render_receipt(task, canonical, truth, feedback)
         code = "0000"
         for convention in conventions(GENERATOR.AXES):
             if tuple(GENERATOR.key_for(task.table, convention)) == tuple(truth):
@@ -367,8 +367,8 @@ def test_a_scorer_the_gate_does_not_price_is_refused() -> None:
 class _EncodedCorrections(_Wrapped):
     """Corrections spelled as ordinary band names, carrying the option indices."""
 
-    def render_receipt(self, task, canonical, truth):
-        ast = self._inner.render_receipt(task, canonical, truth)
+    def render_receipt(self, task, canonical, truth, feedback):
+        ast = self._inner.render_receipt(task, canonical, truth, feedback)
         bands = list(task.table.dom["bands"])
         indices = [0, 0, 0, 0]
         for convention in conventions(GENERATOR.AXES):
@@ -437,9 +437,9 @@ class _Conditional(_Wrapped):
         super().__init__()
         self._stash = ""
 
-    def render_receipt(self, task, canonical, truth):
+    def render_receipt(self, task, canonical, truth, feedback):
         self._stash = "".join(truth)
-        return self._inner.render_receipt(task, canonical, truth)
+        return self._inner.render_receipt(task, canonical, truth, feedback)
 
     def render_placebo(self, task, canonical, envelope):
         ast = self._inner.render_placebo(task, canonical, envelope)
@@ -640,8 +640,8 @@ def test_the_production_environment_has_no_override() -> None:
 class _SampleHonest(_Wrapped):
     """Honest on every filing admission samples, and only on those."""
 
-    def render_receipt(self, task, canonical, truth):
-        ast = self._inner.render_receipt(task, canonical, truth)
+    def render_receipt(self, task, canonical, truth, feedback):
+        ast = self._inner.render_receipt(task, canonical, truth, feedback)
         # Honest on every filing admission samples, on BOTH sides and in every
         # registered class, since admission judges the whole set. Compared as parsed
         # values rather than as filing text: a partial filing canonicalizes to one
@@ -919,9 +919,9 @@ class _RewritesCommitment(_Wrapped):
         super().__init__()
         self._code = 0
 
-    def render_receipt(self, task, canonical, truth):
+    def render_receipt(self, task, canonical, truth, feedback):
         self._code = sum(_option_indices(truth, task.table))
-        return self._inner.render_receipt(task, canonical, truth)
+        return self._inner.render_receipt(task, canonical, truth, feedback)
 
     def render_placebo(self, task, canonical, envelope):
         envelope.neutral["verdict"] = ("%04d" % self._code,) * 24
@@ -968,9 +968,9 @@ class _BendsOrdinals(_Wrapped):
             ),
         )
 
-    def render_receipt(self, task, canonical, truth):
+    def render_receipt(self, task, canonical, truth, feedback):
         self._indices = _option_indices(truth, task.table)
-        return self._bend(self._inner.render_receipt(task, canonical, truth))
+        return self._bend(self._inner.render_receipt(task, canonical, truth, feedback))
 
     def render_placebo(self, task, canonical, envelope):
         return self._bend(self._inner.render_placebo(task, canonical, envelope))
@@ -2327,8 +2327,8 @@ class _WrongWrapper(_Wrapped):
         return ReceiptAST(kind=ast.kind, task_id=ast.task_id, row_count=9999,
                           rows=ast.rows, body=ast.body)
 
-    def render_receipt(self, task, canonical, truth):
-        return self._bend(self._inner.render_receipt(task, canonical, truth))
+    def render_receipt(self, task, canonical, truth, feedback):
+        return self._bend(self._inner.render_receipt(task, canonical, truth, feedback))
 
     def render_placebo(self, public, canonical, envelope):
         return self._bend(self._inner.render_placebo(public, canonical, envelope))
