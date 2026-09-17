@@ -854,6 +854,30 @@ def _guarded(name: str, run: Callable[[], CheckResult]) -> CheckResult:
         return CheckResult(name, False, f"the generator raised: {type(exc).__name__}: {exc}")
 
 
+def profile_checks(
+    generator: Generator, instance: Instance
+) -> list[tuple[str, Callable[[], CheckResult]]]:
+    """The checks one declared copy profile adds to the eleven every family runs.
+
+    DISPATCHED ON THE DECLARATION, like the copying itself. The eleven named checks ask
+    what a receipt can carry and what a cell has to be, and they are the same questions
+    for every family. What is NOT the same is what a cheap reader of one genre can do:
+    ledger's answers are band names a reader maps between two printed tables, and sound
+    change's are whole invented words a reader can partly read off the phones. So a
+    profile brings the checks its own cheap readers need, and a family gets them by
+    declaring the profile rather than by anyone remembering to add them.
+    """
+    if copy_profiles.profile_of(generator) != copy_profiles.SOUNDCHANGE_V1:
+        return []
+    from shogym.envs.receipts.generators import soundchange_audit
+
+    return [
+        ("cascade", lambda: soundchange_audit.check_cascade(generator, instance)),
+        ("phone_lookup", lambda: soundchange_audit.check_phone_lookup(generator, instance)),
+        ("analogy", lambda: soundchange_audit.check_analogy(generator, instance)),
+    ]
+
+
 def run_checks(
     generator: Generator,
     instance: Instance,
@@ -882,11 +906,13 @@ def run_checks(
         ("lint", lambda: check_lint(generator, instance)),
         ("invariance", lambda: check_invariance(generator, instance)),
     ]
+    planned.extend(profile_checks(generator, instance))
     return [_guarded(name, run) for name, run in planned]
 
 
 __all__ = [
     "COPY_MAPS",
+    "profile_checks",
     "NO_INDUCTION_MAPS",
     "REPORTED_MAPS",
     "UNPRINTABLE_VALUE",
