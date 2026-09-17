@@ -10,6 +10,8 @@ renderers, so a receipt can never grade something the score did not.
 
 from __future__ import annotations
 
+import hashlib
+
 import pytest
 
 from shogym.envs.receipts import bank as bank_mod
@@ -208,6 +210,29 @@ def test_the_description_gained_that_sentence_and_no_other_public_text() -> None
         sentence = ledger.scope_sentence(label)
         assert task.text.count(sentence) == 1
         assert task.text.replace(sentence + "\n\n", "", 1) == before
+
+
+#: The descriptions the code before the scope sentence rendered for the first three
+#: instances under MASTER, as digests, so that the comparison above rests on bytes
+#: frozen outside the template it tests rather than on the template with the sentence
+#: taken out, which a change to the policy text would move on both sides at once.
+DESCRIPTIONS_BEFORE_THE_SCOPE_SENTENCE = {
+    (0, "A"): "ba25b49cd1825ed18c69a069cd21d999a0836b2766c646daf4c87f4f47dbedd4",
+    (0, "B"): "bc03614212dc5d37113438bf0cfd3fc4ccd3915093ddc09533a99a9071b97aab",
+    (1, "A"): "260f4777f71861df0479135f52ce188a3f74d269923fe21399cc54ab78f59341",
+    (1, "B"): "b5f7c6e56a7850b719b1def3aa411edc2509a5e2e703ff0901c4b15429511ded",
+    (2, "A"): "50b2fbeba7171d1c9c8f62541057b4186ddb40edad81489476f11b191363e49b",
+    (2, "B"): "6ef39b61fc8aac80cdf0830b92356439a022f565b78e3badc1b98acaeae39df8",
+}
+
+
+def test_without_the_sentence_the_description_is_the_bytes_the_earlier_code_rendered() -> None:
+    """The baseline is frozen, not derived from the template under test."""
+    for (ordinal, label), digest in DESCRIPTIONS_BEFORE_THE_SCOPE_SENTENCE.items():
+        task = _instance(ordinal).side(label.lower())
+        sentence = ledger.scope_sentence(label)
+        stripped = task.text.replace(sentence + "\n\n", "", 1)
+        assert hashlib.sha256(stripped.encode("utf-8")).hexdigest() == digest
 
 
 def test_a_sibling_label_the_family_does_not_have_is_refused() -> None:
