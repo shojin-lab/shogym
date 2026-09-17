@@ -12,7 +12,9 @@ import itertools
 import json
 import random
 import shutil
+import sys
 import threading
+import types
 from pathlib import Path
 from types import MappingProxyType
 from typing import Mapping, Sequence
@@ -27,6 +29,7 @@ from shogym.envs.receipts import review, soundchange_review
 from shogym.envs.receipts import checks, copy_profiles
 from shogym.envs.receipts.generators import ledger, soundchange
 from shogym.envs.receipts.generators import soundchange_audit as audit
+from shogym.envs.receipts.generators.vectors import VECTORS
 from shogym.envs.receipts.protocol import option_mentions
 from shogym.envs.receipts.protocol import (
     ConstructionExhausted,
@@ -224,7 +227,9 @@ class _NoRanksUnderTheTokenProfile(_Undeclared):
         return None
 
 
-def test_a_generator_without_a_declared_profile_is_refused_at_registration() -> None:
+def test_a_generator_without_a_declared_profile_is_refused_at_registration(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
     """A copy family is declared, and registration is where the declaration is read.
 
     It fails if an undeclared profile falls back to any family at all, if a profile
@@ -233,6 +238,12 @@ def test_a_generator_without_a_declared_profile_is_refused_at_registration() -> 
     a family of words priced by maps between two published vocabularies reports the
     maximum of a transfer nobody can perform, and the bar is then read against a
     number that measured nothing.
+
+    THE LAST PART REGISTERS ONE. Asking the helper directly and then loading the
+    generators this build already declares leaves the rule stated and unenforced: both
+    halves stay green with the reading removed from the registry, because everything on
+    the roster declares a profile and nothing else ever reaches the door. A generator
+    that declares none is put on the roster here, and the refusal is asked of the door.
     """
     for offered in (_Undeclared(), _Unregistered()):
         with pytest.raises(ValueError) as refusal:
@@ -242,6 +253,26 @@ def test_a_generator_without_a_declared_profile_is_refused_at_registration() -> 
             copy_profiles.require_profile(offered)
     for name in sorted(set(GENRES) | set(FIXTURES_NAMES)):
         assert copy_profiles.profile_of(load_generator(name)) in copy_profiles.PROFILES
+
+    for genre, offered in (("undeclared", _Undeclared()), ("unregistered", _Unregistered())):
+        stub = types.ModuleType(f"a_module_declaring_{genre}")
+        stub.GENERATOR = offered
+        monkeypatch.setitem(sys.modules, stub.__name__, stub)
+        monkeypatch.setitem(GENRES, genre, stub.__name__)
+        assert GENRES[genre] == stub.__name__
+        with pytest.raises(ValueError) as refused:
+            load_generator(genre)
+        assert "COPY_PROFILE" in str(refused.value) or "profile" in str(refused.value)
+
+    # A gate vector reaches the same door by its own map, and is read the same way: the
+    # vectors are exercised through the shipped commands, so an undeclared one would be
+    # priced under whichever family the copy screen tried first.
+    monkeypatch.setitem(VECTORS, "undeclared_vector", _Undeclared())
+    with pytest.raises(ValueError) as vector_refused:
+        load_generator("undeclared_vector")
+    assert "COPY_PROFILE" in str(vector_refused.value) or "profile" in str(
+        vector_refused.value
+    )
 
 
 def test_realized_answers_are_never_consumed_as_published_ranks() -> None:
