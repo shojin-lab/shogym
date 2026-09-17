@@ -36,6 +36,10 @@ from typing import Mapping, Sequence
 
 import numpy as np
 
+from shogym.envs.receipts.admission import (
+    REGISTERED_MAX_FLIP_SCORE,
+    REGISTERED_MIN_LEVERAGE,
+)
 from shogym.envs.receipts.checks import (
     CheckResult,
     axis_leverage,
@@ -742,6 +746,29 @@ def check_support(generator, instance: Instance) -> CheckResult:
                 "components_support", False,
                 "under reference %s the registered copy family earns %.6f on B, over %.6f"
                 % (reference, registered, MAX_COPY_ROWS / float(ROWS)),
+            )
+        # THE TWO NUMBERS BELOW WERE PRINTED AND NOT READ. The shared `copy` check reads
+        # them at the rule that was drawn, and this walks the other two, which is the
+        # whole reason for rerunning the arithmetic at every reference: a pair whose
+        # counterfactual rule costs nothing to get wrong is a pair the link cannot be
+        # scored on whenever that rule is the one drawn, and every ordinal draws its own.
+        if scores["option_flip"] > REGISTERED_MAX_FLIP_SCORE + TOLERANCE:
+            return CheckResult(
+                "components_support", False,
+                "under reference %s a filing made under one of the other two rules still "
+                "earns %.6f on B, over the registered %.6f"
+                % (reference, scores["option_flip"], REGISTERED_MAX_FLIP_SCORE),
+            )
+        weak = sorted(
+            name for name, value in leverage.items()
+            if value < REGISTERED_MIN_LEVERAGE - TOLERANCE
+        )
+        if weak:
+            return CheckResult(
+                "components_support", False,
+                "under reference %s B pays %.6f for %s and the registered leverage is "
+                "%.6f" % (reference, leverage[weak[0]], ", ".join(weak),
+                          REGISTERED_MIN_LEVERAGE),
             )
         lines.append(
             "%s blocks %d, evident %d, ceiling %.6f, floor %.6f, H %.6f, copy %.6f, "
