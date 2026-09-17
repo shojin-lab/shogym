@@ -451,7 +451,10 @@ directory.
 
 The `screen` command analyzes recorded outcomes and runs no model. **No model screen has been run
 for this genre.** The procedure, in one place for whoever runs it, with
-`components_review.screen_refusals` as the companion audit of the allocation:
+`components_review.screen_refusals` as the companion audit of the allocation. That audit takes the
+bank's admitted order and the recorded `ScreenRecord` as well as the allocation, and reads the
+identities against the first and the outcomes against the second, because an allocation checked
+against its own fields is an allocation that says whatever it likes:
 
 1. Reserve the **first 12 admitted identities** as an exploratory prefix, at most three per
    initial state in cyclic order. Unused reserved identities do not become final cases. Freeze
