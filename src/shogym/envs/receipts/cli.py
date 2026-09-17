@@ -31,8 +31,10 @@ convention and the answer key. None of this is reachable from a lineage sandbox.
 from __future__ import annotations
 
 import argparse
+import functools
 import math
 from pathlib import Path
+from typing import Callable
 
 from shogym.envs.receipts import admission as admission_mod
 from shogym.envs.receipts import bank as bank_mod
@@ -497,6 +499,38 @@ def _list() -> int:
     return 0
 
 
+def _one_attempt_at_a_time(
+    command: Callable[[argparse.Namespace], int],
+) -> Callable[[argparse.Namespace], int]:
+    """Run a materialization under the claim on its genre's evidence directory.
+
+    THE WHOLE COMMAND, AND NOT ONLY THE CHECK. The refusal that makes a second key an
+    act with a name is a read of the provenance record followed by a write of it, and
+    the attempt itself sits between them: two commands started together both read a
+    record with nothing in it, so neither of them was a reroll, and the key the second
+    one wrote down replaced the first one's. Holding the claim from before the check
+    until after the attempt has been recorded is what leaves the second command reading
+    what the first one wrote.
+
+    A gate vector has no bank, no record and no key, and the command refuses it by name,
+    so it takes no claim.
+    """
+
+    @functools.wraps(command)
+    def under_one_claim(args: argparse.Namespace) -> int:
+        if is_fixture(args.name):
+            return command(args)
+        try:
+            with bank_mod.one_attempt(provenance_path(args.name)):
+                return command(args)
+        except bank_mod.AttemptInProgress as busy:
+            print(str(busy))
+            return 1
+
+    return under_one_claim
+
+
+@_one_attempt_at_a_time
 def _materialize(args: argparse.Namespace) -> int:
     """Freeze a bank: a generator, a key recorded before it is used, and its passers.
 
