@@ -59,8 +59,9 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from types import MappingProxyType
-from typing import Callable, Iterable, Mapping, Sequence
+from typing import Callable, Mapping, Sequence
 
+from shogym.envs.receipts import copy_profiles
 from shogym.envs.receipts.observe import canonical_filing_text, observe
 from shogym.envs.receipts.oracle import OracleTemplate
 from shogym.envs.receipts.oracle import parse_body as parse_oracle_body
@@ -163,164 +164,16 @@ def check_materiality(
 # --------------------------------------------------------------------------
 
 
-def _fit(values: Sequence[str], width: int) -> list[str]:
-    """A filing for B of the right length, whatever A's row count was."""
-    padded = list(values) + [""] * width
-    return padded[:width]
-
-
-def _distinct(filings: Iterable[Sequence[str]]) -> list[list[str]]:
-    """The same filings with the repeats dropped, in the order they first appeared.
-
-    A closed family names one filing many ways: the row move that undoes a rotation
-    of a symmetric filing, the two token maps that agree on the answers A actually
-    filed. Scoring each of those again costs a parse and decides nothing, and the
-    maximum is over the set rather than the enumeration.
-    """
-    seen: dict[tuple[str, ...], list[str]] = {}
-    for filing in filings:
-        seen.setdefault(tuple(filing), list(filing))
-    return list(seen.values())
-
-
-def _permutations(values: Sequence[str], width: int) -> list[list[str]]:
-    """The registered row moves, as the CLOSED family the two generators produce.
-
-    The generators are the rotation and the reversal, and a family that listed only
-    those was not closed: reversing and THEN rotating is a composition of registered
-    moves that no listed member equals, and on a real draw one of them scored above
-    the bar while the reported maximum sat under it. Rotation and reversal generate
-    the dihedral group, so the closed family is every rotation of the sequence and
-    every rotation of the reversed sequence: 2n moves for n rows, 48 at the ledger's
-    24. Closing it here is what makes the composition with the relabels closed too,
-    because a product of a closed family with a commuting one is closed.
-
-    The moves are positional, so they are taken on the FITTED sequence: the filing
-    they rearrange is the one B would receive, whatever A's row count was.
-    """
-    fitted = _fit(values, width)
-    reversed_fitted = list(reversed(fitted))
-    out: list[list[str]] = []
-    for base in (fitted, reversed_fitted):
-        for shift in range(max(len(base), 1)):
-            out.append(list(base[shift:]) + list(base[:shift]))
-    return out
-
-
-def _token_generators(
-    values: Sequence[str],
-    source_ranks: Sequence[str],
-    target_ranks: Sequence[str],
-) -> list[dict[str, str]]:
-    """The registered token dictionaries themselves, before anything is closed.
-
-    EVERY TARGET SIDE IS A PUBLISHED VOCABULARY. The RANK map takes the two tasks'
-    own published answer orders and sends first to first: it is the cheapest transfer
-    there is, because both orders are printed in the two task texts and reading them
-    off needs no induction at all. Its rotations come with it. The LEXICAL map is the
-    same construction over the published vocabularies sorted alphabetically, which is
-    what a reader with no sense of the order would write. The FILED map narrows the
-    source to the answers the agent actually filed on A, which it knows without
-    inducing anything, and sends them into the same published target order.
-
-    The target side is never the tokens B's drawn key happened to realize. A map into
-    the realized target prices a transfer nobody could perform: producing it means
-    already knowing what the hidden draw did to B, which is the thing the screen
-    exists to bound. It is also not measuring the surface pair, since it moves with
-    the draw, and the bar was read against the numbers it inflated.
-
-    These are the GENERATORS. What the screen is read against is what they generate,
-    which `_token_maps` computes.
-    """
-    out: list[dict[str, str]] = []
-    for source, into in (
-        (list(source_ranks), list(target_ranks)),
-        (sorted(set(source_ranks)), sorted(set(target_ranks))),
-        (sorted(set(values)), sorted(set(target_ranks))),
-    ):
-        if not source or not into:
-            continue
-        for shift in range(len(into)):
-            out.append({s: into[(i + shift) % len(into)] for i, s in enumerate(source)})
-    return out
-
-
-def _token_maps(
-    values: Sequence[str],
-    source_ranks: Sequence[str],
-    target_ranks: Sequence[str],
-) -> list[dict[str, str]]:
-    """The registered token dictionaries CLOSED under composition, identity first.
-
-    A LIST OF DICTIONARIES IS NOT THE FAMILY, and the difference has a price. Each
-    registered dictionary is applied by leaving anything outside it alone, so it is a
-    total function on the finite set of tokens the dictionaries and the filing
-    mention, and two of them compose into a third total function on that same set. A
-    rank map that carries A's bands into B's while leaving an untouched token alone,
-    followed by a filed map that carries that token onward while leaving the already
-    translated bands alone, is a map an agent builds from the same two published
-    dictionaries and no more. Listing the dictionaries and not their compositions left
-    such a map out, and on a real draw it scored 13 of 24 where the reported maximum
-    was 11 of 24, so the bar admitted it.
-
-    So this closes them, generically rather than by hand. Compositions are taken until
-    no new map appears, which terminates because there are finitely many functions
-    from a finite token set to itself. The result is a monoid: the identity is in it,
-    and it is closed, so nothing an agent can build by chaining registered
-    dictionaries is outside what the screen prices.
-    """
-    universe = sorted(set(values) | set(source_ranks) | set(target_ranks))
-    if not universe:
-        return [{}]
-    position = {token: n for n, token in enumerate(universe)}
-
-    def total(table: Mapping[str, str]) -> tuple[str, ...]:
-        """One dictionary as its images over the whole token set, in one order."""
-        return tuple(table.get(token, token) for token in universe)
-
-    def after(first: tuple[str, ...], second: tuple[str, ...]) -> tuple[str, ...]:
-        """`first` and then `second`, which is a map on the same token set."""
-        return tuple(second[position[image]] for image in first)
-
-    identity = tuple(universe)
-    found = [identity]
-    known = {identity}
-    for table in _token_generators(values, source_ranks, target_ranks):
-        made = total(table)
-        if made not in known:
-            known.add(made)
-            found.append(made)
-    frontier = list(found)
-    while frontier:
-        fresh: list[tuple[str, ...]] = []
-        against = list(found)
-        for one in frontier:
-            for other in against:
-                for made in (after(one, other), after(other, one)):
-                    if made not in known:
-                        known.add(made)
-                        found.append(made)
-                        fresh.append(made)
-        frontier = fresh
-    return [dict(zip(universe, image)) for image in found]
-
-
-def _relabellings(
-    values: Sequence[str],
-    source_ranks: Sequence[str],
-    target_ranks: Sequence[str],
-    width: int,
-) -> list[list[str]]:
-    """Every filing the closed token family can make of A's answers, deduplicated.
-
-    The identity is among the maps, so the untouched filing leads the list and
-    composing this with the row moves produces those moves themselves.
-    """
-    seen: dict[tuple[str, ...], list[str]] = {}
-    for table in _token_maps(values, source_ranks, target_ranks):
-        filing = _fit([table.get(value, value) for value in values], width)
-        seen.setdefault(tuple(filing), filing)
-    return list(seen.values())
+#: The positional and value maps, and the profile dispatch, live in `copy_profiles`.
+#: They are named here because this module is where the screen is read and because a
+#: reader of a failure looks for them beside the check that reported it. The bodies
+#: moved and the outputs did not: the ordered-token family is the family it was.
+_fit = copy_profiles.fit
+_distinct = copy_profiles.distinct
+_permutations = copy_profiles.permutations
+_token_generators = copy_profiles.token_generators
+_token_maps = copy_profiles.token_maps
+_relabellings = copy_profiles.token_relabellings
 
 
 def copy_map_filings(
@@ -334,12 +187,12 @@ def copy_map_filings(
     """
     a_key = list(instance.a.key)
     width = len(instance.b.key)
-    relabels = _relabellings(
-        a_key,
-        generator.answer_ranks(instance.a.table),
-        generator.answer_ranks(instance.b.table),
-        width,
-    )
+    # WHICH VALUE MAPS, decided by the family's DECLARED profile rather than by what
+    # its answers happen to look like from here. An undeclared or unregistered profile
+    # is refused: pricing a family of words by maps between two published vocabularies
+    # it does not have would report a maximum of a transfer nobody can perform, and the
+    # bar would be read against a number that measured nothing.
+    relabels = copy_profiles.relabellings(generator, instance, a_key, width)
     out: dict[str, list[list[str]]] = {
         "identity": [_fit(a_key, width)],
         "permutation": _permutations(a_key, width),

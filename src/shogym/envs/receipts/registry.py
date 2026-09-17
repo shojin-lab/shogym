@@ -12,6 +12,7 @@ import importlib
 import os
 from pathlib import Path
 
+from shogym.envs.receipts.copy_profiles import require_profile
 from shogym.envs.receipts.protocol import Generator
 
 #: Genre name to the module that implements it. A module earns a line here by
@@ -44,19 +45,28 @@ DEFAULT_BANK_DIR = Path.home() / ".cache" / "shogym" / "receipts" / "banks"
 
 
 def load_generator(name: str) -> Generator:
-    """The generator a genre name or a gate vector points at."""
+    """The generator a genre name or a gate vector points at.
+
+    EVERY GENERATOR THAT ARRIVES THROUGH THIS DOOR DECLARES ITS COPY PROFILE. The copy
+    screen prices a registered family of maps and its bar is read against exactly that
+    family, so a generator that declares none is refused here rather than priced under
+    whichever family this package happened to try first. Registration is the right
+    place for it because it is the one door every command, every check and every bundle
+    reaches a generator through, and because the refusal a caller wants is "this module
+    is not a generator yet", not a copy maximum taken over maps its answers cannot be.
+    """
     if name in VECTORS and name in GENRES:
         # Vectors are looked up first, so a collision would silently serve a gate
         # exhibit wherever the family was meant. It is refused rather than resolved.
         raise KeyError(f"{name!r} names both a genre and a gate vector")
     if name in VECTORS:
-        return VECTORS[name]
+        return require_profile(VECTORS[name])
     if name not in GENRES:
         raise KeyError(
             "no genre or vector named %r; this build carries %s"
             % (name, ", ".join(sorted(set(GENRES) | set(VECTORS))))
         )
-    return importlib.import_module(GENRES[name]).GENERATOR
+    return require_profile(importlib.import_module(GENRES[name]).GENERATOR)
 
 
 def is_fixture(name: str) -> bool:
