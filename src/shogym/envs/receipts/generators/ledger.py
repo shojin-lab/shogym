@@ -591,8 +591,9 @@ no other text. File every record, in the order the records appear above.
 #: One convention is drawn for a pair of sibling schedules, and a reader that is
 #: never told so has no reason to carry to the second schedule anything it worked
 #: out on the first. That is what a run of 119 readers measured: 64 of them held a
-#: correct statement of the rule and filed the second schedule under a different
-#: one, because nothing they could see said the two were scored together. So the
+#: correct statement of the rule and read it as scoped to the schedule it came
+#: with, and 44 of those filed the second schedule under a different rule, because
+#: nothing they could see said the two were scored together. So the
 #: task says which schedules share the conventions, by what the reader does with
 #: them rather than by any name printed on them, and says that the pair after them
 #: is scored under conventions of its own. It states that two consecutive schedules
@@ -659,8 +660,9 @@ PHRASES = {
 #: THE HEADING NAMES THE SCOPE BY THE SCHEDULES THE READER FILES.
 #: A heading that scoped the rule to a word for the body of work it was drawn for
 #: was read, and what it did was measured. Of 119 readers given a correct statement
-#: of the rule, 64 restated it correctly and wrote it into their own notes, and then
-#: filed the held-out schedule under a different rule: they had taken the scope word
+#: of the rule, 64 restated it correctly, wrote it into their own notes and read it
+#: as scoped to the schedule it came with, and 44 of those then filed the held-out
+#: schedule under a different rule: they had taken the scope word
 #: for the organisation printed at the top of the schedule, and the two sibling
 #: schedules never carry one organisation between them, so the heading told each
 #: reader that the rule it had just been handed did not reach the schedule it was
