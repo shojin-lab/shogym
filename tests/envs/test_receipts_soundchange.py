@@ -10,9 +10,13 @@ import hashlib
 import json
 from pathlib import Path
 
-from shogym.envs.receipts import checks
+import pytest
+
+from shogym.envs.receipts import checks, copy_profiles
 from shogym.envs.receipts.generators import ledger
 from shogym.envs.receipts.protocol import draw
+from shogym.envs.receipts.registry import FIXTURES as FIXTURES_NAMES
+from shogym.envs.receipts.registry import GENRES, load_generator
 from shogym.envs.receipts.render import judge_cells
 
 FIXTURES = Path(__file__).resolve().parents[1] / "_fixtures"
@@ -146,3 +150,123 @@ _READING_FIELDS = (
     "extras",
     "omissions",
 )
+
+
+# ----- the shared copying contract ------------------------------------------
+
+
+class _Undeclared:
+    """A generator-shaped object that never says which family prices it."""
+
+    name = "undeclared"
+    genre = "a generator with no copy profile"
+
+    def answer_ranks(self, table) -> tuple[str, ...]:
+        return ("one", "two")
+
+
+class _Unregistered(_Undeclared):
+    name = "unregistered"
+    COPY_PROFILE = "whatever_this_build_does_not_know"
+
+
+class _RanksWithoutAProfileForThem(_Undeclared):
+    """Declares the word profile and hands back the daughters a draw realized."""
+
+    name = "leaky"
+    COPY_PROFILE = copy_profiles.SOUNDCHANGE_V1
+
+
+class _NoRanksUnderTheTokenProfile(_Undeclared):
+    name = "rankless"
+    COPY_PROFILE = copy_profiles.ORDERED_TOKENS
+
+    def answer_ranks(self, table) -> None:
+        return None
+
+
+def test_a_generator_without_a_declared_profile_is_refused_at_registration() -> None:
+    """A copy family is declared, and registration is where the declaration is read.
+
+    It fails if an undeclared profile falls back to any family at all, if a profile
+    name this build does not register is accepted, or if `load_generator` hands back a
+    generator whose declaration was never read. Silence is the failure being refused:
+    a family of words priced by maps between two published vocabularies reports the
+    maximum of a transfer nobody can perform, and the bar is then read against a
+    number that measured nothing.
+    """
+    for offered in (_Undeclared(), _Unregistered()):
+        with pytest.raises(ValueError) as refusal:
+            copy_profiles.profile_of(offered)
+        assert "COPY_PROFILE" in str(refusal.value) or "profile" in str(refusal.value)
+        with pytest.raises(ValueError):
+            copy_profiles.require_profile(offered)
+    for name in sorted(set(GENRES) | set(FIXTURES_NAMES)):
+        assert copy_profiles.profile_of(load_generator(name)) in copy_profiles.PROFILES
+
+
+def test_realized_answers_are_never_consumed_as_published_ranks() -> None:
+    """The two halves of the declaration have to agree with each other.
+
+    It fails if a family declaring the word profile may publish answer ranks anyway,
+    which is how the daughters one hidden draw realized would reach the copy screen as
+    though a reader could have read them off the task, and it fails if a family
+    declaring the token profile may publish none, which is a bar read against maps
+    that were never built.
+    """
+    with pytest.raises(ValueError) as leaked:
+        copy_profiles.answer_ranks_for(_RanksWithoutAProfileForThem(), None)
+    assert "ordered vocabulary" in str(leaked.value)
+    with pytest.raises(ValueError) as missing:
+        copy_profiles.answer_ranks_for(_NoRanksUnderTheTokenProfile(), None)
+    assert "no answer ranks" in str(missing.value)
+
+
+def test_the_character_maps_are_closed_under_composition() -> None:
+    """The registered character family is a family, not a list of maps.
+
+    It fails if composing two registered character maps leaves the registered set, if
+    the identity is not in it, or if the count is not the direct product of the two
+    permutation groups. A family that is not closed reports a maximum some composition
+    of its own members exceeds, which is the failure that admitted two ledger draws.
+    """
+    maps = copy_profiles.character_maps()
+    assert len(maps) == 36
+    frozen = {tuple(sorted(table.items())) for table in maps}
+    assert len(frozen) == 36
+    identity = {c: c for c in copy_profiles.DELETABLE_VOWELS + copy_profiles.REPLACEMENT_PHONES}
+    assert tuple(sorted(identity.items())) in frozen
+    for one in maps:
+        for other in maps:
+            composed = {k: other.get(one[k], one[k]) for k in one}
+            assert tuple(sorted(composed.items())) in frozen
+
+
+def test_character_maps_and_row_moves_commute_and_close_the_product() -> None:
+    """The product of the two commuting closed families is the family the bar reads.
+
+    It fails if a character map applied after a row move differs from the same move
+    applied after the map, if the identity filing is missing, or if either subfamily
+    escapes the combined closure. A subfamily that exceeded the closure would mean the
+    number the bar is read against is not a number any member reaches.
+    """
+    values = ["mbagtip", "pigtap", "pgatip", "kpitap"]
+    width = len(values)
+    for table in copy_profiles.character_maps():
+        for move in copy_profiles.permutations(values, width):
+            mapped_then_moved = [copy_profiles.apply_characters(table, v) for v in move]
+            moved_then_mapped = copy_profiles.permutations(
+                [copy_profiles.apply_characters(table, v) for v in values], width
+            )
+            assert mapped_then_moved in moved_then_mapped
+    relabels = copy_profiles.character_relabellings(values, width)
+    combined = copy_profiles.distinct(
+        filing
+        for relabelled in relabels
+        for filing in copy_profiles.permutations(relabelled, width)
+    )
+    as_tuples = {tuple(f) for f in combined}
+    assert tuple(values) in as_tuples
+    assert {tuple(f) for f in relabels} <= as_tuples
+    assert {tuple(f) for f in copy_profiles.permutations(values, width)} <= as_tuples
+    assert len(combined) <= 36 * 2 * width

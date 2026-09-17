@@ -51,6 +51,7 @@ from typing import Any, Mapping, Sequence
 
 from shogym.envs.receipts import filing as shared_filing
 from shogym.envs.receipts import streams
+from shogym.envs.receipts.copy_profiles import ORDERED_TOKENS
 from shogym.envs.receipts.filing import SCOPE_SENTENCE, scope_sentence
 from shogym.envs.receipts.protocol import (
     Axis,
@@ -706,6 +707,13 @@ class LedgerGenerator:
     SHAPE = SHAPE
     AXES = AXES
     SCORING: str = ROW_ADDITIVE_EQUAL_WEIGHT
+    #: The copy screen prices this family through the ordered-token profile, which is
+    #: the family it was already priced under. Its published vocabulary is the band
+    #: table each sibling task prints, in the order it prints it, so a whole row answer
+    #: is one token of a complete ordered list and the registered maps are maps between
+    #: two such lists. Declared rather than assumed, because the bar and the family are
+    #: one registration and a second genre's answers are not this shape.
+    COPY_PROFILE: str = ORDERED_TOKENS
 
     # ----- the instance -----
 

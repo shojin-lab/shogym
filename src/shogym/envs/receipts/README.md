@@ -338,6 +338,31 @@ Every target vocabulary is a published one. A map into the tokens B's drawn key 
 realize would price a transfer nobody can perform, because producing it means already knowing
 what the hidden draw did to B.
 
+### Every generator declares its copy profile
+
+Which value maps the screen enumerates depends on what a task publishes, so a generator
+declares `COPY_PROFILE` and `registry.load_generator` **refuses one that does not**. The
+declared profiles live in `copy_profiles.py`:
+
+| Profile | Value maps | Who declares it |
+|---|---|---|
+| `ordered_tokens` | the registered token dictionaries between two published answer orders, closed under composition | `ledger`, the gate vectors |
+| `soundchange_v1` | the 36 global character maps: every permutation of the three deletable vowels crossed with every permutation of the three replacement phones | `soundchange` |
+
+A generator added later declares one of these or is refused at registration, and a profile
+name this build does not register is refused the same way. The refusal is the point: a family
+whose answers are whole invented words has no complete ordered vocabulary, so pricing it under
+`ordered_tokens` would report the maximum of a transfer nobody can perform, and the bar would
+be read against a number that measured nothing. `answer_ranks` may return `None` for a profile
+that consumes no ranks, and only for such a profile; an empty tuple is not a fictitious
+complete vocabulary, and a family that publishes ranks while declaring a profile that consumes
+none is refused rather than quietly priced by fewer maps.
+
+`soundchange_v1` and its bar are a **new registration**. The number 0.50 is carried over as a
+conservative initial ceiling and inherits none of `ordered_tokens`'s empirical calibration, so
+the combined registration is named `receipts-gates-v3` and a bundle frozen under the earlier
+label does not verify against it.
+
 It reports **two** numbers against two thresholds, because they answer different questions. The
 no-induction best is what an agent gets for reusing A's answers. The flip best is what it gets
 for inducing every axis but one and being wrong about that one, which is a near miss rather

@@ -62,6 +62,7 @@ from shogym.envs.receipts.receipt_ast import (
     SlotSpec,
     envelope_size_for,
 )
+from shogym.envs.receipts.copy_profiles import ORDERED_TOKENS
 from shogym.envs.receipts.protocol import support_of as _support_of
 from shogym.receipts import AXIS_LABEL, ROW_LABEL
 
@@ -103,6 +104,13 @@ class VectorGenerator:
         self.name = name
         self.genre = genre
         self.SCORING: str = ROW_ADDITIVE_EQUAL_WEIGHT
+        # A vector publishes a complete ordered vocabulary: every value its readout can
+        # take over the whole support, which is a finite list it can enumerate. So it
+        # is priced by the ordered-token family, declared here rather than left out,
+        # because a fixture with no declaration would be the one generator the
+        # registration rule does not reach and the rule would hold for everything but
+        # the things the gates are validated on.
+        self.COPY_PROFILE: str = ORDERED_TOKENS
         self.AXES = tuple(axes)
         self._n_rows = n_rows
         self._readout = readout
