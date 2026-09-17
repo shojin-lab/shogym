@@ -941,6 +941,27 @@ def one_attempt(history: Path, wait: float | None = None) -> Iterator[None]:
         os.close(descriptor)
 
 
+def _fsync_directory(path: Path) -> None:
+    """Flush the directory entry for a file that was just written or renamed.
+
+    A file's own fsync says its bytes are on the disk and says nothing about the name
+    that reaches them: the entry the rename made lives in the directory, and a machine
+    that loses power between the two comes back with the bytes and no name. Not every
+    platform lets a directory be opened for this, so a refusal here is not a failure of
+    the write that has already landed.
+    """
+    try:
+        descriptor = os.open(str(path), os.O_RDONLY)
+    except OSError:
+        return
+    try:
+        os.fsync(descriptor)
+    except OSError:
+        pass
+    finally:
+        os.close(descriptor)
+
+
 def _replace_record(path: Path, payload: Mapping[str, Any]) -> None:
     """Put this record in place of the one that is there, in one step or not at all.
 
@@ -968,6 +989,7 @@ def _replace_record(path: Path, payload: Mapping[str, Any]) -> None:
             handle.flush()
             os.fsync(handle.fileno())
         os.replace(handle.name, target)
+        _fsync_directory(target.parent)
     except BaseException:
         Path(handle.name).unlink(missing_ok=True)
         raise
@@ -1049,6 +1071,92 @@ def read_history(path: Path) -> list[dict[str, Any]]:
     return out
 
 
+def position_path(history: Path) -> Path:
+    """Where the position a history has reached is retained, beside the history."""
+    target = Path(history)
+    return target.with_name(target.name + ".position")
+
+
+def read_position(history: Path) -> dict[str, Any] | None:
+    """The position retained beside this history, or nothing when none is.
+
+    A file that is not a position is refused rather than read as an absent one, for the
+    same reason an unreadable history is: the two say different things about what has
+    been recorded.
+    """
+    target = position_path(history)
+    if not target.is_file():
+        return None
+    payload = json.loads(target.read_text(encoding="utf-8"))
+    if (
+        not isinstance(payload, dict)
+        or set(payload) != {"sequence", "digest"}
+        or isinstance(payload["sequence"], bool)
+        or not isinstance(payload["sequence"], int)
+        or not isinstance(payload["digest"], str)
+    ):
+        raise ValueError(
+            f"the position retained beside the key history at {history} is not a "
+            "position: it names a sequence and the digest of the line at it"
+        )
+    return payload
+
+
+def record_position(history: Path, entry: Mapping[str, Any]) -> dict[str, Any]:
+    """Retain how far this history has got, beside it and in one step or not at all."""
+    position = {"sequence": int(entry["sequence"]), "digest": str(entry["digest"])}
+    _replace_record(position_path(history), position)
+    return position
+
+
+def position_problems(path: Path, position: Mapping[str, Any] | None) -> list[str]:
+    """Where a history falls short of a position retained outside it. Empty when it holds.
+
+    EVERY VALID PREFIX OF A CHAIN IS A VALID CHAIN. Each line names the digest of the one
+    before it, so removing lines from the END breaks nothing: the file that is left
+    verifies, and the genre whose last attempt was in the part removed reads as a genre
+    that has attempted nothing. The chain says what its lines are; it cannot say how many
+    there were. That takes a position kept somewhere else, and this is the comparison
+    against one.
+    """
+    if position is None:
+        return []
+    held = read_history(path)
+    sequence = int(position["sequence"])
+    if len(held) <= sequence:
+        return [
+            "the history holds %d line(s) and a position retained outside it records "
+            "line %d, so lines have been removed from the end of it"
+            % (len(held), sequence + 1)
+        ]
+    if str(held[sequence]["digest"]) != str(position["digest"]):
+        return [
+            "line %d of the history is not the line a position retained outside it "
+            "records, so the history was rewritten from there" % (sequence + 1)
+        ]
+    return []
+
+
+def retained_position(path: Path) -> dict[str, Any] | None:
+    """The furthest position a provenance record carries, or nothing when it carries none.
+
+    The record is written in the evidence directory and the history is not, so the two
+    are a second place the position sits. A record made before positions were kept
+    carries none, and this says so rather than defaulting to the start of the chain.
+    """
+    furthest: dict[str, Any] | None = None
+    for attempt in read_provenance(path)["attempts"]:
+        position = attempt.get("position")
+        if not isinstance(position, dict) or set(position) != {"sequence", "digest"}:
+            continue
+        if furthest is None or int(position["sequence"]) > int(furthest["sequence"]):
+            furthest = {
+                "sequence": int(position["sequence"]),
+                "digest": str(position["digest"]),
+            }
+    return furthest
+
+
 def history_problems(path: Path) -> list[str]:
     """Where the history stops being the one that was written. Empty when it holds.
 
@@ -1072,7 +1180,7 @@ def history_problems(path: Path) -> list[str]:
         if _history_digest(entry) != entry["digest"]:
             problems.append(f"line {position + 1} does not hash to the digest it carries")
         previous = str(entry["digest"])
-    return problems
+    return problems + position_problems(path, read_position(path))
 
 
 def append_history(path: Path, entry: Mapping[str, Any]) -> dict[str, Any]:
@@ -1100,8 +1208,16 @@ def append_history(path: Path, entry: Mapping[str, Any]) -> dict[str, Any]:
     made["digest"] = _history_digest(made)
     target = Path(path)
     target.parent.mkdir(parents=True, exist_ok=True)
+    # FLUSHED BEFORE THE CALLER GOES ON. The line is written before construction begins
+    # because the attempt it records is the one that may not finish, and a line sitting
+    # in a buffer when the machine stops is a key that was rolled and not recorded. The
+    # directory is flushed as well, because the entry that reaches the bytes lives there.
     with open(target, "a", encoding="utf-8") as handle:
         handle.write(json.dumps(made, sort_keys=True) + "\n")
+        handle.flush()
+        os.fsync(handle.fileno())
+    _fsync_directory(target.parent)
+    record_position(target, made)
     return made
 
 
@@ -1299,9 +1415,13 @@ def begin_attempt(
         }
     )
     Path(path).parent.mkdir(parents=True, exist_ok=True)
-    _replace_record(path, record)
+    # THE CHAIN FIRST, AND THE SUMMARY AFTER IT. The summary now carries where in the
+    # chain this attempt sits, which is a thing the line has to exist before anything can
+    # say. The order is also the safe one: a process that stops between the two leaves an
+    # attempt in the chain that the record does not mention, and the next invocation
+    # reads the chain.
     if history is not None:
-        append_history(
+        line = append_history(
             history,
             {
                 "sequence": 0,
@@ -1321,6 +1441,10 @@ def begin_attempt(
                 "digest": "",
             },
         )
+        attempts[index]["position"] = {
+            "sequence": line["sequence"], "digest": line["digest"]
+        }
+    _replace_record(path, record)
     return index
 
 
@@ -1346,32 +1470,32 @@ def finish_attempt(
         raise ValueError(f"the provenance record has no attempt {index}")
     attempts[index]["outcome"] = outcome
     attempts[index]["detail"] = str(detail)
-    _replace_record(path, record)
-    if history is None:
-        return
     started = attempts[index]
-    append_history(
-        history,
-        {
-            "sequence": 0,
-            "event": outcome,
-            "attempt": str(started.get("identity", "")),
-            "generator": str(started["generator"]),
-            "commitment": str(started["commitment"]),
-            # The key is on the started line and is not repeated: one line holds it, and a
-            # second copy is a second thing to keep in step with the first.
-            "master": "",
-            "size": int(started["size"]),
-            "note": str(started["note"]),
-            "code": "",
-            "instrument": {},
-            "bounds": {},
-            "banks": "",
-            "detail": str(detail),
-            "previous": "",
-            "digest": "",
-        },
-    )
+    if history is not None:
+        line = append_history(
+            history,
+            {
+                "sequence": 0,
+                "event": outcome,
+                "attempt": str(started.get("identity", "")),
+                "generator": str(started["generator"]),
+                "commitment": str(started["commitment"]),
+                # The key is on the started line and is not repeated: one line holds it,
+                # and a second copy is a second thing to keep in step with the first.
+                "master": "",
+                "size": int(started["size"]),
+                "note": str(started["note"]),
+                "code": "",
+                "instrument": {},
+                "bounds": {},
+                "banks": "",
+                "detail": str(detail),
+                "previous": "",
+                "digest": "",
+            },
+        )
+        started["position"] = {"sequence": line["sequence"], "digest": line["digest"]}
+    _replace_record(path, record)
 
 
 def bank_record(bank: Bank) -> dict[str, Any]:
@@ -1532,6 +1656,11 @@ __all__ = [
     "history_attempts",
     "history_problems",
     "import_record",
+    "position_path",
+    "position_problems",
+    "read_position",
+    "record_position",
+    "retained_position",
     "key_commitment",
     "read_history",
     "read_provenance",

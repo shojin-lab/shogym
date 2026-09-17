@@ -1111,10 +1111,21 @@ Recorded boundaries, held by process rather than by a check:
   nothing in it and both writing themselves into it as a first attempt. Two commands naming two
   different histories are two chains and are not serialized by it.
 
-  That is still not closure. An operator who deletes the file has deleted the file, and a chain
-  that starts from nothing verifies. Closing it takes provenance retained where this process
-  cannot reach it, and publishing the commitment before the bank is built is what the record is
-  shaped for.
+  A line is flushed to the disk, and its directory entry with it, before construction begins,
+  because the attempt it records is the one that may not finish. Every valid prefix of a chain is
+  a valid chain, so removing lines from the END of one breaks nothing the chain itself can see:
+  the file that is left verifies and the genre whose last attempt was in the part removed reads
+  as a genre that has attempted nothing. What says otherwise is a POSITION, the last sequence and
+  the digest of the line at it, retained in two places that are not the history: a file beside it
+  and the record beside the banks. A history shorter than either, or whose line at that sequence
+  is not the one recorded, is refused before construction.
+
+  That is still not closure. An operator who rewrites the history, the position beside it and the
+  record beside the banks has rewritten three files, and an operator who deletes all of them has
+  deleted them; a chain that starts from nothing verifies. What the position adds is that
+  removing lines is no longer a one-file edit that nothing notices. Closing it takes provenance
+  retained where this process cannot reach it, and publishing the commitment before the bank is
+  built is what the record is shaped for.
 
 - **The task text is a stable instance name.** A surface is a pure function of the ordinal, so a
   lineage that remembers a previous link can recognize an instance it has been served before.
