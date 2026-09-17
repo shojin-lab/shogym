@@ -148,6 +148,73 @@ def test_no_task_text_names_an_option() -> None:
             assert option_mentions(GENERATOR.AXES, task.text) == []
 
 
+def test_each_sibling_is_told_which_schedules_share_its_conventions() -> None:
+    """The sentence a sibling carries, word for word, and where it sits.
+
+    A convention is drawn for a pair of schedules, and a reader told nothing about
+    that has no reason to carry to the second what it worked out on the first. So
+    each sibling says it, by what the reader does with the schedules rather than by
+    anything printed on them, and it says nothing about what the conventions are.
+    """
+    for ordinal in ORDINALS:
+        instance = _instance(ordinal)
+        for side, label, other in (("a", "A", "B"), ("b", "B", "A")):
+            task = instance.side(side)
+            mine = ledger.scope_sentence(label)
+            assert _flat([mine]) in _flat([task.text])
+            assert _flat([ledger.scope_sentence(other)]) not in _flat([task.text])
+            # after the holiday list the policy extract ends on, before the schedule
+            assert task.text.index("covered by this schedule are:") < task.text.index(mine)
+            assert task.text.index(mine) < task.text.index("\nSCHEDULE (")
+            # and it names no option of the hidden rule
+            assert option_mentions(GENERATOR.AXES, mine) == []
+    assert ledger.scope_sentence("A") == (
+        "This schedule and the next one you file are scored under the same house\n"
+        "conventions; the pair after that is scored under conventions of its own."
+    )
+    assert ledger.scope_sentence("B") == (
+        "This schedule is scored under the same house conventions as the one you filed\n"
+        "before it."
+    )
+
+
+def test_the_description_gained_that_sentence_and_no_other_public_text() -> None:
+    """Take the sentence back out and the text is the one the task printed before.
+
+    Which is the whole claim: the two siblings' descriptions differ in that sentence
+    and in the surface data they already differed in, and in nothing else.
+    """
+    instance = _instance()
+    bare = ledger.TASK_TEMPLATE.replace("{scope}\n\n", "")
+    assert "{scope}" not in bare
+    for side, label in (("a", "A"), ("b", "B")):
+        task = instance.side(side)
+        dom = task.table.dom
+        before = bare.format(
+            org=dom["org"],
+            title=dom["title"],
+            ref=dom["refdate"].isoformat(),
+            entity=dom["entity"],
+            manual=dom["manual"],
+            table=ledger.band_table(dom),
+            unit=dom["unit"],
+            hol="\n".join(
+                "    %s   %s" % (d.isoformat(), n)
+                for d, n in zip(task.table.holidays, dom["holnames"])
+            ),
+            fmtnote=ledger.FMT_NOTE[dom["fmt"]],
+            body=task.table.body,
+        )
+        sentence = ledger.scope_sentence(label)
+        assert task.text.count(sentence) == 1
+        assert task.text.replace(sentence + "\n\n", "", 1) == before
+
+
+def test_a_sibling_label_the_family_does_not_have_is_refused() -> None:
+    with pytest.raises(ValueError, match="siblings A and B"):
+        ledger.scope_sentence("C")
+
+
 # ----- the envelope -----
 
 
