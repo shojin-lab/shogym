@@ -1123,7 +1123,9 @@ def test_the_review_pack_covers_the_family_and_a_stale_pin_does_not_verify(
     assert ("counterfactual", "alternative convention") in seen
     labelled = [key for category, key in seen
                 if category == "counterfactual" and key.startswith("review counterfactual")]
-    assert len(labelled) == 4
+    # The two rules that were not drawn, over the seven filing classes and both siblings,
+    # and the four mixed filings the worksheets are written against.
+    assert len(labelled) == 2 * len(checks.FILING_CLASSES) * 2 + 4
     paths = {entry["path"] for entry in manifest["renders"]}
     assert all(not path.startswith(components_review.WORKSHEETS) for path in paths)
     assert any(f"-{side}-" in path for path in paths for side in ("a", "b"))
@@ -1304,6 +1306,66 @@ def _screen_payload(model: str = "a model nobody ran here") -> dict[str, object]
         "candidates_screened": 1,
         "selection_note": "",
     }
+
+
+def test_the_pack_shows_every_filing_class_under_every_rule_on_both_siblings(
+    frozen,
+) -> None:
+    """Three rules, seven filing classes, two siblings, through the judged path.
+
+    It fails if a filing class is shown only under the rule this bank drew, if a cell
+    taken under a rule that was not drawn is not labelled a review counterfactual in the
+    manifest, if a counterfactual cell is offered as coverage of a filing class, or if
+    any cell is not the bytes the shared judge builds. A reader who sees the seven
+    classes under one rule has been shown that they behave that way under one rule, and
+    the claim the genre makes is about all three.
+    """
+    from shogym.envs.receipts import components_review
+
+    bank, held, built = frozen
+    assert len(held.instances) == 2
+    first = held.instances[0]
+    drawn = first.convention["contact_kernel"]
+    root = Path(built.root).parent.parent / "pack"
+    manifest = components_review.read_pack(root)
+    entries = {entry["path"]: entry for entry in manifest["renders"]}
+
+    for option in OPTIONS:
+        under = (
+            first if option == drawn
+            else audit.retasked_instance(GENERATOR, first, {"contact_kernel": option})
+        )
+        for shape in checks.FILING_CLASSES:
+            for side in ("a", "b"):
+                task = under.side(side)
+                raw = checks.filing_of(GENERATOR, under, side, shape)
+                canonical = GENERATOR.parse_and_canonicalize(task, raw)
+                judged = judge_cells(
+                    GENERATOR, task, canonical,
+                    {"contact_kernel": option}, under.envelope,
+                )
+                assert not judged.problems
+                for kind, body in judged.payloads.items():
+                    name = (
+                        "renders/filing-%s-%s-%s.txt" % (shape, side, kind)
+                        if option == drawn
+                        else "renders/counterfactual-%s-filing-%s-%s-%s.txt"
+                        % (option, shape, side, kind)
+                    )
+                    assert (root / name).read_bytes() == body
+                    entry = entries[name]
+                    if option == drawn:
+                        assert (entry["category"], entry["key"]) == ("filing", shape)
+                    else:
+                        assert entry["category"] == "counterfactual"
+                        assert option in entry["key"] and shape in entry["key"]
+                        assert side.upper() in entry["key"]
+                        assert entry["key"].startswith("review counterfactual")
+
+    # A counterfactual cell is never offered as coverage of the class it renders.
+    for entry in manifest["renders"]:
+        if entry["category"] == "filing":
+            assert "counterfactual" not in entry["path"]
 
 
 def test_the_screen_procedure_allocates_thirty_six_cases_over_four_states() -> None:
