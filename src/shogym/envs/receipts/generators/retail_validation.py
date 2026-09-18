@@ -741,6 +741,12 @@ def pair_refusal(a_table: RetailTable, b_table: RetailTable) -> str:
 
     Convention free and quantified over the whole support, so acceptance is a
     function of the two schedules alone.
+
+    BOTH COPYING FAMILIES ARE BOUNDS HERE. The shipped closure and the wider
+    all-bijection family are separate registrations at separate bars, and each is
+    asserted under every convention. A pair that cleared one and not the other used to
+    be admitted and reported; a bar that is reported beside a passing check is not a
+    bar, so it is applied where the pair is accepted.
     """
     for table, label in ((a_table, "A"), (b_table, "B")):
         refusal = side_refusal(table, label)
@@ -767,6 +773,13 @@ def pair_refusal(a_table: RetailTable, b_table: RetailTable) -> str:
             return (
                 f"reusing A's answers earns {earned:.4f} on B under one convention, "
                 f"over the registered {MAX_SHIPPED_COPY:.4f}"
+            )
+        wider = bijection_copy_maximum(a_keys[at], b_keys[at])
+        if wider > MAX_BIJECTION_COPY:
+            return (
+                f"relabelling A's answers earns {wider:.4f} on B under one "
+                f"convention, over the {MAX_BIJECTION_COPY:.4f} the wider family is "
+                "qualified at"
             )
     return ""
 
