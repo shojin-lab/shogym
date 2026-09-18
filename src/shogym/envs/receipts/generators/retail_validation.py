@@ -117,6 +117,31 @@ MAX_PAYMENT_ID = 19
 MAX_TYPE = 11
 MAX_CODE = 2
 
+#: The eight joint profiles A's recipe prints, stated here rather than imported, so a
+#: constructor that paired its orientations some other way is a disagreement between
+#: two statements of the recipe and not a table validated against itself. Each entry
+#: is a public kind and the orientation of each class it carries, where True means the
+#: smaller amount prints first and None means the case does not carry that class.
+#:
+#: WHY THE PAIRING IS THE THING. Counting gift orientations and original orientations
+#: separately accepts a mixed case with a smaller-first gift class and a larger-first
+#: original class, as long as another case pays it back, so the recipe's pairing
+#: survives in the two tallies and is gone from the table. The pairing is what it
+#: takes to separate the two selectors: a gift-purchase case reads the same
+#: orientation on both classes and a mixed case without a gift purchase reads opposite
+#: ones, so the first-listed member and one extremum agree on one of them and disagree
+#: on the other.
+A_JOINT_PROFILES: tuple[tuple[str, bool | None, bool | None], ...] = (
+    (GIFTS_ONLY, True, None),
+    (GIFTS_ONLY, False, None),
+    (ORIGINALS_ONLY, None, True),
+    (ORIGINALS_ONLY, None, False),
+    (BOTH_GIFT_PURCHASE, True, True),
+    (BOTH_GIFT_PURCHASE, False, False),
+    (BOTH_NO_GIFT_PURCHASE, True, False),
+    (BOTH_NO_GIFT_PURCHASE, False, True),
+)
+
 NON_GIFT = (CREDIT_CARD, PAYPAL)
 AXIS_NAMES = tuple(axis.name for axis in AXES)
 #: Every permutation of the six codes, as flat indices into a six-by-six match-count
@@ -385,7 +410,8 @@ def body_refusal(cases: Sequence[ParsedCase], label: str) -> str:
 
     Each case on its own, then what only the whole table can say: that no identifier
     repeats across it, that the four public kinds appear the registered number of
-    times, and that the side's amount ordering law holds.
+    times, and that the side's amount ordering law holds, which on A is the eight
+    joint profiles rather than a tally of each class on its own.
     """
     side = label.upper()
     if len(cases) != ROWS:
@@ -415,28 +441,59 @@ def body_refusal(cases: Sequence[ParsedCase], label: str) -> str:
     return _orientation_refusal(cases, side)
 
 
+def _joint_profile(case: ParsedCase) -> tuple[str, bool | None, bool | None] | str:
+    """One A case's public kind and the orientation of each class it carries.
+
+    True means the class prints its smaller amount first, and None means the case does
+    not carry that class. A tie inside a class has no orientation at all, so it comes
+    back as a refusal rather than as a profile.
+    """
+    gifts, originals = _classes(case)
+    marks: list[bool | None] = []
+    for name, members, field in (
+        ("gift", gifts, "balance"), ("original", originals, "contribution")
+    ):
+        if len(members) != A_CLASS_SIZE:
+            marks.append(None)
+            continue
+        first, second = (int(m[field] or 0) for m in members)
+        if first == second:
+            return f"case {case.case_id} prints a tie in its {name} class"
+        marks.append(first < second)
+    return (parsed_kind(case), marks[0], marks[1])
+
+
+def _profile_words(profile: tuple[str, bool | None, bool | None]) -> str:
+    """One joint profile in words, for a refusal a reader can act on."""
+    kind, gift, origin = profile
+    said = [kind]
+    for name, mark in (("gift", gift), ("original", origin)):
+        if mark is not None:
+            said.append(f"{name} {'smaller' if mark else 'larger'} first")
+    return ", ".join(said)
+
+
 def _orientation_refusal(cases: Sequence[ParsedCase], side: str) -> str:
-    """A's two amount orientations per class, and B's median-first ordering."""
+    """A's eight joint profiles, and B's median-first ordering."""
     if side == "A":
-        tallies: dict[tuple[str, str], dict[bool, int]] = {}
+        counted: dict[tuple[str, bool | None, bool | None], int] = {}
         for case in cases:
-            gifts, originals = _classes(case)
-            for name, members, field in (
-                ("gift", gifts, "balance"), ("original", originals, "contribution")
-            ):
-                if len(members) != A_CLASS_SIZE:
-                    continue
-                first, second = (int(m[field] or 0) for m in members)
-                if first == second:
-                    return f"case {case.case_id} prints a tie in its {name} class"
-                tally = tallies.setdefault((parsed_kind(case), name), {})
-                tally[first < second] = tally.get(first < second, 0) + 1
-        for (kind, name), tally in sorted(tallies.items()):
-            if sorted(tally.values()) != [PER_ORIENTATION, PER_ORIENTATION]:
+            profile = _joint_profile(case)
+            if isinstance(profile, str):
+                return profile
+            counted[profile] = counted.get(profile, 0) + 1
+        for profile in sorted(A_JOINT_PROFILES, key=str):
+            if counted.get(profile, 0) != PER_ORIENTATION:
                 return (
-                    f"side A prints {tally} {name} orientations on {kind} cases, not "
-                    f"{PER_ORIENTATION} of each"
+                    f"side A prints {counted.get(profile, 0)} cases of the joint "
+                    f"profile ({_profile_words(profile)}), not {PER_ORIENTATION}"
                 )
+        outside = sorted(set(counted) - set(A_JOINT_PROFILES), key=str)
+        if outside:
+            return (
+                f"side A prints the joint profile ({_profile_words(outside[0])}), "
+                "which the recipe does not pair"
+            )
         return ""
     for case in cases:
         gifts, originals = _classes(case)
@@ -776,7 +833,7 @@ def check_retail_surface(generator, instance: Instance, master: bytes) -> CheckR
 
     It fails if a body does not parse, if a printed field leaves its registered
     bounds, if the class partition, the contribution totals, the purchase flag, the
-    profile counts or the side's class cardinality are not what the schedule
+    joint profiles or the side's class cardinality are not what the schedule
     promises, if any parsed record differs from the stored record in any field or
     position, if any of the 27 keys disagrees with the production scorer on either
     side, if two destinations inside one case normalize alike, if two conventions
@@ -1051,6 +1108,7 @@ def pair_report(generator, instance: Instance) -> dict[str, object]:
 
 __all__ = [
     "AXIS_NAMES",
+    "A_JOINT_PROFILES",
     "MAX_BIJECTION_COPY",
     "MAX_FLIP",
     "MAX_SHIPPED_COPY",
