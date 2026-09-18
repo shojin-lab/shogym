@@ -23,9 +23,10 @@ The two receipt selections cost more than that now, and the reason is in the ins
 rather than in the partition. A family whose receipt reports only the rows a committed mask
 drew is admitted less often and is dearer to admit, and the bundle tests each recompute a
 bank's population, so a job that used to walk admission a hundred and forty times walks it
-more. A later measurement put ``receipt-attacks`` at 650s and the receipt modules of ``rest``
-at about 340s, which keeps the slowest job inside a quarter of an hour without re-cutting the
-selections. The next re-cut should measure all five again rather than trust these.
+more. A later measurement put ``receipt-attacks`` at 601s, ``receipt-serving`` at 451s and the
+receipt modules of ``rest`` at 553s, which keeps the slowest job inside a quarter of an hour
+without re-cutting the selections. The next re-cut should measure all five again rather than
+trust these: ``frontier`` and the rest of ``rest`` were not measured here.
 
 The selections live here rather than in the workflow because two readers need the same answer.
 The workflow asks which paths a shard runs, which assets it needs prepared and whether it carries
