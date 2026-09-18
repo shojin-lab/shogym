@@ -711,6 +711,52 @@ def test_the_bank_band_is_read_over_the_bank_and_not_the_instance() -> None:
     assert not tight.passed
 
 
+def test_the_review_pack_covers_the_selected_and_suppressed_cases() -> None:
+    """A person has to have seen what this receipt does before it is released.
+
+    FAILS IF a pack for a family whose receipt reports only some rows can be verified
+    without a reported pass, a reported failure, a reported omission, a reported legal
+    empty answer, a suppressed failure, a receipt that reports one of the records with
+    no dates and one that reports none, a posterior of one rule, a posterior of several
+    with different held-out keys, the mask commitment beside the three cells, or a pair
+    of conventions whose reduced receipts are identical. It also fails if a family that
+    reports every row is asked for any of them.
+    """
+    from shogym.envs.receipts.review import SAMPLED_CASES, required_coverage, verify
+
+    counts = [24, 24]
+    sampled = required_coverage(_sampled(), checks.FILING_CLASSES, counts)
+    full = required_coverage(soundchange.GENERATOR, checks.FILING_CLASSES, counts)
+    added = [key for kind, key in sampled.required if kind == "sampled"]
+    assert added == list(SAMPLED_CASES)
+    assert len(SAMPLED_CASES) == 11
+    assert not [key for kind, key in full.required if kind == "sampled"]
+    # A pack that shows everything but one of them does not establish the family.
+    seen = [pair for pair in sampled.required if pair != ("sampled", SAMPLED_CASES[4])]
+    missing = sampled.missing(seen)
+    assert missing == ["sampled:" + SAMPLED_CASES[4]]
+    files = {f"renders/{n:03d}.txt": 4000 for n in range(len(sampled.required))}
+    manifest = {
+        "reviewer": "a person",
+        "checklist": ["the suppressed rows say nothing"],
+        "seeds": [0],
+        "family": "ledger",
+        "bank": "a-bank",
+        "renders": [
+            {
+                "category": category,
+                "key": key,
+                "kind": "cell",
+                "path": f"renders/{n:03d}.txt",
+            }
+            for n, (category, key) in enumerate(sampled.required)
+        ],
+    }
+    assert verify(manifest, sampled, 2657, files, "ledger", "a-bank") == []
+    short = dict(manifest, renders=manifest["renders"][:-1])
+    assert verify(short, sampled, 2657, files, "ledger", "a-bank")
+
+
 # ----- the families that keep the full receipt -----
 
 

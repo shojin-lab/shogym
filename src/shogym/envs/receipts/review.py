@@ -23,12 +23,46 @@ import math
 from dataclasses import dataclass
 from typing import Any, Mapping, Sequence
 
-from shogym.envs.receipts.protocol import Generator
+from shogym.envs.receipts.protocol import Generator, policy_of
 
 #: The categories a pack has to cover. Each is enumerated from what the family
 #: declares, so adding an axis or a surface adds a required render rather than
 #: leaving the pack as it was.
-CATEGORIES = ("surface", "option", "filing", "rows", "counterfactual")
+CATEGORIES = ("surface", "option", "filing", "rows", "counterfactual", "sampled")
+
+#: What a pack has to show as well, for a family whose receipt reports only the rows a
+#: committed mask drew. Every one of them is a judgement no mechanical check makes.
+#:
+#: The first five are about the cell: a reader has to see a reported row that passed
+#: and one that failed, a reported row nobody filed and one filed with the legal empty
+#: answer, and a row that failed and was suppressed anyway, which is the one case the
+#: policy exists to create and the one a reader is most likely to mistake for a pass.
+#:
+#: The next two are about the class the mask can miss entirely: a receipt that reports
+#: at least one record with no dates and one that reports none of them. Under this
+#: policy the second happens on nearly half of all masks, and what it leaves is the
+#: whole of one hidden decision.
+#:
+#: The last four are about what the receipt leaves behind. A posterior the receipt pins
+#: to one convention, a posterior holding several that disagree on the sibling's
+#: answers, the mask commitment itself printed beside the three cells so a reader can
+#: check that the reported rows are the drawn ones, and a pair of conventions whose
+#: reduced receipts are byte identical while their sibling keys are not. That last one
+#: is the point of the change rather than a defect in it, so a person is shown it and
+#: told what it costs on the held-out schedule.
+SAMPLED_CASES = (
+    "a reported record that passed",
+    "a reported record that failed",
+    "a reported record nobody filed",
+    "a reported record filed with the legal empty answer",
+    "a failed record the mask did not report",
+    "a receipt reporting a record with no dates",
+    "a receipt reporting no record with no dates",
+    "a posterior holding one convention",
+    "a posterior holding several with different held-out keys",
+    "the mask commitment beside the three cells",
+    "two conventions with identical reduced receipts and their held-out cost",
+)
 
 #: What kind of artifact a render entry is, and the smallest it can plausibly be. A
 #: cell's floor is the family's own envelope size; a task text's is a few hundred
@@ -66,7 +100,15 @@ class Coverage:
 def required_coverage(
     generator: Generator, filing_classes: Sequence[str], row_counts: Sequence[int]
 ) -> Coverage:
-    """Everything a pack for this family has to show, enumerated from its own SHAPE and AXES."""
+    """Everything a pack for this family has to show, enumerated from its own SHAPE and AXES.
+
+    AND FROM ITS DECLARED RECEIPT POLICY. A family whose receipt reports only some of
+    its rows puts a reader in front of a cell that is silent on most of them, and none
+    of the categories above would ever show them a suppressed failure or a posterior
+    with more than one rule left in it. Those are enumerated from the declaration, so a
+    family that adopts the policy gains the renders rather than leaving the pack as it
+    was.
+    """
     required: list[tuple[str, str]] = []
     for surface in generator.surface_templates():
         required.append(("surface", surface))
@@ -78,6 +120,9 @@ def required_coverage(
     for count in sorted(set(int(c) for c in row_counts)):
         required.append(("rows", str(count)))
     required.append(("counterfactual", "alternative convention"))
+    if policy_of(generator).samples:
+        for case in SAMPLED_CASES:
+            required.append(("sampled", case))
     return Coverage(required=tuple(required))
 
 
@@ -212,6 +257,7 @@ __all__ = [
     "MIN_TASK_BYTES",
     "REQUIRED_FIELDS",
     "RENDER_FIELDS",
+    "SAMPLED_CASES",
     "Coverage",
     "identities",
     "identity",
