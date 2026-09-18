@@ -32,6 +32,7 @@ from shogym.envs.receipts.generators import soundchange_audit as audit
 from shogym.envs.receipts.generators.vectors import VECTORS
 from shogym.envs.receipts.protocol import option_mentions
 from shogym.envs.receipts.protocol import (
+    SAMPLED_TWO_OF_TWENTY_FOUR,
     ConstructionExhausted,
     Instance,
     PublicTask,
@@ -40,6 +41,7 @@ from shogym.envs.receipts.protocol import (
     receipt_mask,
 )
 from shogym.envs.receipts.oracle import OracleTemplate
+from shogym.envs.receipts.receipt_law import law_for
 from shogym.envs.receipts.streams import digest
 from shogym.envs.receipts.receipt_ast import (
     ReceiptAST,
@@ -971,6 +973,50 @@ def test_giving_the_readable_axes_away_has_to_leave_something_to_infer() -> None
 
 def _forms(instance: Instance, side: str) -> tuple[str, ...]:
     return tuple(row.proto for row in instance.side(side).table.rows)
+
+
+def _sampled():
+    """The sound change family under the sampled policy.
+
+    A subclass while the family itself still declares the full receipt, and the family
+    once it declares the sampled one. The mask stream is keyed by the generator's NAME,
+    which does not change, so the rows this draws are the rows the family draws.
+    """
+    if soundchange.GENERATOR.RECEIPT_POLICY.samples:
+        return soundchange.GENERATOR
+
+    class SampledSoundChange(soundchange.SoundChangeGenerator):
+        RECEIPT_POLICY = SAMPLED_TWO_OF_TWENTY_FOUR
+
+    return SampledSoundChange()
+
+
+def test_the_readable_axes_are_given_away_on_the_receipt_that_is_served() -> None:
+    """Under a sampled policy the stronger lookup is priced over the mask law too.
+
+    FAILS IF a family whose receipt reports two forms of twenty four is asked only what
+    a reader of all twenty four corrected forms could do. That reader is not the one
+    the family serves, so its numbers are a stress test and the same question has to be
+    put to the receipt that is served: over every mask the registered law can draw,
+    with the reflex and the deleted vowel conceded on top of what the floor already
+    concedes. It also fails if the full-key half stops saying which reader it priced,
+    which would leave two floors in one line with nothing to tell them apart.
+    """
+    generator = _sampled()
+    instance = draw(generator, MASTER, 0)
+    assert len(instance.a.mask) == 2
+    measured = audit.check_phone_lookup(generator, instance)
+    assert measured.passed, measured.detail
+    assert "full key, a stress test under this policy" in measured.detail
+    assert "over all 276 masks" in measured.detail
+
+    found = law_for(generator, instance, "a", given=audit.READABLE_AXES)
+    assert "augmented floor %.6f" % found.augmented in measured.detail
+    assert found.augmented_room > audit.MIN_LOOKUP_ROOM
+
+    full = audit.check_phone_lookup(soundchange.GENERATOR, _drawn(0))
+    if not soundchange.GENERATOR.RECEIPT_POLICY.samples:
+        assert "over all 276 masks" not in full.detail
 
 
 def test_a_sibling_made_by_renaming_inert_consonants_is_refused() -> None:

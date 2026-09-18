@@ -14,3 +14,4 @@ shogym_logs/
 examples/*/runs/
 .evidence-soundchange/
 .evidence-receipt/
+.evidence-counts/

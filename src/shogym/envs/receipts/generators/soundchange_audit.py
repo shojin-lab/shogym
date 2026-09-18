@@ -50,7 +50,8 @@ from shogym.envs.receipts.generators.soundchange import (
     VOWELS,
     SoundTable,
 )
-from shogym.envs.receipts.protocol import Instance
+from shogym.envs.receipts.protocol import Instance, policy_of
+from shogym.envs.receipts.receipt_law import law_for
 from shogym.envs.receipts.receipt_ast import (
     GAP,
     ORDINAL_WIDTH,
@@ -76,6 +77,12 @@ MAX_NO_RECEIPT = 0.25
 #: The lookup floor, the augmented lookup floor, and the room each has to leave.
 MAX_LOOKUP_FLOOR = 0.90
 MIN_LOOKUP_ROOM = 0.05
+#: THE AXES A CORRECTED DAUGHTER FORM HANDS OVER, named here and read by the law.
+#: The three replacement phones never occur in a proto form, so any one of them in a
+#: correction names the reflex outright; and the deleted vowel is the one the daughter
+#: has fewer of than the form it came from. Both are direct subword correspondences
+#: rather than inferences, so the comparator concedes them and asks what is left.
+READABLE_AXES = ("reflex", "loss")
 #: What the character copy family and the skeleton transfer may earn on the sibling.
 MAX_TRANSFER = 0.50
 #: The longest proto form the grammar produces, held here so a drifting grammar is a
@@ -806,9 +813,24 @@ def check_phone_lookup(generator, instance: Instance) -> CheckResult:
     at every reference draw and in both directions. A family that cleared H on room a
     reader can reach by reading two subword correspondences has the room the gate
     measured and not the room the release would describe.
+
+    THE FULL-KEY HALF IS A CONSTRUCTION FACT AND STAYS ONE. It reads the whole support
+    key of one side, which is what a receipt reporting every row prints, so it prices a
+    reader handed all 24 corrected forms. That reader exists under any policy, because
+    the answers are what they are, and the bars above still decide. Under a policy that
+    reports only the rows a mask drew it is no longer a statement about the receipt the
+    family serves, so its line says which reader it priced and the same question is put
+    to the served receipt below.
+
+    THE REDUCED HALF IS THE SAME QUESTION ABOUT WHAT IS SERVED. Over every mask the
+    registered law can draw, with the two readable axes conceded on top of the lookup
+    observations, and against the same two bars. A family that cleared the law-level
+    room bar on room a reader reaches by reading two subword correspondences has not
+    left the room the design measures.
     """
     a_codes = answer_codes(support_keys(_protos(instance.a.table)))
     b_codes = answer_codes(support_keys(_protos(instance.b.table)))
+    samples = policy_of(generator).samples
     lines: list[str] = []
     for name, shown, answers in (
         ("A to B", a_codes, b_codes),
@@ -818,17 +840,18 @@ def check_phone_lookup(generator, instance: Instance) -> CheckResult:
         if measured.worst_augmented > MAX_LOOKUP_FLOOR:
             return CheckResult(
                 "phone_lookup", False,
-                f"{name}: giving the reflex and the deleted vowel away puts the floor at "
-                f"{measured.worst_augmented:.6f}, over the registered "
-                f"{MAX_LOOKUP_FLOOR:.4f}",
+                f"{name}: giving the reflex and the deleted vowel away puts the floor "
+                f"at {measured.worst_augmented:.6f} for a reader of every corrected "
+                f"form, over the registered {MAX_LOOKUP_FLOOR:.4f}",
             )
         room_left = measured.ceiling - measured.worst_augmented
         if room_left <= MIN_LOOKUP_ROOM:
             return CheckResult(
                 "phone_lookup", False,
-                f"{name}: {room_left:.6f} is left above the augmented floor, under the "
-                f"registered {MIN_LOOKUP_ROOM:.4f}, so what the receipt adds is the two "
-                "axes a reader can already read off the phones",
+                f"{name}: {room_left:.6f} is left above the augmented floor for a "
+                f"reader of every corrected form, under the registered "
+                f"{MIN_LOOKUP_ROOM:.4f}, so what it adds is the two axes a reader can "
+                "already read off the phones",
             )
         lines.append(
             "%s ceiling %.6f, augmented floor %.6f to %.6f, room %.6f"
@@ -836,6 +859,30 @@ def check_phone_lookup(generator, instance: Instance) -> CheckResult:
                 name, measured.ceiling, min(measured.augmented),
                 measured.worst_augmented, room_left,
             )
+        )
+    if not samples:
+        return CheckResult("phone_lookup", True, "; ".join(lines))
+    lines = [f"full key, a stress test under this policy: {line}" for line in lines]
+    for name, side in (("A to B", "a"), ("B to A", "b")):
+        found = law_for(generator, instance, side, given=READABLE_AXES)
+        if found.augmented > MAX_LOOKUP_FLOOR:
+            return CheckResult(
+                "phone_lookup", False,
+                f"{name}: over the registered mask law, giving the reflex and the "
+                f"deleted vowel away puts the floor at {found.augmented:.6f}, over the "
+                f"registered {MAX_LOOKUP_FLOOR:.4f}",
+            )
+        if found.augmented_room <= MIN_LOOKUP_ROOM:
+            return CheckResult(
+                "phone_lookup", False,
+                f"{name}: over the registered mask law {found.augmented_room:.6f} is "
+                f"left above the augmented floor, under the registered "
+                f"{MIN_LOOKUP_ROOM:.4f}, so what the reported rows add is the two axes "
+                "a reader can already read off the phones",
+            )
+        lines.append(
+            "%s over all %d masks: ideal %.6f, augmented floor %.6f, room %.6f"
+            % (name, found.masks, found.ideal, found.augmented, found.augmented_room)
         )
     return CheckResult("phone_lookup", True, "; ".join(lines))
 
@@ -972,6 +1019,7 @@ __all__ = [
     "MAX_TRANSFER",
     "MIN_CLUSTER_ROWS",
     "MIN_LOOKUP_ROOM",
+    "READABLE_AXES",
     "MIN_MOVED_ROWS",
     "Room",
     "align",

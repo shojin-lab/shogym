@@ -144,7 +144,20 @@ FULL_RECEIPT = ReceiptPolicy(name="full", shape=EVERY_ROW)
 SAMPLED_FOUR_OF_TWENTY_FOUR = ReceiptPolicy(
     name="sampled-4-of-24", shape=SAMPLED_ROWS, reported=4, rows=24
 )
-REGISTERED_POLICIES = (FULL_RECEIPT, SAMPLED_FOUR_OF_TWENTY_FOUR)
+#: THE COUNT IS PER GENERATOR AND NOT PER SHAPE. How many rows a receipt has to report
+#: before it stops teaching is a property of the family's own tables: ledger's four
+#: records leave an ideal reader at about 0.82, and the same four forms of sound change
+#: leave one at 0.95, because a corrected daughter form exposes the reflex and the lost
+#: vowel directly. So two counts are registered rather than one, each on the arithmetic
+#: its own bank produced, and a family declares the one its arithmetic chose.
+SAMPLED_TWO_OF_TWENTY_FOUR = ReceiptPolicy(
+    name="sampled-2-of-24", shape=SAMPLED_ROWS, reported=2, rows=24
+)
+REGISTERED_POLICIES = (
+    FULL_RECEIPT,
+    SAMPLED_TWO_OF_TWENTY_FOUR,
+    SAMPLED_FOUR_OF_TWENTY_FOUR,
+)
 
 
 def policy_of(generator: "Generator") -> ReceiptPolicy:
@@ -734,6 +747,7 @@ __all__ = [
     "POLICY_SHAPES",
     "REGISTERED_POLICIES",
     "SAMPLED_FOUR_OF_TWENTY_FOUR",
+    "SAMPLED_TWO_OF_TWENTY_FOUR",
     "SAMPLED_ROWS",
     "Axis",
     "ConstructionExhausted",
