@@ -49,6 +49,17 @@ receipt must take at least `REGISTERED_MIN_RATIO` of that room, over at least
 because a diagnostic run may want to see what a family does against another bar: a
 result says whether the bars it was judged against were the registered ones, and a
 caller that deals families requires the registered ones or does not deal.
+
+TWO MORE, AND THEY ASK WHAT THE OTHER THREE CANNOT SEE. The mean executed oracle level
+has to reach `REGISTERED_MIN_ORACLE`, because a low one is as consistent with copies
+that could not carry out a rule they were handed as with a family that leaves nothing
+to carry, and the ratio divides by that room either way. And the graded level has to
+sit at least `REGISTERED_MIN_LEARNING_GAP` below `ideal`, the level a perfect reader of
+the SAME receipts reaches on the held-out task, with the paired interval's lower bound
+above zero. A family already at its receipt's own ceiling passes the first three bars
+emphatically and has nothing left for a later step to read better, which is the whole
+question a chain is run to answer. `ideal` is carried per case from the gate's exact
+computation over the registered mask law, never measured here.
 """
 
 from __future__ import annotations
@@ -73,6 +84,20 @@ REGISTERED_MIN_PAIRS = 36
 #: receipt takes less than a quarter of the room it had is not converting it.
 REGISTERED_MIN_ROOM = 0.05
 REGISTERED_MIN_RATIO = 0.25
+#: Two more registered bars, beside those three and not instead of them.
+#:
+#: THE ORACLE HAS TO BE EXECUTED. The room the ratio is a fraction of is the oracle's,
+#: and a low oracle mean is as consistent with a copy that could not carry out a rule
+#: it was handed as with a family that leaves nothing to carry. A screen that did not
+#: ask would divide by a denominator it could not account for.
+REGISTERED_MIN_ORACLE = 0.90
+#: AND THERE HAS TO BE ROOM ABOVE THE RECEIPT'S OWN CEILING. `ideal` is the level a
+#: perfect reader of THIS receipt reaches on the held-out task, carried per case from
+#: the gate's own computation over the registered mask law. A graded level already at
+#: it is a family where nothing is left to read better: reducing what the receipt says
+#: lowers the score without creating anything for a later step to improve on, which is
+#: the failure this bar exists to catch and the one the other three cannot see.
+REGISTERED_MIN_LEARNING_GAP = 0.10
 
 #: How many candidates a screen may have been selected from and still be DEAL
 #: EVIDENCE. The best of several clears a bar more easily than one does, and nothing
@@ -163,9 +188,9 @@ def _identity(value: object, name: str) -> str:
 
 
 def _pair(row: object) -> "PairRecord":
-    """One pair row, requiring exactly the five fields a pair is."""
+    """One pair row, requiring exactly the fields a pair is."""
     if not isinstance(row, dict):
-        raise ValueError("a pair is a record of five fields")
+        raise ValueError("a pair is a record of six fields")
     if set(row) != set(PAIR_FIELDS):
         raise ValueError(
             "a pair names exactly %s, and this one names %s"
@@ -177,6 +202,7 @@ def _pair(row: object) -> "PairRecord":
         placebo=_score(row["placebo"], "placebo"),
         graded=_score(row["graded"], "graded"),
         oracle=_score(row["oracle"], "oracle"),
+        ideal=_score(row["ideal"], "ideal"),
     )
 
 
@@ -190,7 +216,7 @@ def _score(value: object, name: str) -> float:
 #: What one pair row says, and the whole of it. A field the reader ignores is a field
 #: a stale conclusion travels in, and a reader who finds `passed: true` beside three
 #: scores has no way to know nothing checked it.
-PAIR_FIELDS = ("instance", "filing", "placebo", "graded", "oracle")
+PAIR_FIELDS = ("instance", "filing", "placebo", "graded", "oracle", "ideal")
 
 
 @dataclass(frozen=True)
@@ -207,6 +233,12 @@ class PairRecord:
     placebo: float
     graded: float
     oracle: float
+    #: The level a perfect reader of this case's receipt reaches on the held-out task,
+    #: carried from the gate's computation over the registered mask law rather than
+    #: measured here. It is per case because it is a property of that case's tables and
+    #: the policy, and a screen that averaged one number over a bank would be holding
+    #: every case against a ceiling that is not its own.
+    ideal: float = 1.0
 
 
 @dataclass(frozen=True)
@@ -271,6 +303,7 @@ class ScreenRun:
             placebo=tuple(p.placebo for p in self.pairs),
             graded=tuple(p.graded for p in self.pairs),
             oracle=tuple(p.oracle for p in self.pairs),
+            ideal=tuple(p.ideal for p in self.pairs),
         )
 
     @classmethod
@@ -314,6 +347,8 @@ DECISION_FIELDS = (
     "min_room",
     "min_ratio",
     "min_pairs",
+    "min_oracle",
+    "min_learning_gap",
     "floor",
     "floor_rule",
     "candidates_screened",
@@ -343,6 +378,8 @@ class ScreenRecord:
     min_room: float
     min_ratio: float
     min_pairs: int
+    min_oracle: float
+    min_learning_gap: float
     floor: float
     floor_rule: str
     candidates_screened: int
@@ -360,6 +397,8 @@ class ScreenRecord:
             ("min_room", REGISTERED_MIN_ROOM),
             ("min_ratio", REGISTERED_MIN_RATIO),
             ("min_pairs", REGISTERED_MIN_PAIRS),
+            ("min_oracle", REGISTERED_MIN_ORACLE),
+            ("min_learning_gap", REGISTERED_MIN_LEARNING_GAP),
         ):
             value = getattr(self, name)
             if value != registered:
@@ -395,6 +434,8 @@ class ScreenRecord:
             min_room=self.min_room,
             min_ratio=self.min_ratio,
             min_pairs=self.min_pairs,
+            min_oracle=self.min_oracle,
+            min_learning_gap=self.min_learning_gap,
             candidates_screened=self.candidates_screened,
             selection_note=self.selection_note,
             floor=self.floor,
@@ -440,6 +481,8 @@ class ScreenRecord:
             min_room=_bar(payload["min_room"], "min_room"),
             min_ratio=_bar(payload["min_ratio"], "min_ratio"),
             min_pairs=_whole(payload["min_pairs"], "min_pairs"),
+            min_oracle=_bar(payload["min_oracle"], "min_oracle"),
+            min_learning_gap=_bar(payload["min_learning_gap"], "min_learning_gap"),
             floor=_bar(payload["floor"], "floor"),
             floor_rule=rule,
             candidates_screened=candidates,
@@ -493,6 +536,12 @@ class Outcomes:
     placebo: tuple[float, ...]
     graded: tuple[float, ...]
     oracle: tuple[float, ...]
+    #: Per pair, the level a perfect reader of that case's receipt reaches on the
+    #: held-out task. Not a branch and not measured here: it is carried from the gate's
+    #: computation over the registered mask law. It defaults to one, which is what a
+    #: receipt that identifies the whole rule leaves, so a family that reports every
+    #: row reads as having no gap to close.
+    ideal: tuple[float, ...] = ()
 
     def __post_init__(self) -> None:
         n = len(self.placebo)
@@ -500,11 +549,21 @@ class Outcomes:
             raise ValueError("the screen needs at least one pair")
         if len(self.graded) != n or len(self.oracle) != n:
             raise ValueError("the three branches must carry the same number of pairs")
+        if not self.ideal:
+            object.__setattr__(self, "ideal", (1.0,) * n)
+        if len(self.ideal) != n:
+            raise ValueError(
+                "every pair carries the ideal level of its own receipt, so there are "
+                "as many of them as there are pairs"
+            )
         # A branch score is a component score, and a component score lives in [0, 1].
         # A screen that accepted 2.0 would report a ratio above one and call a family
         # admissible on evidence no run could have produced.
         for branch, values in (
-            ("placebo", self.placebo), ("graded", self.graded), ("oracle", self.oracle)
+            ("placebo", self.placebo),
+            ("graded", self.graded),
+            ("oracle", self.oracle),
+            ("ideal", self.ideal),
         ):
             for value in values:
                 if not math.isfinite(value) or not 0.0 <= value <= 1.0:
@@ -524,6 +583,7 @@ class Outcomes:
             placebo=tuple(float(r["placebo"]) for r in rows),
             graded=tuple(float(r["graded"]) for r in rows),
             oracle=tuple(float(r["oracle"]) for r in rows),
+            ideal=tuple(float(r.get("ideal", 1.0)) for r in rows),
         )
 
 
@@ -554,6 +614,16 @@ class ScreenResult:
     room_pass: bool
     ratio_pass: bool
     verdict: bool
+    #: The two bars beside those three: the mean executed oracle level, and how far the
+    #: graded level sits below the level a perfect reader of the same receipts reaches.
+    oracle: float = 1.0
+    gap: float = 0.0
+    gap_low: float = float("nan")
+    gap_high: float = float("nan")
+    min_oracle: float = REGISTERED_MIN_ORACLE
+    min_learning_gap: float = REGISTERED_MIN_LEARNING_GAP
+    oracle_pass: bool = True
+    gap_pass: bool = True
     reasons: tuple[str, ...] = ()
 
     @property
@@ -563,6 +633,8 @@ class ScreenResult:
             self.min_room == REGISTERED_MIN_ROOM
             and self.min_ratio == REGISTERED_MIN_RATIO
             and self.min_pairs == REGISTERED_MIN_PAIRS
+            and self.min_oracle == REGISTERED_MIN_ORACLE
+            and self.min_learning_gap == REGISTERED_MIN_LEARNING_GAP
         )
 
     def lines(self) -> list[str]:
@@ -575,6 +647,11 @@ class ScreenResult:
             f"GAIN   graded - placebo   {self.gain:8.4f}",
             f"RATIO  gain / room        {self.ratio:8.4f}   (needs {self.min_ratio:.4f}, "
             f"interval {self.ratio_low:.4f} to {self.ratio_high:.4f})",
+            f"ORACLE executed level     {self.oracle:8.4f}   (needs "
+            f"{self.min_oracle:.4f})",
+            f"GAP    ideal - graded     {self.gap:8.4f}   (needs "
+            f"{self.min_learning_gap:.4f}, interval {self.gap_low:.4f} to "
+            f"{self.gap_high:.4f})",
             f"candidates screened       {self.candidates_screened:8d}",
             f"pairs already at ceiling  {self.saturated:8.4f}",
             "",
@@ -587,6 +664,8 @@ class ScreenResult:
             "",
             f"ROOM   {'PASS' if self.room_pass else 'FAIL'}",
             f"RATIO  {'PASS' if self.ratio_pass else 'FAIL'}",
+            f"ORACLE {'PASS' if self.oracle_pass else 'FAIL'}",
+            f"GAP    {'PASS' if self.gap_pass else 'FAIL'}",
             f"VERDICT                {'ADMITTED' if self.verdict else 'REJECTED'}",
             "BARS                   %s"
             % ("registered" if self.registered else "OVERRIDDEN, not the registered set"),
@@ -606,15 +685,18 @@ def canonical_order(outcomes: Outcomes) -> Outcomes:
     to be written in. Sorting the whole triples first removes it: the multiset is the
     input, and a permutation of the file is the same input.
 
-    Whole triples, never the three columns separately, because a pair is one A
-    execution and its three B branches and pulling the columns apart would invent
-    pairings the pilot never ran.
+    Whole rows, never the columns separately, because a pair is one A execution, its
+    three B branches and the ideal level of its own receipt, and pulling the columns
+    apart would invent pairings the pilot never ran.
     """
-    ordered = sorted(zip(outcomes.placebo, outcomes.graded, outcomes.oracle))
+    ordered = sorted(
+        zip(outcomes.placebo, outcomes.graded, outcomes.oracle, outcomes.ideal)
+    )
     return Outcomes(
         placebo=tuple(row[0] for row in ordered),
         graded=tuple(row[1] for row in ordered),
         oracle=tuple(row[2] for row in ordered),
+        ideal=tuple(row[3] for row in ordered),
     )
 
 
@@ -624,6 +706,18 @@ def contrasts(outcomes: Outcomes) -> tuple[np.ndarray, np.ndarray]:
     return (
         np.asarray(outcomes.graded, dtype=float) - placebo,
         np.asarray(outcomes.oracle, dtype=float) - placebo,
+    )
+
+
+def learning_gap(outcomes: Outcomes) -> np.ndarray:
+    """The per-pair gap between the receipt's own ceiling and what was graded.
+
+    PAIRED, because the ideal level is that case's own. A gap taken between two means
+    would be a gap over cases whose receipts leave different amounts, and the interval
+    it carries would be priced on a spread that is mostly the tables.
+    """
+    return np.asarray(outcomes.ideal, dtype=float) - np.asarray(
+        outcomes.graded, dtype=float
     )
 
 
@@ -708,6 +802,8 @@ def screen(
     min_room: float = REGISTERED_MIN_ROOM,
     min_ratio: float = REGISTERED_MIN_RATIO,
     min_pairs: int = REGISTERED_MIN_PAIRS,
+    min_oracle: float = REGISTERED_MIN_ORACLE,
+    min_learning_gap: float = REGISTERED_MIN_LEARNING_GAP,
     candidates_screened: int = 1,
     selection_note: str = "",
     floor: float = 0.0,
@@ -747,7 +843,11 @@ def screen(
     if candidates_screened < 1:
         raise ValueError("a screen was run on at least one candidate")
     for name, value in (
-        ("min_room", min_room), ("min_ratio", min_ratio), ("floor", floor)
+        ("min_room", min_room),
+        ("min_ratio", min_ratio),
+        ("min_oracle", min_oracle),
+        ("min_learning_gap", min_learning_gap),
+        ("floor", floor),
     ):
         if not math.isfinite(value) or not 0.0 <= value <= 1.0:
             raise ValueError(
@@ -756,7 +856,11 @@ def screen(
             )
     # One order for the sample before anything positional touches it, so the verdict
     # is a fact about the observations rather than about how the file was written.
-    x, y = contrasts(canonical_order(outcomes))
+    ordered = canonical_order(outcomes)
+    x, y = contrasts(ordered)
+    gaps = learning_gap(ordered)
+    oracle_level = float(np.asarray(ordered.oracle, dtype=float).mean())
+    gap = float(gaps.mean())
     room = float(y.mean())
     gain = float(x.mean())
     ratio = floored_ratio(gain, room, floor, floor_rule)
@@ -770,6 +874,7 @@ def screen(
 
     room_low, room_high = _interval(y, min_pairs)
     ratio_low, ratio_high = _ratio_interval(x, y, floor, floor_rule, min_pairs)
+    gap_low, gap_high = _interval(gaps, min_pairs)
 
     reasons: list[str] = []
     enough = outcomes.n_pairs >= min_pairs
@@ -806,6 +911,26 @@ def screen(
         reasons.append(
             f"one graded receipt took {ratio:.4f} of the room the oracle had"
         )
+    oracle_pass = at_least(oracle_level, min_oracle)
+    if not oracle_pass:
+        reasons.append(
+            f"the oracle copies reached {oracle_level:.4f} on the held-out task, under "
+            f"the registered {min_oracle:.4f}, so the room the ratio divides by is a "
+            "room this model did not take even when it was told the rule"
+        )
+    gap_certain = bool(math.isfinite(gap_low) and gap_low > 0.0)
+    gap_pass = bool(at_least(gap, min_learning_gap) and gap_certain)
+    if not at_least(gap, min_learning_gap):
+        reasons.append(
+            f"the graded level sits {gap:.4f} below what a perfect reader of the same "
+            f"receipts reaches, under the registered {min_learning_gap:.4f}, so there "
+            "is nothing left for a later step to read better"
+        )
+    elif not gap_certain:
+        reasons.append(
+            f"the gap interval reaches {gap_low:.4f}, so this sample does not "
+            "establish that there is any room above the receipt's own ceiling"
+        )
     if declared and candidates_screened > 1:
         # Not a failure and not an adjustment. Last, so it never crowds a real reason
         # out of the two a bundle prints, and on the result so a reader is told that
@@ -840,7 +965,23 @@ def screen(
         min_ratio=min_ratio,
         room_pass=room_pass,
         ratio_pass=ratio_pass,
-        verdict=bool(room_pass and ratio_pass and enough and certain and declared),
+        oracle=oracle_level,
+        gap=gap,
+        gap_low=gap_low,
+        gap_high=gap_high,
+        min_oracle=min_oracle,
+        min_learning_gap=min_learning_gap,
+        oracle_pass=oracle_pass,
+        gap_pass=gap_pass,
+        verdict=bool(
+            room_pass
+            and ratio_pass
+            and oracle_pass
+            and gap_pass
+            and enough
+            and certain
+            and declared
+        ),
         reasons=tuple(reasons),
     )
 
@@ -851,6 +992,8 @@ __all__ = [
     "DECISION_FIELDS",
     "FLOOR_RULES",
     "PAIR_FIELDS",
+    "REGISTERED_MIN_LEARNING_GAP",
+    "REGISTERED_MIN_ORACLE",
     "REGISTERED_MIN_PAIRS",
     "REGISTERED_MIN_RATIO",
     "REGISTERED_MIN_ROOM",
@@ -866,6 +1009,7 @@ __all__ = [
     "canonical_order",
     "contrasts",
     "floored_ratio",
+    "learning_gap",
     "read_payload",
     "screen",
     "sd_influence",

@@ -8,7 +8,15 @@ because failing one means something different.
                is NOT gate R: it is asked of every axis at its own arity, so a
                binary axis passes at two blocks and is never asked for three. An
                axis nothing on A's receipt responds to is an axis the link cannot
-               teach.
+               teach. Asked of a family whose receipt reports every row.
+  law          the same demand moved from the artifact to the registered law, for a
+               family whose receipt reports only the rows a committed mask drew: for
+               every single-axis alternative, the probability over masks that the
+               receipt shows a row the two disagree on. It reports the expected
+               number of consistent conventions, the singleton probability, the
+               posterior entropy, the no-receipt level, the ideal level and the
+               recomputed lookup floor. The band on the ideal level and the room
+               above the floor are bank quantities and are read where the bank is.
   materiality  every axis is material in B: under the drawn convention, changing
                the option changes B's correct answers on some rows. An axis A
                resolves and B is inert on carries nothing at this link, because the
@@ -72,6 +80,7 @@ from shogym.envs.receipts.protocol import (
     conventions,
     draw,
     option_mentions,
+    policy_of,
     support_of,
 )
 from shogym.envs.receipts.receipt_ast import (
@@ -83,7 +92,12 @@ from shogym.envs.receipts.receipt_ast import (
     slot_ranges,
 )
 from shogym.envs.receipts.oracle import render as oracle_render
-from shogym.envs.receipts.render import frozen_template, judge_cells
+from shogym.envs.receipts.receipt_law import (
+    REGISTERED_MIN_DISTINGUISHING,
+    LawResult,
+    law_for,
+)
+from shogym.envs.receipts.render import feedback_for, frozen_template, judge_cells
 from shogym.envs.receipts.render import oracle_difference
 from shogym.receipts import resolution_blocks
 
@@ -123,6 +137,44 @@ def check_exercise(generator: Generator, instance: Instance) -> CheckResult:
             f"A's receipt does not exercise {', '.join(short)} ({detail})",
         )
     return CheckResult("exercise", True, f"blocks against the bar: {detail}")
+
+
+def check_receipt_law(
+    generator: Generator,
+    instance: Instance,
+    min_distinguishing: float = REGISTERED_MIN_DISTINGUISHING,
+    law: LawResult | None = None,
+) -> CheckResult:
+    """What the registered mask law leaves, for a receipt that reports only some rows.
+
+    THIS REPLACES THE EXERCISE CHECK AND IS NOT A WEAKER FORM OF IT. The exercise check
+    asks what the realized receipt resolved, and under a sampled policy that question
+    has no answer worth gating on: a four-row mask can miss an axis's witnesses
+    entirely and is not redrawn when it does, because a mask redrawn until every hidden
+    decision had a witness would be a mask the convention could be read off. So the
+    demand moves from the artifact to the law, where it is a statement about every mask
+    the policy can draw rather than about the one it drew.
+
+    What it demands is that the receipt speaks to every single-axis alternative: for
+    each one, the probability over masks that some reported row disagrees with it is at
+    least the bar. An alternative the receipt almost never shows a row for is an
+    alternative the link cannot teach, whatever the realized mask happened to do.
+
+    The band on the ideal level and the room above the lookup floor are BANK
+    quantities and are read where the bank is, because one table's ideal level moves
+    with how much its own rows happen to move. Everything the law computes is reported
+    here whichever way the check goes, because the numbers are the point.
+    """
+    found = law if law is not None else law_for(generator, instance, "a")
+    name, weakest = found.weakest
+    if weakest < min_distinguishing:
+        return CheckResult(
+            "law", False,
+            f"the receipt distinguishes {name} with probability {weakest:.4f}, under "
+            f"the registered {min_distinguishing:.4f}, so the link cannot teach that "
+            f"choice; {found.detail()}",
+        )
+    return CheckResult("law", True, found.detail())
 
 
 def axis_materiality(
@@ -241,6 +293,77 @@ def copy_scores(generator: Generator, instance: Instance) -> dict[str, float]:
     }
 
 
+#: The diagnostics a sampled policy adds beside the bar, reported and never barred.
+#: `reduced` is what a reader holding only what the receipt actually showed can earn by
+#: transfer: it keeps the values it filed on A, replaces them on the reported rows with
+#: the corrections it was given, and applies the registered maps to the result.
+#: `selected` is the same transfer from the reported answers alone, with nothing filed
+#: where the receipt said nothing.
+REDUCED_MAPS = ("reduced", "selected")
+
+
+def reduced_copy_scores(generator: Generator, instance: Instance) -> dict[str, float]:
+    """What transfer earns on B from the REDUCED evidence, rather than from A's key.
+
+    The registered copy bar is read against the closure applied to A's whole answer
+    key, which is a conservative full-key transfer stress test: it asks what an agent
+    that somehow held every A answer could earn on B without inducing anything. Under a
+    policy that reports four rows, no agent holds every A answer, so that number is an
+    upper bound rather than a measurement of what this receipt hands over.
+
+    These are the measurement beside it. A reader guesses a convention and files A
+    under it, the receipt corrects it on the rows it reports, and the reader transfers
+    what it then holds through the same closed family of maps. The guesses walked here
+    are the single-axis alternatives to the drawn convention, which is the nearest a
+    guess can be and therefore the most such a reader can hold.
+
+    Reported, never barred. Lowering the registered bar because a reduced receipt hands
+    over less would be moving the bar to fit a candidate.
+    """
+    identifiers = generator.row_identifiers(instance.b.table)
+    width = len(instance.b.key)
+    mask = set(instance.a.mask)
+    truth = list(instance.a.key)
+
+    def score_of(values: Sequence[str]) -> float:
+        raw = "\n".join(f"{i},{v}" for i, v in zip(identifiers, values))
+        canonical = generator.parse_and_canonicalize(instance.b, raw)
+        return generator.score(instance.b, canonical)[0]
+
+    def transfer(values: Sequence[str]) -> float:
+        relabels = copy_profiles.relabellings(generator, instance, list(values), width)
+        return max(
+            (
+                score_of(filing)
+                for relabelled in relabels
+                for filing in _permutations(relabelled, width)
+            ),
+            default=0.0,
+        )
+
+    guesses: list[list[str]] = []
+    for axis in generator.AXES:
+        for option in axis.options:
+            if option == instance.convention[axis.name]:
+                continue
+            alt = dict(instance.convention)
+            alt[axis.name] = option
+            filed = list(generator.key_for(instance.a.table, MappingProxyType(alt)))
+            guesses.append(
+                [
+                    truth[row] if row in mask else filed[row]
+                    for row in range(len(filed))
+                ]
+            )
+    selected_only = [
+        truth[row] if row in mask else "" for row in range(len(truth))
+    ]
+    return {
+        "reduced": max((transfer(guess) for guess in guesses), default=0.0),
+        "selected": transfer(selected_only),
+    }
+
+
 def axis_leverage(generator: Generator, instance: Instance) -> dict[str, float]:
     """Per axis, what getting it right is worth on B against getting it wrong.
 
@@ -331,6 +454,13 @@ def check_copy(
     read against is a number some map in the family actually reaches. Its sub-families
     are printed beside it, because "the rank relabel alone earns this" is a different
     repair from "only relabelling and then permuting earns it". See NO_INDUCTION_MAPS.
+
+    UNDER A SAMPLED POLICY THE BAR IS A FULL-KEY TRANSFER STRESS TEST, and it is said
+    here in those words. Its closure starts from A's whole answer key, which no agent
+    reading a receipt that reports four rows of twenty four ever holds, so the number
+    it reports bounds transfer rather than measuring it. `reduced_copy_scores` is the
+    measurement beside it and is reported, never barred: lowering 0.50 because a
+    reduced receipt hands over less would be moving the bar to fit the candidate.
     """
     scores = copy_scores(generator, instance)
     leverage = axis_leverage(generator, instance)
@@ -339,10 +469,20 @@ def check_copy(
     plain_score = plain.get(best_plain, 0.0)
     flip_score = scores.get("option_flip", 0.0)
     weak = [a for a, value in leverage.items() if value < min_leverage]
+    # The reduced diagnostics are priced for an instance that clears the bar, because
+    # they are what a reader of an ADMITTED family wants beside the number the bar was
+    # read against. An instance the bar already refused is refused whatever they say,
+    # and each one optimizes over the whole closed family a second time.
+    clears = (
+        plain_score <= max_copy_score and flip_score <= max_flip_score and not weak
+    )
+    sampled = policy_of(generator).samples
+    reduced = reduced_copy_scores(generator, instance) if sampled and clears else {}
     detail = (
-        "no-induction best %s at %.4f (bar %.4f, over the closed family); alone: %s; "
-        "one axis wrong scores %.4f (bar %.4f); leverage %s"
+        "%s best %s at %.4f (bar %.4f, over the closed family); alone: %s; "
+        "one axis wrong scores %.4f (bar %.4f); leverage %s%s"
         % (
+            "full-key transfer stress test," if sampled else "no-induction",
             best_plain,
             plain_score,
             max_copy_score,
@@ -350,6 +490,10 @@ def check_copy(
             flip_score,
             max_flip_score,
             ", ".join(f"{a} {v:+.4f}" for a, v in leverage.items()),
+            ""
+            if not sampled or not reduced
+            else "; from the reduced receipt: "
+            + ", ".join(f"{name} {reduced[name]:.4f}" for name in REDUCED_MAPS),
         )
     )
     if plain_score > max_copy_score:
@@ -448,9 +592,11 @@ def check_envelope(
         # bytes when the whole task is retasked under a different rule.
         retasked = Task(
             label=task.label, task_id=task.task_id, surface=task.surface,
-            table=task.table, text=task.text, key=tuple(truth),
+            table=task.table, text=task.text, key=tuple(truth), mask=task.mask,
         )
-        graded_ast = generator.render_receipt(retasked, canonical, truth)
+        graded_ast = generator.render_receipt(
+            retasked, canonical, truth, feedback_for(generator, retasked, envelope)
+        )
         ranges = slot_ranges(graded_ast, envelope)
         graded = serialize(graded_ast, envelope)
         placebo_ast = generator.render_placebo(retasked.public(), canonical, envelope)
@@ -619,7 +765,7 @@ def check_graded(generator: Generator, instance: Instance, side: str = "a") -> C
         truth = tuple(generator.key_for(task.table, convention))
         retasked = Task(
             label=task.label, task_id=task.task_id, surface=task.surface,
-            table=task.table, text=task.text, key=truth,
+            table=task.table, text=task.text, key=truth, mask=task.mask,
         )
         judged = judge_cells(generator, retasked, canonical, convention, envelope)
         if judged.problems:
@@ -665,7 +811,7 @@ def check_placebo(generator: Generator, instance: Instance, side: str = "a") -> 
             truth = tuple(generator.key_for(task.table, convention))
             retasked = Task(
                 label=task.label, task_id=task.task_id, surface=task.surface,
-                table=task.table, text=task.text, key=truth,
+                table=task.table, text=task.text, key=truth, mask=task.mask,
             )
             canonical = generator.parse_and_canonicalize(retasked, raw)
             judged = judge_cells(generator, retasked, canonical, convention, envelope)
@@ -814,6 +960,7 @@ def _with_convention(
             table=task.table,
             text="",
             key=tuple(generator.key_for(task.table, convention)),
+            mask=task.mask,
         )
         out.append(generator.describe(rebuilt.public()))
     return out[0], out[1]
@@ -887,10 +1034,27 @@ def run_checks(
     max_flip_score: float,
     min_leverage: float,
     min_material_rows: int = 1,
+    min_distinguishing: float = REGISTERED_MIN_DISTINGUISHING,
+    law: LawResult | None = None,
 ) -> list[CheckResult]:
-    """Every named check, in the order a reader wants them."""
+    """Every named check, in the order a reader wants them.
+
+    The first one is the receipt's own: what it exercises for a family that reports
+    every row, and what its registered mask law leaves for one that reports some. They
+    are dispatched on the DECLARED policy, like the copying is dispatched on the
+    declared profile, so a family gets the question its instrument can answer rather
+    than the one whoever wrote this module had in mind.
+    """
+    first: tuple[str, Callable[[], CheckResult]] = (
+        (
+            "law",
+            lambda: check_receipt_law(generator, instance, min_distinguishing, law),
+        )
+        if policy_of(generator).samples
+        else ("exercise", lambda: check_exercise(generator, instance))
+    )
     planned: list[tuple[str, Callable[[], CheckResult]]] = [
-        ("exercise", lambda: check_exercise(generator, instance)),
+        first,
         ("materiality", lambda: check_materiality(generator, instance, min_material_rows)),
         ("copy", lambda: check_copy(
             generator, instance, max_copy_score, max_flip_score, min_leverage)),
@@ -914,12 +1078,14 @@ __all__ = [
     "COPY_MAPS",
     "profile_checks",
     "NO_INDUCTION_MAPS",
+    "REDUCED_MAPS",
     "REPORTED_MAPS",
     "UNPRINTABLE_VALUE",
     "CheckResult",
     "axis_leverage",
     "axis_materiality",
     "check_copy",
+    "check_receipt_law",
     "FILING_CLASSES",
     "check_envelope",
     "check_graded",
@@ -934,5 +1100,6 @@ __all__ = [
     "check_materiality",
     "copy_map_filings",
     "copy_scores",
+    "reduced_copy_scores",
     "run_checks",
 ]

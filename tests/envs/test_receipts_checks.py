@@ -30,8 +30,21 @@ def _instance(ordinal: int = 0):
 
 
 def test_every_axis_is_exercised_at_its_own_arity() -> None:
-    """The exercise bar is min(3, arity), so a binary axis is asked for two."""
-    result = checks.check_exercise(GENERATOR, _instance())
+    """The exercise bar is min(3, arity), so a binary axis is asked for two.
+
+    Asked of a family that reports every row, which is the shape the check is about.
+    Where a receipt reports only the rows a committed mask drew, an axis can have no
+    witness among them and is not redrawn until it does, so the demand moves to the
+    registered law and `check_receipt_law` is what runs.
+    """
+    from shogym.envs.receipts.generators.ledger import LedgerGenerator
+    from shogym.envs.receipts.protocol import FULL_RECEIPT
+
+    class FullLedger(LedgerGenerator):
+        RECEIPT_POLICY = FULL_RECEIPT
+
+    every_row = FullLedger()
+    result = checks.check_exercise(every_row, draw(every_row, MASTER, 0))
     assert result.passed, result.detail
     assert "boundary 2 of 2" in result.detail
     assert "anchor 3 of 3" in result.detail
@@ -237,8 +250,7 @@ def test_a_draw_a_composed_token_map_copies_is_excluded() -> None:
     assert scores["closure"] == round(13 / 24, 6)
     assert max(scores[name] for name in checks.REPORTED_MAPS) <= 0.5
     report = admission.report(GENERATOR, instance, MASTER, admission.Thresholds())
-    assert report.gates.verdict  # the copy screen excludes it, not a gate
-    assert report.failed_checks == ("copy",)
+    assert "copy" in report.failed_checks
     assert not report.admitted
 
 
@@ -255,8 +267,7 @@ def test_a_draw_a_composed_row_move_copies_is_excluded() -> None:
     assert scores["closure"] == round(13 / 24, 6)
     assert max(scores[name] for name in checks.REPORTED_MAPS) <= 0.5
     report = admission.report(GENERATOR, instance, MASTER, admission.Thresholds())
-    assert report.gates.verdict  # it is the copy screen that excludes it, not a gate
-    assert report.failed_checks == ("copy",)
+    assert "copy" in report.failed_checks
     assert not report.admitted
 
 
@@ -344,14 +355,23 @@ def test_the_task_texts_are_identical_under_every_convention() -> None:
 
 
 def test_admission_runs_every_gate_and_every_check() -> None:
+    """Eleven named checks, and the first is dispatched on the declared receipt policy.
+
+    A family that reports every row is asked what its receipt exercised; one that
+    reports the rows a committed mask drew is asked what its registered mask law
+    leaves. The other ten are the same questions for both.
+    """
     report = admission.report(GENERATOR, _instance(), MASTER, THRESHOLDS)
     assert report.gates.verdict
     assert [c.name for c in report.checks] == [
-        "exercise", "materiality", "copy", "fixation", "envelope", "graded", "placebo",
+        "law", "materiality", "copy", "fixation", "envelope", "graded", "placebo",
         "neutral", "oracle", "lint", "invariance",
     ]
+    assert report.policy == "sampled-4-of-24"
+    assert report.law is not None
     assert report.admitted
     assert "ADMITTED" in "\n".join(report.lines())
+    assert "RECEIPT POLICY         sampled-4-of-24" in "\n".join(report.lines())
 
 
 def test_a_failing_check_excludes_an_instance_even_when_the_gates_pass() -> None:
@@ -363,7 +383,12 @@ def test_a_failing_check_excludes_an_instance_even_when_the_gates_pass() -> None
 
 
 def test_the_gate_version_is_named_and_excludes_the_count_gate() -> None:
-    assert admission.GATE_VERSION == "receipts-gates-v3"
+    assert admission.GATE_VERSION == "receipts-gates-v4"
+    # And the label a bank stamps is the same one, without importing the gate module
+    # to find it out. Two spellings of the version are two versions.
+    from shogym.envs.receipts import bank as bank_mod
+
+    assert bank_mod.GATE_LABEL == admission.GATE_VERSION
 
 
 def test_the_bars_are_registered_and_overridable() -> None:
@@ -378,6 +403,12 @@ def test_the_bars_are_registered_and_overridable() -> None:
     assert registered.max_copy_score == admission.REGISTERED_MAX_COPY_SCORE == 0.50
     assert registered.max_flip_score == admission.REGISTERED_MAX_FLIP_SCORE == 0.875
     assert registered.min_leverage == admission.REGISTERED_MIN_LEVERAGE == 0.10
+    assert (
+        registered.min_distinguishing
+        == admission.REGISTERED_MIN_DISTINGUISHING
+        == 0.30
+    )
+    assert not admission.Thresholds(min_distinguishing=0.2).settled
     assert not admission.Thresholds(max_copy_score=0.9).registered
     with pytest.raises(ValueError):
         admission.Thresholds(max_copy_score=float("nan"))
@@ -409,6 +440,13 @@ def test_the_registered_bars_fill_a_bank() -> None:
 
 
 def test_every_admitted_instance_clears_every_registered_bar() -> None:
+    """Every bar an admitted instance is judged against, on the ledger's own draws.
+
+    The headroom bar is not among them and the reason is the receipt policy: this
+    family reports the rows a committed mask drew, so its realized headroom is a
+    quantity of that mask and the registered law is what admission reads instead. The
+    law's own bar is here, the distinguishing probability its named check applies.
+    """
     registered = admission.Thresholds()
     admitted = 0
     for ordinal in range(12):
@@ -417,7 +455,8 @@ def test_every_admitted_instance_clears_every_registered_bar() -> None:
         if not report.admitted:
             continue
         admitted += 1
-        assert report.gates.headroom > registered.min_headroom
+        assert report.law is not None
+        assert report.law.weakest[1] >= registered.min_distinguishing
         scores = checks.copy_scores(GENERATOR, instance)
         plain = max(scores[name] for name in checks.NO_INDUCTION_MAPS)
         assert plain <= registered.max_copy_score

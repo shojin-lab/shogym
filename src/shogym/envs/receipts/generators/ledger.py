@@ -59,6 +59,8 @@ from shogym.envs.receipts.protocol import (
     Filing,
     ROW_ADDITIVE_EQUAL_WEIGHT,
     PublicTask,
+    ReceiptPolicy,
+    SAMPLED_FOUR_OF_TWENTY_FOUR,
     RowOutcome,
     Shape,
     Task,
@@ -66,7 +68,7 @@ from shogym.envs.receipts.protocol import (
 from shogym.envs.receipts.oracle import OracleTemplate
 from shogym.envs.receipts.oracle import parse as parse_oracle_cell
 from shogym.envs.receipts.oracle import render as render_oracle_cell
-from shogym.envs.receipts.render import graded_receipt, placebo_receipt
+from shogym.envs.receipts.render import Feedback, graded_receipt, placebo_receipt
 from shogym.receipts import ROW_LABEL
 from shogym.envs.receipts.receipt_ast import (
     Envelope,
@@ -578,7 +580,7 @@ POLICY EXTRACT ({manual}, section 4)
 {hol}
 
 {scope}
-
+{receipt}
 SCHEDULE ({fmtnote})
 
 {body}
@@ -586,6 +588,36 @@ SCHEDULE ({fmtnote})
 File one line per record: the record id, a comma, and the band, with no header and
 no other text. File every record, in the order the records appear above.
 """
+
+#: WHAT THE RECEIPT WILL SAY, SAID BEFORE THE WORK IS DONE.
+#: A receipt that reports four records of twenty four is a receipt whose silence on the
+#: other twenty means nothing, and a reader who was not told that has been handed twenty
+#: rows of apparent evidence that the schedule was filed correctly. So the task says
+#: which of the two it is, in the same words for every arm of a fork and without naming
+#: which records were selected: the selection is drawn before any filing exists and a
+#: reader can see it in the receipt anyway, while a reader who could see it here could
+#: file the rest at random and lose nothing.
+#:
+#: It is one sentence, it is the same bytes under every convention, and it is printed
+#: only under a policy that samples. Under the full receipt the description is the one
+#: it was, to the byte.
+RECEIPT_SENTENCE: tuple[str, ...] = (
+    "The receipt for this schedule reports the verdict and the correct band for four",
+    "selected records only, and the lines for the other records say nothing about",
+    "whether they were right.",
+)
+
+
+def receipt_sentence(policy: ReceiptPolicy) -> str:
+    """The registered sentence for this policy, as the description prints it.
+
+    Empty under the full receipt, which promises a verdict and a correction on every
+    record and therefore has nothing to qualify.
+    """
+    if not policy.samples:
+        return ""
+    return "\n" + "\n".join(RECEIPT_SENTENCE) + "\n"
+
 
 #: WHICH SCHEDULES SHARE A CONVENTION, SAID IN THE TASK ITSELF.
 #: One convention is drawn for a pair of sibling schedules, and a reader that is
@@ -714,6 +746,15 @@ class LedgerGenerator:
     #: two such lists. Declared rather than assumed, because the bar and the family are
     #: one registration and a second genre's answers are not this shape.
     COPY_PROFILE: str = ORDERED_TOKENS
+    #: FOUR RECORDS OF TWENTY FOUR, verdict and correction, and nothing at all on the
+    #: other twenty. A receipt that reports every record identifies the whole convention
+    #: at the first step: a run of 144 triplets graded 0.960 against an oracle of 0.992,
+    #: with 118 of 144 graded copies applying the exact rule, which leaves a later step
+    #: about four hundredths to improve on. What this leaves instead is an ideal reader
+    #: at about 0.82 against a lookup floor of about 0.74, which is room a better way of
+    #: reading the next receipt could fill and which is what the design measures.
+    #: Declared rather than assumed, and refused at registration when it is absent.
+    RECEIPT_POLICY: ReceiptPolicy = SAMPLED_FOUR_OF_TWENTY_FOUR
 
     # ----- the instance -----
 
@@ -863,11 +904,13 @@ class LedgerGenerator:
     # ----- the task text -----
 
     def describe(self, task: PublicTask) -> str:
-        """The schedule, the policy extract, and which schedules share a convention.
+        """The schedule, the policy extract, which schedules share a convention, and
+        what the receipt will report on.
 
         It takes the PUBLIC task, so there is no argument here the drawn rule could
-        arrive through, and the scope sentence is chosen by the sibling label and by
-        nothing else: the same bytes go to every arm of a fork.
+        arrive through. The scope sentence is chosen by the sibling label and the
+        receipt sentence by the declared policy, and by nothing else: the same bytes
+        go to every arm of a fork.
         """
         table: LedgerTable = task.table
         dom = table.dom
@@ -878,27 +921,31 @@ class LedgerGenerator:
             org=dom["org"], title=dom["title"], ref=dom["refdate"].isoformat(),
             entity=dom["entity"], manual=dom["manual"], table=band_table(dom),
             unit=dom["unit"], hol=hol, scope=scope_sentence(task.label),
+            receipt=receipt_sentence(self.RECEIPT_POLICY),
             fmtnote=FMT_NOTE[dom["fmt"]], body=table.body,
         )
 
     # ----- the three cells -----
 
     def render_receipt(
-        self, task: Task, canonical: Filing, truth: Sequence[str]
+        self, task: Task, canonical: Filing, truth: Sequence[str], feedback: Feedback
     ) -> ReceiptAST:
-        """One verdict per record, on what the filing did.
+        """One verdict per reported record, on what the filing did.
 
-        The rows are built by the shared grader from the scorer's own outcomes, so
-        what a row says is not a choice this module gets to make. The receipt names
-        records, never axes, and a correction is that row's own answer rather than a
-        value picked for what a reader could deduce from it.
+        The rows are built by the shared grader from the scorer's own outcomes and the
+        committed feedback, so neither what a row says nor which rows say anything is a
+        choice this module gets to make. The receipt names records, never axes, and a
+        correction is that row's own answer rather than a value picked for what a
+        reader could deduce from it.
         """
         graded = Task(
             label=task.label, task_id=task.task_id, surface=task.surface, table=task.table,
-            text=task.text, key=tuple(truth),
+            text=task.text, key=tuple(truth), mask=task.mask,
         )
         _, outcomes = self.score(graded, canonical)
-        return graded_receipt(task.task_id, outcomes, BLANK_TOKEN, UNFILED_TOKEN)
+        return graded_receipt(
+            task.task_id, outcomes, BLANK_TOKEN, UNFILED_TOKEN, feedback
+        )
 
     def render_placebo(
         self, task: PublicTask, canonical: Filing, envelope: Envelope
@@ -912,7 +959,7 @@ class LedgerGenerator:
         """
         blind = Task(
             label=task.label, task_id=task.task_id, surface=task.surface, table=task.table,
-            text="", key=(),
+            text="", key=(), mask=task.mask,
         )
         _, outcomes = self.score(blind, canonical)
         return placebo_receipt(
@@ -962,6 +1009,7 @@ __all__ = [
     "ORACLE_TEMPLATE",
     "PENDING_TOKEN",
     "POOL_A",
+    "RECEIPT_SENTENCE",
     "POOL_B",
     "SHAPE",
     "SLOTS",
@@ -972,5 +1020,6 @@ __all__ = [
     "daycount",
     "key_for",
     "leverage",
+    "receipt_sentence",
     "scope_sentence",
 ]

@@ -185,8 +185,8 @@ def test_the_description_gained_that_sentence_and_no_other_public_text() -> None
     and in the surface data they already differed in, and in nothing else.
     """
     instance = _instance()
-    bare = ledger.TASK_TEMPLATE.replace("{scope}\n\n", "")
-    assert "{scope}" not in bare
+    bare = ledger.TASK_TEMPLATE.replace("{scope}\n{receipt}\n", "")
+    assert "{scope}" not in bare and "{receipt}" not in bare
     for side, label in (("a", "A"), ("b", "B")):
         task = instance.side(side)
         dom = task.table.dom
@@ -206,8 +206,14 @@ def test_the_description_gained_that_sentence_and_no_other_public_text() -> None
             body=task.table.body,
         )
         sentence = ledger.scope_sentence(label)
+        # The scope sentence and, under a policy that samples, the registered sentence
+        # about what the receipt will report: both are what the description gained, and
+        # the text with both taken out is the text this task printed before either.
+        added = (
+            sentence + "\n" + ledger.receipt_sentence(GENERATOR.RECEIPT_POLICY) + "\n"
+        )
         assert task.text.count(sentence) == 1
-        assert task.text.replace(sentence + "\n\n", "", 1) == before
+        assert task.text.replace(added, "", 1) == before
 
 
 def test_a_sibling_label_the_family_does_not_have_is_refused() -> None:
@@ -231,7 +237,9 @@ def test_graded_and_placebo_differ_only_inside_the_registered_slots() -> None:
         for side in ("a", "b"):
             canonical = _canonical(instance, side)
             task = instance.side(side)
-            graded = GENERATOR.render_receipt(task, canonical, task.key)
+            graded = GENERATOR.render_receipt(
+                task, canonical, task.key, _feedback(instance, task)
+            )
             placebo = GENERATOR.render_placebo(task, canonical, instance.envelope)
             ranges = slot_ranges(graded, instance.envelope)
             first = serialize(graded, instance.envelope)
@@ -255,7 +263,9 @@ def test_no_byte_outside_the_slots_moves_with_the_drawn_convention() -> None:
     for convention in conventions(GENERATOR.AXES):
         key = ledger.key_for(task.table, convention)
         seen_keys.add(key)
-        graded = GENERATOR.render_receipt(task, canonical, key)
+        graded = GENERATOR.render_receipt(
+            task, canonical, key, _feedback(instance, task)
+        )
         payload = serialize(graded, instance.envelope)
         if ranges is None:
             ranges = slot_ranges(graded, instance.envelope)
@@ -304,7 +314,12 @@ def test_a_cell_that_overruns_its_envelope_is_refused() -> None:
     )
     canonical = _canonical(instance, "a")
     with pytest.raises(ValueError, match="registered envelope"):
-        serialize(GENERATOR.render_receipt(instance.a, canonical, instance.a.key), small)
+        serialize(
+            GENERATOR.render_receipt(
+                instance.a, canonical, instance.a.key, _feedback(instance, instance.a)
+            ),
+            small,
+        )
 
 
 def test_a_non_ascii_field_is_refused_rather_than_shifting_every_offset() -> None:
@@ -358,7 +373,10 @@ def test_the_receipt_names_records_and_never_an_axis() -> None:
     instance = _instance()
     canonical = _canonical(instance, "a")
     text = serialize(
-        GENERATOR.render_receipt(instance.a, canonical, instance.a.key), instance.envelope
+        GENERATOR.render_receipt(
+            instance.a, canonical, instance.a.key, _feedback(instance, instance.a)
+        ),
+        instance.envelope,
     ).decode()
     for axis in GENERATOR.AXES:
         assert axis.name not in text
@@ -378,10 +396,15 @@ def test_the_scorer_and_the_receipt_read_the_same_canonical_filing() -> None:
     )
     fork = bank_mod.render_fork(GENERATOR, instance, "a", raw)
     graded = fork.graded.decode()
-    passes = sum(1 for o in fork.outcomes if o.matched)
+    # The receipt reports the rows its committed mask drew, and the verdict on each of
+    # them is the one the scorer recorded for that row. The score is still over every
+    # row: what the policy changes is what is reported, not what is graded.
+    reported = [o for o in fork.outcomes if (o.ordinal - 1) in task.mask]
+    passes = sum(1 for o in reported if o.matched)
     assert graded.count("PASS") == passes
-    assert graded.count("FAIL") == len(fork.outcomes) - passes
-    assert fork.component_score == pytest.approx(passes / len(fork.outcomes))
+    assert graded.count("FAIL") == len(reported) - passes
+    scored = sum(1 for o in fork.outcomes if o.matched)
+    assert fork.component_score == pytest.approx(scored / len(fork.outcomes))
 
 
 # ----- the oracle states the rule and can be read back -----
@@ -573,7 +596,8 @@ def test_the_receipt_tells_an_unfiled_row_from_an_empty_one() -> None:
     raw = f"{identifiers[0]},"  # one row, filed empty; the rest unfiled
     canonical = GENERATOR.parse_and_canonicalize(task, raw)
     text = serialize(
-        GENERATOR.render_receipt(task, canonical, task.key), instance.envelope
+        GENERATOR.render_receipt(task, canonical, task.key, _feedback(instance, task)),
+        instance.envelope,
     ).decode()
     assert ledger.BLANK_TOKEN in text
     assert ledger.UNFILED_TOKEN in text
@@ -584,8 +608,16 @@ def _retasked(task, key):
 
     return Task(
         label=task.label, task_id=task.task_id, surface=task.surface, table=task.table,
-        text=task.text, key=tuple(key),
+        text=task.text, key=tuple(key), mask=task.mask,
     )
+
+
+def _feedback(instance, task):
+    """The commitment the shared judge would hand this task's renderer."""
+    from shogym.envs.receipts.receipt_ast import frozen_envelope
+    from shogym.envs.receipts.render import feedback_for
+
+    return feedback_for(GENERATOR, task, frozen_envelope(instance.envelope))
 
 
 def _raw(instance, side: str) -> str:

@@ -1,0 +1,307 @@
+{
+ "cells": {
+  "soundchange/0/a/canonical": {
+   "graded": "3a3a691f95ab0d349d4a40108d88710021b0ca196c8b565fb085aa41f73e2ec0",
+   "oracle": "304fa7f163577daaa72e5987cf8167a3ecfb1046cd73d7030a225bab20f5f48d",
+   "placebo": "0414204fa01aec2944bce7734c48aa176f82606de2736bd7d1069b94a46e0a67"
+  },
+  "soundchange/0/a/empty": {
+   "graded": "a88da8dde8cec910ef22de1b50dae7af22f041fad88051632d342354a84ca822",
+   "oracle": "304fa7f163577daaa72e5987cf8167a3ecfb1046cd73d7030a225bab20f5f48d",
+   "placebo": "8d65a8901a4a4ed576afe70ba2cb986077801e0f7e37d1fc642c04f0d9d49744"
+  },
+  "soundchange/0/a/half": {
+   "graded": "ae75a21caf752d05550950f3e207174aff587c32264d8526ddcea95cc5a95ebb",
+   "oracle": "304fa7f163577daaa72e5987cf8167a3ecfb1046cd73d7030a225bab20f5f48d",
+   "placebo": "35105f25dcde6840f261077b5cdcd7c871cba8e998b2d0799e59940277b873f2"
+  },
+  "soundchange/0/b/canonical": {
+   "graded": "f4927a933badac16a38b7672b3feea1a9d03db287cc532808e61deaf7247d877",
+   "oracle": "72c34527ea5ab50f33c9d2518cc61162cf84e2454e003c0f4126b2b22ea4dced",
+   "placebo": "669a6f28e76c66671f7fe62da0c1ed0a85e026c7ecc30ddc6c1597a4e9967c65"
+  },
+  "soundchange/0/b/empty": {
+   "graded": "b801ee46811701abe6b0715f42f7d98149320592c092672e7263428bebe8b448",
+   "oracle": "72c34527ea5ab50f33c9d2518cc61162cf84e2454e003c0f4126b2b22ea4dced",
+   "placebo": "4d0bb91e8055e67df4ed3a59aacb137fb2c8051e240be449b04a954d61c3befe"
+  },
+  "soundchange/0/b/half": {
+   "graded": "aaff4e8f9c08f28ff77eaab39b557f5b97b5967e1e0bee6c4cfab83b5a37f9c9",
+   "oracle": "72c34527ea5ab50f33c9d2518cc61162cf84e2454e003c0f4126b2b22ea4dced",
+   "placebo": "72cb9c174ce3f353eb37f2e140fbcc32a3f819c459b2e5fa084b9e17e325a7bc"
+  },
+  "soundchange/0/text": {
+   "a": "f245b9ad50aca3681b9b36a1eee5d14e83c9a1603cbd3f1a75027373aaa36175",
+   "b": "50e42e182fbeebeeebb100a985e5d4ac484e8694cd978464ba9283391acf8cc7"
+  },
+  "soundchange/1/a/canonical": {
+   "graded": "6ea599bf0c645f48e0240a040405dc8853fa0c93d790f2d76a405737b7221e9f",
+   "oracle": "78696e9937bed1446dc0a3d5bc94f2af06990b106747b343e00df8946d7120b4",
+   "placebo": "3bfe6357416b34a93d114a6c9a9530fb9efe1f941b03b28cc0cdc78b861ad350"
+  },
+  "soundchange/1/a/empty": {
+   "graded": "d1977aa63871eb5abc6f0847df76956ce727a2b7f00202d6efde1817f4a87c56",
+   "oracle": "78696e9937bed1446dc0a3d5bc94f2af06990b106747b343e00df8946d7120b4",
+   "placebo": "dfe4acd7d8f4fbd71055909ed886e62098da18443c2e3dae1cbf1827d22bb8d0"
+  },
+  "soundchange/1/a/half": {
+   "graded": "5c4d92514ae2a94b88c4f0b0efd5928ef8cc2a0afe3674408a4aecee17b856e3",
+   "oracle": "78696e9937bed1446dc0a3d5bc94f2af06990b106747b343e00df8946d7120b4",
+   "placebo": "cd4dd49561b80c3fc41cc62640967756d9ea0adb4a1231679151b32140f055f1"
+  },
+  "soundchange/1/b/canonical": {
+   "graded": "baf3c02fd125fffc23727c27ced7d48eb141dfbf111e4f2086def2146d1604c3",
+   "oracle": "8d2c0576636ea428997977b0c70a3830305035136dd3d696183e814a814a6d1d",
+   "placebo": "f995aba59f339f063e0fb527ab9905692c4ff45179cb4dc3cc7787a6f54375cc"
+  },
+  "soundchange/1/b/empty": {
+   "graded": "ed71f1aa9941a5f027cb7acfecf81ef9837b081aa44e11ff315ee92b1321fa27",
+   "oracle": "8d2c0576636ea428997977b0c70a3830305035136dd3d696183e814a814a6d1d",
+   "placebo": "4044f1595a1a4ec3578a7606a3d3b5a58c922aca72a04184bc7c9c8f07d11380"
+  },
+  "soundchange/1/b/half": {
+   "graded": "392086c117ec9cd3090d2e03143ca4abd9fae41344008a028d2f9998556ea99c",
+   "oracle": "8d2c0576636ea428997977b0c70a3830305035136dd3d696183e814a814a6d1d",
+   "placebo": "e3494b4fd537796283db85a36795cdc3268a4218832c0060105a33fe10cbfa97"
+  },
+  "soundchange/1/text": {
+   "a": "1dc03b8c9c43340755eb1a37514971cb998f88380c367150d1f3a85bb67db34c",
+   "b": "7682d47d82b24a09aa225a440f01e304decb25d59da4387aec3679bbb93702f8"
+  }
+ },
+ "checks": {
+  "soundchange/0": {
+   "admitted": true,
+   "checks": [
+    [
+     "exercise",
+     true
+    ],
+    [
+     "materiality",
+     true
+    ],
+    [
+     "copy",
+     true
+    ],
+    [
+     "fixation",
+     true
+    ],
+    [
+     "envelope",
+     true
+    ],
+    [
+     "graded",
+     true
+    ],
+    [
+     "placebo",
+     true
+    ],
+    [
+     "neutral",
+     true
+    ],
+    [
+     "oracle",
+     true
+    ],
+    [
+     "lint",
+     true
+    ],
+    [
+     "invariance",
+     true
+    ],
+    [
+     "cascade",
+     true
+    ],
+    [
+     "phone_lookup",
+     true
+    ],
+    [
+     "analogy",
+     true
+    ]
+   ]
+  }
+ },
+ "gates": {
+  "affine/0": {
+   "blocks": {
+    "slot0": 1,
+    "slot1": 1,
+    "slot2": 1,
+    "slot3": 1
+   },
+   "ceiling": 0.666666667,
+   "floor": 0.444444444,
+   "h_pass": true,
+   "n_evident": 0,
+   "placebo": 0.333333333,
+   "r_pass": false,
+   "s_pass": true,
+   "verdict": false
+  },
+  "binary/0": {
+   "blocks": {
+    "bin": 2
+   },
+   "ceiling": 1.0,
+   "floor": 1.0,
+   "h_pass": false,
+   "n_evident": 2,
+   "placebo": 0.5,
+   "r_pass": false,
+   "s_pass": false,
+   "verdict": false
+  },
+  "copies-1/0": {
+   "blocks": {
+    "ax0": 2,
+    "ax1": 2
+   },
+   "ceiling": 0.5,
+   "floor": 0.5,
+   "h_pass": false,
+   "n_evident": 0,
+   "placebo": 0.25,
+   "r_pass": false,
+   "s_pass": false,
+   "verdict": false
+  },
+  "copies-20/0": {
+   "blocks": {
+    "ax0": 2,
+    "ax1": 2
+   },
+   "ceiling": 0.5,
+   "floor": 0.5,
+   "h_pass": false,
+   "n_evident": 0,
+   "placebo": 0.25,
+   "r_pass": false,
+   "s_pass": false,
+   "verdict": false
+  },
+  "merge/0": {
+   "blocks": {
+    "k": 3
+   },
+   "ceiling": 1.0,
+   "floor": 0.833333333,
+   "h_pass": true,
+   "n_evident": 0,
+   "placebo": 0.666666667,
+   "r_pass": true,
+   "s_pass": true,
+   "verdict": true
+  },
+  "one-row/0": {
+   "blocks": {
+    "k": 2
+   },
+   "ceiling": 0.666666667,
+   "floor": 0.666666667,
+   "h_pass": false,
+   "n_evident": 0,
+   "placebo": 0.333333333,
+   "r_pass": false,
+   "s_pass": false,
+   "verdict": false
+  },
+  "slots-c3/0": {
+   "blocks": {
+    "ax0": 2,
+    "ax1": 2
+   },
+   "ceiling": 0.666666667,
+   "floor": 0.666666667,
+   "h_pass": false,
+   "n_evident": 0,
+   "placebo": 0.333333333,
+   "r_pass": false,
+   "s_pass": false,
+   "verdict": false
+  },
+  "slots-c4/0": {
+   "blocks": {
+    "ax0": 2,
+    "ax1": 2
+   },
+   "ceiling": 0.5,
+   "floor": 0.5,
+   "h_pass": false,
+   "n_evident": 0,
+   "placebo": 0.25,
+   "r_pass": false,
+   "s_pass": false,
+   "verdict": false
+  },
+  "slots-c6/0": {
+   "blocks": {
+    "ax0": 2,
+    "ax1": 2
+   },
+   "ceiling": 0.333333333,
+   "floor": 0.333333333,
+   "h_pass": false,
+   "n_evident": 0,
+   "placebo": 0.166666667,
+   "r_pass": false,
+   "s_pass": false,
+   "verdict": false
+  },
+  "soundchange/0": {
+   "blocks": {
+    "environment": 2,
+    "loss": 3,
+    "reflex": 3,
+    "sequence": 2
+   },
+   "ceiling": 1.0,
+   "floor": 0.228009259,
+   "h_pass": true,
+   "n_evident": 0,
+   "placebo": 0.150462963,
+   "r_pass": true,
+   "s_pass": true,
+   "verdict": true
+  },
+  "soundchange/1": {
+   "blocks": {
+    "environment": 2,
+    "loss": 3,
+    "reflex": 3,
+    "sequence": 2
+   },
+   "ceiling": 1.0,
+   "floor": 0.333333333,
+   "h_pass": true,
+   "n_evident": 0,
+   "placebo": 0.146990741,
+   "r_pass": true,
+   "s_pass": true,
+   "verdict": true
+  }
+ },
+ "printed": {
+  "affine/0": "5cfd202c33b178f316d61561195ae5626d6a3c1f9cfd8d1b435f9fd8e7ac78c2",
+  "binary/0": "0ff6e5b1660ff625377d24a20590ebd485bd4b0bade65964658e0fa7bc373932",
+  "copies-1/0": "107c6658f71c2f209dc8e826fed6e57ff39d2b3a5c5c78f4adb87ef87267aac2",
+  "copies-20/0": "3a3dcc61fd4ddcdd2ac0788598453966a9ba69fa33473089964059219624d69c",
+  "merge/0": "429710957346e0dd0711e265c90bb4b6220907bce4a9c0c7e0f279d843094375",
+  "one-row/0": "8704b942f36286316082f675f354335e4af6da99fad3acbb06a78d95f4876837",
+  "slots-c3/0": "b343db054d78801f9d4a5cb1599920fd5f86b19552cb3a000a65b739f25f1908",
+  "slots-c4/0": "8595bd169750f5c6fe412753a250db4e84b133f7582887a74d75794d6b69be3e",
+  "slots-c6/0": "965579e39817db0272d5bfdb95118d727b66a5fd6c297fbdf9b4a2ee86115173",
+  "soundchange/0": "cc6e434e6ae3e0259ded0e6cee843c9b4b7b9dea9d082bbaaf8b1551a9ecde1b",
+  "soundchange/1": "43dc862d9ec43a2e3be58b3137b6251f377f903c23530397ab28197cee450670"
+ }
+}

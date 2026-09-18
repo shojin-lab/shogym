@@ -215,6 +215,19 @@ class Observation:
     #: is a self-interpretation whatever it is spelled as.
     slot_grammar: Mapping[str, frozenset[str]] = field(default_factory=dict)
     slot_realized: Mapping[str, frozenset[str]] = field(default_factory=dict)
+    #: The same two, per printed position, for a receipt whose policy reports only
+    #: some of its rows. At a reported position a slot may print what its registered
+    #: grammar allows; at a suppressed one it may print that position's committed
+    #: neutral token and nothing else. The family-wide sets above are the union over
+    #: positions, so a value legal somewhere is not thereby legal everywhere, and a
+    #: receipt that printed a neutral token where it owed a verdict is a violation
+    #: even though every value it printed appears in the union.
+    slot_row_grammar: Mapping[str, tuple[frozenset[str], ...]] = field(
+        default_factory=dict
+    )
+    slot_row_realized: Mapping[str, tuple[frozenset[str], ...]] = field(
+        default_factory=dict
+    )
     #: Every value the scorer can produce as a correct answer on the graded task,
     #: over the whole convention space. A receipt is entitled to print these: they
     #: are what it is grading. Anything else it prints is there to be interpreted.
@@ -472,6 +485,12 @@ def grammar_violations(obs: Observation) -> list[str]:
     not catch one that says `2100`, and a four-digit code is a complete statement of
     the rule to a child that has seen two of them. The defence is not a longer list
     of forbidden words: it is a closed list of permitted ones.
+
+    THE LIST IS PER POSITION WHERE THE POLICY IS. A receipt that reports only the rows
+    a committed mask drew prints that position's committed neutral token at every
+    other one, and those tokens are legal there and nowhere else. Reading one closed
+    list for the whole slot would license a neutral-looking code on a row the receipt
+    owed a verdict on, which is exactly the numeric rule statement this refuses.
     """
     out: list[str] = []
     for name, realized in sorted(obs.slot_realized.items()):
@@ -479,7 +498,19 @@ def grammar_violations(obs: Observation) -> list[str]:
         if allowed is None:
             out.append(f"{name!r} prints values under no registered grammar")
             continue
-        stray = sorted(v for v in realized if v not in allowed)
+        by_row = obs.slot_row_grammar.get(name)
+        seen_by_row = obs.slot_row_realized.get(name)
+        if by_row is not None and seen_by_row is not None:
+            stray = sorted(
+                {
+                    value
+                    for licensed, seen in zip(by_row, seen_by_row)
+                    for value in seen
+                    if value not in licensed
+                }
+            )
+        else:
+            stray = sorted(v for v in realized if v not in allowed)
         if stray:
             shown = ", ".join(repr(v) for v in stray[:4])
             more = "" if len(stray) <= 4 else f" and {len(stray) - 4} more"
@@ -524,6 +555,9 @@ class GateResult:
     r_axes: list[str]
     s_pass: bool
     s_structural: str
+    #: How many printed rows carry an axis label. Kept beside the sentence that
+    #: describes them because it is what `s_form_pass` reads.
+    s_axis_labelled: int
     s_label_resolution_equal: bool
     s_leaks: list[str]
     s_order_moves: bool
@@ -536,6 +570,21 @@ class GateResult:
     @property
     def headroom(self) -> float:
         return self.ceiling - self.floor
+
+    @property
+    def s_form_pass(self) -> bool:
+        """S apart from its information-equality part: what the receipt PRINTS.
+
+        Three of S's checks are about the printed form and one is about what the
+        printed rows resolve. No row is labelled by axis, the bytes leak no axis name
+        or option token and every slot prints what its registered grammar allows, and
+        the printed order does not move with the convention. All three are properties
+        of the instrument: a receipt that fails one of them prints its own
+        interpretation whichever rows it happens to report. The fourth, that the
+        evident rows alone already reach the whole receipt's resolution, is a
+        statement about the rows in front of it, which is why it is separated here.
+        """
+        return not self.s_axis_labelled and not self.s_leaks and not self.s_order_moves
 
     def lines(self) -> list[str]:
         width = max((len(a) for a in self.arity), default=6) + 4
@@ -714,6 +763,7 @@ def gate(
         r_axes=r_axes,
         s_pass=s_pass,
         s_structural=s_structural,
+        s_axis_labelled=n_axis_labelled,
         s_label_resolution_equal=s_equal,
         s_leaks=leaks,
         s_order_moves=order_moves,

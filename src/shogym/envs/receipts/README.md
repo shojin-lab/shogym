@@ -88,6 +88,12 @@ committed filler stream.
 - **graded** and **placebo** are structurally congruent. Identical wrapper, identifiers,
   order, offsets, whitespace, column headers and padding. They differ **only** inside
   registered fixed-width slots: `verdict` (4 bytes) and `correction` (12 bytes).
+- And on some rows they do not differ at all. A family declares a **receipt policy**, and
+  under one that samples the graded cell reports a verdict and a same-row correction on
+  only the rows a committed mask drew. Every other row carries that position's committed
+  neutral tokens in both slots, which is exactly what the placebo carries there, so
+  outside the drawn rows the two cells are identical inside the slots as well as outside
+  them.
 - The placebo fills those slots with neutral tokens from the family's registered filler
   alphabet, drawn by the committed stream and fixed before launch. No character of that
   alphabet appears in a verdict token or a band. A placebo may not group, reorder, highlight,
@@ -106,6 +112,48 @@ The envelope check runs at the moment the cells are made and refuses to persist 
 fails it. It caught a real break during development: graded and placebo were carrying
 different column headers.
 
+## The receipt policy: which rows a receipt reports
+
+A generator declares `RECEIPT_POLICY`, and `registry.load_generator` refuses one that does
+not, the way it refuses one that declares no copy profile. Two policies are registered.
+
+| Policy | What the graded cell carries |
+|---|---|
+| `full` | a verdict and that row's own answer on **every** printed row |
+| `sampled-4-of-24` | a verdict and that row's own answer on the **four** rows a committed mask drew, and that position's committed neutral tokens in both slots on the other twenty |
+
+**Ledger declares the sampled policy. Sound change and every gate vector declare the full
+one**, and keep it until their own arithmetic under a sampled policy has been done: four
+fully reported rows leave an ideal reader at 0.96 on sound change and 0.98 on components,
+because a corrected daughter form exposes the replacement phone and the lost vowel
+directly and because one ternary axis is identified by verdicts alone. Ledger's count does
+not carry to them.
+
+**The mask is drawn before any filing and independently of the drawn convention**, from a
+fifth committed stream keyed by the generator, the ordinal and the sibling label. It joins
+the instance commitment beside both answer keys, so a re-render after a crash reports the
+same records, and it reaches the renderer as an immutable `render.Feedback` the shared
+judge builds from the frozen envelope before any family callback runs. A cell that reports
+a row the mask did not draw, or goes quiet on one it did, is refused by name.
+
+**A mask that happens to omit an axis is not redrawn.** What is registered is the law, not
+the realized receipt: a mask redrawn until every hidden decision had a witness would be a
+mask the convention could be read off, and the arithmetic the gate does averages over the
+uniform law rather than over a filtered one.
+
+**The task says so.** Under a policy that samples, the ledger description carries one
+registered sentence, after the scope sentence and before the schedule:
+
+```
+The receipt for this schedule reports the verdict and the correct band for four
+selected records only, and the lines for the other records say nothing about
+whether they were right.
+```
+
+The same bytes in every arm and under every convention, and it names no record: the
+selection is drawn before any filing exists, a reader can see it in the receipt anyway,
+and a reader who could see it in the task could file the rest at random and lose nothing.
+
 ## Rendering order: what exists when
 
 The graded and placebo cells depend on the agent's A filing, which does not exist until the
@@ -113,7 +161,8 @@ agent files. Nothing here pretends otherwise.
 
 - **Before launch**, materialized and hashed: every instance (both surfaces, both task texts),
   the convention commitments, the envelope template with its registered slots, the committed
-  filler stream, and the renderer configuration.
+  filler stream, the receipt policy with each side's drawn mask, and the renderer
+  configuration.
 - **After A seals**, in one act: the parser canonicalizes the filing, the three cells are
   rendered, they are judged, and the blobs are hashed. That is `bank.render_fork`, and it is
   the only place the three cells are made. Every retry replays those blobs; nothing rerenders,
@@ -246,9 +295,9 @@ for whoever runs it:
 5. Record O, P and G by initial state as well as pooled, with rule-reading mistakes, execution
    mistakes, omitted rows, tool failures, context use, time and tokens.
 6. Judge it against the registered bars: `min_room=0.05`, `min_ratio=0.25`, `min_pairs=36`,
-   `floor=0.0`, `floor_rule="drop"`, `candidates_screened=1`. **Beside them**, as a predeclared
-   roster-release condition and not a `screen.json` field: **mean executed oracle grade at least
-   0.90**.
+   `min_oracle=0.90`, `min_learning_gap=0.10`, `floor=0.0`, `floor_rule="drop"`,
+   `candidates_screened=1`. The last two of those used to be a roster-release condition beside
+   the record; they are fields of it now, and a bundle re-verifies against them.
 
 A pooled mean can conceal a state-specific uptake failure, which is why the by-state report is
 part of the procedure rather than an extra. A solved reference implementation proves
@@ -333,7 +382,7 @@ score, and none carries anything that moves with the draw.
   fork. `finalize_error` means the terminal transaction failed; on its own it implies neither
   "no fork" nor "`grade_error` is present".
 
-## The gates: `receipts-gates-v3`
+## The gates: `receipts-gates-v4`
 
 Three questions, all answered controller-side at zero execution cost, per instance, from the
 **serialized bytes** of the receipt the renderer actually produced. Not from the structure
@@ -346,7 +395,9 @@ nonzero on a fail.
   option produces a rendered receipt; options whose receipts print the same thing are options
   the agent can never tell apart. An instance fails when every axis of three or more options
   sits at two blocks or fewer. Binary axes are outside R: two blocks is full resolution for
-  them. The siblinghood exercise check covers them at their own arity.
+  them. The siblinghood exercise check covers them at their own arity, where the family
+  reports every row; where it reports only the rows a committed mask drew, the `law` check
+  covers them over the registered mask law instead.
 - **S, non-self-interpretation.** Five exact checks, on the declared labels **and** on the
   serialized bytes: no row is labelled by axis; the evident rows alone do not already reach
   the whole receipt's resolution; the bytes print no axis name and no option token that is not
@@ -376,18 +427,36 @@ exactly one axis and prints a distinct thing for every option of it: such a row 
 and reading the option off it costs no induction. The derivation is deliberately generous, so
 the floor is high and the gate under-reports headroom rather than over-reporting it.
 
+**Which of the three decide depends on what the receipt reports.** For a family that
+reports every row, all three: there is one receipt and no other it could have served. For a
+family that reports the rows a committed mask drew, what decides is S's printed form, which
+is no row labelled by axis, no vocabulary or grammar leak in the bytes, and a printed order
+that does not move with the convention. R, H and S's information equality are quantities of
+the realized mask. A mask that happens to omit an axis leaves R short and one that happens to
+draw the evident rows leaves no headroom, and such a mask is not redrawn: refusing the
+instance instead is the same filter by another route, and the masks the bank would then hold
+are the masks that happened to be rich. What replaces them is the registered law, read in two
+places, the distinguishing bar in the `law` check and the band over the bank. Every realized
+number is still computed and printed, and `shogym receipts gate` says so under the report.
+
 The gate set is named because it is chain-specific: it implements R, S and H from the
 instrument and deliberately excludes the instrument's later count gate, whose channel is a
 paid mechanism here rather than a defect. Nothing claims the instrument's own verdict.
 
-The name is at **v3** because the copy bar is now read against whichever registered family a
-generator declares, and because a declared profile can bring further checks with it. The
-numbers are the numbers they were; the rule they are read against is not, which is what a named
-version exists to keep apart. A family admitted under an earlier label does not publish under
-this one, and a bundle frozen under an earlier label does not verify. The renderer
-configuration is at `receipts-render-v2` for the same kind of reason: a second genre registers a
-wider correction slot and a larger envelope, and the widths a cell is built at are part of how
-it is built.
+The name is at **v4** because what a receipt reports is now a registration of its own: a family
+says which of its rows carry a verdict and a correction, and for one that reports only some of
+them the demand that every axis is exercised by the realized receipt is replaced by a demand on
+the registered mask law. v3 was the copy bar being read against whichever registered family a
+generator declares, with the further checks a declared profile brings. The numbers are the
+numbers they were; the rule they are read against is not, which is what a named version exists
+to keep apart. A family admitted under an earlier label does not publish under this one, and a
+bundle frozen under an earlier label does not verify. The renderer configuration is at
+`receipts-render-v3` for the same kind of reason: which rows a cell reports is part of how it is
+built, as the second genre's wider correction slot and larger envelope were before it.
+
+The **policy identity** is separate and is the policy's own name, recorded in every instance
+the bank commits. A gate version says which rule judged a family; a policy name says which
+instrument it judged, and the two move independently.
 
 ### The vectors
 
@@ -411,7 +480,8 @@ generator's declared copy profile brings with it.
 
 | Check | What it asks |
 |---|---|
-| `exercise` | every axis exercised in A's receipt at `min(3, arity)` blocks |
+| `exercise` | every axis exercised in A's receipt at `min(3, arity)` blocks. Asked of a family that reports **every** row |
+| `law` | for a family whose receipt reports only the rows a committed mask drew: over every mask the policy can draw, the probability that the receipt distinguishes each single-axis alternative is at least `0.30`. It reports the expected number of consistent conventions, the singleton probability, the posterior entropy, the no-receipt level, the ideal graded level and the recomputed lookup floor |
 | `materiality` | every axis moves B's answers under the drawn convention |
 | `copy` | what transfer earns on B, and what a near miss earns |
 | `fixation` | the instance rebuilds byte-identically, so every branch of a fork gets one B |
@@ -479,8 +549,8 @@ none is refused rather than quietly priced by fewer maps.
 
 `soundchange_v1` and its bar are a **new registration**. The number 0.50 is carried over as a
 conservative initial ceiling and inherits none of `ordered_tokens`'s empirical calibration, so
-the combined registration is named `receipts-gates-v3` and a bundle frozen under the earlier
-label does not verify against it.
+the combined registration was named `receipts-gates-v3`, and the receipt policy has taken it to
+`receipts-gates-v4`; a bundle frozen under an earlier label does not verify against it.
 
 It reports **two** numbers against two thresholds, because they answer different questions. The
 no-induction best is what an agent gets for reusing A's answers. The flip best is what it gets
@@ -508,18 +578,52 @@ transfer family at most `0.50`, one axis wrong at most `0.875`, per-axis leverag
 `0.10`. They are the defaults and
 `materialize` takes no flag to move them, because which rule filled a bank is the whole of
 what the bank means. `check` can be pointed at other bars for diagnosis; what it prints is a
-diagnosis, and a bundle carries the registered seven exactly or does not verify.
+diagnosis, and a bundle carries the registered eight exactly or does not verify.
 
 They sit where the ledger's own distribution makes them bite without emptying the bank. Its
 one-axis-wrong score is never below five sixths, so a flip bar under that admits nothing;
 `0.875` rejects the worst draws and keeps the rest. Its weakest axis leverage never exceeds
 one sixth, so a leverage bar above that admits nothing; `0.10` leaves room under the ceiling.
 
-R's arity and block constants are the settled rule rather than dials. `gate` will run with
-them moved, for diagnosis, but it renames its output `receipts-gates-custom`.
+R's arity and block constants are the settled rule rather than dials, and so is the law
+check's distinguishing bar of `0.30`. `gate` will run with them moved, for diagnosis, but it
+renames its output `receipts-gates-custom`.
 
-The room screen is registered too: **`min_room = 0.05`** with the bootstrap interval's lower
-bound above zero, **`min_ratio = 0.25`**, over **36 distinct tasks**. A pair is one execution of
+**The law's own bars are read where the bank is.** For a family whose receipt reports only
+some rows, the bank-mean ideal graded level has to sit in **`0.75` to `0.90`** and the
+bank-mean room above the recomputed lookup floor has to be **above `0.05`**. They are bank
+quantities rather than per-instance ones because one table's ideal level moves with how much
+its own rows happen to move, and reading the band at each instance would refuse tables for
+sitting at the edge of the distribution the band was computed as the centre of. A bank whose
+mean sits outside the band is not filled. A bank of ONE instance reads the band at that
+instance, which is why nothing here freezes one: ledger's own rooms run from about `0.048` to
+`0.093` around a mean well clear of the bar.
+
+**The recomputed floor is the consultation's construction**, and the two agree to nine
+places: the evident rows the reduced receipt shows, plus one all-matched bit per dependence
+class among the rest, the class of empty local dependence included, averaged over every
+canonical reference convention. That class belongs in it because local dependence is derived
+one axis at a time, so a row it finds empty is a row no single-axis alternative moves and a
+joint alternative can still move it. The six run 5 table pairs give `0.753568219`,
+`0.733884414`, `0.751611431`, `0.734439942`, `0.708373223` and `0.767741008`, mean
+`0.741603040`, against an ideal level of `0.817285062`.
+
+The `0.30` is the sampling law's own arithmetic: ledger's weakest registered movement is two
+rows, and a four-row mask misses both with probability `choose(22,4)/choose(24,4)`, so such an
+alternative is distinguished with probability `0.3116`. The `0.75` to `0.90` band is a design
+choice: above it the receipt identifies too much for a later step to improve on, which is the
+saturation the sampled policy exists to undo.
+
+The room screen is registered too, and it has five bars rather than three:
+**`min_room = 0.05`** with the bootstrap interval's lower bound above zero,
+**`min_ratio = 0.25`**, over **36 distinct tasks**, plus a mean executed oracle level of at
+least **`min_oracle = 0.90`** and a graded level at least **`min_learning_gap = 0.10`** below
+the level a perfect reader of the same receipts reaches, with that paired interval's lower
+bound above zero. That level rides on each pair row as `ideal`, carried from the gate's exact
+computation over the registered mask law rather than measured in the pilot. A low oracle level
+is as consistent with copies that could not carry out a rule they were handed as with a family
+that leaves nothing to carry, and a family already at its receipt's own ceiling clears the
+first three bars emphatically while having nothing left for a later step to read better. A pair is one execution of
 A and three of B, so that is 36 A executions and 108 B executions, the costing a cheap
 generated family was planned against. Verification
 recomputes room, gain, ratio and the interval from the raw rows and compares them with those
@@ -604,7 +708,9 @@ eligibility operation, and production, the roster and `shogym receipts verify` a
   against the rebuilt canonical record, its commitment against the rebuilt convention;
 - the **screen** is rerun on its own rows and the recomputed room, ratio and interval are
   compared with the REGISTERED bars: `min_room = 0.05` with the bootstrap interval's lower
-  bound above zero, `min_ratio = 0.25`, and 36 distinct tasks. A bundle carries those bars
+  bound above zero, `min_ratio = 0.25`, 36 distinct tasks, a mean oracle level of at least
+  `0.90`, and a graded level at least `0.10` below the receipts' own ideal with that interval
+  above zero. A bundle carries those bars
   exactly, the way it carries the gate thresholds. A diagnostic run may still ask what a
   family does against another bar, and `screen` prints which bars it used, but recording that
   a bar was moved is not refusing to deal a family admitted under an easier rule. A pair is
@@ -663,16 +769,16 @@ against, or the one declared trust boundary at the end.
 | `instances.json` entries | exact fields, recomputed: compared in order with the rebuilt sequence |
 | `instances[].digest` | recomputed: the canonical instance record rebuilt and hashed |
 | `instances[].commitment` | recomputed from the rebuilt convention and the master key |
-| `screen.json` field set | exact: the four run fields and all seven decision inputs, none absent |
+| `screen.json` field set | exact: the four run fields and all nine decision inputs, none absent |
 | `screen.family` | exact: the family the pilot was taken on, refused when it is not this bundle's |
 | `screen.model`, `task_seeds` | validated: nonblank finite names, refused rather than defaulted |
-| `screen.pairs[]` field set | exact: exactly instance, filing, placebo, graded, oracle |
+| `screen.pairs[]` field set | exact: exactly instance, filing, placebo, graded, oracle, ideal |
 | `screen.pairs[]` identities | validated and required distinct: one row per task, and one task seed per row. That the labels name genuinely different tasks is reported by whoever ran the pilot, in the same class as the render boundary below |
 | `screen.pairs[]` scores | bounded to `[0, 1]` and finite, then used to recompute |
-| `screen` bars (`min_room`, `min_ratio`, `min_pairs`) | exact: the registered `0.05`, `0.25` and `36` |
+| `screen` bars (`min_room`, `min_ratio`, `min_pairs`, `min_oracle`, `min_learning_gap`) | exact: the registered `0.05`, `0.25`, `36`, `0.90` and `0.10` |
 | `screen.floor`, `floor_rule`, `selection_note` | bounded and used verbatim in the rerun; a selection of more than one candidate must be disclosed |
 | `screen.candidates_screened` | exact: the registered `1`. A larger disclosed count is scored and printed as a diagnostic and refused as deal evidence, because nothing adjusts for selection |
-| room, gain, ratio, interval, verdict | recomputed from the raw rows and compared with the registered bars here |
+| room, gain, ratio, oracle level, ideal-minus-graded gap, intervals, verdict | recomputed from the raw rows and compared with the registered bars here |
 | distinct task units | recomputed: counted from the rows and compared with the registered 36 |
 | `review.json` field set | exact: exactly reviewer, checklist, seeds, family, bank, renders |
 | `review.family`, `review.bank` | exact: the family and the bank identity the pack was read of, refused when they are not this bundle's |
@@ -758,6 +864,12 @@ pairwise semantic matrix over every implemented hidden axis, the independent val
 the independent master-key provenance, and a named human attestation tying all of it to final
 code and bundle hashes. A registry entry is not admission and a verified bundle is not a roster
 place.
+
+The receipt policy is one family's, and the other roster candidates keep the full receipt
+until their own arithmetic is done. Sound change and components are not ledger: four fully
+reported rows leave an ideal reader at 0.96 and 0.98 on them, so ledger's count does not
+carry and a policy for either of them has to be priced on its own tables before it is
+declared.
 
 Recorded boundaries, held by process rather than by a check:
 

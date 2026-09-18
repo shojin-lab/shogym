@@ -13,10 +13,18 @@ names, one per axis, hand over the whole convention while every gate sees a lega
 answer in a legal slot. The defence is not a longer list of forbidden values. It is
 that the value is not a choice.
 
-So the graded row is a function of the row's `RowOutcome` alone, and the receipt a
-generator actually rendered has to equal the receipt this function would have
-rendered. A generator is free to render its own; it is not free to render a different
-one.
+So the graded row is a function of the row's `RowOutcome` and the family's committed
+feedback policy alone, and the receipt a generator actually rendered has to equal the
+receipt this function would have rendered. A generator is free to render its own; it
+is not free to render a different one.
+
+WHICH ROWS IT REPORTS IS ALSO NOT A CHOICE. A family declares a receipt policy, and
+under a sampled policy the rows that carry a verdict and a correction are the ones a
+committed stream drew before any filing existed. Every other row prints that
+position's committed neutral tokens in both slots, so the graded and placebo cells
+are identical there even inside the slots. The policy and the mask reach this module
+as one immutable `Feedback`, built from the frozen envelope before any renderer runs,
+and the same object builds the expected cell and is handed to the family.
 
 The placebo is the same idea from the other side: its slot values are the committed
 neutral tokens for that row, fixed before launch.
@@ -38,7 +46,7 @@ from typing import Mapping, Sequence
 from shogym.envs.receipts.oracle import OracleTemplate
 from shogym.envs.receipts.oracle import parse_body as parse_oracle_body
 from shogym.envs.receipts.oracle import render as oracle_render
-from shogym.envs.receipts.protocol import RowOutcome
+from shogym.envs.receipts.protocol import ReceiptPolicy, RowOutcome, policy_of
 from shogym.envs.receipts.receipt_ast import (
     GRADED,
     PLACEBO,
@@ -52,6 +60,67 @@ VERDICT_SLOT = "verdict"
 CORRECTION_SLOT = "correction"
 PASS_TOKEN = "PASS"
 FAIL_TOKEN = "FAIL"
+
+
+@dataclass(frozen=True)
+class Feedback:
+    """What the graded cell may report, fixed before any renderer runs.
+
+    Three things, and they travel together because they are one commitment: the
+    registered policy, the mask that policy drew for this task, and the committed
+    neutral tokens a suppressed position prints. A renderer is handed this and cannot
+    widen it, because the cell it produces is compared against the cell this same
+    object builds: reporting a row the mask did not select is a refusal rather than a
+    receipt that says more than the gate priced.
+
+    Under the full policy the mask is every row and nothing is suppressed, which is
+    what keeps a full-policy family's bytes the bytes it had.
+    """
+
+    policy: ReceiptPolicy
+    #: The printed positions the receipt reports on, zero-based and in order.
+    mask: tuple[int, ...]
+    #: Slot name to one committed neutral token per printed position.
+    neutral: Mapping[str, tuple[str, ...]]
+
+    def reports(self, ordinal: int) -> bool:
+        """Whether the row at this printed ordinal carries a verdict and a correction."""
+        return (int(ordinal) - 1) in self.mask
+
+    @property
+    def positions(self) -> int:
+        """How many printed positions this commitment covers."""
+        return min((len(tokens) for tokens in self.neutral.values()), default=0)
+
+    def covers(self, ordinal: int) -> bool:
+        """Whether this commitment has a position at this printed ordinal at all."""
+        return 1 <= int(ordinal) <= self.positions
+
+    def suppressed(self, ordinal: int) -> dict[str, str]:
+        """What every slot prints at a position the mask did not select.
+
+        The caller asks `covers` first. A row printed at an ordinal the instance has no
+        position for is already a row nothing can be compared against, and answering it
+        with some position's tokens would put a policy complaint on a fault that is not
+        about the policy.
+        """
+        return {name: tokens[int(ordinal) - 1] for name, tokens in self.neutral.items()}
+
+
+def feedback_for(generator, task, envelope: Envelope) -> Feedback:
+    """The feedback commitment for one task, read off the declaration and the task.
+
+    Every caller in this package builds it from the FROZEN envelope, so the neutral
+    tokens a suppressed position prints are the committed ones rather than whatever a
+    renderer left behind.
+    """
+    return Feedback(
+        policy=policy_of(generator),
+        mask=tuple(task.mask),
+        neutral=MappingProxyType(
+            {name: tuple(values) for name, values in envelope.neutral.items()}
+        ),
+    )
 
 
 def observed_cell(outcome: RowOutcome, blank_token: str, unfiled_token: str) -> str:
@@ -77,21 +146,45 @@ def canonical_correction(outcome: RowOutcome, blank_token: str) -> str:
 
 
 def graded_rows(
-    outcomes: Sequence[RowOutcome], blank_token: str, unfiled_token: str
+    outcomes: Sequence[RowOutcome],
+    blank_token: str,
+    unfiled_token: str,
+    feedback: Feedback,
 ) -> tuple[ReceiptRow, ...]:
-    """The graded rows, as a function of what the scorer said and nothing else."""
-    return tuple(
-        ReceiptRow(
-            ordinal=outcome.ordinal,
-            identifier=outcome.identifier,
-            observed=observed_cell(outcome, blank_token, unfiled_token),
-            slots=(
+    """The graded rows, as a function of the scorer's outcomes and the commitment.
+
+    On a REPORTED row, the verdict is the row's matched bit and the correction is that
+    row's own answer, which is what every row of a full receipt carries. On a row the
+    mask did not select, both slots carry that position's committed neutral tokens,
+    which is exactly what the placebo carries there: outside the selected rows the two
+    cells are identical even inside the slots, so a reader learns nothing about those
+    rows from the graded arm that the placebo arm does not also say.
+
+    The echoed filing and the identifier are untouched by the policy. Suppressing the
+    echo as well would move bytes the registered slots do not cover, and the row would
+    stop being one the envelope check can hold against its placebo.
+    """
+    rows: list[ReceiptRow] = []
+    for outcome in outcomes:
+        if feedback.reports(outcome.ordinal):
+            slots = (
                 Slot(VERDICT_SLOT, PASS_TOKEN if outcome.matched else FAIL_TOKEN),
                 Slot(CORRECTION_SLOT, canonical_correction(outcome, blank_token)),
-            ),
+            )
+        else:
+            quiet = feedback.suppressed(outcome.ordinal)
+            slots = tuple(
+                Slot(name, quiet[name]) for name in (VERDICT_SLOT, CORRECTION_SLOT)
+            )
+        rows.append(
+            ReceiptRow(
+                ordinal=outcome.ordinal,
+                identifier=outcome.identifier,
+                observed=observed_cell(outcome, blank_token, unfiled_token),
+                slots=slots,
+            )
         )
-        for outcome in outcomes
-    )
+    return tuple(rows)
 
 
 def graded_receipt(
@@ -99,12 +192,45 @@ def graded_receipt(
     outcomes: Sequence[RowOutcome],
     blank_token: str,
     unfiled_token: str,
+    feedback: Feedback,
 ) -> ReceiptAST:
-    """The whole graded cell, built from the outcomes."""
-    rows = graded_rows(outcomes, blank_token, unfiled_token)
+    """The whole graded cell, built from the outcomes and the committed policy."""
+    rows = graded_rows(outcomes, blank_token, unfiled_token, feedback)
     return ReceiptAST(
         kind=GRADED, task_id=task_id, row_count=len(rows), rows=rows
     )
+
+
+def mask_disagreements(rendered: ReceiptAST, feedback: Feedback) -> list[str]:
+    """Where a rendered graded cell reports rows other than the ones the mask drew.
+
+    `row_disagreements` already refuses any row that is not the one the shared builder
+    would have made, so this adds no strictness. What it adds is the diagnosis: a cell
+    that reports an unselected row and a cell that prints the wrong band on a selected
+    one are the same byte difference to an equality test and are two entirely different
+    faults, and only one of them says more than the gate priced.
+    """
+    out: list[str] = []
+    for row in rendered.rows:
+        if not feedback.covers(row.ordinal):
+            # A row at an impossible ordinal is refused by the row comparison, which
+            # names the ordinal it printed. It is not a policy fault and this does not
+            # claim it as one.
+            continue
+        quiet = feedback.suppressed(row.ordinal)
+        printed = {slot.name: slot.value for slot in row.slots}
+        silent = all(printed.get(name) == value for name, value in quiet.items())
+        if feedback.reports(row.ordinal) and silent:
+            out.append(
+                f"row {row.ordinal} is one the committed mask selected and this cell "
+                "prints its neutral tokens, so a reported row was suppressed"
+            )
+        elif not feedback.reports(row.ordinal) and not silent:
+            out.append(
+                f"row {row.ordinal} is not one the committed mask selected and this "
+                "cell reports on it, so the receipt says more than the policy registers"
+            )
+    return out
 
 
 def placebo_rows(
@@ -289,8 +415,12 @@ def judge_cells(
     blank = str(getattr(generator, "BLANK_TOKEN", "(empty)"))
     unfiled = str(getattr(generator, "UNFILED_TOKEN", "(none)"))
     score, outcomes = generator.score(task, canonical)
+    # The commitment, taken from the frozen envelope and the task's own committed mask
+    # BEFORE the renderer runs. The same object builds the expected cell and is handed
+    # to the family, so what it may report and what it is held to are one thing.
+    feedback = feedback_for(generator, task, committed)
     expected = {
-        GRADED: graded_receipt(task.task_id, outcomes, blank, unfiled),
+        GRADED: graded_receipt(task.task_id, outcomes, blank, unfiled, feedback),
         PLACEBO: placebo_receipt(task.task_id, outcomes, committed, blank, unfiled),
     }
     # The oracle this package would render, built from the declared phrase table
@@ -304,12 +434,22 @@ def judge_cells(
         )
 
     asts = {
-        GRADED: generator.render_receipt(task, canonical, task.key),
+        GRADED: generator.render_receipt(task, canonical, task.key, feedback),
         PLACEBO: generator.render_placebo(task.public(), canonical, committed),
         ORACLE: generator.render_oracle(task.task_id, drawn, task.n_rows),
     }
 
     problems: list[str] = []
+    # WHICH ROWS, then WHAT THEY SAY. A cell that reports a row the mask did not draw
+    # and a cell that prints the wrong answer on a row it did are the same inequality
+    # and two different faults, so the policy question is asked first and answered in
+    # its own words.
+    off_mask = mask_disagreements(asts[GRADED], feedback)
+    if off_mask:
+        problems.append(
+            "the graded cell does not report the rows the committed mask drew: "
+            + "; ".join(off_mask[:3])
+        )
     wrong = row_disagreements(asts[GRADED], expected[GRADED])
     if wrong:
         problems.append(
@@ -412,8 +552,11 @@ __all__ = [
     "PASS_TOKEN",
     "VERDICT_SLOT",
     "Cells",
+    "Feedback",
     "canonical_correction",
+    "feedback_for",
     "frozen_template",
+    "mask_disagreements",
     "oracle_difference",
     "graded_receipt",
     "graded_rows",

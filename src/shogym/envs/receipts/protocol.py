@@ -29,6 +29,11 @@ A generator supplies:
             checkably lossless.
   describe  the instruction the agent sees, leaving every axis genuinely
             undetermined.
+  RECEIPT_POLICY
+            which of the graded task's rows the receipt reports a verdict and a
+            correction on: every one of them, or the q the committed mask drew. It
+            is a registration, priced by the gate and stated in the task text, and a
+            generator that declares none is refused at registration.
 
 THE TRUST BOUNDARY. Everything in this module is controller-side. Generator code,
 the sampler's live draws, the convention, the answer key, the oracle renderer and
@@ -71,6 +76,138 @@ NO_FILING_REASONS = (
     "unreadable",
     "no_known_identifier",
 )
+
+#: The two shapes a receipt policy can have. EVERY_ROW is what every family had: a
+#: verdict and a same-row correction on all of the graded task's rows. SAMPLED_ROWS
+#: reports q of n rows in full and says nothing at all on the other n - q, which carry
+#: the row's committed neutral tokens in both slots.
+EVERY_ROW = "every-row"
+SAMPLED_ROWS = "sampled-rows"
+POLICY_SHAPES = (EVERY_ROW, SAMPLED_ROWS)
+
+
+@dataclass(frozen=True)
+class ReceiptPolicy:
+    """Which of the graded task's rows the receipt reports on, as one registration.
+
+    WHY THIS IS A REGISTRATION AND NOT A RENDERER'S CHOICE. What a receipt reports is
+    the whole of what one link can teach, so it is priced by the gate, stated in the
+    task text, committed with the instance, and compared against by the judge. A
+    generator free to decide per render what it reported would be a generator whose
+    measured room and served room are two different things.
+
+    `reported` and `rows` are q and n for a sampled policy and are zero for the full
+    one, whose row count is whatever the task prints. A generator declares one of
+    `REGISTERED_POLICIES` and one that declares none is refused at registration,
+    exactly as an undeclared copy profile is.
+    """
+
+    name: str
+    shape: str
+    reported: int = 0
+    rows: int = 0
+
+    def __post_init__(self) -> None:
+        if self.shape not in POLICY_SHAPES:
+            raise ValueError(
+                f"a receipt policy is one of {POLICY_SHAPES}, not {self.shape!r}"
+            )
+        if self.shape == EVERY_ROW and (self.reported or self.rows):
+            raise ValueError(
+                "the full receipt reports every row the task prints, so it names no "
+                "count of its own"
+            )
+        if self.shape == SAMPLED_ROWS and not 1 <= self.reported < self.rows:
+            raise ValueError(
+                f"a sampled receipt reports between one and {self.rows - 1} of "
+                f"{self.rows} rows, not {self.reported}"
+            )
+
+    @property
+    def samples(self) -> bool:
+        """Whether this policy reports fewer rows than the task prints."""
+        return self.shape == SAMPLED_ROWS
+
+    def as_record(self) -> dict[str, object]:
+        """The policy as one canonical value, for the instance commitment."""
+        return {
+            "name": self.name,
+            "shape": self.shape,
+            "reported": int(self.reported),
+            "rows": int(self.rows),
+        }
+
+
+#: THE REGISTERED POLICIES, and the whole of them. A policy outside this tuple has not
+#: been priced by any gate, so nothing may be registered under it.
+FULL_RECEIPT = ReceiptPolicy(name="full", shape=EVERY_ROW)
+SAMPLED_FOUR_OF_TWENTY_FOUR = ReceiptPolicy(
+    name="sampled-4-of-24", shape=SAMPLED_ROWS, reported=4, rows=24
+)
+REGISTERED_POLICIES = (FULL_RECEIPT, SAMPLED_FOUR_OF_TWENTY_FOUR)
+
+
+def policy_of(generator: "Generator") -> ReceiptPolicy:
+    """The receipt policy this generator declares, refused when it declares none.
+
+    Refused rather than defaulted. Which rows a receipt reports decides what the gate
+    prices, what the task text promises and what the judge accepts, and a default here
+    would be that decision taken about a family by whoever wrote this module.
+    """
+    declared = getattr(generator, "RECEIPT_POLICY", None)
+    name = getattr(generator, "name", type(generator).__name__)
+    if declared is None:
+        raise ValueError(
+            f"{name!r} declares no RECEIPT_POLICY. Which rows a receipt reports is what "
+            f"the gate prices and what the task text says, so a generator declares one; "
+            f"the registered policies are "
+            f"{', '.join(p.name for p in REGISTERED_POLICIES)}"
+        )
+    if not isinstance(declared, ReceiptPolicy) or declared not in REGISTERED_POLICIES:
+        shown = getattr(declared, "name", declared)
+        raise ValueError(
+            f"{name!r} declares receipt policy {shown!r}; the registered policies are "
+            f"{', '.join(p.name for p in REGISTERED_POLICIES)}"
+        )
+    return declared
+
+
+def require_policy(generator: "Generator") -> "Generator":
+    """Refuse a generator that does not declare a registered policy. Returns it."""
+    policy_of(generator)
+    return generator
+
+
+def receipt_mask(
+    policy: ReceiptPolicy,
+    master: bytes,
+    generator: str,
+    ordinal: int,
+    label: str,
+    n_rows: int,
+) -> tuple[int, ...]:
+    """The rows this task's receipt reports on, as printed positions in order.
+
+    DRAWN BEFORE ANY FILING AND FROM A STREAM OF ITS OWN, so it cannot depend on what
+    the agent filed and cannot depend on the drawn convention. It is a function of the
+    master key and of the generator, the ordinal and the sibling label alone, so a
+    re-render after a crash reproduces the same rows and the two branches of one fork
+    are served the same cell.
+
+    A MASK THAT OMITS AN AXIS IS NOT REDRAWN. What is registered is the law and not the
+    realized receipt: redrawing until every hidden decision has a witness would make the
+    mask a function of the convention, and the arithmetic the gate does averages over
+    the uniform law rather than over a filtered one.
+    """
+    if not policy.samples:
+        return tuple(range(int(n_rows)))
+    if int(n_rows) != policy.rows:
+        raise ValueError(
+            f"policy {policy.name!r} reports {policy.reported} of {policy.rows} rows "
+            f"and this task prints {n_rows}"
+        )
+    stream = streams.rng(master, streams.RECEIPT_MASK, generator, ordinal, label)
+    return tuple(sorted(stream.sample(range(int(n_rows)), policy.reported)))
 
 
 class ConstructionExhausted(RuntimeError):
@@ -201,6 +338,10 @@ class PublicTask:
     surface: str
     table: Any
     n_rows: int
+    #: The rows this task's receipt reports on. Drawn from its own stream before any
+    #: filing and independently of the convention, so it is not an answer oracle and
+    #: it is carried here the way the row count is.
+    mask: tuple[int, ...] = ()
 
 
 @dataclass(frozen=True)
@@ -210,6 +351,14 @@ class Task:
     `table` is the generator's own row structure and is opaque here. `key` is the
     answer under the instance's drawn convention: an answer oracle, controller-side
     only. `task_id` is the opaque identifier that crosses the boundary.
+
+    `mask` is the receipt's committed row selection, and it is a REQUIRED field with
+    no default. Every counterfactual render in this package retasks a task under
+    another convention by building a new one of these, and a default would let such a
+    rebuild silently drop the rows the receipt reports on: the cell it produced would
+    then be compared against an expected cell built from the same dropped mask, and
+    both would be wrong together. Naming it at every construction is what makes a
+    forgotten mask a refusal rather than a quiet second instrument.
     """
 
     label: str
@@ -218,6 +367,7 @@ class Task:
     table: Any
     text: str
     key: tuple[str, ...]
+    mask: tuple[int, ...]
 
     @property
     def n_rows(self) -> int:
@@ -231,6 +381,7 @@ class Task:
             surface=self.surface,
             table=self.table,
             n_rows=self.n_rows,
+            mask=self.mask,
         )
 
 
@@ -271,6 +422,12 @@ class Generator(Protocol):
     #: family priced under the wrong one reports a number that measured nothing.
     #: `copy_profiles` holds the registered names and what each one enumerates.
     COPY_PROFILE: str
+    #: Which rows of the graded task this family's receipt reports on. Declared rather
+    #: than assumed, and refused at registration when it is absent: what a receipt
+    #: reports is what the gate prices and what the task text promises, so a family
+    #: that named none would be gated against one instrument and served as another.
+    #: `REGISTERED_POLICIES` holds the registered values.
+    RECEIPT_POLICY: ReceiptPolicy
 
     def surface_for(self, ordinal: int, label: str) -> str:
         """Which surface data pool this instance uses for side A or side B."""
@@ -320,9 +477,20 @@ class Generator(Protocol):
         ...
 
     def render_receipt(
-        self, task: Task, canonical: Filing, truth: Sequence[str]
+        self,
+        task: Task,
+        canonical: Filing,
+        truth: Sequence[str],
+        feedback: Any,
     ) -> ReceiptAST:
-        """Per-row verdicts on what the filing did. No axis labels."""
+        """Per-row verdicts on what the filing did. No axis labels.
+
+        `feedback` is the immutable `render.Feedback`: the declared policy, the
+        committed mask, and the neutral tokens a suppressed position prints. It is
+        snapshotted before this callback runs and the same snapshot builds the cell
+        this one is compared against, so a renderer cannot widen what it reports by
+        rewriting what it was handed.
+        """
         ...
 
     def render_placebo(
@@ -506,8 +674,20 @@ def _task(
     key = tuple(generator.key_for(table, convention))
     task_id = streams.task_identifier(master, generator.name, ordinal, label)
     surface = generator.surface_for(ordinal, label)
+    # The mask is drawn here, from the key and the coordinates, and before the text is
+    # written or any filing exists. The convention is already in hand at this point and
+    # is deliberately not one of the coordinates: the stream is domain-separated, so
+    # what the receipt reports on is independent of what it would report.
+    mask = receipt_mask(
+        policy_of(generator), master, generator.name, ordinal, label, len(key)
+    )
     public = PublicTask(
-        label=label, task_id=task_id, surface=surface, table=table, n_rows=len(key)
+        label=label,
+        task_id=task_id,
+        surface=surface,
+        table=table,
+        n_rows=len(key),
+        mask=mask,
     )
     return Task(
         label=label,
@@ -516,6 +696,7 @@ def _task(
         table=table,
         text=generator.describe(public),
         key=key,
+        mask=mask,
     )
 
 
@@ -547,7 +728,13 @@ def option_mentions(axes: Sequence[Axis], text: str) -> list[tuple[str, str]]:
 
 
 __all__ = [
+    "EVERY_ROW",
+    "FULL_RECEIPT",
     "NO_FILING_REASONS",
+    "POLICY_SHAPES",
+    "REGISTERED_POLICIES",
+    "SAMPLED_FOUR_OF_TWENTY_FOUR",
+    "SAMPLED_ROWS",
     "Axis",
     "ConstructionExhausted",
     "Column",
@@ -556,6 +743,7 @@ __all__ = [
     "Instance",
     "NoFiling",
     "PublicTask",
+    "ReceiptPolicy",
     "RowOutcome",
     "SealedSubmission",
     "Shape",
@@ -564,6 +752,9 @@ __all__ = [
     "Task",
     "conventions",
     "draw",
+    "policy_of",
+    "receipt_mask",
+    "require_policy",
     "support_of",
     "draw_convention",
     "option_mentions",
