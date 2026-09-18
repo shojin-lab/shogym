@@ -8,8 +8,10 @@ production selector this module is checking.
 
 from __future__ import annotations
 
+import hashlib
 import json
 import re
+import shutil
 from fractions import Fraction
 from pathlib import Path
 from typing import Mapping, Sequence
@@ -1343,3 +1345,287 @@ def test_the_shipped_commands_materialize_gate_check_and_draw_this_genre(
     assert "economic destination choice" in drawn_out
     assert "refund destination schedule" in drawn_out
     assert "all three match the envelope: True" in drawn_out
+
+
+# --------------------------------------------------------------------------
+# the review pack, the bundle and the served route
+# --------------------------------------------------------------------------
+
+
+def _screen_artifact(pairs: int = 40) -> dict:
+    """A recorded room screen for this family, structurally valid and not measured here.
+
+    The numbers stand in for a pilot nobody ran in a test. What is being exercised is
+    the path that recomputes everything mechanical about a bundle, not the screen.
+    """
+    return {
+        "family": GENERATOR.name,
+        "model": "a scripted policy",
+        "task_seeds": [str(i) for i in range(pairs)],
+        "pairs": [
+            {"instance": f"task-{i:02d}", "filing": f"filing-{i:02d}",
+             "placebo": 0.3, "graded": 0.7, "oracle": 0.95}
+            for i in range(pairs)
+        ],
+        "min_room": 0.05, "min_ratio": 0.25, "min_pairs": 36,
+        "floor": 0.0, "floor_rule": "drop",
+        "candidates_screened": 1, "selection_note": "",
+    }
+
+
+#: The key this module's bank is built under. FIXED, because a pack carries every
+#: worksheet case and a bank of two need not exhibit all of them under a fresh key
+#: every run, so what is exercised here is the exporter rather than the draw.
+PACK_MASTER = hashlib.sha256(b"retail-review-pack").digest()
+
+
+@pytest.fixture(scope="module")
+def frozen(tmp_path_factory: pytest.TempPathFactory):
+    """One small bank of this genre, its exported pack, and a bundle that verifies."""
+    from shogym.envs.receipts import bundle as bundle_mod
+    from shogym.envs.receipts import retail_review
+
+    room = tmp_path_factory.mktemp("retail")
+    bank, held = bank_mod.materialized(GENERATOR, PACK_MASTER, 2)
+    outcomes = room / "screen.json"
+    outcomes.write_text(json.dumps(_screen_artifact()), encoding="utf-8")
+    pack_root = room / "pack"
+    pack = retail_review.export(bank, held, pack_root)
+    # The exporter leaves the attestation unset, so the bundle refuses the pack until a
+    # person has put their name to it. That refusal is the point of leaving it unset.
+    with pytest.raises(ValueError):
+        bundle_mod.build(room / "bundles", GENERATOR, bank, outcomes, pack)
+    retail_review.attested(pack_root, "a named reader")
+    built = bundle_mod.build(room / "bundles", GENERATOR, bank, outcomes, pack)
+    assert bundle_mod.verify(built, GENERATOR).problems == ()
+    return bank, held, built
+
+
+def test_the_review_pack_covers_the_family_and_names_no_reviewer(
+    frozen, tmp_path: Path
+) -> None:
+    """What the exported pack has to contain, and the one thing it must not.
+
+    It fails if the pack misses a surface template, an option of any axis, a registered
+    filing class, the row count the bank holds or a counterfactual render, if the 27
+    oracle cells are not all there, if a counterfactual is missing for any option of
+    any axis on any surface, if the worksheets do not carry every phenomenon, the
+    equal-amount fixtures, the separating matrix and the validation and copying
+    numbers, or if the exporter names a reviewer. It also fails if the worksheets are
+    labelled as renders: they are explanatory material, they are not served tasks, and
+    a bundle carrying them as evidence of what was served would be saying something
+    nobody checked.
+    """
+    from shogym.envs.receipts import review, retail_review
+    from shogym.envs.receipts.streams import digest
+
+    bank, held, _ = frozen
+    room = tmp_path / "again"
+    pack = retail_review.export(bank, held, room)
+    manifest = json.loads(pack.read_text(encoding="utf-8"))
+    assert set(manifest) == set(review.REQUIRED_FIELDS)
+    assert manifest["reviewer"] is None
+    assert manifest["family"] == "retail_refund"
+    assert manifest["bank"] == bank_mod.bank_identity(bank)
+    assert manifest["seeds"] == list(held.ordinals)
+
+    coverage = review.required_coverage(
+        GENERATOR, checks.FILING_CLASSES, [retail.ROWS]
+    )
+    seen = [(e["category"], e["key"]) for e in manifest["renders"]]
+    assert coverage.missing(seen) == []
+    oracles = {
+        e["path"] for e in manifest["renders"] if e["path"].startswith("renders/oracle-")
+    }
+    assert len(oracles) == 27
+    for surface in GENERATOR.surface_templates():
+        for axis in retail.AXES:
+            for option in axis.options:
+                assert ("counterfactual", f"{surface} {axis.name}={option}") in seen
+    for entry in manifest["renders"]:
+        assert not entry["path"].startswith(retail_review.WORKSHEETS)
+        assert (room / entry["path"]).is_file()
+
+    index = json.loads((room / retail_review.WORKSHEET_INDEX).read_text("utf-8"))
+    assert index["cases"] == list(retail_review.WORKSHEET_CASES)
+    for name, hashed in index["files"].items():
+        assert digest((room / name).read_bytes()) == hashed
+    for name in ("cases", "ties", "matrix", "validation"):
+        assert f"{retail_review.WORKSHEETS}/{name}.json" in index["files"]
+
+    ties = json.loads(
+        (room / retail_review.WORKSHEETS / "ties.json").read_text("utf-8")
+    )
+    assert len(ties["cases"]) == len(retail_review.TIE_FIXTURES)
+    matrix = json.loads(
+        (room / retail_review.WORKSHEETS / "matrix.json").read_text("utf-8")
+    )
+    assert matrix["distinct_answer_vectors"] == 27
+    assert len(matrix["cases"]) == 8
+    numbers = json.loads(
+        (room / retail_review.WORKSHEETS / "validation.json").read_text("utf-8")
+    )
+    assert numbers["pair"]["copying"]["shipped_family_bound"] == 0.50
+    assert numbers["pair"]["copying"]["all_bijection_bound"] == 0.50
+    assert all(c["masked_bytes_equal"] for c in numbers["cell_comparisons"])
+    sheet = json.loads(
+        (room / retail_review.WORKSHEETS
+         / "apparel-route_policy-route_gift.json").read_text("utf-8")
+    )
+    assert len(sheet["rows"]) == retail.ROWS
+    assert {row["class_selected"] for row in sheet["rows"]} == {
+        "gift cards", "original instruments"
+    }
+    # Under unconditional gift preference every original-only case reaches its class
+    # through the public fallback, and under the conditional route none does.
+    assert sum(1 for row in sheet["rows"] if row["fallback_applied"]) == retail.PER_KIND
+    conditional = json.loads(
+        (room / retail_review.WORKSHEETS
+         / "apparel-route_policy-route_usedgift.json").read_text("utf-8")
+    )
+    assert not any(row["fallback_applied"] for row in conditional["rows"])
+
+    # The exported pack is the same pack twice, so two readers read one document.
+    twice = tmp_path / "twice"
+    retail_review.export(bank, held, twice)
+    assert (twice / retail_review.PACK).read_bytes() == pack.read_bytes()
+
+
+def test_a_frozen_bank_rebuilds_and_a_failed_extra_check_is_not_dealable(frozen) -> None:
+    """Replay, rebuild, and what happens when one of the declared checks says no.
+
+    It fails if a small valid frozen bank cannot be rebuilt byte-identically, if an
+    instance failing one of the three checks this family declares is still admitted or
+    still fills a bank, or if replaying a committed fork changes its cells or answers
+    one filing with another filing's feedback.
+    """
+    from shogym.envs.receipts import admission
+
+    bank, held, built = frozen
+    again = bank_mod.population(bank, GENERATOR)
+    assert again.ordinals == held.ordinals
+    for first, second in zip(held.instances, again.instances):
+        assert bank_mod.instance_digest(first, GENERATOR) == bank_mod.instance_digest(
+            second, GENERATOR
+        )
+
+    instance = held.instances[0]
+    assert admission.report(
+        GENERATOR, instance, bank.master, admission.Thresholds()
+    ).admitted
+    kept = validation.NAMED_CHECKS["retail_surface"]
+    try:
+        validation.NAMED_CHECKS["retail_surface"] = lambda *_: checks.CheckResult(
+            "retail_surface", False, "a fixture refusal"
+        )
+        report = admission.report(
+            GENERATOR, instance, bank.master, admission.Thresholds()
+        )
+        assert "retail_surface" in report.failed_checks
+        assert not report.admitted
+        with pytest.raises(ValueError):
+            bank_mod.population(bank, GENERATOR)
+    finally:
+        validation.NAMED_CHECKS["retail_surface"] = kept
+
+    room = Path(built.root).parent / "forks"
+    source = built.digest
+    task = instance.a
+    identifiers = list(GENERATOR.row_identifiers(task.table))
+    perfect = "\n".join("%s,%s" % kv for kv in zip(identifiers, task.key))
+    wrong = "\n".join("%s,%s" % (i, "zz") for i in identifiers)
+    keyed = bank_mod.filing_digest(perfect)
+    assert bank_mod.load_fork(room, task.task_id, keyed, source) is None
+    first = bank_mod.fork_for(GENERATOR, instance, "a", perfect, room, source)
+    assert bank_mod.load_fork(room, task.task_id, keyed, source) is not None
+    replayed = bank_mod.fork_for(GENERATOR, instance, "a", perfect, room, source)
+    assert replayed.replayed
+    assert (replayed.graded, replayed.placebo, replayed.oracle) == (
+        first.graded, first.placebo, first.oracle
+    )
+    assert replayed.component_score == first.component_score == 1.0
+    other = bank_mod.fork_for(GENERATOR, instance, "a", wrong, room, source)
+    assert other.graded != first.graded
+    assert other.component_score == 0.0
+    assert other.filing_digest != first.filing_digest
+
+
+async def test_a_filing_an_independent_reader_believes_seals_at_one(
+    frozen, tmp_path: Path
+) -> None:
+    """What the served environment does with a correct filing, an empty one and a grade.
+
+    It fails if a filing computed by the second implementation reading the printed body
+    does not seal at 1, if an empty filing is credited, if prose is scored rather than
+    reason coded, or if either channel of the terminal result carries a grade: what one
+    graded receipt is worth is the quantity this environment exists to measure, so a
+    terminal that handed the grade back would put a receipt in every arm including the
+    one meant to carry none.
+    """
+    from shogym.envs.receipts.env_v1 import ReceiptsV1Env
+    from shogym.serve import ServedEpisode
+
+    _, _, built = frozen
+    private = tmp_path / "served"
+    private.mkdir()
+    opened = private / built.root.name
+    shutil.copytree(built.root, opened)
+    config = {"genre": "retail_refund", "bundle": str(opened), "side": "a"}
+    env = ReceiptsV1Env(**config)
+    ordinal = env._ordinals[0]
+    instance = env.instance(ordinal)
+    task = instance.a
+    independent = validation.audit_key(
+        [c.instruments for c in validation.parsed_cases(task.table)], instance.convention
+    )
+    assert independent == tuple(task.key)
+    filing = "\n".join(
+        "%s,%s" % kv
+        for kv in zip(GENERATOR.row_identifiers(task.table), independent)
+    )
+
+    episode = await ServedEpisode.start(
+        "receipts_v1", task=0, env_config=config, trace_path=tmp_path / "run.jsonl"
+    )
+    try:
+        spec = episode.describe()
+        assert "SCHEDULE (" in spec.instructions
+        assert option_mentions(retail.AXES, json.dumps(spec.model_dump())) == []
+        result = await episode.call("submit_filing", {"filing": filing})
+        assert result.terminated
+        content = json.loads(result.content)
+        assert set(content) == {"filed", "rows", "finalize_error"}
+        assert "1.0" not in json.dumps(content)
+        feedback = {item["name"]: item["value"] for item in episode.terminal_feedback}
+        assert feedback["component_score"] == 1.0
+        assert feedback["rows_omitted"] == 0.0
+    finally:
+        await episode.close()
+
+    blank = "\n".join(
+        "%s," % identifier for identifier in GENERATOR.row_identifiers(task.table)
+    )
+    empty = await ServedEpisode.start(
+        "receipts_v1", task=0, env_config=config, trace_path=tmp_path / "empty.jsonl"
+    )
+    try:
+        await empty.call("submit_filing", {"filing": blank})
+        feedback = {item["name"]: item["value"] for item in empty.terminal_feedback}
+        assert feedback["component_score"] == 0.0
+        assert feedback["rows_filed"] == float(retail.ROWS)
+        assert "no_filing" not in feedback
+    finally:
+        await empty.close()
+
+    unread = await ServedEpisode.start(
+        "receipts_v1", task=0, env_config=config, trace_path=tmp_path / "prose.jsonl"
+    )
+    try:
+        await unread.call(
+            "submit_filing", {"filing": "I could not work out the convention"}
+        )
+        feedback = {item["name"]: item["value"] for item in unread.terminal_feedback}
+        assert feedback["component_score"] == 0.0
+        assert feedback["no_filing"] == "no_known_identifier"
+    finally:
+        await unread.close()
