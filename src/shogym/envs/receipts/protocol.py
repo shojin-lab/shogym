@@ -406,6 +406,29 @@ class Generator(Protocol):
         ...
 
 
+# A FAMILY MAY DECLARE CHECKS OF ITS OWN, AND THEY ARE NOT MEMBERS OF THE PROTOCOL
+# ABOVE. The eleven named checks ask what a receipt can carry and what a cell has to be,
+# which are the same questions for every family. A family can also have an invariant
+# nothing shared can see: that its printed body says what its stored table says, that
+# the pair it was built from passes the registered bars under every convention rather
+# than under the one it drew, that no row of one sibling holds the other's structural
+# position. Such a family declares
+#
+#     ADDITIONAL_CHECKS   a tuple of names
+#     check_additional(name, instance, master) -> CheckResult
+#
+# and `checks.run_checks` runs one guarded callback per declared name, after the eleven
+# and after whatever the declared copy profile brought. An absent attribute is the empty
+# tuple, so a family that declares none is untouched.
+#
+# It is deliberately NOT a member of `Generator`. This protocol is runtime checkable and
+# most families have no such invariant, so putting the pair here would make every one of
+# them carry two members it does not use, and an `isinstance` most families fail is not
+# a protocol anybody can read. `checks.additional_checks` refuses a repeated name, a name
+# that shadows one of the eleven, and a result returned under a name other than the one
+# asked for, which is the part a declaration cannot be trusted with.
+
+
 # --------------------------------------------------------------------------
 # the sampler law, and the draw
 # --------------------------------------------------------------------------
