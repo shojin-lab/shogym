@@ -612,9 +612,10 @@ wrong in both.
 
 | Check | What it asks |
 |---|---|
-| `retail_surface` | the printed body reads back, every field stays inside its registered bounds, the class partition, contribution totals, purchase flag, profile counts and class cardinality are what the schedule promises, all 27 keys agree with an independently implemented selector on both sides, and no case id or correct code changes under serialize and read back |
+| `retail_surface` | the printed body reads back, every field stays inside its registered bounds, the class partition, contribution totals, purchase flag, joint profiles and class cardinality are what the schedule promises, every parsed record is the stored record field by field, all 27 keys agree with an independently implemented selector on both sides, and no case id or correct code changes under serialize and read back |
 | `retail_support` | the registered gates and the exercise, materiality and copy checks pass under **every one of the 27 conventions**, not only under the one drawn, and the all-support movement minima and six-code realization hold |
 | `retail_profile_transfer` | no case of one schedule shares a code-free structural fingerprint with any case of the other, so a corrected destination's position is not reusable |
+| `retail_bijection` | relabelling A's answers by any of the 720 maps and moving the rows by any of the 48 earns at most 0.50 on B, under **every one of the 27 conventions**; the construction filter holds the same bound, so it is a bar and not a number reported beside a pass |
 
 `retail_support` is what makes the pass predicate independent of which convention was sampled.
 Without it a deliberately constructed pair can pass for one draw and fail for another, and the
@@ -925,7 +926,9 @@ A copy profile brings the checks its own cheap readers need. A family can also h
 nothing shared can see, and it declares that itself:
 
 ```python
-ADDITIONAL_CHECKS = ("retail_surface", "retail_support", "retail_profile_transfer")
+ADDITIONAL_CHECKS = (
+    "retail_surface", "retail_support", "retail_profile_transfer", "retail_bijection",
+)
 
 def check_additional(self, name, instance, master) -> CheckResult: ...
 ```
