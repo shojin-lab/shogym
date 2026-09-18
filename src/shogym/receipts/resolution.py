@@ -555,6 +555,9 @@ class GateResult:
     r_axes: list[str]
     s_pass: bool
     s_structural: str
+    #: How many printed rows carry an axis label. Kept beside the sentence that
+    #: describes them because it is what `s_form_pass` reads.
+    s_axis_labelled: int
     s_label_resolution_equal: bool
     s_leaks: list[str]
     s_order_moves: bool
@@ -567,6 +570,21 @@ class GateResult:
     @property
     def headroom(self) -> float:
         return self.ceiling - self.floor
+
+    @property
+    def s_form_pass(self) -> bool:
+        """S apart from its information-equality part: what the receipt PRINTS.
+
+        Three of S's checks are about the printed form and one is about what the
+        printed rows resolve. No row is labelled by axis, the bytes leak no axis name
+        or option token and every slot prints what its registered grammar allows, and
+        the printed order does not move with the convention. All three are properties
+        of the instrument: a receipt that fails one of them prints its own
+        interpretation whichever rows it happens to report. The fourth, that the
+        evident rows alone already reach the whole receipt's resolution, is a
+        statement about the rows in front of it, which is why it is separated here.
+        """
+        return not self.s_axis_labelled and not self.s_leaks and not self.s_order_moves
 
     def lines(self) -> list[str]:
         width = max((len(a) for a in self.arity), default=6) + 4
@@ -745,6 +763,7 @@ def gate(
         r_axes=r_axes,
         s_pass=s_pass,
         s_structural=s_structural,
+        s_axis_labelled=n_axis_labelled,
         s_label_resolution_equal=s_equal,
         s_leaks=leaks,
         s_order_moves=order_moves,

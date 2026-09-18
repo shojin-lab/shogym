@@ -6,9 +6,16 @@ channel that gate closes is a paid mechanism in this design rather than a defect
 name is what this publishes its verdicts under, so nothing here can be mistaken for
 the instrument's own.
 
-An instance is admissible when every gate and every check passes on it. A bank holds
-the instances this admits, in ordinal order, and which ones those are is recomputed by
-rerunning this rather than read from a list.
+An instance is admissible when every check passes on it and the gate report clears
+whatever its receipt policy makes a prerequisite. For a family that reports every row
+that is all three gates. For one that reports the rows a committed mask drew it is S's
+printed form: R, H and S's information equality are quantities of the realized mask,
+and requiring them would admit the instances whose mask happened to be rich, which is a
+filter on the very masks the registered law averages over. `decides` is where that
+choice lives, and the realized numbers are reported either way.
+
+A bank holds the instances this admits, in ordinal order, and which ones those are is
+recomputed by rerunning this rather than read from a list.
 
 THE BARS ARE REGISTERED and are the defaults here. A run may move them for diagnosis,
 and a report carries the ones it judged against, but a bundle is verified against the
@@ -232,18 +239,34 @@ class Report:
 
     #: The policy the family declared when this report was made. Set by `report`.
     policy: str = ""
+    #: Whether that policy reports only the rows a committed mask drew. It is what
+    #: decides which of the gate report's verdicts is a prerequisite, so it is carried
+    #: rather than read back off the name.
+    samples: bool = False
 
     @property
     def failed_checks(self) -> tuple[str, ...]:
         return tuple(c.name for c in self.checks if not c.passed)
 
     @property
+    def gate_prerequisite(self) -> bool:
+        """The part of the gate report admission requires, for this policy shape."""
+        return decides(self.gates, self.samples)
+
+    @property
     def admitted(self) -> bool:
-        return self.gates.verdict and not self.failed_checks
+        return self.gate_prerequisite and not self.failed_checks
 
     def lines(self) -> list[str]:
         out = list(self.gates.lines())
         out += ["", "RECEIPT POLICY         %s" % (self.policy or "not declared")]
+        if self.samples:
+            out += [
+                "                       R, H and S's information equality are reported "
+                "and do not decide;",
+                "                       the registered law does, in the law check and "
+                "in the bank's band",
+            ]
         out += ["", "NAMED CHECKS"]
         out += ["   " + c.line() for c in self.checks]
         out += [
@@ -251,6 +274,30 @@ class Report:
             "ADMISSION              %s" % ("ADMITTED" if self.admitted else "EXCLUDED"),
         ]
         return out
+
+
+def decides(gates: GateResult, samples: bool) -> bool:
+    """Which of the gate report's verdicts admission requires, for this policy shape.
+
+    A family whose receipt reports EVERY row is required to pass all three. R, S and H
+    are statements about the one receipt it serves, and there is no other receipt it
+    could have served.
+
+    A family whose receipt reports the rows a COMMITTED MASK DREW is required to pass
+    S's printed form and nothing else from here. R, H and S's information equality are
+    quantities of the realized mask: a mask that happens to omit an axis leaves R short
+    and a mask that happens to draw the evident rows leaves no headroom, and such a
+    mask is not redrawn. Requiring them would drop the instance instead, which is the
+    same filter by another route: the masks the bank then holds are the masks that
+    happened to be rich, and the law the gate averages over is a law over every mask.
+    What replaces them is the registered law itself, read in two places, the
+    distinguishing bar in the named law check and the band over the bank. The realized
+    numbers are computed and reported, because a reader wants to know what the receipt
+    in front of them resolved; they are not a prerequisite.
+    """
+    if not samples:
+        return gates.verdict
+    return gates.s_form_pass
 
 
 def report(
@@ -284,16 +331,17 @@ def report(
             ),
             thresholds=thresholds,
             policy=policy.name,
+            samples=policy.samples,
         )
-    # THE LAW IS PRICED ONLY WHERE IT DECIDES SOMETHING. It is an exact walk of every
-    # mask the policy can draw, which is the expensive thing this package computes, and
-    # an instance the gates or another check already refused is refused whatever it
-    # says. A bank fill considers many ordinals to hold a few, so pricing the refused
-    # ones would be most of the cost of filling a bank and none of the answer. Where an
-    # instance is priced the numbers are reported in full, and where it is not the check
-    # says which refusal came first.
-    priced = result.verdict
-    law = law_for(generator, instance, side) if policy.samples and priced else None
+    # THE LAW IS PRICED WHEREVER IT DECIDES SOMETHING, which for a family that reports
+    # only the rows a committed mask drew is every instance it is asked about. It is an
+    # exact walk of every mask the policy can draw, which is the expensive thing this
+    # package computes, and a bank fill considers many ordinals to hold a few. It is
+    # priced anyway: the realized gates no longer refuse such an instance, so an
+    # unpriced one is an instance nothing has decided rather than a saving. A family
+    # that reports every row is not priced at all, because the law asks a question
+    # about masks it does not have.
+    law = law_for(generator, instance, side) if policy.samples else None
     checks = run_checks(
         generator,
         instance,
@@ -304,7 +352,6 @@ def report(
         min_material_rows=thresholds.min_material_rows,
         min_distinguishing=thresholds.min_distinguishing,
         law=law,
-        price_law=priced,
     )
     return Report(
         tag=result.tag,
@@ -313,6 +360,7 @@ def report(
         thresholds=thresholds,
         law=law,
         policy=policy.name,
+        samples=policy.samples,
     )
 
 
@@ -334,6 +382,10 @@ def _refused(generator: Generator, exc: Exception) -> GateResult:
         r_axes=[],
         s_pass=False,
         s_structural="not evaluable",
+        # Nothing was printed, so no printed row is labelled by axis. The refusal this
+        # report stands for is carried by the failed `gates` check beside it rather
+        # than by inventing a label nobody saw.
+        s_axis_labelled=0,
         s_label_resolution_equal=False,
         s_leaks=[],
         s_order_moves=False,
@@ -368,5 +420,6 @@ __all__ = [
     "Report",
     "Thresholds",
     "admitter",
+    "decides",
     "report",
 ]

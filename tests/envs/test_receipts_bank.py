@@ -179,8 +179,21 @@ def test_every_registered_filing_shape_renders() -> None:
 
 
 def test_the_mixed_shape_puts_both_verdicts_on_the_receipt() -> None:
-    built = _bank(1)
-    instance = _population(1).instances[0]
-    raw = bank_mod.review_filing(GENERATOR, instance, "a", "mixed", built.master)
-    graded = bank_mod.render_fork(GENERATOR, instance, "a", raw).graded.decode()
-    assert "PASS" in graded and "FAIL" in graded
+    """A mixed filing is mixed on the table, and the receipt shows both verdicts.
+
+    It is asked of the bank rather than of one instance because the filing is mixed
+    over all twenty four rows while the receipt reports the four a committed mask
+    drew, so a filing that is genuinely mixed can still draw four rows that all
+    passed. Every instance's filing has to be mixed on the table; one of them has to
+    print both verdicts, which is the case a review pack needs.
+    """
+    built = _bank(2)
+    both = 0
+    for instance in _population(2).instances:
+        raw = bank_mod.review_filing(GENERATOR, instance, "a", "mixed", built.master)
+        fork = bank_mod.render_fork(GENERATOR, instance, "a", raw)
+        assert 0.0 < fork.component_score < 1.0
+        graded = fork.graded.decode()
+        assert "PASS" in graded or "FAIL" in graded
+        both += 1 if ("PASS" in graded and "FAIL" in graded) else 0
+    assert both

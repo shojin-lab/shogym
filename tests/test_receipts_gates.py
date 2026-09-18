@@ -122,7 +122,11 @@ def test_an_axis_labelled_receipt_prints_its_own_interpretation() -> None:
     result = _gate("slots-c4")
     assert not result.s_pass
     assert "labelled by axis" in result.s_structural
+    assert result.s_axis_labelled
     assert any("names the axis" in leak for leak in result.s_leaks)
+    # And what the printed form alone says about it, which is the part of S that does
+    # not depend on which rows a receipt happens to report.
+    assert not result.s_form_pass
 
 
 def test_a_row_labelled_receipt_that_merges_passes_s() -> None:
@@ -130,7 +134,28 @@ def test_a_row_labelled_receipt_that_merges_passes_s() -> None:
     assert result.s_pass
     assert result.s_leaks == []
     assert not result.s_order_moves
+    assert not result.s_axis_labelled
     assert "labelled by scored row" in result.s_structural
+    assert result.s_form_pass
+
+
+def test_the_printed_form_part_of_s_is_separable_from_what_it_resolves() -> None:
+    """S's three printed-form checks, held apart from its information equality.
+
+    FAILS IF the two move together. A receipt whose evident rows already reach the
+    whole receipt's resolution fails S and prints nothing about its own
+    interpretation, which is the case a family reporting only some of its rows is
+    admitted over: what its mask drew decides the equality and not the form.
+    """
+    for name in ("one-row", "binary"):
+        result = _gate(name)
+        assert result.s_label_resolution_equal
+        assert not result.s_pass
+        assert result.s_form_pass
+    # And a receipt that does print its own interpretation fails both.
+    labelled = _gate("slots-c3")
+    assert labelled.s_label_resolution_equal
+    assert not labelled.s_pass and not labelled.s_form_pass
 
 
 # ----- 6. the correlated sampler is rejected -----
