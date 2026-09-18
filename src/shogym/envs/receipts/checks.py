@@ -144,6 +144,7 @@ def check_receipt_law(
     instance: Instance,
     min_distinguishing: float = REGISTERED_MIN_DISTINGUISHING,
     law: LawResult | None = None,
+    price: bool = True,
 ) -> CheckResult:
     """What the registered mask law leaves, for a receipt that reports only some rows.
 
@@ -165,6 +166,14 @@ def check_receipt_law(
     with how much its own rows happen to move. Everything the law computes is reported
     here whichever way the check goes, because the numbers are the point.
     """
+    if not price and law is None:
+        # The gates already refused this instance, and an exact walk of every mask it
+        # could have drawn would price a receipt nothing will serve. What the caller
+        # gets is the refusal it already has, said in this check's own words.
+        return CheckResult(
+            "law", False,
+            "the gates refused this instance, so its receipt law was not priced",
+        )
     found = law if law is not None else law_for(generator, instance, "a")
     name, weakest = found.weakest
     if weakest < min_distinguishing:
@@ -469,8 +478,15 @@ def check_copy(
     plain_score = plain.get(best_plain, 0.0)
     flip_score = scores.get("option_flip", 0.0)
     weak = [a for a, value in leverage.items() if value < min_leverage]
+    # The reduced diagnostics are priced for an instance that clears the bar, because
+    # they are what a reader of an ADMITTED family wants beside the number the bar was
+    # read against. An instance the bar already refused is refused whatever they say,
+    # and each one optimizes over the whole closed family a second time.
+    clears = (
+        plain_score <= max_copy_score and flip_score <= max_flip_score and not weak
+    )
     sampled = policy_of(generator).samples
-    reduced = reduced_copy_scores(generator, instance) if sampled else {}
+    reduced = reduced_copy_scores(generator, instance) if sampled and clears else {}
     detail = (
         "%s best %s at %.4f (bar %.4f, over the closed family); alone: %s; "
         "one axis wrong scores %.4f (bar %.4f); leverage %s%s"
@@ -484,7 +500,7 @@ def check_copy(
             max_flip_score,
             ", ".join(f"{a} {v:+.4f}" for a, v in leverage.items()),
             ""
-            if not sampled
+            if not sampled or not reduced
             else "; from the reduced receipt: "
             + ", ".join(f"{name} {reduced[name]:.4f}" for name in REDUCED_MAPS),
         )
@@ -1029,6 +1045,7 @@ def run_checks(
     min_material_rows: int = 1,
     min_distinguishing: float = REGISTERED_MIN_DISTINGUISHING,
     law: LawResult | None = None,
+    price_law: bool = True,
 ) -> list[CheckResult]:
     """Every named check, in the order a reader wants them.
 
@@ -1039,7 +1056,12 @@ def run_checks(
     than the one whoever wrote this module had in mind.
     """
     first: tuple[str, Callable[[], CheckResult]] = (
-        ("law", lambda: check_receipt_law(generator, instance, min_distinguishing, law))
+        (
+            "law",
+            lambda: check_receipt_law(
+                generator, instance, min_distinguishing, law, price_law
+            ),
+        )
         if policy_of(generator).samples
         else ("exercise", lambda: check_exercise(generator, instance))
     )

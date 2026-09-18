@@ -288,6 +288,18 @@ DRAWN_REFERENCE = "drawn"
 REFERENCE_RULES = (ALL_REFERENCES, DRAWN_REFERENCE)
 
 
+#: How many computed laws are kept in memory, and why any are.
+#:
+#: The law is a pure function of the two tables, the drawn convention and the policy, and
+#: it is an exact walk of every mask rather than a sample of them. Verification recomputes
+#: a bank's population by rerunning admission, and a run that verifies several bundles
+#: over one bank walks the same masks for the same answer every time. The key is the two
+#: task identifiers, which are HMACs over the master key and the coordinates, so two banks
+#: under two keys never share an entry and a redrawn instance of the same bank does.
+_CACHE_SIZE = 512
+_CACHE: "dict[tuple[object, ...], LawResult]" = {}
+
+
 def law_for(
     generator: Generator,
     instance: Instance,
@@ -310,6 +322,19 @@ def law_for(
             f"a floor averages over {REFERENCE_RULES}, not {references!r}"
         )
     policy = policy or policy_of(generator)
+    remembered = (
+        type(generator).__qualname__,
+        instance.a.task_id,
+        instance.b.task_id,
+        tuple(sorted(instance.convention.items())),
+        policy.as_record()["name"],
+        policy.as_record()["reported"],
+        side.strip().lower(),
+        references,
+    )
+    known = _CACHE.get(remembered)
+    if known is not None:
+        return known
     task = instance.side(side)
     sibling = instance.side("b" if side.strip().lower() == "a" else "a")
     axes = tuple(axis.name for axis in generator.AXES)
@@ -484,7 +509,7 @@ def law_for(
             missed = comb(rows - moved, reported) / masks if rows - moved >= reported else 0.0
             distinguishing[f"{axis}={option}"] = 1.0 - missed
 
-    return LawResult(
+    found = LawResult(
         tag=f"{instance.generator}/{instance.ordinal}/{task.label}",
         policy=policy.name,
         rows=rows,
@@ -498,6 +523,10 @@ def law_for(
         floor=floor,
         distinguishing=distinguishing,
     )
+    if len(_CACHE) >= _CACHE_SIZE:
+        _CACHE.clear()
+    _CACHE[remembered] = found
+    return found
 
 
 @dataclass(frozen=True)

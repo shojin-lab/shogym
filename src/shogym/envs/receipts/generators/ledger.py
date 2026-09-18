@@ -57,10 +57,10 @@ from shogym.envs.receipts.protocol import (
     Axis,
     Column,
     Filing,
-    FULL_RECEIPT,
     ROW_ADDITIVE_EQUAL_WEIGHT,
     PublicTask,
     ReceiptPolicy,
+    SAMPLED_FOUR_OF_TWENTY_FOUR,
     RowOutcome,
     Shape,
     Task,
@@ -746,9 +746,15 @@ class LedgerGenerator:
     #: two such lists. Declared rather than assumed, because the bar and the family are
     #: one registration and a second genre's answers are not this shape.
     COPY_PROFILE: str = ORDERED_TOKENS
-    #: Which records the receipt reports on. Declared rather than assumed, and refused
-    #: at registration when it is absent.
-    RECEIPT_POLICY: ReceiptPolicy = FULL_RECEIPT
+    #: FOUR RECORDS OF TWENTY FOUR, verdict and correction, and nothing at all on the
+    #: other twenty. A receipt that reports every record identifies the whole convention
+    #: at the first step: a run of 144 triplets graded 0.960 against an oracle of 0.992,
+    #: with 118 of 144 graded copies applying the exact rule, which leaves a later step
+    #: about four hundredths to improve on. What this leaves instead is an ideal reader
+    #: at about 0.82 against a lookup floor of about 0.74, which is room a better way of
+    #: reading the next receipt could fill and which is what the design measures.
+    #: Declared rather than assumed, and refused at registration when it is absent.
+    RECEIPT_POLICY: ReceiptPolicy = SAMPLED_FOUR_OF_TWENTY_FOUR
 
     # ----- the instance -----
 

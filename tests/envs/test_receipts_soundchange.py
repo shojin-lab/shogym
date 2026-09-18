@@ -86,6 +86,14 @@ def test_moving_the_filing_helpers_out_changed_nothing_ledger_does() -> None:
     changed, a repeated identifier, a comma-free filing at full length and at part
     length, prose, a mapping, an unknown identifier, an explicitly empty value and a
     value carrying characters outside printable ASCII.
+
+    TWO OF THE FROZEN VALUES HAVE MOVED SINCE, and exactly two: the task text digest,
+    because the description gained the registered sentence saying that the receipt
+    reports four selected records, and the graded cell digest, because the receipt
+    reports four selected records. Every other value here is the one the extraction
+    froze, including both placebo digests, both oracle digests, every parser reading,
+    every grade, every copy maximum and every leverage, so what this still holds is
+    what it was written to hold.
     """
     frozen = _frozen_ledger()
     generator = ledger.GENERATOR
@@ -1179,10 +1187,11 @@ def _screen_artifact(pairs: int = 40) -> dict:
         "task_seeds": [str(i) for i in range(pairs)],
         "pairs": [
             {"instance": f"task-{i:02d}", "filing": f"filing-{i:02d}",
-             "placebo": 0.4, "graded": 0.6, "oracle": 0.95}
+             "placebo": 0.4, "graded": 0.6, "oracle": 0.95, "ideal": 0.82}
             for i in range(pairs)
         ],
         "min_room": 0.05, "min_ratio": 0.25, "min_pairs": 36,
+        "min_oracle": 0.90, "min_learning_gap": 0.10,
         "floor": 0.0, "floor_rule": "drop",
         "candidates_screened": 1, "selection_note": "",
     }

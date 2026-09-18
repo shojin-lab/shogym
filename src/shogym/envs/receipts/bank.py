@@ -248,6 +248,18 @@ def materialized(
     return bank, population(bank, generator)
 
 
+# THERE IS NO POPULATION CACHE HERE, and one was tried. Verifying several bundles over
+# one bank in one process walks the same ordinals under the same rule for the same
+# answer every time, and remembering the answer per bank record and bars cut a test
+# shard from fourteen minutes to two. It is still wrong. The walk's answer depends on
+# the deciding CODE as well as on the bank and the bars, and a caller that replaces one
+# of the checks in this process gets the answer from before it did: one test does
+# exactly that, to assert that a bank holding an instance a check now refuses cannot be
+# filled, and with the cache in place it was filled. A verification path that can return
+# a stale verdict is worse than a slow one, so the cost was cut where the work is
+# instead.
+
+
 def population(bank: Bank, generator: Generator, thresholds=None) -> Population:
     """The instances this bank holds, by rerunning admission over the ordinals in order.
 

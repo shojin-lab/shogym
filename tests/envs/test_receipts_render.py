@@ -396,10 +396,15 @@ def test_the_scorer_and_the_receipt_read_the_same_canonical_filing() -> None:
     )
     fork = bank_mod.render_fork(GENERATOR, instance, "a", raw)
     graded = fork.graded.decode()
-    passes = sum(1 for o in fork.outcomes if o.matched)
+    # The receipt reports the rows its committed mask drew, and the verdict on each of
+    # them is the one the scorer recorded for that row. The score is still over every
+    # row: what the policy changes is what is reported, not what is graded.
+    reported = [o for o in fork.outcomes if (o.ordinal - 1) in task.mask]
+    passes = sum(1 for o in reported if o.matched)
     assert graded.count("PASS") == passes
-    assert graded.count("FAIL") == len(fork.outcomes) - passes
-    assert fork.component_score == pytest.approx(passes / len(fork.outcomes))
+    assert graded.count("FAIL") == len(reported) - passes
+    scored = sum(1 for o in fork.outcomes if o.matched)
+    assert fork.component_score == pytest.approx(scored / len(fork.outcomes))
 
 
 # ----- the oracle states the rule and can be read back -----

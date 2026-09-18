@@ -144,6 +144,8 @@ result = screen("ledger", Outcomes.from_rows(rows))   # the registered bars
     room  = mean(oracle - placebo)
     gain  = mean(graded - placebo)
     ratio = gain / room
+    oracle_level = mean(oracle)
+    gap   = mean(ideal - graded)
 
 The ratio is a ratio of two **aggregated** differences, never a mean of per-pair ratios. A
 pooled denominator below `floor` is not turned into a ratio at all, under one of three rules
@@ -157,11 +159,20 @@ solves.
 
 **The bars are registered.** What a family must show to earn a roster place is the
 maintainer's call, and the call is `min_room = 0.05` with the bootstrap interval's lower bound
-above zero, `min_ratio = 0.25`, and 36 DISTINCT tasks. The first two are defaults rather than
+above zero, `min_ratio = 0.25`, and 36 DISTINCT tasks, plus `min_oracle = 0.90` on the mean
+executed oracle level and `min_learning_gap = 0.10` on how far the graded level sits below
+`ideal`, with that paired interval's lower bound above zero. They are defaults rather than
 constants, so a diagnostic run can ask what a family does against another bar; a result says
 whether the bars it was judged against were the registered ones. A caller that deals families
 requires the registered ones: recording that a bar was moved is not refusing to deal a family
 admitted under an easier rule, and `receipts_v1` refuses one.
+
+`ideal` is the level a perfect reader of THAT case's receipt reaches on the held-out task,
+carried on the pair row from the gate's exact computation over the registered mask law and
+never measured in the pilot. It is per case because it is a property of that case's tables and
+the policy. A family whose receipt identifies the whole rule carries one, and then the gap bar
+is what says there is nothing left for a later step to read better: the first three bars are
+cleared most emphatically by exactly the family a chain would learn nothing on.
 
 A pair is one task, not one observation of one. `ScreenRun` requires distinct task seeds and
 distinct task instances, because repeated filings against a single table clear the sample floor
