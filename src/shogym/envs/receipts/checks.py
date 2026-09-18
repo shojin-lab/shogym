@@ -878,6 +878,80 @@ def profile_checks(
     ]
 
 
+#: The eleven every family runs, named so the optional extension below can refuse a
+#: declared name that would shadow one of them.
+STANDARD_CHECKS = (
+    "exercise", "materiality", "copy", "fixation", "envelope", "graded", "placebo",
+    "neutral", "oracle", "lint", "invariance",
+)
+
+
+def additional_checks(
+    generator: Generator, instance: Instance, master: bytes, taken: Sequence[str]
+) -> list[tuple[str, Callable[[], CheckResult]]]:
+    """The checks one family declares for itself, beyond the eleven and its profile's.
+
+    OPTIONAL, AND NOT A MEMBER OF THE PROTOCOL. A family with an invariant nothing
+    shared can see declares `ADDITIONAL_CHECKS`, a tuple of names, and a
+    `check_additional(name, instance, master)` that runs one of them. An absent
+    attribute is the empty tuple, so a family that declares none is untouched, and the
+    runtime-checkable protocol does not grow a member most families would not have.
+
+    THE NAMES ARE PART OF THE DECLARATION. A repeated name, a name that shadows one of
+    the eleven or one a profile already brought, and a result returned under a name
+    other than the one asked for are all refused here rather than run: a check whose
+    result can arrive under another check's name is a check that can report a pass
+    somebody else earned. They are refused as failures of the named check rather than
+    as exceptions, because the caller is deciding about a bank and not debugging a
+    module.
+
+    A declared check is PINNED CODE. It runs wherever the eleven run, which is at
+    materialization and again when a bundle rebuilds its population, and the family
+    reaches its implementation by importing it, so the code pin's walk covers it.
+    """
+    declared: tuple[str, ...] = tuple(
+        str(name) for name in (getattr(generator, "ADDITIONAL_CHECKS", ()) or ())
+    )
+    if not declared:
+        return []
+    run_one = getattr(generator, "check_additional", None)
+    if run_one is None:
+        return [(
+            "additional",
+            lambda: CheckResult(
+                "additional", False,
+                "this family declares %s and has no check_additional to run them with"
+                % ", ".join(declared),
+            ),
+        )]
+    out: list[tuple[str, Callable[[], CheckResult]]] = []
+    seen = set(taken)
+    for name in declared:
+        if name in seen:
+            out.append((
+                name,
+                lambda name=name: CheckResult(
+                    name, False,
+                    f"{name!r} is declared twice or shadows a check every family runs",
+                ),
+            ))
+            continue
+        seen.add(name)
+
+        def run(name: str = name) -> CheckResult:
+            result = run_one(name, instance, master)
+            if result.name != name:
+                return CheckResult(
+                    name, False,
+                    f"the family returned a result named {result.name!r} for the check "
+                    f"{name!r}, so a verdict would be recorded under another name",
+                )
+            return result
+
+        out.append((name, run))
+    return out
+
+
 def run_checks(
     generator: Generator,
     instance: Instance,
@@ -907,11 +981,16 @@ def run_checks(
         ("invariance", lambda: check_invariance(generator, instance)),
     ]
     planned.extend(profile_checks(generator, instance))
+    planned.extend(
+        additional_checks(generator, instance, master, [name for name, _ in planned])
+    )
     return [_guarded(name, run) for name, run in planned]
 
 
 __all__ = [
     "COPY_MAPS",
+    "STANDARD_CHECKS",
+    "additional_checks",
     "profile_checks",
     "NO_INDUCTION_MAPS",
     "REPORTED_MAPS",
