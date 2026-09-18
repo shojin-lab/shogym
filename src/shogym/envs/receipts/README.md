@@ -427,6 +427,18 @@ exactly one axis and prints a distinct thing for every option of it: such a row 
 and reading the option off it costs no induction. The derivation is deliberately generous, so
 the floor is high and the gate under-reports headroom rather than over-reporting it.
 
+**Which of the three decide depends on what the receipt reports.** For a family that
+reports every row, all three: there is one receipt and no other it could have served. For a
+family that reports the rows a committed mask drew, what decides is S's printed form, which
+is no row labelled by axis, no vocabulary or grammar leak in the bytes, and a printed order
+that does not move with the convention. R, H and S's information equality are quantities of
+the realized mask. A mask that happens to omit an axis leaves R short and one that happens to
+draw the evident rows leaves no headroom, and such a mask is not redrawn: refusing the
+instance instead is the same filter by another route, and the masks the bank would then hold
+are the masks that happened to be rich. What replaces them is the registered law, read in two
+places, the distinguishing bar in the `law` check and the band over the bank. Every realized
+number is still computed and printed, and `shogym receipts gate` says so under the report.
+
 The gate set is named because it is chain-specific: it implements R, S and H from the
 instrument and deliberately excludes the instrument's later count gate, whose channel is a
 paid mechanism here rather than a defect. Nothing claims the instrument's own verdict.
@@ -583,7 +595,18 @@ bank-mean room above the recomputed lookup floor has to be **above `0.05`**. The
 quantities rather than per-instance ones because one table's ideal level moves with how much
 its own rows happen to move, and reading the band at each instance would refuse tables for
 sitting at the edge of the distribution the band was computed as the centre of. A bank whose
-mean sits outside the band is not filled.
+mean sits outside the band is not filled. A bank of ONE instance reads the band at that
+instance, which is why nothing here freezes one: ledger's own rooms run from about `0.048` to
+`0.093` around a mean well clear of the bar.
+
+**The recomputed floor is the consultation's construction**, and the two agree to nine
+places: the evident rows the reduced receipt shows, plus one all-matched bit per dependence
+class among the rest, the class of empty local dependence included, averaged over every
+canonical reference convention. That class belongs in it because local dependence is derived
+one axis at a time, so a row it finds empty is a row no single-axis alternative moves and a
+joint alternative can still move it. The six run 5 table pairs give `0.753568219`,
+`0.733884414`, `0.751611431`, `0.734439942`, `0.708373223` and `0.767741008`, mean
+`0.741603040`, against an ideal level of `0.817285062`.
 
 The `0.30` is the sampling law's own arithmetic: ledger's weakest registered movement is two
 rows, and a four-row mask misses both with probability `choose(22,4)/choose(24,4)`, so such an
@@ -849,17 +872,6 @@ carry and a policy for either of them has to be priced on its own tables before 
 declared.
 
 Recorded boundaries, held by process rather than by a check:
-
-- **The law-level lookup floor is one construction of several.** It applies the existing
-  lookup-floor construction to the reduced serialized receipt: a row the mask did not draw
-  responds to no axis, so it contributes no column, and the result reproduces the gate's own
-  floor exactly when the policy reports every row. The consultation that priced the policy
-  computed a mean floor 0.0032 higher on the same six table pairs, so its construction is
-  slightly the more generous of the two, in the direction the floor is deliberately generous
-  in. The ideal level and the expected number of consistent conventions reproduce that
-  calculation exactly, and both constructions leave the mean room well above the registered
-  bar, but which of the two a later revision registers is a maintainer's call rather than
-  something the code settles.
 
 - **Which bank was frozen.** `bundle` takes no argument pointing at another bank and `draw`
   takes no seed, but that is the command line and not a proof that nobody chose the key.
