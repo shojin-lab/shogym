@@ -115,19 +115,28 @@ different column headers.
 ## The receipt policy: which rows a receipt reports
 
 A generator declares `RECEIPT_POLICY`, and `registry.load_generator` refuses one that does
-not, the way it refuses one that declares no copy profile. Two policies are registered.
+not, the way it refuses one that declares no copy profile. Three policies are registered.
 
 | Policy | What the graded cell carries |
 |---|---|
 | `full` | a verdict and that row's own answer on **every** printed row |
+| `sampled-2-of-24` | a verdict and that row's own answer on the **two** rows a committed mask drew, and that position's committed neutral tokens in both slots on the other twenty two |
 | `sampled-4-of-24` | a verdict and that row's own answer on the **four** rows a committed mask drew, and that position's committed neutral tokens in both slots on the other twenty |
 
-**Ledger declares the sampled policy. Sound change and every gate vector declare the full
-one**, and keep it until their own arithmetic under a sampled policy has been done: four
-fully reported rows leave an ideal reader at 0.96 on sound change and 0.98 on components,
-because a corrected daughter form exposes the replacement phone and the lost vowel
-directly and because one ternary axis is identified by verdicts alone. Ledger's count does
-not carry to them.
+**The count is registered per generator and the bars are the same for all.** Ledger
+declares four records of twenty four, sound change two forms of twenty four, components
+two rows of twenty four, and every gate vector the full receipt. How many rows a receipt
+has to report before it stops teaching is a property of the family's own tables, not of the shape they share: four
+fully reported rows leave an ideal reader at about 0.82 on ledger and at 0.95 on sound
+change, because a corrected daughter form exposes the replacement phone and the lost
+vowel directly. Two rows of sound change leave 0.849 against a lookup floor of 0.220, and
+they are the only count from one to eight whose bank-mean ideal level sits in the
+registered band. Components is two for a different reason: a board's count is one of the
+two values its own pattern can take, so a verdict alone names the other and any form that
+keeps every verdict saturates, while two reported rows leave 329/368 against a lookup
+floor of 305/368. A count is chosen from a bank's arithmetic before the bank is looked
+at, and a family whose fresh bank fails a bar is not admitted at that count and is not
+admitted at a count chosen afterwards.
 
 **The mask is drawn before any filing and independently of the drawn convention**, from a
 fifth committed stream keyed by the generator, the ordinal and the sibling label. It joins
@@ -141,18 +150,29 @@ the realized receipt: a mask redrawn until every hidden decision had a witness w
 mask the convention could be read off, and the arithmetic the gate does averages over the
 uniform law rather than over a filtered one.
 
-**The task says so.** Under a policy that samples, the ledger description carries one
-registered sentence, after the scope sentence and before the schedule:
+**The task says so.** Under a policy that samples, the description carries one registered
+sentence, after the scope sentence and before the table. `filing.receipt_sentence` holds
+when it is printed and that it is the same bytes in every arm and under every convention;
+the words are the genre's, because a schedule has records and bands where a batch has
+forms and daughter forms:
 
 ```
 The receipt for this schedule reports the verdict and the correct band for four
 selected records only, and the lines for the other records say nothing about
 whether they were right.
+
+The receipt for this batch reports the verdict and the correct daughter form for
+two selected forms only, and the lines for the other forms say nothing about
+whether they were right.
+
+The receipt for this schedule reports the verdict and the correct count for
+two selected rows only, and the lines for the other rows say nothing about
+whether they were right.
 ```
 
-The same bytes in every arm and under every convention, and it names no record: the
-selection is drawn before any filing exists, a reader can see it in the receipt anyway,
-and a reader who could see it in the task could file the rest at random and lose nothing.
+Neither names a row: the selection is drawn before any filing exists, a reader can see it
+in the receipt anyway, and a reader who could see it in the task could file the rest at
+random and lose nothing.
 
 ## Rendering order: what exists when
 
@@ -262,8 +282,18 @@ the renderer with the scorer and cannot catch a scorer that is wrong in both.
 | Check | What it asks |
 |---|---|
 | `cascade` | an independently implemented validator recomputes every answer on all 36 draws and both sides, the forms stay inside the declared grammar, and no printed identifier or correction changes under serialize and read back |
-| `phone_lookup` | giving the reflex and the deleted vowel away for free, on top of the lookup observations the floor already concedes, leaves the floor at or under 0.90 and more than 0.05 of room, at every reference draw and in both directions |
+| `phone_lookup` | giving the reflex and the deleted vowel away for free, on top of the lookup observations the floor already concedes, leaves the floor at or under 0.90 and more than 0.05 of room, at every reference draw and in both directions, and the same of the receipt this family serves |
 | `analogy` | an optimistic reader who transfers A's own edits to every B form with the same skeleton earns at most 0.50 under every draw, in both directions |
+
+**Two of the three read the tables and not the receipt, and the count does not move them.**
+`cascade` recomputes the answers and `analogy` transfers the proto forms' skeletons, so both
+are construction facts about a pair and ask the same question whatever a receipt reports.
+`phone_lookup` reads one side's whole support key, which is what a receipt reporting every row
+prints, so under a count that reports two of twenty four it prices a reader the family does not
+serve. Its lines say so, and the same two bars are put to the served receipt beside them: over
+every mask the registered law can draw, with both readable axes conceded on top of what the
+floor already concedes. On sound change's evidence bank at two reported rows that floor is
+`0.688284` with `0.160965` of room above it.
 
 The disjoint final-consonant pools give the two batches disjoint answers without either side
 reading the other, and they establish **nothing** about copying resistance: the registered
@@ -324,6 +354,190 @@ effect. A high graded arm as well as a high oracle arm leaves little scope for l
 improvement, so the mixed-chain pilot has to report the graded arm's ceiling frequency and the
 available gain by initial state. Corrections are not removed to avoid saturation without a
 separately registered change.
+
+## The genre: `components`, geometric contact connectivity
+
+A schedule of 24 separate 5 by 5 boards, each with one to six occupied cells printed as
+coordinate pairs, and one question per board: how many islands are there. The mechanics of an
+island are completely public. One decision they never make is the hidden convention:
+
+| Axis | Options | The decision |
+|---|---|---|
+| `contact_kernel` | `side_contacts`, `corner_contacts`, `combined_contacts` | which two occupied cells count as touching |
+
+Three conventions. Sibling schedules are two different sets of boards on one notation, scored
+under one draw. Transitivity is the whole of the work: two cells with no direct contact still
+share an island when a path joins them, and a cycle merges nothing extra, so the count is not a
+sum of contacts and cannot be reached by subtracting contacts from cells. Six cells with five
+side contacts can still be two islands.
+
+**The recipe, and what it fixes.** Each side holds six rows on which a shared side answers
+differently from the other two rules, six on which a corner-only rule does, six on which the
+combined rule does, and six invariant boards of mutually separated cells that every rule answers
+alike. Every pair of rules therefore differs on exactly **12 of 24** rows on both siblings, which
+fixes all of the arithmetic: the whole receipt resolves three blocks, no informative row is
+evident, the full-receipt ceiling is 1, the registered lookup floor is 5/6 and H is **1/6**. A
+reader with no receipt does no better than each row's modal count, which is **3/4**; a reader who
+has resolved the rule scores 1; and the ideal oracle-minus-placebo room is **1/4**.
+
+**A catalogue rather than a sampler.** Every subset of one to six of the 25 cells is enumerated,
+245505 of them. A board is informative when exactly two of its three counts agree, and it is then
+classified by its colour-preserving contact graph, where every pair of cells carries a colour for
+a shared side, a shared corner or neither. That gives **46 / 96 / 78** classes in the three
+strata. Boards with no contact at all under any rule are the control pools. "Random small boards"
+is not a specification: isolated cells merge all three rules, pure side chains merge two of them
+and pure diagonal chains merge the other two, and the fixed strata reject those by construction.
+
+**The bounded construction.** For each ordinal the search tries proposals `p = 0..4095`. Each
+proposal samples six classes per stratum for A and six more for B from what is left, so no
+informative contact graph occurs twice within or across the siblings, then draws one coordinate
+embedding per class and one control of each size, with A's control of that size removed from B's
+pool. A proposal is refused when a count occurs more than eight times under any rule on either
+side, or when neither side holds an informative board whose side contacts close a cycle. A
+surviving proposal tries orderings `q = 0..63` and accepts the first whose copy maximum, over
+every rotation of A's filing and of its reversal composed with every bijection of the six counts,
+is at most **12 of 24** under all three rules. Running out is `ConstructionExhausted`, which is a
+named whole-bank failure and never a skipped ordinal or a widened bound. The proposal bound is
+4096 because a keyed sweep of ordinals 0 to 63 under a public test master needed proposal indices
+from 2 to 1047.
+
+**Ledger's receipt geometry, unchanged.** An island count is one byte and the longest coordinate
+list is 35 bytes, but a coordinate list belongs in the task table and never in a receipt field:
+an observed value is the submitted count, not the input pattern. Registered widths are therefore
+12 / 16 / 4 / 12 with a 1100-byte oracle body allowance, which is a 59-byte row line and a
+**2657-byte** envelope, exactly ledger's. That is why this genre moves neither
+`receipts-gates-v3` nor `receipts-render-v2`.
+
+### The six checks this genre adds
+
+`copy_profiles` gives it the `ordered_tokens` profile, because the six counts are a complete
+published vocabulary in a published order. The added checks are brought by the **genre name**
+rather than by the profile, because a profile says what a family's answers are and two families
+can share one and have nothing else in common: a geometry audit run over a schedule of dates
+would be asking a ledger whether its boards are on the board. They live in
+`generators/components_audit.py`, which never imports the production contact predicate: it builds
+its own coordinate neighbourhoods from each option's own name and floods from every unvisited
+cell.
+
+| Check | What it asks |
+|---|---|
+| `components_semantics` | an independent flood fill agrees with the scorer on every row under every rule, every board is nonempty, in range, distinct and no larger than six cells, every key value is in the published vocabulary, and no printed identifier or correction changes under serialize and read back |
+| `components_shape` | both sides hold six rows in each of the three informative strata and six separated controls, realize every count under every rule, keep no count over eight times, hold a side-contact cycle, and share no informative contact graph and no exact board |
+| `components_support` | at each of the three reference rules on both siblings the keys are injective; the serialized receipts REPORTING EVERY ROW are injective and give three blocks, zero evident rows, ceiling 1, floor 5/6 and H 1/6 with exercise holding; movement is exactly 12; the registered mask law leaves 329/368, 305/368, 3/46 and 35/46; and the one-rule-wrong score, the leverage and the registered copy calculation hold across the support |
+| `components_bijection_copy` | the exact maximum over all 48 row moves and all 720 value bijections is at most 12 of 24 under every rule, in both directions, with the attaining transformation printed |
+| `components_analogy` | no informative contact graph occurs on both siblings, so a correction cannot be carried across by recognition, and the public modal fallback that remains scores exactly 3/4 |
+| `components_public_contract` | no committed neutral token normalizes onto a legal answer, a verdict or a status; each task carries its own registered scope sentence and not the other's; identifiers and coordinate lists survive the shared reading; and neither the printed coordinate order nor any of the eight symmetries of the square changes a count |
+
+They are mandatory: they run wherever the eleven common checks run, which is every admission
+report and therefore every bank fill and every bundle reverification. A family whose geometry
+check fails is not admitted on the strength of the common ones.
+
+The registered `ordered_tokens` closure here is exactly six cyclic token maps, which with 48 row
+moves is 288 transformations. `components_bijection_copy` tests 34560 per rule. Island counts are
+genuinely ordered numbers, so the nominal-value objection is less acute here than for a family
+whose answers are destination codes, and the stronger bound is retained anyway rather than making
+substantive disjointness rest on calling a relabelling "ordered".
+
+### One use per chain, and a master key of its own
+
+**The receipt-shaped half of `components_support` is asked of the receipt that reports
+every row.** Which two rows a stream drew is not what a recipe check is about, and
+several of those numbers are deliberately false on masks this policy can draw: a mask
+that drew two of the six controls resolves one block and aliases all three rules, and it
+is not redrawn. So the injectivity, the blocks, the evident rows and the gate's own
+ceiling and floor are computed on the full receipt, which is a fact about six rows of
+each informative type and six controls, and the law beside them is the same recipe's
+statement about what is served. The row recipe makes the law a closed form in the
+reported count alone, so those four numbers are the same on every compliant pair.
+
+**At most one components process per chain**, and that is a release restriction rather than a
+caution. If a previous draw were known and repetition forbidden, two rules would remain, and the
+lookup floor's single all-passed bit separates those two outright: the floor reaches the ceiling
+and H is zero. Adding an axis is not an automatic repair. A second use needs every possible prior
+chain history and the remaining support evaluated first, and a larger support used more than once
+still needs distinct draws and documented conditional evidence.
+
+**A master key of its own, separate from every other genre's.** `draw_convention`'s coordinates
+are the stream label and the ordinal and carry no generator name, so two genres under one key
+draw the *same* rule at every ordinal however different their surfaces are. That is refused where
+the key is recorded: `begin_attempt` refuses a commitment the key history already holds for
+another generator, and a master that is the key of another genre's bank in the same evidence
+directory.
+
+### The review pack for this genre
+
+`components_review.export` writes the first admitted instance's two task texts, all three oracle
+cells, the row count, and the graded, placebo and oracle cells of all seven filing classes on both
+siblings under **each of the three rules**. Each rule's filings are its own, so a canonical filing
+is correct under the rule being shown. The cells taken under the two rules that were not drawn are
+labelled review counterfactuals in the manifest and are offered as coverage of nothing: they show
+what a receipt would have said had that rule been drawn, and no bank member holds them. Beside the
+renders the exporter writes private worksheets, which are not renders and are in no bundle field.
+The pack names no reviewer, so `review.verify` refuses it until a person does.
+
+### The model room screen for this genre
+
+The `screen` command analyzes recorded outcomes and runs no model. **No model screen has been run
+for this genre.** The procedure, in one place for whoever runs it, with
+`components_review.screen_refusals` as the companion audit of the allocation. That audit takes the
+bank's admitted order and the recorded `ScreenRecord` as well as the allocation, and reads the
+identities against the first and the outcomes against the second, because an allocation checked
+against its own fields is an allocation that says whatever it likes. The cases and the recorded
+pairs are matched one to one, with each case naming the pair it executed, an ordinal the
+allocation puts in the final screen and the A filing the record binds to that pair; the release
+statistic is the mean over those matched pairs and over no others, because counting 36 cases
+beside 36 pairs says nothing about which case was which execution:
+
+1. Reserve the **first 12 admitted identities** as an exploratory prefix, at most three per
+   initial state in cyclic order. Unused reserved identities do not become final cases. Freeze
+   the complete instrument and model configuration before final execution; any change after
+   exploration needs the prescribed rebuild and fresh final evidence.
+2. The **next 36 admitted identities** are the final screen. Assign case j, in bank population
+   order, to initial state `j mod 4` with j starting at zero, which gives **nine distinct cases
+   per state** and 36 distinct cases in all. Use the roster's common four frozen initial states
+   with their digests and histories predeclared. Each case is a fresh restoration at zero prior
+   dose and never a continuation of another case.
+3. Execute A once, seal its filing, and make a complete common checkpoint. Resume three copies
+   with graded, byte-matched placebo and oracle payloads from that seal, then give each exactly
+   the same B bytes. There is no B feedback and no further task in a case. Hold model, budgets,
+   tools, standing instructions and continuation policy fixed. That is **36 A executions plus 108
+   B executions, 144 in all**, excluding exploration. Report actual attempts when a failure
+   prevents a later execution, and do not replace an unfortunate filing or a failed branch.
+4. Record the case identities and A filing digests in the standard `ScreenRecord`: family, model,
+   task_seeds and the five pair fields. Use `min_pairs=36`, `min_room=0.05`, `min_ratio=0.25`,
+   `floor=0.0`, `floor_rule="drop"` and a truthful candidate-selection disclosure. Do not add a
+   state field to that strict pair record: a hashed companion allocation binds each identity to
+   its initial-state digest, bank ordinal, source and task digests, sealed checkpoint and
+   execution evidence.
+5. Require mean O minus mean P at least 0.05, its paired 90 percent bootstrap lower endpoint
+   strictly above zero, and `(mean G - mean P) / (mean O - mean P)` at least 0.25, which is a
+   ratio of pooled differences and never an average of case ratios.
+6. **Beside them**, as a predeclared roster-release condition and not a `screen.json` field: mean
+   executed oracle grade at least **0.90**. Report O, P, G, room, gain, saturation and failure
+   counts by initial state as well as pooled. The bundle verifier does not enforce this and the
+   release audit recomputes it from the same sealed outcomes.
+7. Classify errors from observable evidence: a payload rejected as instructions, scope limited to
+   the prior task, a complete key under another rule, mixed counting mistakes, malformed or
+   omitted filings, and execution failure. Match B filings against all three canonical keys and
+   keep any diagnosis that needs prose labelled as human assessment. Preserve ambiguous cases: a
+   high complete-key rate does not by itself separate refusal from a wrongly inferred rule.
+
+The common standing instruction every arm starts with is the registered one, and
+`components_review.STANDING_INSTRUCTION` is what the screen evidence is audited against. **This
+repository does not install it.** The harness that carries standing instructions is a different
+one and still carries the shorter sentence this one replaces, so evidence gathered before it is
+installed is refused by the audit rather than accepted and explained afterwards.
+
+### What this genre does not establish
+
+Small boards and one-digit answers make correct execution attainable and say nothing about
+whether a reader will use the oracle's prose; that is what the screen is for. Only `log2(3)` bits
+are unknown, so easy inference or rapid saturation stays possible and the pilot has to report the
+graded arm's ceiling frequency and the available gain by initial state. The catalogue exclusion
+stops a correction being carried across by recognizing the same complete coloured contact graph;
+it is not a bound on every program that examines geometry and corrections, and comparing candidate
+rules against a collection of corrected boards is the intended induction rather than prohibited
+lookup. A green mathematical fixture is not a filled production bank.
 
 ## Tools (served over MCP)
 
@@ -476,7 +690,14 @@ them, `materialize` refuses them, and the environment refuses to be constructed 
 
 `shogym receipts check <name>` runs eleven for every family, each named separately from the
 gates because failing one means something different, plus whichever further checks the
-generator's declared copy profile brings with it.
+generator's declared copy profile brings with it and whichever its **genre name** brings.
+
+Two dispatches, because they answer different questions. A **profile** says what a family's
+answers are and therefore which maps a copy screen prices, so it brings the checks a cheap reader
+of answers of that kind needs. A **genre** brings the evidence its own hidden function needs, and
+two families can share a profile and have nothing else in common: island counts and ledger's band
+names are both tokens of a complete published vocabulary, and a geometry audit run over a
+schedule of dates would be asking a ledger whether its boards are on the board.
 
 | Check | What it asks |
 |---|---|
@@ -535,7 +756,7 @@ declared profiles live in `copy_profiles.py`:
 
 | Profile | Value maps | Who declares it |
 |---|---|---|
-| `ordered_tokens` | the registered token dictionaries between two published answer orders, closed under composition | `ledger`, the gate vectors |
+| `ordered_tokens` | the registered token dictionaries between two published answer orders, closed under composition | `ledger`, `components`, the gate vectors |
 | `soundchange_v1` | the 36 global character maps: every permutation of the three deletable vowels crossed with every permutation of the three replacement phones | `soundchange` |
 
 A generator added later declares one of these or is refused at registration, and a profile
@@ -722,11 +943,19 @@ eligibility operation, and production, the roster and `shogym receipts verify` a
 - the **review coverage** is enumerated from the rebuilt instances and the family's own
   declarations: every surface template (both pools, since B is served too), every option of
   every axis, every registered filing shape, every row count on either sibling, and at least
-  one counterfactual render. Each named render has to be a file the manifest hashed and large
-  enough to be what it claims: a rendered cell is the envelope size, a task text is hundreds of
-  bytes. A reviewer that is null, blank or not a name is refused when the bundle is built and
-  again when it is read, because `str(None)` is the nonempty string `"None"` and a pack export
-  that lost the attesting person would otherwise arrive with one.
+  one counterfactual render. A family that declares a count adds eleven more, none of which any
+  other category would ever show a reader: a reported row that passed, one that failed, one
+  nobody filed and one filed with an empty value; a row that failed and was suppressed anyway;
+  a receipt whose reported rows witness every axis and one that leaves an axis unwitnessed; a
+  posterior of one convention and a posterior of several with different held-out keys; the mask
+  commitment beside the three cells; and a pair of conventions whose reduced receipts are byte
+  identical, with what that costs on the held-out task. Each named render has to be a file the
+  manifest hashed and large enough to be what it claims: a rendered cell is the envelope size, a
+  task text is hundreds of bytes, and a **document** is material assembled out of committed
+  values for a reader to read rather than anything the family served. A reviewer that is null,
+  blank or not a name is refused when the bundle is built and again when it is read, because
+  `str(None)` is the nonempty string `"None"` and a pack export that lost the attesting person
+  would otherwise arrive with one.
 
 There are no summary fields, and every file has an EXACT field set. Nothing records how many
 ordinals were considered, what fraction passed, how many rows a sibling has, or which stages a
@@ -859,30 +1088,76 @@ position stays controller-side.
 ## Still to build
 
 The frozen manifest release with its pairwise disjointness matrix, the rented-family
-protocol, and the further genres. Two generators are not a roster: the release still needs the
+protocol, and the further genres. Three generators are not a roster: the release still needs the
 pairwise semantic matrix over every implemented hidden axis, the independent validator results,
-the independent master-key provenance, and a named human attestation tying all of it to final
-code and bundle hashes. A registry entry is not admission and a verified bundle is not a roster
-place.
+the independent master-key provenance, the chain-use plan proving that `components` occurs at most
+once and that repeated other generators use distinct draws, and a named human attestation tying
+all of it to final code and bundle hashes. A registry entry is not admission and a verified bundle
+is not a roster place.
 
-The receipt policy is one family's, and the other roster candidates keep the full receipt
-until their own arithmetic is done. Sound change and components are not ledger: four fully
-reported rows leave an ideal reader at 0.96 and 0.98 on them, so ledger's count does not
-carry and a policy for either of them has to be priced on its own tables before it is
-declared.
+Three families now declare a count of their own and each was priced on its own tables:
+four records of twenty four for ledger, two forms of twenty four for sound change, two
+rows of twenty four for components. None is in the recursion roster on the strength of
+that arithmetic. What a count establishes is an information form worth screening;
+whether a model reads a receipt that reports two rows at all is what the actual-model
+screen measures, and none of the three has been screened under its count.
 
 Recorded boundaries, held by process rather than by a check:
 
 - **Which bank was frozen.** `bundle` takes no argument pointing at another bank and `draw`
   takes no seed, but that is the command line and not a proof that nobody chose the key.
-  `materialize` now writes the key and its commitment to a provenance record beside the banks
-  before construction begins, keeps them whether or not the bank fills, and refuses a second
-  attempt until `--reroll` names why, so a reroll is an act somebody has to perform on purpose
-  and a failed attempt is no longer invisible. That is not closure: the bank directory is
-  redirectable by `SHOGYM_RECEIPTS_BANKS`, an operator can delete the record, and a bank record
-  is five fields anyone can write. Closing it takes append-only external provenance the v0 hash
-  set does not have, and publishing the commitment before the bank is built is what that record
-  is shaped for.
+  `materialize` writes the key and its commitment before construction begins and keeps them
+  whether or not the bank fills, in **two** places that are deliberately not one. The record
+  beside the banks is a per-genre summary: it is rewritten when an attempt ends and it moves when
+  the evidence directory moves. The **key history** is neither. It is one file for every genre and
+  every evidence directory, reached through `SHOGYM_RECEIPTS_HISTORY` rather than through the bank
+  directory; it is only ever appended to, so an outcome is a line after the line that recorded the
+  attempt and never a rewrite of it; each line carries the digest of the line before it, so a
+  removed, reordered or edited line is a chain that does not verify and is refused rather than
+  continued; and each started line binds the attempt to the code pin, the gate and renderer
+  labels, the generator's declared construction bounds and the evidence directory it was made in,
+  because the same key under a wider bound or a later renderer is a different attempt at a
+  different instrument.
+
+  `materialize` reads the history rather than the local record, so redirecting
+  `SHOGYM_RECEIPTS_BANKS` no longer turns a second attempt into a first. A second invocation has
+  the acts the procedure allows: `--retry` makes the recorded attempt again under the key it
+  kept, `--reroll REASON` rolls another key and says why, and `--retry --changed REASON` makes an
+  attempt under the kept key at a size, a code pin, an instrument or a construction bound that is
+  not the recorded one. The complete recorded identity is compared before construction, so a
+  plain `--retry` that would change any of those four is refused and names which; a changed
+  attempt is recorded with its own identity. All of them leave the first attempt where it was,
+  and so does `--force`. A key already committed to another genre is refused where it is
+  recorded, in the history or in a bank file beside it.
+
+  An evidence directory made by the build before the history holds its attempts in the local
+  record and nothing in the chain, and the refusal reads the chain, so an upgrade would have
+  rolled a second key and written it down as a first. A genre in that state is refused until the
+  attempts already recorded are reconciled into the chain with `--import-record`, which imports
+  what the earlier record actually held: no code pin, no instrument labels and no construction
+  bounds, because the earlier build wrote none. A retry of an imported attempt is therefore a
+  changed retry.
+
+  Attempts are made one at a time. The claim is a file beside the key history, so two commands
+  pointed at two evidence directories wait on each other rather than both reading a chain with
+  nothing in it and both writing themselves into it as a first attempt. Two commands naming two
+  different histories are two chains and are not serialized by it.
+
+  A line is flushed to the disk, and its directory entry with it, before construction begins,
+  because the attempt it records is the one that may not finish. Every valid prefix of a chain is
+  a valid chain, so removing lines from the END of one breaks nothing the chain itself can see:
+  the file that is left verifies and the genre whose last attempt was in the part removed reads
+  as a genre that has attempted nothing. What says otherwise is a POSITION, the last sequence and
+  the digest of the line at it, retained in two places that are not the history: a file beside it
+  and the record beside the banks. A history shorter than either, or whose line at that sequence
+  is not the one recorded, is refused before construction.
+
+  That is still not closure. An operator who rewrites the history, the position beside it and the
+  record beside the banks has rewritten three files, and an operator who deletes all of them has
+  deleted them; a chain that starts from nothing verifies. What the position adds is that
+  removing lines is no longer a one-file edit that nothing notices. Closing it takes provenance
+  retained where this process cannot reach it, and publishing the commitment before the bank is
+  built is what the record is shaped for.
 
 - **The task text is a stable instance name.** A surface is a pure function of the ordinal, so a
   lineage that remembers a previous link can recognize an instance it has been served before.
@@ -907,6 +1182,9 @@ Recorded boundaries, held by process rather than by a check:
 | `generators/soundchange.py` | the sound change genre: the phone inventory, the three passes, the keyed pair construction and its filter, the four surfaces, the oracle template. |
 | `generators/soundchange_audit.py` | a second implementation of that cascade, the predicates the pair is filtered on, and the three checks the profile adds. |
 | `soundchange_review.py` | the deterministic review pack and the private trace worksheets for that genre. |
+| `generators/components.py` | the components genre: the contact rules, the exact board catalogue, the bounded keyed pair construction, the one surface, the oracle template. |
+| `generators/components_audit.py` | a second implementation of the island count by flood fill, the predicates the pair is filtered on, and the six checks the genre adds. |
+| `components_review.py` | the deterministic review pack and private worksheets for that genre, and the audit of a recorded screen's allocation. |
 | `bank.py` | what is frozen before launch, and the one atomic render after a filing seals. |
 | `bundle.py` | the admission bundle: one addressed directory, and the one verifier over it. |
 | `review.py` | what a review pack has to cover, enumerated from the family's declarations. |

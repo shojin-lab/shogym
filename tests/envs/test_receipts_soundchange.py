@@ -32,6 +32,8 @@ from shogym.envs.receipts.generators import soundchange_audit as audit
 from shogym.envs.receipts.generators.vectors import VECTORS
 from shogym.envs.receipts.protocol import option_mentions
 from shogym.envs.receipts.protocol import (
+    FULL_RECEIPT,
+    SAMPLED_TWO_OF_TWENTY_FOUR,
     ConstructionExhausted,
     Instance,
     PublicTask,
@@ -40,6 +42,7 @@ from shogym.envs.receipts.protocol import (
     receipt_mask,
 )
 from shogym.envs.receipts.oracle import OracleTemplate
+from shogym.envs.receipts.receipt_law import law_for
 from shogym.envs.receipts.streams import digest
 from shogym.envs.receipts.receipt_ast import (
     ReceiptAST,
@@ -53,6 +56,7 @@ from shogym.envs.receipts.registry import FIXTURES as FIXTURES_NAMES
 from shogym.envs.receipts.registry import (
     BANK_DIR_VAR,
     GENRES,
+    HISTORY_VAR,
     bank_path,
     load_generator,
     provenance_path,
@@ -746,16 +750,18 @@ def test_a_thirteen_byte_daughter_survives_serialize_and_read_back() -> None:
     assert len(answer) == 13 > ledger.CORRECTION_WIDTH
     assert soundchange.CORRECTION_WIDTH == 16
 
-    instance = _drawn(0)
+    # Under the full receipt, so that every row's correction is read back out of the
+    # bytes rather than the two the family's own mask happens to draw. The slot width
+    # and the serializer are what this is about, and neither moves with the count.
+    full = _full_policy()
+    instance = draw(full, MASTER, 0)
     task = instance.a
-    identifiers = list(generator_of().row_identifiers(task.table))
+    identifiers = list(full.row_identifiers(task.table))
     longest = max(task.key, key=len)
     blank = "\n".join("%s," % identifier for identifier in identifiers)
-    read = generator_of().parse_and_canonicalize(task, blank)
+    read = full.parse_and_canonicalize(task, blank)
     envelope = frozen_envelope(instance.envelope)
-    ast = generator_of().render_receipt(
-        task, read, task.key, feedback_for(generator_of(), task, envelope)
-    )
+    ast = full.render_receipt(task, read, task.key, feedback_for(full, task, envelope))
     payload = serialize(ast, envelope)
     low, high = envelope.slot_span("correction")
     printed = [
@@ -764,6 +770,32 @@ def test_a_thirteen_byte_daughter_survives_serialize_and_read_back() -> None:
     ]
     assert printed == list(task.key)
     assert longest in printed
+    # And under the count this family serves, the rows the mask drew carry the same
+    # values in the same slot.
+    served = _drawn(0)
+    served_task = served.a
+    served_envelope = frozen_envelope(served.envelope)
+    served_ast = generator_of().render_receipt(
+        served_task,
+        generator_of().parse_and_canonicalize(
+            served_task,
+            "\n".join(
+                "%s," % identifier
+                for identifier in generator_of().row_identifiers(served_task.table)
+            ),
+        ),
+        served_task.key,
+        feedback_for(generator_of(), served_task, served_envelope),
+    )
+    served_printed = [
+        line[low:high].decode("ascii").strip()
+        for line in row_lines(
+            serialize(served_ast, served_envelope), served_ast, served_envelope
+        )
+    ]
+    assert [served_printed[i] for i in served_task.mask] == [
+        served_task.key[i] for i in served_task.mask
+    ]
     # The same value in ledger's narrower slot is a different, shorter string, which is
     # what makes the wider registration load bearing rather than tidy.
     assert len(longest) <= soundchange.CORRECTION_WIDTH
@@ -776,12 +808,29 @@ def generator_of():
     return soundchange.GENERATOR
 
 
+def _full_policy():
+    """The same genre under the full receipt, for a claim that is not about the count.
+
+    The name, the streams, the tables and the answers are the family's, so what this
+    draws is what the family drew; the count is the only thing that moves.
+    """
+    if not soundchange.GENERATOR.RECEIPT_POLICY.samples:
+        return soundchange.GENERATOR
+
+    class FullSoundChange(soundchange.SoundChangeGenerator):
+        RECEIPT_POLICY = FULL_RECEIPT
+
+    return FullSoundChange()
+
+
 def test_every_cell_is_congruent_under_every_filing_class_and_every_draw() -> None:
     """The three cells, over seven filing shapes, 36 conventions and both siblings.
 
     It fails if any byte outside the two registered slots moves, if the graded and
-    placebo cells lose row alignment, if their JSON encoded lengths differ, or if any
-    printed correction is anything but that row's own truth. The encoded length is
+    placebo cells lose row alignment, if their JSON encoded lengths differ, if a
+    reported row's correction is anything but that row's own truth, or if a row the
+    mask did not draw prints anything but that position's committed neutral tokens. The
+    encoded length is
     checked as well as the raw one because the serving contract carries the cells as
     JSON strings, and two cells of one size can encode to two sizes if one of them
     holds a character the encoder escapes.
@@ -821,8 +870,18 @@ def test_every_cell_is_congruent_under_every_filing_class_and_every_draw() -> No
                 )
                 alignment = tuple(r.identifier for r in judged.asts["graded"].rows)
                 assert alignment == generator.row_identifiers(task.table)
-                for row, outcome in zip(judged.asts["graded"].rows, judged.outcomes):
+                neutral = instance.envelope.neutral
+                for position, (row, outcome) in enumerate(
+                    zip(judged.asts["graded"].rows, judged.outcomes)
+                ):
                     printed = {slot.name: slot.value for slot in row.slots}
+                    if position not in task.mask:
+                        # A row the mask did not draw says nothing about correctness,
+                        # and what it prints instead is this position's committed
+                        # neutral token in both slots rather than a token chosen here.
+                        assert printed["verdict"] == neutral["verdict"][position]
+                        assert printed["correction"] == neutral["correction"][position]
+                        continue
                     assert printed["verdict"] == ("PASS" if outcome.matched else "FAIL")
                     assert printed["correction"] == (
                         "" if outcome.matched else outcome.correct
@@ -973,6 +1032,50 @@ def _forms(instance: Instance, side: str) -> tuple[str, ...]:
     return tuple(row.proto for row in instance.side(side).table.rows)
 
 
+def _sampled():
+    """The sound change family under the sampled policy.
+
+    A subclass while the family itself still declares the full receipt, and the family
+    once it declares the sampled one. The mask stream is keyed by the generator's NAME,
+    which does not change, so the rows this draws are the rows the family draws.
+    """
+    if soundchange.GENERATOR.RECEIPT_POLICY.samples:
+        return soundchange.GENERATOR
+
+    class SampledSoundChange(soundchange.SoundChangeGenerator):
+        RECEIPT_POLICY = SAMPLED_TWO_OF_TWENTY_FOUR
+
+    return SampledSoundChange()
+
+
+def test_the_readable_axes_are_given_away_on_the_receipt_that_is_served() -> None:
+    """Under a sampled policy the stronger lookup is priced over the mask law too.
+
+    FAILS IF a family whose receipt reports two forms of twenty four is asked only what
+    a reader of all twenty four corrected forms could do. That reader is not the one
+    the family serves, so its numbers are a stress test and the same question has to be
+    put to the receipt that is served: over every mask the registered law can draw,
+    with the reflex and the deleted vowel conceded on top of what the floor already
+    concedes. It also fails if the full-key half stops saying which reader it priced,
+    which would leave two floors in one line with nothing to tell them apart.
+    """
+    generator = _sampled()
+    instance = draw(generator, MASTER, 0)
+    assert len(instance.a.mask) == 2
+    measured = audit.check_phone_lookup(generator, instance)
+    assert measured.passed, measured.detail
+    assert "full key, a stress test under this policy" in measured.detail
+    assert "over all 276 masks" in measured.detail
+
+    found = law_for(generator, instance, "a", given=audit.READABLE_AXES)
+    assert "augmented floor %.6f" % found.augmented in measured.detail
+    assert found.augmented_room > audit.MIN_LOOKUP_ROOM
+
+    full = audit.check_phone_lookup(soundchange.GENERATOR, _drawn(0))
+    if not soundchange.GENERATOR.RECEIPT_POLICY.samples:
+        assert "over all 276 masks" not in full.detail
+
+
 def test_a_sibling_made_by_renaming_inert_consonants_is_refused() -> None:
     """The disjoint final consonants are not the obstacle, and are not evidence.
 
@@ -1016,6 +1119,7 @@ def test_the_key_is_recorded_before_the_bank_is_built_and_kept_when_it_is_not(
     reroll for a friendlier bank is the one thing an operator can do that no hash sees.
     """
     monkeypatch.setenv(BANK_DIR_VAR, str(tmp_path))
+    monkeypatch.setenv(HISTORY_VAR, str(tmp_path / "key-history.jsonl"))
     record = provenance_path("soundchange")
 
     # A construction that cannot finish: the attempt is refused by name, the key is kept,
@@ -1037,6 +1141,7 @@ def test_the_key_is_recorded_before_the_bank_is_built_and_kept_when_it_is_not(
     # A second attempt under the same record is refused until the reroll is named.
     monkeypatch.undo()
     monkeypatch.setenv(BANK_DIR_VAR, str(tmp_path))
+    monkeypatch.setenv(HISTORY_VAR, str(tmp_path / "key-history.jsonl"))
     assert _cli(["receipts", "materialize", "soundchange", "--size", "1"]) == 1
     assert "--reroll" in capsys.readouterr().out
     assert len(bank_mod.read_provenance(record)["attempts"]) == 1
@@ -1069,6 +1174,7 @@ def test_two_attempts_at_once_keep_both_keys_and_neither_is_an_unnamed_reroll(
     did not happen, which is the whole of what the record is kept for.
     """
     monkeypatch.setenv(BANK_DIR_VAR, str(tmp_path))
+    monkeypatch.setenv(HISTORY_VAR, str(tmp_path / "key-history.jsonl"))
     record = provenance_path("soundchange")
     constructing = threading.Event()
     give_up = threading.Event()
@@ -1456,3 +1562,55 @@ async def test_a_filing_an_independent_validator_believes_seals_at_one(
         assert feedback["no_filing"] == "no_known_identifier"
     finally:
         await unread.close()
+
+
+def test_the_pack_shows_what_a_receipt_of_two_forms_does(frozen, tmp_path: Path) -> None:
+    """The eleven a sampled family's pack has to carry, in this genre's own rows.
+
+    FAILS IF the pack misses any of the eleven, if a reported row's cell does not show
+    the verdict the case names, if the suppressed failure is offered as a cell rather
+    than as the document that says which rows failed, or if the pair of cascades the
+    receipt cannot tell apart render two different cells. The last is the point of the
+    policy rather than a defect in it, and a pack that could not show it would be
+    hiding what the family does.
+    """
+    bank, held, _ = frozen
+    room = tmp_path / "sampled"
+    pack = soundchange_review.export(bank, held, room)
+    manifest = json.loads(pack.read_text(encoding="utf-8"))
+    sampled = {
+        entry["key"]: entry
+        for entry in manifest["renders"]
+        if entry["category"] == "sampled"
+    }
+    assert sorted(sampled) == sorted(review.SAMPLED_CASES)
+    assert len(review.SAMPLED_CASES) == 11
+    for key, entry in sampled.items():
+        assert entry["kind"] in ("cell", "document"), key
+        assert (room / entry["path"]).exists(), key
+
+    envelope = soundchange.ENVELOPE_SIZE
+    for case in review.SAMPLED_CASES[:4]:
+        assert sampled[case]["kind"] == "cell"
+        assert (room / sampled[case]["path"]).stat().st_size == envelope
+    for case in review.SAMPLED_CASES[4:]:
+        assert sampled[case]["kind"] == "document"
+
+    first = held.instances[0]
+    reported = [position + 1 for position in first.a.mask]
+    passed = (room / sampled[review.SAMPLED_CASES[0]]["path"]).read_text("ascii")
+    failed = (room / sampled[review.SAMPLED_CASES[1]]["path"]).read_text("ascii")
+    unfiled = (room / sampled[review.SAMPLED_CASES[2]]["path"]).read_text("ascii")
+    empty = (room / sampled[review.SAMPLED_CASES[3]]["path"]).read_text("ascii")
+    assert passed.count("PASS") == len(reported)
+    assert failed.count("FAIL") == len(reported)
+    assert unfiled.count(soundchange.UNFILED_TOKEN) == len(reported)
+    assert empty.count(soundchange.BLANK_TOKEN) == len(reported)
+
+    suppressed = (room / sampled[review.SAMPLED_CASES[4]]["path"]).read_text("ascii")
+    assert "says nothing about any of them" in suppressed
+    assert suppressed.count("FAIL") == 0
+
+    aliased = (room / sampled[review.SAMPLED_CASES[10]]["path"]).read_text("ascii")
+    assert "render the cell below byte for byte" in aliased
+    assert "disagree on" in aliased

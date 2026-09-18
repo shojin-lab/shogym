@@ -66,6 +66,7 @@ default buried here would quietly become that call.
 from __future__ import annotations
 
 from dataclasses import dataclass
+from functools import partial
 from types import MappingProxyType
 from typing import Callable, Mapping, Sequence
 
@@ -1025,6 +1026,32 @@ def profile_checks(
     ]
 
 
+def genre_checks(
+    generator: Generator, instance: Instance
+) -> list[tuple[str, Callable[[], CheckResult]]]:
+    """The checks one GENRE adds, dispatched by its name rather than by its copy profile.
+
+    BY NAME, AND NOT BY PROFILE. A profile says what a family's answers are and therefore
+    which maps a copy screen prices, and two families can share one and have nothing else
+    in common: island counts and ledger's band names are both tokens of a complete
+    published vocabulary, and a geometry audit run over a ledger table would be asking a
+    schedule of dates whether its boards are on the board. So the profile brings the copy
+    family, and a genre brings the evidence its own hidden function needs.
+
+    These are mandatory. They run wherever the eleven common checks run, which is every
+    admission report and therefore every bank fill and every bundle reverification, and a
+    family whose geometry check fails is not admitted on the strength of the common ones.
+    """
+    if getattr(generator, "name", "") != "components":
+        return []
+    from shogym.envs.receipts.generators import components_audit
+
+    return [
+        (name, partial(run, generator, instance))
+        for name, run in components_audit.CHECKS
+    ]
+
+
 def run_checks(
     generator: Generator,
     instance: Instance,
@@ -1071,11 +1098,13 @@ def run_checks(
         ("invariance", lambda: check_invariance(generator, instance)),
     ]
     planned.extend(profile_checks(generator, instance))
+    planned.extend(genre_checks(generator, instance))
     return [_guarded(name, run) for name, run in planned]
 
 
 __all__ = [
     "COPY_MAPS",
+    "genre_checks",
     "profile_checks",
     "NO_INDUCTION_MAPS",
     "REDUCED_MAPS",

@@ -34,7 +34,7 @@ import argparse
 import functools
 import math
 from pathlib import Path
-from typing import Callable
+from typing import Any, Callable, Mapping
 
 from shogym.envs.receipts import admission as admission_mod
 from shogym.envs.receipts import bank as bank_mod
@@ -46,9 +46,11 @@ from shogym.envs.receipts.protocol import ConstructionExhausted
 from shogym.envs.receipts.registry import (
     FIXTURES,
     GENRES,
+    bank_dir,
     bank_path,
     bundle_dir,
     bundles,
+    history_path,
     is_fixture,
     load_generator,
     provenance_path,
@@ -74,8 +76,28 @@ def add_parser(sub: argparse._SubParsersAction) -> None:
         "--reroll", default=None, metavar="REASON",
         help="roll a second key for this genre, saying why. The whole gate universe is "
              "a function of the key, so a second roll is an act that has to be named: "
-             "without this a genre whose provenance already records an attempt is "
+             "without this a genre whose history already records an attempt is "
              "refused, whether the first one filled or not",
+    )
+    made.add_argument(
+        "--retry", action="store_true",
+        help="make the attempt this genre's history already records again, under the key "
+             "it retained, rather than rolling another. This is the other thing a second "
+             "invocation may do: reproduce the recorded attempt, or refuse",
+    )
+    made.add_argument(
+        "--import-record", action="store_true", dest="import_record",
+        help="reconcile the attempts a local provenance record holds into the key "
+             "history before reading it. An evidence directory made before this build "
+             "kept a history holds attempts the history has never seen, and a genre in "
+             "that state is refused until they are in the chain",
+    )
+    made.add_argument(
+        "--changed", default=None, metavar="REASON",
+        help="qualify a --retry whose size, code pin, instrument or construction bounds "
+             "are not the recorded attempt's, saying why. The key is still the one that "
+             "attempt kept and the result is a SECOND attempt with its own identity, "
+             "recorded beside the first rather than in place of it",
     )
 
     gated = inner.add_parser(
@@ -515,18 +537,66 @@ def _list() -> int:
     return 0
 
 
+def _attempt_differences(
+    recorded: Mapping[str, Any],
+    size: int,
+    code: str,
+    instrument: Mapping[str, str],
+    bounds: Mapping[str, Any],
+) -> list[str]:
+    """Where this invocation is not the attempt the history recorded. Empty when it is.
+
+    One line per part, rather than one line saying the identities differ, because the
+    operator's next act depends on which part moved: a size is a flag they typed, a code
+    pin is the build they are standing in, and an instrument label is a renderer or a
+    gate set that was revised under them.
+    """
+    out: list[str] = []
+    if int(recorded.get("size", -1)) != int(size):
+        out.append(
+            "it records size %r and this invocation asks for %d"
+            % (recorded.get("size"), size)
+        )
+    if str(recorded.get("code", "")) != code:
+        out.append(
+            "it records code pin %s and this build is %s"
+            % (str(recorded.get("code", ""))[:16] or "nothing", code[:16])
+        )
+    stated = dict(recorded.get("instrument") or {})
+    for name in sorted(set(stated) | set(instrument)):
+        if stated.get(name) != instrument.get(name):
+            out.append(
+                "it records %s %r and this build carries %r"
+                % (name, stated.get(name), instrument.get(name))
+            )
+    held = dict(recorded.get("bounds") or {})
+    if held != dict(bounds):
+        out.append(
+            "it records construction bounds %r and this build declares %r"
+            % (held, dict(bounds))
+        )
+    return out
+
+
 def _one_attempt_at_a_time(
     command: Callable[[argparse.Namespace], int],
 ) -> Callable[[argparse.Namespace], int]:
-    """Run a materialization under the claim on its genre's evidence directory.
+    """Run a materialization under the claim on the key history it authorizes itself by.
 
     THE WHOLE COMMAND, AND NOT ONLY THE CHECK. The refusal that makes a second key an
-    act with a name is a read of the provenance record followed by a write of it, and
-    the attempt itself sits between them: two commands started together both read a
-    record with nothing in it, so neither of them was a reroll, and the key the second
-    one wrote down replaced the first one's. Holding the claim from before the check
-    until after the attempt has been recorded is what leaves the second command reading
-    what the first one wrote.
+    act with a name is a read of the history followed by an append to it, and the
+    attempt itself sits between them: two commands started together both read a history
+    with nothing in it, so neither of them was a reroll, and both wrote themselves down
+    as the first attempt. Holding the claim from before the check until after the
+    outcome has been recorded is what leaves the second command reading what the first
+    one wrote.
+
+    THE CLAIM IS THE HISTORY'S AND NOT THE RECORD'S. The record beside the banks moves
+    when the evidence directory moves, and the history is the one file every evidence
+    directory on this machine appends to, so a claim named for the record leaves two
+    commands pointed at two directories authorizing themselves at once against one
+    chain. The foreign-key exclusion, the local record and the append are all inside
+    this one claim rather than under a second one of their own.
 
     A gate vector has no bank, no record and no key, and the command refuses it by name,
     so it takes no claim.
@@ -537,7 +607,7 @@ def _one_attempt_at_a_time(
         if is_fixture(args.name):
             return command(args)
         try:
-            with bank_mod.one_attempt(provenance_path(args.name)):
+            with bank_mod.one_attempt(history_path()):
                 return command(args)
         except bank_mod.AttemptInProgress as busy:
             print(str(busy))
@@ -564,42 +634,186 @@ def _materialize(args: argparse.Namespace) -> int:
             "no bank"
         )
         return 1
+    if args.retry and args.reroll:
+        print(
+            "--retry makes the recorded attempt again under the key it kept and --reroll "
+            "rolls a new one. They are two different acts, so name one of them"
+        )
+        return 1
+    if args.changed and not args.retry:
+        print(
+            "--changed qualifies a --retry: it says which part of the attempt the history "
+            "records this invocation changes. On its own it names nothing, so say --retry "
+            "as well or roll a key with --reroll"
+        )
+        return 1
     path = bank_path(args.name)
     if path.is_file() and not args.force:
         print(f"{path} already holds a frozen bank; pass --force to replace it")
         return 1
     record = provenance_path(args.name)
-    previous = bank_mod.read_provenance(record)["attempts"]
-    if previous and not args.reroll:
+    history = history_path()
+    broken = bank_mod.history_problems(history)
+    if broken:
+        print(f"the key history at {history} does not verify: {'; '.join(broken[:3])}")
         print(
-            "%s already records %d key attempt(s) at %s, the last one %s. Rolling "
-            "another key draws another gate universe, so say why: "
+            "a history that has been edited is not appended to, because an honest line on "
+            "top of it would not say where it stopped being the record"
+        )
+        return 1
+    # AND THE POSITION THE RECORD RETAINED, which is in the evidence directory and not
+    # beside the history. Every valid prefix of a chain is a valid chain, so the lines
+    # removed from the end of one are the lines it cannot say were ever there; the two
+    # retained positions are what say it, and they are checked before construction
+    # because an attempt begun on a shortened chain is an attempt recorded onto it.
+    shortfall = bank_mod.position_problems(
+        history, bank_mod.retained_position(record)
+    )
+    if shortfall:
+        print(
+            "the key history at %s is behind the position %s retains: %s"
+            % (history, record, "; ".join(shortfall))
+        )
+        print(
+            "the record beside the banks and the position beside the history are two "
+            "places the same line is written down, and a chain shorter than both of "
+            "them is not the chain they were written from"
+        )
+        return 1
+    # THE HISTORY AND NOT THE LOCAL RECORD. The record beside the banks moves when the
+    # evidence directory moves, so a second invocation pointed somewhere fresh would be a
+    # first attempt again; the history is one file for every directory this machine has
+    # used, so the refusal below survives the one thing that used to get past it.
+    previous = bank_mod.history_attempts(history, args.name)
+    # AND THE RECORD MAY PREDATE THE HISTORY. An evidence directory made by the build
+    # before it holds its attempts in the local record and nothing in the chain, and the
+    # refusal below reads the chain, so an upgrade would roll a second key and write it
+    # down as a first. The attempts that are there are reconciled into the chain by an
+    # act with a name, and until they are the genre is refused.
+    local = [
+        attempt for attempt in bank_mod.read_provenance(record)["attempts"]
+        if str(attempt.get("generator") or args.name) == args.name
+    ]
+    if local and not previous:
+        if not args.import_record:
+            print(
+                "%s records %d attempt(s) at %s and the key history at %s records none, "
+                "so this evidence directory was made before the history existed"
+                % (args.name, len(local), record, history)
+            )
+            print(
+                "a key that was rolled is a key the next attempt comes after, so the "
+                "attempts already recorded are reconciled into the chain with "
+                "--import-record and this invocation is refused until they are"
+            )
+            return 1
+        try:
+            added = bank_mod.import_record(
+                history, record, args.name, banks=bank_dir()
+            )
+        except ValueError as exc:
+            print(f"the record at {record} was not imported: {exc}")
+            return 1
+        print(
+            "imported %d attempt(s) from %s into the key history at %s"
+            % (len(added), record, history)
+        )
+        previous = bank_mod.history_attempts(history, args.name)
+    elif args.import_record:
+        print(
+            f"there is nothing at {record} the key history does not already hold, so "
+            "this invocation imports nothing"
+        )
+    if previous and not (args.reroll or args.retry):
+        last = previous[-1]
+        print(
+            "%s already records %d key attempt(s) at %s, the last one %s under commitment "
+            "%s. A second invocation either makes that attempt again under the key it "
+            "kept, with --retry, or rolls another key and says why, with "
             "--reroll \"the reason\""
-            % (args.name, len(previous), record, previous[-1]["outcome"])
+            % (args.name, len(previous), history, last["outcome"], last["commitment"])
         )
         return 1
     generator = load_generator(args.name)
-    master = streams.new_master_key()
+    code = bank_mod.code_pin(generator)["digest"]
+    instrument = {
+        "gates": bank_mod.GATE_LABEL,
+        "renderer": bank_mod.RENDERER_CONFIGURATION,
+    }
+    bounds = dict(getattr(generator, "CONSTRUCTION_BOUNDS", {}))
+    if args.retry:
+        if not previous:
+            print(
+                f"{args.name} has no recorded attempt at {history} to make again; this "
+                "invocation is its first"
+            )
+            return 1
+        last = previous[-1]
+        master = bytes.fromhex(last["master"])
+        # THE KEY IS NOT THE ATTEMPT. What names an attempt is the key AND everything it
+        # was made with, and this invocation supplies all of the rest of that from the
+        # command line and the build: the size asked for, the code pin of the generator
+        # as it is now, the gate and renderer labels this build carries and the
+        # generator's declared construction bounds. Keeping the key while any of them
+        # moved makes a second attempt wearing the first one's name, which is exactly
+        # what the recorded identity exists to tell apart.
+        moved = _attempt_differences(last, args.size, code, instrument, bounds)
+        if moved and not args.changed:
+            print(
+                "%s records attempt %s and this invocation is not it: %s"
+                % (args.name, str(last["attempt"])[:16], "; ".join(moved))
+            )
+            print(
+                "--retry makes the recorded attempt again. An attempt under the key it "
+                "kept at something else is a different attempt, and it is made by naming "
+                "the change with --changed \"the reason\", which records it beside the "
+                "first rather than in place of it"
+            )
+            return 1
+        if args.changed and not moved:
+            print(
+                "--changed says which part of the recorded attempt this invocation "
+                "changes, and this invocation changes none of it. It is the recorded "
+                "attempt, so make it with --retry alone"
+            )
+            return 1
+        note = (
+            "changed retry of attempt %s: %s" % (str(last["attempt"])[:16], args.changed)
+            if args.changed
+            else "retry of attempt %s" % str(last["attempt"])[:16]
+        )
+    else:
+        master = streams.new_master_key()
+        note = args.reroll or "first attempt"
     attempt = bank_mod.begin_attempt(
-        record, args.name, master, args.size, args.reroll or "first attempt"
+        record, args.name, master, args.size, note,
+        history=history,
+        code=code,
+        instrument=instrument,
+        bounds=bounds,
+        banks=bank_dir(),
     )
     try:
         # The population comes back from the fill rather than from a second walk of
         # the same ordinals: admission is what costs, and it has already run.
         built, found = bank_mod.materialized(generator, master, args.size)
     except ConstructionExhausted as exc:
-        bank_mod.finish_attempt(record, attempt, bank_mod.FAILED, str(exc))
+        bank_mod.finish_attempt(
+            record, attempt, bank_mod.FAILED, str(exc), history=history
+        )
         print(f"this family could not be constructed: {exc}")
-        print(f"the key that attempt was made under is kept at {record}")
+        print(f"the key that attempt was made under is kept at {record} and {history}")
         return 1
     except ValueError as exc:
-        bank_mod.finish_attempt(record, attempt, bank_mod.FAILED, str(exc))
+        bank_mod.finish_attempt(
+            record, attempt, bank_mod.FAILED, str(exc), history=history
+        )
         print(f"this bank cannot be filled: {exc}")
-        print(f"the key that attempt was made under is kept at {record}")
+        print(f"the key that attempt was made under is kept at {record} and {history}")
         return 1
     written = bank_mod.save_bank(built, path)
     bank_mod.finish_attempt(
-        record, attempt, bank_mod.FILLED, f"bank digest {written}"
+        record, attempt, bank_mod.FILLED, f"bank digest {written}", history=history
     )
     print(f"materialized {built.size} instances of {args.name} at {path}")
     print(f"bank digest {written[:16]}, ordinals {list(found.ordinals)}")
@@ -609,6 +823,21 @@ def _materialize(args: argparse.Namespace) -> int:
     print(
         "key commitment %s, attempt %d recorded at %s"
         % (bank_mod.key_commitment(master), attempt, record)
+    )
+    print(
+        "attempt %s appended to the key history at %s"
+        % (
+            bank_mod.attempt_identity(
+                args.name, master, args.size,
+                bank_mod.code_pin(generator)["digest"],
+                {
+                    "gates": bank_mod.GATE_LABEL,
+                    "renderer": bank_mod.RENDERER_CONFIGURATION,
+                },
+                getattr(generator, "CONSTRUCTION_BOUNDS", {}),
+            )[:16],
+            history,
+        )
     )
     print(
         "%.1f%% of %d ordinals considered passed %s"

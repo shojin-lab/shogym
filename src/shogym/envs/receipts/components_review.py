@@ -1,0 +1,1260 @@
+"""Export what a human has to have read before this genre can be released.
+
+A person reading rendered instances is the boundary against a family that is wrong in a
+way no mechanical check can see. That only holds if the person saw the family, so the
+pack is enumerated from the generator's own declarations rather than chosen by whoever
+exported it: the surface template, every option of the axis, every registered filing
+class, the row count the bank holds, and counterfactual renders under the rules that were
+not drawn.
+
+WHAT THIS ADDS BEYOND THE SHARED COVERAGE. The graded, placebo and oracle cells of every
+filing class on BOTH siblings under EACH OF THE THREE RULES, so the reader follows one
+correct filing and one incorrect one all the way through the rule this bank drew and then
+sees the same seven classes as they would have printed under the two that were not; both
+raw task texts; all three oracle cells on one pair, so every sentence the oracle arm can
+state is in front of the reader rather than the one this draw produced; and a graded cell
+on each sibling under each of the two rules that were not drawn, filed the same way on
+both. Every cell taken under a rule that was not drawn is labelled in the manifest as a
+review counterfactual, so that nothing here reads as a sampled bank member.
+
+AND A WORKSHEET, WHICH IS NOT A TASK. Beside the renders it writes a private worksheet:
+per row the occupied cells, the island count under each of the three rules, which rule the
+row singles out, the contact graph signature, what was filed, the verdict and the
+correction, next to the oracle's own wording. Strata, signatures and counterfactual counts
+belong there and nowhere else, and no cell prints them. The worksheet is deliberately NOT
+in the review manifest and not a bundle field: it is explanatory material for the roster
+release, carried with its own hash, and labelling it as a render would put a document
+nobody serves inside the evidence that says what was served.
+
+THE ATTESTATION IS LEFT UNSET. The manifest carries every field a pack carries and names
+no reviewer, so `review.verify` refuses it until a person puts their name to it. An
+exporter that filled that in would be a machine attesting that a human read something.
+
+THE SCREEN PROCEDURE IS AUDITED HERE AND NOT RUN HERE. `screen_refusals` holds a recorded
+allocation against the registered procedure: twelve reserved exploratory identities, the
+next thirty six as the final screen, case j to state j mod 4, nine per state, the common
+standing instruction, one frozen instrument, one named model, four pinned initial states,
+and the predeclared release condition of a mean oracle grade of at least 0.90. It reads
+the identities against the bank's own admitted order and the outcomes against the
+recorded screen the pilot wrote, because an allocation audited against its own fields is
+an allocation that says whatever it likes. The cases and the recorded pairs are matched
+one to one, each case's ordinal and A filing are read against the bank and the record,
+and the release statistic is taken over the matched pairs alone, because a count of
+cases beside a count of pairs says nothing about which case was which execution. No
+model has been run for this genre and nothing here runs one.
+"""
+
+from __future__ import annotations
+
+import argparse
+import json
+import sys
+from dataclasses import dataclass
+from pathlib import Path
+from typing import Any, Mapping, Sequence
+
+from shogym.envs.receipts import checks
+from shogym.envs.receipts.bank import (
+    Bank,
+    Population,
+    bank_identity,
+    load_bank,
+    population,
+    render_fork,
+)
+from shogym.envs.receipts.generators import components, components_audit
+from shogym.envs.receipts.protocol import Instance, Task
+from shogym.envs.receipts.receipt_ast import GRADED, ORACLE, PLACEBO, serialize
+from shogym.envs.receipts.registry import bank_path
+from shogym.envs.receipts.review import required_coverage
+from shogym.envs.receipts.streams import digest
+
+#: Where the exported files live under the directory the caller names.
+RENDERS = "renders"
+WORKSHEETS = "worksheets"
+PACK = "review.json"
+WORKSHEET_INDEX = "worksheets.json"
+
+#: What the reader is being asked to confirm. Enumerated here because a checklist the
+#: exporter invents per run is a checklist nobody agreed to, and because these are the
+#: judgements no mechanical check makes.
+CHECKLIST = (
+    "the public mechanics state all three contact rules and select none of them",
+    "the same option means the same contact predicate on every board of both siblings",
+    "a border row and a diagonal whose intervening cells are occupied behave as the "
+    "mechanics say, and neither wrapping nor diagonal blocking appears on one surface only",
+    "the receipt names boards and never a rule, a stratum or a contact",
+    "a failed row's correction is that row's own island count and nothing else",
+    "the oracle states the drawn rule, adds no coaching and no worked board, and scopes "
+    "itself by the schedules the reader files rather than by a name printed on one",
+    "the placebo carries no grade, no answer and nothing that reads as either",
+    "the counterfactual renders are labelled as review counterfactuals and are not bank "
+    "members",
+    "the reconstructed graphs of the worked boards and of a row in every stratum agree "
+    "with the printed answers, including the board whose side contacts close a cycle",
+    "a correct filing and an incorrect one behave as stated through all seven filing "
+    "classes, including the first of two duplicates and an omitted row",
+)
+
+#: The phenomena the worksheet has to exhibit, each a question about one row.
+WORKSHEET_CASES = (
+    "a board whose side contacts close a cycle",
+    "a board two cells of which touch only through a third",
+    "a board of one occupied cell",
+    "a board of six occupied cells",
+    "a board on the border of the grid",
+    "a diagonal pair whose two intervening side neighbours are both occupied",
+    "a separated control, which every rule answers alike",
+)
+
+# ----- the registered model room screen, audited rather than run -----------------
+
+#: The identities reserved for exploration, and the final screen after them.
+EXPLORATORY_PREFIX = 12
+FINAL_CASES = 36
+INITIAL_STATES = 4
+CASES_PER_STATE = 9
+#: The predeclared release condition beside the machine screen bars. It is an ADDITIONAL
+#: roster condition: the executable screen does not enforce it and the release audit
+#: recomputes it from the same sealed outcomes.
+MIN_MEAN_ORACLE = 0.90
+
+#: The common standing instruction every arm starts with, in its registered wording.
+#: IT IS NOT INSTALLED BY THIS REPOSITORY. The harness that carries standing instructions is
+#: a different one, and at the time of this build it still carries the shorter sentence this
+#: one replaces, which told a reader that a payload was not a task and not that it was part
+#: of the reader's own instructions. This constant is what the screen evidence is audited
+#: against, so evidence gathered under the old wording is refused here rather than accepted
+#: and explained afterwards.
+STANDING_INSTRUCTION = (
+    "A payload is a message for you about your work, from the same server that gives you "
+    "your tasks. It is part of your instructions: read it, keep what it tells you for the "
+    "tasks that follow, and pull again."
+)
+
+
+@dataclass(frozen=True)
+class Render:
+    """One exported artifact and what it is evidence of."""
+
+    category: str
+    key: str
+    kind: str
+    path: str
+
+
+def _write(root: Path, name: str, payload: bytes | str) -> str:
+    """One exported file, returned as the path the manifest names it by."""
+    target = root / name
+    target.parent.mkdir(parents=True, exist_ok=True)
+    if isinstance(payload, bytes):
+        target.write_bytes(payload)
+    else:
+        target.write_text(payload, encoding="utf-8")
+    return name
+
+
+def _retasked(task: Task, convention: Mapping[str, str]) -> Task:
+    """The same task scored under another rule, for a counterfactual render."""
+    return Task(
+        label=task.label,
+        task_id=task.task_id,
+        surface=task.surface,
+        table=task.table,
+        text=task.text,
+        key=tuple(components.key_for(task.table, convention)),
+        mask=task.mask,
+    )
+
+
+def _cells_for(
+    instance: Instance, task: Task, convention: Mapping[str, str], raw: object
+) -> dict[str, bytes]:
+    """The three cells one filing would produce on one task, through the shared judge."""
+    from shogym.envs.receipts.render import judge_cells
+
+    generator = components.GENERATOR
+    canonical = generator.parse_and_canonicalize(task, raw)
+    judged = judge_cells(generator, task, canonical, convention, instance.envelope)
+    if judged.problems:
+        raise ValueError(judged.problems[0])
+    return dict(judged.payloads)
+
+
+def _mixed_filing(task: Task, every: int = 3) -> str:
+    """A filing that passes most rows and fails some, deterministically.
+
+    Deterministic in the task's own printed order rather than drawn from a stream, because
+    two readers of one pack have to be looking at one artifact and because the worksheet's
+    verdict column is only worth reading if some rows failed.
+    """
+    lines = []
+    generator = components.GENERATOR
+    for position, (identifier, correct) in enumerate(
+        zip(generator.row_identifiers(task.table), task.key)
+    ):
+        wrong = "6" if correct != "6" else "1"
+        lines.append("%s,%s" % (identifier, correct if position % every else wrong))
+    return "\n".join(lines)
+
+
+def _worksheet_rows(
+    task: Task, convention: Mapping[str, str], raw: str
+) -> list[dict[str, Any]]:
+    """One private worksheet row per printed row, with the rules spelled out side by side."""
+    generator = components.GENERATOR
+    retasked = _retasked(task, convention)
+    canonical = generator.parse_and_canonicalize(retasked, raw)
+    _, outcomes = generator.score(retasked, canonical)
+    out: list[dict[str, Any]] = []
+    for row, outcome in zip(task.table.rows, outcomes):
+        counts = components_audit.flood_counts(row.cells)
+        out.append(
+            {
+                "identifier": row.row_id,
+                "cells": components.print_cells(row.cells),
+                "side_contacts": counts[0],
+                "corner_contacts": counts[1],
+                "combined_contacts": counts[2],
+                "singles_out": components_audit.classify(row.cells),
+                "signature": list(components_audit.graph_signature(tuple(row.cells))),
+                "filed": outcome.filed if outcome.was_filed else "(unfiled)",
+                "verdict": "PASS" if outcome.matched else "FAIL",
+                "correction": "" if outcome.matched else outcome.correct,
+            }
+        )
+    return out
+
+
+def _case_rows(held: Population) -> list[dict[str, Any]]:
+    """The earliest row in the bank exhibiting each phenomenon the worksheet needs."""
+    found: dict[str, dict[str, Any]] = {}
+    for instance in held.instances:
+        if len(found) == len(WORKSHEET_CASES):
+            break
+        for side in ("a", "b"):
+            task = instance.side(side)
+            for row in task.table.rows:
+                cells = tuple(row.cells)
+                counts = components_audit.flood_counts(cells)
+                occupied = set(cells)
+                seen = {
+                    WORKSHEET_CASES[0]: components.has_side_cycle(cells),
+                    WORKSHEET_CASES[1]: _joined_only_through_a_third(cells),
+                    WORKSHEET_CASES[2]: len(cells) == 1,
+                    WORKSHEET_CASES[3]: len(cells) == components.MAX_CELLS,
+                    WORKSHEET_CASES[4]: any(
+                        part in (1, components.SIDE) for cell in cells for part in cell
+                    ),
+                    WORKSHEET_CASES[5]: any(
+                        components_audit.pair_colour(one, other) == 2
+                        and (one[0], other[1]) in occupied
+                        and (other[0], one[1]) in occupied
+                        for one in cells
+                        for other in cells
+                        if one != other
+                    ),
+                    WORKSHEET_CASES[6]: components_audit.classify(cells) == "control",
+                }
+                for case, holds in seen.items():
+                    if holds and case not in found:
+                        found[case] = {
+                            "case": case,
+                            "instance": instance.ordinal,
+                            "side": side.upper(),
+                            "identifier": row.row_id,
+                            "cells": components.print_cells(cells),
+                            "side_contacts": counts[0],
+                            "corner_contacts": counts[1],
+                            "combined_contacts": counts[2],
+                            "signature": list(
+                                components_audit.graph_signature(cells)
+                            ),
+                        }
+    return [found[case] for case in WORKSHEET_CASES if case in found]
+
+
+def _joined_only_through_a_third(cells: Sequence[tuple[int, int]]) -> bool:
+    """Whether some two cells share an island under some rule without touching directly."""
+    for option in components_audit.OPTIONS:
+        neighbours = components_audit.neighbourhood(cells, option)
+        for cell in cells:
+            start = (cell[0], cell[1])
+            direct = set(neighbours[start])
+            reached = set(direct)
+            frontier = list(direct)
+            while frontier:
+                here = frontier.pop()
+                for other in neighbours[here]:
+                    if other not in reached and other != start:
+                        reached.add(other)
+                        frontier.append(other)
+            if reached - direct - {start}:
+                return True
+    return False
+
+
+def _position(convention: Mapping[str, str]) -> int:
+    """Where one rule sits in the declared option order."""
+    return components.AXES[0].options.index(convention["contact_kernel"])
+
+
+def _support(task: Task) -> list[tuple[str, ...]]:
+    """This side's answer key under every rule, in the declared option order."""
+    return [
+        tuple(components.key_for(task.table, {"contact_kernel": option}))
+        for option in components.AXES[0].options
+    ]
+
+
+def _posterior(instance: Instance, side: str) -> list[int]:
+    """The rules a reader of this side's reduced receipt cannot tell apart.
+
+    A reported row says whether the filed count was that rule's answer and, when it was
+    not, what that answer is, so two rules print the same reported row exactly when
+    their counts on it agree. The set is therefore a fact about the mask and the boards
+    and not about what was filed, which is why one filing's pack can show it.
+    """
+    task = instance.side(side)
+    keys = _support(task)
+    drawn = keys[_position(instance.convention)]
+    return [
+        n for n, key in enumerate(keys)
+        if all(key[row] == drawn[row] for row in task.mask)
+    ]
+
+
+def _witnessed(instance: Instance, side: str) -> set[str]:
+    """The axes some reported row disagrees with a one-axis alternative on.
+
+    The same event the law-level gate averages over, taken on the mask that was drawn.
+    An axis with no such row is an axis this receipt says nothing about, and a mask that
+    drew two controls is not redrawn for it.
+    """
+    task = instance.side(side)
+    keys = _support(task)
+    here = _position(instance.convention)
+    drawn = keys[here]
+    out: set[str] = set()
+    for other, key in enumerate(keys):
+        if other == here:
+            continue
+        if any(drawn[row] != key[row] for row in task.mask):
+            out.add(components.AXES[0].name)
+    return out
+
+
+def _filing_over(task: Task, values: Sequence[str | None]) -> str:
+    """A filing over this task's printed rows, with None for a row left out entirely."""
+    return "\n".join(
+        "%s,%s" % (identifier, value)
+        for identifier, value in zip(
+            components.GENERATOR.row_identifiers(task.table), values
+        )
+        if value is not None
+    )
+
+
+def _wrong(correct: str) -> str:
+    """A legal count for a row that is not that row's answer under any rule."""
+    return "6" if correct != "6" else "1"
+
+
+def _found(held: Population, holds) -> tuple[Instance, str] | None:
+    """The earliest admitted instance and side the condition holds on."""
+    for instance in held.instances:
+        for side in ("a", "b"):
+            if holds(instance, side):
+                return (instance, side)
+    return None
+
+
+def _ambiguous(instance: Instance, side: str) -> bool:
+    """Whether this receipt leaves rules that answer the sibling differently."""
+    members = _posterior(instance, side)
+    if len(members) < 2:
+        return False
+    sibling = _support(instance.side("b" if side == "a" else "a"))
+    return len({sibling[n] for n in members}) > 1
+
+
+def _aliased_pair(instance: Instance, side: str, members: Sequence[int]) -> tuple[int, int]:
+    """Two of the rules this receipt cannot tell apart whose sibling keys differ."""
+    sibling = _support(instance.side("b" if side == "a" else "a"))
+    for one in members:
+        for other in members:
+            if one < other and sibling[one] != sibling[other]:
+                return (one, other)
+    raise ValueError("this receipt leaves no pair with different held-out keys")
+
+
+def _held_out_cost(instance: Instance, side: str) -> tuple[int, int]:
+    """How many rows of the sibling the surviving rules do not agree on."""
+    members = _posterior(instance, side)
+    sibling = _support(instance.side("b" if side == "a" else "a"))
+    rows = len(sibling[0])
+    return (
+        sum(1 for row in range(rows) if len({sibling[n][row] for n in members}) > 1),
+        rows,
+    )
+
+
+def _spelled(position: int) -> str:
+    """One rule as a reader of the pack reads it."""
+    return "contact_kernel=%s" % components.AXES[0].options[position]
+
+
+def _document(root: Path, name: str, head: Sequence[str], payload: bytes) -> str:
+    """One assembled document: what a reader is being shown, then the cell itself."""
+    return _write(
+        root, f"{RENDERS}/{name}.txt",
+        "\n".join(head) + "\n\n" + payload.decode("ascii"),
+    )
+
+
+def _sampled_renders(held: Population, root: Path) -> list[Render]:
+    """What a reader of a receipt that reports two rows of twenty four has to see.
+
+    NONE OF IT IS VISIBLE IN THE COVERAGE THE OTHER CATEGORIES ENUMERATE. A surface, an
+    option, a filing class and a row count are all satisfied by a cell that reports every
+    row, so a pack built from those alone would put a reader in front of nothing this
+    policy does. These are the eleven the shared coverage asks a sampled family for, in
+    this genre's own rows.
+
+    THE FIRST FIVE ARE BUILT, NOT SEARCHED FOR. Which rows a filing gets right is the
+    exporter's to choose, so they are made on the first admitted instance by filing
+    against its own committed mask. THE REST ARE FACTS ABOUT THE DRAW. Whether a mask
+    witnesses the axis at all, and whether what it leaves is one rule or several, are
+    properties of the rows the stream drew: two of the twenty four rows are controls
+    under every rule, and a mask that drew two of them says nothing and is not redrawn.
+    A bank too small to exhibit one of those is refused here rather than exported with
+    the case missing.
+    """
+    generator = components.GENERATOR
+    if not generator.RECEIPT_POLICY.samples:
+        return []
+    from shogym.envs.receipts.review import SAMPLED_CASES
+
+    out: list[Render] = []
+    first = held.instances[0]
+    task = first.a
+    key = list(task.key)
+    mask = list(task.mask)
+
+    def built(name: str, case: str, values: Sequence[str | None]) -> None:
+        payload = _cells_for(
+            first, task, dict(first.convention), _filing_over(task, values)
+        )[GRADED]
+        out.append(
+            Render("sampled", case, "cell", _write(root, f"{RENDERS}/{name}.txt", payload))
+        )
+
+    built("sampled-passed", SAMPLED_CASES[0], key)
+    built(
+        "sampled-failed", SAMPLED_CASES[1],
+        [_wrong(v) if p in mask else v for p, v in enumerate(key)],
+    )
+    built(
+        "sampled-unfiled", SAMPLED_CASES[2],
+        [None if p in mask else v for p, v in enumerate(key)],
+    )
+    built(
+        "sampled-empty", SAMPLED_CASES[3],
+        ["" if p in mask else v for p, v in enumerate(key)],
+    )
+    wrong_elsewhere = [v if p in mask else _wrong(v) for p, v in enumerate(key)]
+    out.append(
+        Render(
+            "sampled", SAMPLED_CASES[4], "document",
+            _document(
+                root, "sampled-suppressed",
+                (
+                    "instance %s/%d/%s" % (first.generator, first.ordinal, task.label),
+                    "reported rows %s" % ", ".join(str(r + 1) for r in mask),
+                    "rows filed with a count no rule gives them: %s"
+                    % ", ".join(str(p + 1) for p in range(len(key)) if p not in mask),
+                    "every one of them failed and the cell below says nothing about any "
+                    "of them",
+                ),
+                _cells_for(
+                    first, task, dict(first.convention),
+                    _filing_over(task, wrong_elsewhere),
+                )[GRADED],
+            ),
+        )
+    )
+
+    axes = {components.AXES[0].name}
+    whole = _found(held, lambda i, s: _witnessed(i, s) == axes)
+    if whole is None:
+        raise ValueError(
+            "a review pack shows a receipt whose reported rows witness every axis and "
+            "this bank of %d instances draws no such mask. Materialize more instances "
+            "of this genre and export again" % len(held.instances)
+        )
+    short = _found(held, lambda i, s: _witnessed(i, s) != axes)
+    if short is None:
+        raise ValueError(
+            "a review pack shows a receipt that leaves an axis unwitnessed, which here "
+            "is a mask that drew two control rows, and every mask in this bank of %d "
+            "instances drew an informative row. Materialize more instances of this "
+            "genre and export again" % len(held.instances)
+        )
+    for name, case, (instance, side) in (
+        ("sampled-witnesses-every-axis", SAMPLED_CASES[5], whole),
+        ("sampled-leaves-an-axis-unwitnessed", SAMPLED_CASES[6], short),
+    ):
+        shown = instance.side(side)
+        seen = sorted(_witnessed(instance, side))
+        out.append(
+            Render(
+                "sampled", case, "document",
+                _document(
+                    root, name,
+                    (
+                        "instance %s/%d/%s"
+                        % (instance.generator, instance.ordinal, shown.label),
+                        "reported rows %s"
+                        % ", ".join(str(r + 1) for r in shown.mask),
+                        "axes some reported row disagrees with a one-axis alternative "
+                        "on: %s" % (", ".join(seen) or "none"),
+                        "axes it says nothing about: %s"
+                        % (", ".join(sorted(axes - set(seen))) or "none"),
+                    ),
+                    _cells_for(
+                        instance, shown, dict(instance.convention), _mixed_filing(shown)
+                    )[GRADED],
+                ),
+            )
+        )
+
+    pinned = _found(held, lambda i, s: len(_posterior(i, s)) == 1)
+    if pinned is None:
+        raise ValueError(
+            "a review pack shows a receipt that pins the rule and no mask in this bank "
+            "of %d instances does. Materialize more instances of this genre and export "
+            "again" % len(held.instances)
+        )
+    left = _found(held, _ambiguous)
+    if left is None:
+        raise ValueError(
+            "a review pack shows a receipt that leaves several rules with different "
+            "held-out keys and no mask in this bank of %d instances does. Materialize "
+            "more instances of this genre and export again" % len(held.instances)
+        )
+    for name, case, (instance, side) in (
+        ("sampled-posterior-of-one", SAMPLED_CASES[7], pinned),
+        ("sampled-posterior-of-several", SAMPLED_CASES[8], left),
+    ):
+        shown = instance.side(side)
+        members = _posterior(instance, side)
+        out.append(
+            Render(
+                "sampled", case, "document",
+                _document(
+                    root, name,
+                    (
+                        "instance %s/%d/%s"
+                        % (instance.generator, instance.ordinal, shown.label),
+                        "reported rows %s"
+                        % ", ".join(str(r + 1) for r in shown.mask),
+                        "rules this receipt cannot tell apart: %d of %d"
+                        % (len(members), len(components.AXES[0].options)),
+                    )
+                    + tuple("  %s" % _spelled(n) for n in members)
+                    + (
+                        "held-out rows they disagree on: %d of %d"
+                        % _held_out_cost(instance, side),
+                    ),
+                    _cells_for(
+                        instance, shown, dict(instance.convention), _mixed_filing(shown)
+                    )[GRADED],
+                ),
+            )
+        )
+
+    cells = _cells_for(first, task, dict(first.convention), _mixed_filing(task))
+    out.append(
+        Render(
+            "sampled", SAMPLED_CASES[9], "document",
+            _write(
+                root, f"{RENDERS}/sampled-mask-commitment.txt",
+                "\n".join(
+                    (
+                        "instance %s/%d/%s" % (first.generator, first.ordinal, task.label),
+                        "the receipt policy committed with this instance: %s"
+                        % generator.RECEIPT_POLICY.name,
+                        "the rows it drew, committed before any filing existed: %s"
+                        % ", ".join(str(r + 1) for r in mask),
+                        "",
+                        "",
+                    )
+                )
+                + "\n\n".join(
+                    cells[kind].decode("ascii") for kind in (GRADED, PLACEBO, ORACLE)
+                ),
+            ),
+        )
+    )
+
+    instance, side = left
+    shown = instance.side(side)
+    members = _posterior(instance, side)
+    raw = _mixed_filing(shown)
+    pair = _aliased_pair(instance, side, members)
+    options = components.AXES[0].options
+    rendered = [
+        _cells_for(instance, _retasked(shown, {"contact_kernel": options[n]}),
+                   {"contact_kernel": options[n]}, raw)[GRADED]
+        for n in pair
+    ]
+    if rendered[0] != rendered[1]:
+        raise ValueError(
+            "two rules this receipt cannot tell apart rendered two different cells, so "
+            "the pack cannot show what it says it shows"
+        )
+    disagree, rows = _held_out_cost(instance, side)
+    out.append(
+        Render(
+            "sampled", SAMPLED_CASES[10], "document",
+            _document(
+                root, "sampled-identical-reduced-receipts",
+                (
+                    "instance %s/%d/%s"
+                    % (instance.generator, instance.ordinal, shown.label),
+                    "reported rows %s" % ", ".join(str(r + 1) for r in shown.mask),
+                    "these two rules render the cell below byte for byte:",
+                    "  %s" % _spelled(pair[0]),
+                    "  %s" % _spelled(pair[1]),
+                    "and they disagree on %d of the %d rows of the schedule this reader "
+                    "files next" % (disagree, rows),
+                ),
+                rendered[0],
+            ),
+        )
+    )
+    return out
+
+
+def export(bank: Bank, held: Population, directory: str | Path) -> Path:
+    """Write the review pack and its worksheets, and return the manifest's path.
+
+    Deterministic in the bank and its population: the same bank exports the same bytes, so
+    two readers are looking at one pack and a second export is a comparison rather than a
+    new document. A nonempty output directory is refused, because a pack mixed with an
+    earlier one is a pack nobody can say what was read from.
+    """
+    root = Path(directory)
+    if root.exists() and any(root.iterdir()):
+        raise ValueError(
+            f"{root} is not empty. A review pack is what a person read, and a directory "
+            "holding an earlier export as well has no single answer to what that was"
+        )
+    root.mkdir(parents=True, exist_ok=True)
+    generator = components.GENERATOR
+    if bank.generator != generator.name:
+        raise ValueError(
+            f"this exporter writes packs for {generator.name!r} and the bank names "
+            f"{bank.generator!r}"
+        )
+    if not held.instances:
+        raise ValueError("a review pack is a reading of instances and this bank holds none")
+
+    renders: list[Render] = []
+    first = held.instances[0]
+    drawn = dict(first.convention)
+
+    # ----- both raw task texts, and the one surface template ------------------
+    for side in ("a", "b"):
+        task = first.side(side)
+        path = _write(
+            root, f"{RENDERS}/task-{side}-{first.ordinal:04d}.txt", task.text
+        )
+        renders.append(Render("surface", task.surface, "task", path))
+
+    # ----- every filing class, on both siblings, under EACH of the three rules ---
+    #
+    # The drawn rule is the pack proper; the other two are review counterfactuals and are
+    # labelled as such at every cell. One rule's seven classes tell the reader what this
+    # bank prints; the same seven under the rules that were not drawn are what tells them
+    # that the classes behave the same way whichever rule the family drew, which is the
+    # claim the genre makes and the one a single-rule pack leaves to be taken on trust.
+    # Each rule's filings are that rule's own, so "canonical" means correct under the
+    # rule being shown rather than correct under the one this bank happened to draw.
+    for option in components_audit.OPTIONS:
+        convention = {"contact_kernel": option}
+        counterfactual = option != drawn["contact_kernel"]
+        under = (
+            components_audit.retasked_instance(generator, first, convention)
+            if counterfactual
+            else first
+        )
+        for shape in checks.FILING_CLASSES:
+            for side in ("a", "b"):
+                task = under.side(side)
+                raw = checks.filing_of(generator, under, side, shape)
+                cells = _cells_for(under, task, convention, raw)
+                for kind in (GRADED, PLACEBO, ORACLE):
+                    name = (
+                        f"{RENDERS}/counterfactual-{option}-filing-{shape}-{side}-{kind}.txt"
+                        if counterfactual
+                        else f"{RENDERS}/filing-{shape}-{side}-{kind}.txt"
+                    )
+                    path = _write(root, name, cells[kind])
+                    renders.append(
+                        Render(
+                            "counterfactual",
+                            "review counterfactual under %s, filing %s, side %s"
+                            % (option, shape, side.upper()),
+                            "cell",
+                            path,
+                        )
+                        if counterfactual
+                        else Render("filing", shape, "cell", path)
+                    )
+
+    # ----- the row count the bank holds ---------------------------------------
+    path = _write(
+        root,
+        f"{RENDERS}/rows-{components.ROWS:04d}.txt",
+        _cells_for(
+            first, first.a, first.convention,
+            checks.filing_of(generator, first, "a", "canonical"),
+        )[GRADED],
+    )
+    renders.append(Render("rows", str(components.ROWS), "cell", path))
+
+    # ----- one oracle cell per option, so every sentence the arm can state is read
+    for option in components_audit.OPTIONS:
+        convention = {"contact_kernel": option}
+        payload = serialize(
+            generator.render_oracle(first.a.task_id, convention, first.a.n_rows),
+            first.envelope,
+        )
+        path = _write(root, f"{RENDERS}/oracle-{option}.txt", payload)
+        renders.append(Render("option", f"contact_kernel={option}", "cell", path))
+
+    # ----- a counterfactual graded cell on each sibling under each other rule ---
+    worksheets: list[dict[str, Any]] = []
+    counterfactuals: list[dict[str, Any]] = []
+    for side in ("a", "b"):
+        task = first.side(side)
+        raw = _mixed_filing(task)
+        for option in components_audit.OPTIONS:
+            if option == drawn["contact_kernel"]:
+                continue
+            alternative = {"contact_kernel": option}
+            cells = _cells_for(
+                first, _retasked(task, alternative), alternative, raw
+            )
+            path = _write(
+                root, f"{RENDERS}/counterfactual-{option}-{side}.txt", cells[GRADED]
+            )
+            renders.append(
+                Render("counterfactual", "alternative convention", "cell", path)
+            )
+            renders.append(
+                Render(
+                    "counterfactual",
+                    "review counterfactual under %s, side %s" % (option, side.upper()),
+                    "cell",
+                    path,
+                )
+            )
+            counterfactuals.append(
+                {"path": path, "side": side.upper(), "rule": option, "drawn": drawn}
+            )
+            sheet = {
+                "instance": first.ordinal,
+                "side": side.upper(),
+                "drawn": drawn,
+                "alternative": alternative,
+                "oracle_drawn": list(
+                    generator.render_oracle("0" * 16, drawn, components.ROWS).body
+                ),
+                "oracle_alternative": list(
+                    generator.render_oracle("0" * 16, alternative, components.ROWS).body
+                ),
+                "rows": _worksheet_rows(task, alternative, raw),
+            }
+            worksheets.append(sheet)
+            _write(
+                root,
+                f"{WORKSHEETS}/{side}-{option}.json",
+                json.dumps(sheet, indent=1, sort_keys=True),
+            )
+
+    cases = _case_rows(held)
+    _write(root, f"{WORKSHEETS}/cases.json", json.dumps(cases, indent=1, sort_keys=True))
+
+    renders.extend(_sampled_renders(held, root))
+
+    coverage = required_coverage(generator, checks.FILING_CLASSES, [components.ROWS])
+    missing = coverage.missing([(r.category, r.key) for r in renders])
+    if missing:
+        raise ValueError("this export does not cover " + ", ".join(missing))
+
+    manifest = {
+        # UNSET, AND THE FIELD IS STILL HERE. A pack names exactly six things and this
+        # names six; the one a machine cannot supply is null, so `review.verify` refuses
+        # the pack by name until a person puts theirs to it.
+        "reviewer": None,
+        "checklist": list(CHECKLIST),
+        "seeds": list(held.ordinals),
+        "family": generator.name,
+        "bank": bank_identity(bank),
+        "renders": [
+            {"category": r.category, "key": r.key, "kind": r.kind, "path": r.path}
+            for r in renders
+        ],
+    }
+    pack = root / PACK
+    pack.write_text(json.dumps(manifest, indent=1, sort_keys=True), encoding="utf-8")
+
+    index = {
+        "family": generator.name,
+        "bank": bank_identity(bank),
+        "note": (
+            "explanatory material for the roster release. These are not served tasks and "
+            "are not part of the review manifest or of any bundle. The counterfactual "
+            "renders listed here are review counterfactuals: they show what a receipt "
+            "would have said under a rule that was not drawn, and no bank member holds "
+            "them."
+        ),
+        "cases": [entry["case"] for entry in cases],
+        "counterfactuals": counterfactuals,
+        "files": {
+            str(path.relative_to(root)): digest(path.read_bytes())
+            for path in sorted((root / WORKSHEETS).rglob("*.json"))
+        },
+    }
+    (root / WORKSHEET_INDEX).write_text(
+        json.dumps(index, indent=1, sort_keys=True), encoding="utf-8"
+    )
+    return pack
+
+
+def read_pack(directory: str | Path) -> dict[str, Any]:
+    """The exported manifest, for a caller that wants to add the attestation."""
+    return json.loads((Path(directory) / PACK).read_text(encoding="utf-8"))
+
+
+def attested(
+    directory: str | Path, reviewer: str, checklist: Sequence[str] | None = None
+) -> Path:
+    """Write the same pack with a named reviewer. For a person, after they have read it.
+
+    It is a separate call and it takes the name, because the export cannot know it and a
+    default would be a machine signing for a person.
+    """
+    root = Path(directory)
+    manifest = read_pack(root)
+    manifest["reviewer"] = reviewer
+    if checklist is not None:
+        manifest["checklist"] = list(checklist)
+    pack = root / PACK
+    pack.write_text(json.dumps(manifest, indent=1, sort_keys=True), encoding="utf-8")
+    return pack
+
+
+def read_fork(instance: Instance, side: str, raw: object):
+    """One instance's three cells through the same atomic path a run uses.
+
+    Exposed so a reader can render an instance the pack did not cover without reaching for
+    a second rendering route.
+    """
+    return render_fork(components.GENERATOR, instance, side, raw)
+
+
+# --------------------------------------------------------------------------
+# the screen procedure, audited
+# --------------------------------------------------------------------------
+
+
+def screen_allocation(ordinals: Sequence[int]) -> dict[str, Any]:
+    """The registered allocation of a bank's admitted identities to the screen.
+
+    The first twelve are the exploratory prefix and are never final cases. The next
+    thirty six are the final screen, and case j goes to initial state j mod 4, which gives
+    nine distinct cases per state. Nothing here balances observed outcomes or selects
+    identities after the fact: the allocation is a function of the bank's own order.
+    """
+    held = [int(ordinal) for ordinal in ordinals]
+    needed = EXPLORATORY_PREFIX + FINAL_CASES
+    if len(held) < needed:
+        raise ValueError(
+            f"the registered screen needs {needed} admitted identities and this bank "
+            f"holds {len(held)}"
+        )
+    final = held[EXPLORATORY_PREFIX:needed]
+    return {
+        "exploratory": held[:EXPLORATORY_PREFIX],
+        "cases": [
+            {"case": position, "ordinal": ordinal, "state": position % INITIAL_STATES}
+            for position, ordinal in enumerate(final)
+        ],
+    }
+
+
+def _number(value: object) -> float | None:
+    """One recorded score as a float, or nothing when it is not a number at all."""
+    if value is None or isinstance(value, bool) or not isinstance(value, (int, float)):
+        return None
+    try:
+        return float(value)
+    except (OverflowError, ValueError):
+        return None
+
+
+def screen_refusals(
+    record: Mapping[str, Any],
+    instrument: Mapping[str, str],
+    ordinals: Sequence[int],
+    screen: Mapping[str, Any],
+    release: bool = True,
+) -> list[str]:
+    """What a recorded screen does not establish. Empty when it meets the procedure.
+
+    The executable screen proves neither the state allocation nor the authenticity of a
+    named case from its label, and the bundle verifier enforces neither the per-state
+    requirement nor the oracle release condition. This is the companion audit those
+    sentences point at: it reads the recorded allocation and says where it departs from
+    the registered procedure.
+
+    IT IS READ AGAINST THE BANK AND THE SCREEN RECORD, NOT AGAINST ITSELF. An audit of
+    the allocation's own fields accepts whatever the allocation says: a reservation that
+    was never made, final identities no bank holds, cases in an order with no index to
+    read the state rule against, a model nobody named, and grades that are not numbers.
+    So the identities are held against `ordinals`, the bank's admitted order, and the
+    outcomes against `screen`, the recorded `ScreenRecord` the pilot wrote, which
+    validates its own rows. The oracle mean is computed from that record's pairs and
+    only once everything above holds, because a mean over self-reported grades is a mean
+    over whatever was typed: `float("nan")` is under no bar and over none either.
+
+    THE CASES AND THE RECORDED PAIRS ARE ONE SET, MATCHED ONE TO ONE. Counting the two
+    sides establishes nothing about which case was which execution: thirty six cases can
+    all name a single pair, report its outcomes truthfully, and carry the bank's own
+    final ordinals in its own order, and the thirty five pairs nobody named would still
+    be averaged into the release statistic. So every case names a pair, no pair is named
+    twice, no pair goes unnamed, each case binds its pair to an identity the allocation
+    puts in the final screen and to the A filing the record binds to that pair, and the
+    release statistic is taken over the matched pairs and over nothing else.
+    """
+    from shogym.receipts import Outcomes, PairRecord, ScreenRecord
+
+    problems: list[str] = []
+    cases = list(record.get("cases") or [])
+    exploratory = list(record.get("exploratory") or [])
+    held = [int(value) for value in ordinals]
+
+    # ----- the allocation, against the order the bank admitted -----------------
+    try:
+        registered = screen_allocation(held)
+    except ValueError as exc:
+        problems.append(str(exc))
+        registered = {"exploratory": [], "cases": []}
+    if len(cases) != FINAL_CASES:
+        problems.append(
+            f"the final screen holds {len(cases)} cases and the procedure registers "
+            f"{FINAL_CASES}"
+        )
+    filed = [entry.get("ordinal") for entry in cases]
+    if len(set(filed)) != len(filed):
+        problems.append("the final screen repeats an instance")
+    shared = sorted(set(filed) & set(exploratory), key=repr)
+    if shared:
+        problems.append(
+            "the final screen reuses %d exploratory identities, the first being %r"
+            % (len(shared), shared[0])
+        )
+    if len(exploratory) != EXPLORATORY_PREFIX:
+        problems.append(
+            f"{len(exploratory)} identities were reserved for exploration and the "
+            f"procedure reserves {EXPLORATORY_PREFIX}"
+        )
+    elif registered["exploratory"] and exploratory != registered["exploratory"]:
+        problems.append(
+            "the reserved identities are not the first %d the bank admitted, which are "
+            "%s" % (EXPLORATORY_PREFIX, registered["exploratory"])
+        )
+    outside = [value for value in filed if value not in set(held)]
+    if outside:
+        problems.append(
+            "the final screen names %d identities this bank does not hold, the first "
+            "being %r" % (len(outside), outside[0])
+        )
+    indexed = [entry.get("case") for entry in cases]
+    unindexed = [
+        value for value in indexed
+        if isinstance(value, bool) or not isinstance(value, int)
+    ]
+    if unindexed:
+        problems.append(
+            "%d final cases carry no index, so the state rule is read against an order "
+            "nobody can check" % len(unindexed)
+        )
+    elif indexed != list(range(len(cases))):
+        problems.append(
+            "the final cases are indexed %r and the procedure indexes them 0 to %d in "
+            "the bank's own order" % (indexed[:4], len(cases) - 1)
+        )
+    elif registered["cases"] and filed != [
+        entry["ordinal"] for entry in registered["cases"]
+    ]:
+        problems.append(
+            "the final screen is not the %d identities the bank admitted after the "
+            "reserved ones, in the order it admitted them" % FINAL_CASES
+        )
+    per_state: dict[Any, int] = {}
+    for entry in cases:
+        state = entry.get("state")
+        per_state[state] = per_state.get(state, 0) + 1
+        if entry.get("case") is not None and state != entry["case"] % INITIAL_STATES:
+            problems.append(
+                "case %r is allocated to state %r and the rule allocates it to %d"
+                % (entry.get("case"), state, entry["case"] % INITIAL_STATES)
+            )
+    if sorted(per_state) != list(range(INITIAL_STATES)):
+        problems.append(
+            "the final screen names states %s and the procedure names %s"
+            % (sorted(per_state), list(range(INITIAL_STATES)))
+        )
+    short = sorted(
+        state for state, seen in per_state.items() if seen != CASES_PER_STATE
+    )
+    if short:
+        problems.append(
+            "states %s do not hold %d cases each (%s)"
+            % (short, CASES_PER_STATE, {s: per_state[s] for s in short})
+        )
+
+    # ----- the pins: the wording, the instrument, the model, the four states ---
+    if str(record.get("standing_instruction") or "") != STANDING_INSTRUCTION:
+        problems.append(
+            "the recorded standing instruction is not the registered one, so the arms "
+            "did not start from the wording this screen is read against"
+        )
+    stated = dict(record.get("instrument") or {})
+    for name, value in sorted(instrument.items()):
+        if stated.get(name) != value:
+            problems.append(
+                "the screen names %s %r and this build is %r, so the evidence was "
+                "gathered under another instrument" % (name, stated.get(name), value)
+            )
+    model = str(record.get("model") or "").strip()
+    if not model:
+        problems.append(
+            "the allocation names no model, so nothing in it says what was run"
+        )
+    pinned = dict(record.get("states") or {})
+    frozen: dict[int, str] = {}
+    for state in range(INITIAL_STATES):
+        digest = pinned.get(str(state), pinned.get(state))
+        if not isinstance(digest, str) or not digest.strip():
+            problems.append(
+                "initial state %d is not pinned to a digest, so a case's restoration is "
+                "a label rather than a state" % state
+            )
+        else:
+            frozen[state] = digest
+    drifted = [
+        entry for entry in cases
+        if entry.get("state") in frozen
+        and entry.get("state_digest") != frozen[entry["state"]]
+    ]
+    if drifted:
+        problems.append(
+            "%d cases name an initial state digest the allocation does not pin, the "
+            "first being case %r" % (len(drifted), drifted[0].get("case"))
+        )
+
+    # ----- the outcomes, taken from the screen record rather than from here ----
+    try:
+        validated = ScreenRecord.from_payload(dict(screen))
+    except (TypeError, ValueError) as exc:
+        problems.append(
+            "the screen record these cases are read against is not a readable screen: "
+            "%s" % exc
+        )
+        return problems
+    if validated.run.family != components.GENERATOR.name:
+        problems.append(
+            "the screen record was taken on %r and this audits %r"
+            % (validated.run.family, components.GENERATOR.name)
+        )
+    if model and validated.run.model != model:
+        problems.append(
+            "the allocation names model %r and the screen record was taken with %r"
+            % (model, validated.run.model)
+        )
+    pairs = {pair.instance: pair for pair in validated.run.pairs}
+    if len(validated.run.pairs) != FINAL_CASES:
+        problems.append(
+            "the screen record holds %d pairs and the final screen is %d cases"
+            % (len(validated.run.pairs), FINAL_CASES)
+        )
+
+    # ----- the binding: one case to one pair, and one pair to one case --------
+    # A count of cases beside a count of pairs says nothing about which case was which
+    # execution. Thirty six cases naming ONE pair satisfy every check above: each one
+    # reports that pair's outcomes truthfully, no case names an identity the bank does
+    # not hold, and the thirty five pairs nobody named are still averaged into the
+    # release statistic. So the map from cases to pairs has to be a bijection, and the
+    # statistic is taken over the pairs it matches and over nothing else.
+    bound: dict[str, list[Any]] = {}
+    for entry in cases:
+        bound.setdefault(str(entry.get("instance") or ""), []).append(entry.get("case"))
+    missing = [
+        entry for entry in cases
+        if str(entry.get("instance") or "") not in pairs
+    ]
+    if missing:
+        problems.append(
+            "%d cases name no pair in the screen record, the first being case %r"
+            % (len(missing), missing[0].get("case"))
+        )
+    doubled = sorted(
+        (name for name, over in bound.items() if name in pairs and len(over) > 1),
+        key=repr,
+    )
+    if doubled:
+        problems.append(
+            "%d recorded pairs are named by more than one final case, the first being "
+            "%r on cases %r, so the allocation is not %d executions"
+            % (len(doubled), doubled[0], bound[doubled[0]][:4], FINAL_CASES)
+        )
+    unnamed = sorted((name for name in pairs if name not in bound), key=repr)
+    if unnamed:
+        problems.append(
+            "the screen record holds %d pairs no final case names, the first being %r, "
+            "so the record carries executions this allocation does not account for"
+            % (len(unnamed), unnamed[0])
+        )
+
+    # ----- each matched pair, against the bank's ordinal and the record's filing ---
+    allocated = {entry["ordinal"] for entry in registered["cases"]}
+    matched: list[PairRecord] = []
+    strayed: list[tuple[Any, str]] = []
+    misfiled: list[tuple[Any, str]] = []
+    moved: list[tuple[Any, str]] = []
+    for entry in cases:
+        pair = pairs.get(str(entry.get("instance") or ""))
+        if pair is None:
+            continue
+        holds = len(bound[pair.instance]) == 1
+        if allocated and entry.get("ordinal") not in allocated:
+            strayed.append((entry.get("case"), pair.instance))
+            holds = False
+        filing = entry.get("filing")
+        if not isinstance(filing, str) or filing.strip() != pair.filing:
+            misfiled.append((entry.get("case"), pair.instance))
+            holds = False
+        for branch in ("placebo", "graded", "oracle"):
+            if _number(entry.get(branch)) != getattr(pair, branch):
+                moved.append((entry.get("case"), branch))
+                holds = False
+                break
+        if holds:
+            matched.append(pair)
+    if strayed:
+        problems.append(
+            "%d cases bind a recorded pair to an identity the allocation does not put "
+            "in the final screen, the first being case %r on pair %r"
+            % (len(strayed), strayed[0][0], strayed[0][1])
+        )
+    if misfiled:
+        problems.append(
+            "%d cases do not carry the A filing the screen record binds to the pair "
+            "they name, the first being case %r on pair %r"
+            % (len(misfiled), misfiled[0][0], misfiled[0][1])
+        )
+    if moved:
+        problems.append(
+            "%d cases report an outcome the screen record does not, the first being the "
+            "%s of case %r" % (len(moved), moved[0][1], moved[0][0])
+        )
+    if problems:
+        # The mean is a statement about executed outcomes, and there are none to average
+        # until the cases, the pins and the record agree about what was executed.
+        return problems
+    try:
+        grades = Outcomes(
+            placebo=tuple(pair.placebo for pair in matched),
+            graded=tuple(pair.graded for pair in matched),
+            oracle=tuple(pair.oracle for pair in matched),
+        ).oracle
+    except ValueError as exc:
+        problems.append("the screen record's branch scores are not scores: %s" % exc)
+        return problems
+    mean = sum(grades) / len(grades)
+    if release and mean < MIN_MEAN_ORACLE:
+        problems.append(
+            "the mean oracle grade over the %d matched cases is %.6f and the "
+            "predeclared release condition is %.2f"
+            % (len(grades), mean, MIN_MEAN_ORACLE)
+        )
+    return problems
+
+
+# --------------------------------------------------------------------------
+# the command line
+# --------------------------------------------------------------------------
+
+
+def main(argv: Sequence[str] | None = None) -> int:
+    """Export the pack from the registered bank this build would deal from."""
+    parser = argparse.ArgumentParser(
+        description="export the components review pack a person has to read"
+    )
+    parser.add_argument("--out", required=True, metavar="DIRECTORY")
+    args = parser.parse_args(list(argv) if argv is not None else None)
+    path = bank_path(components.GENERATOR.name)
+    if not path.is_file():
+        print(f"no frozen bank for 'components' at {path}; materialize one first")
+        return 1
+    try:
+        bank = load_bank(path)
+        held = population(bank, components.GENERATOR)
+        pack = export(bank, held, args.out)
+    except (OSError, ValueError) as exc:
+        print(f"this does not make a review pack: {exc}")
+        return 1
+    print(f"review pack {pack}")
+    print(f"bank identity {bank_identity(bank)}")
+    print(
+        "%d instances, ordinals %s"
+        % (len(held.instances), list(held.ordinals))
+    )
+    print(
+        "the pack names no reviewer. A person reads it and then calls "
+        "`components_review.attested(directory, name)`"
+    )
+    return 0
+
+
+__all__ = [
+    "CASES_PER_STATE",
+    "CHECKLIST",
+    "EXPLORATORY_PREFIX",
+    "FINAL_CASES",
+    "INITIAL_STATES",
+    "MIN_MEAN_ORACLE",
+    "PACK",
+    "RENDERS",
+    "STANDING_INSTRUCTION",
+    "WORKSHEETS",
+    "WORKSHEET_CASES",
+    "WORKSHEET_INDEX",
+    "Render",
+    "attested",
+    "export",
+    "main",
+    "read_fork",
+    "read_pack",
+    "screen_allocation",
+    "screen_refusals",
+]
+
+
+if __name__ == "__main__":
+    sys.exit(main())
