@@ -391,7 +391,9 @@ PER_KIND = 6
 
 #: A's two candidate orientations per class, three cases each. Without both, the first
 #: listed member and one extremum agree throughout a class and the two selectors stop
-#: being separable on A's receipt.
+#: being separable on A's receipt. It is also how many cases carry each of the eight
+#: JOINT profiles below, which is the stronger statement: the two classes of one case
+#: are oriented together, and a tally of each class on its own cannot see that.
 PER_ORIENTATION = 3
 
 #: The dollar pools. Gift balances may be zero, because a zero-balance gift card is
@@ -420,29 +422,76 @@ CASE_HEX = 16 ** 8
 MAX_ATTEMPTS = 400
 
 
-def profile_plan(label: str) -> list[tuple[str, bool | None, bool | None]]:
-    """The exact profile multiset for one side, before it is shuffled.
+#: One row of a side, as the recipe states it: the public kind, the orientation of
+#: each class A carries, and the codes the gift class and the original class bind.
+Row = tuple[str, bool | None, bool | None, tuple[str, ...], tuple[str, ...]]
 
-    Each entry is a public case kind and, on A, the orientation of each class it
-    carries: True means the smaller amount is printed first. B has no orientation
-    entry, because every B class prints its median first and randomizes the rest.
+#: A's eight joint profiles, in the order one block prints them, with each class's
+#: codes in that class's own printed order. Three blocks of these eight are the whole
+#: side, so A's correct destination repeats with period eight under every one of the
+#: 27 conventions, and every rotation and reversal keeps that period.
+#:
+#: WHAT THE PERIOD IS FOR. A reader holding A's corrected answers may relabel the six
+#: codes and move the rows, and the wider of the two copying families allows all 720
+#: relabellings against the 48 registered row moves. One relabelling is one function
+#: of A's answer, so against a period-eight A it returns the same code at three
+#: positions eight apart, and B binds three different codes there. At most one of each
+#: such triple can be right: eight of the 24 rows, whatever the relabelling and
+#: whatever the row move. The bound is a property of the two layouts rather than of a
+#: lucky draw, which is what makes the wider qualification something the construction
+#: meets instead of something a search hunts for. Rejecting proposals until one
+#: happened to clear it was 4000 attempts for nothing, because unstructured keys run
+#: near 14 of 24.
+A_BLOCK: tuple[Row, ...] = (
+    (GIFTS_ONLY, True, None, ("D6", "D2"), ()),
+    (GIFTS_ONLY, False, None, ("D6", "D1"), ()),
+    (ORIGINALS_ONLY, None, True, (), ("D3", "D5")),
+    (ORIGINALS_ONLY, None, False, (), ("D3", "D4")),
+    (BOTH_GIFT_PURCHASE, True, True, ("D2", "D5"), ("D1", "D4")),
+    (BOTH_GIFT_PURCHASE, False, False, ("D1", "D4"), ("D2", "D6")),
+    (BOTH_NO_GIFT_PURCHASE, True, False, ("D5", "D6"), ("D4", "D2")),
+    (BOTH_NO_GIFT_PURCHASE, False, True, ("D4", "D2"), ("D5", "D1")),
+)
+
+#: B's four public kinds in the order one block prints them, and the codes a class
+#: binds to its median, least and greatest amounts in the first block. Six blocks of
+#: four, each advancing every code through the published vocabulary by its own block
+#: index, so one kind carries codes two and four apart at positions eight apart. That
+#: is the other half of the bound: three different right answers under one function of
+#: A's repeating answer.
+B_BLOCK: tuple[str, ...] = KINDS
+B_GIFT_CODES = ("D1", "D2", "D3")
+B_ORIGIN_CODES = ("D4", "D5", "D6")
+
+
+def _advanced(codes: Sequence[str], shift: int) -> tuple[str, ...]:
+    """The same codes, each advanced through the published vocabulary by one shift."""
+    return tuple(CODES[(CODES.index(code) + shift) % len(CODES)] for code in codes)
+
+
+def profile_plan(label: str) -> list[Row]:
+    """The exact rows of one side, in the order the recipe prints them.
+
+    Each entry is a public case kind, the orientation of each class it carries on A,
+    and the codes that class binds. True means the smaller amount is printed first. B
+    has no orientation entry, because every B class prints its median first and
+    randomizes the rest, and B binds its codes to the amount ranks rather than to the
+    printed positions, which is what survives that randomization.
+
+    THE ORDER IS THE RECIPE, NOT A PRESENTATION. The profile multiset is the same one
+    the specification registered, and it is laid out in blocks rather than shuffled
+    because the copying bound is a statement about rows eight apart. `build_side`
+    still moves the whole side by one registered rotation or reversal afterwards, so
+    no instance opens on the same profile as the last one.
     """
     if label.upper() == "B":
-        return [(kind, None, None) for kind in KINDS for _ in range(PER_KIND)]
-    plan: list[tuple[str, bool | None, bool | None]] = []
-    for small in (True, False):
-        for _ in range(PER_ORIENTATION):
-            plan.append((GIFTS_ONLY, small, None))
-    for small in (True, False):
-        for _ in range(PER_ORIENTATION):
-            plan.append((ORIGINALS_ONLY, None, small))
-    for small in (True, False):
-        for _ in range(PER_ORIENTATION):
-            plan.append((BOTH_GIFT_PURCHASE, small, small))
-    for small in (True, False):
-        for _ in range(PER_ORIENTATION):
-            plan.append((BOTH_NO_GIFT_PURCHASE, small, not small))
-    return plan
+        return [
+            (kind, None, None,
+             _advanced(B_GIFT_CODES, block), _advanced(B_ORIGIN_CODES, block))
+            for block in range(ROWS // len(B_BLOCK))
+            for kind in B_BLOCK
+        ]
+    return [row for _ in range(ROWS // len(A_BLOCK)) for row in A_BLOCK]
 
 
 def case_kind(case: RetailCase) -> str:
@@ -539,14 +588,47 @@ class _Names:
         return "%010d" % next(self.items)
 
 
+def _bound(
+    members: list[RetailInstrument], codes: Sequence[str], label: str
+) -> list[RetailInstrument]:
+    """One class's instruments, with the recipe's codes bound to its own members.
+
+    On A the code follows the member's printed position inside its class, which is
+    what the two orientation strata move. On B it follows the member's amount rank,
+    median then least then greatest, because B prints its median first and shuffles
+    the other two: a code bound to a position would move with that shuffle, and a code
+    bound to a rank is the same code in every instance of that block.
+    """
+    if not members:
+        return []
+    if label.upper() == "A":
+        chosen = list(codes[: len(members)])
+    else:
+        amounts = [
+            int(m.balance if m.balance is not None else m.contribution) for m in members
+        ]
+        order = sorted(range(len(members)), key=lambda n: amounts[n])
+        chosen = [""] * len(members)
+        for place, rank in enumerate((1, 0, 2)):
+            chosen[order[place]] = codes[rank]
+    return [
+        RetailInstrument(
+            code=code, payment_method_id=member.payment_method_id, type=member.type,
+            balance=member.balance, contribution=member.contribution,
+        )
+        for code, member in zip(chosen, members)
+    ]
+
+
 def _instruments(
     kind: str,
     gift_small_first: bool | None,
     origin_small_first: bool | None,
+    gift_codes: Sequence[str],
+    origin_codes: Sequence[str],
     label: str,
     amounts: random.Random,
     interleave: random.Random,
-    codes: random.Random,
     names: _Names,
 ) -> tuple[list[RetailInstrument], int]:
     """One case's printed instruments and its refund total, in integer cents."""
@@ -587,15 +669,10 @@ def _instruments(
                 )
             )
 
-    printed = _interleaved(gifts, originals, interleave)
-    permutation = codes.sample(CODES, len(CODES))
-    printed = [
-        RetailInstrument(
-            code=permutation[n], payment_method_id=i.payment_method_id, type=i.type,
-            balance=i.balance, contribution=i.contribution,
-        )
-        for n, i in enumerate(printed)
-    ]
+    printed = _interleaved(
+        _bound(gifts, gift_codes, label), _bound(originals, origin_codes, label),
+        interleave,
+    )
     return printed, sum(i.contribution for i in printed)
 
 
@@ -662,12 +739,57 @@ def render_body(cases: Sequence[RetailCase], surface: Surface) -> str:
     return "\n".join(lines)
 
 
+def _relabelled(
+    cases: list[RetailCase], relabelling: Mapping[str, str]
+) -> list[RetailCase]:
+    """Every case of one side under one relabelling of the published codes.
+
+    A relabelling of a whole side moves no amount, no rank, no class and no row, so
+    every predicate the construction filter reads stays where it was and both copying
+    families are closed under it. What it changes is which token a reader sees, so two
+    ordinals do not print the same code on the same profile.
+    """
+    return [
+        RetailCase(
+            case_id=case.case_id, order_id=case.order_id, items=case.items,
+            refund_total=case.refund_total, gift_used=case.gift_used,
+            instruments=tuple(
+                RetailInstrument(
+                    code=relabelling[i.code], payment_method_id=i.payment_method_id,
+                    type=i.type, balance=i.balance, contribution=i.contribution,
+                )
+                for i in case.instruments
+            ),
+        )
+        for case in cases
+    ]
+
+
+def _moved(cases: list[RetailCase], structure: random.Random) -> list[RetailCase]:
+    """The same rows under one registered row move: a rotation, of the order or of its reversal.
+
+    The recipe's blocks bound copying through rows eight apart, and which block prints
+    first is not part of that. Rotations and reversals are the moves the copy screen
+    already prices, and each of them carries one such triple of positions onto
+    another, so the bound survives the move and no two instances open on the same
+    profile.
+    """
+    order = list(range(len(cases)))
+    if structure.choice((False, True)):
+        order.reverse()
+    shift = structure.randrange(len(cases))
+    return [cases[n] for n in order[shift:] + order[:shift]]
+
+
 def build_side(master: bytes, ordinal: int, label: str, attempt: int) -> RetailTable:
     """One side's schedule for one construction attempt, from that side's own streams.
 
-    The five streams are separate coordinates under the side's registered label, so
-    the amounts do not move when the codes do and neither moves when the convention
-    does. None of them is an ambient generator and none of them reads the draw.
+    The six streams are separate coordinates under the side's registered label, so the
+    amounts do not move when the codes do and neither moves when the convention does.
+    None of them is an ambient generator and none of them reads the draw. The recipe
+    fixes which profile carries which codes; the codes stream picks the relabelling of
+    the side and the structure stream picks its row move, which is where a side's
+    presentation comes from now that its layout is the recipe.
     """
     side = label.upper()
     stream = streams.SURFACE_A if side == "A" else streams.SURFACE_B
@@ -679,15 +801,15 @@ def build_side(master: bytes, ordinal: int, label: str, attempt: int) -> RetailT
     items = streams.rng(master, stream, *where, "items")
     interleave = streams.rng(master, stream, *where, "interleave")
 
-    plan = profile_plan(side)
-    structure.shuffle(plan)
     names = _Names(identifiers, side)
     surface = SURFACES[(side, surface_index(ordinal, side))]
     cases: list[RetailCase] = []
-    for kind, gift_small_first, origin_small_first in plan:
+    for kind, gift_small_first, origin_small_first, gift_codes, origin_codes in (
+        profile_plan(side)
+    ):
         printed, refund_total = _instruments(
-            kind, gift_small_first, origin_small_first, side,
-            amounts, interleave, codes, names,
+            kind, gift_small_first, origin_small_first, gift_codes, origin_codes,
+            side, amounts, interleave, names,
         )
         case = RetailCase(
             case_id=names.case_id(),
@@ -700,6 +822,9 @@ def build_side(master: bytes, ordinal: int, label: str, attempt: int) -> RetailT
             instruments=tuple(printed),
         )
         cases.append(case)
+    cases = _moved(
+        _relabelled(cases, dict(zip(CODES, codes.sample(CODES, len(CODES))))), structure
+    )
     return RetailTable(
         domain=surface.name, rows=tuple(cases), body=render_body(cases, surface)
     )
@@ -922,6 +1047,7 @@ class RetailRefundGenerator:
     #: eleven run: at materialization and at bundle verification.
     ADDITIONAL_CHECKS: tuple[str, ...] = (
         "retail_surface", "retail_support", "retail_profile_transfer",
+        "retail_bijection",
     )
     BLANK_TOKEN = BLANK_TOKEN
     UNFILED_TOKEN = UNFILED_TOKEN
@@ -1153,11 +1279,15 @@ GENERATOR = RetailRefundGenerator()
 __all__ = [
     "ALL_CONVENTIONS",
     "AXES",
+    "A_BLOCK",
     "A_CLASS_SIZE",
     "BLANK_TOKEN",
     "B_CLASS_SIZE",
     "BOTH_GIFT_PURCHASE",
     "BOTH_NO_GIFT_PURCHASE",
+    "B_BLOCK",
+    "B_GIFT_CODES",
+    "B_ORIGIN_CODES",
     "CODES",
     "CREDIT_CARD",
     "ENVELOPE_SIZE",

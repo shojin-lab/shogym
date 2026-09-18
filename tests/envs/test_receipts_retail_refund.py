@@ -943,10 +943,10 @@ def test_the_all_bijection_family_is_larger_and_is_priced_under_its_own_name(
 
     It fails if the all-bijection maximum is ever below the shipped family's, which
     would mean the wider family is not wider, if the qualification's verdict is reported
-    under the registered copy check's name, or if the qualification's own result stops
-    naming the number it measured. It does NOT assert that the qualification passes:
-    what it is worth on this design is a measurement, and the measurement is what the
-    check reports.
+    under the registered copy check's name, if the qualification's own result stops
+    naming the number it measured, or if the qualification does not pass. It is a
+    declared check and a construction bar now, so a pair that does not clear it is not
+    served and this asserts the pass rather than reporting the number beside it.
     """
     for convention in retail.ALL_CONVENTIONS:
         a_key = GENERATOR.key_for(drawn.a.table, convention)
@@ -959,12 +959,43 @@ def test_the_all_bijection_family_is_larger_and_is_priced_under_its_own_name(
     result = validation.check_retail_bijection(GENERATOR, drawn, MASTER)
     assert result.name == "retail_bijection"
     assert result.passed == (not refusal)
+    assert result.passed and worst <= validation.MAX_BIJECTION_COPY
     assert ("%.6f" % worst) in result.detail
     # The registered closure is a different number and is never replaced by this one.
     assert worst >= max(
         checks.copy_scores(GENERATOR, drawn)[name]
         for name in checks.NO_INDUCTION_MAPS
     )
+
+
+def test_the_recipe_is_what_bounds_the_wider_copying_family(
+    drawn: Instance, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Why relabelling A's answers cannot earn more than a third of B.
+
+    It fails if A's correct destination does not repeat with the period of its own
+    block under every convention, if B's correct destinations at three positions one
+    period apart are not three different codes, if the support-wide all-bijection
+    maximum rises over eight of the 24 rows, or if the construction filter does not
+    read the bound. Those two layout facts are the proof: one relabelling is one
+    function of A's answer, so it returns the same code at all three of those
+    positions and at most one of them can be right. A later revision that shuffled the
+    rows again fails here, rather than in a bank that quietly stops filling.
+    """
+    period = len(retail.A_BLOCK)
+    assert retail.ROWS % period == 0
+    for convention in retail.ALL_CONVENTIONS:
+        a_key = GENERATOR.key_for(drawn.a.table, convention)
+        b_key = GENERATOR.key_for(drawn.b.table, convention)
+        assert all(code == a_key[n % period] for n, code in enumerate(a_key))
+        for n in range(period):
+            assert len({b_key[n], b_key[n + period], b_key[n + 2 * period]}) == 3
+        assert validation.bijection_copy_maximum(a_key, b_key) <= period / retail.ROWS
+
+    assert validation.pair_refusal(drawn.a.table, drawn.b.table) == ""
+    monkeypatch.setattr(validation, "MAX_BIJECTION_COPY", 0.0)
+    refusal = validation.pair_refusal(drawn.a.table, drawn.b.table)
+    assert "relabelling A's answers" in refusal
 
 
 def test_a_corrected_position_is_not_reusable_on_the_sibling(drawn: Instance) -> None:
@@ -1148,7 +1179,7 @@ def test_a_family_declares_its_own_checks_and_they_run_where_the_eleven_run(
 ) -> None:
     """The optional extension, and that it changes nothing for a family without one.
 
-    It fails if the three checks this family declares are not run beside the eleven, if
+    It fails if the four checks this family declares are not run beside the eleven, if
     one of them failing still leaves the instance admissible, or if a family that
     declares none has its check list changed by the extension existing.
     """
@@ -1161,7 +1192,8 @@ def test_a_family_declares_its_own_checks_and_they_run_where_the_eleven_run(
     ]
     assert names == list(checks.STANDARD_CHECKS) + list(GENERATOR.ADDITIONAL_CHECKS)
     assert GENERATOR.ADDITIONAL_CHECKS == (
-        "retail_surface", "retail_support", "retail_profile_transfer"
+        "retail_surface", "retail_support", "retail_profile_transfer",
+        "retail_bijection",
     )
 
     from shogym.envs.receipts import admission
