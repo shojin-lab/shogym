@@ -144,7 +144,6 @@ def check_receipt_law(
     instance: Instance,
     min_distinguishing: float = REGISTERED_MIN_DISTINGUISHING,
     law: LawResult | None = None,
-    price: bool = True,
 ) -> CheckResult:
     """What the registered mask law leaves, for a receipt that reports only some rows.
 
@@ -166,14 +165,6 @@ def check_receipt_law(
     with how much its own rows happen to move. Everything the law computes is reported
     here whichever way the check goes, because the numbers are the point.
     """
-    if not price and law is None:
-        # The gates already refused this instance, and an exact walk of every mask it
-        # could have drawn would price a receipt nothing will serve. What the caller
-        # gets is the refusal it already has, said in this check's own words.
-        return CheckResult(
-            "law", False,
-            "the gates refused this instance, so its receipt law was not priced",
-        )
     found = law if law is not None else law_for(generator, instance, "a")
     name, weakest = found.weakest
     if weakest < min_distinguishing:
@@ -1045,7 +1036,6 @@ def run_checks(
     min_material_rows: int = 1,
     min_distinguishing: float = REGISTERED_MIN_DISTINGUISHING,
     law: LawResult | None = None,
-    price_law: bool = True,
 ) -> list[CheckResult]:
     """Every named check, in the order a reader wants them.
 
@@ -1058,9 +1048,7 @@ def run_checks(
     first: tuple[str, Callable[[], CheckResult]] = (
         (
             "law",
-            lambda: check_receipt_law(
-                generator, instance, min_distinguishing, law, price_law
-            ),
+            lambda: check_receipt_law(generator, instance, min_distinguishing, law),
         )
         if policy_of(generator).samples
         else ("exercise", lambda: check_exercise(generator, instance))

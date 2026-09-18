@@ -440,6 +440,13 @@ def test_the_registered_bars_fill_a_bank() -> None:
 
 
 def test_every_admitted_instance_clears_every_registered_bar() -> None:
+    """Every bar an admitted instance is judged against, on the ledger's own draws.
+
+    The headroom bar is not among them and the reason is the receipt policy: this
+    family reports the rows a committed mask drew, so its realized headroom is a
+    quantity of that mask and the registered law is what admission reads instead. The
+    law's own bar is here, the distinguishing probability its named check applies.
+    """
     registered = admission.Thresholds()
     admitted = 0
     for ordinal in range(12):
@@ -448,7 +455,8 @@ def test_every_admitted_instance_clears_every_registered_bar() -> None:
         if not report.admitted:
             continue
         admitted += 1
-        assert report.gates.headroom > registered.min_headroom
+        assert report.law is not None
+        assert report.law.weakest[1] >= registered.min_distinguishing
         scores = checks.copy_scores(GENERATOR, instance)
         plain = max(scores[name] for name in checks.NO_INDUCTION_MAPS)
         assert plain <= registered.max_copy_score

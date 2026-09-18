@@ -587,6 +587,87 @@ def test_a_full_policy_family_still_gets_the_exercise_check() -> None:
     assert names[0] == "exercise" and "law" not in names
 
 
+# ----- who decides admission, for a receipt that reports some rows -----
+
+
+def test_a_mask_that_leaves_no_realized_headroom_is_admitted_under_the_law() -> None:
+    """The realized mask does not select the instances the bank holds.
+
+    FAILS IF admission refuses a sampled instance whose registered law clears every
+    bar because the mask it happened to draw left too little headroom on the receipt
+    in front of it. Ordinal 1 is that instance: R and S pass, its realized headroom is
+    0.0394 against the 0.05 bar, every named check passes, and its law leaves an ideal
+    reader 0.8398 against a lookup floor of 0.7704 with its weakest single-axis
+    alternative distinguished with probability 0.5440. A mask that happens to omit an
+    axis is not redrawn, and dropping the instance instead filters the same masks.
+    """
+    from shogym.envs.receipts.admission import Thresholds, report
+
+    generator = _sampled()
+    made = report(generator, draw(generator, MASTER, 1), MASTER, Thresholds())
+    assert made.gates.r_pass and made.gates.s_pass
+    assert not made.gates.h_pass and not made.gates.verdict
+    assert made.gates.headroom < Thresholds().min_headroom
+    assert made.failed_checks == ()
+    assert made.admitted
+    # And what replaces the realized verdict is reported rather than assumed.
+    assert made.law is not None
+    assert abs(made.law.ideal - 0.839846664) < 1e-9
+    assert abs(made.law.weakest[1] - 0.544042914) < 1e-9
+
+
+def test_a_full_policy_instance_that_fails_realized_headroom_is_refused() -> None:
+    """The realized gates still decide for a family that reports every row.
+
+    FAILS IF a full-policy instance is admitted while the gates refuse it. There is one
+    receipt then and no law over masks behind it, so R, S and H are the whole question
+    and nothing about the sampled policy loosens them. The same bar moved past the
+    sampled family's realized headroom leaves it admitted, which is the difference.
+    """
+    from shogym.envs.receipts.admission import Thresholds, report
+
+    full = soundchange.GENERATOR
+    instance = draw(full, MASTER, 0)
+    at_the_bars = report(full, instance, MASTER, Thresholds())
+    assert at_the_bars.admitted and at_the_bars.gates.h_pass
+    above = Thresholds(min_headroom=at_the_bars.gates.headroom + 0.01)
+    refused = report(full, instance, MASTER, above)
+    assert not refused.gates.h_pass and not refused.gates.verdict
+    assert refused.failed_checks == ()
+    assert not refused.admitted
+    # The same move leaves the sampled family where it was.
+    sampled = _sampled()
+    drawn = draw(sampled, MASTER, 1)
+    held = report(sampled, drawn, MASTER, Thresholds(min_headroom=0.99))
+    assert not held.gates.h_pass
+    assert held.admitted
+
+
+def test_the_admitted_sampled_set_is_the_set_the_law_admits() -> None:
+    """Nothing is excluded for what its own mask drew, over a run of ordinals.
+
+    FAILS IF a sampled instance is excluded while every named check passes and the
+    receipt's printed form is sound, which is the only way the realized mask could
+    still be selecting the bank's population. It also fails if no drawn instance has a
+    realized gate verdict the law overrides, because then the run proves nothing.
+    """
+    from shogym.envs.receipts.admission import Thresholds, decides, report
+
+    generator = _sampled()
+    registered = Thresholds()
+    overridden = 0
+    for ordinal in range(12):
+        made = report(generator, draw(generator, MASTER, ordinal), MASTER, registered)
+        assert made.samples
+        assert made.gate_prerequisite == made.gates.s_form_pass
+        assert made.admitted == (made.gates.s_form_pass and not made.failed_checks)
+        if made.admitted and not made.gates.verdict:
+            overridden += 1
+        # A full-policy report over the same gates would have required all three.
+        assert decides(made.gates, False) == made.gates.verdict
+    assert overridden, "no drawn mask left a realized verdict for the law to override"
+
+
 def _run_five_pairs():
     """The six ledger table pairs run 5 served, rebuilt from its own bank.
 
