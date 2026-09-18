@@ -11,6 +11,7 @@ from __future__ import annotations
 import json
 import re
 from fractions import Fraction
+from pathlib import Path
 from typing import Mapping, Sequence
 
 import pytest
@@ -1008,3 +1009,264 @@ def test_the_schedule_prints_as_the_surface_declares_and_nothing_else(
     assert a_table.template.organization not in drawn.b.text
     for name in b_table.template.items:
         assert name not in a_table.body
+
+
+# --------------------------------------------------------------------------
+# the checks a family declares for itself
+# --------------------------------------------------------------------------
+
+
+def test_a_family_declares_its_own_checks_and_they_run_where_the_eleven_run(
+    drawn: Instance,
+) -> None:
+    """The optional extension, and that it changes nothing for a family without one.
+
+    It fails if the three checks this family declares are not run beside the eleven, if
+    one of them failing still leaves the instance admissible, or if a family that
+    declares none has its check list changed by the extension existing.
+    """
+    names = [
+        result.name
+        for result in checks.run_checks(
+            GENERATOR, drawn, MASTER, max_copy_score=0.50, max_flip_score=0.875,
+            min_leverage=0.10,
+        )
+    ]
+    assert names == list(checks.STANDARD_CHECKS) + list(GENERATOR.ADDITIONAL_CHECKS)
+    assert GENERATOR.ADDITIONAL_CHECKS == (
+        "retail_surface", "retail_support", "retail_profile_transfer"
+    )
+
+    from shogym.envs.receipts import admission
+    from shogym.envs.receipts.generators import ledger
+    from shogym.envs.receipts.generators.vectors import VECTORS
+
+    report = admission.report(GENERATOR, drawn, MASTER, admission.Thresholds())
+    assert report.admitted
+    assert [c.name for c in report.checks] == names
+
+    held = validation.NAMED_CHECKS["retail_profile_transfer"]
+    try:
+        validation.NAMED_CHECKS["retail_profile_transfer"] = (
+            lambda *_: checks.CheckResult(
+                "retail_profile_transfer", False, "a fixture refusal"
+            )
+        )
+        refused = admission.report(GENERATOR, drawn, MASTER, admission.Thresholds())
+        assert "retail_profile_transfer" in refused.failed_checks
+        assert not refused.admitted
+    finally:
+        validation.NAMED_CHECKS["retail_profile_transfer"] = held
+
+    for other in (ledger.GENERATOR, VECTORS["merge"]):
+        assert getattr(other, "ADDITIONAL_CHECKS", ()) == ()
+        assert checks.additional_checks(other, drawn, MASTER, []) == []
+
+
+class _Declaring:
+    """A stand-in that declares whatever the test needs it to declare."""
+
+    name = "declaring"
+    AXES = retail.AXES
+
+    def __init__(self, declared, run) -> None:
+        self.ADDITIONAL_CHECKS = declared
+        if run is not None:
+            self.check_additional = run
+
+
+def _ran(generator, instance: Instance) -> dict[str, checks.CheckResult]:
+    planned = checks.additional_checks(generator, instance, MASTER, ["copy", "oracle"])
+    return {name: checks._guarded(name, run) for name, run in planned}
+
+
+def test_a_declared_check_cannot_borrow_another_name_or_shadow_one(
+    drawn: Instance,
+) -> None:
+    """What the declaration is not trusted with.
+
+    It fails if a declared name that shadows one of the eleven is run, if a repeated
+    name is run twice, if a result returned under another name is recorded under that
+    name, if a family that declares names without a runner is treated as declaring
+    none, or if an exception inside a declared check escapes instead of becoming that
+    check's failure.
+    """
+    shadow = _ran(
+        _Declaring(("copy",), lambda name, *_: checks.CheckResult(name, True, "ok")),
+        drawn,
+    )
+    assert not shadow["copy"].passed
+    assert "shadows" in shadow["copy"].detail
+
+    twice = _ran(
+        _Declaring(("mine", "mine"), lambda name, *_: checks.CheckResult(name, True, "ok")),
+        drawn,
+    )
+    assert twice["mine"].passed is False
+    assert "declared twice" in twice["mine"].detail
+
+    borrowed = _ran(
+        _Declaring(("mine",), lambda *_: checks.CheckResult("copy", True, "ok")), drawn
+    )
+    assert not borrowed["mine"].passed
+    assert "another name" in borrowed["mine"].detail
+
+    def raising(*_):
+        raise RuntimeError("the family blew up")
+
+    blew = _ran(_Declaring(("mine",), raising), drawn)
+    assert not blew["mine"].passed
+    assert "RuntimeError" in blew["mine"].detail
+
+    missing = _ran(_Declaring(("mine",), None), drawn)
+    assert not missing["additional"].passed
+    assert "no check_additional" in missing["additional"].detail
+
+
+def _b_case(n: int, kind: str) -> retail.RetailCase:
+    """One B case of a chosen kind, built by hand rather than by the construction."""
+    gifts = [("D%d" % (n % 3 + 1), G, 10 * (n % 5) + 20 + 10 * k, 0) for k in range(3)]
+    if kind == retail.GIFTS_ONLY:
+        printed = [
+            ("D%d" % (k + 1), G, 20 + 10 * k + (n % 3) * 10, 10 * (k + 1))
+            for k in range(3)
+        ]
+    else:
+        printed = [
+            ("D1", G, 30, 20), ("D2", G, 10, 0), ("D3", G, 90, 0),
+            ("D4", C, None, 30), ("D5", P, None, 10), ("D6", C, None, 90),
+        ]
+    del gifts
+    instruments = tuple(
+        retail.RetailInstrument(
+            code=code, payment_method_id="%s_%07d" % (kind_, 5000000 + n * 10 + k),
+            type=kind_, balance=None if balance is None else balance * retail.CENTS,
+            contribution=value * retail.CENTS,
+        )
+        for k, (code, kind_, balance, value) in enumerate(printed)
+    )
+    total = sum(i.contribution for i in instruments)
+    return retail.RetailCase(
+        case_id="CB%08X" % (0x10000 + n),
+        order_id="#W%07d" % (5000000 + n),
+        items=(retail.RetailItem("%010d" % (5000000000 + n), "Cable", total),),
+        refund_total=total,
+        gift_used=any(
+            i.contribution > 0 for i in instruments if i.type == retail.GIFT_CARD
+        ),
+        instruments=instruments,
+    )
+
+
+def test_support_wide_admission_does_not_depend_on_the_convention_sampled(
+    drawn: Instance,
+) -> None:
+    """A pair that passes under one draw and fails under another is refused for all.
+
+    The crafted sibling prints only gift-only cases and mixed cases with a gift
+    purchase, so under either gift-preferring route no row ever reaches the original
+    class and that selector moves nothing. Under the original-preferring route every
+    axis is material and the drawn-convention checks pass. It fails if the
+    drawn-convention materiality check does not show that split, or if the support-wide
+    check's verdict moves with the convention the instance happened to draw.
+    """
+    rows = tuple(
+        _b_case(n, retail.GIFTS_ONLY if n < 12 else retail.BOTH_GIFT_PURCHASE)
+        for n in range(retail.ROWS)
+    )
+    surface = retail.SURFACES[("B", 0)]
+    crafted = retail.RetailTable(
+        domain=surface.name, rows=rows, body=retail.render_body(rows, surface)
+    )
+
+    def instance_of(route: str) -> Instance:
+        convention = {
+            "route_policy": route, "gift_pick": "gift_max", "origin_pick": "origin_min"
+        }
+        return Instance(
+            generator=drawn.generator, genre=drawn.genre, ordinal=drawn.ordinal,
+            convention=convention, a=drawn.a,
+            b=Task(
+                label="B", task_id=drawn.b.task_id, surface=surface.name,
+                table=crafted, text=drawn.b.text,
+                key=tuple(GENERATOR.key_for(crafted, convention)),
+            ),
+            envelope=drawn.envelope,
+        )
+
+    picked = instance_of("route_origin")
+    assert checks.check_materiality(GENERATOR, picked, 1).passed
+    assert not checks.check_materiality(GENERATOR, instance_of("route_gift"), 1).passed
+
+    verdicts = {
+        route: validation.check_retail_support(GENERATOR, instance_of(route), MASTER)
+        for route in ("route_origin", "route_gift", "route_usedgift")
+    }
+    assert {result.passed for result in verdicts.values()} == {False}
+    assert len({result.detail for result in verdicts.values()}) == 1
+
+
+def test_adding_this_genre_changed_nothing_ledger_or_soundchange_does() -> None:
+    """The two families already on the roster, frozen at the base of this branch.
+
+    It fails if the drawn convention, the committed instance digest, the whole
+    admission verdict digest, the list of checks run, the copy maxima, the axis
+    leverage, either task text, either answer key, or any of the three cells under any
+    of the seven registered filing classes moves on either family. The fixture was
+    generated from the unmodified checkout this branch starts from.
+    """
+    from shogym.envs.receipts import admission, streams
+    from shogym.envs.receipts.generators import ledger, soundchange
+
+    fixture = json.loads(
+        (Path(__file__).resolve().parents[1] / "_fixtures"
+         / "receipts_before_retail.json").read_text(encoding="utf-8")
+    )
+    for name, generator in (
+        ("ledger", ledger.GENERATOR), ("soundchange", soundchange.GENERATOR)
+    ):
+        for ordinal, expected in sorted(fixture[name].items()):
+            instance = protocol.draw(generator, MASTER, int(ordinal))
+            assert dict(instance.convention) == expected["convention"]
+            assert bank_mod.instance_digest(instance, generator) == expected[
+                "instance_digest"
+            ]
+            assert admission.report(
+                generator, instance, MASTER, admission.Thresholds()
+            ).digest() == expected["report_digest"]
+            assert [
+                c.name for c in checks.run_checks(
+                    generator, instance, MASTER, max_copy_score=0.5,
+                    max_flip_score=0.875, min_leverage=0.10,
+                )
+            ] == expected["check_names"]
+            assert {
+                k: round(v, 12)
+                for k, v in checks.copy_scores(generator, instance).items()
+            } == expected["copy_scores"]
+            assert {
+                k: round(v, 12)
+                for k, v in checks.axis_leverage(generator, instance).items()
+            } == expected["leverage"]
+            for side in ("a", "b"):
+                task = instance.side(side)
+                envelope = frozen_envelope(instance.envelope)
+                assert streams.digest(task.text.encode()) == expected[side][
+                    "text_digest"
+                ]
+                assert list(task.key) == expected[side]["key"]
+                assert list(generator.row_identifiers(task.table)) == expected[side][
+                    "identifiers"
+                ]
+                for shape in checks.FILING_CLASSES:
+                    raw = checks.filing_of(generator, instance, side, shape)
+                    canonical = generator.parse_and_canonicalize(task, raw)
+                    judged = judge_cells(
+                        generator, task, canonical, instance.convention, envelope
+                    )
+                    assert judged.problems == ()
+                    assert {
+                        kind: streams.digest(payload)
+                        for kind, payload in sorted(judged.payloads.items())
+                    } == expected[side]["cells"][shape]
+                    assert judged.score == expected[side]["scores"][shape]
