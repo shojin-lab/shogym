@@ -68,6 +68,7 @@ from shogym.envs.receipts.generators.retail_refund import (
     PER_KIND,
     PER_ORIENTATION,
     ROWS,
+    RetailCase,
     RetailTable,
 )
 from shogym.envs.receipts.observe import observe
@@ -572,6 +573,82 @@ def support_flip_and_leverage(keys: Mapping[tuple, tuple[str, ...]]) -> tuple[fl
     return worst_flip, weakest
 
 
+def _printed_fields(case: ParsedCase) -> tuple[tuple[str, object], ...]:
+    """One printed case as named values, in a fixed order, position included."""
+    out: list[tuple[str, object]] = [
+        ("case_id", case.case_id),
+        ("order_id", case.order_id),
+        ("refund_total", case.refund_total),
+        ("gift_used", case.gift_used),
+        ("item count", len(case.items)),
+        ("instrument count", len(case.instruments)),
+    ]
+    for n, item in enumerate(case.items):
+        for field in ("item_id", "name", "price"):
+            out.append((f"item {n}'s {field}", item[field]))
+    for n, instrument in enumerate(case.instruments):
+        for field in ("code", "payment_method_id", "type", "balance", "contribution"):
+            out.append((f"instrument {n}'s {field}", instrument[field]))
+    return tuple(out)
+
+
+def _stored_fields(case: RetailCase) -> tuple[tuple[str, object], ...]:
+    """The same named values, taken from the record the schedule holds."""
+    out: list[tuple[str, object]] = [
+        ("case_id", case.case_id),
+        ("order_id", case.order_id),
+        ("refund_total", case.refund_total),
+        ("gift_used", "yes" if case.gift_used else "no"),
+        ("item count", len(case.items)),
+        ("instrument count", len(case.instruments)),
+    ]
+    for n, item in enumerate(case.items):
+        out.append((f"item {n}'s item_id", item.item_id))
+        out.append((f"item {n}'s name", item.name))
+        out.append((f"item {n}'s price", item.price))
+    for n, instrument in enumerate(case.instruments):
+        out.append((f"instrument {n}'s code", instrument.code))
+        out.append((f"instrument {n}'s payment_method_id", instrument.payment_method_id))
+        out.append((f"instrument {n}'s type", instrument.type))
+        out.append((f"instrument {n}'s balance", instrument.balance))
+        out.append((f"instrument {n}'s contribution", instrument.contribution))
+    return tuple(out)
+
+
+def record_refusal(table: RetailTable, label: str) -> str:
+    """Why the printed schedule is not the stored one, field by field.
+
+    THE KEYS AGREEING IS NOT THE RECORDS AGREEING. A renderer that prints a gift
+    balance or a contribution the record does not hold, and does not move that
+    amount's rank inside its class, leaves every destination and all 27 keys where
+    they were: the independent selector reading the body and the production scorer
+    reading the store still agree, so comparing keys sees nothing and the agent
+    answers a schedule the bank did not commit. This compares the complete parsed
+    record with the complete stored record, every item, instrument, amount, flag,
+    identifier and position, rather than the answers they lead to.
+    """
+    side = label.upper()
+    try:
+        cases = parsed_cases(table)
+    except (ValueError, KeyError, TypeError, json.JSONDecodeError) as exc:
+        return f"side {side}'s printed body does not read back: {exc}"
+    if len(cases) != len(table.rows):
+        return (
+            f"side {side} prints {len(cases)} cases where the stored schedule holds "
+            f"{len(table.rows)}"
+        )
+    for printed, held in zip(cases, table.rows):
+        for (name, shown), (_, stored) in zip(
+            _printed_fields(printed), _stored_fields(held)
+        ):
+            if shown != stored:
+                return (
+                    f"side {side} prints {name} as {shown!r} at case {held.case_id}, "
+                    f"where the stored case holds {stored!r}"
+                )
+    return ""
+
+
 def side_refusal(table: RetailTable, label: str) -> str:
     """Why one schedule is not admissible on its own, or the empty string."""
     try:
@@ -700,7 +777,8 @@ def check_retail_surface(generator, instance: Instance, master: bytes) -> CheckR
     It fails if a body does not parse, if a printed field leaves its registered
     bounds, if the class partition, the contribution totals, the purchase flag, the
     profile counts or the side's class cardinality are not what the schedule
-    promises, if any of the 27 keys disagrees with the production scorer on either
+    promises, if any parsed record differs from the stored record in any field or
+    position, if any of the 27 keys disagrees with the production scorer on either
     side, if two destinations inside one case normalize alike, if two conventions
     share a complete key, or if a case id or a correct code changes under serialize
     and read back.
@@ -711,6 +789,9 @@ def check_retail_surface(generator, instance: Instance, master: bytes) -> CheckR
         refusal = side_refusal(table, label)
         if refusal:
             return CheckResult("retail_surface", False, refusal)
+        wrong = record_refusal(table, label)
+        if wrong:
+            return CheckResult("retail_surface", False, wrong)
         cases = parsed_cases(table)
         instruments = [case.instruments for case in cases]
         for convention in ALL_CONVENTIONS:
@@ -996,6 +1077,7 @@ __all__ = [
     "parsed_cases",
     "parsed_kind",
     "prefers_gift",
+    "record_refusal",
     "run_named",
     "selector_of",
     "shipped_copy_maximum",
