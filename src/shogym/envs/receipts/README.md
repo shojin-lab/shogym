@@ -115,19 +115,25 @@ different column headers.
 ## The receipt policy: which rows a receipt reports
 
 A generator declares `RECEIPT_POLICY`, and `registry.load_generator` refuses one that does
-not, the way it refuses one that declares no copy profile. Two policies are registered.
+not, the way it refuses one that declares no copy profile. Three policies are registered.
 
 | Policy | What the graded cell carries |
 |---|---|
 | `full` | a verdict and that row's own answer on **every** printed row |
+| `sampled-2-of-24` | a verdict and that row's own answer on the **two** rows a committed mask drew, and that position's committed neutral tokens in both slots on the other twenty two |
 | `sampled-4-of-24` | a verdict and that row's own answer on the **four** rows a committed mask drew, and that position's committed neutral tokens in both slots on the other twenty |
 
-**Ledger declares the sampled policy. Sound change and every gate vector declare the full
-one**, and keep it until their own arithmetic under a sampled policy has been done: four
-fully reported rows leave an ideal reader at 0.96 on sound change and 0.98 on components,
-because a corrected daughter form exposes the replacement phone and the lost vowel
-directly and because one ternary axis is identified by verdicts alone. Ledger's count does
-not carry to them.
+**The count is registered per generator and the bars are the same for all.** Ledger
+declares four records of twenty four, sound change two forms of twenty four, and every
+gate vector the full receipt. How many rows a receipt has to report before it stops
+teaching is a property of the family's own tables, not of the shape they share: four
+fully reported rows leave an ideal reader at about 0.82 on ledger and at 0.95 on sound
+change, because a corrected daughter form exposes the replacement phone and the lost
+vowel directly. Two rows of sound change leave 0.849 against a lookup floor of 0.220, and
+they are the only count from one to eight whose bank-mean ideal level sits in the
+registered band. A count is chosen from a bank's arithmetic before the bank is looked at,
+and a family whose fresh bank fails a bar is not admitted at that count and is not
+admitted at a count chosen afterwards.
 
 **The mask is drawn before any filing and independently of the drawn convention**, from a
 fifth committed stream keyed by the generator, the ordinal and the sibling label. It joins
@@ -141,18 +147,25 @@ the realized receipt: a mask redrawn until every hidden decision had a witness w
 mask the convention could be read off, and the arithmetic the gate does averages over the
 uniform law rather than over a filtered one.
 
-**The task says so.** Under a policy that samples, the ledger description carries one
-registered sentence, after the scope sentence and before the schedule:
+**The task says so.** Under a policy that samples, the description carries one registered
+sentence, after the scope sentence and before the table. `filing.receipt_sentence` holds
+when it is printed and that it is the same bytes in every arm and under every convention;
+the words are the genre's, because a schedule has records and bands where a batch has
+forms and daughter forms:
 
 ```
 The receipt for this schedule reports the verdict and the correct band for four
 selected records only, and the lines for the other records say nothing about
 whether they were right.
+
+The receipt for this batch reports the verdict and the correct daughter form for
+two selected forms only, and the lines for the other forms say nothing about
+whether they were right.
 ```
 
-The same bytes in every arm and under every convention, and it names no record: the
-selection is drawn before any filing exists, a reader can see it in the receipt anyway,
-and a reader who could see it in the task could file the rest at random and lose nothing.
+Neither names a row: the selection is drawn before any filing exists, a reader can see it
+in the receipt anyway, and a reader who could see it in the task could file the rest at
+random and lose nothing.
 
 ## Rendering order: what exists when
 
@@ -262,8 +275,18 @@ the renderer with the scorer and cannot catch a scorer that is wrong in both.
 | Check | What it asks |
 |---|---|
 | `cascade` | an independently implemented validator recomputes every answer on all 36 draws and both sides, the forms stay inside the declared grammar, and no printed identifier or correction changes under serialize and read back |
-| `phone_lookup` | giving the reflex and the deleted vowel away for free, on top of the lookup observations the floor already concedes, leaves the floor at or under 0.90 and more than 0.05 of room, at every reference draw and in both directions |
+| `phone_lookup` | giving the reflex and the deleted vowel away for free, on top of the lookup observations the floor already concedes, leaves the floor at or under 0.90 and more than 0.05 of room, at every reference draw and in both directions, and the same of the receipt this family serves |
 | `analogy` | an optimistic reader who transfers A's own edits to every B form with the same skeleton earns at most 0.50 under every draw, in both directions |
+
+**Two of the three read the tables and not the receipt, and the count does not move them.**
+`cascade` recomputes the answers and `analogy` transfers the proto forms' skeletons, so both
+are construction facts about a pair and ask the same question whatever a receipt reports.
+`phone_lookup` reads one side's whole support key, which is what a receipt reporting every row
+prints, so under a count that reports two of twenty four it prices a reader the family does not
+serve. Its lines say so, and the same two bars are put to the served receipt beside them: over
+every mask the registered law can draw, with both readable axes conceded on top of what the
+floor already concedes. On sound change's evidence bank at two reported rows that floor is
+`0.688284` with `0.160965` of room above it.
 
 The disjoint final-consonant pools give the two batches disjoint answers without either side
 reading the other, and they establish **nothing** about copying resistance: the registered
@@ -722,11 +745,19 @@ eligibility operation, and production, the roster and `shogym receipts verify` a
 - the **review coverage** is enumerated from the rebuilt instances and the family's own
   declarations: every surface template (both pools, since B is served too), every option of
   every axis, every registered filing shape, every row count on either sibling, and at least
-  one counterfactual render. Each named render has to be a file the manifest hashed and large
-  enough to be what it claims: a rendered cell is the envelope size, a task text is hundreds of
-  bytes. A reviewer that is null, blank or not a name is refused when the bundle is built and
-  again when it is read, because `str(None)` is the nonempty string `"None"` and a pack export
-  that lost the attesting person would otherwise arrive with one.
+  one counterfactual render. A family that declares a count adds eleven more, none of which any
+  other category would ever show a reader: a reported row that passed, one that failed, one
+  nobody filed and one filed with an empty value; a row that failed and was suppressed anyway;
+  a receipt whose reported rows witness every axis and one that leaves an axis unwitnessed; a
+  posterior of one convention and a posterior of several with different held-out keys; the mask
+  commitment beside the three cells; and a pair of conventions whose reduced receipts are byte
+  identical, with what that costs on the held-out task. Each named render has to be a file the
+  manifest hashed and large enough to be what it claims: a rendered cell is the envelope size, a
+  task text is hundreds of bytes, and a **document** is material assembled out of committed
+  values for a reader to read rather than anything the family served. A reviewer that is null,
+  blank or not a name is refused when the bundle is built and again when it is read, because
+  `str(None)` is the nonempty string `"None"` and a pack export that lost the attesting person
+  would otherwise arrive with one.
 
 There are no summary fields, and every file has an EXACT field set. Nothing records how many
 ordinals were considered, what fraction passed, how many rows a sibling has, or which stages a
@@ -865,11 +896,12 @@ the independent master-key provenance, and a named human attestation tying all o
 code and bundle hashes. A registry entry is not admission and a verified bundle is not a roster
 place.
 
-The receipt policy is one family's, and the other roster candidates keep the full receipt
-until their own arithmetic is done. Sound change and components are not ledger: four fully
-reported rows leave an ideal reader at 0.96 and 0.98 on them, so ledger's count does not
-carry and a policy for either of them has to be priced on its own tables before it is
-declared.
+Two families now declare a count of their own and each was priced on its own tables: four
+records of twenty four for ledger, two forms of twenty four for sound change. Neither is
+in the recursion roster on the strength of that arithmetic. What a count establishes is an
+information form worth screening; whether a model reads a receipt that reports two rows at
+all is what the actual-model screen measures, and neither family has been screened under
+its count.
 
 Recorded boundaries, held by process rather than by a check:
 

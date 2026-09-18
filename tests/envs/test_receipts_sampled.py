@@ -71,6 +71,23 @@ def _sampled():
     return SampledLedger()
 
 
+def _full():
+    """A family that reports every row.
+
+    Sound change itself while it still declares the full receipt, and a subclass of it
+    once it declares two forms of twenty four. The name, the streams, the tables and the
+    answers are the family's, so what this draws is what the family drew; the count is
+    the only thing that moves.
+    """
+    if not soundchange.GENERATOR.RECEIPT_POLICY.samples:
+        return soundchange.GENERATOR
+
+    class FullSoundChange(soundchange.SoundChangeGenerator):
+        RECEIPT_POLICY: ReceiptPolicy = FULL_RECEIPT
+
+    return FullSoundChange()
+
+
 def _canonical(generator, task, raw=None):
     if raw is None:
         raw = "\n".join(
@@ -578,11 +595,12 @@ def test_a_full_policy_family_still_gets_the_exercise_check() -> None:
     FAILS IF the exercise check is dropped for a family whose receipt reports every
     row. The law replaced it for one instrument and not for the roster.
     """
-    instance = draw(soundchange.GENERATOR, MASTER, 0)
+    generator = _full()
+    instance = draw(generator, MASTER, 0)
     names = [
         result.name
         for result in checks.run_checks(
-            soundchange.GENERATOR,
+            generator,
             instance,
             MASTER,
             max_copy_score=1.0,
@@ -632,7 +650,7 @@ def test_a_full_policy_instance_that_fails_realized_headroom_is_refused() -> Non
     """
     from shogym.envs.receipts.admission import Thresholds, report
 
-    full = soundchange.GENERATOR
+    full = _full()
     instance = draw(full, MASTER, 0)
     at_the_bars = report(full, instance, MASTER, Thresholds())
     assert at_the_bars.admitted and at_the_bars.gates.h_pass
@@ -818,7 +836,7 @@ def test_the_review_pack_covers_the_selected_and_suppressed_cases() -> None:
 
     counts = [24, 24]
     sampled = required_coverage(_sampled(), checks.FILING_CLASSES, counts)
-    full = required_coverage(soundchange.GENERATOR, checks.FILING_CLASSES, counts)
+    full = required_coverage(_full(), checks.FILING_CLASSES, counts)
     added = [key for kind, key in sampled.required if kind == "sampled"]
     assert added == list(SAMPLED_CASES)
     assert len(SAMPLED_CASES) == 11
@@ -880,22 +898,26 @@ def test_a_full_policy_receipt_reports_a_verdict_and_a_correction_on_every_row()
     class FullLedger(ledger.LedgerGenerator):
         RECEIPT_POLICY: ReceiptPolicy = FULL_RECEIPT
 
-    for generator in (FullLedger(), soundchange.GENERATOR):
+    for generator in (FullLedger(), _full()):
         instance = draw(generator, MASTER, 0)
         assert instance.a.mask == tuple(range(instance.a.n_rows))
         for side in ("a", "b"):
             _reports_every_row(generator, instance, side)
 
 
-def test_sound_change_and_every_fixture_keep_the_full_receipt() -> None:
-    """They keep it until their own arithmetic under the sampled policy is done.
+def test_each_family_declares_the_count_its_own_arithmetic_chose() -> None:
+    """Four records for ledger, two forms for sound change, every row for the vectors.
 
-    FAILS IF any of them declares a policy that samples, which the consultation's
-    fixture arithmetic says would leave sound change at an ideal level of 0.96 and
-    components at 0.98, or if the gate vectors move: every expected number in that
-    module was computed on a receipt that reports every row.
+    FAILS IF a family's declared count is not the one its own bank's arithmetic chose.
+    The counts are not interchangeable and one is not a default for the other: four
+    fully reported rows leave an ideal reader at about 0.82 on ledger and at 0.95 on
+    sound change, because a corrected daughter form exposes the replacement phone and
+    the lost vowel directly, and two rows leave ledger's reader too little. It also
+    fails if any gate vector moves: every expected number in that module is arithmetic
+    on a receipt that reports every row.
     """
-    assert policy_of(soundchange.GENERATOR) is FULL_RECEIPT
+    assert policy_of(ledger.GENERATOR) is SAMPLED_FOUR_OF_TWENTY_FOUR
+    assert policy_of(soundchange.GENERATOR) is SAMPLED_TWO_OF_TWENTY_FOUR
     for name, vector in sorted(VECTORS.items()):
         assert policy_of(vector) is FULL_RECEIPT, name
 
@@ -970,3 +992,45 @@ def test_an_axis_no_family_has_cannot_be_conceded() -> None:
             policy=TWO_OF_TWENTY_FOUR,
             given=("reflexes",),
         )
+
+
+def test_the_law_level_gate_reads_the_count_sound_change_declares() -> None:
+    """The gate prices two forms of twenty four, and no other count.
+
+    FAILS IF the named checks for sound change still begin with the exercise question,
+    which a two-row receipt has no answer to; if the law is walked over anything but the
+    276 masks two rows of twenty four can draw; if it is priced under another policy's
+    name; or if the probability it reports for an alternative is not the draw's own
+    arithmetic, which is one minus the chance both rows miss every row the two
+    conventions disagree on.
+    """
+    from math import comb
+
+    generator = soundchange.GENERATOR
+    instance = draw(generator, MASTER, 0)
+    results = checks.run_checks(
+        generator, instance, MASTER,
+        max_copy_score=1.0, max_flip_score=1.0, min_leverage=0.0,
+    )
+    names = [result.name for result in results]
+    assert names[0] == "law" and "exercise" not in names
+    assert results[0].passed, results[0].detail
+
+    found = law_for(generator, instance, "a")
+    assert (found.policy, found.rows, found.reported, found.masks) == (
+        "sampled-2-of-24", 24, 2, 276,
+    )
+    assert found.weakest[1] >= 0.30
+    drawn = dict(instance.convention)
+    key = generator.key_for(instance.a.table, drawn)
+    for axis in generator.AXES:
+        for option in axis.options:
+            if option == drawn[axis.name]:
+                continue
+            other = generator.key_for(
+                instance.a.table, MappingProxyType(dict(drawn, **{axis.name: option}))
+            )
+            moved = sum(1 for x, y in zip(key, other) if x != y)
+            assert found.distinguishing[f"{axis.name}={option}"] == pytest.approx(
+                1.0 - comb(24 - moved, 2) / comb(24, 2)
+            )

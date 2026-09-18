@@ -42,6 +42,7 @@ from typing import Callable, Sequence
 from shogym.envs.receipts.protocol import (
     Filing,
     NoFiling,
+    ReceiptPolicy,
     RowOutcome,
     SealedSubmission,
 )
@@ -69,6 +70,30 @@ def scope_sentence(label: str) -> str:
     if lines is None:
         raise ValueError(f"a family has siblings A and B, not {label!r}")
     return "\n".join(lines)
+
+
+def receipt_sentence(policy: ReceiptPolicy, sentence: Sequence[str]) -> str:
+    """The genre's own sentence about what its receipt reports, as a description prints it.
+
+    WHAT THE RECEIPT WILL SAY, SAID BEFORE THE WORK IS DONE. A receipt that reports two
+    rows of twenty four is a receipt whose silence on the other twenty two means nothing,
+    and a reader who was not told that has been handed twenty two rows of apparent
+    evidence that the task was filed correctly. So the description says which of the two
+    it is, and it names no selected row: the selection is drawn before any filing exists
+    and a reader can see it in the receipt anyway, while a reader who could see it here
+    could file the rest at random and lose nothing.
+
+    THE RULE IS SHARED AND THE WORDS ARE THE GENRE'S. When the sentence is printed, that
+    it is printed only under a policy that samples, and that it is the same bytes in
+    every arm and under every convention are one registration for every family. What it
+    calls a row and what it calls an answer is not one registration: a schedule has
+    records and bands, a batch has forms and daughter forms, and one sentence over both
+    would name neither. It is empty under the full receipt, which promises a verdict and
+    a correction on every row and so has nothing to qualify.
+    """
+    if not policy.samples:
+        return ""
+    return "\n" + "\n".join(sentence) + "\n"
 
 
 def normalize(value: object) -> str:
@@ -214,6 +239,7 @@ __all__ = [
     "lines_of",
     "normalize",
     "parse_rows",
+    "receipt_sentence",
     "score_rows",
     "scope_sentence",
 ]

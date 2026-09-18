@@ -72,8 +72,8 @@ from shogym.envs.receipts.oracle import OracleTemplate
 from shogym.envs.receipts.oracle import parse as parse_oracle_cell
 from shogym.envs.receipts.oracle import render as render_oracle_cell
 from shogym.envs.receipts.protocol import (
-    FULL_RECEIPT,
     ROW_ADDITIVE_EQUAL_WEIGHT,
+    SAMPLED_TWO_OF_TWENTY_FOUR,
     Axis,
     Column,
     ConstructionExhausted,
@@ -533,7 +533,7 @@ string stays unchanged on that pass. All sources are single phones,
 so there is no longest-match choice or tie to resolve.
 
 {scope}
-
+{receipt}
 BATCH ({format_name})
 
 {body}
@@ -565,6 +565,24 @@ exact correct daughter form after the stated normalization, rounded to
 six decimal places. If feedback is provided, a failed row's correction
 is that row's correct daughter form.
 """
+
+
+#: WHAT THE RECEIPT WILL SAY, IN THIS GENRE'S WORDS.
+#: The rule for printing it is `filing.receipt_sentence`, which every genre with a
+#: sampled receipt uses; these are the words, because a batch has forms and daughter
+#: forms where a schedule has records and bands. It names no form and no choice: the
+#: lint check and the invariance check both pass on it, and `option_mentions` on the
+#: sentence alone returns nothing.
+RECEIPT_SENTENCE: tuple[str, ...] = (
+    "The receipt for this batch reports the verdict and the correct daughter form for",
+    "two selected forms only, and the lines for the other forms say nothing about",
+    "whether they were right.",
+)
+
+
+def receipt_sentence(policy: ReceiptPolicy) -> str:
+    """This genre's registered sentence, under the rule `filing` holds for every genre."""
+    return shared_filing.receipt_sentence(policy, RECEIPT_SENTENCE)
 
 
 # --------------------------------------------------------------------------
@@ -650,10 +668,17 @@ class SoundChangeGenerator:
     #: copy screen prices this family through the character maps rather than through
     #: maps between two published answer orders. See `copy_profiles`.
     COPY_PROFILE: str = SOUNDCHANGE_V1
-    #: The full receipt: a verdict and a same-row correction on every form. This genre
-    #: keeps it until its own arithmetic under the sampled policy has been done, which
-    #: the fixture calculation says will not carry ledger's count.
-    RECEIPT_POLICY: ReceiptPolicy = FULL_RECEIPT
+    #: TWO FORMS OF TWENTY FOUR, verdict and correction, and nothing at all on the other
+    #: twenty two. A receipt that reports every form identifies the whole cascade at the
+    #: first step: a corrected daughter carries the phone the replacement introduced and
+    #: one fewer of the vowel the deletion took, so the full receipt leaves an ideal
+    #: reader at 1.000 and the first engineering run on this genre graded 1.000 against
+    #: an oracle of 0.98 with a recursion effect of -0.004. Ledger's four rows do not
+    #: carry here either: they leave 0.95. Two is the only count from one to eight whose
+    #: bank-mean ideal level sits in the registered band, and it leaves 0.849 against a
+    #: lookup floor of 0.220, or 0.688 with the reflex and the deleted vowel given away.
+    #: Declared rather than assumed, and refused at registration when it is absent.
+    RECEIPT_POLICY: ReceiptPolicy = SAMPLED_TWO_OF_TWENTY_FOUR
     BLANK_TOKEN = BLANK_TOKEN
     UNFILED_TOKEN = UNFILED_TOKEN
 
@@ -778,17 +803,20 @@ class SoundChangeGenerator:
     # ----- the task text -----
 
     def describe(self, task: PublicTask) -> str:
-        """The mechanics, which batches share a cascade, and the batch itself.
+        """The mechanics, which batches share a cascade, what the receipt reports, and
+        the batch itself.
 
         It takes the PUBLIC task, so there is no argument here the drawn rule could
-        arrive through, and the scope sentence is chosen by the sibling label and by
-        nothing else: the same bytes go to every arm of a fork.
+        arrive through. The scope sentence is chosen by the sibling label and the receipt
+        sentence by the declared policy, and by nothing else: the same bytes go to every
+        arm of a fork.
         """
         table: SoundTable = task.table
         surface = table.template
         return TASK_TEMPLATE.format(
             batch_title=surface.title,
             scope=scope_sentence(task.label),
+            receipt=receipt_sentence(self.RECEIPT_POLICY),
             format_name=surface.format_name,
             body=table.body,
         )
@@ -861,6 +889,7 @@ __all__ = [
     "MAX_DAUGHTER",
     "MAX_FILED_ANSWER",
     "ORACLE_TEMPLATE",
+    "RECEIPT_SENTENCE",
     "REFLEX_PHONE",
     "REPLACE_FIRST",
     "ROWS",
@@ -880,6 +909,7 @@ __all__ = [
     "invent_word",
     "key_for",
     "nasal_pass",
+    "receipt_sentence",
     "render_body",
     "replace_pass",
 ]

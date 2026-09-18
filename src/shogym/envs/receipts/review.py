@@ -33,15 +33,21 @@ CATEGORIES = ("surface", "option", "filing", "rows", "counterfactual", "sampled"
 #: What a pack has to show as well, for a family whose receipt reports only the rows a
 #: committed mask drew. Every one of them is a judgement no mechanical check makes.
 #:
-#: The first five are about the cell: a reader has to see a reported row that passed
-#: and one that failed, a reported row nobody filed and one filed with the legal empty
-#: answer, and a row that failed and was suppressed anyway, which is the one case the
-#: policy exists to create and the one a reader is most likely to mistake for a pass.
+#: ONE LIST FOR EVERY SAMPLED FAMILY, IN WORDS NO GENRE OWNS. Two families declare a
+#: count now and they call their rows different things: a schedule has records and
+#: bands, a batch has forms and daughter forms. What a reader has to have seen is the
+#: same in both, so the list says row and answer, and each genre's exporter decides what
+#: its own rows are.
 #:
-#: The next two are about the class the mask can miss entirely: a receipt that reports
-#: at least one record with no dates and one that reports none of them. Under this
-#: policy the second happens on nearly half of all masks, and what it leaves is the
-#: whole of one hidden decision.
+#: The first five are about the cell: a reader has to see a reported row that passed and
+#: one that failed, a reported row nobody filed and one filed with an empty value, and a
+#: row that failed and was suppressed anyway, which is the one case the policy exists to
+#: create and the one a reader is most likely to mistake for a pass.
+#:
+#: The next two are about what the mask can miss entirely: a receipt whose reported rows
+#: disagree with a one-axis alternative to the drawn convention on every axis, and one
+#: that leaves an axis with no such row at all. The second is not redrawn when it
+#: happens, and what it leaves is the whole of one hidden decision.
 #:
 #: The last four are about what the receipt leaves behind. A posterior the receipt pins
 #: to one convention, a posterior holding several that disagree on the sibling's
@@ -49,15 +55,15 @@ CATEGORIES = ("surface", "option", "filing", "rows", "counterfactual", "sampled"
 #: check that the reported rows are the drawn ones, and a pair of conventions whose
 #: reduced receipts are byte identical while their sibling keys are not. That last one
 #: is the point of the change rather than a defect in it, so a person is shown it and
-#: told what it costs on the held-out schedule.
+#: told what it costs on the held-out task.
 SAMPLED_CASES = (
-    "a reported record that passed",
-    "a reported record that failed",
-    "a reported record nobody filed",
-    "a reported record filed with the legal empty answer",
-    "a failed record the mask did not report",
-    "a receipt reporting a record with no dates",
-    "a receipt reporting no record with no dates",
+    "a reported row that passed",
+    "a reported row that failed",
+    "a reported row nobody filed",
+    "a reported row filed with an empty value",
+    "a failed row the mask did not report",
+    "a receipt whose reported rows witness every axis",
+    "a receipt whose reported rows leave an axis unwitnessed",
     "a posterior holding one convention",
     "a posterior holding several with different held-out keys",
     "the mask commitment beside the three cells",
@@ -67,7 +73,14 @@ SAMPLED_CASES = (
 #: What kind of artifact a render entry is, and the smallest it can plausibly be. A
 #: cell's floor is the family's own envelope size; a task text's is a few hundred
 #: bytes, which no real schedule is under.
-KINDS = ("cell", "task")
+#:
+#: A DOCUMENT IS NEITHER, AND SAYS SO. Some of what a reader of a sampled receipt has to
+#: see is not one served artifact: the rows a mask drew are a fact about the instance
+#: and the cells together, and a pair of conventions with identical reduced receipts is
+#: a fact about two cells and the sibling's answers. Material assembled out of committed
+#: values for a reader to read is a document, and calling it a cell or a task would say
+#: the family served it. Its floor is a task's, because it is text a person reads.
+KINDS = ("cell", "task", "document")
 MIN_TASK_BYTES = 400
 
 #: Fields the manifest carries, and the whole of them. Exactly this set: a field the
