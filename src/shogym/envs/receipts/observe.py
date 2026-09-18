@@ -214,8 +214,22 @@ def observe(
         orders=orders,
         payloads=payloads,
         answer_vocabulary=answers_seen,
+        # The family-wide grammar is the UNION over positions, which is what a slot may
+        # print somewhere. It is a summary and not the check: under a policy that
+        # reports only some rows, a token legal where the receipt is silent is not
+        # thereby legal where it owes a verdict, and `slot_row_grammar` below is what
+        # holds that. A union that pretended to be the check would license a four-digit
+        # code in a reported verdict slot.
         slot_grammar={
-            spec.name: spec.allowed(answers_seen) for spec in envelope.slots
+            spec.name: frozenset(
+                spec.allowed(answers_seen)
+                | {
+                    committed.neutral[spec.name][row]
+                    for row in range(n_rows)
+                    if not feedback.reports(row + 1)
+                }
+            )
+            for spec in envelope.slots
         },
         slot_realized={k: frozenset(v) for k, v in realized.items()},
         # THE GRAMMAR IS POSITIONAL WHERE THE POLICY IS. At a reported position a slot

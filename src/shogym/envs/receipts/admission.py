@@ -275,7 +275,6 @@ def report(
             min_blocks=thresholds.min_blocks,
             min_headroom=thresholds.min_headroom,
         )
-        law = law_for(generator, instance, side) if policy.samples else None
     except Exception as exc:  # noqa: BLE001 - a generator that raises has not passed
         return Report(
             tag=f"{instance.generator}/{instance.ordinal}/{side.upper()}",
@@ -286,6 +285,15 @@ def report(
             thresholds=thresholds,
             policy=policy.name,
         )
+    # THE LAW IS PRICED ONLY WHERE IT DECIDES SOMETHING. It is an exact walk of every
+    # mask the policy can draw, which is the expensive thing this package computes, and
+    # an instance the gates or another check already refused is refused whatever it
+    # says. A bank fill considers many ordinals to hold a few, so pricing the refused
+    # ones would be most of the cost of filling a bank and none of the answer. Where an
+    # instance is priced the numbers are reported in full, and where it is not the check
+    # says which refusal came first.
+    priced = result.verdict
+    law = law_for(generator, instance, side) if policy.samples and priced else None
     checks = run_checks(
         generator,
         instance,
@@ -296,6 +304,7 @@ def report(
         min_material_rows=thresholds.min_material_rows,
         min_distinguishing=thresholds.min_distinguishing,
         law=law,
+        price_law=priced,
     )
     return Report(
         tag=result.tag,

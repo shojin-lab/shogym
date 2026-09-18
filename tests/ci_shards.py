@@ -19,6 +19,14 @@ falls mostly on the shard holding the most files, so the numbers below understat
     durable           146s   the kernel and the rest of protocol v2, on the test server
     rest              289s   every other module, which is most of the files and few of the seconds
 
+The two receipt selections cost more than that now, and the reason is in the instrument
+rather than in the partition. A family whose receipt reports only the rows a committed mask
+drew is admitted less often and is dearer to admit, and the bundle tests each recompute a
+bank's population, so a job that used to walk admission a hundred and forty times walks it
+more. A later measurement put ``receipt-attacks`` at 650s and the receipt modules of ``rest``
+at about 340s, which keeps the slowest job inside a quarter of an hour without re-cutting the
+selections. The next re-cut should measure all five again rather than trust these.
+
 The selections live here rather than in the workflow because two readers need the same answer.
 The workflow asks which paths a shard runs, which assets it needs prepared and whether it carries
 the lint and type checks. :mod:`tests.test_ci_shards` asks for the same partition and holds it

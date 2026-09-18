@@ -21,7 +21,7 @@ from shogym.envs.receipts import admission, checks, observe, protocol, streams
 from shogym.envs.receipts.generators import ledger
 from shogym.envs.receipts.generators.ledger import GENERATOR
 from shogym.envs.receipts.registry import load_generator
-from shogym.envs.receipts.protocol import Task, conventions
+from shogym.envs.receipts.protocol import FULL_RECEIPT, Task, conventions
 from shogym.envs.receipts.receipt_ast import (
     ReceiptAST,
     ReceiptRow,
@@ -402,7 +402,10 @@ def test_corrections_that_encode_the_rule_are_refused_though_every_value_is_lega
     assert "graded" in report.failed_checks
     assert not report.admitted
     detail = next(c.detail for c in report.checks if c.name == "graded")
-    assert "scorer's own outcomes" in detail
+    # The same two diagnoses, and the receipt is refused on whichever applies: a
+    # correction chosen for what it encodes is not the one the outcomes carry, and on a
+    # row the committed mask did not draw it is a row that should have said nothing.
+    assert "scorer's own outcomes" in detail or "committed mask drew" in detail
 
 
 def test_the_honest_ledger_renders_exactly_what_the_scorer_says() -> None:
@@ -694,7 +697,14 @@ def test_a_renderer_honest_only_on_the_samples_is_caught_when_the_filing_seals()
     assert admission.report(attack, instance, MASTER, BARS).admitted
     identifiers = GENERATOR.row_identifiers(instance.a.table)
     unsampled = f"{identifiers[0]},Standard"
-    with pytest.raises(ValueError, match="not what the scorer's own outcomes say"):
+    # Either diagnosis is this cell's: the corrections it writes are not the ones the
+    # scorer's outcomes carry, and under a policy that reports only the rows a
+    # committed mask drew most of the rows it writes them on are rows nobody drew.
+    # What the test is about is that the seal refuses it either way.
+    with pytest.raises(
+        ValueError,
+        match="not what the scorer's own outcomes say|the rows the committed mask drew",
+    ):
         bank_mod.render_fork(attack, instance, "a", unsampled)
 
 
@@ -1236,10 +1246,11 @@ def _screen_payload(
         "task_seeds": [str(i) for i in range(pairs)],
         "pairs": [
             {"instance": f"task-{i:02d}", "filing": f"filing-{i:02d}",
-             "placebo": 0.4, "graded": 0.6, "oracle": 0.9}
+             "placebo": 0.4, "graded": 0.6, "oracle": 0.95, "ideal": 0.82}
             for i in range(pairs)
         ],
         "min_room": 0.05, "min_ratio": 0.25, "min_pairs": 36,
+        "min_oracle": 0.90, "min_learning_gap": 0.10,
         "floor": 0.0, "floor_rule": "drop",
         "candidates_screened": 1, "selection_note": "",
     }
@@ -1862,6 +1873,12 @@ def test_review_row_coverage_comes_from_both_siblings() -> None:
     from shogym.envs.receipts.review import required_coverage
 
     class ShortB(_Wrapped):
+        # The full receipt, because a sampled policy names the row count it reports out
+        # of and this family's two siblings print different ones. A family whose tasks
+        # are not the shape its policy registers is refused where the mask is drawn,
+        # which is the right refusal and is not what this is about.
+        RECEIPT_POLICY = FULL_RECEIPT
+
         def build_table(self, master, ordinal, label):
             table = self._inner.build_table(master, ordinal, label)
             if label.upper() == "B":
@@ -1910,8 +1927,8 @@ def test_a_screen_is_rerun_on_its_own_rows(bundle_room) -> None:
 
 
 @pytest.mark.parametrize(
-    "field", ["min_room", "min_ratio", "min_pairs", "floor", "floor_rule",
-              "candidates_screened", "selection_note"]
+    "field", ["min_room", "min_ratio", "min_pairs", "min_oracle", "min_learning_gap",
+              "floor", "floor_rule", "candidates_screened", "selection_note"]
 )
 def test_every_decision_input_is_required(bundle_room, field) -> None:
     """A bar the reader supplies is a bar the record does not state."""
@@ -2173,7 +2190,7 @@ def test_forty_filings_on_one_table_are_not_a_forty_pair_pilot() -> None:
     one_task = _screen_payload()
     one_task["pairs"] = [
         {"instance": "one-table", "filing": f"f{n:02d}",
-         "placebo": 0.4, "graded": 0.6, "oracle": 0.9}
+         "placebo": 0.4, "graded": 0.6, "oracle": 0.95, "ideal": 0.82}
         for n in range(40)
     ]
     with pytest.raises(ValueError, match="repeats instances"):

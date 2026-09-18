@@ -168,7 +168,10 @@ def test_check_reports_every_named_check(capsys: pytest.CaptureFixture[str]) -> 
     _frozen_bank(1)
     assert _run(["receipts", "check", "ledger", "--instances", "1", *BARS]) == 0
     out = capsys.readouterr().out
-    for name in ("exercise", "materiality", "copy", "fixation", "envelope", "graded",
+    # The first check is dispatched on the family's declared receipt policy: what the
+    # realized receipt exercised where every row is reported, and what the registered
+    # mask law leaves where only the rows a committed mask drew are.
+    for name in ("law", "materiality", "copy", "fixation", "envelope", "graded",
                  "placebo", "neutral", "oracle", "lint", "invariance"):
         assert name in out
     assert "0 of 1 instances failed a named check" in out
