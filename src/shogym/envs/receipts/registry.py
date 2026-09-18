@@ -19,6 +19,7 @@ from shogym.envs.receipts.protocol import Generator
 #: implementing the protocol; it earns a place in a release by passing admission,
 #: which is a different and later thing.
 GENRES = {
+    "components": "shogym.envs.receipts.generators.components",
     "ledger": "shogym.envs.receipts.generators.ledger",
     "soundchange": "shogym.envs.receipts.generators.soundchange",
 }
@@ -90,6 +91,23 @@ def bank_path(name: str) -> Path:
     return bank_dir() / f"{name}.json"
 
 
+#: Where the append-only key history lives, and why it is NOT under the bank directory.
+#: The record beside the banks is a per-genre summary and it moves when the evidence
+#: directory moves, so pointing `SHOGYM_RECEIPTS_BANKS` somewhere else produces an empty
+#: record and a first attempt that nobody can see. The history is the other half: one
+#: file, appended to and never rewritten, holding every attempt this machine has made
+#: under any evidence directory. It is overridable for the same reason the bank directory
+#: is, and a run that redirects the banks and leaves this alone is the case the separation
+#: exists for.
+HISTORY_VAR = "SHOGYM_RECEIPTS_HISTORY"
+DEFAULT_HISTORY = Path.home() / ".cache" / "shogym" / "receipts" / "key-history.jsonl"
+
+
+def history_path() -> Path:
+    """The append-only key history for every genre on this machine."""
+    return Path(os.environ.get(HISTORY_VAR) or DEFAULT_HISTORY)
+
+
 def provenance_path(name: str) -> Path:
     """Where a genre's key provenance lives: beside the banks, one file per genre.
 
@@ -126,6 +144,9 @@ def bundles(name: str) -> list[Path]:
 __all__ = [
     "BANK_DIR_VAR",
     "DEFAULT_BANK_DIR",
+    "DEFAULT_HISTORY",
+    "HISTORY_VAR",
+    "history_path",
     "FIXTURES",
     "GENRES",
     "is_fixture",
