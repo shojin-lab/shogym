@@ -12,6 +12,7 @@ import hashlib
 import json
 import re
 import shutil
+from dataclasses import replace
 from fractions import Fraction
 from pathlib import Path
 from typing import Mapping, Sequence
@@ -404,6 +405,67 @@ def test_the_two_a_orientations_are_what_separate_first_listed_from_an_extremum(
     ]
     assert listed == least
     assert validation.movement(keys)["gift_pick"] == 0
+
+
+def test_a_table_of_mixed_orientations_on_its_gift_purchase_rows_is_refused(
+    drawn: Instance,
+) -> None:
+    """The recipe pairs A's two class orientations, and a table that does not is refused.
+
+    It fails if a schedule whose gift-purchase cases print a smaller-first gift class
+    beside a larger-first original class is admitted. Reversing the original class on
+    all six of them leaves three cases of each orientation in each class, so a tally
+    that counts the two classes separately still reads three and three and the pairing
+    the recipe prints is gone from the table.
+    """
+    rows = []
+    for case in drawn.a.table.rows:
+        if retail.case_kind(case) != retail.BOTH_GIFT_PURCHASE:
+            rows.append(case)
+            continue
+        spots = [
+            n for n, i in enumerate(case.instruments)
+            if i.type in retail.NON_GIFT_TYPES and i.contribution > 0
+        ]
+        printed = list(case.instruments)
+        for spot, member in zip(spots, [printed[s] for s in reversed(spots)]):
+            printed[spot] = member
+        rows.append(replace(case, instruments=tuple(printed)))
+    mixed = retail.RetailTable(
+        domain=drawn.a.table.domain, rows=tuple(rows),
+        body=retail.render_body(rows, retail.SURFACE_BY_NAME[drawn.a.table.domain]),
+    )
+    cases = validation.parsed_cases(mixed)
+
+    # Each class on its own still reads three of each orientation, which is what the
+    # separate tallies asked for and what makes the joint profiles the check that bites.
+    tallies: dict[tuple[str, str], dict[bool, int]] = {}
+    for case in cases:
+        gifts, originals = validation._classes(case)
+        for name, members, field in (
+            ("gift", gifts, "balance"), ("original", originals, "contribution")
+        ):
+            if len(members) != retail.A_CLASS_SIZE:
+                continue
+            first, second = (int(m[field] or 0) for m in members)
+            tally = tallies.setdefault((validation.parsed_kind(case), name), {})
+            tally[first < second] = tally.get(first < second, 0) + 1
+    assert tallies
+    for tally in tallies.values():
+        assert sorted(tally.values()) == [retail.PER_ORIENTATION, retail.PER_ORIENTATION]
+
+    refusal = validation.body_refusal(cases, "A")
+    assert "joint profile" in refusal
+    assert validation.side_refusal(mixed, "A") == refusal
+    assert validation.side_refusal(drawn.a.table, "A") == ""
+    counted: dict[tuple[str, bool | None, bool | None], int] = {}
+    for case in validation.parsed_cases(drawn.a.table):
+        profile = validation._joint_profile(case)
+        assert not isinstance(profile, str)
+        counted[profile] = counted.get(profile, 0) + 1
+    assert counted == {
+        profile: retail.PER_ORIENTATION for profile in validation.A_JOINT_PROFILES
+    }
 
 
 def test_the_room_arithmetic_is_what_the_specification_registered(drawn: Instance) -> None:
