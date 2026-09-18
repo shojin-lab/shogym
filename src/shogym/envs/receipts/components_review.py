@@ -294,6 +294,348 @@ def _joined_only_through_a_third(cells: Sequence[tuple[int, int]]) -> bool:
     return False
 
 
+def _position(convention: Mapping[str, str]) -> int:
+    """Where one rule sits in the declared option order."""
+    return components.AXES[0].options.index(convention["contact_kernel"])
+
+
+def _support(task: Task) -> list[tuple[str, ...]]:
+    """This side's answer key under every rule, in the declared option order."""
+    return [
+        tuple(components.key_for(task.table, {"contact_kernel": option}))
+        for option in components.AXES[0].options
+    ]
+
+
+def _posterior(instance: Instance, side: str) -> list[int]:
+    """The rules a reader of this side's reduced receipt cannot tell apart.
+
+    A reported row says whether the filed count was that rule's answer and, when it was
+    not, what that answer is, so two rules print the same reported row exactly when
+    their counts on it agree. The set is therefore a fact about the mask and the boards
+    and not about what was filed, which is why one filing's pack can show it.
+    """
+    task = instance.side(side)
+    keys = _support(task)
+    drawn = keys[_position(instance.convention)]
+    return [
+        n for n, key in enumerate(keys)
+        if all(key[row] == drawn[row] for row in task.mask)
+    ]
+
+
+def _witnessed(instance: Instance, side: str) -> set[str]:
+    """The axes some reported row disagrees with a one-axis alternative on.
+
+    The same event the law-level gate averages over, taken on the mask that was drawn.
+    An axis with no such row is an axis this receipt says nothing about, and a mask that
+    drew two controls is not redrawn for it.
+    """
+    task = instance.side(side)
+    keys = _support(task)
+    here = _position(instance.convention)
+    drawn = keys[here]
+    out: set[str] = set()
+    for other, key in enumerate(keys):
+        if other == here:
+            continue
+        if any(drawn[row] != key[row] for row in task.mask):
+            out.add(components.AXES[0].name)
+    return out
+
+
+def _filing_over(task: Task, values: Sequence[str | None]) -> str:
+    """A filing over this task's printed rows, with None for a row left out entirely."""
+    return "\n".join(
+        "%s,%s" % (identifier, value)
+        for identifier, value in zip(
+            components.GENERATOR.row_identifiers(task.table), values
+        )
+        if value is not None
+    )
+
+
+def _wrong(correct: str) -> str:
+    """A legal count for a row that is not that row's answer under any rule."""
+    return "6" if correct != "6" else "1"
+
+
+def _found(held: Population, holds) -> tuple[Instance, str] | None:
+    """The earliest admitted instance and side the condition holds on."""
+    for instance in held.instances:
+        for side in ("a", "b"):
+            if holds(instance, side):
+                return (instance, side)
+    return None
+
+
+def _ambiguous(instance: Instance, side: str) -> bool:
+    """Whether this receipt leaves rules that answer the sibling differently."""
+    members = _posterior(instance, side)
+    if len(members) < 2:
+        return False
+    sibling = _support(instance.side("b" if side == "a" else "a"))
+    return len({sibling[n] for n in members}) > 1
+
+
+def _aliased_pair(instance: Instance, side: str, members: Sequence[int]) -> tuple[int, int]:
+    """Two of the rules this receipt cannot tell apart whose sibling keys differ."""
+    sibling = _support(instance.side("b" if side == "a" else "a"))
+    for one in members:
+        for other in members:
+            if one < other and sibling[one] != sibling[other]:
+                return (one, other)
+    raise ValueError("this receipt leaves no pair with different held-out keys")
+
+
+def _held_out_cost(instance: Instance, side: str) -> tuple[int, int]:
+    """How many rows of the sibling the surviving rules do not agree on."""
+    members = _posterior(instance, side)
+    sibling = _support(instance.side("b" if side == "a" else "a"))
+    rows = len(sibling[0])
+    return (
+        sum(1 for row in range(rows) if len({sibling[n][row] for n in members}) > 1),
+        rows,
+    )
+
+
+def _spelled(position: int) -> str:
+    """One rule as a reader of the pack reads it."""
+    return "contact_kernel=%s" % components.AXES[0].options[position]
+
+
+def _document(root: Path, name: str, head: Sequence[str], payload: bytes) -> str:
+    """One assembled document: what a reader is being shown, then the cell itself."""
+    return _write(
+        root, f"{RENDERS}/{name}.txt",
+        "\n".join(head) + "\n\n" + payload.decode("ascii"),
+    )
+
+
+def _sampled_renders(held: Population, root: Path) -> list[Render]:
+    """What a reader of a receipt that reports two rows of twenty four has to see.
+
+    NONE OF IT IS VISIBLE IN THE COVERAGE THE OTHER CATEGORIES ENUMERATE. A surface, an
+    option, a filing class and a row count are all satisfied by a cell that reports every
+    row, so a pack built from those alone would put a reader in front of nothing this
+    policy does. These are the eleven the shared coverage asks a sampled family for, in
+    this genre's own rows.
+
+    THE FIRST FIVE ARE BUILT, NOT SEARCHED FOR. Which rows a filing gets right is the
+    exporter's to choose, so they are made on the first admitted instance by filing
+    against its own committed mask. THE REST ARE FACTS ABOUT THE DRAW. Whether a mask
+    witnesses the axis at all, and whether what it leaves is one rule or several, are
+    properties of the rows the stream drew: two of the twenty four rows are controls
+    under every rule, and a mask that drew two of them says nothing and is not redrawn.
+    A bank too small to exhibit one of those is refused here rather than exported with
+    the case missing.
+    """
+    generator = components.GENERATOR
+    if not generator.RECEIPT_POLICY.samples:
+        return []
+    from shogym.envs.receipts.review import SAMPLED_CASES
+
+    out: list[Render] = []
+    first = held.instances[0]
+    task = first.a
+    key = list(task.key)
+    mask = list(task.mask)
+
+    def built(name: str, case: str, values: Sequence[str | None]) -> None:
+        payload = _cells_for(
+            first, task, dict(first.convention), _filing_over(task, values)
+        )[GRADED]
+        out.append(
+            Render("sampled", case, "cell", _write(root, f"{RENDERS}/{name}.txt", payload))
+        )
+
+    built("sampled-passed", SAMPLED_CASES[0], key)
+    built(
+        "sampled-failed", SAMPLED_CASES[1],
+        [_wrong(v) if p in mask else v for p, v in enumerate(key)],
+    )
+    built(
+        "sampled-unfiled", SAMPLED_CASES[2],
+        [None if p in mask else v for p, v in enumerate(key)],
+    )
+    built(
+        "sampled-empty", SAMPLED_CASES[3],
+        ["" if p in mask else v for p, v in enumerate(key)],
+    )
+    wrong_elsewhere = [v if p in mask else _wrong(v) for p, v in enumerate(key)]
+    out.append(
+        Render(
+            "sampled", SAMPLED_CASES[4], "document",
+            _document(
+                root, "sampled-suppressed",
+                (
+                    "instance %s/%d/%s" % (first.generator, first.ordinal, task.label),
+                    "reported rows %s" % ", ".join(str(r + 1) for r in mask),
+                    "rows filed with a count no rule gives them: %s"
+                    % ", ".join(str(p + 1) for p in range(len(key)) if p not in mask),
+                    "every one of them failed and the cell below says nothing about any "
+                    "of them",
+                ),
+                _cells_for(
+                    first, task, dict(first.convention),
+                    _filing_over(task, wrong_elsewhere),
+                )[GRADED],
+            ),
+        )
+    )
+
+    axes = {components.AXES[0].name}
+    whole = _found(held, lambda i, s: _witnessed(i, s) == axes)
+    if whole is None:
+        raise ValueError(
+            "a review pack shows a receipt whose reported rows witness every axis and "
+            "this bank of %d instances draws no such mask. Materialize more instances "
+            "of this genre and export again" % len(held.instances)
+        )
+    short = _found(held, lambda i, s: _witnessed(i, s) != axes)
+    if short is None:
+        raise ValueError(
+            "a review pack shows a receipt that leaves an axis unwitnessed, which here "
+            "is a mask that drew two control rows, and every mask in this bank of %d "
+            "instances drew an informative row. Materialize more instances of this "
+            "genre and export again" % len(held.instances)
+        )
+    for name, case, (instance, side) in (
+        ("sampled-witnesses-every-axis", SAMPLED_CASES[5], whole),
+        ("sampled-leaves-an-axis-unwitnessed", SAMPLED_CASES[6], short),
+    ):
+        shown = instance.side(side)
+        seen = sorted(_witnessed(instance, side))
+        out.append(
+            Render(
+                "sampled", case, "document",
+                _document(
+                    root, name,
+                    (
+                        "instance %s/%d/%s"
+                        % (instance.generator, instance.ordinal, shown.label),
+                        "reported rows %s"
+                        % ", ".join(str(r + 1) for r in shown.mask),
+                        "axes some reported row disagrees with a one-axis alternative "
+                        "on: %s" % (", ".join(seen) or "none"),
+                        "axes it says nothing about: %s"
+                        % (", ".join(sorted(axes - set(seen))) or "none"),
+                    ),
+                    _cells_for(
+                        instance, shown, dict(instance.convention), _mixed_filing(shown)
+                    )[GRADED],
+                ),
+            )
+        )
+
+    pinned = _found(held, lambda i, s: len(_posterior(i, s)) == 1)
+    if pinned is None:
+        raise ValueError(
+            "a review pack shows a receipt that pins the rule and no mask in this bank "
+            "of %d instances does. Materialize more instances of this genre and export "
+            "again" % len(held.instances)
+        )
+    left = _found(held, _ambiguous)
+    if left is None:
+        raise ValueError(
+            "a review pack shows a receipt that leaves several rules with different "
+            "held-out keys and no mask in this bank of %d instances does. Materialize "
+            "more instances of this genre and export again" % len(held.instances)
+        )
+    for name, case, (instance, side) in (
+        ("sampled-posterior-of-one", SAMPLED_CASES[7], pinned),
+        ("sampled-posterior-of-several", SAMPLED_CASES[8], left),
+    ):
+        shown = instance.side(side)
+        members = _posterior(instance, side)
+        out.append(
+            Render(
+                "sampled", case, "document",
+                _document(
+                    root, name,
+                    (
+                        "instance %s/%d/%s"
+                        % (instance.generator, instance.ordinal, shown.label),
+                        "reported rows %s"
+                        % ", ".join(str(r + 1) for r in shown.mask),
+                        "rules this receipt cannot tell apart: %d of %d"
+                        % (len(members), len(components.AXES[0].options)),
+                    )
+                    + tuple("  %s" % _spelled(n) for n in members)
+                    + (
+                        "held-out rows they disagree on: %d of %d"
+                        % _held_out_cost(instance, side),
+                    ),
+                    _cells_for(
+                        instance, shown, dict(instance.convention), _mixed_filing(shown)
+                    )[GRADED],
+                ),
+            )
+        )
+
+    cells = _cells_for(first, task, dict(first.convention), _mixed_filing(task))
+    out.append(
+        Render(
+            "sampled", SAMPLED_CASES[9], "document",
+            _write(
+                root, f"{RENDERS}/sampled-mask-commitment.txt",
+                "\n".join(
+                    (
+                        "instance %s/%d/%s" % (first.generator, first.ordinal, task.label),
+                        "the receipt policy committed with this instance: %s"
+                        % generator.RECEIPT_POLICY.name,
+                        "the rows it drew, committed before any filing existed: %s"
+                        % ", ".join(str(r + 1) for r in mask),
+                        "",
+                        "",
+                    )
+                )
+                + "\n\n".join(
+                    cells[kind].decode("ascii") for kind in (GRADED, PLACEBO, ORACLE)
+                ),
+            ),
+        )
+    )
+
+    instance, side = left
+    shown = instance.side(side)
+    members = _posterior(instance, side)
+    raw = _mixed_filing(shown)
+    pair = _aliased_pair(instance, side, members)
+    options = components.AXES[0].options
+    rendered = [
+        _cells_for(instance, _retasked(shown, {"contact_kernel": options[n]}),
+                   {"contact_kernel": options[n]}, raw)[GRADED]
+        for n in pair
+    ]
+    if rendered[0] != rendered[1]:
+        raise ValueError(
+            "two rules this receipt cannot tell apart rendered two different cells, so "
+            "the pack cannot show what it says it shows"
+        )
+    disagree, rows = _held_out_cost(instance, side)
+    out.append(
+        Render(
+            "sampled", SAMPLED_CASES[10], "document",
+            _document(
+                root, "sampled-identical-reduced-receipts",
+                (
+                    "instance %s/%d/%s"
+                    % (instance.generator, instance.ordinal, shown.label),
+                    "reported rows %s" % ", ".join(str(r + 1) for r in shown.mask),
+                    "these two rules render the cell below byte for byte:",
+                    "  %s" % _spelled(pair[0]),
+                    "  %s" % _spelled(pair[1]),
+                    "and they disagree on %d of the %d rows of the schedule this reader "
+                    "files next" % (disagree, rows),
+                ),
+                rendered[0],
+            ),
+        )
+    )
+    return out
+
+
 def export(bank: Bank, held: Population, directory: str | Path) -> Path:
     """Write the review pack and its worksheets, and return the manifest's path.
 
@@ -444,6 +786,8 @@ def export(bank: Bank, held: Population, directory: str | Path) -> Path:
 
     cases = _case_rows(held)
     _write(root, f"{WORKSHEETS}/cases.json", json.dumps(cases, indent=1, sort_keys=True))
+
+    renders.extend(_sampled_renders(held, root))
 
     coverage = required_coverage(generator, checks.FILING_CLASSES, [components.ROWS])
     missing = coverage.missing([(r.category, r.key) for r in renders])

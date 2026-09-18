@@ -60,8 +60,8 @@ from shogym.envs.receipts.oracle import OracleTemplate
 from shogym.envs.receipts.oracle import parse as parse_oracle_cell
 from shogym.envs.receipts.oracle import render as render_oracle_cell
 from shogym.envs.receipts.protocol import (
-    FULL_RECEIPT,
     ROW_ADDITIVE_EQUAL_WEIGHT,
+    SAMPLED_TWO_OF_TWENTY_FOUR,
     Axis,
     Column,
     ConstructionExhausted,
@@ -780,9 +780,26 @@ Any other comma-free text is not a filing for these rows. Unreadable
 input, empty input, or input identifying no row receives zero credit.
 
 {scope}
-
+{receipt}
 {body}
 """
+
+#: WHAT THE RECEIPT WILL SAY, IN THIS GENRE'S WORDS.
+#: The rule for printing it is `filing.receipt_sentence`, which every genre with a
+#: sampled receipt uses; these are the words, because this schedule has rows and counts
+#: where a batch has forms and daughter forms. It names no row and no rule: the lint
+#: check and the invariance check both pass on it, and `option_mentions` on the sentence
+#: alone returns nothing.
+RECEIPT_SENTENCE: tuple[str, ...] = (
+    "The receipt for this schedule reports the verdict and the correct count for",
+    "two selected rows only, and the lines for the other rows say nothing about",
+    "whether they were right.",
+)
+
+
+def receipt_sentence(policy: ReceiptPolicy) -> str:
+    """This genre's registered sentence, under the rule `filing` holds for every genre."""
+    return shared_filing.receipt_sentence(policy, RECEIPT_SENTENCE)
 
 
 # --------------------------------------------------------------------------
@@ -839,9 +856,18 @@ class ComponentsGenerator:
     #: prices. The stronger all-bijection bound is an added check rather than a change of
     #: profile: see `components_audit.check_bijection_copy`.
     COPY_PROFILE: str = ORDERED_TOKENS
-    #: The full receipt: a verdict and a same-row correction on every board. Declared
-    #: rather than assumed, and refused at registration when it is absent.
-    RECEIPT_POLICY: ReceiptPolicy = FULL_RECEIPT
+    #: TWO ROWS OF TWENTY FOUR, verdict and correction, and nothing at all on the other
+    #: twenty two. A receipt that reports every row identifies the rule outright: a
+    #: board's count is one of the two values its own pattern can take, so a verdict
+    #: alone names the other, and the full receipt leaves an ideal reader at 1.000 with
+    #: nothing for a later step to improve on. Two rows is the only count from one to
+    #: eight that clears the three law-level bars, and it is the same arithmetic on every
+    #: compliant pair: 329/368 for an ideal reader against a lookup floor of 305/368,
+    #: which is 1 on a posterior of one rule and 0.75 otherwise, with every rule
+    #: distinguished from every other with probability 35/46. One row leaves no room at
+    #: all and three leave too little to improve on. Declared rather than assumed, and
+    #: refused at registration when it is absent.
+    RECEIPT_POLICY: ReceiptPolicy = SAMPLED_TWO_OF_TWENTY_FOUR
     BLANK_TOKEN = BLANK_TOKEN
     UNFILED_TOKEN = UNFILED_TOKEN
     CONSTRUCTION_BOUNDS = CONSTRUCTION_BOUNDS
@@ -968,16 +994,19 @@ class ComponentsGenerator:
     # ----- the task text -----
 
     def describe(self, task: PublicTask) -> str:
-        """The mechanics, which schedules share a rule, and the schedule itself.
+        """The mechanics, which schedules share a rule, what the receipt reports, and
+        the schedule itself.
 
         It takes the PUBLIC task, so there is no argument here the drawn rule could
-        arrive through, and the scope sentence is chosen by the sibling label and by
-        nothing else: the same bytes go to every arm of a fork.
+        arrive through. The scope sentence is chosen by the sibling label and the receipt
+        sentence by the declared policy, and by nothing else: the same bytes go to every
+        arm of a fork.
         """
         table: ComponentsTable = task.table
         return TASK_TEMPLATE.format(
             task_id=task.task_id,
             scope=scope_sentence(task.label),
+            receipt=receipt_sentence(self.RECEIPT_POLICY),
             body=table.body,
         )
 
@@ -1058,6 +1087,7 @@ __all__ = [
     "MIN_CELLS",
     "ORACLE_HEAD",
     "ORACLE_TEMPLATE",
+    "RECEIPT_SENTENCE",
     "ROWS",
     "SHAPE",
     "SIDE",
@@ -1084,6 +1114,7 @@ __all__ = [
     "key_for",
     "linked",
     "print_cells",
+    "receipt_sentence",
     "side_structure",
     "stratum_of",
 ]

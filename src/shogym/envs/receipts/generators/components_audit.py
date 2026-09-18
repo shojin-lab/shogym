@@ -30,6 +30,7 @@ from __future__ import annotations
 
 import itertools
 from collections import Counter
+from dataclasses import replace
 from functools import lru_cache
 from types import MappingProxyType
 from typing import Mapping, Sequence
@@ -63,7 +64,8 @@ from shogym.envs.receipts.generators.components import (
 )
 from shogym.envs.receipts.filing import fold, scope_sentence
 from shogym.envs.receipts.observe import observe
-from shogym.envs.receipts.protocol import Instance, Task
+from shogym.envs.receipts.receipt_law import law_for
+from shogym.envs.receipts.protocol import FULL_RECEIPT, Instance, Task, policy_of
 from shogym.envs.receipts.receipt_ast import (
     GAP,
     ORDINAL_WIDTH,
@@ -93,6 +95,18 @@ EXPECTED_BLOCKS = 3
 EXPECTED_CEILING = 1.0
 EXPECTED_FLOOR = 5.0 / 6.0
 EXPECTED_HEADROOM = 1.0 / 6.0
+#: WHAT THE REGISTERED MASK LAW LEAVES, on the recipe rather than on a draw. Six rows of
+#: each of three informative types and six controls make these a closed form in the
+#: reported count alone, so they are the same numbers on every compliant pair and a pair
+#: that reports others is a pair whose rows are not the recipe's. Two reported rows of
+#: twenty four leave an ideal reader at 329/368, which is 1 on a posterior of one rule
+#: and 3/4 otherwise, against a lookup floor of 305/368; the room over it is 3/46; and
+#: every rule is distinguished from every other with probability 1 - choose(12,2)/
+#: choose(24,2), because each pair of rules disagrees on exactly twelve rows.
+EXPECTED_LAW_IDEAL = 329.0 / 368.0
+EXPECTED_LAW_FLOOR = 305.0 / 368.0
+EXPECTED_LAW_ROOM = 3.0 / 46.0
+EXPECTED_LAW_DISTINCTION = 35.0 / 46.0
 #: What the specified case-lookup procedure earns with the public modal fallback: each
 #: row's modal count over the three rules is right on the eighteen informative rows two
 #: times in three and on the six controls always.
@@ -644,24 +658,68 @@ def _has_side_cycle(cells: Sequence[tuple[int, int]]) -> bool:
     return contacts > len(cells) - flood_components(cells, OPTIONS[0])
 
 
+def _reporting_every_row(generator, instance: Instance):
+    """The same family and the same pair, with the receipt reporting every row.
+
+    SOME OF WHAT THE SUPPORT CHECK ASKS IS ABOUT THE ROW RECIPE AND NOT ABOUT A DRAW.
+    That three rules serialize to three different receipts, that the receipt resolves
+    three blocks, that no row is evident and that the ceiling and floor are one and five
+    sixths are facts about six rows of each informative type and six controls. Under a
+    policy that reports two rows of twenty four every one of them is also a fact about
+    which two rows a committed stream happened to draw, and several are deliberately
+    false on masks the policy can draw: two controls resolve one block and alias all
+    three rules. The recipe is what this check is for, so those are asked of the receipt
+    that reports every row, and what the served receipt leaves is asked of the registered
+    mask law beside them.
+
+    It returns the family and the pair unchanged where the family already reports every
+    row, so nothing about a full-policy family passes through a second object.
+    """
+    if not policy_of(generator).samples:
+        return generator, instance
+
+    class EveryRow(type(generator)):
+        RECEIPT_POLICY = FULL_RECEIPT
+
+    whole = tuple(range(len(instance.a.table.rows)))
+    return EveryRow(), replace(
+        instance,
+        a=replace(instance.a, mask=whole),
+        b=replace(instance.b, mask=whole),
+    )
+
+
 def check_support(generator, instance: Instance) -> CheckResult:
     """The room arithmetic, rerun at every rule rather than only at the one drawn.
 
     It fails if under any reference rule, on either sibling, the three keys are not
-    distinct after normalization, the three graded receipts are not distinct as bytes, a
-    pair of keys moves other than twelve rows, the receipt resolves other than three
-    blocks, any row is evident, the ceiling is not one, the lookup floor is not five
-    sixths, the headroom is not one sixth, an axis is not exercised, a one-rule-wrong
-    filing beats its bar, the axis carries too little leverage, or the registered copy
-    calculation reports a maximum over its bar.
+    distinct after normalization, the three graded receipts reporting every row are not
+    distinct as bytes, a pair of keys moves other than twelve rows, that receipt resolves
+    other than three blocks, any row is evident, its ceiling is not one, its lookup floor
+    is not five sixths, its headroom is not one sixth, an axis is not exercised, a
+    one-rule-wrong filing beats its bar, the axis carries too little leverage, or the
+    registered copy calculation reports a maximum over its bar. Under a policy that
+    reports some of the rows it also fails if the registered mask law leaves anything
+    other than the recipe's own 329/368, 305/368, 3/46 and 35/46.
+
+    THE RECEIPT-SHAPED HALF IS ASKED OF THE RECEIPT THAT REPORTS EVERY ROW. Which rows a
+    stream drew is not what a recipe check is about, and several of those numbers are
+    deliberately false on masks the policy can draw: two controls resolve one block and
+    alias all three rules, and they are not redrawn. The law beside them is the same
+    recipe's statement about what is served.
 
     Nothing here calls admission or fixation. A counterfactual instance is a reference
     filing and not a candidate, so fixing it would compare a rebuild of the actual draw
     against a rule that was not drawn.
     """
     lines: list[str] = []
+    every_row, whole_pair = _reporting_every_row(generator, instance)
+    samples = policy_of(generator).samples
     for reference in OPTIONS:
         alternative = retasked_instance(generator, instance, {"contact_kernel": reference})
+        recipe = retasked_instance(
+            every_row, whole_pair, {"contact_kernel": reference}
+        )
         for side in ("a", "b"):
             table = alternative.side(side).table
             keys = {
@@ -677,20 +735,20 @@ def check_support(generator, instance: Instance) -> CheckResult:
                     f"under reference {reference}, side {side.upper()} normalizes two rules "
                     "to one key, so two options are one action",
                 )
-            task = alternative.side(side)
+            task = recipe.side(side)
             filed = "\n".join(
                 "%s,%s" % (identifier, value)
-                for identifier, value in zip(generator.row_identifiers(table), task.key)
+                for identifier, value in zip(every_row.row_identifiers(table), task.key)
             )
-            canonical = generator.parse_and_canonicalize(task, filed)
-            envelope = frozen_envelope(alternative.envelope)
+            canonical = every_row.parse_and_canonicalize(task, filed)
+            envelope = frozen_envelope(recipe.envelope)
             rendered = {
                 option: serialize(
-                    generator.render_receipt(
+                    every_row.render_receipt(
                         task,
                         canonical,
-                        generator.key_for(table, {"contact_kernel": option}),
-                        feedback_for(generator, task, envelope),
+                        every_row.key_for(table, {"contact_kernel": option}),
+                        feedback_for(every_row, task, envelope),
                     ),
                     envelope,
                 )
@@ -700,7 +758,8 @@ def check_support(generator, instance: Instance) -> CheckResult:
                 return CheckResult(
                     "components_support", False,
                     f"under reference {reference}, side {side.upper()} serializes two rules "
-                    "to one receipt, so the bytes alias what the keys separate",
+                    "to one receipt reporting every row, so the bytes alias what the keys "
+                    "separate",
                 )
             for one, other in itertools.combinations(OPTIONS, 2):
                 moved = sum(1 for x, y in zip(keys[one], keys[other]) if x != y)
@@ -711,7 +770,7 @@ def check_support(generator, instance: Instance) -> CheckResult:
                         "recipe moves %d"
                         % (reference, side.upper(), moved, one, other, EXPECTED_MOVEMENT),
                     )
-        result = gate(observe(generator, alternative, "a"))
+        result = gate(observe(every_row, recipe, "a"))
         blocks = result.blocks.get(AXES[0].name, 0)
         if blocks != EXPECTED_BLOCKS:
             return CheckResult(
@@ -736,12 +795,31 @@ def check_support(generator, instance: Instance) -> CheckResult:
                     "under reference %s the %s is %.6f and the recipe gives %.6f"
                     % (reference, name, got, want),
                 )
-        exercised = check_exercise(generator, alternative)
+        exercised = check_exercise(every_row, recipe)
         if not exercised.passed:
             return CheckResult(
                 "components_support", False,
                 f"under reference {reference}, {exercised.detail}",
             )
+        law = None
+        if samples:
+            # AND WHAT THE SERVED RECEIPT LEAVES, on the same recipe. The row recipe
+            # fixes these in the reported count alone, so a pair whose law differs from
+            # the registered one is a pair whose rows are not the recipe's, whatever its
+            # full receipt resolves.
+            law = law_for(generator, alternative, "a")
+            for name, got, want in (
+                ("ideal graded level", law.ideal, EXPECTED_LAW_IDEAL),
+                ("lookup floor", law.floor, EXPECTED_LAW_FLOOR),
+                ("room over the floor", law.room, EXPECTED_LAW_ROOM),
+                ("weakest distinction", law.weakest[1], EXPECTED_LAW_DISTINCTION),
+            ):
+                if abs(got - want) > TOLERANCE:
+                    return CheckResult(
+                        "components_support", False,
+                        "under reference %s the mask law's %s is %.9f and the recipe "
+                        "gives %.9f" % (reference, name, got, want),
+                    )
         scores = copy_scores(generator, alternative)
         leverage = axis_leverage(generator, alternative)
         registered = max(
@@ -778,11 +856,15 @@ def check_support(generator, instance: Instance) -> CheckResult:
             )
         lines.append(
             "%s blocks %d, evident %d, ceiling %.6f, floor %.6f, H %.6f, copy %.6f, "
-            "one rule wrong %.6f, leverage %.6f"
+            "one rule wrong %.6f, leverage %.6f%s"
             % (
                 reference, blocks, result.n_evident, result.ceiling, result.floor,
                 result.ceiling - result.floor, registered, scores["option_flip"],
                 leverage[AXES[0].name],
+                ""
+                if law is None
+                else "; over the mask law ideal %.6f, floor %.6f, room %.6f"
+                % (law.ideal, law.floor, law.room),
             )
         )
     return CheckResult("components_support", True, "; ".join(lines))
