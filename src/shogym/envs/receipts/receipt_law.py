@@ -419,6 +419,15 @@ def law_for(
     # they agree on the selected columns AND derive the same roles for them, which is
     # what keeps an average over seventy two references from costing seventy two times
     # as much.
+    #
+    # EMPTY LOCAL DEPENDENCE IS AN ORDINARY CLASS. `_dependence` moves one axis at a
+    # time, so a column it finds empty is a column no SINGLE-axis alternative moves;
+    # a joint alternative can still move it, and the reader who sees it match learns
+    # that. Dropping that class would concede less to the lookup than the receipt
+    # actually shows, which understates the floor and overstates the room above it.
+    # This is the construction `shogym.receipts.resolution` has always used for the
+    # gate's own floor, where every non-evident row joins the class of its dependence
+    # signature whatever that signature is.
     signature_id: dict[frozenset[str], int] = {}
     roles: dict[int, list[int]] = {}
     for reference, (dependence, evident) in profiles.items():
@@ -426,8 +435,6 @@ def law_for(
         for column in range(rows):
             if evident[column]:
                 row_roles.append(-1)
-            elif not dependence[column]:
-                row_roles.append(-2)
             else:
                 row_roles.append(
                     signature_id.setdefault(dependence[column], len(signature_id))
@@ -452,9 +459,10 @@ def law_for(
         ideal += share * _partition_value(blocks, reader, population)
         # The lookup floor over the same reduced receipt: the evident rows it shows,
         # plus one all-matched bit per class of shown rows a reader can see and not
-        # resolve. Rows the mask did not draw respond to nothing, so their bit is
-        # constant and contributes no column, which is what makes the floor a
-        # statement about the reduced receipt rather than about the full one.
+        # resolve, the class of empty local dependence included. Rows the mask did not
+        # draw respond to nothing, so their bit is constant and contributes no column,
+        # which is what makes the floor a statement about the reduced receipt rather
+        # than about the full one.
         #
         # Two references give one calculation when they agree on the selected columns
         # AND derive the same roles for them, because the labels are built from
