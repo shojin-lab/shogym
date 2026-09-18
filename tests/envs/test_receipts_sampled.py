@@ -19,11 +19,12 @@ import pytest
 
 from shogym.envs.receipts import checks
 from shogym.envs.receipts.bank import instance_record, render_fork
-from shogym.envs.receipts.generators import ledger, soundchange
+from shogym.envs.receipts.generators import ledger, soundchange, soundchange_audit
 from shogym.envs.receipts.generators.vectors import VECTORS
 from shogym.envs.receipts.protocol import (
     FULL_RECEIPT,
     SAMPLED_FOUR_OF_TWENTY_FOUR,
+    SAMPLED_TWO_OF_TWENTY_FOUR,
     ReceiptPolicy,
     Task,
     conventions,
@@ -38,6 +39,7 @@ from shogym.envs.receipts.receipt_ast import (
     row_lines,
     serialize,
 )
+from shogym.envs.receipts.receipt_law import law_for
 from shogym.envs.receipts.registry import load_generator
 from shogym.envs.receipts.render import (
     FAIL_TOKEN,
@@ -48,6 +50,9 @@ from shogym.envs.receipts.render import (
 
 MASTER = bytes(range(32))
 ENVELOPE_BYTES = 2657
+#: Sound change's own count, named here so the law can be priced at it before and
+#: after the family declares it.
+TWO_OF_TWENTY_FOUR = SAMPLED_TWO_OF_TWENTY_FOUR
 
 
 def _sampled():
@@ -498,6 +503,7 @@ def test_an_undeclared_policy_is_refused_at_registration() -> None:
     for name in ("ledger", "soundchange", *sorted(VECTORS)):
         assert policy_of(load_generator(name)) in (
             FULL_RECEIPT,
+            SAMPLED_TWO_OF_TWENTY_FOUR,
             SAMPLED_FOUR_OF_TWENTY_FOUR,
         )
 
@@ -918,3 +924,49 @@ def test_a_full_policy_cell_is_the_cell_the_fork_commits() -> None:
         assert fork.component_score == 1.0
         for kind in (GRADED, PLACEBO):
             assert len(fork.agent_bytes(kind)) == instance.envelope.size
+
+
+def test_a_conceded_axis_moves_the_floor_and_never_the_ceiling() -> None:
+    """A comparator handed two axes reads a higher floor under the same receipt.
+
+    FAILS IF handing the reader the reflex and the deleted vowel leaves the lookup
+    floor where it was, which would mean the concession bought nothing and the
+    comparator was not comparing anything; or if it moves the ideal level, which is
+    what an ideal reader of the receipt reaches and is not a comparator's business; or
+    if the law record does not say which axes were conceded, which would leave a number
+    in the record nobody can say the meaning of.
+    """
+    instance = draw(soundchange.GENERATOR, MASTER, 0)
+    plain = law_for(soundchange.GENERATOR, instance, "a", policy=TWO_OF_TWENTY_FOUR)
+    given = law_for(
+        soundchange.GENERATOR,
+        instance,
+        "a",
+        policy=TWO_OF_TWENTY_FOUR,
+        given=soundchange_audit.READABLE_AXES,
+    )
+    assert plain.ideal == given.ideal
+    assert plain.augmented == plain.floor
+    assert given.augmented > given.floor
+    assert given.augmented_room == given.ideal - given.augmented
+    assert given.as_record()["given"] == ["reflex", "loss"]
+    assert given.as_record()["augmented"] == given.augmented
+    assert "reflex and loss given away" in given.detail()
+    assert "given away" not in plain.detail()
+
+
+def test_an_axis_no_family_has_cannot_be_conceded() -> None:
+    """A comparator hands over choices the family makes, not choices it does not.
+
+    FAILS IF a misspelled axis name is quietly conceded as nothing, which would report
+    a floor computed with no concession under a name that says otherwise.
+    """
+    instance = draw(soundchange.GENERATOR, MASTER, 0)
+    with pytest.raises(ValueError, match="no axis"):
+        law_for(
+            soundchange.GENERATOR,
+            instance,
+            "a",
+            policy=TWO_OF_TWENTY_FOUR,
+            given=("reflexes",),
+        )

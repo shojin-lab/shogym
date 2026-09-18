@@ -95,10 +95,29 @@ class LawResult:
     #: Per single-axis alternative to the drawn convention, the probability over masks
     #: that the receipt shows a row the two disagree on.
     distinguishing: Mapping[str, float]
+    #: The axes a comparator hands the reader for nothing, and the floor it leaves.
+    #:
+    #: SOME FAMILIES HAVE ANSWERS THAT LEAK AN AXIS. A corrected daughter form carries
+    #: the phone the replacement introduced and one fewer of the vowel the deletion
+    #: took, so a reader of one corrected row can name two of sound change's four
+    #: choices by direct correspondence, without inferring anything. A floor that
+    #: counted whole words as indivisible answers would concede none of that and would
+    #: report room the family does not have. So a family's own audit names the axes its
+    #: answers hand over and asks for the floor computed with them conceded as well.
+    #:
+    #: Naming none leaves this equal to the floor, which is the statement that nothing
+    #: the receipt prints hands an axis over for free.
+    given: tuple[str, ...] = ()
+    augmented: float = 0.0
 
     @property
     def room(self) -> float:
         return self.ideal - self.floor
+
+    @property
+    def augmented_room(self) -> float:
+        """What an ideal reader gains over a lookup that was handed the given axes."""
+        return self.ideal - self.augmented
 
     @property
     def weakest(self) -> tuple[str, float]:
@@ -109,7 +128,20 @@ class LawResult:
         return (name, self.distinguishing[name])
 
     def detail(self) -> str:
-        """One line a reader of a check result can price the law from."""
+        """One line a reader of a check result can price the law from.
+
+        The augmented floor is named only where a family gave an axis away, so the line
+        a family that gave none prints is the line it printed before there was anything
+        to give.
+        """
+        return self._detail() + (
+            ""
+            if not self.given
+            else "; with %s given away the floor is %.4f and the room %.4f"
+            % (" and ".join(self.given), self.augmented, self.augmented_room)
+        )
+
+    def _detail(self) -> str:
         name, weakest = self.weakest
         return (
             "over all %d masks: consistent conventions %.4f, singleton %.4f, entropy "
@@ -144,6 +176,8 @@ class LawResult:
             "floor": self.floor,
             "room": self.room,
             "distinguishing": {k: v for k, v in sorted(self.distinguishing.items())},
+            "given": list(self.given),
+            "augmented": self.augmented,
         }
 
 
@@ -306,6 +340,7 @@ def law_for(
     side: str = "a",
     references: str = ALL_REFERENCES,
     policy: ReceiptPolicy | None = None,
+    given: Sequence[str] = (),
 ) -> LawResult:
     """The receipt law for one instance, computed exactly over every mask.
 
@@ -316,12 +351,26 @@ def law_for(
     candidate count takes: what eight reported rows would leave on these tables is a
     question about the tables and the law, and it is asked without rendering a single
     cell under a policy nothing is registered as.
+
+    `given` names axes a comparator concedes to the reader for nothing, on top of the
+    lookup observations the floor already concedes. It moves the floor and never the
+    ceiling: what an ideal reader of the receipt reaches is the same whatever a
+    comparator is handed. A family names its own in its audit, because which of a
+    family's answers hand an axis over is a fact about what its answers spell.
     """
     if references not in REFERENCE_RULES:
         raise ValueError(
             f"a floor averages over {REFERENCE_RULES}, not {references!r}"
         )
     policy = policy or policy_of(generator)
+    conceded = tuple(given)
+    named = {axis.name for axis in generator.AXES}
+    unknown = [axis for axis in conceded if axis not in named]
+    if unknown:
+        raise ValueError(
+            f"{generator.name!r} has no axis {', '.join(unknown)}, so nothing can be "
+            "given away on it"
+        )
     remembered = (
         type(generator).__qualname__,
         instance.a.task_id,
@@ -331,6 +380,7 @@ def law_for(
         policy.as_record()["reported"],
         side.strip().lower(),
         references,
+        conceded,
     )
     known = _CACHE.get(remembered)
     if known is not None:
@@ -405,6 +455,18 @@ def law_for(
     table = [[int(value) for value in row] for row in graded.tolist()]
     population = len(drawable)
     everyone = (1 << population) - 1
+    # WHAT A CONCEDED AXIS COSTS THE FLOOR, as one more refinement rather than as a
+    # second construction: the conventions grouped by their options on the given axes,
+    # one bitmask per group. Cutting the lookup partition by those groups is exactly
+    # handing the reader those choices on top of what it could already read off.
+    given_masks: list[int] | None = None
+    if conceded:
+        places = [axes.index(name) for name in conceded]
+        groups: dict[tuple[str, ...], int] = {}
+        for position, combo in enumerate(drawable):
+            key = tuple(combo[place] for place in places)
+            groups[key] = groups.get(key, 0) | (1 << position)
+        given_masks = list(groups.values())
     column_masks: list[list[int]] = []
     column_mask_of: list[dict[int, int]] = []
     for column in range(rows):
@@ -441,7 +503,7 @@ def law_for(
                 )
         roles[reference] = row_roles
 
-    compatible = singleton = entropy = ideal = floor = 0.0
+    compatible = singleton = entropy = ideal = floor = augmented = 0.0
     for selected, weight in seen.items():
         columns = sorted(representative[kind] for kind in selected)
         blocks: list[int] = [everyone]
@@ -496,10 +558,15 @@ def law_for(
                     break
                 agreed = together[role]
                 lookup = _refined(lookup, (agreed, everyone & ~agreed))
-            floor += (
-                share
-                * (len(members) / len(roles))
-                * _partition_value(lookup, reader, population)
+            weight = share * (len(members) / len(roles))
+            value = _partition_value(lookup, reader, population)
+            floor += weight * value
+            augmented += weight * (
+                value
+                if given_masks is None
+                else _partition_value(
+                    _refined(lookup, given_masks), reader, population
+                )
             )
 
     no_receipt = _partition_value([everyone], reader, population)
@@ -530,6 +597,8 @@ def law_for(
         ideal=ideal,
         floor=floor,
         distinguishing=distinguishing,
+        given=conceded,
+        augmented=augmented,
     )
     if len(_CACHE) >= _CACHE_SIZE:
         _CACHE.clear()
