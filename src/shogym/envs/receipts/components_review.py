@@ -37,8 +37,11 @@ standing instruction, one frozen instrument, one named model, four pinned initia
 and the predeclared release condition of a mean oracle grade of at least 0.90. It reads
 the identities against the bank's own admitted order and the outcomes against the
 recorded screen the pilot wrote, because an allocation audited against its own fields is
-an allocation that says whatever it likes. No model has been run for this genre and
-nothing here runs one.
+an allocation that says whatever it likes. The cases and the recorded pairs are matched
+one to one, each case's ordinal and A filing are read against the bank and the record,
+and the release statistic is taken over the matched pairs alone, because a count of
+cases beside a count of pairs says nothing about which case was which execution. No
+model has been run for this genre and nothing here runs one.
 """
 
 from __future__ import annotations
@@ -579,11 +582,20 @@ def screen_refusals(
     read the state rule against, a model nobody named, and grades that are not numbers.
     So the identities are held against `ordinals`, the bank's admitted order, and the
     outcomes against `screen`, the recorded `ScreenRecord` the pilot wrote, which
-    validates its own rows. The oracle mean is computed from that record's own pairs and
+    validates its own rows. The oracle mean is computed from that record's pairs and
     only once everything above holds, because a mean over self-reported grades is a mean
     over whatever was typed: `float("nan")` is under no bar and over none either.
+
+    THE CASES AND THE RECORDED PAIRS ARE ONE SET, MATCHED ONE TO ONE. Counting the two
+    sides establishes nothing about which case was which execution: thirty six cases can
+    all name a single pair, report its outcomes truthfully, and carry the bank's own
+    final ordinals in its own order, and the thirty five pairs nobody named would still
+    be averaged into the release statistic. So every case names a pair, no pair is named
+    twice, no pair goes unnamed, each case binds its pair to an identity the allocation
+    puts in the final screen and to the A filing the record binds to that pair, and the
+    release statistic is taken over the matched pairs and over nothing else.
     """
-    from shogym.receipts import ScreenRecord
+    from shogym.receipts import Outcomes, PairRecord, ScreenRecord
 
     problems: list[str] = []
     cases = list(record.get("cases") or [])
@@ -736,6 +748,17 @@ def screen_refusals(
             "the screen record holds %d pairs and the final screen is %d cases"
             % (len(validated.run.pairs), FINAL_CASES)
         )
+
+    # ----- the binding: one case to one pair, and one pair to one case --------
+    # A count of cases beside a count of pairs says nothing about which case was which
+    # execution. Thirty six cases naming ONE pair satisfy every check above: each one
+    # reports that pair's outcomes truthfully, no case names an identity the bank does
+    # not hold, and the thirty five pairs nobody named are still averaged into the
+    # release statistic. So the map from cases to pairs has to be a bijection, and the
+    # statistic is taken over the pairs it matches and over nothing else.
+    bound: dict[str, list[Any]] = {}
+    for entry in cases:
+        bound.setdefault(str(entry.get("instance") or ""), []).append(entry.get("case"))
     missing = [
         entry for entry in cases
         if str(entry.get("instance") or "") not in pairs
@@ -745,15 +768,61 @@ def screen_refusals(
             "%d cases name no pair in the screen record, the first being case %r"
             % (len(missing), missing[0].get("case"))
         )
-    moved = []
+    doubled = sorted(
+        (name for name, over in bound.items() if name in pairs and len(over) > 1),
+        key=repr,
+    )
+    if doubled:
+        problems.append(
+            "%d recorded pairs are named by more than one final case, the first being "
+            "%r on cases %r, so the allocation is not %d executions"
+            % (len(doubled), doubled[0], bound[doubled[0]][:4], FINAL_CASES)
+        )
+    unnamed = sorted((name for name in pairs if name not in bound), key=repr)
+    if unnamed:
+        problems.append(
+            "the screen record holds %d pairs no final case names, the first being %r, "
+            "so the record carries executions this allocation does not account for"
+            % (len(unnamed), unnamed[0])
+        )
+
+    # ----- each matched pair, against the bank's ordinal and the record's filing ---
+    allocated = {entry["ordinal"] for entry in registered["cases"]}
+    matched: list[PairRecord] = []
+    strayed: list[tuple[Any, str]] = []
+    misfiled: list[tuple[Any, str]] = []
+    moved: list[tuple[Any, str]] = []
     for entry in cases:
         pair = pairs.get(str(entry.get("instance") or ""))
         if pair is None:
             continue
+        holds = len(bound[pair.instance]) == 1
+        if allocated and entry.get("ordinal") not in allocated:
+            strayed.append((entry.get("case"), pair.instance))
+            holds = False
+        filing = entry.get("filing")
+        if not isinstance(filing, str) or filing.strip() != pair.filing:
+            misfiled.append((entry.get("case"), pair.instance))
+            holds = False
         for branch in ("placebo", "graded", "oracle"):
             if _number(entry.get(branch)) != getattr(pair, branch):
                 moved.append((entry.get("case"), branch))
+                holds = False
                 break
+        if holds:
+            matched.append(pair)
+    if strayed:
+        problems.append(
+            "%d cases bind a recorded pair to an identity the allocation does not put "
+            "in the final screen, the first being case %r on pair %r"
+            % (len(strayed), strayed[0][0], strayed[0][1])
+        )
+    if misfiled:
+        problems.append(
+            "%d cases do not carry the A filing the screen record binds to the pair "
+            "they name, the first being case %r on pair %r"
+            % (len(misfiled), misfiled[0][0], misfiled[0][1])
+        )
     if moved:
         problems.append(
             "%d cases report an outcome the screen record does not, the first being the "
@@ -764,15 +833,20 @@ def screen_refusals(
         # until the cases, the pins and the record agree about what was executed.
         return problems
     try:
-        grades = validated.run.outcomes().oracle
+        grades = Outcomes(
+            placebo=tuple(pair.placebo for pair in matched),
+            graded=tuple(pair.graded for pair in matched),
+            oracle=tuple(pair.oracle for pair in matched),
+        ).oracle
     except ValueError as exc:
         problems.append("the screen record's branch scores are not scores: %s" % exc)
         return problems
     mean = sum(grades) / len(grades)
     if release and mean < MIN_MEAN_ORACLE:
         problems.append(
-            "the mean oracle grade is %.6f and the predeclared release condition is "
-            "%.2f" % (mean, MIN_MEAN_ORACLE)
+            "the mean oracle grade over the %d matched cases is %.6f and the "
+            "predeclared release condition is %.2f"
+            % (len(grades), mean, MIN_MEAN_ORACLE)
         )
     return problems
 

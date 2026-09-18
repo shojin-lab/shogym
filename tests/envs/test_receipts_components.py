@@ -1380,6 +1380,12 @@ def test_the_screen_procedure_allocates_thirty_six_cases_over_four_states() -> N
     taken on another family, a final set that repeats an instance, reuses an exploratory
     one, leaves a state short, was gathered under another standing instruction or another
     instrument pin, or claims the release condition with a mean oracle grade under 0.90.
+
+    It also fails if the cases and the recorded pairs are not matched one to one: many
+    cases bound to one pair, a pair no case names, a case carrying a filing the record
+    binds to another pair, or a case binding a pair to an ordinal the allocation does not
+    put in the final screen. A correct bijection is still accepted, and the release
+    statistic is the mean over the matched pairs rather than over the whole record.
     """
     from shogym.envs.receipts import components_review
 
@@ -1413,6 +1419,7 @@ def test_the_screen_procedure_allocates_thirty_six_cases_over_four_states() -> N
             dict(
                 entry,
                 instance="case-%02d" % entry["case"],
+                filing="filing-%02d" % entry["case"],
                 state_digest=states[str(entry["state"])],
                 oracle=0.95,
                 graded=0.7,
@@ -1536,6 +1543,48 @@ def test_the_screen_procedure_allocates_thirty_six_cases_over_four_states() -> N
         row["oracle"] = 0.6
     assert any("release condition" in p for p in refusals(dim, taken=faint))
     assert refusals(dim, taken=faint, release=False) == []
+
+    # The cases and the recorded pairs are one set, matched one to one. Thirty six
+    # correctly ordered ordinals all bound to ONE pair at 0.6, with the thirty five
+    # pairs nobody named averaged in beside it, is a mean of 0.988889 over executions
+    # this allocation never accounted for.
+    crowded = json.loads(json.dumps(record))
+    lifted = _screen_payload()
+    for position, row in enumerate(lifted["pairs"]):
+        row["oracle"] = 0.6 if position == 0 else 1.0
+    for entry in crowded["cases"]:
+        entry["instance"] = lifted["pairs"][0]["instance"]
+        entry["filing"] = lifted["pairs"][0]["filing"]
+        entry["oracle"] = 0.6
+    reported = [row["oracle"] for row in lifted["pairs"]]
+    assert sum(reported) / len(reported) > components_review.MIN_MEAN_ORACLE
+    said = refusals(crowded, taken=lifted)
+    assert any("named by more than one final case" in p for p in said)
+    assert any("no final case names" in p for p in said)
+
+    # A correct bijection is accepted even when the record lists its pairs in another
+    # order, because a case is matched to a pair by identity and not by position.
+    turned = _screen_payload()
+    turned["pairs"] = list(reversed(turned["pairs"]))
+    turned["task_seeds"] = list(reversed(turned["task_seeds"]))
+    assert refusals(taken=turned) == []
+
+    # Two cases on one pair, which leaves a pair nobody named.
+    twice = json.loads(json.dumps(record))
+    twice["cases"][5]["instance"] = twice["cases"][4]["instance"]
+    twice["cases"][5]["filing"] = twice["cases"][4]["filing"]
+    said = refusals(twice)
+    assert any("named by more than one final case" in p for p in said)
+    assert any("no final case names" in p for p in said)
+
+    # A pair bound to an identity the allocation does not put in the final screen, and
+    # a case carrying the A filing the record binds to another pair.
+    strayed = json.loads(json.dumps(record))
+    strayed["cases"][9]["ordinal"] = 50
+    assert any("does not put in the final screen" in p for p in refusals(strayed))
+    swapped = json.loads(json.dumps(record))
+    swapped["cases"][2]["filing"] = swapped["cases"][3]["filing"]
+    assert any("A filing the screen record binds" in p for p in refusals(swapped))
 
 
 # ----- 17: the key, and the history that outlives the evidence directory ------
