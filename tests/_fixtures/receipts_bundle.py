@@ -127,10 +127,11 @@ def screen_artifact(pairs: int = 40) -> dict:
         "task_seeds": [str(i) for i in range(pairs)],
         "pairs": [
             {"instance": f"task-{i:02d}", "filing": f"filing-{i:02d}",
-             "placebo": 0.4, "graded": 0.6, "oracle": 0.9}
+             "placebo": 0.4, "graded": 0.6, "oracle": 0.95, "ideal": 0.82}
             for i in range(pairs)
         ],
         "min_room": 0.05, "min_ratio": 0.25, "min_pairs": 36,
+        "min_oracle": 0.90, "min_learning_gap": 0.10,
         "floor": 0.0, "floor_rule": "drop",
         "candidates_screened": 1, "selection_note": "",
     }

@@ -231,10 +231,11 @@ def test_a_screen_taken_on_another_family_is_refused_in_a_line(
             "task_seeds": [str(i) for i in range(40)],
             "pairs": [
                 {"instance": f"t{i:02d}", "filing": f"f{i:02d}",
-                 "placebo": 0.4, "graded": 0.6, "oracle": 0.9}
+                 "placebo": 0.4, "graded": 0.6, "oracle": 0.95, "ideal": 0.82}
                 for i in range(40)
             ],
-            "min_room": 0.05, "min_ratio": 0.25, "min_pairs": 36, "floor": 0.0,
+            "min_room": 0.05, "min_ratio": 0.25, "min_pairs": 36,
+            "min_oracle": 0.90, "min_learning_gap": 0.10, "floor": 0.0,
             "floor_rule": "drop", "candidates_screened": 1, "selection_note": "",
         }),
         encoding="utf-8",
@@ -259,10 +260,11 @@ def test_a_screen_carrying_an_out_of_range_number_is_refused_in_a_line(
         "task_seeds": [str(i) for i in range(40)],
         "pairs": [
             {"instance": f"t{i:02d}", "filing": f"f{i:02d}",
-             "placebo": 0.4, "graded": 0.6, "oracle": 0.9}
+             "placebo": 0.4, "graded": 0.6, "oracle": 0.95, "ideal": 0.82}
             for i in range(40)
         ],
-        "min_room": 0.05, "min_ratio": 0.25, "min_pairs": 36, "floor": 0.0,
+        "min_room": 0.05, "min_ratio": 0.25, "min_pairs": 36,
+        "min_oracle": 0.90, "min_learning_gap": 0.10, "floor": 0.0,
         "floor_rule": "drop", "candidates_screened": 1, "selection_note": "",
     }
     payload["pairs"][0]["graded"] = 10**400  # type: ignore[index]
@@ -382,10 +384,11 @@ def _artifacts(room: Path) -> tuple[Path, Path]:
         "task_seeds": [str(i) for i in range(40)],
         "pairs": [
             {"instance": f"t{i:02d}", "filing": f"f{i:02d}",
-             "placebo": 0.4, "graded": 0.6, "oracle": 0.9}
+             "placebo": 0.4, "graded": 0.6, "oracle": 0.95, "ideal": 0.82}
             for i in range(40)
         ],
-        "min_room": 0.05, "min_ratio": 0.25, "min_pairs": 36, "floor": 0.0,
+        "min_room": 0.05, "min_ratio": 0.25, "min_pairs": 36,
+        "min_oracle": 0.90, "min_learning_gap": 0.10, "floor": 0.0,
         "floor_rule": "drop", "candidates_screened": 1, "selection_note": "",
     }), encoding="utf-8")
     coverage = required_coverage(
@@ -429,7 +432,7 @@ def test_screen_scores_the_artifact_it_is_given(
     out = capsys.readouterr().out
     assert "VERDICT                ADMITTED" in out
     assert "model a scripted policy, 40 task seeds" in out
-    assert "screen bars: room 0.05, ratio 0.25, pairs 36 (registered)" in out
+    assert "screen bars: room 0.05, ratio 0.25, pairs 36, oracle 0.9, gap 0.1 (registered)" in out
 
 
 def test_bundle_then_verify_then_list(
@@ -453,7 +456,7 @@ def test_bundle_then_verify_then_list(
     assert (
         "gate bars:   max_copy_score=%g" % admission_mod.REGISTERED_MAX_COPY_SCORE
     ) in verified
-    assert "screen bars: room 0.05, ratio 0.25, pairs 36 (registered)" in verified
+    assert "screen bars: room 0.05, ratio 0.25, pairs 36, oracle 0.9, gap 0.1 (registered)" in verified
 
     assert _run(["receipts", "list"]) == 0
     listed = capsys.readouterr().out
@@ -461,7 +464,7 @@ def test_bundle_then_verify_then_list(
     # here too and says so, which is a different fact from this one being dealable.
     ledger_lines = _genre_lines(listed, "ledger")
     assert "DEALABLE" in ledger_lines and "NOT DEALABLE" not in ledger_lines
-    assert "screen bars: room 0.05, ratio 0.25, pairs 36 (registered)" in ledger_lines
+    assert "screen bars: room 0.05, ratio 0.25, pairs 36, oracle 0.9, gap 0.1 (registered)" in ledger_lines
 
 
 def _genre_lines(listed: str, name: str) -> str:

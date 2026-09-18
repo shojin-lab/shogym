@@ -524,6 +524,8 @@ def _verify_screen(bundle: Bundle, bank: bank_mod.Bank) -> tuple[list[str], Any]
     """
     from shogym.receipts import ScreenRecord
     from shogym.receipts.screen import (
+        REGISTERED_MIN_LEARNING_GAP,
+        REGISTERED_MIN_ORACLE,
         REGISTERED_MIN_PAIRS,
         REGISTERED_MIN_RATIO,
         REGISTERED_MIN_ROOM,
@@ -585,6 +587,23 @@ def _verify_screen(bundle: Bundle, bank: bank_mod.Bank) -> tuple[list[str], Any]
         problems.append(
             f"one graded receipt took {result.ratio:.4f} of the room its oracle had, "
             f"under the registered {REGISTERED_MIN_RATIO:g}"
+        )
+    if not at_least(result.oracle, REGISTERED_MIN_ORACLE):
+        problems.append(
+            f"its oracle copies reached {result.oracle:.4f} on the held-out task, "
+            f"under the registered {REGISTERED_MIN_ORACLE:g}, so the room its ratio "
+            "divides by is a room that model did not take when it was told the rule"
+        )
+    if not at_least(result.gap, REGISTERED_MIN_LEARNING_GAP):
+        problems.append(
+            f"its graded level sits {result.gap:.4f} below what a perfect reader of "
+            f"the same receipts reaches, under the registered "
+            f"{REGISTERED_MIN_LEARNING_GAP:g}"
+        )
+    if not (math.isfinite(result.gap_low) and result.gap_low > 0.0):
+        problems.append(
+            f"its gap interval reaches {result.gap_low:.4f}, so its sample does not "
+            "establish any room above the receipt's own ceiling"
         )
     if not result.verdict and not problems:
         problems.append(
