@@ -276,6 +276,154 @@ improvement, so the mixed-chain pilot has to report the graded arm's ceiling fre
 available gain by initial state. Corrections are not removed to avoid saturation without a
 separately registered change.
 
+## The genre: `retail_refund`, economic destination choice
+
+A schedule of 24 already authorized returns. Each prints its order, its returned items, its
+refund total, a purchase flag and the complete list of payment instruments the house may refund
+it to. The public rules settle eligibility, class membership, the empty-class fallback, ties and
+normalization. Three decisions they never make are the hidden convention:
+
+| Axis | Options | The decision |
+|---|---|---|
+| `route_policy` | `route_gift`, `route_origin`, `route_usedgift` | which destination class the house prefers |
+| `gift_pick` | `gift_list`, `gift_max`, `gift_min` | which gift card is taken inside the gift-card class |
+| `origin_pick` | `origin_list`, `origin_max`, `origin_min` | which original contributor is taken inside its class |
+
+27 conventions. Sibling tasks are two schedules over different organizations, item pools,
+amounts, identifiers and code bindings under four presentation templates (`apparel`, `home`,
+`electronics`, `outdoors`), scored under one draw. The answer is a two-byte destination code.
+
+**The classes are disjoint, and that is a derivative rule.** A gift card belongs to the
+gift-card class whether or not it paid for the purchase; the original class is every listed
+credit card or PayPal instrument with a positive contribution. Native tau2 permits an original
+payment method or an existing gift card and its return tool restricts the non-gift destination
+to the first payment in the order's history. This genre permits every positive non-gift
+contributor instead and puts a purchasing gift in the gift class alone. Neither change may be
+presented as unchanged upstream behaviour.
+
+**Codes are row-local, and that is what keeps the correction honest.** `D2` in one case and `D2`
+in another name different instruments of different types, so a code by itself is not a selector
+label. The published vocabulary is `D1` through `D6` in listing order and every accepted table
+realizes all six under every draw. Registered widths are 12 / 16 / 4 / 12 with a 1100-byte
+oracle body allowance, which is a 59-byte row line and a **2657-byte** envelope, the same
+geometry the ledger uses. A native payment ID would not fit: `credit_card_1234567` is 19 bytes
+and the 12-byte correction would truncate it into a shorter legal looking answer. A full-ID
+instrument is a separately admitted revision, not an alternate spelling in this one.
+
+**What the profile multiset is for.** Each side prints six cases of each of four public kinds:
+gift cards only, original instruments only, both classes with a gift purchase, and both classes
+without one. A prints two candidates per class, three cases with the smaller amount first and
+three with the larger first. B prints three per class with the median amount first and the
+minimum and maximum after it in a random order. The single-class strata are what keep the
+otherwise unused selector material under an unconditional route; the two orientations are what
+separate the first-listed selector from an extremum; the two purchase types are what separate
+the three routes. B's median-first triple is what makes an inferred extremum preference file a
+different code from the printed first candidate, and the two-against-three cardinality is what
+leaves no structural position a corrected destination could be reused from.
+
+**The room, as registered arithmetic rather than as a measurement.** A careful uninformed reader
+scores 5/9 on A and 5/18 on B; a copy executing the stated rule scores 1. Through the shared
+gate on real serialized observations the full receipt's ceiling is 1 and the lookup floor is
+7/12 under either unconditional route and 11/18 under the conditional one, so the smallest
+headroom is 7/18 against a registered bar of 0.05. B's best one-axis-wrong score is 18/24 and
+its weakest axis leverage is 0.25.
+
+**Under the full receipt this genre saturates.** A consultation priced the reduced receipt
+forms for it: four of the 24 rows sampled uniformly and reported in full, with both slots
+neutral on the other 20, leave an ideal level of 0.799323 against a law-level lookup floor of
+0.576664, room 0.222660 above it, a minimum single-axis distinction probability of 0.436759, an
+expected 2.933476 compatible conventions, a singleton probability of 0.167482 and 1.322865 bits
+of posterior entropy. Uniform samples of four, five and six rows pass the three law bars and
+four is the smallest that does. **This build declares the full receipt.** The sampled policy is
+a separate mechanism, declared per generator, and when it arrives the declaration of four rows
+for this genre is one line.
+
+### The checks this genre adds
+
+The family declares `ADDITIONAL_CHECKS` and a `check_additional`, and `run_checks` runs one
+guarded callback per declared name beside the eleven. They live in
+`generators/retail_validation.py`, which is a second implementation: it reads the printed body
+back rather than the stored table, derives each option's operation from the option's own
+identifier, and picks by explicit stable sorting where the production selector picks by a keyed
+minimum. `judge_cells` compares the renderer with the scorer and cannot catch a scorer that is
+wrong in both.
+
+| Check | What it asks |
+|---|---|
+| `retail_surface` | the printed body reads back, every field stays inside its registered bounds, the class partition, contribution totals, purchase flag, profile counts and class cardinality are what the schedule promises, all 27 keys agree with an independently implemented selector on both sides, and no case id or correct code changes under serialize and read back |
+| `retail_support` | the registered gates and the exercise, materiality and copy checks pass under **every one of the 27 conventions**, not only under the one drawn, and the all-support movement minima and six-code realization hold |
+| `retail_profile_transfer` | no case of one schedule shares a code-free structural fingerprint with any case of the other, so a corrected destination's position is not reusable |
+
+`retail_support` is what makes the pass predicate independent of which convention was sampled.
+Without it a deliberately constructed pair can pass for one draw and fail for another, and the
+conditional prior given the public surface moves.
+
+### The two copying families, and the one that does not qualify
+
+The shipped screen is the registered `ordered_tokens` closure: the six rotations of the
+published code order composed with the 48 row moves, at most 288 filings, read against the
+registered 0.50. Accepted pairs clear it under every convention, by construction.
+
+A wider family was asked for separately: every one of the **720 relabellings** of the six codes
+composed with the same 48 row moves, computed by a six-by-six match-count matrix and exact
+assignment optimization, quantified over the whole support, at a conservative 0.50.
+`retail_validation.bijection_copy_maximum` computes it and `check_retail_bijection` reports it.
+
+**It does not qualify, and no schedule built to this recipe can make it.** Over 4000 pairs built
+to the profile recipe the lowest support-wide all-bijection maximum is 13 of 24 (0.541667), the
+median is 14 of 24, and none reaches 12. This is a property of 24 rows over a six-code
+vocabulary rather than of any particular draw: the assignment optimum for one row move already
+runs near 9 of 24 on unstructured keys, and the maximum over 48 moves carries it past half. The
+number is reported beside every admitted pair and in the review pack, and it is never
+relabelled as the registered closure. Whether this candidate is admitted under the shipped
+screen alone, or rejected because the stronger claim is the one the roster needs, is not a
+question this build settles.
+
+### The model room screen for this genre
+
+The `screen` command analyzes recorded outcomes and runs no model. The procedure, in one place
+for whoever runs it:
+
+1. After the mechanical checks and the human read, use the intended harness and resource limits
+   to execute one A copy and three B copies per case, from a common sealed A state. Receipt,
+   placebo and the registered prose oracle are assigned at the ordinary delivery point. B grades
+   are withheld and every artifact reference and transcript is preserved. No executable solver
+   is inserted into the oracle treatment.
+2. If usability exploration is needed, use the **first 12 admitted cases** as a separately
+   labelled diagnostic and freeze the candidate before any admission measurement. Then use the
+   **next 36 previously unused admitted cases**, fixed before outcomes are inspected. Without
+   exploration, use the first 36.
+3. Allocate **nine cases to each of the four frozen initial states**, in their registered order,
+   cyclically by case position. That allocation and the model configuration live in run
+   provenance: the screen schema has no fields for them.
+4. That is **36 A executions plus 108 B executions, 144 in all**, at zero prior receipt dose
+   within each process. Every assigned case and the registered failure dispositions are kept; a
+   run does not keep only the completed favourable triplets.
+5. Record O, P and G by initial state as well as pooled, with rule-reading mistakes, execution
+   mistakes, omitted rows, filing omissions, token length and row-level oracle errors.
+6. Judge it against the registered bars: `min_room=0.05`, `min_ratio=0.25`, `min_pairs=36`,
+   `floor=0.0`, `floor_rule="drop"`, `candidates_screened=1`. **Beside them**, as a predeclared
+   roster-release condition and not a `screen.json` field: **mean executed oracle grade at least
+   0.90**, with the independent reader scoring 1 on every admitted draw.
+
+A pooled mean can conceal a state-specific uptake failure, which is why the by-state report is
+part of the procedure rather than an extra. A solved reference implementation proves
+attainability and says nothing about model uptake.
+
+### What this genre does not establish
+
+It is a table served by the receipts engine and not a tau2 session: there is no retrieval, no
+customer authentication, no database mutation and no proof that a captured destination is the
+sealed action. A tool-backed version would add all of those and no new hidden decision, so it is
+not built here. Passing one-step admission does not establish that this candidate detects the
+recursion effect, and under the full receipt it saturates, which is what the reduced-receipt
+arithmetic above exists to answer. The disjointness claim is about hidden decision functions:
+retail shares printed-order selection, public fallback and exact row matching with the families
+beside it, and what makes it a different decision is that it routes value to an eligible
+economic instrument rather than measuring an elapsed count, resolving an entity or composing
+string transformations. Two additions plus ledger make three generators, and the release wants
+four.
+
 ## Tools (served over MCP)
 
 - **`submit_filing(filing: str)`** is the env's **score terminal**: the call validates its args,
@@ -407,7 +555,8 @@ them, `materialize` refuses them, and the environment refuses to be constructed 
 
 `shogym receipts check <name>` runs eleven for every family, each named separately from the
 gates because failing one means something different, plus whichever further checks the
-generator's declared copy profile brings with it.
+generator's declared copy profile brings with it and whichever further checks the generator
+declares for itself.
 
 | Check | What it asks |
 |---|---|
@@ -465,7 +614,7 @@ declared profiles live in `copy_profiles.py`:
 
 | Profile | Value maps | Who declares it |
 |---|---|---|
-| `ordered_tokens` | the registered token dictionaries between two published answer orders, closed under composition | `ledger`, the gate vectors |
+| `ordered_tokens` | the registered token dictionaries between two published answer orders, closed under composition | `ledger`, `retail_refund`, the gate vectors |
 | `soundchange_v1` | the 36 global character maps: every permutation of the three deletable vowels crossed with every permutation of the three replacement phones | `soundchange` |
 
 A generator added later declares one of these or is refused at registration, and a profile
@@ -476,6 +625,28 @@ be read against a number that measured nothing. `answer_ranks` may return `None`
 that consumes no ranks, and only for such a profile; an empty tuple is not a fictitious
 complete vocabulary, and a family that publishes ranks while declaring a profile that consumes
 none is refused rather than quietly priced by fewer maps.
+
+### A family may declare checks of its own
+
+A copy profile brings the checks its own cheap readers need. A family can also have an invariant
+nothing shared can see, and it declares that itself:
+
+```python
+ADDITIONAL_CHECKS = ("retail_surface", "retail_support", "retail_profile_transfer")
+
+def check_additional(self, name, instance, master) -> CheckResult: ...
+```
+
+`run_checks` plans one guarded callback per declared name after the eleven and after the
+profile's. An absent attribute is the empty tuple, so a family that declares none is untouched.
+The declaration is **not** trusted with the names: a repeated name, a name that shadows one of
+the eleven or one a profile already brought, and a result handed back under a name other than
+the one asked for are refused as failures of that named check rather than run, because a check
+whose result can arrive under another check's name is a check that can report a pass somebody
+else earned. It is deliberately not a member of the runtime-checkable `Generator` protocol, and
+`protocol.py` says why beside it. A declared check is pinned code: it runs at materialization
+and again when a bundle rebuilds its population, and the family reaches its implementation by
+importing it, so the code pin's walk covers it without a manual hash exemption.
 
 `soundchange_v1` and its bar are a **new registration**. The number 0.50 is carried over as a
 conservative initial ceiling and inherits none of `ordered_tokens`'s empirical calibration, so
@@ -795,6 +966,9 @@ Recorded boundaries, held by process rather than by a check:
 | `generators/soundchange.py` | the sound change genre: the phone inventory, the three passes, the keyed pair construction and its filter, the four surfaces, the oracle template. |
 | `generators/soundchange_audit.py` | a second implementation of that cascade, the predicates the pair is filtered on, and the three checks the profile adds. |
 | `soundchange_review.py` | the deterministic review pack and the private trace worksheets for that genre. |
+| `generators/retail_refund.py` | the retail refund genre: the two destination classes, the three selectors, the keyed pair construction, the four surfaces, the oracle template. |
+| `generators/retail_validation.py` | a second implementation of that rule reading the printed body, the predicates the pair is filtered on, the three checks the family declares, and the two copying maxima. |
+| `retail_review.py` | the deterministic review pack, the equal-amount fixtures, the separating matrix and the private worksheets for that genre. |
 | `bank.py` | what is frozen before launch, and the one atomic render after a filing seals. |
 | `bundle.py` | the admission bundle: one addressed directory, and the one verifier over it. |
 | `review.py` | what a review pack has to cover, enumerated from the family's declarations. |
