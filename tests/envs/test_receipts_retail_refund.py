@@ -47,6 +47,20 @@ GENERATOR = retail.GENERATOR
 MASTER = bytes(range(32))
 
 
+def _with_a_table(instance: Instance, table: retail.RetailTable) -> Instance:
+    """The same instance carrying another A schedule, keyed under the same draw."""
+    task = instance.a
+    return Instance(
+        generator=instance.generator, genre=instance.genre, ordinal=instance.ordinal,
+        convention=instance.convention,
+        a=Task(
+            label=task.label, task_id=task.task_id, surface=task.surface, table=table,
+            text=task.text, key=tuple(GENERATOR.key_for(table, instance.convention)),
+        ),
+        b=instance.b, envelope=instance.envelope,
+    )
+
+
 @pytest.fixture(scope="module")
 def drawn() -> Instance:
     """One drawn instance of this genre, shared by the tests that only read it."""
@@ -940,6 +954,55 @@ def test_the_printed_schedule_and_its_answers_are_checked_by_a_second_reader(
         body="\n".join(drawn.a.table.body.split("\n")[:-1]),
     )
     assert "prints 23 cases" in validation.side_refusal(short, "A")
+
+
+def test_a_renderer_that_prints_an_amount_the_record_does_not_hold_is_refused(
+    drawn: Instance,
+) -> None:
+    """The printed schedule has to be the stored schedule, field by field.
+
+    It fails if `retail_surface` admits a body that prints a gift balance the stored
+    case does not hold. A dollar on one balance leaves that amount's rank inside its
+    class where it was, so the body is still a lawful schedule, the independent
+    selector and the production scorer still agree on all 27 keys, and the case ids
+    and corrections still read back: comparing keys and identifiers sees nothing, and
+    the agent answers a schedule the bank did not commit.
+    """
+    table = drawn.a.table
+    spot = next(
+        n for n, case in enumerate(table.rows)
+        if len([i for i in case.instruments if i.type == retail.GIFT_CARD])
+        == retail.A_CLASS_SIZE
+    )
+    gift = next(i for i in table.rows[spot].instruments if i.type == retail.GIFT_CARD)
+    held = "%d.%02d" % divmod(gift.balance, retail.CENTS)
+    lied = "%d.%02d" % divmod(gift.balance + retail.CENTS, retail.CENTS)
+    lines = table.body.split("\n")
+    offset = 0 if table.template.json_body else 1
+    lines[spot + offset] = lines[spot + offset].replace(
+        '"balance":"%s"' % held, '"balance":"%s"' % lied, 1
+    )
+    liar = retail.RetailTable(
+        domain=table.domain, rows=table.rows, body="\n".join(lines)
+    )
+    assert liar.body != table.body
+
+    # The body on its own is still lawful and still earns every answer the store does.
+    assert validation.side_refusal(liar, "A") == ""
+    instruments = [c.instruments for c in validation.parsed_cases(liar)]
+    for convention in retail.ALL_CONVENTIONS:
+        assert tuple(GENERATOR.key_for(liar, convention)) == validation.audit_key(
+            instruments, convention
+        )
+
+    refusal = validation.record_refusal(liar, "A")
+    assert "balance" in refusal
+    assert str(gift.balance + retail.CENTS) in refusal and str(gift.balance) in refusal
+    assert validation.record_refusal(table, "A") == ""
+    assert validation.record_refusal(drawn.b.table, "B") == ""
+    result = validation.check_retail_surface(GENERATOR, _with_a_table(drawn, liar), MASTER)
+    assert not result.passed
+    assert result.detail == refusal
 
 
 def _payload(instance: Instance, side: str, convention: Mapping[str, str]) -> bytes:
