@@ -1270,3 +1270,76 @@ def test_adding_this_genre_changed_nothing_ledger_or_soundchange_does() -> None:
                         for kind, payload in sorted(judged.payloads.items())
                     } == expected[side]["cells"][shape]
                     assert judged.score == expected[side]["scores"][shape]
+
+
+# --------------------------------------------------------------------------
+# registration, under the shared gate label and the shared renderer
+# --------------------------------------------------------------------------
+
+
+def test_the_genre_is_registered_and_both_of_its_modules_are_in_the_code_pin() -> None:
+    """The one door every command reaches a generator through, and what it pins.
+
+    It fails if the genre is not on the roster, if the door hands back a generator
+    whose copy profile was never read, if the gate label or the renderer
+    configuration moved to register it, or if either of this family's two modules is
+    outside the code pin: a decider a bundle does not hash is a decider that can move
+    under a certified bundle.
+    """
+    from shogym.envs.receipts import admission
+    from shogym.envs.receipts.registry import GENRES, load_generator, module_path
+
+    assert GENRES["retail_refund"] == "shogym.envs.receipts.generators.retail_refund"
+    loaded = load_generator("retail_refund")
+    assert loaded is GENERATOR
+    assert copy_profiles.profile_of(loaded) == copy_profiles.ORDERED_TOKENS
+    assert module_path("retail_refund").name == "retail_refund.py"
+
+    # Registered under the labels already on the branch, not under new ones.
+    assert admission.GATE_VERSION == "receipts-gates-v3"
+    assert bank_mod.RENDERER_CONFIGURATION == "receipts-render-v2"
+
+    pinned = bank_mod.pinned_modules(loaded)
+    assert "shogym.envs.receipts.generators.retail_refund" in pinned
+    assert "shogym.envs.receipts.generators.retail_validation" in pinned
+    assert "shogym.envs.receipts.registry" not in pinned
+    pin = bank_mod.code_pin(loaded)
+    assert set(pin["modules"]) == set(pinned)
+    assert pin["modules"]["shogym.envs.receipts.generators.retail_validation"]
+
+
+def test_the_shipped_commands_materialize_gate_check_and_draw_this_genre(
+    tmp_path, monkeypatch, capsys
+) -> None:
+    """The four commands a reader uses, run through the real command line.
+
+    It fails if materialization cannot fill a small bank of this genre under the
+    registered bars, if the frozen bank does not rebuild to the same population, if
+    `gate` or `check` rejects an instance the bank holds, or if `draw` does not print
+    both task texts and three cells of the registered envelope size.
+    """
+    from shogym.cli import main
+    from shogym.envs.receipts.registry import BANK_DIR_VAR
+
+    monkeypatch.setenv(BANK_DIR_VAR, str(tmp_path / "banks"))
+
+    def run(argv: list[str]) -> int:
+        try:
+            main(argv)
+        except SystemExit as exc:
+            return int(exc.code or 0)
+        return 0
+
+    assert run(["receipts", "materialize", "retail_refund", "--size", "2"]) == 0
+    made = capsys.readouterr().out
+    assert "materialized 2 instances" in made
+    assert "receipts-gates-v3" in made
+    assert run(["receipts", "gate", "retail_refund", "--instances", "2"]) == 0
+    assert "0 of 2 instances rejected" in capsys.readouterr().out
+    assert run(["receipts", "check", "retail_refund", "--instances", "2"]) == 0
+    assert "0 of 2 instances failed" in capsys.readouterr().out
+    assert run(["receipts", "draw", "retail_refund", "--side", "a", "--filing", "mixed"]) == 0
+    drawn_out = capsys.readouterr().out
+    assert "economic destination choice" in drawn_out
+    assert "refund destination schedule" in drawn_out
+    assert "all three match the envelope: True" in drawn_out

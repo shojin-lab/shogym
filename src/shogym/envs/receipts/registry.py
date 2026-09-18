@@ -20,6 +20,7 @@ from shogym.envs.receipts.protocol import Generator
 #: which is a different and later thing.
 GENRES = {
     "ledger": "shogym.envs.receipts.generators.ledger",
+    "retail_refund": "shogym.envs.receipts.generators.retail_refund",
     "soundchange": "shogym.envs.receipts.generators.soundchange",
 }
 
