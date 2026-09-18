@@ -502,6 +502,215 @@ def test_an_undeclared_policy_is_refused_at_registration() -> None:
         )
 
 
+# ----- the law the gate reads instead of the exercise check -----
+
+
+def test_the_law_reproduces_the_gate_s_own_ceiling_and_floor() -> None:
+    """The law's arithmetic is the gate's, asked about the whole mask instead of one.
+
+    FAILS IF the ideal level, the lookup floor or the no-receipt level computed over
+    masks disagrees with what the gate computes from the rendered receipt when the
+    policy reports every row and the floor is taken at the drawn reference. There is
+    one mask then, and the two calculations are the same question; a difference means
+    one of them is pricing something the other is not.
+    """
+    from shogym.envs.receipts.observe import observe
+    from shogym.envs.receipts.receipt_law import DRAWN_REFERENCE, law_for
+    from shogym.receipts import gate
+
+    class FullLedger(ledger.LedgerGenerator):
+        RECEIPT_POLICY: ReceiptPolicy = FULL_RECEIPT
+
+    generator = FullLedger()
+    for ordinal in (0, 1):
+        instance = draw(generator, MASTER, ordinal)
+        law = law_for(generator, instance, "a", references=DRAWN_REFERENCE)
+        scored = gate(observe(generator, instance, "a"))
+        assert law.masks == 1
+        assert abs(law.ideal - scored.ceiling) < 1e-12
+        assert abs(law.floor - scored.floor) < 1e-12
+        assert abs(law.no_receipt - scored.placebo) < 1e-12
+
+
+def test_the_law_refuses_an_alternative_the_receipt_rarely_speaks_to() -> None:
+    """Every single-axis alternative has to be distinguished often enough to teach.
+
+    FAILS IF the check passes an instance whose weakest alternative sits under the
+    registered 0.30, or fails one whose alternatives all clear it. An alternative the
+    receipt almost never shows a row for is a choice the link cannot teach, whatever
+    the realized mask happened to draw.
+    """
+    from shogym.envs.receipts.receipt_law import REGISTERED_MIN_DISTINGUISHING
+
+    generator = _sampled()
+    instance = draw(generator, MASTER, 0)
+    passed = checks.check_receipt_law(generator, instance)
+    assert passed.name == "law"
+    assert passed.passed, passed.detail
+    refused = checks.check_receipt_law(generator, instance, min_distinguishing=0.99)
+    assert not refused.passed
+    assert "under the registered" in refused.detail
+    assert REGISTERED_MIN_DISTINGUISHING == 0.30
+    # And it is the check the sampled family gets, in place of the exercise check.
+    names = [
+        result.name
+        for result in checks.run_checks(
+            generator,
+            instance,
+            MASTER,
+            max_copy_score=1.0,
+            max_flip_score=1.0,
+            min_leverage=0.0,
+        )
+    ]
+    assert names[0] == "law" and "exercise" not in names
+
+
+def test_a_full_policy_family_still_gets_the_exercise_check() -> None:
+    """The families that report every row are asked the question they can answer.
+
+    FAILS IF the exercise check is dropped for a family whose receipt reports every
+    row. The law replaced it for one instrument and not for the roster.
+    """
+    instance = draw(soundchange.GENERATOR, MASTER, 0)
+    names = [
+        result.name
+        for result in checks.run_checks(
+            soundchange.GENERATOR,
+            instance,
+            MASTER,
+            max_copy_score=1.0,
+            max_flip_score=1.0,
+            min_leverage=0.0,
+        )
+    ]
+    assert names[0] == "exercise" and "law" not in names
+
+
+def _run_five_pairs():
+    """The six ledger table pairs run 5 served, rebuilt from its own bank.
+
+    Read-only, and skipped where that run is not on the machine. The bank names its
+    master key and its size and nothing else, so the pairs are a function of the key
+    and the ordinals its forks name; the tables do not depend on which gate set
+    admitted them, which is what makes the rebuild exact.
+    """
+    import json
+    import re
+    from pathlib import Path
+
+    from shogym.envs.receipts import streams
+
+    root = Path("/Users/andrew/deutero-runs/claude-code-sonnet-5/bank")
+    if not root.is_dir():
+        return None, ()
+    banks = sorted(root.glob("*/ledger-*.json"))
+    if not banks:
+        return None, ()
+    record = json.loads(banks[0].read_text(encoding="utf-8"))
+    master = bytes.fromhex(record["master"])
+    served: set[str] = set()
+    for path in banks[0].parent.rglob("fork-*.json"):
+        found = re.match(r"fork-([0-9a-f]{16})-", path.name)
+        if found:
+            served.add(found.group(1))
+    ordinals = [
+        ordinal
+        for ordinal in range(64)
+        if streams.task_identifier(master, "ledger", ordinal, "A") in served
+    ]
+    return master, tuple(ordinals)
+
+
+def test_the_law_reproduces_the_consultation_on_the_run_five_tables() -> None:
+    """The arithmetic the policy was chosen on, recomputed by the code that gates it.
+
+    FAILS IF the ideal level or the expected number of consistent conventions over the
+    six table pairs run 5 served differs from the consultation's exact calculation. A
+    policy registered on numbers the implementation does not reproduce is a policy
+    nobody has priced.
+
+    The lookup floor is held to a wider tolerance and the reason is recorded rather
+    than hidden: this computes it by applying the existing lookup-floor construction to
+    the reduced receipt, where a row the mask did not draw responds to no axis and
+    contributes no column, and it reproduces the gate's own floor exactly when the
+    policy reports every row. The consultation's mean floor is 0.0032 higher, so its
+    construction is slightly the more generous of the two, and the direction the floor
+    is deliberately generous in is the one that lowers the room reported. Both leave
+    the mean room well above the registered bar.
+    """
+    from shogym.envs.receipts.receipt_law import bank_law, law_for
+
+    master, ordinals = _run_five_pairs()
+    if master is None or len(ordinals) != 6:
+        pytest.skip("the run 5 bank is not on this machine")
+    generator = _sampled()
+    laws = [law_for(generator, draw(generator, master, o), "a") for o in ordinals]
+    band = bank_law(laws)
+    assert abs(band.ideal - 0.817285) < 0.001
+    assert abs(sum(law.compatible for law in laws) / len(laws) - 7.206182) < 0.001
+    assert abs(band.floor - 0.741603) < 0.005
+    assert abs(band.floor - 0.738406) < 1e-5
+    assert band.passed
+
+
+def test_eight_reported_rows_are_refused_by_the_band() -> None:
+    """Twice the rows is a different instrument, and the band says so.
+
+    FAILS IF a policy reporting eight rows of twenty four clears the registered band.
+    Its ideal level over the six pairs run 5 served is 0.922879, above the 0.90 the
+    band tops out at: a receipt that leaves that little has recreated the saturation
+    this policy exists to undo, and switching to it later would raise the measured
+    level by a tenth with no procedural learning at all.
+
+    ONE PAIR, because eight reported rows of twenty four is 735471 masks against 10626
+    and the walk is exact. The six-pair mean is in the build evidence; what this holds
+    is that the arithmetic runs at another count and that the band refuses what it
+    returns.
+    """
+    from shogym.envs.receipts.receipt_law import bank_law, law_for
+
+    master, ordinals = _run_five_pairs()
+    if master is None or len(ordinals) != 6:
+        pytest.skip("the run 5 bank is not on this machine")
+    generator = _sampled()
+    eight = ReceiptPolicy(
+        name="sampled-8-of-24", shape="sampled-rows", reported=8, rows=24
+    )
+    law = law_for(
+        generator, draw(generator, master, ordinals[0]), "a", policy=eight
+    )
+    assert law.masks == 735471
+    assert law.ideal > 0.90
+    assert abs(law.ideal - 0.936706) < 1e-5
+    band = bank_law([law])
+    assert not band.passed
+    assert any("outside the registered" in reason for reason in band.reasons)
+
+
+def test_the_bank_band_is_read_over_the_bank_and_not_the_instance() -> None:
+    """A fresh bank's mean ideal level sits inside the band with room above lookup.
+
+    FAILS IF the mean over freshly drawn ledger instances leaves the registered 0.75 to
+    0.90, or if the mean room over the recomputed lookup floor is not above 0.05. This
+    is the claim the policy was registered on, taken on tables the consultation never
+    saw, and it runs wherever the suite runs.
+    """
+    from shogym.envs.receipts.receipt_law import bank_law, law_for
+
+    generator = _sampled()
+    laws = [law_for(generator, draw(generator, MASTER, o), "a") for o in range(4)]
+    band = bank_law(laws)
+    assert band.passed, band.reasons
+    assert 0.75 <= band.ideal <= 0.90
+    assert band.room > 0.05
+    # And a bank whose mean sits outside the band is refused, whichever side it is on.
+    outside = bank_law(laws, min_ideal=0.95, max_ideal=0.99)
+    assert not outside.passed
+    tight = bank_law(laws, min_room=0.5)
+    assert not tight.passed
+
+
 # ----- the families that keep the full receipt -----
 
 

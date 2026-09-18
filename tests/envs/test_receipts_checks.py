@@ -363,7 +363,12 @@ def test_a_failing_check_excludes_an_instance_even_when_the_gates_pass() -> None
 
 
 def test_the_gate_version_is_named_and_excludes_the_count_gate() -> None:
-    assert admission.GATE_VERSION == "receipts-gates-v3"
+    assert admission.GATE_VERSION == "receipts-gates-v4"
+    # And the label a bank stamps is the same one, without importing the gate module
+    # to find it out. Two spellings of the version are two versions.
+    from shogym.envs.receipts import bank as bank_mod
+
+    assert bank_mod.GATE_LABEL == admission.GATE_VERSION
 
 
 def test_the_bars_are_registered_and_overridable() -> None:
@@ -378,6 +383,12 @@ def test_the_bars_are_registered_and_overridable() -> None:
     assert registered.max_copy_score == admission.REGISTERED_MAX_COPY_SCORE == 0.50
     assert registered.max_flip_score == admission.REGISTERED_MAX_FLIP_SCORE == 0.875
     assert registered.min_leverage == admission.REGISTERED_MIN_LEVERAGE == 0.10
+    assert (
+        registered.min_distinguishing
+        == admission.REGISTERED_MIN_DISTINGUISHING
+        == 0.30
+    )
+    assert not admission.Thresholds(min_distinguishing=0.2).settled
     assert not admission.Thresholds(max_copy_score=0.9).registered
     with pytest.raises(ValueError):
         admission.Thresholds(max_copy_score=float("nan"))

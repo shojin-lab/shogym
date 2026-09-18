@@ -25,21 +25,35 @@ from typing import Callable
 
 from shogym.envs.receipts.checks import CheckResult, run_checks
 from shogym.envs.receipts.observe import observe
-from shogym.envs.receipts.protocol import Generator, Instance
+from shogym.envs.receipts.protocol import Generator, Instance, policy_of
+from shogym.envs.receipts.receipt_law import (
+    REGISTERED_MIN_DISTINGUISHING,
+    LawResult,
+    law_for,
+)
 from shogym.receipts import GateResult, gate
 
 #: The name of this gate set and the rule it publishes under. Recorded in every bank;
 #: nothing claims the instrument's own verdict.
 #:
-#: v3 BECAUSE THE COPY REGISTRATION CHANGED AGAIN. v1 read its copy bar against three
-#: enumerated maps at 0.40; v2 read it against the closure of those maps under
-#: composition at 0.50; this reads it against whichever registered family the generator
-#: DECLARES, which for a family of invented words is a different family of maps
-#: entirely, and it runs three further checks for that profile. The numbers are the same
-#: numbers and the rule they are read against is not, which is exactly what a named
-#: version exists to keep apart: a family admitted under an earlier rule does not publish
-#: under this name and a bundle frozen under the earlier label does not verify.
-GATE_VERSION = "receipts-gates-v3"
+#: v4 BECAUSE WHAT A RECEIPT REPORTS IS NOW A REGISTRATION. v1 read its copy bar against
+#: three enumerated maps at 0.40; v2 read it against the closure of those maps under
+#: composition at 0.50; v3 read it against whichever registered family the generator
+#: declares, and ran three further checks for the profile that needed them. This adds
+#: the receipt policy: a family says which of its rows the receipt reports, and for a
+#: family that reports only some of them the demand that every axis is exercised by the
+#: realized receipt is replaced by a demand on the registered mask law. Every number
+#: carried over is the same number and the rule they are read against is not, which is
+#: exactly what a named version exists to keep apart: a family admitted under an earlier
+#: rule does not publish under this name and a bundle frozen under the earlier label
+#: does not verify.
+#:
+#: THE POLICY IDENTITY IS SEPARATE AND IS THE POLICY'S OWN NAME. A gate version says
+#: which rule judged a family; a policy name says which instrument it judged. They move
+#: independently: a later gate revision will judge `sampled-4-of-24` instances, and a
+#: later policy will be judged by this gate set. Both are recorded, the first here and
+#: the second in every instance the bank commits.
+GATE_VERSION = "receipts-gates-v4"
 #: What that name means, frozen. R's arity and block constants are the settled rule,
 #: not a dial: two blocks is where the agent learns only that it was wrong, and three
 #: options is where an axis can resolve past it at all. A run that moved them and
@@ -92,6 +106,11 @@ class Thresholds:
     min_blocks: int = SETTLED_MIN_BLOCKS
     min_headroom: float = REGISTERED_MIN_HEADROOM
     min_material_rows: int = 1
+    #: What the registered mask law has to leave, for a family whose receipt reports
+    #: only some of its rows. It is a gate constant rather than a named check's bar:
+    #: it is the thing that replaced the exercise demand, so a run that moved it and
+    #: published this name would put two different rules under one label.
+    min_distinguishing: float = REGISTERED_MIN_DISTINGUISHING
 
     @property
     def registered(self) -> bool:
@@ -99,7 +118,13 @@ class Thresholds:
         return self.as_record() == Thresholds().as_record()
 
     def __post_init__(self) -> None:
-        for name in ("max_copy_score", "max_flip_score", "min_leverage", "min_headroom"):
+        for name in (
+            "max_copy_score",
+            "max_flip_score",
+            "min_leverage",
+            "min_headroom",
+            "min_distinguishing",
+        ):
             value = float(getattr(self, name))
             if not math.isfinite(value) or not 0.0 <= value <= 1.0:
                 raise ValueError(
@@ -113,11 +138,11 @@ class Thresholds:
     def moved_gate_constants(self) -> tuple[str, ...]:
         """Which of the gate set's own constants are not the registered ones.
 
-        R's arity and blocks AND H's headroom. All three are part of what the name
-        `receipts-gates-v2` means, so a run that moved any of them and still published
-        that name would put two different rules under one label. The copy, flip,
-        leverage and material-row bars are the named checks rather than the gates, and
-        `registered` is what covers those.
+        R's arity and blocks, H's headroom, and the law's distinguishing bar. All four
+        are part of what this gate set's name means, so a run that moved any of them
+        and still published that name would put two different rules under one label.
+        The copy, flip, leverage and material-row bars are the named checks rather than
+        the gates, and `registered` is what covers those.
         """
         return tuple(
             name
@@ -125,6 +150,11 @@ class Thresholds:
                 ("min_arity", self.min_arity, SETTLED_MIN_ARITY),
                 ("min_blocks", self.min_blocks, SETTLED_MIN_BLOCKS),
                 ("min_headroom", self.min_headroom, REGISTERED_MIN_HEADROOM),
+                (
+                    "min_distinguishing",
+                    self.min_distinguishing,
+                    REGISTERED_MIN_DISTINGUISHING,
+                ),
             )
             if value != settled
         )
@@ -147,6 +177,7 @@ class Thresholds:
             "min_blocks": float(self.min_blocks),
             "min_headroom": self.min_headroom,
             "min_material_rows": float(self.min_material_rows),
+            "min_distinguishing": self.min_distinguishing,
         }
 
 
@@ -158,6 +189,11 @@ class Report:
     gates: GateResult
     checks: tuple[CheckResult, ...]
     thresholds: "Thresholds" = None  # type: ignore[assignment]
+    #: What the registered mask law leaves, for a family whose receipt reports only
+    #: some of its rows, and None for one that reports every row. It is kept on the
+    #: report rather than recomputed because the bank's own band is read over the
+    #: instances admission already priced.
+    law: LawResult | None = None
 
     def digest(self) -> str:
         """The content hash of this instance's whole admission report.
@@ -169,6 +205,11 @@ class Report:
 
         payload = {
             "tag": self.tag,
+            # Which instrument was judged, beside which rule judged it. The two move
+            # independently and a digest that carried only the second would be equal
+            # for two families whose receipts report different rows.
+            "receipt_policy": self.policy,
+            "law": self.law.as_record() if self.law is not None else None,
             # The name THIS report may publish under, not the settled one. A run that
             # moved R's constants publishes under the custom name, and stamping the
             # settled one here would put two different rules under one label in the
@@ -189,6 +230,9 @@ class Report:
         }
         return streams.digest(json.dumps(payload, sort_keys=True).encode())
 
+    #: The policy the family declared when this report was made. Set by `report`.
+    policy: str = ""
+
     @property
     def failed_checks(self) -> tuple[str, ...]:
         return tuple(c.name for c in self.checks if not c.passed)
@@ -199,6 +243,7 @@ class Report:
 
     def lines(self) -> list[str]:
         out = list(self.gates.lines())
+        out += ["", "RECEIPT POLICY         %s" % (self.policy or "not declared")]
         out += ["", "NAMED CHECKS"]
         out += ["   " + c.line() for c in self.checks]
         out += [
@@ -215,7 +260,14 @@ def report(
     thresholds: Thresholds,
     side: str = "a",
 ) -> Report:
-    """Gate and check one instance, and say whether it is admissible."""
+    """Gate and check one instance, and say whether it is admissible.
+
+    The receipt law is computed ONCE, here, and handed to the checks that read it and
+    kept on the report for the bank band to read. It is an exact average over every
+    mask the policy can draw, so computing it again where the bank is would be the
+    same walk of the same masks for the same answer.
+    """
+    policy = policy_of(generator)
     try:
         result = gate(
             observe(generator, instance, side),
@@ -223,6 +275,7 @@ def report(
             min_blocks=thresholds.min_blocks,
             min_headroom=thresholds.min_headroom,
         )
+        law = law_for(generator, instance, side) if policy.samples else None
     except Exception as exc:  # noqa: BLE001 - a generator that raises has not passed
         return Report(
             tag=f"{instance.generator}/{instance.ordinal}/{side.upper()}",
@@ -231,6 +284,7 @@ def report(
                 CheckResult("gates", False, f"the generator raised: {type(exc).__name__}"),
             ),
             thresholds=thresholds,
+            policy=policy.name,
         )
     checks = run_checks(
         generator,
@@ -240,9 +294,16 @@ def report(
         max_flip_score=thresholds.max_flip_score,
         min_leverage=thresholds.min_leverage,
         min_material_rows=thresholds.min_material_rows,
+        min_distinguishing=thresholds.min_distinguishing,
+        law=law,
     )
     return Report(
-        tag=result.tag, gates=result, checks=tuple(checks), thresholds=thresholds
+        tag=result.tag,
+        gates=result,
+        checks=tuple(checks),
+        thresholds=thresholds,
+        law=law,
+        policy=policy.name,
     )
 
 
@@ -288,6 +349,7 @@ def admitter(
 __all__ = [
     "CUSTOM_VERSION",
     "GATE_VERSION",
+    "REGISTERED_MIN_DISTINGUISHING",
     "REGISTERED_MAX_COPY_SCORE",
     "REGISTERED_MAX_FLIP_SCORE",
     "REGISTERED_MIN_HEADROOM",

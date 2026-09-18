@@ -48,6 +48,7 @@ from shogym.envs.receipts.protocol import (
     draw,
     policy_of,
 )
+from shogym.envs.receipts.receipt_law import LawResult, bank_law
 from shogym.envs.receipts.render import judge_cells
 from shogym.envs.receipts.receipt_ast import (
     GRADED,
@@ -59,17 +60,19 @@ from shogym.envs.receipts.receipt_ast import (
 #: Bumped when anything about how a cell is built changes. It is recorded in every
 #: bank, so a bank built by one renderer cannot be silently served by another.
 #:
-#: v2 BECAUSE THE REGISTERED GEOMETRY GREW. A second genre registers a 16-byte
-#: correction slot and a 2757-byte envelope, and the widths a cell is built at are part
-#: of how it is built: a bank frozen under the earlier revision was gated on cells of
-#: another shape. Bumping it is what refuses a bundle whose rendered task texts and
-#: whose code pin were taken before this build, rather than letting one verify against
-#: an instrument that is no longer the instrument.
-RENDERER_CONFIGURATION = "receipts-render-v2"
+#: v3 BECAUSE WHICH ROWS A CELL REPORTS IS NOW PART OF HOW IT IS BUILT. A family
+#: declares a receipt policy, and under one that samples the graded cell carries the
+#: committed neutral tokens on every row the mask did not draw. v2 carried a verdict
+#: and a correction on every row of every family, so a bank frozen under it was gated
+#: on cells of another shape, exactly as v1's banks were gated on cells of another
+#: width. Bumping it is what refuses a bundle whose rendered cells and whose code pin
+#: were taken before this build, rather than letting one verify against an instrument
+#: that is no longer the instrument.
+RENDERER_CONFIGURATION = "receipts-render-v3"
 
 #: The one label the settled gate set publishes. Kept here rather than imported so
 #: that building a bank does not depend on the gate module at import time.
-GATE_LABEL = "receipts-gates-v3"
+GATE_LABEL = "receipts-gates-v4"
 
 
 @dataclass(frozen=True)
@@ -282,6 +285,7 @@ def population(bank: Bank, generator: Generator, thresholds=None) -> Population:
         )
         raise ValueError(f"only the registered bars may fill a bank; this moved {moved}")
     held: list[Instance] = []
+    laws: list[LawResult] = []
     considered = 0
     for ordinal in range(_ceiling(bank.size)):
         if len(held) >= bank.size:
@@ -302,13 +306,29 @@ def population(bank: Bank, generator: Generator, thresholds=None) -> Population:
                 f"{bank.generator} could not construct ordinal {ordinal} after holding "
                 f"{len(held)} of {bank.size}: {exc}"
             ) from exc
-        if admission_report(generator, instance, bank.master, bars).admitted:
+        made = admission_report(generator, instance, bank.master, bars)
+        if made.admitted:
             held.append(instance)
+            if made.law is not None:
+                laws.append(made.law)
     if len(held) < bank.size:
         raise ValueError(
             f"only {len(held)} of {bank.size} instances passed admission in "
             f"{considered} draws"
         )
+    # THE BAND ON THE IDEAL LEVEL IS A BANK QUANTITY, so it is read here and nowhere
+    # else. One table's ideal level moves with how much its own rows happen to move,
+    # and reading the band at each instance would refuse tables for sitting at the edge
+    # of a distribution the band was computed as the centre of. A bank whose mean sits
+    # outside it is a bank filled under a receipt nobody priced, so it is not filled.
+    if laws:
+        band = bank_law(laws)
+        if not band.passed:
+            raise ValueError(
+                "this bank does not hold the registered receipt law: "
+                + "; ".join(band.reasons)
+                + f". {band.line()}"
+            )
     return Population(instances=tuple(held), considered=considered)
 
 
