@@ -30,6 +30,11 @@ def _filled(size: int = 2) -> tuple[bank_mod.Bank, bank_mod.Population]:
     return bank_mod.materialized(GENERATOR, MASTER, size)
 
 
+#: Why no test here fills a bank of one. The band on the ideal level above the lookup
+#: floor is a BANK quantity, and a bank of one instance reads it at that instance:
+#: ledger's own rooms run from about 0.048 to 0.093 around a mean well above the
+#: registered 0.05, so a single draw can sit under the bar while the bank it belongs to
+#: clears it comfortably. Two is the smallest bank that asks the registered question.
 def _bank(size: int = 2) -> bank_mod.Bank:
     return _filled(size)[0]
 
@@ -61,7 +66,7 @@ def test_the_population_is_the_same_set_every_time_it_is_recomputed() -> None:
 
 
 def test_a_bank_that_names_another_generator_does_not_fill() -> None:
-    built = _bank(1)
+    built = _bank(2)
     moved = bank_mod.Bank(
         generator="elsewhere", genre=built.genre, renderer=built.renderer,
         master=built.master, size=built.size,
@@ -71,7 +76,7 @@ def test_a_bank_that_names_another_generator_does_not_fill() -> None:
 
 
 def test_a_bank_frozen_under_another_renderer_does_not_fill() -> None:
-    built = _bank(1)
+    built = _bank(2)
     moved = bank_mod.Bank(
         generator=built.generator, genre=built.genre, renderer="receipts-render-v0",
         master=built.master, size=built.size,
@@ -95,7 +100,7 @@ def test_a_bank_survives_a_round_trip_through_a_file(tmp_path: Path) -> None:
 
 
 def test_a_bank_record_is_exactly_five_fields() -> None:
-    built = _bank(1)
+    built = _bank(2)
     record = bank_mod.bank_record(built)
     assert set(record) == {"generator", "genre", "renderer", "master", "size"}
     with pytest.raises(ValueError, match="carries exactly"):
@@ -105,8 +110,8 @@ def test_a_bank_record_is_exactly_five_fields() -> None:
 
 
 def test_the_commitment_binds_the_convention_without_printing_it() -> None:
-    built = _bank(1)
-    instance = _population(1).instances[0]
+    built = _bank(2)
+    instance = _population(2).instances[0]
     recorded = bank_mod.commitment(built.master, instance.ordinal, instance.convention)
     for option in instance.convention.values():
         assert option not in recorded
@@ -123,8 +128,8 @@ def test_two_renders_of_one_filing_produce_the_same_bytes() -> None:
     with the first, so a caller that loses the publication race can drop its own bytes
     for the winner's and every branch still reads one set.
     """
-    built = _bank(1)
-    instance = _population(1).instances[0]
+    built = _bank(2)
+    instance = _population(2).instances[0]
     raw = bank_mod.review_filing(GENERATOR, instance, "a", "mixed", built.master)
     first = bank_mod.render_fork(GENERATOR, instance, "a", raw)
     second = bank_mod.render_fork(GENERATOR, instance, "a", raw)
@@ -134,7 +139,7 @@ def test_two_renders_of_one_filing_produce_the_same_bytes() -> None:
 
 
 def test_a_fork_serves_only_the_three_registered_cells() -> None:
-    instance = _population(1).instances[0]
+    instance = _population(2).instances[0]
     fork = bank_mod.render_fork(GENERATOR, instance, "a", "")
     with pytest.raises(ValueError, match="a fork serves"):
         fork.agent_bytes("hint")
@@ -152,7 +157,7 @@ def test_the_graded_and_placebo_cells_differ_only_inside_the_slots() -> None:
     )
     from shogym.envs.receipts.render import judge_cells
 
-    instance = _population(1).instances[0]
+    instance = _population(2).instances[0]
     envelope = frozen_envelope(instance.envelope)
     canonical = GENERATOR.parse_and_canonicalize(instance.a, "")
     judged = judge_cells(GENERATOR, instance.a, canonical, instance.convention, envelope)
@@ -167,8 +172,8 @@ def test_the_graded_and_placebo_cells_differ_only_inside_the_slots() -> None:
 
 
 def test_every_registered_filing_shape_renders() -> None:
-    built = _bank(1)
-    instance = _population(1).instances[0]
+    built = _bank(2)
+    instance = _population(2).instances[0]
     for shape in bank_mod.FILING_SHAPES:
         raw = bank_mod.review_filing(GENERATOR, instance, "a", shape, built.master)
         fork = bank_mod.render_fork(GENERATOR, instance, "a", raw)

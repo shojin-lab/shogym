@@ -706,19 +706,17 @@ def _run_five_pairs():
 def test_the_law_reproduces_the_consultation_on_the_run_five_tables() -> None:
     """The arithmetic the policy was chosen on, recomputed by the code that gates it.
 
-    FAILS IF the ideal level or the expected number of consistent conventions over the
-    six table pairs run 5 served differs from the consultation's exact calculation. A
-    policy registered on numbers the implementation does not reproduce is a policy
-    nobody has priced.
+    FAILS IF the ideal level, the lookup floor or the expected number of consistent
+    conventions over the six table pairs run 5 served differs from the consultation's
+    exact calculation. A policy registered on numbers the implementation does not
+    reproduce is a policy nobody has priced.
 
-    The lookup floor is held to a wider tolerance and the reason is recorded rather
-    than hidden: this computes it by applying the existing lookup-floor construction to
-    the reduced receipt, where a row the mask did not draw responds to no axis and
-    contributes no column, and it reproduces the gate's own floor exactly when the
-    policy reports every row. The consultation's mean floor is 0.0032 higher, so its
-    construction is slightly the more generous of the two, and the direction the floor
-    is deliberately generous in is the one that lowers the room reported. Both leave
-    the mean room well above the registered bar.
+    The floor is held per pair and to six places, not to a tolerance. The two
+    calculations are one construction: the evident rows the reduced receipt shows, plus
+    one all-matched bit per dependence class among the rest, the class of empty local
+    dependence included, averaged over every canonical reference. A row no single-axis
+    alternative moves can still move under a joint one, so its class is a column a
+    reader has and the floor concedes it.
     """
     from shogym.envs.receipts.receipt_law import bank_law, law_for
 
@@ -728,10 +726,17 @@ def test_the_law_reproduces_the_consultation_on_the_run_five_tables() -> None:
     generator = _sampled()
     laws = [law_for(generator, draw(generator, master, o), "a") for o in ordinals]
     band = bank_law(laws)
-    assert abs(band.ideal - 0.817285) < 0.001
+    assert abs(band.ideal - 0.817285062) < 5e-10
     assert abs(sum(law.compatible for law in laws) / len(laws) - 7.206182) < 0.001
-    assert abs(band.floor - 0.741603) < 0.005
-    assert abs(band.floor - 0.738406) < 1e-5
+    assert [round(law.floor, 9) for law in laws] == [
+        0.753568219,
+        0.733884414,
+        0.751611431,
+        0.734439942,
+        0.708373223,
+        0.767741008,
+    ]
+    assert abs(band.floor - 0.741603040) < 5e-10
     assert band.passed
 
 

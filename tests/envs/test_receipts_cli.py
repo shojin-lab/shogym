@@ -89,6 +89,12 @@ def _filled(size: int):
 def _frozen_bank(size: int) -> None:
     """Freeze that bank where this test's commands will look for it.
 
+    No test here freezes a bank of one, and the reason is the registered band: the room
+    above the lookup floor is a BANK quantity, so a bank of one instance reads it at
+    that instance. Ledger's own rooms run from about 0.048 to 0.093 around a mean well
+    clear of the 0.05 bar, and the key here is fresh every run, so a bank of one would
+    refuse to fill on some keys and not on others.
+
     The same file the materialize command writes, written the same way: a bank is five fields
     and every command below recomputes everything else from them.
     """
@@ -132,7 +138,7 @@ def test_materialize_then_list_reports_the_frozen_bank(
 
 def test_a_bank_alone_is_not_dealable(capsys: pytest.CaptureFixture[str]) -> None:
     """Materializing says so, and the roster says so: only a bundle can be dealt."""
-    assert _run(["receipts", "materialize", "ledger", "--size", "1", *BARS]) == 0
+    assert _run(["receipts", "materialize", "ledger", "--size", "2", *BARS]) == 0
     assert "a bank is not dealable" in capsys.readouterr().out
     assert _run(["receipts", "list"]) == 0
     listed = capsys.readouterr().out
@@ -165,7 +171,7 @@ def test_gate_admits_the_merging_vector(capsys: pytest.CaptureFixture[str]) -> N
 
 
 def test_check_reports_every_named_check(capsys: pytest.CaptureFixture[str]) -> None:
-    _frozen_bank(1)
+    _frozen_bank(2)
     assert _run(["receipts", "check", "ledger", "--instances", "1", *BARS]) == 0
     out = capsys.readouterr().out
     # The first check is dispatched on the family's declared receipt policy: what the
@@ -284,7 +290,7 @@ def test_a_gate_vector_needs_no_bank() -> None:
 def test_check_exits_nonzero_when_a_threshold_bites(
     capsys: pytest.CaptureFixture[str],
 ) -> None:
-    _frozen_bank(1)
+    _frozen_bank(2)
     assert _run(
         ["receipts", "check", "ledger", "--instances", "1",
          "--max-copy-score", "0.0", "--max-flip-score", "0.95", "--min-leverage", "0.05"]
@@ -295,15 +301,15 @@ def test_check_exits_nonzero_when_a_threshold_bites(
 def test_materialize_refuses_to_overwrite_without_force(
     capsys: pytest.CaptureFixture[str],
 ) -> None:
-    assert _run(["receipts", "materialize", "ledger", "--size", "1", *BARS]) == 0
+    assert _run(["receipts", "materialize", "ledger", "--size", "2", *BARS]) == 0
     capsys.readouterr()
-    assert _run(["receipts", "materialize", "ledger", "--size", "1", *BARS]) == 1
+    assert _run(["receipts", "materialize", "ledger", "--size", "2", *BARS]) == 1
     assert "pass --force" in capsys.readouterr().out
     # A second key is a second gate universe, so the reroll is named as well as forced.
-    assert _run(["receipts", "materialize", "ledger", "--size", "1", "--force", *BARS]) == 1
+    assert _run(["receipts", "materialize", "ledger", "--size", "2", "--force", *BARS]) == 1
     assert "--reroll" in capsys.readouterr().out
     assert _run([
-        "receipts", "materialize", "ledger", "--size", "1", "--force",
+        "receipts", "materialize", "ledger", "--size", "2", "--force",
         "--reroll", "the first key filled a bank this test then replaced", *BARS,
     ]) == 0
 
@@ -339,7 +345,7 @@ def test_draw_refuses_an_ordinal_the_bank_does_not_hold(
 
 
 def test_draw_takes_no_seed() -> None:
-    _frozen_bank(1)
+    _frozen_bank(2)
     with pytest.raises(SystemExit):
         main(["receipts", "draw", "ledger", "--seed", "4"])
 
@@ -347,7 +353,7 @@ def test_draw_takes_no_seed() -> None:
 def test_draw_renders_every_registered_filing_shape(
     capsys: pytest.CaptureFixture[str],
 ) -> None:
-    _frozen_bank(1)
+    _frozen_bank(2)
     for shape, expected in (
         ("canonical", "component score 1.000000"),
         ("empty", "no filing (empty)"),
@@ -358,7 +364,7 @@ def test_draw_renders_every_registered_filing_shape(
 
 
 def test_tasks_only_stops_before_the_cells(capsys: pytest.CaptureFixture[str]) -> None:
-    _frozen_bank(1)
+    _frozen_bank(2)
     assert _run(["receipts", "draw", "ledger", "--tasks-only"]) == 0
     out = capsys.readouterr().out
     assert "TASK B" in out
@@ -441,7 +447,7 @@ def test_screen_scores_the_artifact_it_is_given(
 def test_bundle_then_verify_then_list(
     tmp_path: Path, capsys: pytest.CaptureFixture[str]
 ) -> None:
-    assert _run(["receipts", "materialize", "ledger", "--size", "1"]) == 0
+    assert _run(["receipts", "materialize", "ledger", "--size", "2"]) == 0
     capsys.readouterr()
     screen, pack = _artifacts(tmp_path)
     assert _run([
@@ -527,7 +533,7 @@ def test_a_bundle_that_does_not_verify_is_not_left_behind(
 
     from shogym.envs.receipts.registry import bundles
 
-    _frozen_bank(1)
+    _frozen_bank(2)
     screen, pack = _artifacts(tmp_path)
     stored = json.loads(pack.read_text(encoding="utf-8"))
     kept = [e for e in stored["renders"] if e["category"] != "option"]
