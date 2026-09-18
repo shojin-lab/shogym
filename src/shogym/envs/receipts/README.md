@@ -465,7 +465,11 @@ for this genre.** The procedure, in one place for whoever runs it, with
 `components_review.screen_refusals` as the companion audit of the allocation. That audit takes the
 bank's admitted order and the recorded `ScreenRecord` as well as the allocation, and reads the
 identities against the first and the outcomes against the second, because an allocation checked
-against its own fields is an allocation that says whatever it likes:
+against its own fields is an allocation that says whatever it likes. The cases and the recorded
+pairs are matched one to one, with each case naming the pair it executed, an ordinal the
+allocation puts in the final screen and the A filing the record binds to that pair; the release
+statistic is the mean over those matched pairs and over no others, because counting 36 cases
+beside 36 pairs says nothing about which case was which execution:
 
 1. Reserve the **first 12 admitted identities** as an exploratory prefix, at most three per
    initial state in cyclic order. Unused reserved identities do not become final cases. Freeze
