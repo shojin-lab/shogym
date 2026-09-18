@@ -163,6 +163,7 @@ def _retasked(task: Task, convention: Mapping[str, str]) -> Task:
         table=task.table,
         text=task.text,
         key=tuple(components.key_for(task.table, convention)),
+        mask=task.mask,
     )
 
 
