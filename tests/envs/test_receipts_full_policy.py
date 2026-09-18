@@ -8,6 +8,15 @@ on the tree the policy was added to, taken there and frozen here.
 Ledger is deliberately not in the fixture: its receipt reports four records of twenty
 four now, so its graded cells and its gate results moved, and that is the change. What
 did not move is everything else, and this is what says so.
+
+SOUND CHANGE IS HERE AS A FAMILY THAT REPORTS EVERY ROW, WHICH IT NO LONGER IS. It now
+declares two forms of twenty four, so the family as it is served produces other bytes,
+and that is its own change rather than a defect in this one. What these hold is the
+same genre under the full receipt, through a subclass that declares it: the tables, the
+answers, the oracle and the gate arithmetic are the family's own, and the only thing the
+subclass changes is the count. Every value below is the value that genre produced before
+a receipt policy was declared anywhere, so a change to any of them is a change the
+policy machinery made to a family that reports every row.
 """
 
 from __future__ import annotations
@@ -23,7 +32,7 @@ from shogym.envs.receipts.bank import render_fork
 from shogym.envs.receipts.generators import soundchange
 from shogym.envs.receipts.generators.vectors import VECTORS
 from shogym.envs.receipts.observe import observe
-from shogym.envs.receipts.protocol import draw
+from shogym.envs.receipts.protocol import FULL_RECEIPT, ReceiptPolicy, draw
 from shogym.receipts import gate
 
 FIXTURE = (
@@ -35,8 +44,18 @@ MASTER = bytes(range(32))
 FROZEN = json.loads(FIXTURE.read_text(encoding="utf-8"))
 
 
+class FullSoundChange(soundchange.SoundChangeGenerator):
+    """Sound change as it was: a verdict and a correction on every form.
+
+    The name, the streams, the tables, the answers and the oracle are the family's, so
+    what this draws is what the family drew; the count is the only thing that moves.
+    """
+
+    RECEIPT_POLICY: ReceiptPolicy = FULL_RECEIPT
+
+
 def _generator(name: str):
-    return soundchange.GENERATOR if name == "soundchange" else VECTORS[name]
+    return FullSoundChange() if name == "soundchange" else VECTORS[name]
 
 
 def _filings(generator, task) -> list[tuple[str, str]]:
