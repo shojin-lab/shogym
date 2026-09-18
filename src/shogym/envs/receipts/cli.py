@@ -291,8 +291,12 @@ def _screen(args: argparse.Namespace) -> int:
 
 def _bars(record) -> str:
     """One line saying what a screen was judged against, and whether that is registered."""
-    stated = "room %g, ratio %g, pairs %d" % (
-        record.min_room, record.min_ratio, record.min_pairs
+    stated = "room %g, ratio %g, pairs %d, oracle %g, gap %g" % (
+        record.min_room,
+        record.min_ratio,
+        record.min_pairs,
+        record.min_oracle,
+        record.min_learning_gap,
     )
     if record.registered:
         return "screen bars: %s (registered)" % stated
