@@ -359,7 +359,7 @@ wrong in both.
 Without it a deliberately constructed pair can pass for one draw and fail for another, and the
 conditional prior given the public surface moves.
 
-### The two copying families, and the one that does not qualify
+### The two copying families, and the recipe that clears both
 
 The shipped screen is the registered `ordered_tokens` closure: the six rotations of the
 published code order composed with the 48 row moves, at most 288 filings, read against the
@@ -370,15 +370,26 @@ composed with the same 48 row moves, computed by a six-by-six match-count matrix
 assignment optimization, quantified over the whole support, at a conservative 0.50.
 `retail_validation.bijection_copy_maximum` computes it and `check_retail_bijection` reports it.
 
-**It does not qualify, and no schedule built to this recipe can make it.** Over 4000 pairs built
-to the profile recipe the lowest support-wide all-bijection maximum is 13 of 24 (0.541667), the
-median is 14 of 24, and none reaches 12. This is a property of 24 rows over a six-code
-vocabulary rather than of any particular draw: the assignment optimum for one row move already
-runs near 9 of 24 on unstructured keys, and the maximum over 48 moves carries it past half. The
-number is reported beside every admitted pair and in the review pack, and it is never
-relabelled as the registered closure. Whether this candidate is admitted under the shipped
-screen alone, or rejected because the stronger claim is the one the roster needs, is not a
-question this build settles.
+**The layout is what clears it, and a random layout does not.** Proposing whole pairs and
+keeping the ones that happened to qualify measured a yield of zero: over 4000 pairs laid out at
+random the lowest support-wide all-bijection maximum was 13 of 24 (0.541667) and the median was
+14 of 24. That is a measurement of one proposal distribution, not a fact about the profiles,
+and the profiles turn out to allow much better. A is printed as three blocks of its eight joint
+profiles, each profile binding the same codes in its class's printed order, so A's correct
+destination repeats with period eight under all 27 conventions and under every rotation and
+reversal of its rows. B is printed as six blocks of its four kinds, each block advancing the
+code bound to every amount rank by its own index, so one kind carries codes two and four apart
+at positions eight apart. One relabelling of A's answers is one function of A's answer, so it
+returns the same code at all three of those positions while B's three are different: at most
+one of each triple can be right, which is **8 of 24 (0.333333)**, whatever the relabelling and
+whatever the row move.
+
+The 64-instance evidence bank measures exactly that. All 64 reach 8 of 24 on the wider family,
+against its 0.50 qualification, and the shipped closure reaches the same 8 of 24 against the
+registered 0.50. The bound is enforced where the pair is accepted: `retail_bijection` is
+declared in `ADDITIONAL_CHECKS`, so it runs at materialization and at bundle verification, and
+`pair_refusal` holds the same bound under every convention during construction. The two numbers
+are still reported separately and the wider one is never relabelled as the registered closure.
 
 ### The model room screen for this genre
 
