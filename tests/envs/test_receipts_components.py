@@ -42,7 +42,7 @@ from shogym.envs.receipts.receipt_ast import (
     serialize,
     slot_ranges,
 )
-from shogym.envs.receipts.render import judge_cells
+from shogym.envs.receipts.render import feedback_for, judge_cells
 
 GENERATOR = components.GENERATOR
 #: A private fixed master. Test keys only: nothing here is a permissible production key.
@@ -323,6 +323,7 @@ def test_nothing_public_moves_when_the_cache_the_call_order_or_the_rule_moves() 
                 table=task.table, text="", key=tuple(
                     GENERATOR.key_for(task.table, convention)
                 ),
+                mask=task.mask,
             )
             assert GENERATOR.describe(rebuilt.public()) == task.text
             assert GENERATOR.row_identifiers(rebuilt.table) == GENERATOR.row_identifiers(
@@ -452,10 +453,11 @@ def _replace_rows(
         text=GENERATOR.describe(
             Task(
                 label=task.label, task_id=task.task_id, surface=task.surface,
-                table=table, text="", key=(),
+                table=table, text="", key=(), mask=task.mask,
             ).public()
         ),
         key=tuple(GENERATOR.key_for(table, instance.convention)),
+        mask=task.mask,
     )
     return Instance(
         generator=instance.generator, genre=instance.genre, ordinal=instance.ordinal,
@@ -769,7 +771,10 @@ def test_a_failed_row_corrects_to_its_own_truth_and_a_sibling_uses_its_own() -> 
         canonical = GENERATOR.parse_and_canonicalize(task, half)
         for option in OPTIONS:
             truth = GENERATOR.key_for(task.table, {"contact_kernel": option})
-            ast = GENERATOR.render_receipt(task, canonical, truth)
+            ast = GENERATOR.render_receipt(
+                task, canonical, truth,
+                feedback_for(GENERATOR, task, frozen_envelope(instance.envelope)),
+            )
             assert [row.identifier for row in ast.rows] == identifiers
             for position, row in enumerate(ast.rows):
                 slots = {slot.name: slot.value for slot in row.slots}
@@ -784,6 +789,7 @@ def test_a_failed_row_corrects_to_its_own_truth_and_a_sibling_uses_its_own() -> 
         instance.b,
         GENERATOR.parse_and_canonicalize(instance.b, ""),
         instance.b.key,
+        feedback_for(GENERATOR, instance.b, frozen_envelope(instance.envelope)),
     )
     assert not a_identifiers & {row.identifier for row in b_ast.rows}
     assert [
@@ -820,6 +826,7 @@ def test_every_cell_is_congruent_under_every_filing_class_and_every_draw() -> No
                     label=task.label, task_id=task.task_id, surface=task.surface,
                     table=task.table, text=task.text,
                     key=tuple(GENERATOR.key_for(task.table, convention)),
+                    mask=task.mask,
                 )
                 canonical = GENERATOR.parse_and_canonicalize(retasked, raw)
                 judged = judge_cells(
@@ -1018,9 +1025,12 @@ def test_the_roster_carries_the_third_genre_under_the_labels_the_second_one_set(
     with pytest.raises(ValueError):
         copy_profiles.require_profile(_Undeclared())
 
-    assert admission.GATE_VERSION == "receipts-gates-v3"
-    assert bank_mod.GATE_LABEL == "receipts-gates-v3"
-    assert bank_mod.RENDERER_CONFIGURATION == "receipts-render-v2"
+    # The labels the RECEIPT POLICY set, which this genre arrives under rather than
+    # under the ones it was built against: the law-level gate is v4 and the renderer
+    # that can suppress a row is v3.
+    assert admission.GATE_VERSION == "receipts-gates-v4"
+    assert bank_mod.GATE_LABEL == "receipts-gates-v4"
+    assert bank_mod.RENDERER_CONFIGURATION == "receipts-render-v3"
     assert (
         components.IDENTIFIER_WIDTH,
         components.OBSERVED_WIDTH,
@@ -1063,10 +1073,11 @@ def _screen_artifact(pairs: int = 40) -> dict:
         "task_seeds": [str(i) for i in range(pairs)],
         "pairs": [
             {"instance": f"task-{i:02d}", "filing": f"filing-{i:02d}",
-             "placebo": 0.4, "graded": 0.6, "oracle": 0.95}
+             "placebo": 0.4, "graded": 0.6, "oracle": 0.95, "ideal": 0.82}
             for i in range(pairs)
         ],
         "min_room": 0.05, "min_ratio": 0.25, "min_pairs": 36,
+        "min_oracle": 0.90, "min_learning_gap": 0.10,
         "floor": 0.0, "floor_rule": "drop",
         "candidates_screened": 1, "selection_note": "",
     }
@@ -1295,12 +1306,15 @@ def _screen_payload(model: str = "a model nobody ran here") -> dict[str, object]
                 "placebo": 0.6,
                 "graded": 0.7,
                 "oracle": 0.95,
+                "ideal": 0.85,
             }
             for j in range(36)
         ],
         "min_room": 0.05,
         "min_ratio": 0.25,
         "min_pairs": 36,
+        "min_oracle": 0.90,
+        "min_learning_gap": 0.10,
         "floor": 0.0,
         "floor_rule": "drop",
         "candidates_screened": 1,

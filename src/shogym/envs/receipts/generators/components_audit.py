@@ -71,7 +71,7 @@ from shogym.envs.receipts.receipt_ast import (
     row_lines,
     serialize,
 )
-from shogym.envs.receipts.render import FAIL_TOKEN, PASS_TOKEN
+from shogym.envs.receipts.render import FAIL_TOKEN, PASS_TOKEN, feedback_for
 from shogym.receipts import gate
 
 #: The option order this module reads answer vectors in. Taken from the axis rather than
@@ -423,6 +423,7 @@ def _retasked(task: Task, convention: Mapping[str, str], generator) -> Task:
         table=task.table,
         text=task.text,
         key=tuple(generator.key_for(task.table, convention)),
+        mask=task.mask,
     )
 
 
@@ -458,7 +459,9 @@ def _printed_columns(generator, instance: Instance, side: str) -> str:
         "%s," % identifier for identifier in generator.row_identifiers(task.table)
     )
     canonical = generator.parse_and_canonicalize(task, raw)
-    ast = generator.render_receipt(task, canonical, task.key)
+    ast = generator.render_receipt(
+        task, canonical, task.key, feedback_for(generator, task, envelope)
+    )
     payload = serialize(ast, envelope)
     identifier_start = len(GAP) + ORDINAL_WIDTH + len(GAP)
     identifier_end = identifier_start + envelope.identifier_width
@@ -684,7 +687,10 @@ def check_support(generator, instance: Instance) -> CheckResult:
             rendered = {
                 option: serialize(
                     generator.render_receipt(
-                        task, canonical, generator.key_for(table, {"contact_kernel": option})
+                        task,
+                        canonical,
+                        generator.key_for(table, {"contact_kernel": option}),
+                        feedback_for(generator, task, envelope),
                     ),
                     envelope,
                 )
