@@ -124,15 +124,18 @@ not, the way it refuses one that declares no copy profile. Three policies are re
 | `sampled-4-of-24` | a verdict and that row's own answer on the **four** rows a committed mask drew, and that position's committed neutral tokens in both slots on the other twenty |
 
 **The count is registered per generator and the bars are the same for all.** Ledger
-declares four records of twenty four, sound change two forms of twenty four, and every
-gate vector the full receipt. How many rows a receipt has to report before it stops
-teaching is a property of the family's own tables, not of the shape they share: four
+declares four records of twenty four, sound change two forms of twenty four, components
+two rows of twenty four, and every gate vector the full receipt. How many rows a receipt
+has to report before it stops teaching is a property of the family's own tables, not of the shape they share: four
 fully reported rows leave an ideal reader at about 0.82 on ledger and at 0.95 on sound
 change, because a corrected daughter form exposes the replacement phone and the lost
 vowel directly. Two rows of sound change leave 0.849 against a lookup floor of 0.220, and
 they are the only count from one to eight whose bank-mean ideal level sits in the
-registered band. A count is chosen from a bank's arithmetic before the bank is looked at,
-and a family whose fresh bank fails a bar is not admitted at that count and is not
+registered band. Components is two for a different reason: a board's count is one of the
+two values its own pattern can take, so a verdict alone names the other and any form that
+keeps every verdict saturates, while two reported rows leave 329/368 against a lookup
+floor of 305/368. A count is chosen from a bank's arithmetic before the bank is looked
+at, and a family whose fresh bank fails a bar is not admitted at that count and is not
 admitted at a count chosen afterwards.
 
 **The mask is drawn before any filing and independently of the drawn convention**, from a
@@ -160,6 +163,10 @@ whether they were right.
 
 The receipt for this batch reports the verdict and the correct daughter form for
 two selected forms only, and the lines for the other forms say nothing about
+whether they were right.
+
+The receipt for this schedule reports the verdict and the correct count for
+two selected rows only, and the lines for the other rows say nothing about
 whether they were right.
 ```
 
@@ -416,7 +423,7 @@ cell.
 |---|---|
 | `components_semantics` | an independent flood fill agrees with the scorer on every row under every rule, every board is nonempty, in range, distinct and no larger than six cells, every key value is in the published vocabulary, and no printed identifier or correction changes under serialize and read back |
 | `components_shape` | both sides hold six rows in each of the three informative strata and six separated controls, realize every count under every rule, keep no count over eight times, hold a side-contact cycle, and share no informative contact graph and no exact board |
-| `components_support` | at each of the three reference rules on both siblings the keys and the serialized receipts are injective, movement is exactly 12, and an independently rerun R, S and H give three blocks, zero evident rows, ceiling 1, floor 5/6 and H 1/6, with exercise, the one-rule-wrong score, the leverage and the registered copy calculation holding across the support |
+| `components_support` | at each of the three reference rules on both siblings the keys are injective; the serialized receipts REPORTING EVERY ROW are injective and give three blocks, zero evident rows, ceiling 1, floor 5/6 and H 1/6 with exercise holding; movement is exactly 12; the registered mask law leaves 329/368, 305/368, 3/46 and 35/46; and the one-rule-wrong score, the leverage and the registered copy calculation hold across the support |
 | `components_bijection_copy` | the exact maximum over all 48 row moves and all 720 value bijections is at most 12 of 24 under every rule, in both directions, with the attaining transformation printed |
 | `components_analogy` | no informative contact graph occurs on both siblings, so a correction cannot be carried across by recognition, and the public modal fallback that remains scores exactly 3/4 |
 | `components_public_contract` | no committed neutral token normalizes onto a legal answer, a verdict or a status; each task carries its own registered scope sentence and not the other's; identifiers and coordinate lists survive the shared reading; and neither the printed coordinate order nor any of the eight symmetries of the square changes a count |
@@ -432,6 +439,16 @@ whose answers are destination codes, and the stronger bound is retained anyway r
 substantive disjointness rest on calling a relabelling "ordered".
 
 ### One use per chain, and a master key of its own
+
+**The receipt-shaped half of `components_support` is asked of the receipt that reports
+every row.** Which two rows a stream drew is not what a recipe check is about, and
+several of those numbers are deliberately false on masks this policy can draw: a mask
+that drew two of the six controls resolves one block and aliases all three rules, and it
+is not redrawn. So the injectivity, the blocks, the evident rows and the gate's own
+ceiling and floor are computed on the full receipt, which is a fact about six rows of
+each informative type and six controls, and the law beside them is the same recipe's
+statement about what is served. The row recipe makes the law a closed form in the
+reported count alone, so those four numbers are the same on every compliant pair.
 
 **At most one components process per chain**, and that is a release restriction rather than a
 caution. If a previous draw were known and repetition forbidden, two rules would remain, and the
@@ -1078,12 +1095,12 @@ once and that repeated other generators use distinct draws, and a named human at
 all of it to final code and bundle hashes. A registry entry is not admission and a verified bundle
 is not a roster place.
 
-Two families now declare a count of their own and each was priced on its own tables: four
-records of twenty four for ledger, two forms of twenty four for sound change. Neither is
-in the recursion roster on the strength of that arithmetic. What a count establishes is an
-information form worth screening; whether a model reads a receipt that reports two rows at
-all is what the actual-model screen measures, and neither family has been screened under
-its count.
+Three families now declare a count of their own and each was priced on its own tables:
+four records of twenty four for ledger, two forms of twenty four for sound change, two
+rows of twenty four for components. None is in the recursion roster on the strength of
+that arithmetic. What a count establishes is an information form worth screening;
+whether a model reads a receipt that reports two rows at all is what the actual-model
+screen measures, and none of the three has been screened under its count.
 
 Recorded boundaries, held by process rather than by a check:
 

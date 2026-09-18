@@ -193,10 +193,16 @@ def token_generators(
     which `token_maps` computes.
     """
     out: list[dict[str, str]] = []
+    # AN EMPTY VALUE IS NOT AN ANSWER THE AGENT FILED. A reduced filing holds a value
+    # at the rows the receipt reported and nothing at the rest, and the empty positions
+    # are rows the reader has no token for. Counting the absence as a filed answer would
+    # register a map that carries it into a published band, which credits the reader
+    # with a value at a row it knows nothing about.
+    filed = sorted(token for token in set(values) if token)
     for source, into in (
         (list(source_ranks), list(target_ranks)),
         (sorted(set(source_ranks)), sorted(set(target_ranks))),
-        (sorted(set(values)), sorted(set(target_ranks))),
+        (filed, sorted(set(target_ranks))),
     ):
         if not source or not into:
             continue
@@ -229,7 +235,16 @@ def token_maps(
     is closed, so nothing an agent can build by chaining registered dictionaries is
     outside what the screen prices.
     """
-    universe = sorted(set(values) | set(source_ranks) | set(target_ranks))
+    # AN EMPTY VALUE IS NOT A TOKEN ANY PUBLISHED VOCABULARY CARRIES, so no registered
+    # map moves it and it is not in the set the maps are closed over. A filing that
+    # holds nothing at a row is a row the reader has no token for; putting that absence
+    # in the universe would price maps that carry it into a band, which is a map nobody
+    # can build from two printed lists, and it would close the family over a point the
+    # generators only ever map out of. The reduced-receipt diagnostic files exactly such
+    # a filing, and with the absence in the universe its closure runs to tens of
+    # thousands of maps on a family whose two vocabularies are the same six tokens.
+    universe = sorted(token for token in
+                      set(values) | set(source_ranks) | set(target_ranks) if token)
     if not universe:
         return [{}]
     position = {token: n for n, token in enumerate(universe)}
@@ -275,11 +290,34 @@ def token_relabellings(
 
     The identity is among the maps, so the untouched filing leads the list and
     composing this with the row moves produces those moves themselves.
+
+    THE ORBIT OF THE FILING, NOT THE MONOID OF MAPS, and the two give the same set. A
+    composition applied to a filing is the first dictionary applied to it and then the
+    next, so closing the FILINGS under the registered dictionaries reaches exactly what
+    closing the dictionaries first and applying each would. What it does not do is build
+    the monoid: where two published vocabularies are the same six tokens and one
+    registered dictionary is not injective, that monoid runs to tens of thousands of
+    maps which between them make a few dozen filings, and closing it took a quarter of
+    an hour on one reduced filing. `token_maps` remains the statement of what the family
+    IS, and this is the family as it reaches a filing.
     """
+    generators = token_generators(values, source_ranks, target_ranks)
+    start = list(values)
+    reached: dict[tuple[str, ...], list[str]] = {tuple(start): start}
+    frontier = [start]
+    while frontier:
+        fresh: list[list[str]] = []
+        for filing in frontier:
+            for table in generators:
+                made = [table.get(value, value) for value in filing]
+                if tuple(made) not in reached:
+                    reached[tuple(made)] = made
+                    fresh.append(made)
+        frontier = fresh
     seen: dict[tuple[str, ...], list[str]] = {}
-    for table in token_maps(values, source_ranks, target_ranks):
-        filing = fit([table.get(value, value) for value in values], width)
-        seen.setdefault(tuple(filing), filing)
+    for filing in reached.values():
+        fitted = fit(filing, width)
+        seen.setdefault(tuple(fitted), fitted)
     return list(seen.values())
 
 

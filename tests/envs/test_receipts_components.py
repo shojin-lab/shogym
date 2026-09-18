@@ -6,6 +6,7 @@ is "something changed" is a test nobody can act on.
 
 from __future__ import annotations
 
+import hashlib
 import inspect
 import itertools
 import json
@@ -551,8 +552,11 @@ def test_a_pair_sharing_a_graph_or_over_the_copy_bound_cannot_enter_a_bank() -> 
 
 #: The eleven checks every family runs, which are what an arrangement has to survive for
 #: this test to be about the ones this genre adds.
+#: The eleven every family runs. The first is dispatched on the declared receipt policy:
+#: a family that reports every row is asked what its receipt exercised, and one that
+#: reports the rows a committed mask drew is asked what its registered mask law leaves.
 COMMON = (
-    "exercise", "materiality", "copy", "fixation", "envelope", "graded", "placebo",
+    "law", "materiality", "copy", "fixation", "envelope", "graded", "placebo",
     "neutral", "oracle", "lint", "invariance",
 )
 
@@ -756,9 +760,10 @@ def test_the_score_is_a_fraction_of_twenty_four_rows_rounded_to_six_places() -> 
 def test_a_failed_row_corrects_to_its_own_truth_and_a_sibling_uses_its_own() -> None:
     """What a graded row is allowed to say, on the drawn rule and on every other.
 
-    It fails if a failed row prints anything but that row's own supplied truth, if a
-    passed row prints a correction, or if either sibling's rendering uses the other's
-    identifiers or the other's key.
+    It fails if a reported row that failed prints anything but that row's own supplied
+    truth, if a reported row that passed prints a correction, if a row the mask did not
+    report prints anything but that position's committed neutral tokens, or if either
+    sibling's rendering uses the other's identifiers or the other's key.
     """
     instance = _drawn(1)
     for side in ("a", "b"):
@@ -776,8 +781,13 @@ def test_a_failed_row_corrects_to_its_own_truth_and_a_sibling_uses_its_own() -> 
                 feedback_for(GENERATOR, task, frozen_envelope(instance.envelope)),
             )
             assert [row.identifier for row in ast.rows] == identifiers
+            neutral = instance.envelope.neutral
             for position, row in enumerate(ast.rows):
                 slots = {slot.name: slot.value for slot in row.slots}
+                if position not in task.mask:
+                    assert slots["verdict"] == neutral["verdict"][position]
+                    assert slots["correction"] == neutral["correction"][position]
+                    continue
                 if slots["verdict"] == "PASS":
                     assert slots["correction"] == ""
                 else:
@@ -792,9 +802,12 @@ def test_a_failed_row_corrects_to_its_own_truth_and_a_sibling_uses_its_own() -> 
         feedback_for(GENERATOR, instance.b, frozen_envelope(instance.envelope)),
     )
     assert not a_identifiers & {row.identifier for row in b_ast.rows}
-    assert [
+    printed = [
         {slot.name: slot.value for slot in row.slots}["correction"] for row in b_ast.rows
-    ] == list(instance.b.key)
+    ]
+    assert [printed[position] for position in instance.b.mask] == [
+        instance.b.key[position] for position in instance.b.mask
+    ]
 
 
 # ----- 13: the bytes ---------------------------------------------------------
@@ -1083,14 +1096,24 @@ def _screen_artifact(pairs: int = 40) -> dict:
     }
 
 
+#: The key this module's bank is built under. FIXED, because a pack has to show a
+#: receipt that leaves the axis unwitnessed and a bank of two instances need not draw
+#: one: a mask says nothing only when both rows it drew are controls, which is 15 of the
+#: 276 masks, so under a fresh key every run about four exports in five would have no
+#: such mask to show and the exporter refuses rather than leave the case out. The bank
+#: under this key draws one, so what is exercised here is the exporter rather than the
+#: draw.
+PACK_MASTER = hashlib.sha256(b"components-review-pack-two-controls").digest()
+
+
 @pytest.fixture(scope="module")
 def frozen(tmp_path_factory: pytest.TempPathFactory):
     """One small bank of this genre, its exported pack, and a bundle that verifies."""
     from shogym.envs.receipts import bundle as bundle_mod
-    from shogym.envs.receipts import components_review, streams
+    from shogym.envs.receipts import components_review
 
     room = tmp_path_factory.mktemp("components")
-    bank, held = bank_mod.materialized(GENERATOR, streams.new_master_key(), 2)
+    bank, held = bank_mod.materialized(GENERATOR, PACK_MASTER, 2)
     outcomes = room / "screen.json"
     outcomes.write_text(json.dumps(_screen_artifact()), encoding="utf-8")
     pack_root = room / "pack"
@@ -2110,3 +2133,110 @@ def test_a_construction_that_runs_out_is_reported_by_the_command_and_keeps_its_k
     assert [entry["event"] for entry in lines] == [bank_mod.STARTED, bank_mod.FAILED]
     assert "frequency refused 2" in lines[1]["detail"]
     components.build_pair.cache_clear()
+
+
+def test_the_law_level_gate_reads_the_count_components_declares() -> None:
+    """Two rows of twenty four, and the recipe's own arithmetic over every mask.
+
+    FAILS IF this genre does not declare the count its own arithmetic chose; if the
+    named checks still begin with the exercise question, which a two-row receipt has no
+    answer to; if the law is walked over anything but the 276 masks two rows of twenty
+    four can draw; or if what it leaves is not the recipe's closed form. Six rows of
+    each of three informative types and six controls make those numbers a function of
+    the reported count alone, so they are the same on every compliant pair: an ideal
+    reader at 329/368, a lookup floor at 305/368, room 3/46 over it, and every rule
+    distinguished from every other with probability 35/46.
+    """
+    from shogym.envs.receipts.protocol import SAMPLED_TWO_OF_TWENTY_FOUR, policy_of
+    from shogym.envs.receipts.receipt_law import law_for
+
+    assert policy_of(GENERATOR) is SAMPLED_TWO_OF_TWENTY_FOUR
+    for ordinal in (0, 1):
+        instance = _drawn(ordinal)
+        assert len(instance.a.mask) == 2 and len(instance.b.mask) == 2
+        results = checks.run_checks(
+            GENERATOR, instance, MASTER,
+            max_copy_score=1.0, max_flip_score=1.0, min_leverage=0.0,
+        )
+        names = [result.name for result in results]
+        assert names[0] == "law" and "exercise" not in names
+        assert results[0].passed, results[0].detail
+
+        law = law_for(GENERATOR, instance, "a")
+        assert (law.policy, law.rows, law.reported, law.masks) == (
+            "sampled-2-of-24", 24, 2, 276,
+        )
+        assert law.ideal == pytest.approx(329 / 368)
+        assert law.floor == pytest.approx(305 / 368)
+        assert law.room == pytest.approx(3 / 46)
+        assert law.no_receipt == pytest.approx(0.75)
+        assert law.compatible == pytest.approx(34 / 23)
+        assert law.singleton == pytest.approx(53 / 92)
+        assert min(law.distinguishing.values()) == pytest.approx(35 / 46)
+
+
+def test_the_task_says_which_two_rows_the_receipt_will_judge() -> None:
+    """One sentence, after the scope sentence and before the schedule, in both arms.
+
+    FAILS IF the sentence is absent, differs between the siblings or under two rules, or
+    names a rule. A reader not told that the silence on twenty two rows means nothing
+    has been handed twenty two rows of apparent evidence that the schedule was right.
+    """
+    from shogym.envs.receipts.protocol import FULL_RECEIPT, option_mentions
+
+    instance = _drawn(0)
+    sentence = "\n".join(components.RECEIPT_SENTENCE)
+    for side in ("a", "b"):
+        text = instance.side(side).text
+        assert sentence in text
+        assert text.index(sentence) > text.index("scored under the same house")
+        assert text.index(sentence) < text.index("| identifier |")
+    assert not option_mentions(GENERATOR.AXES, sentence)
+    assert components.receipt_sentence(FULL_RECEIPT) == ""
+    for option in OPTIONS:
+        other = audit.retasked_instance(GENERATOR, instance, {"contact_kernel": option})
+        assert other.a.text == instance.a.text
+
+
+def test_the_pack_shows_what_a_receipt_of_two_rows_does(frozen, tmp_path: Path) -> None:
+    """The eleven a sampled family's pack has to carry, in this genre's own rows.
+
+    FAILS IF the pack misses any of the eleven, if a reported row's cell does not show
+    the verdict the case names, if the suppressed failure is offered as a cell rather
+    than as the document that says which rows failed, or if the pair of rules the
+    receipt cannot tell apart render two different cells. The last is the point of the
+    policy rather than a defect in it, and a pack that could not show it would be hiding
+    what the family does.
+    """
+    from shogym.envs.receipts import components_review, review
+
+    bank, held, _ = frozen
+    room = tmp_path / "sampled"
+    pack = components_review.export(bank, held, room)
+    manifest = json.loads(pack.read_text(encoding="utf-8"))
+    sampled = {
+        entry["key"]: entry
+        for entry in manifest["renders"]
+        if entry["category"] == "sampled"
+    }
+    assert sorted(sampled) == sorted(review.SAMPLED_CASES)
+    assert len(review.SAMPLED_CASES) == 11
+    for case in review.SAMPLED_CASES[:4]:
+        assert sampled[case]["kind"] == "cell"
+        assert (room / sampled[case]["path"]).stat().st_size == components.ENVELOPE_SIZE
+    for case in review.SAMPLED_CASES[4:]:
+        assert sampled[case]["kind"] == "document"
+
+    reported = len(held.instances[0].a.mask)
+    read = {
+        case: (room / sampled[case]["path"]).read_text("ascii")
+        for case in review.SAMPLED_CASES
+    }
+    assert read[review.SAMPLED_CASES[0]].count("PASS") == reported
+    assert read[review.SAMPLED_CASES[1]].count("FAIL") == reported
+    assert read[review.SAMPLED_CASES[2]].count(components.UNFILED_TOKEN) == reported
+    assert read[review.SAMPLED_CASES[3]].count(components.BLANK_TOKEN) == reported
+    assert "says nothing about any of them" in read[review.SAMPLED_CASES[4]]
+    assert read[review.SAMPLED_CASES[4]].count("FAIL") == 0
+    assert "axes it says nothing about: contact_kernel" in read[review.SAMPLED_CASES[6]]
+    assert "render the cell below byte for byte" in read[review.SAMPLED_CASES[10]]
