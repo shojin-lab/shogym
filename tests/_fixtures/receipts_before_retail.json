@@ -1,0 +1,1498 @@
+{
+  "components": {
+    "0": {
+      "a": {
+        "cells": {
+          "blank": {
+            "graded": "957cfdea71dbbd69a537d17b5f13ae08dbeb729faef08b365c56b05fbe54818f",
+            "oracle": "30076b7b9656af47b770a2301561a4b52d9f74662a2bfe3ad722411b75584bad",
+            "placebo": "3a0f1b605123a1cd328efdf4af179dee47d2da504aef1d98ea981398e68a6dc9"
+          },
+          "canonical": {
+            "graded": "65ccfe5fc0a573a754622e82c8a8457fe994662eb1b7412d7f4da394396228d1",
+            "oracle": "30076b7b9656af47b770a2301561a4b52d9f74662a2bfe3ad722411b75584bad",
+            "placebo": "a578205e1ec647e22617aede6edf2eb264021fdafe4056f5664e6ce53d6240bc"
+          },
+          "duplicate": {
+            "graded": "65ccfe5fc0a573a754622e82c8a8457fe994662eb1b7412d7f4da394396228d1",
+            "oracle": "30076b7b9656af47b770a2301561a4b52d9f74662a2bfe3ad722411b75584bad",
+            "placebo": "a578205e1ec647e22617aede6edf2eb264021fdafe4056f5664e6ce53d6240bc"
+          },
+          "malformed": {
+            "graded": "27645e7316dc29b1cb13bb174c99f48d3b71120f394736a4ac08d01aa440bd50",
+            "oracle": "30076b7b9656af47b770a2301561a4b52d9f74662a2bfe3ad722411b75584bad",
+            "placebo": "25d1892a5ccdd365771933f3c899b3c6dcba89c576c30726b9478d0b53788be2"
+          },
+          "none": {
+            "graded": "27645e7316dc29b1cb13bb174c99f48d3b71120f394736a4ac08d01aa440bd50",
+            "oracle": "30076b7b9656af47b770a2301561a4b52d9f74662a2bfe3ad722411b75584bad",
+            "placebo": "25d1892a5ccdd365771933f3c899b3c6dcba89c576c30726b9478d0b53788be2"
+          },
+          "partial": {
+            "graded": "ddfa225f8b0cc356e4a4f701fe1dc5ee371cc21506590d521fbb4fb7216a5d31",
+            "oracle": "30076b7b9656af47b770a2301561a4b52d9f74662a2bfe3ad722411b75584bad",
+            "placebo": "57f116c1f23c40f60a1649aa4b88c40286be08f953fd8fb896e3fa61bb1f23c2"
+          },
+          "unprintable": {
+            "graded": "886d0e298bceb19fe2fe8eabf4c8a4b6045ae06f323d02f529ac079a30a948b3",
+            "oracle": "30076b7b9656af47b770a2301561a4b52d9f74662a2bfe3ad722411b75584bad",
+            "placebo": "d07388c71fe4a2a67847ed7bfba9e9128640c0bdcb953045bff84ab57b70ab6b"
+          }
+        },
+        "identifiers": [
+          "A7CAA5FD84E",
+          "AA14D9180C0",
+          "A4E4B55ABCC",
+          "A7A3397ECFE",
+          "A3D463FE8DA",
+          "AD5EB9262BE",
+          "A0F8C71935D",
+          "AC42B81CCAD",
+          "A94506B088B",
+          "A5155446A64",
+          "A00EA7EAAF7",
+          "A9AF432EED5",
+          "A21FAE4A222",
+          "AAB8427C387",
+          "AFBBAF762BE",
+          "A9B8300594C",
+          "A17D723B323",
+          "A08CD109CFA",
+          "A79FFD0FFFA",
+          "A74EDA440B2",
+          "AAE53F77137",
+          "A718C5B26D7",
+          "A9F5AFDC73D",
+          "A92ACD7235A"
+        ],
+        "key": [
+          "2",
+          "2",
+          "1",
+          "3",
+          "6",
+          "4",
+          "2",
+          "2",
+          "3",
+          "3",
+          "3",
+          "1",
+          "5",
+          "1",
+          "2",
+          "2",
+          "5",
+          "1",
+          "1",
+          "1",
+          "1",
+          "2",
+          "1",
+          "4"
+        ],
+        "mask": [
+          1,
+          20
+        ],
+        "scores": {
+          "blank": 0.0,
+          "canonical": 1.0,
+          "duplicate": 1.0,
+          "malformed": 0.0,
+          "none": 0.0,
+          "partial": 0.5,
+          "unprintable": 0.5
+        },
+        "text_digest": "d961f7b7dd85d1106fe937902726823cb728d4733d27daf62bbc8ac4d43534ed"
+      },
+      "b": {
+        "cells": {
+          "blank": {
+            "graded": "eee9e001ca2d76eff62247cc8090294a8e462d50b37f6e8581ac2bc53f9ceb23",
+            "oracle": "ab2d0df901031b0c8dc5b7f66a44fe9a9850e27a198a0f04bf4e10c8342e41dd",
+            "placebo": "8a896ecee508659974ac567820926764c52de79c8ae9978c9b9ce5c507cd38e1"
+          },
+          "canonical": {
+            "graded": "ac2d45614db92fa9633f8c429d692355536a2a0a8b55741450edcd7caedfa950",
+            "oracle": "ab2d0df901031b0c8dc5b7f66a44fe9a9850e27a198a0f04bf4e10c8342e41dd",
+            "placebo": "6f7edcecb36ee23d6932a3126803b231441407b6ba04f68ac05ee9ee06418a5b"
+          },
+          "duplicate": {
+            "graded": "ac2d45614db92fa9633f8c429d692355536a2a0a8b55741450edcd7caedfa950",
+            "oracle": "ab2d0df901031b0c8dc5b7f66a44fe9a9850e27a198a0f04bf4e10c8342e41dd",
+            "placebo": "6f7edcecb36ee23d6932a3126803b231441407b6ba04f68ac05ee9ee06418a5b"
+          },
+          "malformed": {
+            "graded": "b33f46dd0dc91de253caed1a2e53348250378ef2b5e0da76b99c6117868c331b",
+            "oracle": "ab2d0df901031b0c8dc5b7f66a44fe9a9850e27a198a0f04bf4e10c8342e41dd",
+            "placebo": "790099d08b697ce449d43ea4e2f271b261867938ec03038a67f623ebecbbccc6"
+          },
+          "none": {
+            "graded": "b33f46dd0dc91de253caed1a2e53348250378ef2b5e0da76b99c6117868c331b",
+            "oracle": "ab2d0df901031b0c8dc5b7f66a44fe9a9850e27a198a0f04bf4e10c8342e41dd",
+            "placebo": "790099d08b697ce449d43ea4e2f271b261867938ec03038a67f623ebecbbccc6"
+          },
+          "partial": {
+            "graded": "3d97c8141794a809bdb511204e79bcb815e681161793a4079a1044ce7235092d",
+            "oracle": "ab2d0df901031b0c8dc5b7f66a44fe9a9850e27a198a0f04bf4e10c8342e41dd",
+            "placebo": "cff6444d329b0f5e31259c2e8882662c85562b76d5d2564c451c04e31ee3530c"
+          },
+          "unprintable": {
+            "graded": "7583940103ac0b2a4394057016f7b130b88b733dd74116754a0e1a0251eb2e96",
+            "oracle": "ab2d0df901031b0c8dc5b7f66a44fe9a9850e27a198a0f04bf4e10c8342e41dd",
+            "placebo": "d6c0f0a1c4c2d820ba86da9ac7bd2f6409378fee1ebbdcca7311e4c291f7a2be"
+          }
+        },
+        "identifiers": [
+          "B08088C3D0D",
+          "B9C3C4135C6",
+          "B0E98208B43",
+          "BE74FC8FA7C",
+          "B342C6C35D5",
+          "B2B018932DE",
+          "B3F1C3AB49D",
+          "B27C7A0EBD2",
+          "B0300646493",
+          "B2E78B56B5A",
+          "B6AA3EEF4A4",
+          "B3CD31AF6A6",
+          "B302F76E82B",
+          "B50EB047D3C",
+          "B7A37BC5CC0",
+          "B753DA3EF36",
+          "B3D44B89811",
+          "BF0E6DC4DA3",
+          "B5A04AA637D",
+          "B7D5ABD5022",
+          "B2CF3CFB389",
+          "BBFF3B9F623",
+          "BBE72F61D25",
+          "BCB21185EE9"
+        ],
+        "key": [
+          "3",
+          "1",
+          "2",
+          "6",
+          "2",
+          "3",
+          "2",
+          "1",
+          "3",
+          "1",
+          "2",
+          "1",
+          "1",
+          "2",
+          "1",
+          "2",
+          "4",
+          "3",
+          "2",
+          "5",
+          "2",
+          "1",
+          "3",
+          "1"
+        ],
+        "mask": [
+          9,
+          21
+        ],
+        "scores": {
+          "blank": 0.0,
+          "canonical": 1.0,
+          "duplicate": 1.0,
+          "malformed": 0.0,
+          "none": 0.0,
+          "partial": 0.5,
+          "unprintable": 0.5
+        },
+        "text_digest": "1ce84d2698bb2bcddb2d908dea1d248f56802aeb99a46720578f46176a192167"
+      },
+      "check_names": [
+        "law",
+        "materiality",
+        "copy",
+        "fixation",
+        "envelope",
+        "graded",
+        "placebo",
+        "neutral",
+        "oracle",
+        "lint",
+        "invariance",
+        "components_semantics",
+        "components_shape",
+        "components_support",
+        "components_bijection_copy",
+        "components_analogy",
+        "components_public_contract"
+      ],
+      "convention": {
+        "contact_kernel": "combined_contacts"
+      },
+      "copy_scores": {
+        "closure": 0.416667,
+        "identity": 0.166667,
+        "option_flip": 0.5,
+        "permutation": 0.416667,
+        "relabel": 0.291667
+      },
+      "instance_digest": "8facb86c1fd26cedc41f2102780fe5f53d1fe4484b63f06965a05678e83bec4d",
+      "leverage": {
+        "contact_kernel": 0.5
+      },
+      "report_digest": "104c4d0cee7fe6beb4aef704319254e3e239650c4156b9ab0896e582227e5056"
+    },
+    "1": {
+      "a": {
+        "cells": {
+          "blank": {
+            "graded": "0dfebf8e7e8cf2e292e9cf84cf7641a3da27342e095016b95ca36ada2e1c36d0",
+            "oracle": "02c98687ca33acb95265b2c7497035c4a116a7606208407c25b30e31a9a33b8e",
+            "placebo": "1070b0de120f4b14659747d18e396c4fc867b6bf169dd29aa59d889090769bb2"
+          },
+          "canonical": {
+            "graded": "a953b227005edc3d12d52ce500f68c3b471bba49de8ad3dd379fea4aba25bb82",
+            "oracle": "02c98687ca33acb95265b2c7497035c4a116a7606208407c25b30e31a9a33b8e",
+            "placebo": "a028b0ea24cab63fcfd44c3ff1784e255ae9c585944f1cfd46a2c02dca086721"
+          },
+          "duplicate": {
+            "graded": "a953b227005edc3d12d52ce500f68c3b471bba49de8ad3dd379fea4aba25bb82",
+            "oracle": "02c98687ca33acb95265b2c7497035c4a116a7606208407c25b30e31a9a33b8e",
+            "placebo": "a028b0ea24cab63fcfd44c3ff1784e255ae9c585944f1cfd46a2c02dca086721"
+          },
+          "malformed": {
+            "graded": "e8d87e07eb279ed107f12923c58b3b036cc8b3d847bc6448c7ca92f02b9f4874",
+            "oracle": "02c98687ca33acb95265b2c7497035c4a116a7606208407c25b30e31a9a33b8e",
+            "placebo": "86f1e1cd0bd3e3f6bc0962aefc77cc1fdd93dcdb589529b4391b6b463c822132"
+          },
+          "none": {
+            "graded": "e8d87e07eb279ed107f12923c58b3b036cc8b3d847bc6448c7ca92f02b9f4874",
+            "oracle": "02c98687ca33acb95265b2c7497035c4a116a7606208407c25b30e31a9a33b8e",
+            "placebo": "86f1e1cd0bd3e3f6bc0962aefc77cc1fdd93dcdb589529b4391b6b463c822132"
+          },
+          "partial": {
+            "graded": "497e355e939e6db6e5304011c733e94551d52b3db9affb1669c4f0468eea1455",
+            "oracle": "02c98687ca33acb95265b2c7497035c4a116a7606208407c25b30e31a9a33b8e",
+            "placebo": "9b12c85939295eb1b91de44b2a4b306f6d642ee72c23596fd8fc84ba2a9b2a60"
+          },
+          "unprintable": {
+            "graded": "8ab561d836d4b312ec7710f85bd8aa22929bea4bb0be50097524b5599480ec31",
+            "oracle": "02c98687ca33acb95265b2c7497035c4a116a7606208407c25b30e31a9a33b8e",
+            "placebo": "ee7f8194bcc5e626c21a0c92896a91ff08d790e3ce8f71199e091026c9ade809"
+          }
+        },
+        "identifiers": [
+          "A24E5A73621",
+          "A2ED14FB60B",
+          "AF3EC99114C",
+          "AB538E2F3E0",
+          "A7F43045BDC",
+          "A11319D66D2",
+          "AA5D5DD18D2",
+          "ADB29BF1C52",
+          "ABCF2FC0624",
+          "AB7A3D0EA4C",
+          "ADB01394AED",
+          "A0C7756CDD7",
+          "A0140A635DB",
+          "AE1F5FFB321",
+          "ACFC64A3885",
+          "AD952BEADB1",
+          "A23DB7C0736",
+          "AB9A491104E",
+          "A4659B059E7",
+          "AE8F4278B13",
+          "A4FF1A3ACEA",
+          "A643A6C45CC",
+          "A53E2A978E7",
+          "A7FABFEE4EA"
+        ],
+        "key": [
+          "2",
+          "6",
+          "5",
+          "1",
+          "5",
+          "2",
+          "6",
+          "4",
+          "4",
+          "1",
+          "3",
+          "2",
+          "5",
+          "3",
+          "2",
+          "2",
+          "2",
+          "1",
+          "3",
+          "3",
+          "4",
+          "6",
+          "3",
+          "3"
+        ],
+        "mask": [
+          10,
+          23
+        ],
+        "scores": {
+          "blank": 0.0,
+          "canonical": 1.0,
+          "duplicate": 1.0,
+          "malformed": 0.0,
+          "none": 0.0,
+          "partial": 0.5,
+          "unprintable": 0.5
+        },
+        "text_digest": "d72b6983828f066509f81fb06d74ce427b3262537742172b942a06fe59a225eb"
+      },
+      "b": {
+        "cells": {
+          "blank": {
+            "graded": "41f480a0e9dd824b37463542c06c3d32b1084e0f8772556712121e98761733cd",
+            "oracle": "588a3bdc854f228691959a4ea0619f129554a9da673b3218fa58e117a7d9eded",
+            "placebo": "71141f623348652a62e91fb8cf399412070f44f584148b6aae0e835aefd269ec"
+          },
+          "canonical": {
+            "graded": "0629a8689059a904d085024a4c7c62b14ce4d13de9b137a13a6053f9ff5083b9",
+            "oracle": "588a3bdc854f228691959a4ea0619f129554a9da673b3218fa58e117a7d9eded",
+            "placebo": "945e9a5be56777054e864d15eef7562c552ed2e2a919825bac160a041aaacbea"
+          },
+          "duplicate": {
+            "graded": "0629a8689059a904d085024a4c7c62b14ce4d13de9b137a13a6053f9ff5083b9",
+            "oracle": "588a3bdc854f228691959a4ea0619f129554a9da673b3218fa58e117a7d9eded",
+            "placebo": "945e9a5be56777054e864d15eef7562c552ed2e2a919825bac160a041aaacbea"
+          },
+          "malformed": {
+            "graded": "9d718f6f1277b1cbb0776780600eb0f776f2570e3a92c058b48d04168e65db23",
+            "oracle": "588a3bdc854f228691959a4ea0619f129554a9da673b3218fa58e117a7d9eded",
+            "placebo": "8de3d65608acf0e9b22336535fd4fb0b371311145bd9c38e2d7577ddbee3a679"
+          },
+          "none": {
+            "graded": "9d718f6f1277b1cbb0776780600eb0f776f2570e3a92c058b48d04168e65db23",
+            "oracle": "588a3bdc854f228691959a4ea0619f129554a9da673b3218fa58e117a7d9eded",
+            "placebo": "8de3d65608acf0e9b22336535fd4fb0b371311145bd9c38e2d7577ddbee3a679"
+          },
+          "partial": {
+            "graded": "97245544140b829dbece3054e211e9d6c58dccd3d88f0473a28bf0cef690eb24",
+            "oracle": "588a3bdc854f228691959a4ea0619f129554a9da673b3218fa58e117a7d9eded",
+            "placebo": "c55fd5935147e0062bcd8d545f0856b52875da9d6957933e9247b3b71b4ec2ff"
+          },
+          "unprintable": {
+            "graded": "c9fcca02e42d431a36487aa5ae214ecb353c4e2ca24c1498ed6d222a094eb0c2",
+            "oracle": "588a3bdc854f228691959a4ea0619f129554a9da673b3218fa58e117a7d9eded",
+            "placebo": "75d2a3dd2f75111e0d93ff1b483aeb1e52718260a9f99c66fc535f3b0208af73"
+          }
+        },
+        "identifiers": [
+          "B700F5CAD20",
+          "BB400E01BBE",
+          "B69630E87D1",
+          "BC58C96D0A6",
+          "B2CCACDE642",
+          "BECA1B98CD1",
+          "BE10367C8B8",
+          "B4E32CF4F4B",
+          "B1CE2BA40CC",
+          "B6084DB2B84",
+          "BF5C3662B08",
+          "B0FE95F9A63",
+          "BC4DC5D493C",
+          "B3E2AEAB152",
+          "B9E0B3114B8",
+          "B6F559F4FA2",
+          "B5D415EF8D7",
+          "B0B38884028",
+          "BDD63B06EE5",
+          "BCEEF590962",
+          "BEFDEAB6FF7",
+          "B37AB8554B2",
+          "BCAFC0A81BD",
+          "B4662473C1F"
+        ],
+        "key": [
+          "3",
+          "2",
+          "1",
+          "6",
+          "2",
+          "2",
+          "5",
+          "1",
+          "4",
+          "3",
+          "3",
+          "4",
+          "4",
+          "2",
+          "4",
+          "2",
+          "4",
+          "4",
+          "3",
+          "5",
+          "2",
+          "4",
+          "4",
+          "3"
+        ],
+        "mask": [
+          5,
+          15
+        ],
+        "scores": {
+          "blank": 0.0,
+          "canonical": 1.0,
+          "duplicate": 1.0,
+          "malformed": 0.0,
+          "none": 0.0,
+          "partial": 0.5,
+          "unprintable": 0.5
+        },
+        "text_digest": "b10a47f27b791c00316ae1cfe10ecbd7d33f8e55b4abc8e8046ad9c8c1ee4e0e"
+      },
+      "check_names": [
+        "law",
+        "materiality",
+        "copy",
+        "fixation",
+        "envelope",
+        "graded",
+        "placebo",
+        "neutral",
+        "oracle",
+        "lint",
+        "invariance",
+        "components_semantics",
+        "components_shape",
+        "components_support",
+        "components_bijection_copy",
+        "components_analogy",
+        "components_public_contract"
+      ],
+      "convention": {
+        "contact_kernel": "corner_contacts"
+      },
+      "copy_scores": {
+        "closure": 0.375,
+        "identity": 0.25,
+        "option_flip": 0.5,
+        "permutation": 0.333333,
+        "relabel": 0.291667
+      },
+      "instance_digest": "b15499ac938395eca0b31679bf4d55e5a3002d9be495572eeed2c4f962d7802e",
+      "leverage": {
+        "contact_kernel": 0.5
+      },
+      "report_digest": "622cb87ea286c6f67220f506fb397b55bf26212d0c1a3cb9143494d8cc4ae58b"
+    }
+  },
+  "ledger": {
+    "0": {
+      "a": {
+        "cells": {
+          "blank": {
+            "graded": "9195376528675aa8d0bdac37b8e652b9ebbe9064f47497703c4d97f8bcb3c4e1",
+            "oracle": "2d914a16393f3658eee1969f0456ebe7833c47f92635d6e92a00960cebbeef68",
+            "placebo": "dcd2db1741870808428d689cdb6bf66fa7a5f2b31cde22c00fa36543f2a67ada"
+          },
+          "canonical": {
+            "graded": "728148c68310c78350f42f8deddc5a6b522bf2f3bc0391282214482176064072",
+            "oracle": "2d914a16393f3658eee1969f0456ebe7833c47f92635d6e92a00960cebbeef68",
+            "placebo": "1662492c38c605ed989d6549d0ca18489a19c7655c4c5f3b6e4c6bf02b4759dc"
+          },
+          "duplicate": {
+            "graded": "728148c68310c78350f42f8deddc5a6b522bf2f3bc0391282214482176064072",
+            "oracle": "2d914a16393f3658eee1969f0456ebe7833c47f92635d6e92a00960cebbeef68",
+            "placebo": "1662492c38c605ed989d6549d0ca18489a19c7655c4c5f3b6e4c6bf02b4759dc"
+          },
+          "malformed": {
+            "graded": "a7545ab1024de77392daac9645175c117b59b7dd4e8e7fb158545d0dcabc41ce",
+            "oracle": "2d914a16393f3658eee1969f0456ebe7833c47f92635d6e92a00960cebbeef68",
+            "placebo": "eb20e6c58486e457f2493a6d72fff28c267555088427e01484608f5cc5c3e4f6"
+          },
+          "none": {
+            "graded": "a7545ab1024de77392daac9645175c117b59b7dd4e8e7fb158545d0dcabc41ce",
+            "oracle": "2d914a16393f3658eee1969f0456ebe7833c47f92635d6e92a00960cebbeef68",
+            "placebo": "eb20e6c58486e457f2493a6d72fff28c267555088427e01484608f5cc5c3e4f6"
+          },
+          "partial": {
+            "graded": "5f6d66812c420a30c380b9e8e65a0bea8addd444e725d283f812ab0758d3de92",
+            "oracle": "2d914a16393f3658eee1969f0456ebe7833c47f92635d6e92a00960cebbeef68",
+            "placebo": "48c8e80d741dc2a22746576246631e94294c40cc8f820f2e3d947de4e8f40163"
+          },
+          "unprintable": {
+            "graded": "67524ca43f7f8510cc6e30c345e0b7a768354c716b9aa0cb0e5f648e41401782",
+            "oracle": "2d914a16393f3658eee1969f0456ebe7833c47f92635d6e92a00960cebbeef68",
+            "placebo": "0eeec88ee4010282b5ce7e9780ce14d484a209a46a0aff8d44731bca591dc875"
+          }
+        },
+        "identifiers": [
+          "CLM-1043",
+          "CLM-1044",
+          "CLM-1045",
+          "CLM-1046",
+          "CLM-1047",
+          "CLM-1048",
+          "CLM-1049",
+          "CLM-1050",
+          "CLM-1051",
+          "CLM-1052",
+          "CLM-1053",
+          "CLM-1054",
+          "CLM-1055",
+          "CLM-1056",
+          "CLM-1057",
+          "CLM-1058",
+          "CLM-1059",
+          "CLM-1060",
+          "CLM-1061",
+          "CLM-1062",
+          "CLM-1063",
+          "CLM-1064",
+          "CLM-1065",
+          "CLM-1066"
+        ],
+        "key": [
+          "Routine",
+          "Routine",
+          "Routine",
+          "Routine",
+          "Routine",
+          "Priority",
+          "Urgent",
+          "Standard",
+          "Standard",
+          "Urgent",
+          "Routine",
+          "Standard",
+          "Routine",
+          "Priority",
+          "Standard",
+          "Routine",
+          "Routine",
+          "Priority",
+          "Urgent",
+          "Routine",
+          "Routine",
+          "Routine",
+          "Urgent",
+          "Standard"
+        ],
+        "mask": [
+          4,
+          9,
+          16,
+          20
+        ],
+        "scores": {
+          "blank": 0.0,
+          "canonical": 1.0,
+          "duplicate": 1.0,
+          "malformed": 0.0,
+          "none": 0.0,
+          "partial": 0.5,
+          "unprintable": 0.5
+        },
+        "text_digest": "22255c03307de424aa8c4a5e33a2f9c271019043ce9b1110a501a797f2c93b52"
+      },
+      "b": {
+        "cells": {
+          "blank": {
+            "graded": "d9d51c0ce2340362c9433b889514462d11d9196f7b06ff5aea77cf07c0265af3",
+            "oracle": "6067a6a1ec3c80d1f9137cc57cdc9c7a929f1065f6f5d5e3ff467b145f5de7ca",
+            "placebo": "bb3efebb5fc006ffcc82ae0e43fb4dc206a1314dc8d9070d0b2e00c5a8e269af"
+          },
+          "canonical": {
+            "graded": "e13685f97a59ae2cbb8c986896e7dcfa7b95867fae7e5029a4676a27e882d03f",
+            "oracle": "6067a6a1ec3c80d1f9137cc57cdc9c7a929f1065f6f5d5e3ff467b145f5de7ca",
+            "placebo": "c7b1e542136bd81c13c5f0ac10eb9d42f4b17453f301ac5e0a0a0380e041beea"
+          },
+          "duplicate": {
+            "graded": "e13685f97a59ae2cbb8c986896e7dcfa7b95867fae7e5029a4676a27e882d03f",
+            "oracle": "6067a6a1ec3c80d1f9137cc57cdc9c7a929f1065f6f5d5e3ff467b145f5de7ca",
+            "placebo": "c7b1e542136bd81c13c5f0ac10eb9d42f4b17453f301ac5e0a0a0380e041beea"
+          },
+          "malformed": {
+            "graded": "2a8a4a8ee47dc379094e250ae983dbe3193dbdf0bf11d88ba9ffb044feff4508",
+            "oracle": "6067a6a1ec3c80d1f9137cc57cdc9c7a929f1065f6f5d5e3ff467b145f5de7ca",
+            "placebo": "012737155c3197226307ecc910072e69dc922d1d43472428330d153b4f0bb2e3"
+          },
+          "none": {
+            "graded": "2a8a4a8ee47dc379094e250ae983dbe3193dbdf0bf11d88ba9ffb044feff4508",
+            "oracle": "6067a6a1ec3c80d1f9137cc57cdc9c7a929f1065f6f5d5e3ff467b145f5de7ca",
+            "placebo": "012737155c3197226307ecc910072e69dc922d1d43472428330d153b4f0bb2e3"
+          },
+          "partial": {
+            "graded": "1bfb7afee0745ecce4c8806ec834db7b7a86e6686a0920a93757c2a9ad4ee522",
+            "oracle": "6067a6a1ec3c80d1f9137cc57cdc9c7a929f1065f6f5d5e3ff467b145f5de7ca",
+            "placebo": "1207b73f894d1befad09d6f77b796a365c79077ec0c411189ab6a77840cd036a"
+          },
+          "unprintable": {
+            "graded": "21da89d399476b5f30ba5d591a18d8b6c3a2f460a540760ffca37e844bb8bca5",
+            "oracle": "6067a6a1ec3c80d1f9137cc57cdc9c7a929f1065f6f5d5e3ff467b145f5de7ca",
+            "placebo": "e96b312e3a18fffbe6a17a1726ea8432f4345f310a8f176cd5c0b233483a124a"
+          }
+        },
+        "identifiers": [
+          "LN-3374",
+          "LN-3375",
+          "LN-3376",
+          "LN-3377",
+          "LN-3378",
+          "LN-3379",
+          "LN-3380",
+          "LN-3381",
+          "LN-3382",
+          "LN-3383",
+          "LN-3384",
+          "LN-3385",
+          "LN-3386",
+          "LN-3387",
+          "LN-3388",
+          "LN-3389",
+          "LN-3390",
+          "LN-3391",
+          "LN-3392",
+          "LN-3393",
+          "LN-3394",
+          "LN-3395",
+          "LN-3396",
+          "LN-3397"
+        ],
+        "key": [
+          "Quiet",
+          "Quiet",
+          "Quiet",
+          "Quiet",
+          "Bar",
+          "Quiet",
+          "Quiet",
+          "Quiet",
+          "Hold",
+          "Hold",
+          "Notice",
+          "Notice",
+          "Notice",
+          "Quiet",
+          "Quiet",
+          "Quiet",
+          "Quiet",
+          "Notice",
+          "Quiet",
+          "Quiet",
+          "Quiet",
+          "Bar",
+          "Quiet",
+          "Chase"
+        ],
+        "mask": [
+          5,
+          11,
+          17,
+          19
+        ],
+        "scores": {
+          "blank": 0.0,
+          "canonical": 1.0,
+          "duplicate": 1.0,
+          "malformed": 0.0,
+          "none": 0.0,
+          "partial": 0.5,
+          "unprintable": 0.5
+        },
+        "text_digest": "10d860bd1019cb0388c1515fff4a972f820a95d8eb1665f4be19b9798edbe2e5"
+      },
+      "check_names": [
+        "law",
+        "materiality",
+        "copy",
+        "fixation",
+        "envelope",
+        "graded",
+        "placebo",
+        "neutral",
+        "oracle",
+        "lint",
+        "invariance"
+      ],
+      "convention": {
+        "anchor": "last_action",
+        "basis": "business",
+        "boundary": "lower",
+        "missing": "lowest"
+      },
+      "copy_scores": {
+        "closure": 0.583333,
+        "identity": 0.0,
+        "option_flip": 0.916667,
+        "permutation": 0.0,
+        "relabel": 0.416667
+      },
+      "instance_digest": "399cd31ace6d033e5c9d14cfc30f83d53f2db9e23a4cb1b6a1ea89fdbdbf9563",
+      "leverage": {
+        "anchor": 0.416667,
+        "basis": 0.1666665,
+        "boundary": 0.333333,
+        "missing": 0.166667
+      },
+      "report_digest": "72e6a1f8b027a8091b0de7313471a54354d8f5a89435ca707d0538e0aa6014a3"
+    },
+    "1": {
+      "a": {
+        "cells": {
+          "blank": {
+            "graded": "f4439a2e55f68ec01c58575ccddf51abd1620da5479f2a858316c1ec4a020776",
+            "oracle": "9bc767b7eaab7e7f5e7affb6686129360655d2a20346b09c62ebaeb3c4df6c08",
+            "placebo": "12514fa551f9d5dc1a4056559cf0ae5426d02648b9285cbc6d99a8388d6ff0e6"
+          },
+          "canonical": {
+            "graded": "0dbb748e31f073de25b8d57283096cee4e90a9187ad131dfa94137dceda00268",
+            "oracle": "9bc767b7eaab7e7f5e7affb6686129360655d2a20346b09c62ebaeb3c4df6c08",
+            "placebo": "d2bb2df30d2b16ab76215ef1e6b476a9dfbc0043f2c97f53bb47bbfc60ac6ea8"
+          },
+          "duplicate": {
+            "graded": "0dbb748e31f073de25b8d57283096cee4e90a9187ad131dfa94137dceda00268",
+            "oracle": "9bc767b7eaab7e7f5e7affb6686129360655d2a20346b09c62ebaeb3c4df6c08",
+            "placebo": "d2bb2df30d2b16ab76215ef1e6b476a9dfbc0043f2c97f53bb47bbfc60ac6ea8"
+          },
+          "malformed": {
+            "graded": "e4c3d0b1e700cf75c55f96b4ac54ef707bddac804d5c9743d320e70279d663df",
+            "oracle": "9bc767b7eaab7e7f5e7affb6686129360655d2a20346b09c62ebaeb3c4df6c08",
+            "placebo": "c59b1c7e2e3cc1d37593f678e846e4fa66623bbadebb6e6da1d67e3a28d2968c"
+          },
+          "none": {
+            "graded": "e4c3d0b1e700cf75c55f96b4ac54ef707bddac804d5c9743d320e70279d663df",
+            "oracle": "9bc767b7eaab7e7f5e7affb6686129360655d2a20346b09c62ebaeb3c4df6c08",
+            "placebo": "c59b1c7e2e3cc1d37593f678e846e4fa66623bbadebb6e6da1d67e3a28d2968c"
+          },
+          "partial": {
+            "graded": "2cdadc1a89a54a42032f33acd1bd3dcfeb6a8b6c25f2c9728eb8ae8d09394a80",
+            "oracle": "9bc767b7eaab7e7f5e7affb6686129360655d2a20346b09c62ebaeb3c4df6c08",
+            "placebo": "bbf309c6579316a5f6a3b37b50d0fc3ddbb4f1d6d10028c20dccda68530f2648"
+          },
+          "unprintable": {
+            "graded": "6627818401bf650cc7f418f5ad884a0010c75689750626d4ba16a1700c220fe3",
+            "oracle": "9bc767b7eaab7e7f5e7affb6686129360655d2a20346b09c62ebaeb3c4df6c08",
+            "placebo": "08f4ebb534735c26597e7799e38687566497735f78d5358acaa3fda5d5281687"
+          }
+        },
+        "identifiers": [
+          "PMT-2210",
+          "PMT-2211",
+          "PMT-2212",
+          "PMT-2213",
+          "PMT-2214",
+          "PMT-2215",
+          "PMT-2216",
+          "PMT-2217",
+          "PMT-2218",
+          "PMT-2219",
+          "PMT-2220",
+          "PMT-2221",
+          "PMT-2222",
+          "PMT-2223",
+          "PMT-2224",
+          "PMT-2225",
+          "PMT-2226",
+          "PMT-2227",
+          "PMT-2228",
+          "PMT-2229",
+          "PMT-2230",
+          "PMT-2231",
+          "PMT-2232",
+          "PMT-2233"
+        ],
+        "key": [
+          "Green",
+          "Black",
+          "Black",
+          "Amber",
+          "Orange",
+          "Black",
+          "Amber",
+          "Red",
+          "Amber",
+          "Black",
+          "Green",
+          "Black",
+          "Black",
+          "Orange",
+          "Amber",
+          "Red",
+          "Amber",
+          "Red",
+          "Orange",
+          "Orange",
+          "Red",
+          "Red",
+          "Red",
+          "Amber"
+        ],
+        "mask": [
+          14,
+          17,
+          19,
+          21
+        ],
+        "scores": {
+          "blank": 0.0,
+          "canonical": 1.0,
+          "duplicate": 1.0,
+          "malformed": 0.0,
+          "none": 0.0,
+          "partial": 0.5,
+          "unprintable": 0.5
+        },
+        "text_digest": "33c5b43cca9ec2c2d834b9ac7a390b9d20603b979b58d436fd32e356a2e8cedd"
+      },
+      "b": {
+        "cells": {
+          "blank": {
+            "graded": "722a7c2e7affe1580e25fd3f454a9c82ad4c0ac7934c8816739ed982b185cf55",
+            "oracle": "e05caa331b7d40a8e5bdf023c73511f61cb4dddfbd0d0519bef5b188e94ef2be",
+            "placebo": "7cf061e9737b6c55ae9e61104ac95dc86543a8fda03c65db12a1bc6ded9e0b13"
+          },
+          "canonical": {
+            "graded": "1e1dc639a803783c81ec3943fd993b697fc1c61e7bee864ce06717962fbaf305",
+            "oracle": "e05caa331b7d40a8e5bdf023c73511f61cb4dddfbd0d0519bef5b188e94ef2be",
+            "placebo": "e4e0eea55663d7eaa0d0956fdda12a94681c4525e6636c027c023b65b7256edc"
+          },
+          "duplicate": {
+            "graded": "1e1dc639a803783c81ec3943fd993b697fc1c61e7bee864ce06717962fbaf305",
+            "oracle": "e05caa331b7d40a8e5bdf023c73511f61cb4dddfbd0d0519bef5b188e94ef2be",
+            "placebo": "e4e0eea55663d7eaa0d0956fdda12a94681c4525e6636c027c023b65b7256edc"
+          },
+          "malformed": {
+            "graded": "16a29f82973f41d911d13882af2316b6647795c95f811700b0c444decdfc39c9",
+            "oracle": "e05caa331b7d40a8e5bdf023c73511f61cb4dddfbd0d0519bef5b188e94ef2be",
+            "placebo": "e33b683877694ac4eb6d51985a250b829f95b1bef742eea580840caa5dffb17b"
+          },
+          "none": {
+            "graded": "16a29f82973f41d911d13882af2316b6647795c95f811700b0c444decdfc39c9",
+            "oracle": "e05caa331b7d40a8e5bdf023c73511f61cb4dddfbd0d0519bef5b188e94ef2be",
+            "placebo": "e33b683877694ac4eb6d51985a250b829f95b1bef742eea580840caa5dffb17b"
+          },
+          "partial": {
+            "graded": "efe07d046f8fa58fc31a8d25d448fff19392839f7867802e52da11057911ecee",
+            "oracle": "e05caa331b7d40a8e5bdf023c73511f61cb4dddfbd0d0519bef5b188e94ef2be",
+            "placebo": "20e2593bfc500d54ac0c1e3e944fa23bfcaa125dd0eee1679946894dd422a79a"
+          },
+          "unprintable": {
+            "graded": "d938711a7050bbe2d12677e99c2ff5a9a3bd04ccdd9a04ace5e493d780f83551",
+            "oracle": "e05caa331b7d40a8e5bdf023c73511f61cb4dddfbd0d0519bef5b188e94ef2be",
+            "placebo": "84c2d27f456e34709567fe3735dccd746dd2ce2971240fccba62d2117a329b43"
+          }
+        },
+        "identifiers": [
+          "DF-4419",
+          "DF-4420",
+          "DF-4421",
+          "DF-4422",
+          "DF-4423",
+          "DF-4424",
+          "DF-4425",
+          "DF-4426",
+          "DF-4427",
+          "DF-4428",
+          "DF-4429",
+          "DF-4430",
+          "DF-4431",
+          "DF-4432",
+          "DF-4433",
+          "DF-4434",
+          "DF-4435",
+          "DF-4436",
+          "DF-4437",
+          "DF-4438",
+          "DF-4439",
+          "DF-4440",
+          "DF-4441",
+          "DF-4442"
+        ],
+        "key": [
+          "Serviceable",
+          "Restricted",
+          "Caution",
+          "Restricted",
+          "Serviceable",
+          "Grounded",
+          "Condemned",
+          "Serviceable",
+          "Caution",
+          "Grounded",
+          "Restricted",
+          "Condemned",
+          "Caution",
+          "Grounded",
+          "Caution",
+          "Condemned",
+          "Caution",
+          "Grounded",
+          "Grounded",
+          "Condemned",
+          "Restricted",
+          "Restricted",
+          "Condemned",
+          "Restricted"
+        ],
+        "mask": [
+          1,
+          2,
+          4,
+          15
+        ],
+        "scores": {
+          "blank": 0.0,
+          "canonical": 1.0,
+          "duplicate": 1.0,
+          "malformed": 0.0,
+          "none": 0.0,
+          "partial": 0.5,
+          "unprintable": 0.5
+        },
+        "text_digest": "f110c1f77aee7cc09a5a2c905c99c0dbb6c432d67e4f4ed2263e43119d07ba0d"
+      },
+      "check_names": [
+        "law",
+        "materiality",
+        "copy",
+        "fixation",
+        "envelope",
+        "graded",
+        "placebo",
+        "neutral",
+        "oracle",
+        "lint",
+        "invariance"
+      ],
+      "convention": {
+        "anchor": "intake",
+        "basis": "business_minus_holidays",
+        "boundary": "lower",
+        "missing": "highest"
+      },
+      "copy_scores": {
+        "closure": 0.458333,
+        "identity": 0.0,
+        "option_flip": 0.833333,
+        "permutation": 0.0,
+        "relabel": 0.25
+      },
+      "instance_digest": "58ac023d6f8a50bd829af7a0a5718e25097942f2d99cdfde3c18c2d9937ffc6e",
+      "leverage": {
+        "anchor": 0.416667,
+        "basis": 0.3541665,
+        "boundary": 0.291667,
+        "missing": 0.166667
+      },
+      "report_digest": "b199d6ff39dcbc156c0a7d794b0c63f404a093f553c49a0686ac8f1cee4ee3f8"
+    }
+  },
+  "soundchange": {
+    "0": {
+      "a": {
+        "cells": {
+          "blank": {
+            "graded": "d0e53451d59c7f10f30be49b2774dcad5db245b14d58610afb6b393ad09d99f4",
+            "oracle": "304fa7f163577daaa72e5987cf8167a3ecfb1046cd73d7030a225bab20f5f48d",
+            "placebo": "09da080ad5405eead7fc0aae624c8cc1785cf2f2ab6705f40df0cbff69015d1c"
+          },
+          "canonical": {
+            "graded": "c648f3b1e17595ee0ff0895cac215915c9f7d401da2ad5053bf9b8e50647da38",
+            "oracle": "304fa7f163577daaa72e5987cf8167a3ecfb1046cd73d7030a225bab20f5f48d",
+            "placebo": "0414204fa01aec2944bce7734c48aa176f82606de2736bd7d1069b94a46e0a67"
+          },
+          "duplicate": {
+            "graded": "c648f3b1e17595ee0ff0895cac215915c9f7d401da2ad5053bf9b8e50647da38",
+            "oracle": "304fa7f163577daaa72e5987cf8167a3ecfb1046cd73d7030a225bab20f5f48d",
+            "placebo": "0414204fa01aec2944bce7734c48aa176f82606de2736bd7d1069b94a46e0a67"
+          },
+          "malformed": {
+            "graded": "38388181c723d4f841ed3205e52a43b03bc58b132e20d2c714ef0e8dfba884a0",
+            "oracle": "304fa7f163577daaa72e5987cf8167a3ecfb1046cd73d7030a225bab20f5f48d",
+            "placebo": "8d65a8901a4a4ed576afe70ba2cb986077801e0f7e37d1fc642c04f0d9d49744"
+          },
+          "none": {
+            "graded": "38388181c723d4f841ed3205e52a43b03bc58b132e20d2c714ef0e8dfba884a0",
+            "oracle": "304fa7f163577daaa72e5987cf8167a3ecfb1046cd73d7030a225bab20f5f48d",
+            "placebo": "8d65a8901a4a4ed576afe70ba2cb986077801e0f7e37d1fc642c04f0d9d49744"
+          },
+          "partial": {
+            "graded": "4f81fc8d1def57365028a2f82b0c0bd3bc985f6ff85bf1ef0c912424246349f8",
+            "oracle": "304fa7f163577daaa72e5987cf8167a3ecfb1046cd73d7030a225bab20f5f48d",
+            "placebo": "b20829edbdf98d8c6dd5cd205dea902aa41ca636e6a787170b1dc46fa1c00da3"
+          },
+          "unprintable": {
+            "graded": "0e1b3ddf62d679f1969f45f55dfbf9b231854bf0245cf5b716a47efa738a16b0",
+            "oracle": "304fa7f163577daaa72e5987cf8167a3ecfb1046cd73d7030a225bab20f5f48d",
+            "placebo": "a7e7fbc60f7717ffe0a4c61c8d1d6c16fafde87f3558719c5981f7d160e2b43d"
+          }
+        },
+        "identifiers": [
+          "F-657fe0f2",
+          "F-c7822b33",
+          "F-695aa9b7",
+          "F-1d185648",
+          "F-f50e97df",
+          "F-aafd912c",
+          "F-8a62064e",
+          "F-f53c3665",
+          "F-f96bc2f0",
+          "F-d4d7a34a",
+          "F-fafd0399",
+          "F-c01a970f",
+          "F-54338f75",
+          "F-f89b8a41",
+          "F-5aaf7e43",
+          "F-59956c6e",
+          "F-31a78a5a",
+          "F-f09287e4",
+          "F-b9c6187e",
+          "F-8270c074",
+          "F-7818e10b",
+          "F-e388c635",
+          "F-1fccfdae",
+          "F-e68c4586"
+        ],
+        "key": [
+          "sombibednomm",
+          "bisesd",
+          "nisnbesud",
+          "dusnepib",
+          "bsitesopotb",
+          "sinted",
+          "tisodsed",
+          "nesisobipnem",
+          "misebb",
+          "pumbsitutesid",
+          "sombitnuteb",
+          "tsimesedim",
+          "nsedib",
+          "smbiseb",
+          "sbitedud",
+          "spitepenunub",
+          "spesipub",
+          "tsised",
+          "missmitetib",
+          "detnesimb",
+          "bipbmusened",
+          "tembetmisd",
+          "pombnemubsid",
+          "sisped"
+        ],
+        "mask": [
+          13,
+          20
+        ],
+        "scores": {
+          "blank": 0.0,
+          "canonical": 1.0,
+          "duplicate": 1.0,
+          "malformed": 0.0,
+          "none": 0.0,
+          "partial": 0.5,
+          "unprintable": 0.5
+        },
+        "text_digest": "97c0245afe69ce9a769f1cd5d1e05e7d8238f058a6322254ec3e0547b200f2a6"
+      },
+      "b": {
+        "cells": {
+          "blank": {
+            "graded": "6d9fc217f152e80d2cde08f86f396d4be8f72d921d5be974e3244dbd06c38c6f",
+            "oracle": "72c34527ea5ab50f33c9d2518cc61162cf84e2454e003c0f4126b2b22ea4dced",
+            "placebo": "8983936c36eed86b81c106080be568107a7652a7ab99c1ee1cfcea7f73b102e6"
+          },
+          "canonical": {
+            "graded": "e759c2fede115a099a532bee987355e551dc59096e651ebe827b08440385e812",
+            "oracle": "72c34527ea5ab50f33c9d2518cc61162cf84e2454e003c0f4126b2b22ea4dced",
+            "placebo": "669a6f28e76c66671f7fe62da0c1ed0a85e026c7ecc30ddc6c1597a4e9967c65"
+          },
+          "duplicate": {
+            "graded": "e759c2fede115a099a532bee987355e551dc59096e651ebe827b08440385e812",
+            "oracle": "72c34527ea5ab50f33c9d2518cc61162cf84e2454e003c0f4126b2b22ea4dced",
+            "placebo": "669a6f28e76c66671f7fe62da0c1ed0a85e026c7ecc30ddc6c1597a4e9967c65"
+          },
+          "malformed": {
+            "graded": "454091cdb610208d83c3436e3c2dbc8503de6b51c9ea4c8331045250e8e782c9",
+            "oracle": "72c34527ea5ab50f33c9d2518cc61162cf84e2454e003c0f4126b2b22ea4dced",
+            "placebo": "4d0bb91e8055e67df4ed3a59aacb137fb2c8051e240be449b04a954d61c3befe"
+          },
+          "none": {
+            "graded": "454091cdb610208d83c3436e3c2dbc8503de6b51c9ea4c8331045250e8e782c9",
+            "oracle": "72c34527ea5ab50f33c9d2518cc61162cf84e2454e003c0f4126b2b22ea4dced",
+            "placebo": "4d0bb91e8055e67df4ed3a59aacb137fb2c8051e240be449b04a954d61c3befe"
+          },
+          "partial": {
+            "graded": "079770465778c4a8039c5eb97271bd122dff6f693984971f034be50aad99d1df",
+            "oracle": "72c34527ea5ab50f33c9d2518cc61162cf84e2454e003c0f4126b2b22ea4dced",
+            "placebo": "51fd0139359a11f90a67cd4ef7e598db65d46125867a62b8be4058e7d9a39530"
+          },
+          "unprintable": {
+            "graded": "5282fcaa25cf008460093674b75e82a4524393f9866f2a590ecdfaac13770e8b",
+            "oracle": "72c34527ea5ab50f33c9d2518cc61162cf84e2454e003c0f4126b2b22ea4dced",
+            "placebo": "daa15537e731b77d802f252f62e3a229132488322210798641e9630f63c14cbc"
+          }
+        },
+        "identifiers": [
+          "F-35e7569b",
+          "F-a9c2fe00",
+          "F-57dcca64",
+          "F-6b390b7a",
+          "F-92f0c6c6",
+          "F-05c1fed3",
+          "F-cdb92536",
+          "F-36fc59c3",
+          "F-90a54bf7",
+          "F-9e406c55",
+          "F-3be18d28",
+          "F-4e176af0",
+          "F-cf9e4d15",
+          "F-c9d877a9",
+          "F-1efa597b",
+          "F-c246d412",
+          "F-4118c95a",
+          "F-7aed22eb",
+          "F-c372e301",
+          "F-8361c1c5",
+          "F-5d92986f",
+          "F-169ec2ff",
+          "F-7894ce1a",
+          "F-00014d5f"
+        ],
+        "key": [
+          "tumpotositet",
+          "stnesimbunn",
+          "sitedimt",
+          "sunitomedupp",
+          "mbumimsusep",
+          "memsepumebin",
+          "sibesdin",
+          "nismep",
+          "totsesomidet",
+          "snebit",
+          "pentototisep",
+          "sepipt",
+          "tusimpset",
+          "misepubt",
+          "sintedidot",
+          "sispubupepop",
+          "stebit",
+          "dsesidot",
+          "mepsemidimbut",
+          "ttmidetson",
+          "mesibumunupp",
+          "mbnisubsen",
+          "mbsesopip",
+          "setsibepumbup"
+        ],
+        "mask": [
+          5,
+          13
+        ],
+        "scores": {
+          "blank": 0.0,
+          "canonical": 1.0,
+          "duplicate": 1.0,
+          "malformed": 0.0,
+          "none": 0.0,
+          "partial": 0.5,
+          "unprintable": 0.5
+        },
+        "text_digest": "1dec96fe38e41bb3802a3c598033fb21c9c708dc1fc5655d86c20f3f786a299b"
+      },
+      "check_names": [
+        "law",
+        "materiality",
+        "copy",
+        "fixation",
+        "envelope",
+        "graded",
+        "placebo",
+        "neutral",
+        "oracle",
+        "lint",
+        "invariance",
+        "cascade",
+        "phone_lookup",
+        "analogy"
+      ],
+      "convention": {
+        "environment": "right_vowel",
+        "loss": "erase_a",
+        "reflex": "out_s",
+        "sequence": "replace_then_erase"
+      },
+      "copy_scores": {
+        "closure": 0.0,
+        "identity": 0.0,
+        "option_flip": 0.75,
+        "permutation": 0.0,
+        "relabel": 0.0
+      },
+      "instance_digest": "a02cd5c3960455000f51d1d73a891c18c5335e16c77e0843615ede230c45b506",
+      "leverage": {
+        "environment": 0.416667,
+        "loss": 1.0,
+        "reflex": 1.0,
+        "sequence": 0.25
+      },
+      "report_digest": "a90bd8694402bf4e5967d8007ef64d0f9e60a1acad0cf0a91128162322d171bf"
+    },
+    "1": {
+      "a": {
+        "cells": {
+          "blank": {
+            "graded": "1ab423343a49c7745fa4883a3b9a012bccd4162b42b3004ef33f08e209f3f6a4",
+            "oracle": "78696e9937bed1446dc0a3d5bc94f2af06990b106747b343e00df8946d7120b4",
+            "placebo": "883cc5369e921b7ecb196a600826a710366917eddad2b52833ff77689f9b6a39"
+          },
+          "canonical": {
+            "graded": "4b1d1d1292647880cccae5e0bbbcdad612149b6e75e0a9045e13b52c6b1f9fa1",
+            "oracle": "78696e9937bed1446dc0a3d5bc94f2af06990b106747b343e00df8946d7120b4",
+            "placebo": "3bfe6357416b34a93d114a6c9a9530fb9efe1f941b03b28cc0cdc78b861ad350"
+          },
+          "duplicate": {
+            "graded": "4b1d1d1292647880cccae5e0bbbcdad612149b6e75e0a9045e13b52c6b1f9fa1",
+            "oracle": "78696e9937bed1446dc0a3d5bc94f2af06990b106747b343e00df8946d7120b4",
+            "placebo": "3bfe6357416b34a93d114a6c9a9530fb9efe1f941b03b28cc0cdc78b861ad350"
+          },
+          "malformed": {
+            "graded": "9c0b2805ea5dfc4e02eb09fcdf34ec8d95b2aec4f04c6b8a240a7aba1e1b24e3",
+            "oracle": "78696e9937bed1446dc0a3d5bc94f2af06990b106747b343e00df8946d7120b4",
+            "placebo": "dfe4acd7d8f4fbd71055909ed886e62098da18443c2e3dae1cbf1827d22bb8d0"
+          },
+          "none": {
+            "graded": "9c0b2805ea5dfc4e02eb09fcdf34ec8d95b2aec4f04c6b8a240a7aba1e1b24e3",
+            "oracle": "78696e9937bed1446dc0a3d5bc94f2af06990b106747b343e00df8946d7120b4",
+            "placebo": "dfe4acd7d8f4fbd71055909ed886e62098da18443c2e3dae1cbf1827d22bb8d0"
+          },
+          "partial": {
+            "graded": "419b8214ccdec8e4996389aed0958128c0bd081a85293a706c286a7f099e7271",
+            "oracle": "78696e9937bed1446dc0a3d5bc94f2af06990b106747b343e00df8946d7120b4",
+            "placebo": "ccebe7c07b800da80cd597753d25650dc70b53d35dd6c2a65f194314230bcf08"
+          },
+          "unprintable": {
+            "graded": "9643bc55e2a4f919c7f726b409c314543dcf62da36d44f697f630507d5cf9bbf",
+            "oracle": "78696e9937bed1446dc0a3d5bc94f2af06990b106747b343e00df8946d7120b4",
+            "placebo": "ba8c7363f2e962b8f4323491448ff9e8a7a80f0c6c36e8a54c061f24c7409ef6"
+          }
+        },
+        "identifiers": [
+          "F-e1d7e832",
+          "F-83765241",
+          "F-a3201fad",
+          "F-b1877b69",
+          "F-fb697748",
+          "F-83bf1efc",
+          "F-7573902f",
+          "F-5724e524",
+          "F-8df36e7f",
+          "F-dc577e7b",
+          "F-cb21f325",
+          "F-96701f9e",
+          "F-49903aa2",
+          "F-ef1665a4",
+          "F-59820eff",
+          "F-b46939b3",
+          "F-9c2deb86",
+          "F-dafa1e2a",
+          "F-733ad1a9",
+          "F-c028ba5c",
+          "F-8d591277",
+          "F-0dd6f262",
+          "F-7c153ce1",
+          "F-24d0f462"
+        ],
+        "key": [
+          "nambikb",
+          "kmbixad",
+          "kibamoxitb",
+          "kikmbad",
+          "bmkaxid",
+          "naxibkib",
+          "nokdidam",
+          "kibnad",
+          "kabixonm",
+          "kambikmd",
+          "tdmkabpib",
+          "kidkam",
+          "kakmbib",
+          "kixunatm",
+          "mipakb",
+          "pabkadixapib",
+          "kidnam",
+          "dikkab",
+          "kabipukb",
+          "tupinbaxamid",
+          "kabdimom",
+          "kixapb",
+          "bibanmbukm",
+          "kamkid"
+        ],
+        "mask": [
+          4,
+          18
+        ],
+        "scores": {
+          "blank": 0.0,
+          "canonical": 1.0,
+          "duplicate": 1.0,
+          "malformed": 0.0,
+          "none": 0.0,
+          "partial": 0.5,
+          "unprintable": 0.5
+        },
+        "text_digest": "22705d7e2d22bc1314be53c8e05d967aa81e906971db5da9d9a468d4c9a3005d"
+      },
+      "b": {
+        "cells": {
+          "blank": {
+            "graded": "8eff69cce83911c79384b766f16f06a7eed88c4f30288ff2e88c06896fdace78",
+            "oracle": "8d2c0576636ea428997977b0c70a3830305035136dd3d696183e814a814a6d1d",
+            "placebo": "de4203a1f7f6121a2d6b69253a590fe1762da239722a6f0228de96e3efad9dc4"
+          },
+          "canonical": {
+            "graded": "da197a31ba6fab8c7f320e91e70824155c630042e1de8b0f8779e96dc00d52b0",
+            "oracle": "8d2c0576636ea428997977b0c70a3830305035136dd3d696183e814a814a6d1d",
+            "placebo": "f995aba59f339f063e0fb527ab9905692c4ff45179cb4dc3cc7787a6f54375cc"
+          },
+          "duplicate": {
+            "graded": "da197a31ba6fab8c7f320e91e70824155c630042e1de8b0f8779e96dc00d52b0",
+            "oracle": "8d2c0576636ea428997977b0c70a3830305035136dd3d696183e814a814a6d1d",
+            "placebo": "f995aba59f339f063e0fb527ab9905692c4ff45179cb4dc3cc7787a6f54375cc"
+          },
+          "malformed": {
+            "graded": "cd4a01f81798ab8f75868936a95861546b1296639aaccffb11495a9cd99dbe42",
+            "oracle": "8d2c0576636ea428997977b0c70a3830305035136dd3d696183e814a814a6d1d",
+            "placebo": "4044f1595a1a4ec3578a7606a3d3b5a58c922aca72a04184bc7c9c8f07d11380"
+          },
+          "none": {
+            "graded": "cd4a01f81798ab8f75868936a95861546b1296639aaccffb11495a9cd99dbe42",
+            "oracle": "8d2c0576636ea428997977b0c70a3830305035136dd3d696183e814a814a6d1d",
+            "placebo": "4044f1595a1a4ec3578a7606a3d3b5a58c922aca72a04184bc7c9c8f07d11380"
+          },
+          "partial": {
+            "graded": "1ce8875256df87a4fb2b2b60455da3e50c933016930c3a6b72df638357b28eb4",
+            "oracle": "8d2c0576636ea428997977b0c70a3830305035136dd3d696183e814a814a6d1d",
+            "placebo": "fe5d34da0520cd6a8f3375751d7ee2f77bc694263b079a8b6a38416f2b8c0ce8"
+          },
+          "unprintable": {
+            "graded": "316ea5cb08324a7a4d8798930b673c2838158ff03dc60e76c1591eed17d9e668",
+            "oracle": "8d2c0576636ea428997977b0c70a3830305035136dd3d696183e814a814a6d1d",
+            "placebo": "9e11faac71584a6ca4ba3c0c92400ef335417d0ed90b2d921b37785cbc1d1c29"
+          }
+        },
+        "identifiers": [
+          "F-dd36bae2",
+          "F-ab79adc3",
+          "F-6307a5c0",
+          "F-df8f0f56",
+          "F-a1a6f2d5",
+          "F-12cece2b",
+          "F-da185c63",
+          "F-931577c2",
+          "F-7a0701f4",
+          "F-667a352a",
+          "F-99cd7172",
+          "F-3ffda70d",
+          "F-99ed6118",
+          "F-91e58efd",
+          "F-a1956eef",
+          "F-46a84516",
+          "F-7c5745a9",
+          "F-1409636b",
+          "F-2b33839f",
+          "F-f2223c0d",
+          "F-546413cd",
+          "F-bbfbb488",
+          "F-f09a283c",
+          "F-00261d83"
+        ],
+        "key": [
+          "bipkubakpup",
+          "dopabupikkit",
+          "napkinot",
+          "mubanimkin",
+          "bkinatimbut",
+          "mbuximibantip",
+          "takbbombimap",
+          "dibuxatt",
+          "naximbkon",
+          "mimbkan",
+          "kixadn",
+          "kadidant",
+          "kimamkat",
+          "madibinipkut",
+          "ktopitan",
+          "kidkomadidan",
+          "daxibnodup",
+          "kixiputamidt",
+          "kidoxamopp",
+          "kapudiktp",
+          "bkixan",
+          "kabidmbun",
+          "katinobt",
+          "pokkibadn"
+        ],
+        "mask": [
+          11,
+          21
+        ],
+        "scores": {
+          "blank": 0.0,
+          "canonical": 1.0,
+          "duplicate": 1.0,
+          "malformed": 0.0,
+          "none": 0.0,
+          "partial": 0.5,
+          "unprintable": 0.5
+        },
+        "text_digest": "fe2482a5d730dc90bb16147384939e2d234e7b1541e9aca3ba24491929cfe83c"
+      },
+      "check_names": [
+        "law",
+        "materiality",
+        "copy",
+        "fixation",
+        "envelope",
+        "graded",
+        "placebo",
+        "neutral",
+        "oracle",
+        "lint",
+        "invariance",
+        "cascade",
+        "phone_lookup",
+        "analogy"
+      ],
+      "convention": {
+        "environment": "vowel_pair",
+        "loss": "erase_e",
+        "reflex": "out_x",
+        "sequence": "erase_then_replace"
+      },
+      "copy_scores": {
+        "closure": 0.0,
+        "identity": 0.0,
+        "option_flip": 0.666667,
+        "permutation": 0.0,
+        "relabel": 0.0
+      },
+      "instance_digest": "1a604ffb9fb07348809d96ff738deb077d89e9159c14dc609198f9c2039701f5",
+      "leverage": {
+        "environment": 0.791667,
+        "loss": 1.0,
+        "reflex": 0.333333,
+        "sequence": 0.583333
+      },
+      "report_digest": "8d7ae7d5906b31360858624e7d7a7b4c3900f5b964d663a403a9daaf086901ff"
+    }
+  }
+}
