@@ -51,6 +51,7 @@ from shogym.envs.receipts.receipt_ast import (
     serialize,
     slot_ranges,
 )
+from shogym.envs.receipts.render import feedback_for
 from shogym.envs.receipts.review import required_coverage
 from shogym.envs.receipts.streams import digest
 
@@ -118,6 +119,7 @@ def _retasked(task: Task, convention: Mapping[str, str]) -> Task:
         table=task.table,
         text=task.text,
         key=tuple(retail.key_for(task.table, convention)),
+        mask=task.mask,
     )
 
 
@@ -470,7 +472,10 @@ def export(bank: Bank, population: Population, directory: str | Path) -> Path:
         for kind in (GRADED, PLACEBO):
             _write(root, f"{RENDERS}/receipt-{label}-{kind}.txt", cells[kind])
         canonical = generator.parse_and_canonicalize(first.a, raw)
-        ast = generator.render_receipt(first.a, canonical, first.a.key)
+        ast = generator.render_receipt(
+            first.a, canonical, first.a.key,
+            feedback_for(generator, first.a, envelope),
+        )
         ranges = slot_ranges(ast, envelope)
         comparisons.append(
             {
