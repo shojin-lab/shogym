@@ -39,7 +39,8 @@ from __future__ import annotations
 
 import itertools
 import json
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
+from math import comb
 from typing import Any, Mapping, Sequence
 
 import numpy as np
@@ -72,13 +73,20 @@ from shogym.envs.receipts.generators.retail_refund import (
     RetailTable,
 )
 from shogym.envs.receipts.observe import observe
-from shogym.envs.receipts.protocol import Instance, Task
+from shogym.envs.receipts.protocol import FULL_RECEIPT, Instance, Task, policy_of
 from shogym.envs.receipts.receipt_ast import (
     GAP,
     ORDINAL_WIDTH,
     frozen_envelope,
     row_lines,
     serialize,
+)
+from shogym.envs.receipts.receipt_law import (
+    REGISTERED_MAX_IDEAL,
+    REGISTERED_MIN_DISTINGUISHING,
+    REGISTERED_MIN_IDEAL,
+    REGISTERED_MIN_LAW_ROOM,
+    law_for,
 )
 from shogym.envs.receipts.render import feedback_for
 
@@ -104,6 +112,9 @@ MAX_BIJECTION_COPY = 0.50
 #: here rather than only under the drawn convention.
 MAX_FLIP = 0.875
 MIN_LEVERAGE = 0.10
+
+#: What counts as equal when a registered bar is read against a floating-point mean.
+TOLERANCE = 1e-9
 
 #: The printed field bounds the schedule promises. Each is a maximum printed size in
 #: ASCII bytes, and each is what a width in the receipt or a column in the body was
@@ -845,6 +856,69 @@ def _read_back(generator, instance: Instance, side: str) -> str:
     return ""
 
 
+def _reporting_every_case(generator, instance: Instance):
+    """The same family and the same pair, with the receipt reporting every case.
+
+    SOME OF WHAT THESE CHECKS ASK IS ABOUT THE ROW RECIPE AND NOT ABOUT A DRAW. That
+    the 27 conventions serialize to 27 different receipts, that the receipt resolves
+    three blocks on every axis, that no case is evident and that the ceiling and the
+    lookup floor are 1 and 7/12 or 11/18 are facts about six cases of each of four
+    public kinds. Under a policy that reports four cases of twenty four every one of
+    them is also a fact about which four a committed stream happened to draw, and
+    several are deliberately false on masks the policy can draw: a mask that drew four
+    cases of one kind resolves fewer blocks and aliases conventions, and it is not
+    redrawn. The recipe is what those checks are for, so they are asked of the receipt
+    that reports every case, and what the served receipt leaves is asked of the
+    registered mask law beside them.
+
+    It returns the family and the pair unchanged where the family already reports every
+    row, so nothing about a full-policy family passes through a second object.
+    """
+    if not policy_of(generator).samples:
+        return generator, instance
+
+    class EveryCase(type(generator)):
+        RECEIPT_POLICY = FULL_RECEIPT
+
+    whole = tuple(range(len(instance.a.table.rows)))
+    return EveryCase(), replace(
+        instance,
+        a=replace(instance.a, mask=whole),
+        b=replace(instance.b, mask=whole),
+    )
+
+
+def support_distinction(cases: Sequence[Sequence[Mapping[str, Any]]], q: int) -> float:
+    """The smallest chance a receipt of q cases speaks to a single-axis alternative.
+
+    Over EVERY convention and every one-option change to it, not only the one that was
+    drawn: two conventions that disagree on d of the printed cases are told apart
+    exactly when the mask drew one of those cases, which is `1 - C(24-d, q)/C(24, q)`.
+    The keys come from this module's own selector reading the printed body, so the
+    number is not the production law's arithmetic restated.
+    """
+    keys = {
+        tuple(sorted(convention.items())): audit_key(cases, convention)
+        for convention in ALL_CONVENTIONS
+    }
+    rows = ROWS
+    worst = 1.0
+    for convention in ALL_CONVENTIONS:
+        here = keys[tuple(sorted(convention.items()))]
+        for axis in AXES:
+            for option in axis.options:
+                if option == convention[axis.name]:
+                    continue
+                other = dict(convention)
+                other[axis.name] = option
+                there = keys[tuple(sorted(other.items()))]
+                moved = sum(1 for x, y in zip(here, there) if x != y)
+                worst = min(
+                    worst, 1.0 - comb(rows - moved, q) / comb(rows, q)
+                )
+    return worst
+
+
 def check_retail_surface(generator, instance: Instance, master: bytes) -> CheckResult:
     """The printed schedule, read back and answered by a second implementation.
 
@@ -856,6 +930,13 @@ def check_retail_surface(generator, instance: Instance, master: bytes) -> CheckR
     side, if two destinations inside one case normalize alike, if two conventions
     share a complete key, or if a case id or a correct code changes under serialize
     and read back.
+
+    THE READ BACK IS ASKED TWICE UNDER A POLICY THAT SAMPLES. The receipt that is
+    served prints a correction on the four cases the mask drew and this instance's
+    committed neutral tokens on the other twenty, so reading it back confirms what a
+    reader is handed and leaves twenty corrections unprinted. The geometry this check
+    exists for is about all twenty four, so the same read back is asked of a receipt
+    that reports every case as well. Nothing is loosened: both still refuse.
     """
     lines: list[str] = []
     for side, label in (("a", "A"), ("b", "B")):
@@ -893,10 +974,12 @@ def check_retail_surface(generator, instance: Instance, master: bytes) -> CheckR
                 len({audit_key(instruments, c) for c in ALL_CONVENTIONS}),
             )
         )
-    for side in ("a", "b"):
-        wrong = _read_back(generator, instance, side)
-        if wrong:
-            return CheckResult("retail_surface", False, wrong)
+    every_case, whole_pair = _reporting_every_case(generator, instance)
+    for family, pair in ((generator, instance), (every_case, whole_pair)):
+        for side in ("a", "b"):
+            wrong = _read_back(family, pair, side)
+            if wrong:
+                return CheckResult("retail_surface", False, wrong)
     a_cases = parsed_cases(instance.a.table)
     b_cases = parsed_cases(instance.b.table)
     wide = max(
@@ -922,6 +1005,16 @@ def check_retail_support(generator, instance: Instance, master: bytes) -> CheckR
     happened to draw. This says the same thing under all 27, so the pass predicate
     does not depend on which convention was sampled and admission cannot correlate
     the public surface with the live option.
+
+    THE RECEIPT-SHAPED HALF IS ASKED OF THE RECEIPT THAT REPORTS EVERY CASE, and what
+    the served receipt leaves is asked of the registered mask law beside it. Which
+    four cases a stream drew is not what a recipe check is about, and the gate's
+    blocks, its evident cases and its ceiling and floor are deliberately false on
+    masks this policy can draw: a mask that drew four cases of one public kind
+    resolves fewer blocks and aliases conventions, and it is not redrawn. So they are
+    computed on the full receipt, which is a fact about six cases of each of four
+    kinds, and the law beside them is the same recipe's statement about what is
+    served.
     """
     from shogym.envs.receipts.admission import Thresholds
     from shogym.receipts import gate
@@ -929,10 +1022,13 @@ def check_retail_support(generator, instance: Instance, master: bytes) -> CheckR
     bars = Thresholds()
     worst_headroom = 1.0
     fewest_blocks = len(ALL_CONVENTIONS)
+    every_case, whole_pair = _reporting_every_case(generator, instance)
+    samples = policy_of(generator).samples
     for convention in ALL_CONVENTIONS:
         retasked = _retasked(instance, generator, convention)
+        recipe = _retasked(whole_pair, every_case, convention)
         result = gate(
-            observe(generator, retasked, "a"),
+            observe(every_case, recipe, "a"),
             min_arity=bars.min_arity,
             min_blocks=bars.min_blocks,
             min_headroom=bars.min_headroom,
@@ -945,10 +1041,17 @@ def check_retail_support(generator, instance: Instance, master: bytes) -> CheckR
             )
         worst_headroom = min(worst_headroom, result.ceiling - result.floor)
         for named in (
-            check_exercise(generator, retasked),
+            check_exercise(every_case, recipe),
             check_materiality(generator, retasked, bars.min_material_rows),
+            # THE COPY BAR IS A FULL-KEY TRANSFER STRESS TEST and says so in its own
+            # words, so it is asked here of the receipt that reports every case. The
+            # two numbers it bars are computed from the answer keys and are the same
+            # either way; what asking it of the served receipt would add is the reduced
+            # transfer diagnostic, recomputed at all 27 conventions, which is a
+            # reported number and never a bar. The shared copy check reports it once,
+            # at the convention that was drawn.
             check_copy(
-                generator, retasked, bars.max_copy_score, bars.max_flip_score,
+                every_case, recipe, bars.max_copy_score, bars.max_flip_score,
                 bars.min_leverage,
             ),
         ):
@@ -982,11 +1085,50 @@ def check_retail_support(generator, instance: Instance, master: bytes) -> CheckR
         detail.append(
             "%s movement %s" % (label, ", ".join(f"{a} {n}" for a, n in sorted(moved.items())))
         )
+    law_line = ""
+    if samples:
+        # AND WHAT THE SERVED RECEIPT LEAVES, on the same recipe. The row recipe fixes
+        # these in the reported count alone: the ideal level and the lookup floor are
+        # averaged over every reference convention, so they are one pair of numbers for
+        # the pair of schedules rather than one per draw, and the weakest distinction
+        # is minimized over the whole support by this module's own selector rather than
+        # taken at the convention that happened to be drawn.
+        policy = policy_of(generator)
+        law = law_for(generator, instance, "a")
+        weakest = support_distinction(
+            [case.instruments for case in parsed_cases(instance.a.table)],
+            policy.reported,
+        )
+        for name, got, low, high in (
+            ("ideal graded level", law.ideal, REGISTERED_MIN_IDEAL, REGISTERED_MAX_IDEAL),
+            ("room over the lookup floor", law.room, REGISTERED_MIN_LAW_ROOM, 1.0),
+            (
+                "weakest single-axis distinction over the support",
+                weakest, REGISTERED_MIN_DISTINGUISHING, 1.0,
+            ),
+        ):
+            if not low - TOLERANCE <= got <= high + TOLERANCE:
+                return CheckResult(
+                    "retail_support", False,
+                    "the registered mask law's %s is %.6f and the law-level bars are "
+                    "%.4f to %.4f" % (name, got, low, high),
+                )
+        law_line = (
+            "; over the %d masks %d of %d cases can draw, ideal %.6f, lookup floor "
+            "%.6f, room %.6f, weakest distinction over the support %.6f"
+            % (
+                law.masks, policy.reported, policy.rows, law.ideal, law.floor,
+                law.room, weakest,
+            )
+        )
     return CheckResult(
         "retail_support", True,
-        "every one of the %d conventions passes the registered gates and checks; "
-        "worst headroom %.6f, fewest blocks %d; %s"
-        % (len(ALL_CONVENTIONS), worst_headroom, fewest_blocks, "; ".join(detail)),
+        "every one of the %d conventions passes the registered gates and checks on a "
+        "receipt reporting every case; worst headroom %.6f, fewest blocks %d; %s%s"
+        % (
+            len(ALL_CONVENTIONS), worst_headroom, fewest_blocks, "; ".join(detail),
+            law_line,
+        ),
     )
 
 
@@ -1157,6 +1299,7 @@ __all__ = [
     "selector_of",
     "shipped_copy_maximum",
     "side_refusal",
+    "support_distinction",
     "support_flip_and_leverage",
     "support_keys",
 ]
