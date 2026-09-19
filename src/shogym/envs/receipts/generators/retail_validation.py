@@ -80,6 +80,7 @@ from shogym.envs.receipts.receipt_ast import (
     row_lines,
     serialize,
 )
+from shogym.envs.receipts.render import feedback_for
 
 # ----- the registered bars this module reads ---------------------------------
 #
@@ -797,6 +798,7 @@ def _retasked(instance: Instance, generator, convention: Mapping[str, str]) -> I
             label=task.label, task_id=task.task_id, surface=task.surface,
             table=task.table, text=task.text,
             key=tuple(generator.key_for(task.table, convention)),
+            mask=task.mask,
         )
     return Instance(
         generator=instance.generator, genre=instance.genre, ordinal=instance.ordinal,
@@ -819,7 +821,9 @@ def _read_back(generator, instance: Instance, side: str) -> str:
         "%s," % identifier for identifier in generator.row_identifiers(task.table)
     )
     canonical = generator.parse_and_canonicalize(task, raw)
-    ast = generator.render_receipt(task, canonical, task.key)
+    ast = generator.render_receipt(
+        task, canonical, task.key, feedback_for(generator, task, envelope)
+    )
     payload = serialize(ast, envelope)
     identifier_start = len(GAP) + ORDINAL_WIDTH + len(GAP)
     identifier_end = identifier_start + envelope.identifier_width

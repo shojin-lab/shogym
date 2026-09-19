@@ -41,7 +41,7 @@ from shogym.envs.receipts.receipt_ast import (
     serialize,
     slot_ranges,
 )
-from shogym.envs.receipts.render import judge_cells
+from shogym.envs.receipts.render import feedback_for, judge_cells
 from shogym.receipts import ROW_LABEL, gate
 
 GENERATOR = retail.GENERATOR
@@ -57,6 +57,7 @@ def _with_a_table(instance: Instance, table: retail.RetailTable) -> Instance:
         a=Task(
             label=task.label, task_id=task.task_id, surface=task.surface, table=table,
             text=task.text, key=tuple(GENERATOR.key_for(table, instance.convention)),
+            mask=task.mask,
         ),
         b=instance.b, envelope=instance.envelope,
     )
@@ -706,7 +707,7 @@ def test_every_cell_is_congruent_under_every_filing_class_and_every_draw(
                 truth = tuple(GENERATOR.key_for(task.table, convention))
                 retasked = Task(
                     label=task.label, task_id=task.task_id, surface=task.surface,
-                    table=task.table, text=task.text, key=truth,
+                    table=task.table, text=task.text, key=truth, mask=task.mask,
                 )
                 canonical = GENERATOR.parse_and_canonicalize(retasked, raw)
                 judged = judge_cells(
@@ -834,7 +835,7 @@ def test_the_whole_schedule_is_committed_and_a_changed_binding_moves_the_digest(
             convention=drawn.convention,
             a=Task(
                 label=drawn.a.label, task_id=drawn.a.task_id, surface=drawn.a.surface,
-                table=table, text=drawn.a.text, key=drawn.a.key,
+                table=table, text=drawn.a.text, key=drawn.a.key, mask=drawn.a.mask,
             ),
             b=drawn.b, envelope=drawn.envelope,
         )
@@ -1104,12 +1105,16 @@ def _payload(instance: Instance, side: str, convention: Mapping[str, str]) -> by
         label=task.label, task_id=task.task_id, surface=task.surface,
         table=task.table, text=task.text,
         key=tuple(GENERATOR.key_for(task.table, convention)),
+        mask=task.mask,
     )
     canonical = GENERATOR.parse_and_canonicalize(
         retasked, checks.filing_of(GENERATOR, instance, side, "canonical")
     )
-    ast = GENERATOR.render_receipt(retasked, canonical, retasked.key)
-    return serialize(ast, frozen_envelope(instance.envelope))
+    envelope = frozen_envelope(instance.envelope)
+    ast = GENERATOR.render_receipt(
+        retasked, canonical, retasked.key, feedback_for(GENERATOR, retasked, envelope)
+    )
+    return serialize(ast, envelope)
 
 
 def test_the_receipt_prints_no_neutral_token_that_reads_as_a_grade(drawn: Instance) -> None:
@@ -1349,6 +1354,7 @@ def test_support_wide_admission_does_not_depend_on_the_convention_sampled(
                 label="B", task_id=drawn.b.task_id, surface=surface.name,
                 table=crafted, text=drawn.b.text,
                 key=tuple(GENERATOR.key_for(crafted, convention)),
+                mask=drawn.b.mask,
             ),
             envelope=drawn.envelope,
         )
@@ -1365,24 +1371,28 @@ def test_support_wide_admission_does_not_depend_on_the_convention_sampled(
     assert len({result.detail for result in verdicts.values()}) == 1
 
 
-def test_adding_this_genre_changed_nothing_ledger_or_soundchange_does() -> None:
-    """The two families already on the roster, frozen at the base of this branch.
+def test_adding_this_genre_changed_nothing_the_other_three_do() -> None:
+    """The three families already on the roster, frozen at the base of this branch.
 
     It fails if the drawn convention, the committed instance digest, the whole
     admission verdict digest, the list of checks run, the copy maxima, the axis
-    leverage, either task text, either answer key, or any of the three cells under any
-    of the seven registered filing classes moves on either family. The fixture was
-    generated from the unmodified checkout this branch starts from.
+    leverage, either task text, either answer key, either committed row mask, or any
+    of the three cells under any of the seven registered filing classes moves on any
+    of them. The fixture was generated from the unmodified checkout this branch starts
+    from, and regenerating it here reproduces it byte for byte.
     """
     from shogym.envs.receipts import admission, streams
-    from shogym.envs.receipts.generators import ledger, soundchange
+    from shogym.envs.receipts.generators import components, ledger, soundchange
 
     fixture = json.loads(
         (Path(__file__).resolve().parents[1] / "_fixtures"
          / "receipts_before_retail.json").read_text(encoding="utf-8")
     )
+    assert sorted(fixture) == ["components", "ledger", "soundchange"]
     for name, generator in (
-        ("ledger", ledger.GENERATOR), ("soundchange", soundchange.GENERATOR)
+        ("ledger", ledger.GENERATOR),
+        ("soundchange", soundchange.GENERATOR),
+        ("components", components.GENERATOR),
     ):
         for ordinal, expected in sorted(fixture[name].items()):
             instance = protocol.draw(generator, MASTER, int(ordinal))
@@ -1414,6 +1424,7 @@ def test_adding_this_genre_changed_nothing_ledger_or_soundchange_does() -> None:
                     "text_digest"
                 ]
                 assert list(task.key) == expected[side]["key"]
+                assert list(task.mask) == expected[side]["mask"]
                 assert list(generator.row_identifiers(task.table)) == expected[side][
                     "identifiers"
                 ]
@@ -1455,8 +1466,8 @@ def test_the_genre_is_registered_and_both_of_its_modules_are_in_the_code_pin() -
     assert module_path("retail_refund").name == "retail_refund.py"
 
     # Registered under the labels already on the branch, not under new ones.
-    assert admission.GATE_VERSION == "receipts-gates-v3"
-    assert bank_mod.RENDERER_CONFIGURATION == "receipts-render-v2"
+    assert admission.GATE_VERSION == "receipts-gates-v4"
+    assert bank_mod.RENDERER_CONFIGURATION == "receipts-render-v3"
 
     pinned = bank_mod.pinned_modules(loaded)
     assert "shogym.envs.receipts.generators.retail_refund" in pinned
@@ -1478,9 +1489,13 @@ def test_the_shipped_commands_materialize_gate_check_and_draw_this_genre(
     both task texts and three cells of the registered envelope size.
     """
     from shogym.cli import main
-    from shogym.envs.receipts.registry import BANK_DIR_VAR
+    from shogym.envs.receipts.registry import BANK_DIR_VAR, HISTORY_VAR
 
     monkeypatch.setenv(BANK_DIR_VAR, str(tmp_path / "banks"))
+    # THE KEY HISTORY OUTLIVES THE EVIDENCE DIRECTORY, so redirecting the banks alone
+    # leaves this command appending to the record of every attempt this machine has
+    # made, and a second run of the suite is then refused as a repeat attempt.
+    monkeypatch.setenv(HISTORY_VAR, str(tmp_path / "key-history.jsonl"))
 
     def run(argv: list[str]) -> int:
         try:
@@ -1492,7 +1507,7 @@ def test_the_shipped_commands_materialize_gate_check_and_draw_this_genre(
     assert run(["receipts", "materialize", "retail_refund", "--size", "2"]) == 0
     made = capsys.readouterr().out
     assert "materialized 2 instances" in made
-    assert "receipts-gates-v3" in made
+    assert "receipts-gates-v4" in made
     assert run(["receipts", "gate", "retail_refund", "--instances", "2"]) == 0
     assert "0 of 2 instances rejected" in capsys.readouterr().out
     assert run(["receipts", "check", "retail_refund", "--instances", "2"]) == 0
@@ -1521,10 +1536,11 @@ def _screen_artifact(pairs: int = 40) -> dict:
         "task_seeds": [str(i) for i in range(pairs)],
         "pairs": [
             {"instance": f"task-{i:02d}", "filing": f"filing-{i:02d}",
-             "placebo": 0.3, "graded": 0.7, "oracle": 0.95}
+             "placebo": 0.3, "graded": 0.7, "oracle": 0.95, "ideal": 0.85}
             for i in range(pairs)
         ],
         "min_room": 0.05, "min_ratio": 0.25, "min_pairs": 36,
+        "min_oracle": 0.90, "min_learning_gap": 0.10,
         "floor": 0.0, "floor_rule": "drop",
         "candidates_screened": 1, "selection_note": "",
     }
