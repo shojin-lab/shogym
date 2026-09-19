@@ -1051,8 +1051,14 @@ def genre_checks(
         for name, run in components_audit.CHECKS
     ]
 
-#: The eleven every family runs, named so the optional extension below can refuse a
-#: declared name that would shadow one of them.
+#: The eleven every family runs, in the order `run_checks` plans them, named so a reader
+#: can say what a family's own list adds to.
+#:
+#: THE FIRST NAME IS THE RECEIPT'S OWN AND MOVES WITH THE DECLARED POLICY. A family that
+#: reports every row answers the exercise question; one that reports some runs `law` in
+#: its place, and the name here is the full-receipt one. Nothing dispatches on this
+#: tuple: the extension below refuses a shadowing name against the checks actually
+#: planned, so a family that declared `law` is refused wherever `law` is what ran.
 STANDARD_CHECKS = (
     "exercise", "materiality", "copy", "fixation", "envelope", "graded", "placebo",
     "neutral", "oracle", "lint", "invariance",

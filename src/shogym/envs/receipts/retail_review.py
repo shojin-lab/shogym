@@ -402,6 +402,373 @@ def _first_with_surface(population: Population, name: str) -> tuple[Instance, st
     raise ValueError(f"no admitted instance in this bank draws the surface {name!r}")
 
 
+# --------------------------------------------------------------------------
+# what a reader of a receipt that reports four cases of twenty four has to see
+# --------------------------------------------------------------------------
+
+
+def _position(convention: Mapping[str, str]) -> int:
+    """Which of the 27 registered conventions this one is."""
+    wanted = {axis.name: convention[axis.name] for axis in retail.AXES}
+    for place, candidate in enumerate(retail.ALL_CONVENTIONS):
+        if candidate == wanted:
+            return place
+    raise ValueError("this convention is not one of the 27 the sampler draws")
+
+
+def _support(task: Task) -> list[tuple[str, ...]]:
+    """This side's answer key under every convention, in the registered order."""
+    return [
+        tuple(retail.key_for(task.table, convention))
+        for convention in retail.ALL_CONVENTIONS
+    ]
+
+
+def _posterior(instance: Instance, side: str) -> list[int]:
+    """The conventions a reader of this side's reduced receipt cannot tell apart.
+
+    A reported case says whether the filed code was that convention's answer and, when
+    it was not, what that answer is, so two conventions print the same reported case
+    exactly when their codes on it agree. The set is a fact about the mask and the two
+    schedules and not about what was filed, which is why one filing's pack can show it.
+    """
+    task = instance.side(side)
+    keys = _support(task)
+    drawn = keys[_position(instance.convention)]
+    return [
+        n for n, key in enumerate(keys)
+        if all(key[row] == drawn[row] for row in task.mask)
+    ]
+
+
+def _witnessed(instance: Instance, side: str) -> set[str]:
+    """The axes some reported case disagrees with a one-option alternative on.
+
+    The same event the law-level gate averages over, taken on the mask that was drawn.
+    An axis with no such case is an axis this receipt says nothing about, and a mask
+    that drew four cases of one public kind is not redrawn for it.
+    """
+    task = instance.side(side)
+    keys = _support(task)
+    here = instance.convention
+    drawn = keys[_position(here)]
+    out: set[str] = set()
+    for axis in retail.AXES:
+        for option in axis.options:
+            if option == here[axis.name]:
+                continue
+            other = dict(here)
+            other[axis.name] = option
+            key = keys[_position(other)]
+            if any(drawn[row] != key[row] for row in task.mask):
+                out.add(axis.name)
+    return out
+
+
+def _ambiguous(instance: Instance, side: str) -> bool:
+    """Whether this receipt leaves conventions that answer the sibling differently."""
+    members = _posterior(instance, side)
+    if len(members) < 2:
+        return False
+    sibling = _support(instance.side("b" if side == "a" else "a"))
+    return len({sibling[n] for n in members}) > 1
+
+
+def _aliased_pair(instance: Instance, side: str, members: Sequence[int]) -> tuple[int, int]:
+    """Two conventions this receipt cannot tell apart whose sibling keys differ."""
+    sibling = _support(instance.side("b" if side == "a" else "a"))
+    for one in members:
+        for other in members:
+            if one < other and sibling[one] != sibling[other]:
+                return (one, other)
+    raise ValueError("this receipt leaves no pair with different held-out keys")
+
+
+def _held_out_cost(instance: Instance, side: str) -> tuple[int, int]:
+    """How many cases of the sibling the surviving conventions do not agree on."""
+    members = _posterior(instance, side)
+    sibling = _support(instance.side("b" if side == "a" else "a"))
+    rows = len(sibling[0])
+    return (
+        sum(1 for row in range(rows) if len({sibling[n][row] for n in members}) > 1),
+        rows,
+    )
+
+
+def _spelled(position: int) -> str:
+    """One convention as a reader of the pack reads it."""
+    convention = retail.ALL_CONVENTIONS[position]
+    return ", ".join(
+        "%s=%s" % (axis.name, convention[axis.name]) for axis in retail.AXES
+    )
+
+
+def _wrong_code(task: Task, position: int) -> str:
+    """A code printed in that case which is not that case's answer under the draw."""
+    correct = task.key[position]
+    case = task.table.rows[position]
+    return next(
+        (i.code for i in case.instruments if i.code != correct), correct
+    )
+
+
+def _filing_over(task: Task, values: Sequence[str | None]) -> str:
+    """A filing over this task's printed cases, with None for a case left out."""
+    return "\n".join(
+        "%s,%s" % (identifier, value)
+        for identifier, value in zip(
+            retail.GENERATOR.row_identifiers(task.table), values
+        )
+        if value is not None
+    )
+
+
+def _found(population: Population, holds) -> tuple[Instance, str] | None:
+    """The earliest admitted instance and side the condition holds on."""
+    for instance in population.instances:
+        for side in ("a", "b"):
+            if holds(instance, side):
+                return (instance, side)
+    return None
+
+
+def _document(root: Path, name: str, head: Sequence[str], payload: bytes) -> str:
+    """One assembled document: what a reader is being shown, then the cell itself."""
+    return _write(
+        root, f"{RENDERS}/{name}.txt",
+        "\n".join(head) + "\n\n" + payload.decode("ascii"),
+    )
+
+
+def _sampled_renders(population: Population, root: Path) -> list[Render]:
+    """What a reader of a receipt reporting four cases of twenty four has to see.
+
+    NONE OF IT IS VISIBLE IN THE COVERAGE THE OTHER CATEGORIES ENUMERATE. A surface, an
+    option, a filing class and a row count are all satisfied by a cell that reports
+    every case, so a pack built from those alone would put a reader in front of nothing
+    this policy does. These are the eleven the shared coverage asks a sampled family
+    for, in this genre's own cases.
+
+    THE FIRST FIVE ARE BUILT, NOT SEARCHED FOR. Which cases a filing gets right is the
+    exporter's to choose, so they are made on the first admitted instance by filing
+    against its own committed mask. THE REST ARE FACTS ABOUT THE DRAW. Whether a mask
+    witnesses every axis, and whether what it leaves is one convention or several, are
+    properties of the four cases the stream drew, and a mask that leaves an axis
+    unwitnessed is not redrawn. A bank too small to exhibit one of those is refused
+    here rather than exported with the case missing.
+    """
+    generator = retail.GENERATOR
+    if not generator.RECEIPT_POLICY.samples:
+        return []
+    from shogym.envs.receipts.review import SAMPLED_CASES
+
+    out: list[Render] = []
+    first = population.instances[0]
+    task = first.a
+    key = list(task.key)
+    mask = list(task.mask)
+
+    def built(name: str, case: str, values: Sequence[str | None]) -> None:
+        payload = _cells(
+            first, task, dict(first.convention), _filing_over(task, values)
+        )[GRADED]
+        out.append(
+            Render("sampled", case, "cell", _write(root, f"{RENDERS}/{name}.txt", payload))
+        )
+
+    built("sampled-passed", SAMPLED_CASES[0], key)
+    built(
+        "sampled-failed", SAMPLED_CASES[1],
+        [_wrong_code(task, p) if p in mask else v for p, v in enumerate(key)],
+    )
+    built(
+        "sampled-unfiled", SAMPLED_CASES[2],
+        [None if p in mask else v for p, v in enumerate(key)],
+    )
+    built(
+        "sampled-empty", SAMPLED_CASES[3],
+        ["" if p in mask else v for p, v in enumerate(key)],
+    )
+    wrong_elsewhere = [
+        v if p in mask else _wrong_code(task, p) for p, v in enumerate(key)
+    ]
+    out.append(
+        Render(
+            "sampled", SAMPLED_CASES[4], "document",
+            _document(
+                root, "sampled-suppressed",
+                (
+                    "instance %s/%d/%s" % (first.generator, first.ordinal, task.label),
+                    "reported cases %s" % ", ".join(str(r + 1) for r in mask),
+                    "cases filed with a destination the drawn convention does not "
+                    "select: %s"
+                    % ", ".join(str(p + 1) for p in range(len(key)) if p not in mask),
+                    "every one of them failed and the cell below says nothing about "
+                    "any of them",
+                ),
+                _cells(
+                    first, task, dict(first.convention),
+                    _filing_over(task, wrong_elsewhere),
+                )[GRADED],
+            ),
+        )
+    )
+
+    axes = {axis.name for axis in retail.AXES}
+    whole = _found(population, lambda i, s: _witnessed(i, s) == axes)
+    if whole is None:
+        raise ValueError(
+            "a review pack shows a receipt whose reported cases witness every axis and "
+            "this bank of %d instances draws no such mask. Materialize more instances "
+            "of this genre and export again" % len(population.instances)
+        )
+    short = _found(population, lambda i, s: _witnessed(i, s) != axes)
+    if short is None:
+        raise ValueError(
+            "a review pack shows a receipt that leaves an axis unwitnessed, which here "
+            "is a mask whose four cases never separate one of the three choices, and "
+            "every mask in this bank of %d instances witnesses all three. Materialize "
+            "more instances of this genre and export again" % len(population.instances)
+        )
+    for name, case, (instance, side) in (
+        ("sampled-witnesses-every-axis", SAMPLED_CASES[5], whole),
+        ("sampled-leaves-an-axis-unwitnessed", SAMPLED_CASES[6], short),
+    ):
+        shown = instance.side(side)
+        seen = sorted(_witnessed(instance, side))
+        out.append(
+            Render(
+                "sampled", case, "document",
+                _document(
+                    root, name,
+                    (
+                        "instance %s/%d/%s"
+                        % (instance.generator, instance.ordinal, shown.label),
+                        "reported cases %s"
+                        % ", ".join(str(r + 1) for r in shown.mask),
+                        "axes some reported case disagrees with a one-option "
+                        "alternative on: %s" % (", ".join(seen) or "none"),
+                        "axes it says nothing about: %s"
+                        % (", ".join(sorted(axes - set(seen))) or "none"),
+                    ),
+                    _cells(
+                        instance, shown, dict(instance.convention), _mixed_filing(shown)
+                    )[GRADED],
+                ),
+            )
+        )
+
+    pinned = _found(population, lambda i, s: len(_posterior(i, s)) == 1)
+    if pinned is None:
+        raise ValueError(
+            "a review pack shows a receipt that pins the convention and no mask in "
+            "this bank of %d instances does. Materialize more instances of this genre "
+            "and export again" % len(population.instances)
+        )
+    left = _found(population, _ambiguous)
+    if left is None:
+        raise ValueError(
+            "a review pack shows a receipt that leaves several conventions with "
+            "different held-out keys and no mask in this bank of %d instances does. "
+            "Materialize more instances of this genre and export again"
+            % len(population.instances)
+        )
+    for name, case, (instance, side) in (
+        ("sampled-posterior-of-one", SAMPLED_CASES[7], pinned),
+        ("sampled-posterior-of-several", SAMPLED_CASES[8], left),
+    ):
+        shown = instance.side(side)
+        members = _posterior(instance, side)
+        out.append(
+            Render(
+                "sampled", case, "document",
+                _document(
+                    root, name,
+                    (
+                        "instance %s/%d/%s"
+                        % (instance.generator, instance.ordinal, shown.label),
+                        "reported cases %s"
+                        % ", ".join(str(r + 1) for r in shown.mask),
+                        "conventions this receipt cannot tell apart: %d of %d"
+                        % (len(members), len(retail.ALL_CONVENTIONS)),
+                    )
+                    + tuple("  %s" % _spelled(n) for n in members)
+                    + (
+                        "held-out cases they disagree on: %d of %d"
+                        % _held_out_cost(instance, side),
+                    ),
+                    _cells(
+                        instance, shown, dict(instance.convention), _mixed_filing(shown)
+                    )[GRADED],
+                ),
+            )
+        )
+
+    cells = _cells(first, task, dict(first.convention), _mixed_filing(task))
+    out.append(
+        Render(
+            "sampled", SAMPLED_CASES[9], "document",
+            _write(
+                root, f"{RENDERS}/sampled-mask-commitment.txt",
+                "\n".join(
+                    (
+                        "instance %s/%d/%s"
+                        % (first.generator, first.ordinal, task.label),
+                        "the receipt policy committed with this instance: %s"
+                        % generator.RECEIPT_POLICY.name,
+                        "the cases it drew, committed before any filing existed: %s"
+                        % ", ".join(str(r + 1) for r in mask),
+                        "",
+                        "",
+                    )
+                )
+                + "\n\n".join(
+                    cells[kind].decode("ascii") for kind in (GRADED, PLACEBO, ORACLE)
+                ),
+            ),
+        )
+    )
+
+    instance, side = left
+    shown = instance.side(side)
+    members = _posterior(instance, side)
+    raw = _mixed_filing(shown)
+    pair = _aliased_pair(instance, side, members)
+    rendered = [
+        _cells(
+            instance, _retasked(shown, retail.ALL_CONVENTIONS[n]),
+            dict(retail.ALL_CONVENTIONS[n]), raw,
+        )[GRADED]
+        for n in pair
+    ]
+    if rendered[0] != rendered[1]:
+        raise ValueError(
+            "two conventions this receipt cannot tell apart rendered two different "
+            "cells, so the pack cannot show what it says it shows"
+        )
+    disagree, rows = _held_out_cost(instance, side)
+    out.append(
+        Render(
+            "sampled", SAMPLED_CASES[10], "document",
+            _document(
+                root, "sampled-identical-reduced-receipts",
+                (
+                    "instance %s/%d/%s"
+                    % (instance.generator, instance.ordinal, shown.label),
+                    "reported cases %s" % ", ".join(str(r + 1) for r in shown.mask),
+                    "these two conventions render the cell below byte for byte:",
+                    "  %s" % _spelled(pair[0]),
+                    "  %s" % _spelled(pair[1]),
+                    "and they disagree on %d of the %d cases of the schedule this "
+                    "reader files next" % (disagree, rows),
+                ),
+                rendered[0],
+            ),
+        )
+    )
+    return out
+
+
 def export(bank: Bank, population: Population, directory: str | Path) -> Path:
     """Write the review pack and its worksheets, and return the manifest's path.
 
@@ -594,6 +961,8 @@ def export(bank: Bank, population: Population, directory: str | Path) -> Path:
             indent=1, sort_keys=True,
         ),
     )
+
+    renders.extend(_sampled_renders(population, root))
 
     coverage = required_coverage(generator, checks.FILING_CLASSES, [retail.ROWS])
     missing = coverage.missing([(r.category, r.key) for r in renders])

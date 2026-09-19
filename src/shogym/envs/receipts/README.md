@@ -124,9 +124,10 @@ not, the way it refuses one that declares no copy profile. Three policies are re
 | `sampled-4-of-24` | a verdict and that row's own answer on the **four** rows a committed mask drew, and that position's committed neutral tokens in both slots on the other twenty |
 
 **The count is registered per generator and the bars are the same for all.** Ledger
-declares four records of twenty four, sound change two forms of twenty four, components
-two rows of twenty four, and every gate vector the full receipt. How many rows a receipt
-has to report before it stops teaching is a property of the family's own tables, not of the shape they share: four
+declares four records of twenty four, sound change two forms of twenty four, components two
+rows of twenty four, retail four cases of twenty four, and every gate vector the full
+receipt. How many rows a receipt has to report before it stops teaching is a property of the
+family's own tables, not of the shape they share: four
 fully reported rows leave an ideal reader at about 0.82 on ledger and at 0.95 on sound
 change, because a corrected daughter form exposes the replacement phone and the lost
 vowel directly. Two rows of sound change leave 0.849 against a lookup floor of 0.220, and
@@ -134,9 +135,13 @@ they are the only count from one to eight whose bank-mean ideal level sits in th
 registered band. Components is two for a different reason: a board's count is one of the
 two values its own pattern can take, so a verdict alone names the other and any form that
 keeps every verdict saturates, while two reported rows leave 329/368 against a lookup
-floor of 305/368. A count is chosen from a bank's arithmetic before the bank is looked
-at, and a family whose fresh bank fails a bar is not admitted at that count and is not
-admitted at a count chosen afterwards.
+floor of 305/368. Retail is four for a third reason: a corrected destination is the code
+the convention computes, so a receipt that reports every case saturates, and four cases
+leave 152885/191268 against a lookup floor of 82723/143451 with every single-axis
+alternative distinguished over the whole support with probability at least 221/506. A
+count is chosen from a bank's arithmetic before the bank is looked at, and a family whose
+fresh bank fails a bar is not admitted at that count and is not admitted at a count
+chosen afterwards.
 
 **The mask is drawn before any filing and independently of the drawn convention**, from a
 fifth committed stream keyed by the generator, the ordinal and the sibling label. It joins
@@ -596,9 +601,32 @@ neutral on the other 20, leave an ideal level of 0.799323 against a law-level lo
 0.576664, room 0.222660 above it, a minimum single-axis distinction probability of 0.436759, an
 expected 2.933476 compatible conventions, a singleton probability of 0.167482 and 1.322865 bits
 of posterior entropy. Uniform samples of four, five and six rows pass the three law bars and
-four is the smallest that does. **This build declares the full receipt.** The sampled policy is
-a separate mechanism, declared per generator, and when it arrives the declaration of four rows
-for this genre is one line.
+four is the smallest that does. **This genre declares `sampled-4-of-24`**, and the numbers
+above are the ones its own tables produce: the registered mask law walked over all 10626
+masks reproduces every one of them at the precision the consultation states, and the
+law-level gate reads them in place of the exercise question.
+
+**What the declaration changes and what it does not.** The task description carries three
+more lines, after the scope sentence and before the schedule, saying that the receipt
+reports the verdict and the correct destination code for four selected cases only and that
+the lines for the other cases say nothing about whether they were right. The graded cell
+carries a verdict and a same-case correction on the four cases the committed mask drew and
+this instance's committed neutral tokens in both slots on the other twenty, which is what
+makes those twenty rows the same bytes in the graded cell and the placebo. The schedules,
+the answer keys, the 27 conventions, the oracle and the construction filter do not move.
+
+**The review pack gains the eleven renders the shared coverage asks a sampled family for.**
+A surface, an option, a filing class and a row count are all satisfied by a cell that
+reports every case, so a pack built from those alone would put a reader in front of nothing
+this policy does. `retail_review.export` adds a reported case that passed, one that failed,
+one nobody filed and one filed empty; a document showing that every unreported case was
+filed wrongly and the cell says nothing about any of them; a receipt whose reported cases
+witness every axis and one that leaves an axis unwitnessed; a posterior of one convention
+and one of several with different held-out keys; the committed mask printed beside the three
+cells; and two conventions whose reduced receipts are the same bytes, with the number of
+held-out cases they disagree on. The last four are facts about the draw rather than choices
+the exporter makes, so a bank too small to exhibit one is refused rather than exported with
+the case missing.
 
 ### The checks this genre adds
 
@@ -612,8 +640,8 @@ wrong in both.
 
 | Check | What it asks |
 |---|---|
-| `retail_surface` | the printed body reads back, every field stays inside its registered bounds, the class partition, contribution totals, purchase flag, joint profiles and class cardinality are what the schedule promises, every parsed record is the stored record field by field, all 27 keys agree with an independently implemented selector on both sides, and no case id or correct code changes under serialize and read back |
-| `retail_support` | the registered gates and the exercise, materiality and copy checks pass under **every one of the 27 conventions**, not only under the one drawn, and the all-support movement minima and six-code realization hold |
+| `retail_surface` | the printed body reads back, every field stays inside its registered bounds, the class partition, contribution totals, purchase flag, joint profiles and class cardinality are what the schedule promises, every parsed record is the stored record field by field, all 27 keys agree with an independently implemented selector on both sides, and no case id or correct code changes under serialize and read back. The read back is asked twice: of the receipt that is served, which prints four corrections and twenty committed neutral tokens, and of a receipt reporting every case, which is where the geometry it exists for lives |
+| `retail_support` | the registered gates and the exercise, materiality and copy checks pass under **every one of the 27 conventions**, not only under the one drawn, and the all-support movement minima and six-code realization hold. The gate, the exercise question and the copy bar are asked of a receipt reporting every case, because they are facts about six cases of each of four public kinds and are deliberately false on masks this policy can draw; what the served receipt leaves is asked of the registered mask law beside them, and the ideal level, the room over the lookup floor and the weakest single-axis distinction over the whole support are read against the three law-level bars |
 | `retail_profile_transfer` | no case of one schedule shares a code-free structural fingerprint with any case of the other, so a corrected destination's position is not reusable |
 | `retail_bijection` | relabelling A's answers by any of the 720 maps and moving the rows by any of the 48 earns at most 0.50 on B, under **every one of the 27 conventions**; the construction filter holds the same bound, so it is a bar and not a number reported beside a pass |
 

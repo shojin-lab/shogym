@@ -64,8 +64,8 @@ from shogym.envs.receipts.oracle import OracleTemplate
 from shogym.envs.receipts.oracle import parse as parse_oracle_cell
 from shogym.envs.receipts.oracle import render as render_oracle_cell
 from shogym.envs.receipts.protocol import (
-    FULL_RECEIPT,
     ROW_ADDITIVE_EQUAL_WEIGHT,
+    SAMPLED_FOUR_OF_TWENTY_FOUR,
     Axis,
     Column,
     ConstructionExhausted,
@@ -921,7 +921,7 @@ order. This listing assigns no preference. Choose a code that is present in
 that case's instruments list, and file the code rather than its payment-ID.
 
 {scope}
-
+{receipt}
 SCHEDULE ({format_note})
 
 {body}
@@ -947,6 +947,24 @@ The grade is the fraction of the {rows} printed cases with the correct destinati
 with equal weight per case, rounded to six decimal places. A filing seals this
 schedule. No verdict or score is returned at submission.
 """
+
+
+#: WHAT THE RECEIPT WILL SAY, IN THIS GENRE'S WORDS.
+#: The rule for printing it is `filing.receipt_sentence`, which every genre with a
+#: sampled receipt uses; these are the words, because this schedule has cases and
+#: destination codes where a batch has forms and daughter forms. It names no case and
+#: no preference: the lint check and the invariance check both pass on it, and
+#: `option_mentions` on the sentence alone returns nothing.
+RECEIPT_SENTENCE: tuple[str, ...] = (
+    "The receipt for this schedule reports the verdict and the correct destination",
+    "code for four selected cases only, and the lines for the other cases say",
+    "nothing about whether they were right.",
+)
+
+
+def receipt_sentence(policy: ReceiptPolicy) -> str:
+    """This genre's registered sentence, under the rule `filing` holds for every genre."""
+    return shared_filing.receipt_sentence(policy, RECEIPT_SENTENCE)
 
 
 # --------------------------------------------------------------------------
@@ -1051,11 +1069,21 @@ class RetailRefundGenerator:
         "retail_surface", "retail_support", "retail_profile_transfer",
         "retail_bijection",
     )
-    #: EVERY CASE, verdict and correction, which is the receipt this genre was built
-    #: and gated under and the one every number in its audit was computed on. It is
-    #: declared here rather than assumed, because a generator that declares none is
-    #: refused at registration.
-    RECEIPT_POLICY: ReceiptPolicy = FULL_RECEIPT
+    #: FOUR CASES OF TWENTY FOUR, verdict and correction, and nothing at all on the
+    #: other twenty. A receipt that reports every case saturates this genre: a
+    #: corrected destination is the code the rule computes, and twenty four of them
+    #: leave an ideal reader at 1.000 with nothing for a later step to improve on.
+    #: Four is the smallest uniform sample from one to eight that clears the three
+    #: law-level bars, and its arithmetic is a property of the row recipe rather than
+    #: of a draw: an ideal reader at 152885/191268 against a law-level lookup floor of
+    #: 82723/143451, room 127763/573804 over it, 1.322865 bits of posterior entropy,
+    #: an expected 140270/47817 compatible conventions, and every single-axis
+    #: alternative distinguished with probability at least 221/506. Three cases leave
+    #: an ideal reader at 0.724, under the registered band, and two also speak to a
+    #: single-axis alternative less than a quarter of the time; seven and eight leave
+    #: the reader over the band. Declared rather than assumed, and refused at
+    #: registration when it is absent.
+    RECEIPT_POLICY: ReceiptPolicy = SAMPLED_FOUR_OF_TWENTY_FOUR
     BLANK_TOKEN = BLANK_TOKEN
     UNFILED_TOKEN = UNFILED_TOKEN
 
@@ -1200,17 +1228,20 @@ class RetailRefundGenerator:
     # ----- the task text -----
 
     def describe(self, task: PublicTask) -> str:
-        """The public rules, which schedules share a convention, and the schedule.
+        """The public rules, which schedules share a convention, what the receipt
+        reports, and the schedule.
 
         It takes the PUBLIC task, so there is no argument here the drawn rule could
-        arrive through, and the scope sentence is chosen by the sibling label and by
-        nothing else: the same bytes go to every arm of a fork.
+        arrive through. The scope sentence is chosen by the sibling label and the
+        receipt sentence by the declared policy, and by nothing else: the same bytes go
+        to every arm of a fork.
         """
         table: RetailTable = task.table
         surface = table.template
         return TASK_TEMPLATE.format(
             organization=surface.organization,
             scope=scope_sentence(task.label),
+            receipt=receipt_sentence(self.RECEIPT_POLICY),
             format_note=surface.format_note,
             body=table.body,
             rows=len(table.rows),
@@ -1315,6 +1346,7 @@ __all__ = [
     "PAYPAL",
     "PER_KIND",
     "PER_ORIENTATION",
+    "RECEIPT_SENTENCE",
     "ROWS",
     "SHAPE",
     "SLOTS",
@@ -1335,6 +1367,7 @@ __all__ = [
     "key_for",
     "original_class",
     "profile_plan",
+    "receipt_sentence",
     "render_body",
     "surface_index",
 ]

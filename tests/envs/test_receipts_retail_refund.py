@@ -26,11 +26,14 @@ from shogym.envs.receipts.generators import retail_validation as validation
 from shogym.envs.receipts.observe import observe
 from shogym.envs.receipts.oracle import OracleTemplate, render_body
 from shogym.envs.receipts.protocol import (
+    FULL_RECEIPT,
+    SAMPLED_FOUR_OF_TWENTY_FOUR,
     Instance,
     NoFiling,
     SealedSubmission,
     Task,
     option_mentions,
+    policy_of,
 )
 from shogym.envs.receipts.receipt_ast import (
     GRADED,
@@ -478,6 +481,11 @@ def test_the_room_arithmetic_is_what_the_specification_registered(drawn: Instanc
     the registered 0.05, if the best one-axis-wrong score on B rises above 0.75, or if
     the weakest axis leverage on B falls under 0.25. Each is computed here by
     enumeration or through the shared gate, never read from a stored number.
+
+    THE CEILING AND THE FLOOR ARE THE FULL RECEIPT'S and are asked of it. They are the
+    specification's own registered numbers and they are facts about six cases of each
+    of four public kinds; what the served four-case receipt leaves is the registered
+    mask law, which the declaration test holds.
     """
     def prior(table: retail.RetailTable) -> Fraction:
         keys = _keys(table)
@@ -496,10 +504,15 @@ def test_the_room_arithmetic_is_what_the_specification_registered(drawn: Instanc
     assert flip == pytest.approx(0.75)
     assert leverage == pytest.approx(0.25)
 
+    every_case, whole_pair = validation._reporting_every_case(GENERATOR, drawn)
     floors: dict[str, set[tuple[float, float]]] = {}
     for convention in retail.ALL_CONVENTIONS:
         result = gate(
-            observe(GENERATOR, validation._retasked(drawn, GENERATOR, convention), "a"),
+            observe(
+                every_case,
+                validation._retasked(whole_pair, every_case, convention),
+                "a",
+            ),
             min_arity=3, min_blocks=2, min_headroom=0.05,
         )
         assert result.verdict
@@ -691,11 +704,13 @@ def test_every_cell_is_congruent_under_every_filing_class_and_every_draw(
 ) -> None:
     """What the fork would commit, over the whole support and every registered filing.
 
-    It fails if a graded row says anything but what the scorer said, if a passing row
-    carries a correction, if a failing row's correction is not that same row's own
-    code, if the placebo leaves one byte of either slot on any row unreplaced, if the
-    graded and placebo cells differ outside the registered slots, or if any of the
-    three cells is not the registered envelope size.
+    It fails if a graded row the mask reported says anything but what the scorer said,
+    if a reported passing row carries a correction, if a reported failing row's
+    correction is not that same row's own code, if a row the mask did not report
+    carries anything but that position's committed neutral tokens, if the placebo
+    leaves one byte of either slot on any row unreplaced, if the graded and placebo
+    cells differ outside the registered slots, or if any of the three cells is not the
+    registered envelope size.
     """
     envelope = frozen_envelope(drawn.envelope)
     seen = 0
@@ -720,12 +735,25 @@ def test_every_cell_is_congruent_under_every_filing_class_and_every_draw(
                 assert mask_slots(judged.payloads[GRADED], ranges) == mask_slots(
                     judged.payloads[PLACEBO], ranges
                 )
-                for row, outcome in zip(judged.asts[GRADED].rows, judged.outcomes):
+                reported = set(retasked.mask)
+                for position, (row, outcome) in enumerate(
+                    zip(judged.asts[GRADED].rows, judged.outcomes)
+                ):
                     slots = {slot.name: slot.value for slot in row.slots}
-                    assert slots["verdict"] == ("PASS" if outcome.matched else "FAIL")
-                    assert slots["correction"] == (
-                        "" if outcome.matched else outcome.correct
-                    )
+                    if position in reported:
+                        assert slots["verdict"] == (
+                            "PASS" if outcome.matched else "FAIL"
+                        )
+                        assert slots["correction"] == (
+                            "" if outcome.matched else outcome.correct
+                        )
+                        continue
+                    # A case the mask did not draw says nothing about whether it was
+                    # right: both slots carry this instance's committed neutral tokens,
+                    # which is what makes the graded and placebo cells the same bytes
+                    # on it.
+                    for name, value in slots.items():
+                        assert value == envelope.neutral[name][position]
                 for position, row in enumerate(judged.asts[PLACEBO].rows):
                     for slot in row.slots:
                         assert slot.value == envelope.neutral[slot.name][position]
@@ -1195,7 +1223,13 @@ def test_a_family_declares_its_own_checks_and_they_run_where_the_eleven_run(
             min_leverage=0.10,
         )
     ]
-    assert names == list(checks.STANDARD_CHECKS) + list(GENERATOR.ADDITIONAL_CHECKS)
+    # The first of the eleven is the receipt's own and is dispatched on the declared
+    # policy: the exercise question for a family that reports every row, the registered
+    # mask law for one that reports some.
+    first = "law" if policy_of(GENERATOR).samples else "exercise"
+    assert names == (
+        [first] + list(checks.STANDARD_CHECKS)[1:] + list(GENERATOR.ADDITIONAL_CHECKS)
+    )
     assert GENERATOR.ADDITIONAL_CHECKS == (
         "retail_surface", "retail_support", "retail_profile_transfer",
         "retail_bijection",
@@ -1225,6 +1259,99 @@ def test_a_family_declares_its_own_checks_and_they_run_where_the_eleven_run(
     for other in (ledger.GENERATOR, VECTORS["merge"]):
         assert getattr(other, "ADDITIONAL_CHECKS", ()) == ()
         assert checks.additional_checks(other, drawn, MASTER, []) == []
+
+
+# --------------------------------------------------------------------------
+# the count this genre declares, and what the served receipt leaves
+# --------------------------------------------------------------------------
+
+
+def test_the_law_level_gate_reads_the_count_retail_declares(drawn: Instance) -> None:
+    """Four cases of twenty four, and the recipe's own arithmetic over every mask.
+
+    It fails if this genre does not declare the count its own arithmetic chose; if the
+    named checks still begin with the exercise question, which a four-case receipt has
+    no answer to; if the law is walked over anything but the 10626 masks four cases of
+    twenty four can draw; or if what it leaves is not what the consultation registered.
+    The ideal level and the lookup floor are averaged over every reference convention,
+    so they are one pair of numbers for the pair of schedules: an ideal reader at
+    152885/191268 against 82723/143451, room 127763/573804 over it, an expected
+    140270/47817 compatible conventions, a singleton probability of 5339/31878, a
+    no-receipt level of 5/18 and 1.322865 bits of posterior entropy. The weakest
+    single-axis distinction over the whole support is 221/506, which is the three cases
+    a selector moves that an unconditional route does not.
+    """
+    from shogym.envs.receipts.receipt_law import (
+        REGISTERED_MAX_IDEAL,
+        REGISTERED_MIN_DISTINGUISHING,
+        REGISTERED_MIN_IDEAL,
+        REGISTERED_MIN_LAW_ROOM,
+        law_for,
+    )
+
+    assert policy_of(GENERATOR) is SAMPLED_FOUR_OF_TWENTY_FOUR
+    assert (len(drawn.a.mask), len(drawn.b.mask)) == (4, 4)
+
+    results = checks.run_checks(
+        GENERATOR, drawn, MASTER,
+        max_copy_score=0.50, max_flip_score=0.875, min_leverage=0.10,
+    )
+    names = [result.name for result in results]
+    assert names[0] == "law" and "exercise" not in names
+    assert results[0].passed, results[0].detail
+
+    law = law_for(GENERATOR, drawn, "a")
+    assert (law.policy, law.rows, law.reported, law.masks) == (
+        "sampled-4-of-24", 24, 4, 10626,
+    )
+    assert law.ideal == pytest.approx(152885 / 191268)
+    assert law.floor == pytest.approx(82723 / 143451)
+    assert law.room == pytest.approx(127763 / 573804)
+    assert law.compatible == pytest.approx(140270 / 47817)
+    assert law.singleton == pytest.approx(5339 / 31878)
+    assert law.entropy == pytest.approx(1.322865, abs=1e-6)
+    assert law.no_receipt == pytest.approx(5 / 18)
+    assert REGISTERED_MIN_IDEAL <= law.ideal <= REGISTERED_MAX_IDEAL
+    assert law.room > REGISTERED_MIN_LAW_ROOM
+
+    # The consultation's minimum is over every convention and every one-option change
+    # to it; the law reports the alternatives to the convention that was drawn, which
+    # is the question admission asks. Both clear the bar and the smaller is registered.
+    weakest = validation.support_distinction(
+        [case.instruments for case in validation.parsed_cases(drawn.a.table)], 4
+    )
+    assert weakest == pytest.approx(221 / 506)
+    assert weakest >= REGISTERED_MIN_DISTINGUISHING
+    assert min(law.distinguishing.values()) >= weakest
+
+    # Every convention leaves the same ideal level and the same floor, because the row
+    # recipe fixes them in the reported count alone.
+    for convention in retail.ALL_CONVENTIONS:
+        other = law_for(
+            GENERATOR, validation._retasked(drawn, GENERATOR, convention), "a"
+        )
+        assert (other.ideal, other.floor) == pytest.approx((law.ideal, law.floor))
+
+
+def test_the_task_says_which_four_cases_the_receipt_will_judge(drawn: Instance) -> None:
+    """One sentence, after the scope sentence and before the schedule, in both arms.
+
+    It fails if the sentence is absent, differs between the siblings or under two
+    conventions, or names an option. A reader not told that the silence on twenty cases
+    means nothing has been handed twenty cases of apparent evidence that the schedule
+    was filed correctly. It also fails if the sentence is printed under a policy that
+    reports every case, which has nothing to qualify.
+    """
+    sentence = "\n".join(retail.RECEIPT_SENTENCE)
+    for side in ("a", "b"):
+        text = drawn.side(side).text
+        assert sentence in text
+        assert text.index(sentence) > text.index("scored under the same house")
+        assert text.index(sentence) < text.index("SCHEDULE (")
+    assert not option_mentions(GENERATOR.AXES, sentence)
+    assert retail.receipt_sentence(FULL_RECEIPT) == ""
+    assert checks.check_lint(GENERATOR, drawn).passed
+    assert checks.check_invariance(GENERATOR, drawn).passed
 
 
 class _Declaring:
@@ -1662,6 +1789,53 @@ def test_the_review_pack_covers_the_family_and_names_no_reviewer(
     twice = tmp_path / "twice"
     retail_review.export(bank, held, twice)
     assert (twice / retail_review.PACK).read_bytes() == pack.read_bytes()
+
+
+def test_the_pack_shows_what_a_receipt_of_four_cases_does(frozen, tmp_path: Path) -> None:
+    """The eleven the shared coverage asks a sampled family for, in this genre's cases.
+
+    It fails if any of the eleven is missing from the manifest, if a render it names is
+    not on disk, if the reported cases a document says were drawn are not the mask the
+    instance committed, if the receipt the pack shows as pinning the convention leaves
+    more than one, if the one it shows as leaving several leaves fewer than two with
+    different held-out keys, or if the two conventions it says render one cell do not.
+    None of it is visible in the other categories: a surface, an option, a filing class
+    and a row count are all satisfied by a cell that reports every case.
+    """
+    from shogym.envs.receipts import retail_review
+    from shogym.envs.receipts.review import SAMPLED_CASES
+
+    bank, held, _ = frozen
+    room = tmp_path / "sampled"
+    pack = retail_review.export(bank, held, room)
+    manifest = json.loads(pack.read_text(encoding="utf-8"))
+    shown = [e for e in manifest["renders"] if e["category"] == "sampled"]
+    assert [e["key"] for e in shown] == list(SAMPLED_CASES)
+    assert {e["kind"] for e in shown} == {"cell", "document"}
+    for entry in shown:
+        assert (room / entry["path"]).is_file()
+        assert (room / entry["path"]).stat().st_size > 0
+
+    first = held.instances[0]
+    commitment = ", ".join(str(r + 1) for r in first.a.mask)
+    written = (room / "renders/sampled-mask-commitment.txt").read_text("utf-8")
+    assert "sampled-4-of-24" in written
+    assert commitment in written
+
+    pinned = retail_review._found(
+        held, lambda i, side: len(retail_review._posterior(i, side)) == 1
+    )
+    assert pinned is not None
+    left = retail_review._found(held, retail_review._ambiguous)
+    assert left is not None
+    instance, side = left
+    members = retail_review._posterior(instance, side)
+    assert len(members) > 1
+    one, other = retail_review._aliased_pair(instance, side, members)
+    sibling = retail_review._support(instance.side("b" if side == "a" else "a"))
+    assert sibling[one] != sibling[other]
+    disagree, rows = retail_review._held_out_cost(instance, side)
+    assert 0 < disagree <= rows == retail.ROWS
 
 
 def test_a_frozen_bank_rebuilds_and_a_failed_extra_check_is_not_dealable(frozen) -> None:
