@@ -241,6 +241,49 @@ identifier wins), extras, and omissions. One forgiving reading is registered and
 a filing with no commas anywhere is read positionally **only** when it has exactly one line per
 printed row, so a paragraph of prose cannot be read as an answer to the first rows.
 
+### The review pack for this genre
+
+`ledger_review.export` writes one task text per surface template, taken from the earliest
+admitted instance that draws it; the graded, placebo and oracle cells of all seven filing classes
+on both siblings; a cell per row count the bank holds; **all 72 oracle cells**, so every sentence
+the oracle arm can state is in front of the reader rather than the four this draw produced; and a
+counterfactual graded cell on each sibling for every axis. Every cell taken under a convention
+that was not drawn is labelled a review counterfactual, so nothing here reads as a bank member.
+Beside the renders the exporter writes private worksheets: per record the three dates, the day
+count and the band under the drawn convention and under the alternative, what was filed, the
+verdict and the correction. Day counts and axis labels belong there and no cell prints them, so
+the worksheets are not renders and are in no bundle field. The pack names no reviewer, so
+`review.verify` refuses it until a person does.
+
+**This genre reports four records of twenty four, so the pack carries the eleven a sampled family
+owes.** Five of them are built by filing against the instance's own committed mask, because which
+records a filing gets right is the exporter's to choose: a reported record that passed, one that
+failed, one nobody filed, one filed with an empty value, and every unreported record filed wrong
+so that a reader sees the cell say nothing about twenty failures. The other six are facts about
+the rows the stream drew and are searched for: a mask that witnesses every axis and one that
+leaves an axis unwitnessed, which on this genre is a receipt that reported no record with no
+dates; a posterior holding one convention and one holding several with different held-out keys;
+the mask commitment printed beside the three cells; and **two conventions whose reduced receipts
+are byte identical**, with the number of records of the held-out schedule they disagree on. That
+last one is the point of the policy rather than a defect in it.
+
+**A bank that cannot exhibit one of them is refused by name, before anything is written.** Every
+search runs before the directory is made, so a refusal leaves no half written pack for somebody
+to read as one, and the message names the case rather than narrowing what a pack is. Four
+instances is the smallest bank that can draw all eight surfaces, and a bank that small does not
+always draw a mask that pins the convention.
+
+`ledger_review.screen_refusals` is the companion audit of a recorded screen's allocation, and the
+procedure it reads against is the roster's rather than this genre's: twelve reserved exploratory
+identities, the next thirty six as the final screen, case j to state j mod 4 for nine per state,
+the common standing instruction, one frozen instrument, one named model, four pinned initial
+states, and the predeclared release condition of a mean oracle grade of at least 0.90. It reads
+the identities against the bank's own admitted order and the outcomes against the recorded
+`ScreenRecord`, matches each case to one pair and each pair to one case, and takes the release
+statistic over the matched pairs alone. `screen_allocation` is imported from the components
+exporter rather than written again, because the reservation, the case count and the state rule
+are one registration. **No model screen has been run for this genre under the sampled receipt.**
+
 ## The genre: `soundchange`, phonological transformation composition
 
 A batch of 24 invented proto forms and the complete public mechanics of a cascade that turns
@@ -1394,6 +1437,7 @@ Recorded boundaries, held by process rather than by a check:
 | `filing.py` | the shared line reading, the printable fold, the row parser, the equal-row scorer, and the sentences that say which tasks share a convention. |
 | `copy_profiles.py` | the registered families of maps the copy screen prices, and which generator declares which. |
 | `generators/ledger.py` | the ledger genre: domains, the scoring function, the three renderers, the oracle template. |
+| `ledger_review.py` | the deterministic review pack and private worksheets for that genre, the eleven its sampled receipt owes, and the audit of a recorded screen's allocation. |
 | `generators/soundchange.py` | the sound change genre: the phone inventory, the three passes, the keyed pair construction and its filter, the four surfaces, the oracle template. |
 | `generators/soundchange_audit.py` | a second implementation of that cascade, the predicates the pair is filtered on, and the three checks the profile adds. |
 | `soundchange_review.py` | the deterministic review pack and the private trace worksheets for that genre. |
