@@ -15,6 +15,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import re
 from pathlib import Path
 
 import pytest
@@ -226,6 +227,47 @@ def test_the_pack_shows_what_a_receipt_of_four_records_does(complete) -> None:
     aliased = (root / sampled[review.SAMPLED_CASES[10]]["path"]).read_text("ascii")
     assert "render the cell below byte for byte" in aliased
     assert "records of the schedule this reader files next" in aliased
+
+
+def test_the_identical_receipts_document_states_what_its_named_pair_costs(
+    complete,
+) -> None:
+    """The document names two conventions, and the cost it prints is what those two disagree on.
+
+    FAILS IF the held-out cost the document prints is not counted from the two named
+    conventions' own keys on the schedule the reader files next. Counting over every
+    convention the receipt leaves standing states what the whole posterior leaves open,
+    which is more than the named pair costs whenever a third convention survives: 20 of 24
+    against 4 of 24 on the receipt this bank shows, which leaves nine.
+    """
+    _bank, held, root, pack = complete
+    manifest = json.loads(pack.read_text(encoding="utf-8"))
+    (path,) = [
+        entry["path"]
+        for entry in manifest["renders"]
+        if entry["category"] == "sampled" and entry["key"] == review.SAMPLED_CASES[10]
+    ]
+    head = (root / path).read_text("ascii").split("\n\n", 1)[0].splitlines()
+
+    _, ordinal, label = head[0].split()[1].split("/")
+    (instance,) = [i for i in held.instances if i.ordinal == int(ordinal)]
+    members = ledger_review._posterior(instance, label.lower())
+    assert len(members) > 2
+    sibling = instance.side("b" if label.lower() == "a" else "a")
+    start = head.index("these two conventions render the cell below byte for byte:")
+    named = [
+        dict(part.split("=", 1) for part in line.strip().split(", "))
+        for line in head[start + 1:start + 3]
+    ]
+    assert all(set(n) == {axis.name for axis in ledger.AXES} for n in named)
+    assert named[0] != named[1]
+    keys = [ledger.key_for(sibling.table, convention) for convention in named]
+    cost = sum(1 for one, other in zip(*keys) if one != other)
+
+    claim = re.search(r"disagree on (\d+) of the (\d+) records", head[-1])
+    assert claim is not None, head[-1]
+    assert (int(claim.group(1)), int(claim.group(2))) == (cost, len(keys[0]))
+    assert (cost, len(keys[0]), len(members)) == (4, ledger.SHAPE.rows, 9)
 
 
 def test_the_unwitnessed_example_reports_no_record_without_dates(complete) -> None:

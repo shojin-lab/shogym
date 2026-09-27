@@ -343,9 +343,16 @@ def _aliased_pair(instance: Instance, side: str, members: Sequence[int]) -> tupl
     raise ValueError("this receipt leaves no pair with different held-out keys")
 
 
-def _held_out_cost(instance: Instance, side: str) -> tuple[int, int]:
-    """How many records of the sibling the surviving conventions do not agree on."""
-    members = _posterior(instance, side)
+def _held_out_cost(
+    instance: Instance, side: str, members: Sequence[int]
+) -> tuple[int, int]:
+    """How many records of the sibling the named conventions do not agree on.
+
+    The conventions are the caller's, because two documents ask two questions: the
+    posterior documents ask what every surviving convention leaves open, and the
+    identical-receipts document names one pair and states what that pair costs. Taking the
+    whole posterior for the pair overstated it whenever a third convention survived.
+    """
     sibling = _support(instance.side("b" if side == "a" else "a"))
     rows = len(sibling[0])
     return (
@@ -587,7 +594,7 @@ def _sampled_renders(chosen: Selected, root: Path) -> list[Render]:
                     )
                     + (
                         "held-out records they disagree on: %d of %d"
-                        % _held_out_cost(instance, side),
+                        % _held_out_cost(instance, side, members),
                     ),
                     _cells(
                         instance, held, instance.convention, _mixed_filing(held)
@@ -635,7 +642,7 @@ def _sampled_renders(chosen: Selected, root: Path) -> list[Render]:
             "two conventions this receipt cannot tell apart rendered two different cells, "
             "so the pack cannot show what it says it shows"
         )
-    disagree, rows = _held_out_cost(instance, side)
+    disagree, rows = _held_out_cost(instance, side, chosen.aliased)
     out.append(
         Render(
             "sampled",
