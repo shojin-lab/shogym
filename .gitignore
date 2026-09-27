@@ -16,3 +16,5 @@ examples/*/runs/
 .evidence-receipt/
 .evidence-counts/
 .evidence-components/
+.evidence-retail/
+.evidence-ledger-pack/
