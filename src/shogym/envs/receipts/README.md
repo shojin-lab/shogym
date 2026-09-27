@@ -712,10 +712,27 @@ for whoever runs it:
    run does not keep only the completed favourable triplets.
 5. Record O, P and G by initial state as well as pooled, with rule-reading mistakes, execution
    mistakes, omitted rows, filing omissions, token length and row-level oracle errors.
-6. Judge it against the registered bars: `min_room=0.05`, `min_ratio=0.25`, `min_pairs=36`,
-   `floor=0.0`, `floor_rule="drop"`, `candidates_screened=1`. **Beside them**, as a predeclared
-   roster-release condition and not a `screen.json` field: **mean executed oracle grade at least
-   0.90**, with the independent reader scoring 1 on every admitted draw.
+6. Write the pairs to the standard `ScreenRecord`: family, model, task_seeds and the six pair
+   fields `instance`, `filing`, `placebo`, `graded`, `oracle` and `ideal`. `ideal` is the level a
+   perfect reader of that case's receipt reaches on B. It is carried from the gate's exact
+   computation over the registered mask law and is never measured in the screen, and this
+   genre's row recipe puts it at 152885/191268 (0.799323) on every compliant pair, which is the
+   ideal level stated above. Use `min_pairs=36`, `min_room=0.05`, `min_ratio=0.25`,
+   `min_oracle=0.90`, `min_learning_gap=0.10`, `floor=0.0`, `floor_rule="drop"`,
+   `candidates_screened=1` and a truthful selection note. Every one of those is a required field
+   of the record, and a bundle whose five bars are not the registered `0.05`, `0.25`, `36`,
+   `0.90` and `0.10` is refused.
+7. Require mean O minus mean P at least 0.05, its paired 90 percent bootstrap lower endpoint
+   strictly above zero, and `(mean G - mean P) / (mean O - mean P)` at least 0.25, which is a
+   ratio of pooled differences and never an average of case ratios. Require as well a mean
+   executed oracle grade of at least **0.90**, and a mean of `ideal - G` over the pairs of at
+   least **0.10** with its paired 90 percent bootstrap lower endpoint strictly above zero. The
+   screen and the bundle verifier recompute all five from the raw pair rows.
+
+The independent reader scores 1 on every admitted draw, and that is an admission check rather
+than a screen bar: `retail_surface` refuses a pair on which the second implementation in
+`generators/retail_validation.py` disagrees with the scorer on any case under any of the 27
+conventions.
 
 A pooled mean can conceal a state-specific uptake failure, which is why the by-state report is
 part of the procedure rather than an extra. A solved reference implementation proves
