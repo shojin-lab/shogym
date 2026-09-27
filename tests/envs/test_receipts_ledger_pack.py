@@ -38,7 +38,9 @@ COMPLETE_SIZE = 4
 #: A bank that draws every surface and no mask that pins the convention to one member of
 #: the support. It is the bank the refusal is about: the shortfall is the bank's, and a pack
 #: exported from it would have gone to a reader with one of the eleven silently missing.
-INCOMPLETE_MASTER = hashlib.sha256(b"ledger-review-pack:7").digest()
+#: Which ordinals a key admits moves whenever admission does, so the test that reads this
+#: bank asserts what it draws before it asserts what the export refuses.
+INCOMPLETE_MASTER = hashlib.sha256(b"ledger-review-pack:10").digest()
 INCOMPLETE_SIZE = 4
 
 
@@ -233,10 +235,25 @@ def test_a_bank_that_cannot_exhibit_a_case_is_refused_by_name(tmp_path: Path) ->
     leaves a half written pack behind for somebody to read as one. The key here draws every
     surface and no mask that pins the convention, so what is being exercised is the sampled
     search rather than the surface one, which is refused by name just above it.
+
+    It also fails if the bank stops being that bank. Which ordinals a key admits is a fact
+    about admission, and when admission changed, the key this test used to read admitted
+    two fewer surfaces, so the export refused a surface and the test read the wrong
+    refusal. So every search the export runs before this one is asserted to succeed on this
+    bank, and this one to fail, before the export is asked.
     """
     bank, held = bank_mod.materialized(
         ledger.GENERATOR, INCOMPLETE_MASTER, INCOMPLETE_SIZE
     )
+    sides = [(instance, side) for instance in held.instances for side in ("a", "b")]
+    axes = {axis.name for axis in ledger.AXES}
+    assert {i.side(s).surface for i, s in sides} == set(
+        ledger.GENERATOR.surface_templates()
+    )
+    assert any(ledger_review._witnessed(i, s) == axes for i, s in sides)
+    assert any(ledger_review._witnessed(i, s) != axes for i, s in sides)
+    assert all(len(ledger_review._posterior(i, s)) > 1 for i, s in sides)
+
     room = tmp_path / "pack"
     with pytest.raises(ValueError) as refused:
         ledger_review.export(bank, held, room)
