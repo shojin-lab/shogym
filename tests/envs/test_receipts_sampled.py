@@ -50,6 +50,7 @@ from shogym.envs.receipts.render import (
     feedback_for,
     judge_cells,
 )
+from tests._fixtures.ledger_reports import SHARES_REGISTERED_REPORTS, registered_reports
 
 MASTER = bytes(range(32))
 ENVELOPE_BYTES = 2657
@@ -678,6 +679,7 @@ def test_a_full_policy_instance_that_fails_realized_headroom_is_refused() -> Non
     assert held.admitted
 
 
+@SHARES_REGISTERED_REPORTS
 def test_the_admitted_sampled_set_is_the_set_the_law_admits() -> None:
     """Nothing is excluded for what its own mask drew, over a run of ordinals.
 
@@ -685,14 +687,16 @@ def test_the_admitted_sampled_set_is_the_set_the_law_admits() -> None:
     receipt's printed form is sound, which is the only way the realized mask could
     still be selecting the bank's population. It also fails if no drawn instance has a
     realized gate verdict the law overrides, because then the run proves nothing.
+
+    The twelve reports under the registered bars are the ones
+    tests/envs/test_receipts_checks.py also reads, made once for both by
+    tests/_fixtures/ledger_reports.py while the sampled family is the ledger itself.
     """
-    from shogym.envs.receipts.admission import Thresholds, decides, report
+    from shogym.envs.receipts.admission import decides
 
     generator = _sampled()
-    registered = Thresholds()
     overridden = 0
-    for ordinal in range(12):
-        made = report(generator, draw(generator, MASTER, ordinal), MASTER, registered)
+    for _, made in registered_reports(generator, MASTER):
         assert made.samples
         assert made.gate_prerequisite == made.gates.s_form_pass
         assert made.admitted == (made.gates.s_form_pass and not made.failed_checks)
