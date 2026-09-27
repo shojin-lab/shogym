@@ -11,6 +11,7 @@ rather than reading anything off it.
 from __future__ import annotations
 
 import functools
+import hashlib
 from pathlib import Path
 
 import pytest
@@ -18,6 +19,7 @@ import pytest
 from shogym.cli import main
 from shogym.envs.receipts import admission as admission_mod
 from shogym.envs.receipts import bank as bank_mod
+from shogym.envs.receipts import streams
 from shogym.envs.receipts.registry import BANK_DIR_VAR, HISTORY_VAR
 from tests._fixtures.receipts_bundle import private_bundle, screen_artifact
 
@@ -26,6 +28,18 @@ from tests._fixtures.receipts_bundle import private_bundle, screen_artifact
 #: The registered bars are the defaults, so nothing here has to pass them. The list
 #: is kept for the cases that deliberately override one.
 BARS: list[str] = []
+
+#: The key :func:`_filled` fills its banks under. Under it admission admits ordinals 0, 1 and 2,
+#: so the bank of two is two reports and the bank of three is three, and both clear the registered
+#: band read at their mean.
+FILLED_MASTER = hashlib.sha256(b"receipts-test-key:b").digest()
+
+#: The keys the materialize command draws in one test, in the order it draws them. The first is
+#: FILLED_MASTER, so a test that builds a pack over a bank it has just materialized reads the
+#: population ``_filled(2)`` walked, when that ran first in this process. The second is another
+#: key, under which admission admits ordinals 0 and 1, so a forced reroll fills its bank under a
+#: key the first attempt did not use, as it does on a real run.
+MATERIALIZE_KEYS = (FILLED_MASTER, hashlib.sha256(b"receipts-test-key:c").digest())
 
 
 def _run(argv: list[str]) -> int:
@@ -48,6 +62,26 @@ def _banks(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Path:
     monkeypatch.setenv(BANK_DIR_VAR, str(tmp_path / "banks"))
     monkeypatch.setenv(HISTORY_VAR, str(tmp_path / "key-history.jsonl"))
     return tmp_path
+
+
+@pytest.fixture(autouse=True)
+def _keys(monkeypatch: pytest.MonkeyPatch) -> None:
+    """The materialize command draws its keys from MATERIALIZE_KEYS, in order, afresh in each test.
+
+    Under a key fresh from the system on every run, how many reports each materialize walked moved
+    with the key from one run to the next. The command still draws a key for each attempt it makes,
+    and a second attempt still draws a different key: what is fixed is which keys they are. A test
+    that draws more keys than are listed fails rather than drawing one it has drawn already.
+    """
+    keys = iter(MATERIALIZE_KEYS)
+
+    def drawn() -> bytes:
+        key = next(keys, None)
+        if key is None:
+            raise AssertionError("this test drew more keys than MATERIALIZE_KEYS lists")
+        return key
+
+    monkeypatch.setattr(streams, "new_master_key", drawn)
 
 
 #: The instances each bank this module has walked holds. A population is a function of the bank
@@ -81,14 +115,14 @@ def _filled(size: int):
     The real materialize command is what five of the tests below are about, and they still run
     it: its report, its refusal to overwrite, its forced replacement, its refusal of a gate
     vector, and the whole materialize/bundle/verify/list chain.
+
+    The bank is filled under FILLED_MASTER, named here rather than drawn, so which key it is does
+    not depend on which test asked first or on how many keys that test had drawn already.
     """
     from shogym.envs.receipts import bank as bank_mod
-    from shogym.envs.receipts import streams
     from shogym.envs.receipts.registry import load_generator
 
-    bank, held = bank_mod.materialized(
-        load_generator("ledger"), streams.new_master_key(), size
-    )
+    bank, held = bank_mod.materialized(load_generator("ledger"), FILLED_MASTER, size)
     _POPULATIONS[bank] = held
     return bank, held
 
@@ -99,8 +133,8 @@ def _frozen_bank(size: int) -> None:
     No test here freezes a bank of one, and the reason is the registered band: the room
     above the lookup floor is a BANK quantity, so a bank of one instance reads it at
     that instance. Ledger's own rooms run from about 0.048 to 0.093 around a mean well
-    clear of the 0.05 bar, and the key here is fresh every run, so a bank of one would
-    refuse to fill on some keys and not on others.
+    clear of the 0.05 bar, so a bank of one would ask about one draw rather than the
+    question the band registers, and two is the smallest bank that asks it.
 
     The same file the materialize command writes, written the same way: a bank is five fields
     and every command below recomputes everything else from them.
@@ -308,7 +342,10 @@ def test_check_exits_nonzero_when_a_threshold_bites(
 def test_materialize_refuses_to_overwrite_without_force(
     capsys: pytest.CaptureFixture[str],
 ) -> None:
+    from shogym.envs.receipts.registry import bank_path
+
     assert _run(["receipts", "materialize", "ledger", "--size", "2", *BARS]) == 0
+    first = bank_mod.load_bank(bank_path("ledger")).master
     capsys.readouterr()
     assert _run(["receipts", "materialize", "ledger", "--size", "2", *BARS]) == 1
     assert "pass --force" in capsys.readouterr().out
@@ -319,6 +356,8 @@ def test_materialize_refuses_to_overwrite_without_force(
         "receipts", "materialize", "ledger", "--size", "2", "--force",
         "--reroll", "the first key filled a bank this test then replaced", *BARS,
     ]) == 0
+    # The reroll filled its bank under a key the first attempt did not use.
+    assert bank_mod.load_bank(bank_path("ledger")).master != first
 
 
 def test_draw_needs_a_bank_before_it_will_render(
