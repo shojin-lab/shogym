@@ -25,8 +25,13 @@ from shogym.receipts import (
 _PAIRS = 2
 
 
-def _outcomes(placebo, graded, oracle) -> Outcomes:
-    return Outcomes(placebo=tuple(placebo), graded=tuple(graded), oracle=tuple(oracle))
+def _outcomes(placebo, graded, oracle, ideal=None) -> Outcomes:
+    return Outcomes(
+        placebo=tuple(placebo),
+        graded=tuple(graded),
+        oracle=tuple(oracle),
+        ideal=tuple(ideal) if ideal is not None else (),
+    )
 
 
 def test_the_contrasts_are_the_two_differences_against_the_placebo() -> None:
@@ -163,16 +168,19 @@ def test_a_sample_exactly_at_a_registered_bar_clears_it() -> None:
     0.05, and the same pairs put the ratio a fraction under 0.25. One registered
     resolution decides both, here and again when a bundle re-verifies.
     """
-    room_edge = screen("f", _outcomes([0.3] * 36, [0.32] * 36, [0.35] * 36))
+    # The oracle and gap bars are held at zero here so that the verdict is decided by
+    # the two bars this is about. Their own edge is held in the tests below.
+    edges = {"min_oracle": 0.0, "min_learning_gap": 0.0}
+    room_edge = screen("f", _outcomes([0.3] * 36, [0.32] * 36, [0.35] * 36), **edges)
     assert room_edge.room < 0.05  # the float really is under the bar
     assert room_edge.room_pass and room_edge.verdict
 
-    both = screen("f", _outcomes([0.4] * 36, [0.4125] * 36, [0.45] * 36))
+    both = screen("f", _outcomes([0.4] * 36, [0.4125] * 36, [0.45] * 36), **edges)
     assert both.room < 0.05 and both.ratio < 0.25
     assert both.room_pass and both.ratio_pass and both.verdict
 
     # A sample genuinely under the bar still fails: the resolution is not a discount.
-    under = screen("f", _outcomes([0.3] * 36, [0.31] * 36, [0.34] * 36))
+    under = screen("f", _outcomes([0.3] * 36, [0.31] * 36, [0.34] * 36), **edges)
     assert not under.room_pass and not under.verdict
 
 
@@ -214,10 +222,11 @@ def test_a_selected_screen_is_scored_and_is_not_deal_evidence() -> None:
             "task_seeds": [str(n) for n in range(36)],
             "pairs": [
                 {"instance": f"t{n:02d}", "filing": f"f{n:02d}",
-                 "placebo": 0.4, "graded": 0.6, "oracle": 0.9}
+                 "placebo": 0.4, "graded": 0.6, "oracle": 0.9, "ideal": 0.82}
                 for n in range(36)
             ],
             "min_room": 0.05, "min_ratio": 0.25, "min_pairs": 36,
+            "min_oracle": 0.90, "min_learning_gap": 0.10,
             "floor": 0.0, "floor_rule": "drop",
             "candidates_screened": count, "selection_note": note,
         })
@@ -226,3 +235,83 @@ def test_a_selected_screen_is_scored_and_is_not_deal_evidence() -> None:
     assert not record(2, "best of two").dealable_selection
     assert not record(1000000, "best of a million").dealable_selection
 
+
+
+def test_the_oracle_bar_refuses_a_family_whose_oracle_copies_did_not_execute() -> None:
+    """The room the ratio divides by has to be a room this model actually took.
+
+    FAILS IF a screen passes while the oracle copies averaged under 0.90 on the
+    held-out task. A low oracle level is as consistent with copies that could not carry
+    out a rule they were handed as with a family that leaves nothing to carry, and the
+    ratio reads the same either way.
+    """
+    weak = screen("f", _outcomes([0.2] * 36, [0.5] * 36, [0.7] * 36, [0.9] * 36))
+    assert weak.room_pass and weak.ratio_pass
+    assert not weak.oracle_pass and not weak.verdict
+    assert any("told the rule" in reason for reason in weak.reasons)
+    strong = screen("f", _outcomes([0.2] * 36, [0.5] * 36, [0.95] * 36, [0.9] * 36))
+    assert strong.oracle_pass and strong.verdict
+    assert strong.oracle == pytest.approx(0.95)
+
+
+def test_the_gap_bar_refuses_a_family_already_at_its_receipt_s_own_ceiling() -> None:
+    """A graded level at the ideal has nothing left for a later step to read better.
+
+    FAILS IF a screen passes while the graded level sits within 0.10 of the level a
+    perfect reader of the SAME receipts reaches, or while the paired interval on that
+    gap reaches zero. The other three bars cannot see this: a family at its own ceiling
+    clears them emphatically, which is exactly the saturation a chain would then be run
+    on for nothing.
+    """
+    saturated = screen(
+        "f", _outcomes([0.45] * 36, [0.96] * 36, [0.99] * 36, [1.0] * 36)
+    )
+    assert saturated.room_pass and saturated.ratio_pass and saturated.oracle_pass
+    assert not saturated.gap_pass and not saturated.verdict
+    assert any("nothing left for a later step" in r for r in saturated.reasons)
+
+    room_to_read = screen(
+        "f", _outcomes([0.45] * 36, [0.65] * 36, [0.99] * 36, [0.82] * 36)
+    )
+    assert room_to_read.gap == pytest.approx(0.17)
+    assert room_to_read.gap_pass and room_to_read.verdict
+
+    # The point estimate is not enough on its own: the paired interval has to clear
+    # zero, and a sample that straddles it does not establish the gap.
+    straddling = screen(
+        "f",
+        _outcomes(
+            [0.45] * 36,
+            [0.6 if n % 2 else 0.95 for n in range(36)],
+            [0.99] * 36,
+            [0.9 if n % 2 else 0.6 for n in range(36)],
+        ),
+    )
+    assert not straddling.gap_pass and not straddling.verdict
+
+
+def test_the_two_new_bars_are_registered_and_the_three_before_them_did_not_move() -> None:
+    """Five bars now, and the three that were there are the numbers they were.
+
+    FAILS IF the registered room, ratio or sample bars move, or if the two new ones are
+    not part of what `registered` means. A record judged against a moved bar is a
+    record that says it was judged against the registered set.
+    """
+    from shogym.receipts.screen import (
+        REGISTERED_MIN_LEARNING_GAP,
+        REGISTERED_MIN_ORACLE,
+        REGISTERED_MIN_PAIRS,
+        REGISTERED_MIN_RATIO,
+        REGISTERED_MIN_ROOM,
+    )
+
+    assert (REGISTERED_MIN_ROOM, REGISTERED_MIN_RATIO, REGISTERED_MIN_PAIRS) == (
+        0.05,
+        0.25,
+        36,
+    )
+    assert (REGISTERED_MIN_ORACLE, REGISTERED_MIN_LEARNING_GAP) == (0.90, 0.10)
+    rows = _outcomes([0.45] * 36, [0.65] * 36, [0.99] * 36, [0.82] * 36)
+    assert screen("f", rows).registered
+    assert not screen("f", rows, min_oracle=0.5).registered
+    assert not screen("f", rows, min_learning_gap=0.01).registered

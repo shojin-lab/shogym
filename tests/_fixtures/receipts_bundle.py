@@ -48,10 +48,23 @@ from shogym.envs.receipts.generators.ledger import GENERATOR
 #: no wider than this.
 _TEMPLATES: dict[int, Path] = {}
 
+#: The key the one-instance template is filled under, which is fixed where every larger template
+#: takes a fresh one. The band on the ideal level is read at a bank's mean, so a bank of one reads
+#: it at its only instance, and a single ledger instance can stand under the 0.05 bar: 3 of 160
+#: fresh keys drew a first instance with no more room than that, and the bank then refused to fill
+#: before any test that asked for it had started. Under this key ordinal 0 is admitted with an ideal
+#: level of 0.8254 standing 0.0869 above its lookup floor, so the bank fills on every run, and a
+#: change that moves it under the bar fails on every run rather than on about one in fifty.
+ONE_INSTANCE_MASTER = bytes(range(96, 128))
 
-def verified_bundle(room: Path, size: int = 2) -> Path:
-    """Build a bundle of ``size`` admitted instances under ``room``, and return its directory."""
-    bank, held = bank_mod.materialized(GENERATOR, streams.new_master_key(), size)
+
+def verified_bundle(room: Path, size: int = 2, master: bytes | None = None) -> Path:
+    """Build a bundle of ``size`` admitted instances under ``room``, and return its directory.
+
+    The bank is filled under ``master``, or under a fresh key when none is named.
+    """
+    key = master if master is not None else streams.new_master_key()
+    bank, held = bank_mod.materialized(GENERATOR, key, size)
     outcomes = room / "screen.json"
     outcomes.write_text(json.dumps(screen_artifact()), encoding="utf-8")
     pack = review_pack(room, held, bank)
@@ -64,14 +77,18 @@ def verified_template(size: int = 2) -> Path:
     """The one bundle of this size this process builds, read-only and shared.
 
     Built under the system temporary directory rather than under a test's own, because it outlives
-    every test that reads it and belongs to none of them. It is removed when the process ends.
+    every test that reads it and belongs to none of them. It is removed when the process ends. A
+    template of one instance is filled under :data:`ONE_INSTANCE_MASTER`, and any other under a
+    fresh key.
     """
     known = _TEMPLATES.get(size)
     if known is not None:
         return known
     room = Path(tempfile.mkdtemp(prefix=f"shogym-receipts-template-{size}-"))
     atexit.register(_discard, room)
-    built = verified_bundle(room, size=size)
+    built = verified_bundle(
+        room, size=size, master=ONE_INSTANCE_MASTER if size == 1 else None
+    )
     _mode(built, writable=False)
     _TEMPLATES[size] = built
     return built
@@ -127,10 +144,11 @@ def screen_artifact(pairs: int = 40) -> dict:
         "task_seeds": [str(i) for i in range(pairs)],
         "pairs": [
             {"instance": f"task-{i:02d}", "filing": f"filing-{i:02d}",
-             "placebo": 0.4, "graded": 0.6, "oracle": 0.9}
+             "placebo": 0.4, "graded": 0.6, "oracle": 0.95, "ideal": 0.82}
             for i in range(pairs)
         ],
         "min_room": 0.05, "min_ratio": 0.25, "min_pairs": 36,
+        "min_oracle": 0.90, "min_learning_gap": 0.10,
         "floor": 0.0, "floor_rule": "drop",
         "candidates_screened": 1, "selection_note": "",
     }
@@ -179,6 +197,7 @@ def review_pack(room: Path, held: bank_mod.Population, bank: bank_mod.Bank) -> P
 
 
 __all__ = [
+    "ONE_INSTANCE_MASTER",
     "private_bundle",
     "review_pack",
     "screen_artifact",

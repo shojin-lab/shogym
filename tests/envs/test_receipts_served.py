@@ -19,12 +19,11 @@ from pathlib import Path
 import pytest
 
 from shogym.envs.receipts import bank as bank_mod
-from shogym.envs.receipts import streams
 from shogym.envs.receipts.env_v1 import ReceiptsV1Env
 from shogym.envs.receipts.generators.ledger import GENERATOR
 from shogym.envs.receipts.protocol import option_mentions
 from shogym.serve import ServedEpisode
-from tests._fixtures.receipts_bundle import private_bundle
+from tests._fixtures.receipts_bundle import ONE_INSTANCE_MASTER, private_bundle
 
 
 @pytest.fixture(scope="module")
@@ -38,12 +37,15 @@ def frozen_bundle(tmp_path_factory: pytest.TempPathFactory) -> Path:
 
 
 def _built_bundle(room: Path) -> Path:
-    """A second admission bundle, under its own key, for the tests that need two.
+    """A second admission bundle, of another size and key, for the tests that need two.
 
-    A copy of the one-instance template, which was built under a key of its own and is therefore
-    a different bundle from the module's: a different digest, a different directory, and its own
-    verification when something opens it. Each caller gets its own copy, because every test here
-    that asks for one is about to edit it, link to it or open it from a directory of its own.
+    A copy of the one-instance template. It holds one instance where the module's holds two, so it
+    is a different bank and therefore a different bundle from the module's whatever key that one
+    drew: a different digest, a different directory, and its own verification when something opens
+    it. Its key is fixed and known to fill, because a bank of one reads the band at its only
+    instance and a fresh key can draw one that stands under the bar. Each caller gets its own copy,
+    because every test here that asks for one is about to edit it, link to it or open it from a
+    directory of its own.
     """
     room.mkdir(parents=True, exist_ok=True)
     return private_bundle(room, size=1)
@@ -690,7 +692,7 @@ def test_the_environment_refuses_a_bank_that_was_never_bundled(
     """
     path = tmp_path / "raw.json"
     bank_mod.save_bank(
-        bank_mod.materialize(GENERATOR, streams.new_master_key(), 1), path
+        bank_mod.materialize(GENERATOR, ONE_INSTANCE_MASTER, 1), path
     )
     with pytest.raises(ValueError, match="there is no bundle at"):
         ReceiptsV1Env(bundle=str(path.parent))

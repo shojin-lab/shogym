@@ -30,7 +30,8 @@ from shogym.envs.receipts.protocol import (
     Task,
     support_of,
 )
-from shogym.envs.receipts.receipt_ast import row_lines, serialize
+from shogym.envs.receipts.receipt_ast import frozen_envelope, row_lines, serialize
+from shogym.envs.receipts.render import feedback_for
 from shogym.receipts import AxisSpace, Observation
 
 
@@ -137,6 +138,11 @@ def observe(
     canonical = filing or generator.parse_and_canonicalize(
         task, canonical_filing_text(generator, task)
     )
+    # The commitment the gates read the receipt under, built from the frozen envelope
+    # once and before any render, so every counterfactual is rendered under the one
+    # mask the instance committed to rather than under a mask a renderer chose.
+    committed = frozen_envelope(envelope)
+    feedback = feedback_for(generator, task, committed)
 
     # Indexed by the space's own position, never by iteration order: the two happen
     # to agree, and a gate that depended on them agreeing would be a gate that broke
@@ -149,15 +155,24 @@ def observe(
     orders: dict[int, tuple[str, ...]] = {}
     graded_keys: list[tuple[str, ...]] = []
     realized: dict[str, set[str]] = {spec.name: set() for spec in envelope.slots}
+    n_rows = len(generator.row_identifiers(task.table))
+    realized_rows: dict[str, list[set[str]]] = {
+        spec.name: [set() for _ in range(n_rows)] for spec in envelope.slots
+    }
     for convention in support:
         position = index[tuple(convention[a.name] for a in generator.AXES)]
         truth = tuple(generator.key_for(task.table, convention))
         graded_keys.append(truth)
         reachable.append(position)
-        ast = generator.render_receipt(task, canonical, truth)
+        ast = generator.render_receipt(task, canonical, truth, feedback)
         for row in ast.rows:
             for slot in row.slots:
                 realized.setdefault(slot.name, set()).add(slot.value)
+                seen_here = realized_rows.setdefault(
+                    slot.name, [set() for _ in range(n_rows)]
+                )
+                if 0 <= row.ordinal - 1 < len(seen_here):
+                    seen_here[row.ordinal - 1].add(slot.value)
         payload = serialize(ast, envelope)
         views[position] = row_lines(payload, ast, envelope)
         whole[position] = payload
@@ -199,10 +214,46 @@ def observe(
         orders=orders,
         payloads=payloads,
         answer_vocabulary=answers_seen,
+        # The family-wide grammar is the UNION over positions, which is what a slot may
+        # print somewhere. It is a summary and not the check: under a policy that
+        # reports only some rows, a token legal where the receipt is silent is not
+        # thereby legal where it owes a verdict, and `slot_row_grammar` below is what
+        # holds that. A union that pretended to be the check would license a four-digit
+        # code in a reported verdict slot.
         slot_grammar={
-            spec.name: spec.allowed(answers_seen) for spec in envelope.slots
+            spec.name: frozenset(
+                spec.allowed(answers_seen)
+                | {
+                    committed.neutral[spec.name][row]
+                    for row in range(n_rows)
+                    if not feedback.reports(row + 1)
+                }
+            )
+            for spec in envelope.slots
         },
         slot_realized={k: frozenset(v) for k, v in realized.items()},
+        # THE GRAMMAR IS POSITIONAL WHERE THE POLICY IS. At a reported position a slot
+        # may print what its registered grammar allows; at a suppressed one it may
+        # print that position's committed neutral token and nothing else. Licensing
+        # the neutral tokens family-wide instead would license a receipt that printed
+        # a four-digit code in a verdict slot on a row it was supposed to report,
+        # which is the short numeric rule statement the grammar exists to refuse.
+        # They are deliberately not added to the slot's registered vocabulary either:
+        # the neutral check reads that vocabulary as the set of tokens the placebo may
+        # never print, and a neutral token inside it would fail every family.
+        slot_row_grammar={
+            spec.name: tuple(
+                spec.allowed(answers_seen)
+                if feedback.reports(row + 1)
+                else frozenset({committed.neutral[spec.name][row]})
+                for row in range(n_rows)
+            )
+            for spec in envelope.slots
+        },
+        slot_row_realized={
+            name: tuple(frozenset(seen) for seen in rows)
+            for name, rows in realized_rows.items()
+        },
         tag=f"{instance.generator}/{instance.ordinal}/{task.label}",
     )
 

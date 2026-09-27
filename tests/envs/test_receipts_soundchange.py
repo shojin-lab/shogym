@@ -37,6 +37,7 @@ from shogym.envs.receipts.protocol import (
     PublicTask,
     Task,
     draw,
+    receipt_mask,
 )
 from shogym.envs.receipts.oracle import OracleTemplate
 from shogym.envs.receipts.streams import digest
@@ -57,7 +58,7 @@ from shogym.envs.receipts.registry import (
     provenance_path,
 )
 from shogym.envs.receipts.env_v1 import ReceiptsV1Env
-from shogym.envs.receipts.render import judge_cells
+from shogym.envs.receipts.render import feedback_for, judge_cells
 
 from shogym.serve import ServedEpisode
 
@@ -85,6 +86,14 @@ def test_moving_the_filing_helpers_out_changed_nothing_ledger_does() -> None:
     changed, a repeated identifier, a comma-free filing at full length and at part
     length, prose, a mapping, an unknown identifier, an explicitly empty value and a
     value carrying characters outside printable ASCII.
+
+    TWO OF THE FROZEN VALUES HAVE MOVED SINCE, and exactly two: the task text digest,
+    because the description gained the registered sentence saying that the receipt
+    reports four selected records, and the graded cell digest, because the receipt
+    reports four selected records. Every other value here is the one the extraction
+    froze, including both placebo digests, both oracle digests, every parser reading,
+    every grade, every copy maximum and every leverage, so what this still holds is
+    what it was written to hold.
     """
     frozen = _frozen_ledger()
     generator = ledger.GENERATOR
@@ -564,14 +573,18 @@ def _made_instance(
     for label, protos in (("A", a_protos), ("B", b_protos)):
         table = _table(label, protos, ordinal)
         key = soundchange.key_for(table, drawn)
+        mask = receipt_mask(
+            soundchange.GENERATOR.RECEIPT_POLICY, MASTER, generator.name, ordinal,
+            label, len(key),
+        )
         public = PublicTask(
             label=label, task_id="%016x" % (ordinal * 2 + (label == "B")),
-            surface=table.surface, table=table, n_rows=len(key),
+            surface=table.surface, table=table, n_rows=len(key), mask=mask,
         )
         tasks.append(
             Task(
                 label=label, task_id=public.task_id, surface=table.surface, table=table,
-                text=generator.describe(public), key=key,
+                text=generator.describe(public), key=key, mask=mask,
             )
         )
     return Instance(
@@ -739,8 +752,10 @@ def test_a_thirteen_byte_daughter_survives_serialize_and_read_back() -> None:
     longest = max(task.key, key=len)
     blank = "\n".join("%s," % identifier for identifier in identifiers)
     read = generator_of().parse_and_canonicalize(task, blank)
-    ast = generator_of().render_receipt(task, read, task.key)
     envelope = frozen_envelope(instance.envelope)
+    ast = generator_of().render_receipt(
+        task, read, task.key, feedback_for(generator_of(), task, envelope)
+    )
     payload = serialize(ast, envelope)
     low, high = envelope.slot_span("correction")
     printed = [
@@ -785,7 +800,7 @@ def test_every_cell_is_congruent_under_every_filing_class_and_every_draw() -> No
                 truth = tuple(generator.key_for(task.table, convention))
                 retasked = Task(
                     label=task.label, task_id=task.task_id, surface=task.surface,
-                    table=task.table, text=task.text, key=truth,
+                    table=task.table, text=task.text, key=truth, mask=task.mask,
                 )
                 canonical = generator.parse_and_canonicalize(retasked, raw)
                 judged = judge_cells(
@@ -1172,10 +1187,11 @@ def _screen_artifact(pairs: int = 40) -> dict:
         "task_seeds": [str(i) for i in range(pairs)],
         "pairs": [
             {"instance": f"task-{i:02d}", "filing": f"filing-{i:02d}",
-             "placebo": 0.4, "graded": 0.6, "oracle": 0.95}
+             "placebo": 0.4, "graded": 0.6, "oracle": 0.95, "ideal": 0.82}
             for i in range(pairs)
         ],
         "min_room": 0.05, "min_ratio": 0.25, "min_pairs": 36,
+        "min_oracle": 0.90, "min_learning_gap": 0.10,
         "floor": 0.0, "floor_rule": "drop",
         "candidates_screened": 1, "selection_note": "",
     }

@@ -291,8 +291,12 @@ def _screen(args: argparse.Namespace) -> int:
 
 def _bars(record) -> str:
     """One line saying what a screen was judged against, and whether that is registered."""
-    stated = "room %g, ratio %g, pairs %d" % (
-        record.min_room, record.min_ratio, record.min_pairs
+    stated = "room %g, ratio %g, pairs %d, oracle %g, gap %g" % (
+        record.min_room,
+        record.min_ratio,
+        record.min_pairs,
+        record.min_oracle,
+        record.min_learning_gap,
     )
     if record.registered:
         return "screen bars: %s (registered)" % stated
@@ -393,9 +397,15 @@ def _instances(name: str, count: int):
 
 def _gate(args: argparse.Namespace) -> int:
     from shogym.envs.receipts.observe import observe
+    from shogym.envs.receipts.protocol import policy_of
     from shogym.receipts import gate as run_gate
 
     generator, master, instances = _instances(args.name, args.instances)
+    # WHAT COUNTS AS A REJECTION IS THE LIBRARY'S RULE, not a second one written here.
+    # For a family whose receipt reports the rows a committed mask drew, R and H and
+    # S's information equality are reported and do not decide, so counting them would
+    # print that the gate set rejected instances its own bank holds.
+    samples = policy_of(generator).samples
     failures = 0
     for instance in instances:
         result = run_gate(
@@ -406,7 +416,7 @@ def _gate(args: argparse.Namespace) -> int:
         )
         print(RULE)
         print("\n".join(result.lines()))
-        failures += 0 if result.verdict else 1
+        failures += 0 if admission_mod.decides(result, samples) else 1
     # ONE NAMING RULE, and it is the library's. Two conjunctions, one here and one in
     # `Thresholds`, are two answers to which rule a run published under.
     bars = admission_mod.Thresholds(
@@ -425,6 +435,12 @@ def _gate(args: argparse.Namespace) -> int:
         "%s: %d of %d instances rejected by %s"
         % (args.name, failures, len(instances), version)
     )
+    if samples:
+        print(
+            "the receipt reports %d of %d rows, so R, H and S's information equality "
+            "are reported above and do not reject; the registered mask law decides"
+            % (policy_of(generator).reported, policy_of(generator).rows)
+        )
     if moved:
         print(
             "moved: %s, so this is a diagnostic run and its results may not fill a bank"

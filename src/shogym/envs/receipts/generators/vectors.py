@@ -41,9 +41,11 @@ from shogym.envs.receipts.protocol import (
     Axis,
     Column,
     Filing,
+    FULL_RECEIPT,
     ROW_ADDITIVE_EQUAL_WEIGHT,
     NoFiling,
     PublicTask,
+    ReceiptPolicy,
     RowOutcome,
     SealedSubmission,
     Shape,
@@ -111,6 +113,12 @@ class VectorGenerator:
         # registration rule does not reach and the rule would hold for everything but
         # the things the gates are validated on.
         self.COPY_PROFILE: str = ORDERED_TOKENS
+        # And the full receipt, for the same reason: a fixture with no declaration
+        # would be the one generator the registration rule does not reach, and the
+        # rule would hold for everything but the things the gates are validated on.
+        # Every expected value in this module is arithmetic on a receipt that reports
+        # every row, so this is the policy those numbers were computed under.
+        self.RECEIPT_POLICY: ReceiptPolicy = FULL_RECEIPT
         self.AXES = tuple(axes)
         self._n_rows = n_rows
         self._readout = readout
@@ -267,11 +275,11 @@ class VectorGenerator:
         )
 
     def render_receipt(
-        self, task: Task, canonical: Filing, truth: Sequence[str]
+        self, task: Task, canonical: Filing, truth: Sequence[str], feedback: object
     ) -> ReceiptAST:
         graded = Task(
             label=task.label, task_id=task.task_id, surface=task.surface, table=task.table,
-            text=task.text, key=tuple(truth),
+            text=task.text, key=tuple(truth), mask=task.mask,
         )
         _, outcomes = self.score(graded, canonical)
         rows = []
@@ -301,7 +309,7 @@ class VectorGenerator:
         # and the row identities, and nothing else.
         blind = Task(
             label=task.label, task_id=task.task_id, surface=task.surface, table=task.table,
-            text="", key=(),
+            text="", key=(), mask=task.mask,
         )
         _, outcomes = self.score(blind, canonical)
         rows = tuple(
