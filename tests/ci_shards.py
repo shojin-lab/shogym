@@ -28,8 +28,28 @@ before any selection had workers:
 
 So the receipt modules ``rest`` held that need no server became ``receipt-families``, the four that
 serve a generation over the test server joined ``durable``, and ``rest`` kept everything else and
-the collection of the whole tree. What this layout costs is measured by its own first run, and is
-recorded here once it has been.
+the collection of the whole tree. The first run of this layout passed in every job and measured,
+as whole jobs and then as pytest alone:
+
+    receipt-serving    731s   698s   four workers, 95 passed
+    receipt-families   643s   606s   four workers, 240 passed
+    receipt-attacks    517s   473s   four workers, 177 passed, then ruff and pyright
+    durable            472s   423s   one process, 405 passed
+    frontier           386s   276s   one process, 20 passed
+    rest               335s   254s   one process, 1992 passed and 87 skipped
+
+That is 3084 job seconds where there were 4494, and a slowest job of about twelve minutes where
+there was one of thirty. It is not every job under ten minutes: two receipt jobs are over that.
+
+Three things in that run say where the rest of the time is. A test on one of four workers took
+about 1.9 times what it took alone, so the runner's four CPUs gave about two times, not four:
+retail's rebuild test took 467s against 245s alone, and the ledger pack's bundle test 232s against
+125s. A group is as slow as its tests added up, and retail's group, its fixture at 119s and that
+rebuild test, is most of ``receipt-families`` by itself. And fixtures that are built per process
+are built per worker: the attacks' session bundle was built by all four workers, about 63s on three
+of them, and the protocol and served modules each built the verified template on a worker of their
+own, 160s and 151s. ``receipt-serving`` has no one long group; its work is spread over all four
+workers, so it is what that work costs rather than what any one test does.
 
 The selections live here rather than in the workflow because two readers need the same answer.
 The workflow asks which paths a shard runs and on how many workers, which assets it needs
