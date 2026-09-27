@@ -66,6 +66,7 @@ default buried here would quietly become that call.
 from __future__ import annotations
 
 from dataclasses import dataclass
+from functools import partial
 from types import MappingProxyType
 from typing import Callable, Mapping, Sequence
 
@@ -298,7 +299,9 @@ def copy_scores(generator: Generator, instance: Instance) -> dict[str, float]:
 #: transfer: it keeps the values it filed on A, replaces them on the reported rows with
 #: the corrections it was given, and applies the registered maps to the result.
 #: `selected` is the same transfer from the reported answers alone, with nothing filed
-#: where the receipt said nothing.
+#: where the receipt said nothing: those rows are `copy_profiles.UNREPORTED`, which no
+#: map moves and which the filing leaves out, so a family whose rule can leave a row
+#: blank is not credited with a blank answer the reader never gave.
 REDUCED_MAPS = ("reduced", "selected")
 
 
@@ -325,12 +328,15 @@ def reduced_copy_scores(generator: Generator, instance: Instance) -> dict[str, f
     mask = set(instance.a.mask)
     truth = list(instance.a.key)
 
-    def score_of(values: Sequence[str]) -> float:
-        raw = "\n".join(f"{i},{v}" for i, v in zip(identifiers, values))
+    def score_of(values: Sequence[str | None]) -> float:
+        # An unreported row gets no line, so it is an omission and not a blank answer.
+        raw = "\n".join(
+            f"{i},{v}" for i, v in zip(identifiers, values) if v is not None
+        )
         canonical = generator.parse_and_canonicalize(instance.b, raw)
         return generator.score(instance.b, canonical)[0]
 
-    def transfer(values: Sequence[str]) -> float:
+    def transfer(values: Sequence[str | None]) -> float:
         relabels = copy_profiles.relabellings(generator, instance, list(values), width)
         return max(
             (
@@ -356,7 +362,8 @@ def reduced_copy_scores(generator: Generator, instance: Instance) -> dict[str, f
                 ]
             )
     selected_only = [
-        truth[row] if row in mask else "" for row in range(len(truth))
+        truth[row] if row in mask else copy_profiles.UNREPORTED
+        for row in range(len(truth))
     ]
     return {
         "reduced": max((transfer(guess) for guess in guesses), default=0.0),
@@ -1025,6 +1032,32 @@ def profile_checks(
     ]
 
 
+def genre_checks(
+    generator: Generator, instance: Instance
+) -> list[tuple[str, Callable[[], CheckResult]]]:
+    """The checks one GENRE adds, dispatched by its name rather than by its copy profile.
+
+    BY NAME, AND NOT BY PROFILE. A profile says what a family's answers are and therefore
+    which maps a copy screen prices, and two families can share one and have nothing else
+    in common: island counts and ledger's band names are both tokens of a complete
+    published vocabulary, and a geometry audit run over a ledger table would be asking a
+    schedule of dates whether its boards are on the board. So the profile brings the copy
+    family, and a genre brings the evidence its own hidden function needs.
+
+    These are mandatory. They run wherever the eleven common checks run, which is every
+    admission report and therefore every bank fill and every bundle reverification, and a
+    family whose geometry check fails is not admitted on the strength of the common ones.
+    """
+    if getattr(generator, "name", "") != "components":
+        return []
+    from shogym.envs.receipts.generators import components_audit
+
+    return [
+        (name, partial(run, generator, instance))
+        for name, run in components_audit.CHECKS
+    ]
+
+
 def run_checks(
     generator: Generator,
     instance: Instance,
@@ -1071,11 +1104,13 @@ def run_checks(
         ("invariance", lambda: check_invariance(generator, instance)),
     ]
     planned.extend(profile_checks(generator, instance))
+    planned.extend(genre_checks(generator, instance))
     return [_guarded(name, run) for name, run in planned]
 
 
 __all__ = [
     "COPY_MAPS",
+    "genre_checks",
     "profile_checks",
     "NO_INDUCTION_MAPS",
     "REDUCED_MAPS",

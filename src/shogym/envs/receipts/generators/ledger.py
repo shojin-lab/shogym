@@ -609,14 +609,13 @@ RECEIPT_SENTENCE: tuple[str, ...] = (
 
 
 def receipt_sentence(policy: ReceiptPolicy) -> str:
-    """The registered sentence for this policy, as the description prints it.
+    """This genre's registered sentence, under the rule `filing` holds for every genre.
 
-    Empty under the full receipt, which promises a verdict and a correction on every
-    record and therefore has nothing to qualify.
+    The words are this module's, because they name records and bands. When they are
+    printed and that they are the same bytes under every convention is not this module's
+    and is not repeated here.
     """
-    if not policy.samples:
-        return ""
-    return "\n" + "\n".join(RECEIPT_SENTENCE) + "\n"
+    return shared_filing.receipt_sentence(policy, RECEIPT_SENTENCE)
 
 
 #: WHICH SCHEDULES SHARE A CONVENTION, SAID IN THE TASK ITSELF.

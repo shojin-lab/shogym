@@ -9,7 +9,7 @@ from __future__ import annotations
 
 import pytest
 
-from shogym.envs.receipts import admission, checks
+from shogym.envs.receipts import admission, checks, copy_profiles
 from shogym.envs.receipts.generators.ledger import GENERATOR
 from shogym.envs.receipts.protocol import draw
 from shogym.envs.receipts.registry import load_generator
@@ -269,6 +269,74 @@ def test_a_draw_a_composed_row_move_copies_is_excluded() -> None:
     report = admission.report(GENERATOR, instance, MASTER, admission.Thresholds())
     assert "copy" in report.failed_checks
     assert not report.admitted
+
+
+def test_a_draw_whose_a_key_holds_blank_answers_is_excluded() -> None:
+    """A blank answer is an answer, and the draw that lost it is kept as the regression.
+
+    Under the `blank` option on the `missing` axis, A's key holds the empty band on its
+    undated rows. The filed map sends every answer A filed into B's published band
+    order, the blank one included, and with the rank map and a row move it earns 13 of
+    24 on this draw. Reading the blank as a row with no answer took it out of the filed
+    map, the closure fell to 10 of 24 and the bar admitted the draw.
+    """
+    instance = _instance(135)
+    assert instance.convention["missing"] == "blank"
+    assert "" in instance.a.key
+    scores = checks.copy_scores(GENERATOR, instance)
+    assert scores["closure"] == round(13 / 24, 6)
+    assert scores["relabel"] == round(9 / 24, 6)
+    report = admission.report(GENERATOR, instance, MASTER, admission.Thresholds())
+    assert "copy" in report.failed_checks
+    assert not report.admitted
+
+
+def test_a_blank_answer_is_relabelled_and_an_unreported_row_is_not() -> None:
+    """The empty string is a value the maps carry. An unreported position is not a value.
+
+    A blank A filed is a token like any other, so the filed map sends it into the
+    published target order and it is in the set the maps are closed over. A row the
+    receipt said nothing about is neither: no registered map moves it, no map sends
+    anything to it, and it is the same unreported row in every filing the family makes.
+    """
+    values = ["low", "", copy_profiles.UNREPORTED, "high", ""]
+    source_ranks = ["low", "mid", "high"]
+    target_ranks = ["one", "two", "three"]
+    width = len(values)
+
+    relabels = copy_profiles.token_relabellings(values, source_ranks, target_ranks, width)
+    assert any(filing[1] in target_ranks for filing in relabels)
+    assert all(filing[2] is copy_profiles.UNREPORTED for filing in relabels)
+    assert all(
+        value is not copy_profiles.UNREPORTED
+        for filing in relabels
+        for row, value in enumerate(filing)
+        if row != 2
+    )
+
+    maps = copy_profiles.token_maps(values, source_ranks, target_ranks)
+    assert all("" in table for table in maps)
+    assert all(copy_profiles.UNREPORTED not in table for table in maps)
+
+    # A's whole key is answers alone, and the maps over it are the same maps as over
+    # the answers the reduced filing holds, because the unreported row adds no token.
+    answers_only = [value for value in values if value is not copy_profiles.UNREPORTED]
+    assert copy_profiles.token_maps(answers_only, source_ranks, target_ranks) == maps
+
+
+def test_the_selected_transfer_files_only_the_rows_the_receipt_reported() -> None:
+    """A row the receipt said nothing about is left unfiled, not filed as a blank.
+
+    On a draw whose rule leaves undated rows blank, B's key holds blanks too, and a
+    filing that put a blank at every unreported row was credited on B's blank rows with
+    answers the reader never gave. Filed as omissions, those rows earn nothing, so the
+    transfer from the reported answers alone can earn at most one row per reported row.
+    """
+    instance = _instance(135)
+    assert "" in instance.b.key
+    width = len(instance.b.key)
+    selected = checks.reduced_copy_scores(GENERATOR, instance)["selected"]
+    assert selected <= round(len(instance.a.mask) / width, 6)
 
 
 def test_the_copy_bar_is_read_against_the_closure_and_not_a_sub_family() -> None:

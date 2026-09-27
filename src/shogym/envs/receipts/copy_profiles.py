@@ -40,7 +40,7 @@ product of two commuting closed families is closed.
 from __future__ import annotations
 
 import itertools
-from typing import Iterable, Mapping, Sequence
+from typing import Iterable, Mapping, Sequence, TypeVar, cast
 
 #: The declared profiles. A generator names one of these and nothing else.
 ORDERED_TOKENS = "ordered_tokens"
@@ -58,6 +58,23 @@ CONSUMES_RANKS = {ORDERED_TOKENS: True, SOUNDCHANGE_V1: False}
 #: the symbols whose identity the hidden rule chooses.
 DELETABLE_VOWELS = ("a", "e", "i")
 REPLACEMENT_PHONES = ("g", "x", "s")
+
+#: A POSITION THE READER HOLDS NO ANSWER FOR, and it is not the empty string. A family
+#: whose rule can leave a row blank publishes the empty string as a legal answer:
+#: ledger's `missing` axis has a `blank` option, A's key then holds "" on its undated
+#: rows, and a map that sends those rows into one of B's published bands is a map an
+#: agent builds from what it filed and the printed band table. An unreported position
+#: is a row a reduced receipt said nothing about. No registered map moves it, it is
+#: not a token the maps are closed over, and a filing leaves it unfiled rather than
+#: filing a blank answer there. It is None, so the code below finds it with `is None`
+#: and the type of a filing says whether it can hold one.
+UNREPORTED = None
+
+#: A filing's values: answers alone, or answers with unreported positions among them.
+#: Every move here keeps the kind it was given, so A's whole key comes back as answers
+#: and never as something a scorer has to check for a missing value. The casts below
+#: say this to the type checker where a mapped value is built from a narrowed one.
+Value = TypeVar("Value", str, str | None)
 
 
 def profile_of(generator) -> str:
@@ -120,13 +137,13 @@ def answer_ranks_for(generator, table) -> tuple[str, ...] | None:
 # --------------------------------------------------------------------------
 
 
-def fit(values: Sequence[str], width: int) -> list[str]:
+def fit(values: Sequence[Value], width: int) -> list[Value]:
     """A filing for B of the right length, whatever A's row count was."""
-    padded = list(values) + [""] * width
+    padded = list(values) + [cast(Value, "")] * width
     return padded[:width]
 
 
-def distinct(filings: Iterable[Sequence[str]]) -> list[list[str]]:
+def distinct(filings: Iterable[Sequence[Value]]) -> list[list[Value]]:
     """The same filings with the repeats dropped, in the order they first appeared.
 
     A closed family names one filing many ways: the row move that undoes a rotation of
@@ -134,13 +151,13 @@ def distinct(filings: Iterable[Sequence[str]]) -> list[list[str]]:
     Scoring each of those again costs a parse and decides nothing, and the maximum is
     over the set rather than over the enumeration.
     """
-    seen: dict[tuple[str, ...], list[str]] = {}
+    seen: dict[tuple[Value, ...], list[Value]] = {}
     for filing in filings:
         seen.setdefault(tuple(filing), list(filing))
     return list(seen.values())
 
 
-def permutations(values: Sequence[str], width: int) -> list[list[str]]:
+def permutations(values: Sequence[Value], width: int) -> list[list[Value]]:
     """The registered row moves, as the CLOSED family the two generators produce.
 
     The generators are the rotation and the reversal, and a family that listed only
@@ -155,7 +172,7 @@ def permutations(values: Sequence[str], width: int) -> list[list[str]]:
     """
     fitted = fit(values, width)
     reversed_fitted = list(reversed(fitted))
-    out: list[list[str]] = []
+    out: list[list[Value]] = []
     for base in (fitted, reversed_fitted):
         for shift in range(max(len(base), 1)):
             out.append(list(base[shift:]) + list(base[:shift]))
@@ -168,7 +185,7 @@ def permutations(values: Sequence[str], width: int) -> list[list[str]]:
 
 
 def token_generators(
-    values: Sequence[str],
+    values: Sequence[str | None],
     source_ranks: Sequence[str],
     target_ranks: Sequence[str],
 ) -> list[dict[str, str]]:
@@ -193,10 +210,17 @@ def token_generators(
     which `token_maps` computes.
     """
     out: list[dict[str, str]] = []
+    # AN UNREPORTED POSITION IS NOT AN ANSWER THE AGENT FILED. A reduced filing holds a
+    # value at the rows the receipt reported and UNREPORTED at the rest, which are rows
+    # the reader has no token for. Counting that as a filed answer would register a map
+    # that carries it into a published band, which credits the reader with a value at a
+    # row it knows nothing about. The empty string is different: where a family's rule
+    # can leave a row blank it is an answer A's key holds, and it is filed like any other.
+    filed = sorted(token for token in set(values) if token is not None)
     for source, into in (
         (list(source_ranks), list(target_ranks)),
         (sorted(set(source_ranks)), sorted(set(target_ranks))),
-        (sorted(set(values)), sorted(set(target_ranks))),
+        (filed, sorted(set(target_ranks))),
     ):
         if not source or not into:
             continue
@@ -206,7 +230,7 @@ def token_generators(
 
 
 def token_maps(
-    values: Sequence[str],
+    values: Sequence[str | None],
     source_ranks: Sequence[str],
     target_ranks: Sequence[str],
 ) -> list[dict[str, str]]:
@@ -229,7 +253,16 @@ def token_maps(
     is closed, so nothing an agent can build by chaining registered dictionaries is
     outside what the screen prices.
     """
-    universe = sorted(set(values) | set(source_ranks) | set(target_ranks))
+    # AN UNREPORTED POSITION IS NOT A TOKEN, so no registered map moves it and it is
+    # not in the set the maps are closed over. Putting it in the universe would price
+    # maps that carry a row the reader has no answer for into a band, which is a map
+    # nobody can build from two printed lists. A legal blank answer stays in: it is a
+    # value A's key holds, and the filed map carries it like any other.
+    universe = sorted(
+        token
+        for token in set(values) | set(source_ranks) | set(target_ranks)
+        if token is not None
+    )
     if not universe:
         return [{}]
     position = {token: n for n, token in enumerate(universe)}
@@ -266,21 +299,53 @@ def token_maps(
 
 
 def token_relabellings(
-    values: Sequence[str],
+    values: Sequence[Value],
     source_ranks: Sequence[str],
     target_ranks: Sequence[str],
     width: int,
-) -> list[list[str]]:
+) -> list[list[Value]]:
     """Every filing the closed token family can make of A's answers, deduplicated.
 
     The identity is among the maps, so the untouched filing leads the list and
     composing this with the row moves produces those moves themselves.
+
+    THE ORBIT OF THE FILING, NOT THE MONOID OF MAPS, and the two give the same set. A
+    composition applied to a filing is the first dictionary applied to it and then the
+    next, so closing the FILINGS under the registered dictionaries reaches exactly what
+    closing the dictionaries first and applying each would. What it does not do is build
+    the monoid: where two published vocabularies are the same six tokens and one
+    registered dictionary is not injective, that monoid runs to tens of thousands of
+    maps which between them make a few dozen filings, and closing it took a quarter of
+    an hour on one reduced filing. `token_maps` remains the statement of what the family
+    IS, and this is the family as it reaches a filing.
+
+    An unreported position stays where it is and stays unreported under every map.
     """
-    seen: dict[tuple[str, ...], list[str]] = {}
-    for table in token_maps(values, source_ranks, target_ranks):
-        filing = fit([table.get(value, value) for value in values], width)
-        seen.setdefault(tuple(filing), filing)
+    generators = token_generators(values, source_ranks, target_ranks)
+    start = list(values)
+    reached: dict[tuple[Value, ...], list[Value]] = {tuple(start): start}
+    frontier = [start]
+    while frontier:
+        fresh: list[list[Value]] = []
+        for filing in frontier:
+            for table in generators:
+                made = [_relabel(table, value) for value in filing]
+                if tuple(made) not in reached:
+                    reached[tuple(made)] = made
+                    fresh.append(made)
+        frontier = fresh
+    seen: dict[tuple[Value, ...], list[Value]] = {}
+    for filing in reached.values():
+        fitted = fit(filing, width)
+        seen.setdefault(tuple(fitted), fitted)
     return list(seen.values())
+
+
+def _relabel(table: Mapping[str, str], value: Value) -> Value:
+    """One dictionary applied to one value, leaving an unreported position alone."""
+    if value is None:
+        return value
+    return cast(Value, table.get(value, value))
 
 
 # --------------------------------------------------------------------------
@@ -317,17 +382,25 @@ def apply_characters(table: Mapping[str, str], value: str) -> str:
     return "".join(table.get(character, character) for character in value)
 
 
-def character_relabellings(values: Sequence[str], width: int) -> list[list[str]]:
+def character_relabellings(values: Sequence[Value], width: int) -> list[list[Value]]:
     """Every filing the closed character family can make of A's answers, deduplicated.
 
     The identity map leads, so the untouched filing leads the list and composing this
-    with the row moves produces those moves themselves.
+    with the row moves produces those moves themselves. An unreported position stays
+    unreported under every map.
     """
-    seen: dict[tuple[str, ...], list[str]] = {}
+    seen: dict[tuple[Value, ...], list[Value]] = {}
     for table in character_maps():
-        filing = fit([apply_characters(table, value) for value in values], width)
+        filing = fit([_characters(table, value) for value in values], width)
         seen.setdefault(tuple(filing), filing)
     return list(seen.values())
+
+
+def _characters(table: Mapping[str, str], value: Value) -> Value:
+    """One character map applied to one value, leaving an unreported position alone."""
+    if value is None:
+        return value
+    return cast(Value, apply_characters(table, value))
 
 
 # --------------------------------------------------------------------------
@@ -336,8 +409,8 @@ def character_relabellings(values: Sequence[str], width: int) -> list[list[str]]
 
 
 def relabellings(
-    generator, instance, values: Sequence[str], width: int
-) -> list[list[str]]:
+    generator, instance, values: Sequence[Value], width: int
+) -> list[list[Value]]:
     """Every filing this family's registered value maps can make of A's answers.
 
     Dispatched on the DECLARED profile, so a family whose answers are words is never
@@ -363,6 +436,8 @@ __all__ = [
     "PROFILES",
     "REPLACEMENT_PHONES",
     "SOUNDCHANGE_V1",
+    "UNREPORTED",
+    "Value",
     "answer_ranks_for",
     "apply_characters",
     "character_maps",
