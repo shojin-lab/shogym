@@ -97,8 +97,12 @@ def frozen_bundle(tmp_path_factory: pytest.TempPathFactory) -> Path:
 
     This module's own copy of the process's verified template, under a room no other module
     writes into: what an environment opened on it forks and seals goes beside it.
+
+    The template of one instance, because every test here serves task 0 at position 0, and a
+    bank of one holds that instance. Its bank is filled under the fixed key the one-instance
+    template names, so every walk over it is one report.
     """
-    return private_bundle(tmp_path_factory.mktemp("bundles"))
+    return private_bundle(tmp_path_factory.mktemp("bundles"), size=1)
 
 
 async def _episode(frozen_bundle: Path, tmp_path: Path, task: int = 0) -> ServedEpisode:
