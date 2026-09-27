@@ -26,6 +26,13 @@ from shogym.serve import ServedEpisode
 from tests._fixtures.receipts_bundle import ONE_INSTANCE_MASTER, private_bundle
 
 
+#: The tests that read ``frozen_bundle``, as one group. Under ``--dist loadgroup`` a group goes to
+#: one worker, so the verified template and this module's copy of it are made there once, rather
+#: than on every worker that happens to draw one of these tests. The other tests stay free to go
+#: anywhere.
+SHARES_FROZEN_BUNDLE = pytest.mark.xdist_group("receipts-served-frozen-bundle")
+
+
 @pytest.fixture(scope="module")
 def frozen_bundle(tmp_path_factory: pytest.TempPathFactory) -> Path:
     """One admission bundle that actually verifies, shared by the module.
@@ -80,6 +87,7 @@ def _filing(env: ReceiptsV1Env, ordinal: int, side: str = "a") -> str:
     )
 
 
+@SHARES_FROZEN_BUNDLE
 async def test_describe_surfaces_the_schedule_and_the_filing_tool(
     frozen_bundle: Path, tmp_path: Path
 ) -> None:
@@ -98,6 +106,7 @@ async def test_describe_surfaces_the_schedule_and_the_filing_tool(
         await episode.close()
 
 
+@SHARES_FROZEN_BUNDLE
 async def test_the_task_spec_carries_no_convention_and_no_answer(
     frozen_bundle: Path, tmp_path: Path
 ) -> None:
@@ -130,6 +139,7 @@ async def test_the_task_spec_carries_no_convention_and_no_answer(
         await episode.close()
 
 
+@SHARES_FROZEN_BUNDLE
 async def test_a_correct_filing_scores_one_and_the_content_carries_no_verdict(
     frozen_bundle: Path, tmp_path: Path
 ) -> None:
@@ -151,6 +161,7 @@ async def test_a_correct_filing_scores_one_and_the_content_carries_no_verdict(
         await episode.close()
 
 
+@SHARES_FROZEN_BUNDLE
 async def test_the_whole_terminal_result_carries_no_verdict_on_either_channel(
     frozen_bundle: Path, tmp_path: Path
 ) -> None:
@@ -200,6 +211,7 @@ async def test_the_whole_terminal_result_carries_no_verdict_on_either_channel(
         await episode.close()
 
 
+@SHARES_FROZEN_BUNDLE
 async def test_a_partial_filing_scores_the_fraction_it_got_right(
     frozen_bundle: Path, tmp_path: Path
 ) -> None:
@@ -219,6 +231,7 @@ async def test_a_partial_filing_scores_the_fraction_it_got_right(
         await episode.close()
 
 
+@SHARES_FROZEN_BUNDLE
 async def test_a_filing_carrying_bytes_the_serializer_refuses_still_seals(
     frozen_bundle: Path, tmp_path: Path
 ) -> None:
@@ -249,6 +262,7 @@ async def test_a_filing_carrying_bytes_the_serializer_refuses_still_seals(
 
 
 @pytest.mark.parametrize("value", ["\ud800", "\udfff"], ids=["high", "low"])
+@SHARES_FROZEN_BUNDLE
 async def test_a_lone_surrogate_seals_and_commits_a_fork(
     frozen_bundle: Path, tmp_path: Path, value: str
 ) -> None:
@@ -280,6 +294,7 @@ async def test_a_lone_surrogate_seals_and_commits_a_fork(
     assert len(set(forks.rglob("fork-*.json")) - before) == 1
 
 
+@SHARES_FROZEN_BUNDLE
 async def test_a_failure_inside_finalize_leaves_grade_error_and_no_fork(
     frozen_bundle: Path, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -310,6 +325,7 @@ async def test_a_failure_inside_finalize_leaves_grade_error_and_no_fork(
     assert set(forks.rglob("fork-*.json")) == before
 
 
+@SHARES_FROZEN_BUNDLE
 async def test_a_core_verifier_failure_leaves_a_committed_fork_and_no_feedback(
     frozen_bundle: Path, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -342,6 +358,7 @@ async def test_a_core_verifier_failure_leaves_a_committed_fork_and_no_feedback(
     assert len(set(forks.rglob("fork-*.json")) - before) == 1
 
 
+@SHARES_FROZEN_BUNDLE
 async def test_an_unreadable_filing_is_reason_coded_not_a_low_score(
     frozen_bundle: Path, tmp_path: Path
 ) -> None:
@@ -356,6 +373,7 @@ async def test_an_unreadable_filing_is_reason_coded_not_a_low_score(
         await episode.close()
 
 
+@SHARES_FROZEN_BUNDLE
 async def test_terminating_without_filing_records_that_none_arrived(
     frozen_bundle: Path, tmp_path: Path
 ) -> None:
@@ -370,6 +388,7 @@ async def test_terminating_without_filing_records_that_none_arrived(
         await episode.close()
 
 
+@SHARES_FROZEN_BUNDLE
 async def test_side_b_files_and_seals_through_the_same_path(
     frozen_bundle: Path, tmp_path: Path
 ) -> None:
@@ -402,6 +421,7 @@ async def test_side_b_files_and_seals_through_the_same_path(
         await episode.close()
 
 
+@SHARES_FROZEN_BUNDLE
 async def test_a_second_seal_replays_the_fork_it_wrote_outside_the_bundle(
     frozen_bundle: Path, tmp_path: Path
 ) -> None:
@@ -440,6 +460,7 @@ async def test_a_second_seal_replays_the_fork_it_wrote_outside_the_bundle(
             assert frozen_bundle not in fresh[0].parents
 
 
+@SHARES_FROZEN_BUNDLE
 def test_the_instructions_promise_nothing_about_feedback(frozen_bundle: Path) -> None:
     """Whether a score comes back is the schedule's business, not the task body's.
 
@@ -455,6 +476,7 @@ def test_the_instructions_promise_nothing_about_feedback(frozen_bundle: Path) ->
     assert "feedback" not in published.lower()
 
 
+@SHARES_FROZEN_BUNDLE
 def test_a_second_open_of_one_bundle_reuses_the_first_verification(
     frozen_bundle: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -491,6 +513,7 @@ def test_a_second_open_of_one_bundle_reuses_the_first_verification(
     assert first.instance(ordinal) is second.instance(ordinal)
 
 
+@SHARES_FROZEN_BUNDLE
 def test_another_bundle_or_moved_code_misses_the_cache(
     frozen_bundle: Path, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -534,6 +557,7 @@ def test_another_bundle_or_moved_code_misses_the_cache(
     assert hashed, "moved code reopens rather than answering from the old verification"
 
 
+@SHARES_FROZEN_BUNDLE
 def test_one_relative_name_in_two_directories_is_two_bundles(
     frozen_bundle: Path, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -640,6 +664,7 @@ def test_a_bundle_edited_after_it_was_opened_is_refused_by_the_next_process(
     assert "ValueError" in fresh.stdout
 
 
+@SHARES_FROZEN_BUNDLE
 def test_the_two_sides_are_two_envs_over_one_convention(frozen_bundle: Path) -> None:
     side_a = ReceiptsV1Env(**_config(frozen_bundle, "a"))
     side_b = ReceiptsV1Env(**_config(frozen_bundle, "b"))
@@ -649,11 +674,13 @@ def test_the_two_sides_are_two_envs_over_one_convention(frozen_bundle: Path) -> 
     assert side_a.dealable
 
 
+@SHARES_FROZEN_BUNDLE
 def test_the_env_refuses_a_side_that_is_not_a_or_b(frozen_bundle: Path) -> None:
     with pytest.raises(ValueError, match="sides a and b"):
         ReceiptsV1Env(bundle=str(frozen_bundle), side="c")
 
 
+@SHARES_FROZEN_BUNDLE
 async def test_the_terminal_reports_the_rows_the_filing_named(
     frozen_bundle: Path, tmp_path: Path
 ) -> None:
@@ -706,6 +733,7 @@ def test_the_environment_refuses_a_bank_that_was_never_bundled(
     assert dev.num_tasks == 2
 
 
+@SHARES_FROZEN_BUNDLE
 def test_the_published_task_id_is_the_opaque_one(frozen_bundle: Path) -> None:
     """The selector stays controller-side; what goes out encodes no ordinal."""
     env = ReceiptsV1Env(bundle=str(frozen_bundle))

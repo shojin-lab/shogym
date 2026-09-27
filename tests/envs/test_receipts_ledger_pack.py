@@ -80,6 +80,12 @@ def _screen_artifact(pairs: int = 40) -> dict:
     }
 
 
+#: The tests that read ``complete``, as one group. Under ``--dist loadgroup`` a group goes to one
+#: worker, so the filled bank and what is built over it are made there once, rather than on every
+#: worker that happens to draw one of these tests. The other tests stay free to go anywhere.
+SHARES_COMPLETE = pytest.mark.xdist_group("receipts-ledger-pack-complete")
+
+
 @pytest.fixture(scope="module")
 def complete(tmp_path_factory: pytest.TempPathFactory):
     """One small complete bank of this genre and the pack exported from it.
@@ -104,6 +110,7 @@ def _rows(cell: str) -> dict[int, str]:
     return out
 
 
+@SHARES_COMPLETE
 def test_the_review_pack_covers_the_family_and_names_no_reviewer(complete) -> None:
     """What the exported pack has to contain, and the one thing it must not.
 
@@ -174,6 +181,7 @@ def test_the_review_pack_covers_the_family_and_names_no_reviewer(complete) -> No
         }
 
 
+@SHARES_COMPLETE
 def test_the_pack_shows_what_a_receipt_of_four_records_does(complete) -> None:
     """The eleven a sampled family's pack has to carry, in this genre's own records.
 
@@ -229,6 +237,7 @@ def test_the_pack_shows_what_a_receipt_of_four_records_does(complete) -> None:
     assert "records of the schedule this reader files next" in aliased
 
 
+@SHARES_COMPLETE
 def test_the_identical_receipts_document_states_what_its_named_pair_costs(
     complete,
 ) -> None:
@@ -270,6 +279,7 @@ def test_the_identical_receipts_document_states_what_its_named_pair_costs(
     assert (cost, len(keys[0]), len(members)) == (4, ledger.SHAPE.rows, 9)
 
 
+@SHARES_COMPLETE
 def test_the_unwitnessed_example_reports_no_record_without_dates(complete) -> None:
     """The two witness documents show the missing-record class present, then absent.
 
@@ -357,6 +367,7 @@ def test_a_bank_that_cannot_exhibit_a_case_is_refused_by_name(tmp_path: Path) ->
     assert not (tmp_path / "empty").exists()
 
 
+@SHARES_COMPLETE
 def test_the_export_is_the_same_bytes_twice(complete, tmp_path: Path) -> None:
     """One bank exports one pack, so two readers are looking at one document.
 
@@ -386,6 +397,7 @@ def test_the_export_is_the_same_bytes_twice(complete, tmp_path: Path) -> None:
         ledger_review.export(bank, held, twice)
 
 
+@SHARES_COMPLETE
 def test_the_exporter_renders_only_conventions_the_family_declares(complete) -> None:
     """Every convention the pack shows comes from the declared support, not from the draw.
 
@@ -457,6 +469,7 @@ def test_the_exporter_renders_only_conventions_the_family_declares(complete) -> 
             assert (root / entry["path"]).stat().st_size == ledger.ENVELOPE_SIZE
 
 
+@SHARES_COMPLETE
 def test_the_pack_verifies_through_a_bundle_once_a_person_has_signed_it(
     complete, tmp_path: Path
 ) -> None:
@@ -629,6 +642,7 @@ def test_the_screen_procedure_allocates_thirty_six_cases_over_four_states() -> N
     )
 
 
+@SHARES_COMPLETE
 def test_a_reader_can_render_an_instance_the_pack_did_not_cover(complete) -> None:
     """The one rendering route a reader is offered, so nobody reaches for a second one.
 

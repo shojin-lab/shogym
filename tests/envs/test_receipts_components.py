@@ -1107,6 +1107,12 @@ def _screen_artifact(pairs: int = 40) -> dict:
 PACK_MASTER = hashlib.sha256(b"components-review-pack-two-controls").digest()
 
 
+#: The tests that read ``frozen``, as one group. Under ``--dist loadgroup`` a group goes to one
+#: worker, so the filled bank and what is built over it are made there once, rather than on every
+#: worker that happens to draw one of these tests. The other tests stay free to go anywhere.
+SHARES_FROZEN = pytest.mark.xdist_group("receipts-components-frozen")
+
+
 @pytest.fixture(scope="module")
 def frozen(tmp_path_factory: pytest.TempPathFactory):
     """One small bank of this genre, its exported pack, and a bundle that verifies."""
@@ -1129,6 +1135,7 @@ def frozen(tmp_path_factory: pytest.TempPathFactory):
     return bank, held, built
 
 
+@SHARES_FROZEN
 def test_the_review_pack_covers_the_family_and_a_stale_pin_does_not_verify(
     frozen, tmp_path: Path
 ) -> None:
@@ -1225,6 +1232,7 @@ def test_the_review_pack_covers_the_family_and_a_stale_pin_does_not_verify(
     assert bundle_mod.verify(built, GENERATOR).problems == ()
 
 
+@SHARES_FROZEN
 async def test_a_filing_an_independent_validator_believes_seals_at_one(
     frozen, tmp_path: Path
 ) -> None:
@@ -1346,6 +1354,7 @@ def _screen_payload(model: str = "a model nobody ran here") -> dict[str, object]
     }
 
 
+@SHARES_FROZEN
 def test_the_pack_shows_every_filing_class_under_every_rule_on_both_siblings(
     frozen,
 ) -> None:
@@ -2199,6 +2208,7 @@ def test_the_task_says_which_two_rows_the_receipt_will_judge() -> None:
         assert other.a.text == instance.a.text
 
 
+@SHARES_FROZEN
 def test_the_pack_shows_what_a_receipt_of_two_rows_does(frozen, tmp_path: Path) -> None:
     """The eleven a sampled family's pack has to carry, in this genre's own rows.
 
@@ -2243,6 +2253,7 @@ def test_the_pack_shows_what_a_receipt_of_two_rows_does(frozen, tmp_path: Path) 
     assert "render the cell below byte for byte" in read[review.SAMPLED_CASES[10]]
 
 
+@SHARES_FROZEN
 def test_the_aliasing_document_states_what_its_named_pair_costs(
     frozen, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:

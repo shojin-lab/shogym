@@ -84,6 +84,13 @@ def seal_of(name: str) -> str:
     return sha256(name.encode("utf-8")).hexdigest()
 
 
+#: The tests that read ``frozen_bundle``, as one group. Under ``--dist loadgroup`` a group goes to
+#: one worker, so the verified template and this module's copy of it are made there once, rather
+#: than on every worker that happens to draw one of these tests. The other tests stay free to go
+#: anywhere.
+SHARES_FROZEN_BUNDLE = pytest.mark.xdist_group("receipts-artifact-frozen-bundle")
+
+
 @pytest.fixture(scope="module")
 def frozen_bundle(tmp_path_factory: pytest.TempPathFactory) -> Path:
     """One admission bundle that actually verifies, shared by the module.
@@ -193,6 +200,7 @@ def _rewrite(episode: ServedEpisode, seal_id: str, record: Dict[str, Any]) -> No
     path.write_text(json.dumps(record, sort_keys=True, separators=(",", ":")), encoding="utf-8")
 
 
+@SHARES_FROZEN_BUNDLE
 async def test_a_seal_under_a_contract_publishes_three_cells_and_a_descriptor_over_them(
     frozen_bundle: Path, tmp_path: Path
 ) -> None:
@@ -288,6 +296,7 @@ def test_the_cells_a_source_holds_are_the_cells_this_environment_renders() -> No
     assert ORACLE_CELL not in ELIGIBLE_CELLS
 
 
+@SHARES_FROZEN_BUNDLE
 async def test_a_seal_with_no_contract_publishes_no_descriptor(
     frozen_bundle: Path, tmp_path: Path
 ) -> None:
@@ -315,6 +324,7 @@ async def test_a_seal_with_no_contract_publishes_no_descriptor(
         await episode.close()
 
 
+@SHARES_FROZEN_BUNDLE
 async def test_a_generation_that_publishes_bodies_and_was_given_no_store_is_refused(
     frozen_bundle: Path, tmp_path: Path
 ) -> None:
@@ -335,6 +345,7 @@ async def test_a_generation_that_publishes_bodies_and_was_given_no_store_is_refu
         await episode.close()
 
 
+@SHARES_FROZEN_BUNDLE
 async def test_a_contract_this_environment_cannot_publish_under_is_refused_before_a_capture(
     frozen_bundle: Path, tmp_path: Path
 ) -> None:
@@ -372,6 +383,7 @@ async def test_a_contract_this_environment_cannot_publish_under_is_refused_befor
         await episode.close()
 
 
+@SHARES_FROZEN_BUNDLE
 async def test_a_retry_with_another_filing_and_no_world_returns_the_first_committed_source(
     frozen_bundle: Path, tmp_path: Path
 ) -> None:
@@ -408,6 +420,7 @@ async def test_a_retry_with_another_filing_and_no_world_returns_the_first_commit
         await episode.close()
 
 
+@SHARES_FROZEN_BUNDLE
 async def test_two_captures_exchanged_under_each_other_s_seal_are_refused_as_the_wrong_source(
     frozen_bundle: Path, tmp_path: Path
 ) -> None:
@@ -479,6 +492,7 @@ async def test_two_captures_exchanged_under_each_other_s_seal_are_refused_as_the
         await episode.close()
 
 
+@SHARES_FROZEN_BUNDLE
 async def test_a_bank_digest_and_a_blob_address_never_stand_in_for_one_another(
     frozen_bundle: Path, tmp_path: Path
 ) -> None:
@@ -529,6 +543,7 @@ async def test_a_bank_digest_and_a_blob_address_never_stand_in_for_one_another(
         await episode.close()
 
 
+@SHARES_FROZEN_BUNDLE
 async def test_two_raw_filings_with_one_canonical_text_share_a_submission_and_not_a_source(
     frozen_bundle: Path, tmp_path: Path
 ) -> None:
@@ -572,6 +587,7 @@ async def test_two_raw_filings_with_one_canonical_text_share_a_submission_and_no
         await episode.close()
 
 
+@SHARES_FROZEN_BUNDLE
 async def test_publication_interrupted_after_any_install_publishes_the_same_source(
     frozen_bundle: Path, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -694,6 +710,7 @@ def _counted(monkeypatch: pytest.MonkeyPatch) -> Dict[str, int]:
     return written
 
 
+@SHARES_FROZEN_BUNDLE
 async def test_a_renderer_a_contract_or_a_grade_that_drifted_under_a_capture_is_refused(
     frozen_bundle: Path, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -758,6 +775,7 @@ async def test_a_renderer_a_contract_or_a_grade_that_drifted_under_a_capture_is_
         await episode.close()
 
 
+@SHARES_FROZEN_BUNDLE
 async def test_a_held_record_this_build_cannot_read_is_refused_rather_than_repaired(
     frozen_bundle: Path, tmp_path: Path
 ) -> None:
@@ -829,6 +847,7 @@ def _as_text(name: str) -> Any:
     return doctor
 
 
+@SHARES_FROZEN_BUNDLE
 async def test_cells_that_stopped_being_a_pair_are_refused_at_publication(
     frozen_bundle: Path, tmp_path: Path
 ) -> None:
@@ -882,6 +901,7 @@ async def test_cells_that_stopped_being_a_pair_are_refused_at_publication(
         await episode.close()
 
 
+@SHARES_FROZEN_BUNDLE
 async def test_a_retry_after_the_capture_scores_nothing_and_renders_nothing_again(
     frozen_bundle: Path, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:

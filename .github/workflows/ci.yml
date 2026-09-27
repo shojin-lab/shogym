@@ -53,13 +53,14 @@ jobs:
       - name: Checkout
         uses: actions/checkout@v4
 
-      # The shard says what this job runs, what it needs prepared and whether it carries the lint
-      # and type checks. Every step below reads those variables and names no selection of its own,
-      # which is what keeps the partition a single fact: tests/test_ci_shards.py holds the same
-      # selections against the tests on disk and against what this job collected, in every
-      # one of these jobs, so a file no shard names and a job given the wrong paths both fail a
-      # test rather than quietly running in no job at all. tests/test_ci_partition.py holds every
-      # selection's collection against the suite's own, in the one job that can collect the tree.
+      # The shard says what this job runs, what it needs prepared, whether it carries the lint
+      # and type checks and how many workers it runs its tests on. Every step below reads those
+      # variables and names no selection of its own, which is what keeps the partition a single
+      # fact: tests/test_ci_shards.py holds the same selections against the tests on disk and
+      # against what this job collected, in every one of these jobs, so a file no shard names and
+      # a job given the wrong paths both fail a test rather than quietly running in no job at
+      # all. tests/test_ci_partition.py holds every selection's collection against the suite's
+      # own, in the one job that can collect the tree.
       - name: Read this shard's selection
         run: python3 tests/ci_shards.py github-env "${{ matrix.shard }}" >> "$GITHUB_ENV"
 
@@ -85,12 +86,10 @@ jobs:
       # whose job is fetching, instead of inside a run that calls itself offline. Nothing may skip
       # in this mode either, so a preparation that did not prepare says so.
       #
-      # It prepares this shard's assets and no others. Most of that material belongs to modules
-      # one shard holds: only the frontier selection runs a task container, and the receipt
-      # selections bind no upstream, read no domain data and start no test server, so their jobs
-      # ask for nothing and pay for nothing. The test server binary is the exception, asked for by
-      # two jobs, because the durable selection and four of the receipt modules in `rest` both
-      # serve a real generation over one.
+      # It prepares this shard's assets and no others. Each kind of material belongs to modules
+      # one shard holds: only the frontier selection runs a task container, only the durable
+      # selection starts a test server, and the receipt selections bind no upstream, read no domain
+      # data and start no test server, so their jobs ask for nothing and pay for nothing.
       - name: Prepare this shard's upstream sources, data and task images (networked)
         run: |
           env -u OPENAI_API_KEY SHOGYM_PROVISIONING=prepare \
@@ -124,15 +123,23 @@ jobs:
       # arguments rather than one. `--durations=25` leaves each shard's own slowest phases in its
       # own log, which is where the next partition will be read from, and the copy is what the
       # summary at the end counts outcomes out of.
+      #
+      # `-n` is this shard's worker count, and zero runs every test in this one process, which is
+      # what the selections that drive the test server, fork the interpreter or edit the package's
+      # source are given. `--dist loadgroup` sends the tests that share one module's bundle or bank
+      # to one worker together, so that bundle is built once; it does nothing when `-n` is zero.
+      # Neither flag lives in the pytest configuration, because the guard collects each selection
+      # by running pytest again and a worker count there would reach that collection too.
       - name: Run tests (offline, keyless)
         run: |
           set -o pipefail
           env -u OPENAI_API_KEY SHOGYM_PROVISIONING=offline \
-            uv run --no-sync pytest -q -m "not network" --durations=25 $SHOGYM_CI_PATHS \
+            uv run --no-sync pytest -q -m "not network" --durations=25 \
+            -n "$SHOGYM_CI_WORKERS" --dist loadgroup $SHOGYM_CI_PATHS \
             | tee "$RUNNER_TEMP/pytest.log"
 
-      # Once, in the shard that prepares nothing and finishes first, because the answer is about
-      # the checkout rather than about any selection and one answer is all it has.
+      # Once, in a shard that prepares nothing, because the answer is about the checkout rather
+      # than about any selection and one answer is all it has.
       - name: Lint (ruff)
         if: env.SHOGYM_CI_QUALITY == 'true'
         run: uv run ruff check .

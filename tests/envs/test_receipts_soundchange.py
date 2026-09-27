@@ -1313,6 +1313,12 @@ def _screen_artifact(pairs: int = 40) -> dict:
 PACK_MASTER = hashlib.sha256(b"soundchange-review-pack").digest()
 
 
+#: The tests that read ``frozen``, as one group. Under ``--dist loadgroup`` a group goes to one
+#: worker, so the filled bank and what is built over it are made there once, rather than on every
+#: worker that happens to draw one of these tests. The other tests stay free to go anywhere.
+SHARES_FROZEN = pytest.mark.xdist_group("receipts-soundchange-frozen")
+
+
 @pytest.fixture(scope="module")
 def frozen(tmp_path_factory: pytest.TempPathFactory):
     """One small bank of this genre, its exported pack, and a bundle that verifies."""
@@ -1334,6 +1340,7 @@ def frozen(tmp_path_factory: pytest.TempPathFactory):
     return bank, held, built
 
 
+@SHARES_FROZEN
 def test_the_review_pack_covers_the_family_and_names_no_reviewer(
     frozen, tmp_path: Path
 ) -> None:
@@ -1420,6 +1427,7 @@ def test_a_bank_missing_a_worksheet_case_is_refused_and_no_pack_is_written(
     assert not room.exists()
 
 
+@SHARES_FROZEN
 def test_a_frozen_bank_rebuilds_and_a_failed_new_check_is_not_dealable(frozen) -> None:
     """Replay, rebuild, and what happens when one of the added checks says no.
 
@@ -1485,6 +1493,7 @@ class _stub:
         setattr(self.module, self.name, self.held)
 
 
+@SHARES_FROZEN
 async def test_a_filing_an_independent_validator_believes_seals_at_one(
     frozen, tmp_path: Path
 ) -> None:
@@ -1565,6 +1574,7 @@ async def test_a_filing_an_independent_validator_believes_seals_at_one(
         await unread.close()
 
 
+@SHARES_FROZEN
 def test_the_pack_shows_what_a_receipt_of_two_forms_does(frozen, tmp_path: Path) -> None:
     """The eleven a sampled family's pack has to carry, in this genre's own rows.
 
@@ -1617,6 +1627,7 @@ def test_the_pack_shows_what_a_receipt_of_two_forms_does(frozen, tmp_path: Path)
     assert "disagree on" in aliased
 
 
+@SHARES_FROZEN
 def test_the_aliasing_document_states_what_its_named_pair_costs(
     frozen, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:

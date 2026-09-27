@@ -100,6 +100,13 @@ def seal_of(name: str) -> str:
     return sha256(name.encode("utf-8")).hexdigest()
 
 
+#: The tests that read ``frozen_bundle``, as one group. Under ``--dist loadgroup`` a group goes to
+#: one worker, so the verified template and this module's copy of it are made there once, rather
+#: than on every worker that happens to draw one of these tests. The other tests stay free to go
+#: anywhere.
+SHARES_FROZEN_BUNDLE = pytest.mark.xdist_group("receipts-protocol-v2-frozen-bundle")
+
+
 @pytest.fixture(scope="module")
 def frozen_bundle(tmp_path_factory: pytest.TempPathFactory) -> Path:
     """One admission bundle that actually verifies, shared by the module.
@@ -228,6 +235,7 @@ async def seal_and_grade(
     return sealed, graded
 
 
+@SHARES_FROZEN_BUNDLE
 async def test_the_environment_and_not_the_stand_in_is_what_a_generation_is_built_over(
     frozen_bundle: Path, tmp_path: Path
 ) -> None:
@@ -263,6 +271,7 @@ async def test_the_environment_and_not_the_stand_in_is_what_a_generation_is_buil
         await episode.close()
 
 
+@SHARES_FROZEN_BUNDLE
 def test_the_roster_is_one_position_for_every_sibling_of_every_family(
     frozen_bundle: Path,
 ) -> None:
@@ -298,6 +307,7 @@ def test_the_roster_is_one_position_for_every_sibling_of_every_family(
     )
 
 
+@SHARES_FROZEN_BUNDLE
 async def test_one_configuration_serves_both_siblings_of_a_family(
     frozen_bundle: Path, tmp_path: Path
 ) -> None:
@@ -328,6 +338,7 @@ async def test_one_configuration_serves_both_siblings_of_a_family(
         await first.close()
 
 
+@SHARES_FROZEN_BUNDLE
 async def test_a_filing_sealed_under_the_stream_scores_what_the_v1_path_scores(
     frozen_bundle: Path, tmp_path: Path
 ) -> None:
@@ -406,6 +417,7 @@ async def test_a_filing_sealed_under_the_stream_scores_what_the_v1_path_scores(
     assert read["nothing readable"]["no_filing"] == "no_known_identifier"
 
 
+@SHARES_FROZEN_BUNDLE
 async def test_a_filing_that_says_nothing_is_refused_rather_than_sealed(
     frozen_bundle: Path, tmp_path: Path
 ) -> None:
@@ -445,6 +457,7 @@ async def test_a_filing_that_says_nothing_is_refused_rather_than_sealed(
         await episode.close()
 
 
+@SHARES_FROZEN_BUNDLE
 async def test_the_acknowledgement_says_the_filing_landed_and_nothing_it_was_worth(
     frozen_bundle: Path, tmp_path: Path
 ) -> None:
@@ -483,6 +496,7 @@ async def test_the_acknowledgement_says_the_filing_landed_and_nothing_it_was_wor
     assert graded.score < 1.0
 
 
+@SHARES_FROZEN_BUNDLE
 async def test_a_retried_seal_returns_the_first_seals_numbers_and_renders_nothing_again(
     frozen_bundle: Path, tmp_path: Path
 ) -> None:
@@ -538,6 +552,7 @@ async def test_a_retried_seal_returns_the_first_seals_numbers_and_renders_nothin
     assert elsewhere.canonical_submission_text == first.canonical_submission_text
 
 
+@SHARES_FROZEN_BUNDLE
 async def test_two_seals_of_one_filing_arriving_together_render_the_fork_once(
     frozen_bundle: Path, tmp_path: Path
 ) -> None:
@@ -597,6 +612,7 @@ async def test_two_seals_of_one_filing_arriving_together_render_the_fork_once(
     assert cells[0] == cells[1]
 
 
+@SHARES_FROZEN_BUNDLE
 async def test_the_cells_are_kept_under_the_seal_that_rendered_them(
     frozen_bundle: Path, tmp_path: Path
 ) -> None:
@@ -682,6 +698,7 @@ def test_the_grade_publishes_the_score_and_whether_the_table_was_solved() -> Non
         check_grade_result(score=0.5, components={"solved": 0.5}, grade=RECEIPTS_GRADE)
 
 
+@SHARES_FROZEN_BUNDLE
 async def test_the_horizon_is_the_floor_because_the_filing_is_the_agents(
     frozen_bundle: Path, tmp_path: Path
 ) -> None:
@@ -708,6 +725,7 @@ async def test_the_horizon_is_the_floor_because_the_filing_is_the_agents(
         await episode.close()
 
 
+@SHARES_FROZEN_BUNDLE
 async def test_a_seal_that_arrives_after_the_world_was_let_go_refuses(
     frozen_bundle: Path, tmp_path: Path
 ) -> None:
@@ -766,6 +784,7 @@ async def test_a_seal_that_arrives_after_the_world_was_let_go_refuses(
         await elsewhere_now[1](grading)
 
 
+@SHARES_FROZEN_BUNDLE
 async def test_an_ordinary_generation_over_this_environment_may_publish_its_score(
     frozen_bundle: Path, tmp_path: Path
 ) -> None:

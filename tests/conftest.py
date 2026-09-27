@@ -1,19 +1,27 @@
 """Test-wide fixtures.
 
-Both of the ones here are about a directory rather than about any test. An episode opened without
+Every one of them is about a directory rather than about any test. An episode opened without
 a trace path resolves its finalization store to ``~/.cache/shogym/sessions``, which is shared by
 every session ever run on the machine and never pruned, so a suite run writes its records into the
 developer's own store and every later run reads them back. A suite that grows it is a suite that
-slowly poisons the machine it runs on. Wordle's sealed plays are the same kind of directory and
-get the same treatment.
+slowly poisons the machine it runs on. Wordle's sealed plays and the receipts banks and key history
+are the same kind of directory and get the same treatment.
+
+One hook is here as well, and it is about the CI guard rather than about a directory: it keeps the
+id each test was collected under, which a parallel worker renames when the test is grouped. See
+tests/_fixtures/node_ids.py.
 """
 
 from __future__ import annotations
 
 import pytest
 
+from shogym.envs.receipts.registry import BANK_DIR_VAR, HISTORY_VAR
 from shogym.envs.wordle import protocol_v2 as wordle_protocol_v2
 from shogym.serve import lifecycle
+
+# pytest finds a hook by its name in this module, so importing it here is what installs it.
+from tests._fixtures.node_ids import pytest_collection_modifyitems  # noqa: F401
 
 
 @pytest.fixture(autouse=True)
@@ -53,3 +61,24 @@ def _wordle_seals(
     root = tmp_path_factory.mktemp("wordle-seals")
     monkeypatch.setattr(wordle_protocol_v2, "seal_store_root", lambda: root)
     monkeypatch.setenv(wordle_protocol_v2.SEALS_ROOT_ENV_VAR, str(root))
+
+
+@pytest.fixture(autouse=True)
+def _receipt_banks(
+    monkeypatch: pytest.MonkeyPatch, tmp_path_factory: pytest.TempPathFactory
+) -> None:
+    """Point the receipts bank directory and key history at this test's own directory.
+
+    Left alone, both resolve under ``~/.cache/shogym/receipts``, which every run on the machine
+    shares and which the workers of one parallel run would share at once: one worker could read or
+    replace a bank another wrote, and every materialization would append to the developer's own
+    history. Per test, so no test reads another's banks. Side by side rather than one inside the
+    other, because the history is the record that does not move when the banks do.
+
+    Through the environment, because that is where the registry reads them and because a child
+    process inherits it. Through ``monkeypatch``, so a test that points them somewhere of its own
+    still can: it sets them after this does, on the same object, and both are undone together.
+    """
+    root = tmp_path_factory.mktemp("receipts")
+    monkeypatch.setenv(BANK_DIR_VAR, str(root / "banks"))
+    monkeypatch.setenv(HISTORY_VAR, str(root / "key-history.jsonl"))
