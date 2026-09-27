@@ -73,6 +73,24 @@ NO_FILING_REASONS = (
 )
 
 
+class ConstructionExhausted(RuntimeError):
+    """A generator's bounded search for a valid instance ran out.
+
+    IT IS NOT A SKIPPED ORDINAL. A generator that searches for a table its own filter
+    accepts can fail to find one, and the two ways of reporting that are not
+    interchangeable. An ordinary exception out of `build_table` reaches `bank.population`
+    outside the admission guard and leaves the caller with a traceback where it was
+    promised a count; treating it as a rejection would silently move the population,
+    because the bank would fill from later ordinals and the passing fraction it prints
+    would be measured against a different rule than the one it says it used.
+
+    So it has a name. Materialization stops on it and says which ordinal exhausted,
+    verification recognises it as the same whole-bank failure rather than as a bundle
+    that cannot be read, and the provenance record beside the bank keeps the key the
+    attempt was made under, so a failed attempt is reproducible instead of lost.
+    """
+
+
 @dataclass(frozen=True)
 class Axis:
     """One hidden decision: a name and an interchangeable option set."""
@@ -247,6 +265,12 @@ class Generator(Protocol):
     AXES: tuple[Axis, ...]
     #: Which of the registered scoring shapes this generator's `score` implements.
     SCORING: str
+    #: Which registered family of maps the copy screen prices this generator against.
+    #: Declared rather than inferred, and refused at registration when it is absent:
+    #: the bar and the family of maps it is a maximum over are one registration, so a
+    #: family priced under the wrong one reports a number that measured nothing.
+    #: `copy_profiles` holds the registered names and what each one enumerates.
+    COPY_PROFILE: str
 
     def surface_for(self, ordinal: int, label: str) -> str:
         """Which surface data pool this instance uses for side A or side B."""
@@ -353,15 +377,23 @@ class Generator(Protocol):
         """
         ...
 
-    def answer_ranks(self, table: Any) -> tuple[str, ...]:
+    def answer_ranks(self, table: Any) -> tuple[str, ...] | None:
         """The family's COMPLETE ordered legal answers for this table, as the task
-        publishes them.
+        publishes them, or None where the declared profile consumes none.
 
         Complete, and ordered, and public. The copy screen needs it because the
         cheapest transfer a reader can do is not lexical: it is to read the two band
         tables the two tasks print and map first to first. A screen that built its
         relabels from the tokens one drawn key happened to realize would miss that
         map entirely, and would call two vocabularies of different size a bijection.
+
+        NONE IS FOR A PROFILE THAT CONSUMES NO RANKS, and it is not the same as an
+        empty tuple. A family whose answers are whole invented words has no complete
+        ordered vocabulary to publish: an empty tuple would be a fictitious one, and a
+        list of the words one drawn key realized would be a transfer nobody could
+        perform. Such a family declares a profile whose maps are built from something
+        else and returns None here, which `copy_profiles` refuses to confuse with a
+        family that publishes ranks and forgot to.
         """
         ...
 
@@ -517,6 +549,7 @@ def option_mentions(axes: Sequence[Axis], text: str) -> list[tuple[str, str]]:
 __all__ = [
     "NO_FILING_REASONS",
     "Axis",
+    "ConstructionExhausted",
     "Column",
     "Filing",
     "Generator",

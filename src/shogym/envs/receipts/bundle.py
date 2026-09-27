@@ -46,6 +46,7 @@ from typing import Any, Mapping, Sequence
 from shogym.envs.receipts import bank as bank_mod
 from shogym.envs.receipts import streams
 from shogym.envs.receipts.protocol import Generator, Instance
+from shogym.envs.receipts.protocol import ConstructionExhausted
 from shogym.envs.receipts.review import identities, identity
 
 #: Bumped when the bundle's own layout changes. A bundle naming another version is
@@ -377,6 +378,13 @@ def verify(bundle: Bundle, generator: Generator) -> Verification:
         return Verification(digest=bundle.digest, problems=tuple(problems))
     try:
         held = bank_mod.population(bank, generator, thresholds)
+    except ConstructionExhausted as exc:
+        # The same named failure materialization reports, recognised here rather than
+        # arriving as an unspecified exception out of a verifier that promises a verdict.
+        # A bundle whose population cannot be constructed is a bundle that does not
+        # verify, and the reason a reader wants is which ordinal ran out.
+        problems.append(f"its population cannot be constructed: {exc}")
+        return Verification(digest=bundle.digest, problems=tuple(problems))
     except (KeyError, OverflowError, TypeError, ValueError) as exc:
         problems.append(f"its population does not recompute: {exc}")
         return Verification(digest=bundle.digest, problems=tuple(problems))
