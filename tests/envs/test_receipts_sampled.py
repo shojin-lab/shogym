@@ -13,6 +13,9 @@ state is a test nobody can act on.
 
 from __future__ import annotations
 
+import datetime as dt
+import json
+from pathlib import Path
 from types import MappingProxyType
 
 import pytest
@@ -48,6 +51,14 @@ from shogym.envs.receipts.render import (
 
 MASTER = bytes(range(32))
 ENVELOPE_BYTES = 2657
+
+#: The six ledger table pairs run 5 served, written once from that run's bank, with the
+#: ordinal each pair was drawn at. Each table is as the generator records it, less the
+#: schedule text, which no answer is read from. That run's key is not here and neither is
+#: any convention it drew.
+RUN_FIVE_TABLES = (
+    Path(__file__).resolve().parents[1] / "_fixtures" / "ledger_run_five_tables.json"
+)
 
 
 def _sampled():
@@ -668,39 +679,47 @@ def test_the_admitted_sampled_set_is_the_set_the_law_admits() -> None:
     assert overridden, "no drawn mask left a realized verdict for the law to override"
 
 
+def _ledger_table(record: dict) -> ledger.LedgerTable:
+    """A ledger table from its committed record, with an empty schedule text."""
+    return ledger.LedgerTable(
+        domain=record["domain"],
+        rows=tuple(
+            ledger.LedgerRow(
+                row_id=row["row_id"],
+                dates=None
+                if row["dates"] is None
+                else {name: dt.date.fromisoformat(day) for name, day in row["dates"].items()},
+            )
+            for row in record["rows"]
+        ),
+        holidays=tuple(dt.date.fromisoformat(day) for day in record["holidays"]),
+        body="",
+    )
+
+
 def _run_five_pairs():
-    """The six ledger table pairs run 5 served, rebuilt from its own bank.
+    """The six ledger table pairs run 5 served, drawn again around the committed tables.
 
-    Read-only, and skipped where that run is not on the machine. The bank names its
-    master key and its size and nothing else, so the pairs are a function of the key
-    and the ordinals its forks name; the tables do not depend on which gate set
-    admitted them, which is what makes the rebuild exact.
+    The tables are all that is taken from that run. Everything else about each instance
+    comes from this file's own key through the ordinary draw: the convention, the answer
+    keys, the masks and the task text. The law these tests read averages over every
+    reference convention and every mask, so its ideal level, its floor, its expected
+    count of consistent conventions and its mask count are functions of the two tables
+    alone, and they come out exactly as they do on the run's own draw.
     """
-    import json
-    import re
-    from pathlib import Path
+    frozen = json.loads(RUN_FIVE_TABLES.read_text(encoding="utf-8"))
+    tables = {
+        (pair["ordinal"], side.upper()): _ledger_table(pair[side])
+        for pair in frozen["pairs"]
+        for side in ("a", "b")
+    }
 
-    from shogym.envs.receipts import streams
+    class RunFiveTables(type(_sampled())):
+        def build_table(self, master: bytes, ordinal: int, label: str) -> ledger.LedgerTable:
+            return tables[(ordinal, label.upper())]
 
-    root = Path("/Users/andrew/deutero-runs/claude-code-sonnet-5/bank")
-    if not root.is_dir():
-        return None, ()
-    banks = sorted(root.glob("*/ledger-*.json"))
-    if not banks:
-        return None, ()
-    record = json.loads(banks[0].read_text(encoding="utf-8"))
-    master = bytes.fromhex(record["master"])
-    served: set[str] = set()
-    for path in banks[0].parent.rglob("fork-*.json"):
-        found = re.match(r"fork-([0-9a-f]{16})-", path.name)
-        if found:
-            served.add(found.group(1))
-    ordinals = [
-        ordinal
-        for ordinal in range(64)
-        if streams.task_identifier(master, "ledger", ordinal, "A") in served
-    ]
-    return master, tuple(ordinals)
+    generator = RunFiveTables()
+    return generator, [draw(generator, MASTER, pair["ordinal"]) for pair in frozen["pairs"]]
 
 
 def test_the_law_reproduces_the_consultation_on_the_run_five_tables() -> None:
@@ -720,11 +739,9 @@ def test_the_law_reproduces_the_consultation_on_the_run_five_tables() -> None:
     """
     from shogym.envs.receipts.receipt_law import bank_law, law_for
 
-    master, ordinals = _run_five_pairs()
-    if master is None or len(ordinals) != 6:
-        pytest.skip("the run 5 bank is not on this machine")
-    generator = _sampled()
-    laws = [law_for(generator, draw(generator, master, o), "a") for o in ordinals]
+    generator, instances = _run_five_pairs()
+    assert len(instances) == 6
+    laws = [law_for(generator, instance, "a") for instance in instances]
     band = bank_law(laws)
     assert abs(band.ideal - 0.817285062) < 5e-10
     assert abs(sum(law.compatible for law in laws) / len(laws) - 7.206182) < 0.001
@@ -756,16 +773,11 @@ def test_eight_reported_rows_are_refused_by_the_band() -> None:
     """
     from shogym.envs.receipts.receipt_law import bank_law, law_for
 
-    master, ordinals = _run_five_pairs()
-    if master is None or len(ordinals) != 6:
-        pytest.skip("the run 5 bank is not on this machine")
-    generator = _sampled()
+    generator, instances = _run_five_pairs()
     eight = ReceiptPolicy(
         name="sampled-8-of-24", shape="sampled-rows", reported=8, rows=24
     )
-    law = law_for(
-        generator, draw(generator, master, ordinals[0]), "a", policy=eight
-    )
+    law = law_for(generator, instances[0], "a", policy=eight)
     assert law.masks == 735471
     assert law.ideal > 0.90
     assert abs(law.ideal - 0.936706) < 1e-5
