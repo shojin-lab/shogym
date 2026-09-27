@@ -64,6 +64,7 @@ import os
 import re
 import subprocess
 import sys
+from collections import Counter
 from dataclasses import dataclass
 from functools import lru_cache
 from pathlib import Path
@@ -235,6 +236,9 @@ SHARDS: Tuple[Shard, ...] = (
             # The identity audit, here because this is the job that prepares the pinned upstream
             # sources, and the whole tests tree only collects where they are.
             "tests/test_ci_partition.py",
+            # The guard's own checks under the grouped scheduler. They are about its code rather
+            # than about any job's selection, so they run once rather than in every job.
+            "tests/test_ci_scheduling.py",
             "tests/test_cli.py",
             "tests/test_durable_service.py",
             "tests/test_env_grading.py",
@@ -352,7 +356,7 @@ class CollectionFailed(RuntimeError):
 
 
 @lru_cache(maxsize=None)
-def collect_ids(paths: Tuple[str, ...]) -> Tuple[str, ...]:
+def collect_ids(paths: Tuple[str, ...], root: Path = REPO_ROOT) -> Tuple[str, ...]:
     """The node ids ``paths`` collect under :data:`SUITE_MARKER`, in the order pytest collects them.
 
     A selection is the identities it collects rather than the files it names, because a job runs
@@ -363,7 +367,9 @@ def collect_ids(paths: Tuple[str, ...]) -> Tuple[str, ...]:
     Collection only, in a subprocess of this interpreter and from the repository root, so the
     answer costs a collection rather than the run it describes, and cached by paths because more
     than one check asks the same selection the same question. It writes nothing: no cache plugin
-    and no bytecode, so a check that reads the tests tree does not leave anything in it.
+    and no bytecode, so a check that reads the tests tree does not leave anything in it. It is
+    serial, since a collection never distributes, and ``root`` is another tree only for the checks
+    in :mod:`tests.test_ci_scheduling`, which build a small one of their own.
     """
     command = [
         sys.executable,
@@ -380,7 +386,7 @@ def collect_ids(paths: Tuple[str, ...]) -> Tuple[str, ...]:
     try:
         finished = subprocess.run(
             command,
-            cwd=REPO_ROOT,
+            cwd=root,
             capture_output=True,
             text=True,
             env={**os.environ, "PYTHONDONTWRITEBYTECODE": "1"},
@@ -416,6 +422,37 @@ def listing(ids: Iterable[str], limit: int = 8) -> str:
     if len(shown) <= limit:
         return ", ".join(shown)
     return ", ".join(shown[:limit]) + f", and {len(shown) - limit} more"
+
+
+def selection_problems(
+    name: str, collected: Sequence[str], expected: Iterable[str]
+) -> List[str]:
+    """What keeps the job called ``name`` from being its shard, or nothing when it is.
+
+    ``expected`` is what the shard's selection collects and ``collected`` is what the job
+    collected, each read as the id pytest collected it under, which a parallel worker renames when
+    the test is grouped (see tests/_fixtures/node_ids.py). Every id has to be collected once, and
+    the two have to be equal: a job that collected less dropped tests no other job runs, and a job
+    that collected more ran something twice or ran something that is not its own.
+    """
+    problems: List[str] = []
+    repeated = [node for node, times in Counter(collected).items() if times > 1]
+    if repeated:
+        problems.append(
+            f"the {name} job collected the same test more than once, and paid for it twice: "
+            f"{listing(repeated)}. Its pytest run was given a path more than once."
+        )
+    wanted = set(expected)
+    missing = wanted - set(collected)
+    strayed = set(collected) - wanted
+    if missing or strayed:
+        problems.append(
+            f"the {name} job did not collect its shard's selection. Named by the shard and not "
+            f"collected here, so run in no job at all: {listing(missing)}. Collected here and not "
+            f"named by the shard, so run twice or in the wrong one: {listing(strayed)}. Its pytest "
+            "run was given something other than the shard's selection."
+        )
+    return problems
 
 
 def _github_env(chosen: Shard) -> str:

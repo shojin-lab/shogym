@@ -21,6 +21,13 @@ less than its shard names, and what it dropped no other job collects either: tho
 running while every green job said the suite passed. Reading only whether what it collected
 belongs to its shard calls that run correct.
 
+A job that runs its tests in several processes collects the same identities under other names: a
+pytest-xdist worker under ``--dist loadgroup`` appends ``@`` and the group to the id of every test
+it groups. So the job's collection is read as the ids pytest collected, which
+tests/_fixtures/node_ids.py keeps before any renaming, and the equality is the same equality.
+:mod:`tests.test_ci_scheduling` holds this to a grouped run that collected everything and to one
+that collected less.
+
 The claim in identities across every job at once is :mod:`tests.test_ci_partition`, which
 collects the whole tests tree and each selection and holds them against the one. That
 needs a tree that collects, which is a job with the pinned upstream sources prepared, so it runs
@@ -34,17 +41,17 @@ a question about where its seconds should go.
 from __future__ import annotations
 
 import os
-from collections import Counter
 
 import pytest
 
+from tests._fixtures.node_ids import collected_as
 from tests.ci_shards import (
     GUARD,
     SHARDS,
     collect_ids,
-    listing,
     named_paths,
     owners,
+    selection_problems,
     shard,
     suite_test_files,
 )
@@ -84,8 +91,13 @@ def test_this_job_collected_exactly_what_its_shard_names(request: pytest.Fixture
     Without that variable there is no shard to be, which is every run a developer makes. What is
     left to read off the collection is then the weaker claim it can support: every file in it is
     named by exactly one selection, the guard excepted, which every selection carries.
+
+    Each test is read by the id it was collected under rather than by ``nodeid``, because a
+    parallel worker renames a grouped test and a serial collection does not. A parallel worker
+    also holds the whole collection rather than the share it was sent, so this reads the same
+    job whichever worker runs it.
     """
-    collected = [item.nodeid for item in request.session.items]
+    collected = [collected_as(item) for item in request.session.items]
     assert collected, "this run collected nothing, so it proves nothing about the partition"
 
     files = sorted({node.split("::")[0] for node in collected})
@@ -101,20 +113,8 @@ def test_this_job_collected_exactly_what_its_shard_names(request: pytest.Fixture
     if not name:
         return
 
-    repeated = [node for node, times in Counter(collected).items() if times > 1]
-    assert not repeated, (
-        f"the {name} job collected the same test more than once, and paid for it twice: "
-        f"{listing(repeated)}. Its pytest run was given a path more than once."
-    )
-    expected = set(collect_ids(shard(name).selection()))
-    missing = expected - set(collected)
-    strayed = set(collected) - expected
-    assert not missing and not strayed, (
-        f"the {name} job did not collect its shard's selection. Named by the shard and not "
-        f"collected here, so run in no job at all: {listing(missing)}. Collected here and not "
-        f"named by the shard, so run twice or in the wrong one: {listing(strayed)}. Its pytest "
-        "run was given something other than the shard's selection."
-    )
+    problems = selection_problems(name, collected, collect_ids(shard(name).selection()))
+    assert not problems, "\n".join(problems)
 
 
 def test_exactly_one_shard_carries_the_lint_and_type_checks() -> None:

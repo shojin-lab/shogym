@@ -6,6 +6,10 @@ every session ever run on the machine and never pruned, so a suite run writes it
 developer's own store and every later run reads them back. A suite that grows it is a suite that
 slowly poisons the machine it runs on. Wordle's sealed plays and the receipts banks and key history
 are the same kind of directory and get the same treatment.
+
+One hook is here as well, and it is about the CI guard rather than about a directory: it keeps the
+id each test was collected under, which a parallel worker renames when the test is grouped. See
+tests/_fixtures/node_ids.py.
 """
 
 from __future__ import annotations
@@ -15,6 +19,9 @@ import pytest
 from shogym.envs.receipts.registry import BANK_DIR_VAR, HISTORY_VAR
 from shogym.envs.wordle import protocol_v2 as wordle_protocol_v2
 from shogym.serve import lifecycle
+
+# pytest finds a hook by its name in this module, so importing it here is what installs it.
+from tests._fixtures.node_ids import pytest_collection_modifyitems  # noqa: F401
 
 
 @pytest.fixture(autouse=True)
