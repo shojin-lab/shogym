@@ -11,6 +11,7 @@ import inspect
 import itertools
 import json
 import random
+import re
 import shutil
 import sys
 import threading
@@ -1614,3 +1615,56 @@ def test_the_pack_shows_what_a_receipt_of_two_forms_does(frozen, tmp_path: Path)
     aliased = (room / sampled[review.SAMPLED_CASES[10]]["path"]).read_text("ascii")
     assert "render the cell below byte for byte" in aliased
     assert "disagree on" in aliased
+
+
+def test_the_aliasing_document_states_what_its_named_pair_costs(
+    frozen, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The document names two cascades, and the cost it prints is what those two disagree on.
+
+    FAILS IF the held-out cost the document prints is not counted from the two named
+    cascades' own keys on the batch the reader files next. Counting over every cascade
+    the receipt leaves standing states what the whole posterior leaves open, which is
+    more than the named pair costs whenever a third cascade survives: 17 of 24 against
+    13 of 24 on the receipt this test reads.
+
+    The exporter shows the earliest receipt that leaves several cascades, and in this
+    bank that one leaves two, where the two counts agree. So the choice is narrowed to a
+    receipt that leaves more than two, which this bank draws, and the document is read
+    there.
+    """
+    bank, held, _ = frozen
+    several = soundchange_review._ambiguous
+    monkeypatch.setattr(
+        soundchange_review,
+        "_ambiguous",
+        lambda i, s: several(i, s) and len(soundchange_review._posterior(i, s)) > 2,
+    )
+    room = tmp_path / "aliased"
+    pack = soundchange_review.export(bank, held, room)
+    manifest = json.loads(pack.read_text(encoding="utf-8"))
+    (path,) = [
+        entry["path"]
+        for entry in manifest["renders"]
+        if entry["category"] == "sampled" and entry["key"] == review.SAMPLED_CASES[10]
+    ]
+    head = (room / path).read_text("ascii").split("\n\n", 1)[0].splitlines()
+
+    _, ordinal, label = head[0].split()[1].split("/")
+    (instance,) = [i for i in held.instances if i.ordinal == int(ordinal)]
+    assert len(soundchange_review._posterior(instance, label.lower())) > 2
+    sibling = instance.side("b" if label.lower() == "a" else "a")
+    start = head.index("these two cascades render the cell below byte for byte:")
+    named = [
+        dict(part.split("=", 1) for part in line.strip().split(", "))
+        for line in head[start + 1:start + 3]
+    ]
+    assert all(set(n) == {axis.name for axis in soundchange.AXES} for n in named)
+    assert named[0] != named[1]
+    keys = [soundchange.key_for(sibling.table, convention) for convention in named]
+    cost = sum(1 for one, other in zip(*keys) if one != other)
+
+    claim = re.search(r"disagree on (\d+) of the (\d+) rows", head[-1])
+    assert claim is not None, head[-1]
+    assert (int(claim.group(1)), int(claim.group(2))) == (cost, len(keys[0]))
+    assert (cost, len(keys[0])) == (13, soundchange.ROWS)

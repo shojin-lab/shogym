@@ -499,7 +499,7 @@ def _sampled_renders(population: Population, root: Path) -> list[Render]:
                     )
                     + (
                         "held-out rows they disagree on: %d of %d"
-                        % _held_out_cost(instance, side),
+                        % _held_out_cost(instance, side, members),
                     ),
                     _cells(instance, held, _mixed_filing(held))[GRADED],
                 ),
@@ -545,7 +545,7 @@ def _sampled_renders(population: Population, root: Path) -> list[Render]:
             "two cascades this receipt cannot tell apart rendered two different cells, "
             "so the pack cannot show what it says it shows"
         )
-    disagree, rows = _held_out_cost(instance, side)
+    disagree, rows = _held_out_cost(instance, side, pair)
     out.append(
         Render(
             "sampled", SAMPLED_CASES[10], "document",
@@ -595,9 +595,16 @@ def _aliased_pair(instance: Instance, side: str, members: Sequence[int]) -> tupl
     raise ValueError("this receipt leaves no pair with different held-out keys")
 
 
-def _held_out_cost(instance: Instance, side: str) -> tuple[int, int]:
-    """How many rows of the sibling the surviving cascades do not agree on."""
-    members = _posterior(instance, side)
+def _held_out_cost(
+    instance: Instance, side: str, members: Sequence[int]
+) -> tuple[int, int]:
+    """How many rows of the sibling the named cascades do not agree on.
+
+    The cascades are the caller's, because two documents ask two questions: the
+    posterior documents ask what every surviving cascade leaves open, and the aliasing
+    document names one pair and states what that pair costs. Taking the whole posterior
+    for the pair overstated it whenever a third cascade survived.
+    """
     sibling = _support(instance.side("b" if side == "a" else "a"))
     rows = len(sibling[0])
     return (

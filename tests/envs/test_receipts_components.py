@@ -11,6 +11,7 @@ import inspect
 import itertools
 import json
 import random
+import re
 import threading
 from functools import lru_cache
 from pathlib import Path
@@ -2240,3 +2241,59 @@ def test_the_pack_shows_what_a_receipt_of_two_rows_does(frozen, tmp_path: Path) 
     assert read[review.SAMPLED_CASES[4]].count("FAIL") == 0
     assert "axes it says nothing about: contact_kernel" in read[review.SAMPLED_CASES[6]]
     assert "render the cell below byte for byte" in read[review.SAMPLED_CASES[10]]
+
+
+def test_the_aliasing_document_states_what_its_named_pair_costs(
+    frozen, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The document names two rules, and the cost it prints is what those two disagree on.
+
+    FAILS IF the held-out cost the document prints is not counted from the two named
+    rules' own keys on the schedule the reader files next. Every pair of rules differs on
+    exactly twelve of twenty four rows, so the named pair costs 12 of 24 whatever the
+    mask drew. Counting over every rule the receipt leaves standing printed 18 of 24 on a
+    mask that drew two controls, which is what the whole posterior leaves open and not
+    what the pair costs.
+
+    The exporter shows the earliest receipt that leaves several rules, and in this bank
+    that one leaves two, where the two counts agree. So the choice is narrowed to a
+    receipt that leaves all three, which this bank draws, and the document is read there.
+    """
+    from shogym.envs.receipts import components_review, review
+
+    bank, held, _ = frozen
+    several = components_review._ambiguous
+    monkeypatch.setattr(
+        components_review,
+        "_ambiguous",
+        lambda i, s: several(i, s) and len(components_review._posterior(i, s)) == 3,
+    )
+    room = tmp_path / "aliased"
+    pack = components_review.export(bank, held, room)
+    manifest = json.loads(pack.read_text(encoding="utf-8"))
+    (path,) = [
+        entry["path"]
+        for entry in manifest["renders"]
+        if entry["category"] == "sampled" and entry["key"] == review.SAMPLED_CASES[10]
+    ]
+    head = (room / path).read_text("ascii").split("\n\n", 1)[0].splitlines()
+
+    _, ordinal, label = head[0].split()[1].split("/")
+    (instance,) = [i for i in held.instances if i.ordinal == int(ordinal)]
+    assert len(components_review._posterior(instance, label.lower())) == 3
+    sibling = instance.side("b" if label.lower() == "a" else "a")
+    named = [
+        line.strip().split("=", 1)[1]
+        for line in head
+        if line.startswith("  contact_kernel=")
+    ]
+    assert len(named) == 2 and named[0] != named[1]
+    keys = [
+        components.key_for(sibling.table, {"contact_kernel": option}) for option in named
+    ]
+    cost = sum(1 for one, other in zip(*keys) if one != other)
+
+    claim = re.search(r"disagree on (\d+) of the (\d+) rows", head[-1])
+    assert claim is not None, head[-1]
+    assert (int(claim.group(1)), int(claim.group(2))) == (cost, len(keys[0]))
+    assert (cost, len(keys[0])) == (12, components.ROWS)
