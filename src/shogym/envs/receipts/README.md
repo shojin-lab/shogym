@@ -504,18 +504,27 @@ beside 36 pairs says nothing about which case was which execution:
    B executions, 144 in all**, excluding exploration. Report actual attempts when a failure
    prevents a later execution, and do not replace an unfortunate filing or a failed branch.
 4. Record the case identities and A filing digests in the standard `ScreenRecord`: family, model,
-   task_seeds and the five pair fields. Use `min_pairs=36`, `min_room=0.05`, `min_ratio=0.25`,
-   `floor=0.0`, `floor_rule="drop"` and a truthful candidate-selection disclosure. Do not add a
+   task_seeds and the six pair fields `instance`, `filing`, `placebo`, `graded`, `oracle` and
+   `ideal`. `ideal` is the level a perfect reader of that case's receipt reaches on B. It is
+   carried from the gate's exact computation over the registered mask law and is never measured
+   in the screen, and this genre's row recipe puts it at 329/368 on every compliant pair. Use
+   `min_pairs=36`, `min_room=0.05`, `min_ratio=0.25`, `min_oracle=0.90`,
+   `min_learning_gap=0.10`, `floor=0.0`, `floor_rule="drop"` and a truthful candidate-selection
+   disclosure. Every one of those is a required field of the record, and a bundle whose five
+   bars are not the registered `0.05`, `0.25`, `36`, `0.90` and `0.10` is refused. Do not add a
    state field to that strict pair record: a hashed companion allocation binds each identity to
    its initial-state digest, bank ordinal, source and task digests, sealed checkpoint and
    execution evidence.
 5. Require mean O minus mean P at least 0.05, its paired 90 percent bootstrap lower endpoint
    strictly above zero, and `(mean G - mean P) / (mean O - mean P)` at least 0.25, which is a
-   ratio of pooled differences and never an average of case ratios.
-6. **Beside them**, as a predeclared roster-release condition and not a `screen.json` field: mean
-   executed oracle grade at least **0.90**. Report O, P, G, room, gain, saturation and failure
-   counts by initial state as well as pooled. The bundle verifier does not enforce this and the
-   release audit recomputes it from the same sealed outcomes.
+   ratio of pooled differences and never an average of case ratios. Require as well a mean
+   executed oracle grade of at least **0.90**, and a mean of `ideal - G` over the pairs of at
+   least **0.10** with its paired 90 percent bootstrap lower endpoint strictly above zero. The
+   screen and the bundle verifier recompute all five from the raw pair rows.
+6. Report O, P, G, room, gain, saturation and failure counts by initial state as well as pooled.
+   `components_review.screen_refusals` recomputes the mean oracle grade over the cases it
+   matches to recorded pairs and refuses one under 0.90, so the release audit holds the same
+   bar over exactly the executions the allocation names.
 7. Classify errors from observable evidence: a payload rejected as instructions, scope limited to
    the prior task, a complete key under another rule, mixed counting mistakes, malformed or
    omitted filings, and execution failure. Match B filings against all three canonical keys and

@@ -34,7 +34,7 @@ THE SCREEN PROCEDURE IS AUDITED HERE AND NOT RUN HERE. `screen_refusals` holds a
 allocation against the registered procedure: twelve reserved exploratory identities, the
 next thirty six as the final screen, case j to state j mod 4, nine per state, the common
 standing instruction, one frozen instrument, one named model, four pinned initial states,
-and the predeclared release condition of a mean oracle grade of at least 0.90. It reads
+and a mean oracle grade of at least 0.90 over the cases it matches. It reads
 the identities against the bank's own admitted order and the outcomes against the
 recorded screen the pilot wrote, because an allocation audited against its own fields is
 an allocation that says whatever it likes. The cases and the recorded pairs are matched
@@ -114,9 +114,13 @@ EXPLORATORY_PREFIX = 12
 FINAL_CASES = 36
 INITIAL_STATES = 4
 CASES_PER_STATE = 9
-#: The predeclared release condition beside the machine screen bars. It is an ADDITIONAL
-#: roster condition: the executable screen does not enforce it and the release audit
-#: recomputes it from the same sealed outcomes.
+#: The registered oracle bar. The screen record carries it as the required field
+#: `min_oracle`, and beside it the required `min_learning_gap` and each pair's sixth field
+#: `ideal`: a mean oracle grade of at least 0.90, and a mean of ideal minus graded of at
+#: least 0.10 with that interval's lower bound above zero. The screen and the bundle
+#: verifier enforce both over the record's pairs. The release audit below holds the
+#: oracle bar over the cases it matches to those pairs, so a release is judged on exactly
+#: the executions the allocation names.
 MIN_MEAN_ORACLE = 0.90
 
 #: The common standing instruction every arm starts with, in its registered wording.
@@ -916,10 +920,10 @@ def screen_refusals(
     """What a recorded screen does not establish. Empty when it meets the procedure.
 
     The executable screen proves neither the state allocation nor the authenticity of a
-    named case from its label, and the bundle verifier enforces neither the per-state
-    requirement nor the oracle release condition. This is the companion audit those
-    sentences point at: it reads the recorded allocation and says where it departs from
-    the registered procedure.
+    named case from its label. The bundle verifier does not enforce the per-state
+    requirement, and it holds the oracle bar over the record's pairs rather than over the
+    cases the allocation names. This is the companion audit those sentences point at: it
+    reads the recorded allocation and says where it departs from the registered procedure.
 
     IT IS READ AGAINST THE BANK AND THE SCREEN RECORD, NOT AGAINST ITSELF. An audit of
     the allocation's own fields accepts whatever the allocation says: a reservation that
