@@ -148,6 +148,12 @@ SHARDS: Tuple[Shard, ...] = (
         paths=(
             "tests/envs/test_receipts_bank.py",
             "tests/envs/test_receipts_cli.py",
+            # The ledger review pack, here rather than beside the other two genres' packs.
+            # It fills one small bank and builds one bundle over it, which is four walks of
+            # admission, and the rule this partition follows is to make the slowest job as
+            # fast as it can be: ``rest`` already holds both other genres' pack modules and
+            # this is the cheapest of the three receipt jobs.
+            "tests/envs/test_receipts_ledger_pack.py",
             "tests/envs/test_receipts_protocol_v2.py",
             "tests/envs/test_receipts_served.py",
         ),
