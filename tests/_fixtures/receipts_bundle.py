@@ -11,12 +11,11 @@ It lives here rather than in one test module because two of them now open an env
 bundle, and a second copy of this would be a second answer to what a bundle that verifies is.
 
 BUILDING ONE IS THE EXPENSIVE THING THIS SUITE DOES, so it is built once. Filling the bank walks
-admission over every ordinal it considers, the build walks it again to record the instances and a
-third time to verify what it just wrote, and the explicit verification below is a fourth. Seven
-modules each wanted a bundle of the same shape, so those four walks ran seven times to produce
-seven bundles that differed only in the key they were frozen under, and no test read the key.
-:func:`verified_template` runs them once per process and :func:`private_bundle` hands out copies,
-which is the whole saving.
+admission over every ordinal it considers, and the build walks it again to record the instances and
+a third time to verify what it just wrote. Seven modules each wanted a bundle of the same shape, so
+those three walks ran seven times to produce seven bundles that differed only in the key they were
+frozen under, and no test read the key. :func:`verified_template` runs them once per process and
+:func:`private_bundle` hands out copies, which is the whole saving.
 
 WHAT MAY BE SHARED AND WHAT MAY NOT. The template is frozen input: a bank, a population and a
 verification, none of which any test writes to. Everything a test forks, seals, captures or edits
@@ -68,8 +67,9 @@ def verified_bundle(room: Path, size: int = 2, master: bytes | None = None) -> P
     outcomes = room / "screen.json"
     outcomes.write_text(json.dumps(screen_artifact()), encoding="utf-8")
     pack = review_pack(room, held, bank)
+    # The build verifies what it wrote before it returns, and removes it and raises when it does
+    # not verify, so a second verification here would be the same walk for the same answer.
     built = bundle_mod.build(room / "bundles", GENERATOR, bank, outcomes, pack)
-    assert bundle_mod.verify(built, GENERATOR).problems == ()
     return built.root
 
 
