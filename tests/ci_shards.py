@@ -1,38 +1,42 @@
 """The selections CI runs the suite in, in the one place the workflow and a test both read.
 
-CI is the suite: one job running every test takes about forty five minutes, and ninety nine
-percent of that is pytest. The seconds are not spread evenly over the tree. One offline run
-measured 1402s in total, of which two receipt modules and one frontier_bench module hold more
-than half. Splitting by count would therefore split nothing, so the suite is split by module into
-five selections, and each is a job that checks out, installs, prepares only the assets its own
-modules need and runs only its own paths. The run then costs what its slowest shard costs
-instead of what all five cost together.
+CI is the suite, and ninety nine percent of a job is pytest. The seconds are not spread evenly
+over the tree: the receipt modules hold most of them, because every bank they fill and every bundle
+they build or verify walks admission over a population. Splitting by count would therefore split
+nothing, so the suite is split by module into six selections, and each is a job that checks out,
+installs, prepares only the assets its own modules need and runs only its own paths. The run then
+costs what its slowest shard costs instead of what all six cost together.
 
-The partition below is that measurement, in the seconds it printed for phases of a second or
-more (1316s of the 1402s; the remaining 86s is thousands of shorter phases and collection, which
-falls mostly on the shard holding the most files, so the numbers below understate ``rest``). The
-``durable`` row is a later measurement of its own selection, whole rather than by phase:
+Three of those jobs also run their tests in several processes. A shard's ``workers`` is how many
+pytest-xdist workers its job starts, under ``--dist loadgroup`` so that the tests one module-scoped
+bundle or bank serves go to one worker together, and zero is one process, which is what ``-n 0``
+means to pytest-xdist. Only the receipt selections have workers: their cost is admission walks,
+which need a core and nothing else, and none of their modules drives a workflow on the Temporal
+test server, forks the interpreter or edits the package's own source. The modules that do stay in
+selections that run in one process. A durable test holds real time timeouts that a crowded runner
+can miss, a fork copies a process whatever its other threads are doing, and an edited source file
+moves the code pin under every test that computes it while the edit lasts.
 
-    receipt-attacks   350s   the attack surface of a bundle, and the cells a seal publishes
-    frontier          311s   the vendored task oracles, their containers and their verifiers
-    receipt-serving   363s   the receipt environment, its bank, and the operator's CLI
-    durable           146s   the kernel and the rest of protocol v2, on the test server
-    rest              289s   every other module, which is most of the files and few of the seconds
+The partition was last cut from one measurement, of whole jobs in seconds, taken on the offline run
+before any selection had workers:
 
-The two receipt selections cost more than that now, and the reason is in the instrument
-rather than in the partition. A family whose receipt reports only the rows a committed mask
-drew is admitted less often and is dearer to admit, and the bundle tests each recompute a
-bank's population, so a job that used to walk admission a hundred and forty times walks it
-more. A later measurement put ``receipt-attacks`` at 601s, ``receipt-serving`` at 451s and the
-receipt modules of ``rest`` at 553s, which keeps the slowest job inside a quarter of an hour
-without re-cutting the selections. The next re-cut should measure all five again rather than
-trust these: ``frontier`` and the rest of ``rest`` were not measured here.
+    rest              1799s   every other module; about 1560s of its pytest was receipt modules
+    receipt-serving   1172s   the receipt environment, its bank, the ledger pack and the CLI
+    receipt-attacks    950s   the attack surface of a bundle, and the cells a seal publishes
+    frontier           330s   the vendored task oracles, their containers and their verifiers
+    durable            243s   the kernel and the rest of protocol v2, on the test server
+
+So the receipt modules ``rest`` held that need no server became ``receipt-families``, the four that
+serve a generation over the test server joined ``durable``, and ``rest`` kept everything else and
+the collection of the whole tree. What this layout costs is measured by its own first run, and is
+recorded here once it has been.
 
 The selections live here rather than in the workflow because two readers need the same answer.
-The workflow asks which paths a shard runs, which assets it needs prepared and whether it carries
-the lint and type checks. :mod:`tests.test_ci_shards` asks for the same partition and holds it
-against the test files on disk and against what its own job collected, so a file that no shard
-names fails a test in every job rather than quietly running in none of them.
+The workflow asks which paths a shard runs and on how many workers, which assets it needs
+prepared and whether it carries the lint and type checks. :mod:`tests.test_ci_shards` asks for the
+same partition and holds it against the test files on disk and against what its own job
+collected, so a file that no shard names fails a test in every job rather than quietly running in
+none of them.
 
 :data:`SUITE_MARKER` is the other half of what a job runs. ``network`` is what it deselects, and
 that is a statement about third parties: a model API, a live oracle, a cold download. A test that
@@ -95,8 +99,8 @@ SUITE_MARKER = "not network"
 
 # The asset groups tests/prepare_offline_suite.py provisions, named here because a shard declares
 # which ones its modules need and its job prepares those and nothing else. The receipt shards need
-# no upstream at all; only the frontier shard needs a task image built; two shards start a test
-# server, so two of them ask for the binary.
+# no upstream at all; only the frontier shard needs a task image built; only the durable shard
+# starts a test server, so it alone asks for the binary.
 SOURCES = "sources"
 TAU2_DATA = "tau2-data"
 DURABLE_SERVICE = "durable-service"
@@ -115,6 +119,10 @@ class Shard:
     assets: Tuple[str, ...] = ()
     #: Whether this job also runs ruff and pyright. Exactly one shard does.
     quality: bool = False
+    #: How many pytest-xdist workers this job's run starts. Zero is one process, which is what
+    #: ``-n 0`` means to pytest-xdist, and it is what a shard holding a module that drives the
+    #: Temporal test server, forks the interpreter or edits the package's source has to be.
+    workers: int = 0
 
     def selection(self) -> Tuple[str, ...]:
         """The paths this shard's pytest run is given: its own files, plus the guard."""
@@ -125,7 +133,8 @@ SHARDS: Tuple[Shard, ...] = (
     # The heaviest single module in the suite, and the artifact module beside it: both build
     # receipt bundles and neither needs an upstream source, a task image or a test server, so this
     # job installs and starts testing. That is why it carries ruff and pyright: it is the first
-    # job to be free, while the frontier shard is still building images.
+    # job to be free, while the frontier shard is still building images. Four workers, one per
+    # CPU of the runner, because what it pays for is admission walks.
     Shard(
         name="receipt-attacks",
         paths=(
@@ -133,6 +142,7 @@ SHARDS: Tuple[Shard, ...] = (
             "tests/envs/test_receipts_attacks.py",
         ),
         quality=True,
+        workers=4,
     ),
     # The one module that runs real task containers. It is alone because its preparation is the
     # expensive one: five environment images, five verifier images and one oracle's packages.
@@ -143,21 +153,38 @@ SHARDS: Tuple[Shard, ...] = (
     ),
     # The other side of the receipts port: the served environment, the bank underneath it and the
     # CLI an operator reaches both through. These pay for bundle construction the way the attacks
-    # module does, so they are balanced against it rather than added to it.
+    # module does, so they are balanced against it rather than added to it, and run on four
+    # workers for the same reason.
     Shard(
         name="receipt-serving",
         paths=(
             "tests/envs/test_receipts_bank.py",
             "tests/envs/test_receipts_cli.py",
-            # The ledger review pack, here rather than beside the other two genres' packs.
-            # It fills one small bank and builds one bundle over it, which is four walks of
-            # admission, and the rule this partition follows is to make the slowest job as
-            # fast as it can be: ``rest`` already holds both other genres' pack modules and
-            # this is the cheapest of the three receipt jobs.
+            # The ledger review pack, here rather than beside the other genres' packs. It fills
+            # one small bank and exports a pack over it, and the tests that read them run
+            # together on one worker.
             "tests/envs/test_receipts_ledger_pack.py",
             "tests/envs/test_receipts_protocol_v2.py",
             "tests/envs/test_receipts_served.py",
         ),
+        workers=4,
+    ),
+    # The receipt families: each genre's own module and the reading, rendering and policy modules
+    # the genres share. They were most of the seconds in ``rest``. None of them needs an upstream
+    # source, a task image or a test server, so this job prepares nothing, and what they pay for
+    # is admission walks, so it runs four workers.
+    Shard(
+        name="receipt-families",
+        paths=(
+            "tests/envs/test_receipts_checks.py",
+            "tests/envs/test_receipts_components.py",
+            "tests/envs/test_receipts_full_policy.py",
+            "tests/envs/test_receipts_render.py",
+            "tests/envs/test_receipts_retail_refund.py",
+            "tests/envs/test_receipts_sampled.py",
+            "tests/envs/test_receipts_soundchange.py",
+        ),
+        workers=4,
     ),
     # Protocol v2's own tests, which drive real workflows on the Temporal test server. They used
     # to carry ``network`` for the download that server was, so they ran in no job at all; the
@@ -166,9 +193,16 @@ SHARDS: Tuple[Shard, ...] = (
     # of which 143s is the set that used to be deselected and 3s is what ``rest`` was already
     # paying for these files. Folding it in would put all 143s on the job that holds most of the
     # tree, and the rule this partition follows is to make the slowest job as fast as it can be.
+    #
+    # The four receipt modules that serve a real generation over the test server are here too,
+    # because this is the job that prepares it and runs in one process.
     Shard(
         name="durable",
         paths=(
+            "tests/envs/test_receipts_artifact_carry.py",
+            "tests/envs/test_receipts_artifact_route.py",
+            "tests/envs/test_receipts_read_back.py",
+            "tests/envs/test_receipts_recovery.py",
             "tests/test_protocol_v2_finalize.py",
             "tests/test_protocol_v2_gateway_schedules.py",
             "tests/test_protocol_v2_kernel.py",
@@ -183,8 +217,9 @@ SHARDS: Tuple[Shard, ...] = (
     # Everything else, which is most of the files and few of the seconds. It is the only shard
     # whose modules bind a pinned upstream or read tau2's domains, so it is the only one that
     # prepares those, and for the same reason it is the one job in which the whole tests tree can
-    # be collected: the identity audit is therefore one of its files. It asks for the test server
-    # as well, because four receipt modules serve a real generation over one.
+    # be collected: the identity audit is therefore one of its files. It runs in one process,
+    # because it holds a test that forks the interpreter and the tests that edit the receipts
+    # package's own source.
     Shard(
         name="rest",
         paths=(
@@ -208,17 +243,10 @@ SHARDS: Tuple[Shard, ...] = (
             "tests/envs/test_hle_judge.py",
             "tests/envs/test_hle_served.py",
             "tests/envs/test_hle_verify.py",
-            "tests/envs/test_receipts_artifact_carry.py",
-            "tests/envs/test_receipts_artifact_route.py",
-            "tests/envs/test_receipts_checks.py",
-            "tests/envs/test_receipts_components.py",
-            "tests/envs/test_receipts_read_back.py",
-            "tests/envs/test_receipts_recovery.py",
-            "tests/envs/test_receipts_full_policy.py",
-            "tests/envs/test_receipts_render.py",
-            "tests/envs/test_receipts_retail_refund.py",
-            "tests/envs/test_receipts_sampled.py",
-            "tests/envs/test_receipts_soundchange.py",
+            # The tests that edit pinned source files to show the code pin moves. They are here
+            # rather than beside the attacks, because nothing else may compute the pin while they
+            # run, and this job runs one test at a time.
+            "tests/envs/test_receipts_pin_drift.py",
             "tests/envs/test_tau2_domains_served.py",
             "tests/envs/test_tau2_fidelity.py",
             "tests/envs/test_tau2_mock_served.py",
@@ -275,7 +303,7 @@ SHARDS: Tuple[Shard, ...] = (
             "tests/test_trace_store.py",
             "tests/test_v1_runs.py",
         ),
-        assets=(SOURCES, TAU2_DATA, DURABLE_SERVICE),
+        assets=(SOURCES, TAU2_DATA),
     ),
 )
 
@@ -461,7 +489,8 @@ def _github_env(chosen: Shard) -> str:
     The paths are space separated because the step that runs pytest wants them split into
     arguments, and the assets are comma separated because the preparation script takes one value.
     An empty asset list is a shard that needs nothing prepared, and it has to stay distinguishable
-    from a shard that said nothing at all.
+    from a shard that said nothing at all. The worker count is always written, zero included,
+    because the step passes it to ``-n`` as it is.
     """
     return "\n".join(
         (
@@ -469,6 +498,7 @@ def _github_env(chosen: Shard) -> str:
             f"SHOGYM_CI_PATHS={' '.join(chosen.selection())}",
             f"SHOGYM_CI_ASSETS={','.join(chosen.assets)}",
             f"SHOGYM_CI_QUALITY={'true' if chosen.quality else 'false'}",
+            f"SHOGYM_CI_WORKERS={chosen.workers}",
         )
     )
 

@@ -33,6 +33,10 @@ collects the whole tests tree and each selection and holds them against the one.
 needs a tree that collects, which is a job with the pinned upstream sources prepared, so it runs
 in one job while this file runs in every one.
 
+Last, it holds which jobs run their tests on several workers and that each job is told how many,
+because a module that drives the test server, forks the interpreter or edits the package's source
+may not share a job with workers.
+
 A new test file that no shard claims fails the first test below, in every job, naming the
 file. Adding it to a shard in ``tests/ci_shards.py`` is the fix, and which shard to add it to is
 a question about where its seconds should go.
@@ -46,15 +50,25 @@ import pytest
 
 from tests._fixtures.node_ids import collected_as
 from tests.ci_shards import (
+    DURABLE_SERVICE,
     GUARD,
     SHARDS,
     collect_ids,
+    main,
     named_paths,
     owners,
     selection_problems,
     shard,
     suite_test_files,
 )
+
+#: Test files that may only run in a shard without workers, and why. The modules that drive the
+#: Temporal test server are not listed, because the asset they all need holds them: see
+#: :func:`test_only_the_receipt_selections_run_with_workers`.
+_ONE_PROCESS_ONLY = {
+    "tests/envs/test_receipts_pin_drift.py": "it rewrites pinned source files every worker reads",
+    "tests/test_serve_session_lifecycle.py": "it forks the interpreter",
+}
 
 
 def test_every_test_file_is_named_by_exactly_one_shard() -> None:
@@ -126,3 +140,39 @@ def test_exactly_one_shard_carries_the_lint_and_type_checks() -> None:
     assert len(set(names)) == len(names), f"two shards share a name: {names}"
     empty = [candidate.name for candidate in SHARDS if not candidate.paths]
     assert not empty, f"a shard with no paths is a job with nothing to run: {empty}"
+
+
+def test_only_the_receipt_selections_run_with_workers() -> None:
+    """The three receipt selections run four workers each, and every other shard one process.
+
+    A durable test holds real time timeouts, a fork copies a process whatever its other threads
+    are doing, and a test that edits the package's source moves the code pin under every test that
+    computes it, so none of them may share a job with workers. The durable tests are held by the
+    one asset they all need: a shard that prepares the test server runs in one process. This fails
+    if a worker count is not a whole number, if a receipt selection does not run four, if any
+    other shard runs workers, or if a file listed above is in a shard that does.
+    """
+    for candidate in SHARDS:
+        assert isinstance(candidate.workers, int) and candidate.workers >= 0, candidate
+        if DURABLE_SERVICE in candidate.assets:
+            assert candidate.workers == 0, f"{candidate.name} starts the test server on workers"
+    running = {candidate.name: candidate.workers for candidate in SHARDS if candidate.workers}
+    assert running == {"receipt-attacks": 4, "receipt-serving": 4, "receipt-families": 4}
+    for path, reason in _ONE_PROCESS_ONLY.items():
+        held = [shard(name) for name in owners(path)]
+        assert held, f"{path} is named by no shard"
+        crowded = [candidate.name for candidate in held if candidate.workers]
+        assert not crowded, f"{path} runs with workers in {crowded}, and {reason}"
+
+
+def test_each_job_is_told_its_worker_count(capsys: pytest.CaptureFixture[str]) -> None:
+    """The command the workflow reads a shard with writes that shard's worker count, zero too.
+
+    The step that runs pytest passes it to ``-n`` as it is written, so this fails if a shard's
+    assignments leave the count out or write another one.
+    """
+    for candidate in SHARDS:
+        assert main(["github-env", candidate.name]) == 0
+        written = dict(line.split("=", 1) for line in capsys.readouterr().out.splitlines())
+        assert written["SHOGYM_CI_SHARD"] == candidate.name
+        assert written["SHOGYM_CI_WORKERS"] == str(candidate.workers)

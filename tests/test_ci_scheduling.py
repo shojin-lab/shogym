@@ -10,9 +10,9 @@ under the other.
 These checks hold the guard to that in both directions, in real grouped runs. In a small tree
 built here, a grouped run that collected everything passes, and its workers did rename, so the
 names they gave would have failed; a parameter id holding an ``@`` of its own is compared as it
-was collected; and a run that collected less is refused, naming exactly what it dropped. On the
-receipt selections themselves, with ``SHOGYM_CI_SHARD`` set the way a job sets it, the guard passes
-a grouped run of the whole selection and refuses a narrowed one.
+was collected; and a run that collected less is refused, naming exactly what it dropped. On each
+selection whose job runs with workers, with ``SHOGYM_CI_SHARD`` set the way that job sets it, the
+guard passes a grouped run of the whole selection and refuses a narrowed one.
 
 Each run is its own pytest, in a subprocess, with two workers. The collections the guard makes
 inside those runs stay serial. They run once, in one job, because what they check is the guard's
@@ -34,15 +34,15 @@ import pytest
 from tests.ci_shards import (
     GUARD,
     REPO_ROOT,
+    SHARDS,
     SUITE_MARKER,
     collect_ids,
     selection_problems,
     shard,
 )
 
-#: The selections checked here under the grouped scheduler, which are the receipt selections: the
-#: ones that scheduler is for.
-SCHEDULED = ("receipt-attacks", "receipt-serving")
+#: The selections checked here under the grouped scheduler: every one whose job runs with workers.
+SCHEDULED = tuple(candidate.name for candidate in SHARDS if candidate.workers)
 
 #: The guard's equality, by node id.
 _GUARD_TEST = f"{GUARD}::test_this_job_collected_exactly_what_its_shard_names"
@@ -239,10 +239,10 @@ def test_the_comparison_refuses_a_repeat_a_gap_and_a_stray() -> None:
 
 
 @pytest.mark.parametrize("name", SCHEDULED)
-def test_the_guard_passes_a_grouped_run_of_a_whole_receipt_selection(
+def test_the_guard_passes_a_grouped_run_of_a_whole_scheduled_selection(
     name: str, tmp_path: Path
 ) -> None:
-    """A receipt job's whole selection, with its shard named, passes under the grouped scheduler.
+    """A job's whole selection, with its shard named, passes under the grouped scheduler.
 
     Every test is collected as the job collects it, and all but the guard's equality are skipped
     by tests/_fixtures/only_the_guard.py before their fixtures are set up, so the guard reads the
@@ -266,10 +266,10 @@ def test_the_guard_passes_a_grouped_run_of_a_whole_receipt_selection(
 
 
 @pytest.mark.parametrize("name", SCHEDULED)
-def test_the_guard_refuses_a_grouped_run_of_a_narrowed_receipt_selection(
+def test_the_guard_refuses_a_grouped_run_of_a_narrowed_scheduled_selection(
     name: str, tmp_path: Path
 ) -> None:
-    """A receipt job given only the guard, with its shard named, is refused under the scheduler.
+    """A job given only the guard, with its shard named, is refused under the grouped scheduler.
 
     It fails if the run passes, if the refusal is not the equality naming this shard, or if the
     guard calls the one test the run did collect a stray.
