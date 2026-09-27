@@ -31,8 +31,10 @@ from shogym.envs.receipts.streams import digest
 
 #: A bank that draws every surface this genre has and exhibits all four searched sampled
 #: cases. Four instances is the smallest bank that can draw eight surfaces, because each
-#: instance draws one of each pool.
-COMPLETE_MASTER = hashlib.sha256(b"ledger-review-pack:3").digest()
+#: instance draws one of each pool. Among its eight masks is one that reports no record
+#: without dates, which the unwitnessed example has to be and which not every key of this
+#: size draws.
+COMPLETE_MASTER = hashlib.sha256(b"ledger-review-pack:22").digest()
 COMPLETE_SIZE = 4
 
 #: A bank that draws every surface and no mask that pins the convention to one member of
@@ -226,6 +228,47 @@ def test_the_pack_shows_what_a_receipt_of_four_records_does(complete) -> None:
     assert "records of the schedule this reader files next" in aliased
 
 
+def test_the_unwitnessed_example_reports_no_record_without_dates(complete) -> None:
+    """The two witness documents show the missing-record class present, then absent.
+
+    FAILS IF the receipt shown as leaving an axis unwitnessed reports a record with no
+    dates, or if the receipt shown as witnessing every axis reports none. On this genre a
+    record with no dates is the only thing that witnesses the missing-record axis, so the
+    first document is the class present and the second the class absent. Taking whichever
+    receipt first leaves any axis open does not give the second: under the key this module
+    used before, that receipt reported record 24, which has no dates, and left only the
+    basis unwitnessed.
+    """
+    _bank, held, root, pack = complete
+    manifest = json.loads(pack.read_text(encoding="utf-8"))
+    paths = {
+        entry["key"]: entry["path"]
+        for entry in manifest["renders"]
+        if entry["category"] == "sampled"
+    }
+
+    def read(case: str) -> tuple[list[int], list[str]]:
+        head = (root / paths[case]).read_text("ascii").split("\n\n", 1)[0].splitlines()
+        _, ordinal, label = head[0].split()[1].split("/")
+        (instance,) = [i for i in held.instances if i.ordinal == int(ordinal)]
+        task = instance.side(label.lower())
+        reported = [
+            int(r) for r in head[1].removeprefix("reported records ").split(", ")
+        ]
+        assert reported == [row + 1 for row in task.mask]
+        undated = [r for r in reported if task.table.rows[r - 1].dates is None]
+        silent = head[3].removeprefix("axes it says nothing about: ").split(", ")
+        return undated, silent
+
+    present, silent = read(review.SAMPLED_CASES[5])
+    assert present
+    assert silent == ["none"]
+
+    absent, silent = read(review.SAMPLED_CASES[6])
+    assert absent == []
+    assert "missing" in silent
+
+
 def test_a_bank_that_cannot_exhibit_a_case_is_refused_by_name(tmp_path: Path) -> None:
     """A pack is all eleven cases, and a small bank does not always draw all eleven.
 
@@ -251,7 +294,10 @@ def test_a_bank_that_cannot_exhibit_a_case_is_refused_by_name(tmp_path: Path) ->
         ledger.GENERATOR.surface_templates()
     )
     assert any(ledger_review._witnessed(i, s) == axes for i, s in sides)
-    assert any(ledger_review._witnessed(i, s) != axes for i, s in sides)
+    assert any(
+        ledger_review._witnessed(i, s) != axes and not ledger_review._undated(i, s)
+        for i, s in sides
+    )
     assert all(len(ledger_review._posterior(i, s)) > 1 for i, s in sides)
 
     room = tmp_path / "pack"

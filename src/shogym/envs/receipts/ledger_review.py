@@ -314,6 +314,16 @@ def _witnessed(instance: Instance, side: str) -> set[str]:
     return out
 
 
+def _undated(instance: Instance, side: str) -> list[int]:
+    """The reported records with no dates, by position.
+
+    The one class of record that witnesses the missing-record axis, so a receipt that
+    reports none of them says nothing about that axis whatever else it reports.
+    """
+    task = instance.side(side)
+    return [row for row in task.mask if task.table.rows[row].dates is None]
+
+
 def _ambiguous(instance: Instance, side: str) -> bool:
     """Whether this receipt leaves conventions that answer the sibling differently."""
     members = _posterior(instance, side)
@@ -400,7 +410,13 @@ def _selected(population: Population) -> Selected:
     whole = _found(population, lambda i, s: _witnessed(i, s) == axes)
     if whole is None:
         raise _refused(SAMPLED_CASES[5], population)
-    short = _found(population, lambda i, s: _witnessed(i, s) != axes)
+    # The unwitnessed example is a receipt that reported no record without dates, which is
+    # the class that witnesses the missing-record axis. Any unwitnessed axis would do for
+    # the case's name, and the earliest such receipt can report an undated record and leave
+    # only the basis open, which shows a reader the class present rather than absent.
+    short = _found(
+        population, lambda i, s: _witnessed(i, s) != axes and not _undated(i, s)
+    )
     if short is None:
         raise _refused(SAMPLED_CASES[6], population)
     pinned = _found(population, lambda i, s: len(_posterior(i, s)) == 1)
