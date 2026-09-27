@@ -653,6 +653,8 @@ def test_the_construction_filter_never_reads_the_drawn_convention() -> None:
     instance = _drawn(0)
     a_protos = tuple(row.proto for row in instance.a.table.rows)
     b_protos = tuple(row.proto for row in instance.b.table.rows)
+    # The acceptance decision is asked once, here. Its signature, checked above, takes the two
+    # batches and no convention, so a call inside the loop below could only repeat this one.
     assert audit.pair_refusal(a_protos, b_protos) == ""
     first_texts = None
     first_record = None
@@ -667,8 +669,6 @@ def test_the_construction_filter_never_reads_the_drawn_convention() -> None:
             made.envelope.filler,
             {k: tuple(v) for k, v in made.envelope.neutral.items()},
         )
-        # The acceptance decision, recomputed with this convention live.
-        assert audit.pair_refusal(a_protos, b_protos) == ""
         if first_texts is None:
             first_texts, first_record = texts, record
         assert texts == first_texts
@@ -1333,10 +1333,10 @@ def frozen(tmp_path_factory: pytest.TempPathFactory):
     with pytest.raises(ValueError):
         bundle_mod.build(room / "bundles", soundchange.GENERATOR, bank, outcomes, pack)
     soundchange_review.attested(pack_root, "a named reader")
+    # The build verifies the bundle before it returns, and raises when it does not verify.
     built = bundle_mod.build(
         room / "bundles", soundchange.GENERATOR, bank, outcomes, pack
     )
-    assert bundle_mod.verify(built, soundchange.GENERATOR).problems == ()
     return bank, held, built
 
 

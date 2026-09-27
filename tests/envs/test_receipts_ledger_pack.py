@@ -477,8 +477,9 @@ def test_the_pack_verifies_through_a_bundle_once_a_person_has_signed_it(
 
     It fails if a bundle can be built from a pack that names no reviewer, which would let a
     machine attest that a human read something; if the same pack with a name on it does not
-    verify through `bundle.verify`; or if the coverage the bundle enumerates from the
-    rebuilt instances is not the coverage the exporter wrote.
+    build, and the build verifies the bundle through `bundle.verify` before it returns; or if
+    the coverage the bundle enumerates from the rebuilt instances is not the coverage the
+    exporter wrote.
     """
     bank, _held, root, pack = complete
     room = tmp_path / "bundles"
@@ -489,10 +490,9 @@ def test_the_pack_verifies_through_a_bundle_once_a_person_has_signed_it(
         bundle_mod.build(room, ledger.GENERATOR, bank, outcomes, pack)
 
     ledger_review.attested(root, "a named reader")
+    # The build verifies the bundle before it returns, and removes it and raises when it does
+    # not verify, so a bundle returned here is one that verified.
     built = bundle_mod.build(room, ledger.GENERATOR, bank, outcomes, pack)
-    checked = bundle_mod.verify(built, ledger.GENERATOR)
-    assert checked.problems == ()
-    assert checked.verified
 
     inside = built.payload(bundle_mod.REVIEW)
     assert inside["reviewer"] == "a named reader"

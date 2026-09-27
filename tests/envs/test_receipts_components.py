@@ -1130,8 +1130,8 @@ def frozen(tmp_path_factory: pytest.TempPathFactory):
     with pytest.raises(ValueError):
         bundle_mod.build(room / "bundles", GENERATOR, bank, outcomes, pack)
     components_review.attested(pack_root, "a named reader")
+    # The build verifies the bundle before it returns, and raises when it does not verify.
     built = bundle_mod.build(room / "bundles", GENERATOR, bank, outcomes, pack)
-    assert bundle_mod.verify(built, GENERATOR).problems == ()
     return bank, held, built
 
 

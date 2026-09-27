@@ -13,6 +13,7 @@ from shogym.envs.receipts import admission, checks, copy_profiles
 from shogym.envs.receipts.generators.ledger import GENERATOR
 from shogym.envs.receipts.protocol import draw
 from shogym.envs.receipts.registry import load_generator
+from tests._fixtures.ledger_reports import SHARES_REGISTERED_REPORTS, registered_reports
 
 MASTER = bytes(range(32))
 # Diagnostic bars, not the registered ones: loose enough that the fixture instance
@@ -507,6 +508,7 @@ def test_the_registered_bars_fill_a_bank() -> None:
     assert registered.min_leverage == 0.10
 
 
+@SHARES_REGISTERED_REPORTS
 def test_every_admitted_instance_clears_every_registered_bar() -> None:
     """Every bar an admitted instance is judged against, on the ledger's own draws.
 
@@ -514,12 +516,13 @@ def test_every_admitted_instance_clears_every_registered_bar() -> None:
     family reports the rows a committed mask drew, so its realized headroom is a
     quantity of that mask and the registered law is what admission reads instead. The
     law's own bar is here, the distinguishing probability its named check applies.
+
+    The twelve reports are the ones tests/envs/test_receipts_sampled.py also reads, made
+    once for both by tests/_fixtures/ledger_reports.py.
     """
     registered = admission.Thresholds()
     admitted = 0
-    for ordinal in range(12):
-        instance = draw(GENERATOR, MASTER, ordinal)
-        report = admission.report(GENERATOR, instance, MASTER, registered)
+    for instance, report in registered_reports(GENERATOR, MASTER):
         if not report.admitted:
             continue
         admitted += 1

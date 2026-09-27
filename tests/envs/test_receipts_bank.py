@@ -8,6 +8,7 @@ with the rule that made them.
 from __future__ import annotations
 
 import functools
+import hashlib
 from pathlib import Path
 
 import pytest
@@ -16,7 +17,10 @@ from shogym.envs.receipts import bank as bank_mod
 from shogym.envs.receipts.generators.ledger import GENERATOR
 from shogym.envs.receipts.receipt_ast import GRADED, ORACLE, PLACEBO
 
-MASTER = bytes(range(32, 64))
+#: The key this module's banks are filled under. Under it admission admits ordinals 0 and 2 and
+#: refuses ordinal 1, so the bank of two is three reports and still skips an ordinal, which is what
+#: the test of admission order reads across. It clears the registered band read at its mean.
+MASTER = hashlib.sha256(b"receipts-test-key:d").digest()
 
 
 @functools.lru_cache(maxsize=2)
@@ -49,6 +53,8 @@ def test_a_bank_holds_the_instances_admission_admits_in_order() -> None:
     assert built.size == 2
     assert len(found.instances) == 2
     assert found.considered >= 2
+    # This key's bank skips an ordinal admission refused, so the order is read across a gap.
+    assert found.considered > len(found.instances)
     assert found.passing_fraction == pytest.approx(2 / found.considered)
     assert list(found.ordinals) == sorted(set(found.ordinals))
     assert built.renderer == bank_mod.RENDERER_CONFIGURATION
