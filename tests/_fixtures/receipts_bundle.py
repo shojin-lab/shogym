@@ -31,6 +31,7 @@ verification: what the sharing removes is the building, not the checking.
 from __future__ import annotations
 
 import atexit
+import hashlib
 import json
 import shutil
 import stat
@@ -47,14 +48,24 @@ from shogym.envs.receipts.generators.ledger import GENERATOR
 #: no wider than this.
 _TEMPLATES: dict[int, Path] = {}
 
-#: The key the one-instance template is filled under, which is fixed where every larger template
-#: takes a fresh one. The band on the ideal level is read at a bank's mean, so a bank of one reads
-#: it at its only instance, and a single ledger instance can stand under the 0.05 bar: 3 of 160
-#: fresh keys drew a first instance with no more room than that, and the bank then refused to fill
-#: before any test that asked for it had started. Under this key ordinal 0 is admitted with an ideal
-#: level of 0.8254 standing 0.0869 above its lookup floor, so the bank fills on every run, and a
-#: change that moves it under the bar fails on every run rather than on about one in fifty.
+#: The key the one-instance template is filled under. The band on the ideal level is read at a
+#: bank's mean, so a bank of one reads it at its only instance, and a single ledger instance can
+#: stand under the 0.05 bar: 3 of 160 fresh keys drew a first instance with no more room than that,
+#: and the bank then refused to fill before any test that asked for it had started. Under this key
+#: ordinal 0 is admitted with an ideal level of 0.8254 standing 0.0869 above its lookup floor, so
+#: the bank fills on every run, and a change that moves it under the bar fails on every run rather
+#: than on about one in fifty.
 ONE_INSTANCE_MASTER = bytes(range(96, 128))
+
+#: The key the two-instance template is filled under. Under it admission admits ordinals 0 and 1,
+#: so every walk over the bank is two reports, and the bank of two clears the registered band read
+#: at its mean. Under a fresh key on every run, how many reports a walk took moved with the key,
+#: and so did what every test that builds or opens a copy of this template cost.
+TWO_INSTANCE_MASTER = hashlib.sha256(b"receipts-test-key:a").digest()
+
+#: The key each template is filled under, by its size. Each was chosen by a real fill at that size,
+#: so a size with no key here has no template until one is.
+TEMPLATE_MASTERS = {1: ONE_INSTANCE_MASTER, 2: TWO_INSTANCE_MASTER}
 
 
 def verified_bundle(room: Path, size: int = 2, master: bytes | None = None) -> Path:
@@ -77,18 +88,21 @@ def verified_template(size: int = 2) -> Path:
     """The one bundle of this size this process builds, read-only and shared.
 
     Built under the system temporary directory rather than under a test's own, because it outlives
-    every test that reads it and belongs to none of them. It is removed when the process ends. A
-    template of one instance is filled under :data:`ONE_INSTANCE_MASTER`, and any other under a
-    fresh key.
+    every test that reads it and belongs to none of them. It is removed when the process ends. It
+    is filled under its size's key in :data:`TEMPLATE_MASTERS`.
     """
     known = _TEMPLATES.get(size)
     if known is not None:
         return known
+    master = TEMPLATE_MASTERS.get(size)
+    if master is None:
+        raise ValueError(
+            f"no key is chosen for a template of {size} instances; fill one for real at that "
+            "size and add it to TEMPLATE_MASTERS"
+        )
     room = Path(tempfile.mkdtemp(prefix=f"shogym-receipts-template-{size}-"))
     atexit.register(_discard, room)
-    built = verified_bundle(
-        room, size=size, master=ONE_INSTANCE_MASTER if size == 1 else None
-    )
+    built = verified_bundle(room, size=size, master=master)
     _mode(built, writable=False)
     _TEMPLATES[size] = built
     return built
@@ -198,6 +212,8 @@ def review_pack(room: Path, held: bank_mod.Population, bank: bank_mod.Bank) -> P
 
 __all__ = [
     "ONE_INSTANCE_MASTER",
+    "TEMPLATE_MASTERS",
+    "TWO_INSTANCE_MASTER",
     "private_bundle",
     "review_pack",
     "screen_artifact",
