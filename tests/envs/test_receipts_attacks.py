@@ -29,7 +29,12 @@ from shogym.envs.receipts.receipt_ast import (
     serialize,
 )
 from shogym.receipts import gate
+from tests._fixtures.receipts_bundle import ONE_INSTANCE_MASTER
 
+#: The key the attacks draw and report their instances under. Admission refuses its ordinal 0 and
+#: admits its ordinal 1, so a bank of one filled under it considers two ordinals, which is what the
+#: passing-fraction test reads. The bundle the attacks copy is filled under ONE_INSTANCE_MASTER
+#: instead, whose ordinal 0 is admitted, so every walk over that bank is one report rather than two.
 MASTER = bytes(range(32))
 # Diagnostic bars, not the registered ones: loose enough that the fixture instances
 # clear them, so an attack test fails on the attack rather than on a threshold.
@@ -57,7 +62,7 @@ def _filled(generator, master: bytes, size: int):
 
 def _admitted():
     """One instance a bank would actually hold, out of the fill the materials below share."""
-    return _filled(GENERATOR, MASTER, 1)[1].instances[0]
+    return _filled(GENERATOR, ONE_INSTANCE_MASTER, 1)[1].instances[0]
 
 
 def _instance(ordinal: int = 0):
@@ -1275,8 +1280,12 @@ def _pack(
     return pack
 
 
-def _materials(room, generator=None, master=MASTER, size: int = 1):
-    """A bank, a screen artifact and a review pack: the three things a bundle holds."""
+def _materials(room, generator=None, master=ONE_INSTANCE_MASTER, size: int = 1):
+    """A bank, a screen artifact and a review pack: the three things a bundle holds.
+
+    The bank is filled under ONE_INSTANCE_MASTER unless a key is named, which admits its ordinal
+    0, so a walk over it is one report.
+    """
     from shogym.envs.receipts import bank as bank_mod
     from shogym.envs.receipts.review import required_coverage
 
@@ -1524,19 +1533,27 @@ def test_a_commitment_to_another_convention_is_caught(bundle_room) -> None:
     )
 
 
-def test_the_passing_fraction_is_computed_and_never_stored(built_bundle) -> None:
+def test_the_passing_fraction_is_computed_and_never_stored(tmp_path) -> None:
     """It was a third trusted summary. There is nowhere to write it now: the fraction
-    is what recomputing the population produced, and it comes back on the result."""
+    is what recomputing the population produced, and it comes back on the result.
+
+    Read on a bundle filled under MASTER rather than on the shared one. Admission refuses
+    MASTER's ordinal 0 and admits its ordinal 1, so the fraction is under one, and a
+    verification that reported one whatever the walk found fails here.
+    """
     from shogym.envs.receipts import bundle as bundle_mod
 
+    bank, screen, pack, _ = _materials(tmp_path, master=MASTER)
+    built = bundle_mod.build(tmp_path / "bundles", GENERATOR, bank, screen, pack)
     for name in bundle_mod.CONTENTS:
-        text = (built_bundle.root / name).read_text(encoding="utf-8")
+        text = (built.root / name).read_text(encoding="utf-8")
         assert "considered" not in text
         assert "passing_fraction" not in text
-    checked = bundle_mod.verify(built_bundle, GENERATOR)
+    checked = bundle_mod.verify(built, GENERATOR)
     assert checked.passing_fraction == pytest.approx(
         len(checked.instances) / checked.considered
     )
+    assert checked.passing_fraction < 1.0
 
 
 # ----- the thresholds, the code pin and the bank identity -----
@@ -2390,7 +2407,9 @@ def test_every_cell_admission_accepts_the_fork_accepts() -> None:
     from shogym.envs.receipts import bank as bank_mod
 
     instance = _admitted()
-    report = admission.report(GENERATOR, instance, MASTER, admission.Thresholds())
+    report = admission.report(
+        GENERATOR, instance, ONE_INSTANCE_MASTER, admission.Thresholds()
+    )
     assert report.admitted
     seen = 0
     for side in ("a", "b"):
