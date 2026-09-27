@@ -237,7 +237,13 @@ def test_without_the_sentence_the_description_is_the_bytes_the_earlier_code_rend
     for (ordinal, label), digest in DESCRIPTIONS_BEFORE_THE_SCOPE_SENTENCE.items():
         task = _instance(ordinal).side(label.lower())
         sentence = ledger.scope_sentence(label)
-        stripped = task.text.replace(sentence + "\n\n", "", 1)
+        # Both registered additions come out: the scope sentence and, under a policy
+        # that samples, the sentence about what the receipt will report.
+        added = (
+            sentence + "\n" + ledger.receipt_sentence(GENERATOR.RECEIPT_POLICY) + "\n"
+        )
+        assert task.text.count(added) == 1
+        stripped = task.text.replace(added, "", 1)
         assert hashlib.sha256(stripped.encode("utf-8")).hexdigest() == digest
 
 
