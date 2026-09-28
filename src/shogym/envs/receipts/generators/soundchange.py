@@ -23,6 +23,12 @@ therefore produce identical answers on every possible form, and no search for be
 words could separate them. Keeping them would have advertised a decision no data can
 reveal.
 
+FIFTY FOUR IS A SECOND VERSION, NOT AN EDIT TO THIS ONE. A third environment that does
+not commute with the deletion exists, and `soundchange_v2` adds it under a name and
+streams of its own. This version stays at 36, because a bank names its generator and
+recomputes its population, and a wider support here would redraw every instance an
+existing bank holds.
+
 WHY THE RECEIPT CAN CARRY SOMETHING. The scored column holds a whole daughter form,
 which the rule COMPUTES, not the option the agent chose. Two reflexes that leave a row
 untouched are indistinguishable on that row and distinguishable on another; an
@@ -427,14 +433,23 @@ def render_body(protos: Sequence[str], identifiers: Sequence[str], surface: Surf
 
 
 def _side_table(
-    master: bytes, ordinal: int, label: str, attempt: int, protos: Sequence[str]
+    master: bytes,
+    ordinal: int,
+    label: str,
+    attempt: int,
+    protos: Sequence[str],
+    family: str = "soundchange",
 ) -> SoundTable:
-    """One side's frozen table: the shuffled forms, their identifiers and the body."""
+    """One side's frozen table: the shuffled forms, their identifiers and the body.
+
+    `family` names the streams, so a later version of this genre draws its row order
+    and identifiers from coordinates of its own rather than from this version's.
+    """
     stream = streams.SURFACE_A if label == "A" else streams.SURFACE_B
     order = list(protos)
-    streams.rng(master, stream, "soundchange", ordinal, attempt, "row-order").shuffle(order)
+    streams.rng(master, stream, family, ordinal, attempt, "row-order").shuffle(order)
     identifiers = _identifiers(
-        streams.rng(master, stream, "soundchange", ordinal, attempt, "row-identifiers")
+        streams.rng(master, stream, family, ordinal, attempt, "row-identifiers")
     )
     surface = SURFACES[(label, int(ordinal) % 2)]
     return SoundTable(
@@ -691,6 +706,9 @@ class SoundChangeGenerator:
     RECEIPT_POLICY: ReceiptPolicy = SAMPLED_TWO_OF_TWENTY_FOUR
     BLANK_TOKEN = BLANK_TOKEN
     UNFILED_TOKEN = UNFILED_TOKEN
+    #: The mechanics the task states. A later version that adds an option states a
+    #: different list and inherits everything else.
+    TASK_TEMPLATE: str = TASK_TEMPLATE
 
     # ----- the instance -----
 
@@ -725,14 +743,15 @@ class SoundChangeGenerator:
         """The registered envelope, with this instance's committed filler and neutrals.
 
         The coordinates name this generator, so a bank of one genre and a bank of
-        another under one master key do not share a filler stream.
+        another under one master key do not share a filler stream, and neither do two
+        versions of this one.
         """
         neutral: dict[str, tuple[str, ...]] = {}
         for spec in SLOTS:
             neutral[spec.name] = tuple(
                 streams.filler_stream(
                     master, FILLER_ALPHABET, spec.width,
-                    "soundchange", ordinal, "neutral", spec.name, row,
+                    self.name, ordinal, "neutral", spec.name, row,
                 )
                 for row in range(SHAPE.rows)
             )
@@ -742,7 +761,7 @@ class SoundChangeGenerator:
             observed_width=OBSERVED_WIDTH,
             slots=SLOTS,
             filler=streams.filler_stream(
-                master, FILLER_ALPHABET, ENVELOPE_SIZE, "soundchange", ordinal, "pad"
+                master, FILLER_ALPHABET, ENVELOPE_SIZE, self.name, ordinal, "pad"
             ),
             column_titles=COLUMN_TITLES,
             neutral=neutral,
@@ -823,7 +842,7 @@ class SoundChangeGenerator:
         """
         table: SoundTable = task.table
         surface = table.template
-        return TASK_TEMPLATE.format(
+        return self.TASK_TEMPLATE.format(
             batch_title=surface.title,
             scope=scope_sentence(task.label),
             receipt=receipt_sentence(self.RECEIPT_POLICY),
@@ -876,10 +895,10 @@ class SoundChangeGenerator:
         self, task_id: str, convention: Mapping[str, str], row_count: int = 0
     ) -> ReceiptAST:
         """The drawn cascade, from the declared phrases, with no rows to align."""
-        return render_oracle_cell(ORACLE_TEMPLATE, task_id, convention, row_count)
+        return render_oracle_cell(self.ORACLE, task_id, convention, row_count)
 
     def parse_oracle(self, ast: ReceiptAST) -> dict[str, str]:
-        return parse_oracle_cell(ORACLE_TEMPLATE, ast)
+        return parse_oracle_cell(self.ORACLE, ast)
 
 
 GENERATOR = SoundChangeGenerator()
