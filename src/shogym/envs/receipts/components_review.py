@@ -114,13 +114,12 @@ EXPLORATORY_PREFIX = 12
 FINAL_CASES = 36
 INITIAL_STATES = 4
 CASES_PER_STATE = 9
-#: The registered oracle bar. The screen record carries it as the required field
-#: `min_oracle`, and beside it the required `min_learning_gap` and each pair's sixth field
-#: `ideal`: a mean oracle grade of at least 0.90, and a mean of ideal minus graded of at
-#: least 0.10 with that interval's lower bound above zero. The screen and the bundle
-#: verifier enforce both over the record's pairs. The release audit below holds the
-#: oracle bar over the cases it matches to those pairs, so a release is judged on exactly
-#: the executions the allocation names.
+#: The release audit's own oracle condition: a mean oracle grade of at least 0.90 over the
+#: cases it matches to the record's pairs, so a release is judged on exactly the executions
+#: the allocation names. It is this audit's predeclared condition and not a screen bar. A
+#: record made under the screen's first version carries the same number as its required
+#: `min_oracle`, and the screen and the bundle verifier hold it over that record's pairs. The
+#: registered version has no oracle bar and reports the oracle level.
 MIN_MEAN_ORACLE = 0.90
 
 #: The common standing instruction every arm starts with, in its registered wording.
