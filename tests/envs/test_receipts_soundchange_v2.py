@@ -468,9 +468,7 @@ def test_a_pack_is_exported_for_the_second_version_and_its_bundle_verifies(
                      "placebo": 0.4, "graded": 0.6, "oracle": 0.95, "ideal": 0.82}
                     for i in range(40)
                 ],
-                "min_room": 0.05, "min_ratio": 0.25, "min_pairs": 36,
-                "min_oracle": 0.90, "min_learning_gap": 0.10,
-                "floor": 0.0, "floor_rule": "drop",
+                "bars": "receipts-screen-v2", "min_pairs": 36, "min_learning_gap": 0.10,
                 "candidates_screened": 1, "selection_note": "",
             }
         ),
