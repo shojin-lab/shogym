@@ -1231,8 +1231,9 @@ def _screen_payload(
 ) -> dict:
     """A screen artifact: the rows, the family they were taken on, and the bars.
 
-    It is made under the first version of the bars, which names none, so this module's
-    bundle is frozen on the kind of record every bundle before the registered version was.
+    It is made under the first version of the bars, which names none. A new bundle refuses
+    it, so a test here puts it in a bundle by rewriting the bundle's screen and resealing,
+    and the bundle then holds one the way a bundle frozen under the first version does.
     """
     payload = {
         "family": family,
@@ -1324,7 +1325,7 @@ def _materials(room, generator=None, master=ONE_INSTANCE_MASTER, size: int = 1):
     bank, held = _filled(generator, master, size)
     screen = room / "screen.json"
     screen.write_text(
-        json.dumps(_screen_payload(family=generator.name)), encoding="utf-8"
+        json.dumps(_registered_screen_payload(family=generator.name)), encoding="utf-8"
     )
     counts = [i.a.n_rows for i in held.instances] + [i.b.n_rows for i in held.instances]
     coverage = required_coverage(generator, checks.FILING_CLASSES, counts)
@@ -1412,9 +1413,8 @@ def test_a_verified_bundle_holds_every_named_file_and_opens(built_bundle) -> Non
     assert checked.problems == ()
     assert len(checked.instances) == 1
     assert checked.considered >= 1
-    # Frozen on a record made under the first version of the screen's bars, which still
-    # verifies under them.
-    assert checked.screen.bars == "receipts-screen-v1"
+    # Frozen on a record made under the registered bars, the only kind a new bundle takes.
+    assert checked.screen.bars == "receipts-screen-v2"
 
 
 def test_a_bundle_names_nothing_outside_itself(built_bundle) -> None:
@@ -2044,9 +2044,9 @@ def test_a_screen_below_the_registered_sample_is_not_deal_evidence(tmp_path) -> 
     room.mkdir()
     bank, screen, pack, _ = _materials(room)
     for payload, expected in (
-        (_screen_payload(pairs=4, min_pairs=REGISTERED_MIN_PAIRS - 2),
+        (_registered_screen_payload(pairs=4, min_pairs=REGISTERED_MIN_PAIRS - 2),
          "not the registered ones"),
-        (_screen_payload(pairs=4), "distinct tasks where 36 is registered"),
+        (_registered_screen_payload(pairs=4), "distinct tasks where 36 is registered"),
     ):
         screen.write_text(json.dumps(payload), encoding="utf-8")
         with pytest.raises(ValueError, match=expected):
@@ -2224,20 +2224,59 @@ def test_a_screen_under_the_registered_bars_is_refused(bundle_room) -> None:
 
 
 def test_a_bundle_verifies_on_a_screen_made_under_either_version(bundle_room) -> None:
-    """The first version's record verifies as it did, and a registered one verifies too.
+    """A registered record verifies, and a first version record in a bundle verifies as it did.
 
-    This module's bundle is frozen on a record without a `bars` field, and the test that
-    opens it holds it to verifying. This one freezes the same bundle on a record made under
-    the registered bars.
+    This module's bundle is frozen on a record made under the registered bars, and the test
+    that opens it holds it to verifying. This one puts a record without a `bars` field into
+    the same bundle, as a bundle frozen under the first version holds one.
 
-    FAILS IF a record made under the registered bars is not dealable.
+    FAILS IF a bundle already frozen on a record made under the first bars stops verifying
+    under them.
     """
     from shogym.envs.receipts import bundle as bundle_mod
 
-    root = _tamper(bundle_room, bundle_mod.SCREEN, _registered_screen_payload())
+    root = _tamper(bundle_room, bundle_mod.SCREEN, _screen_payload())
     checked = bundle_mod.verify_at(root, GENERATOR)
     assert checked.verified, checked.problems
-    assert checked.screen.bars == "receipts-screen-v2"
+    assert checked.screen.bars == "receipts-screen-v1"
+
+
+def _solved_or_not(index: int) -> dict:
+    """Twenty five tasks the copy with feedback solved, and eleven it did not."""
+    return {"placebo": 0.6, "graded": 1.0 if index < 25 else 0.0, "oracle": 0.9, "ideal": 1.0}
+
+
+@pytest.mark.parametrize("rows", [None, _solved_or_not], ids=["steady", "solved-or-not"])
+def test_a_new_bundle_refuses_a_record_made_under_the_first_bars(tmp_path, rows) -> None:
+    """A new bundle is frozen only on a record made under the registered bars.
+
+    Both records pass the first version's bars over otherwise valid inputs. The steady one
+    passes the registered bars too. The other is a ratio of 0.31 against the first version's
+    0.25 with a feedback effect whose interval reaches zero, so the registered bars refuse
+    it, and freezing it would deal a family that never met them.
+
+    FAILS IF a record made under the first bars is frozen into a new bundle, whatever its
+    verdict under either version, or if the refusal leaves a directory behind.
+    """
+    from shogym.envs.receipts import bundle as bundle_mod
+    from shogym.receipts import ScreenRecord
+
+    bank, screen, pack, _ = _materials(tmp_path)
+    first = _screen_payload(pairs=36)
+    if rows is not None:
+        first["pairs"] = [dict(pair, **rows(index)) for index, pair in enumerate(first["pairs"])]
+    assert ScreenRecord.from_payload(first).result("ledger").verdict
+    registered = ScreenRecord.from_payload(_registered_screen_payload(pairs=36, rows=rows))
+    assert registered.result("ledger").verdict == (rows is None)
+
+    screen.write_text(json.dumps(first), encoding="utf-8")
+    with pytest.raises(
+        ValueError,
+        match="made under receipts-screen-v1, and a new bundle is frozen only on a record "
+        "made under the registered receipts-screen-v2",
+    ):
+        bundle_mod.build(tmp_path / "bundles", GENERATOR, bank, screen, pack)
+    assert not (tmp_path / "bundles").exists()
 
 
 def _screen_problems(root: Path) -> list[str]:

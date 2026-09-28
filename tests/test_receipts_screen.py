@@ -11,6 +11,7 @@ rerun to the verdict it had.
 
 from __future__ import annotations
 
+import importlib
 import math
 
 import pytest
@@ -336,7 +337,6 @@ def test_the_registered_bars_are_the_interval_version() -> None:
     floor moves, the interval stops being 90 percent over 2,000 resamples, or a name that
     says a superseded bar is registered comes back.
     """
-    from shogym.receipts import screen as screen_module
     from shogym.receipts.screen import (
         BARS_V1,
         BARS_V2,
@@ -351,8 +351,12 @@ def test_the_registered_bars_are_the_interval_version() -> None:
     assert REGISTERED_BARS == BARS_V2
     assert (REGISTERED_MIN_PAIRS, REGISTERED_MIN_LEARNING_GAP) == (36, 0.10)
     assert (BOOTSTRAP_DRAWS, BOOTSTRAP_MASS) == (2000, 0.90)
-    for gone in ("REGISTERED_MIN_ROOM", "REGISTERED_MIN_RATIO", "REGISTERED_MIN_ORACLE"):
-        assert not hasattr(screen_module, gone), gone
+    # The modules themselves: `from shogym.receipts import screen` is the screen function,
+    # which never had these names, so asking it would pass whatever the module held.
+    for name in ("shogym.receipts.screen", "shogym.receipts"):
+        module = importlib.import_module(name)
+        for gone in ("REGISTERED_MIN_ROOM", "REGISTERED_MIN_RATIO", "REGISTERED_MIN_ORACLE"):
+            assert not hasattr(module, gone), (name, gone)
     rows = _outcomes([0.2] * 36, [0.5] * 36, [0.6] * 36, [0.9] * 36)
     assert screen("f", rows).registered
     assert not screen("f", rows, min_pairs=40).registered
