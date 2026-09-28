@@ -1144,7 +1144,9 @@ for, that the ratio divides by the oracle's room, went with the ratio.
 it. It asked for **`min_room = 0.05`** with the room interval's lower bound above zero,
 **`min_ratio = 0.25`**, a mean executed oracle level of at least **`min_oracle = 0.90`**, and
 the same gap bar and sample. Such a record is still read, rerun and verified under exactly
-those bars, so what it admitted or refused it still admits or refuses. Verification recomputes
+those bars, so what it admitted or refused it still admits or refuses. A new bundle is not
+frozen on one: building a bundle from a record made under the first version is refused, because
+a family that clears its ratio can fail the registered intervals. Verification recomputes
 every statistic from the raw rows and compares it with the bars of the record's own version:
 recording that a bar was moved is not refusing to deal a family admitted under an easier rule,
 so a bundle whose recorded bars are not its version's registered ones is refused. `screen` is a

@@ -25,8 +25,11 @@ carries `bars`, `min_pairs`, `min_learning_gap`, `candidates_screened` and `sele
 its run, and no room, ratio or oracle bar and no floor, which are refused on it. A record with no
 `bars` field was made under the first version, `receipts-screen-v1`, and is read, rerun, printed
 and verified under that version's bars exactly as before, so every record, bundle and pack made
-under them keeps its verdict. Naming `receipts-screen-v1` explicitly is refused, because such
-records carry no field. The printed `screen bars:` line now starts with the version.
+under them keeps its verdict. A new bundle is not frozen on one: `build` refuses a record made
+under `receipts-screen-v1` and names both versions, because a family that clears the first
+version's ratio can fail the registered intervals. Naming `receipts-screen-v1` explicitly is
+refused, because such records carry no field. The printed `screen bars:` line now starts with the
+version.
 
 Renamed: `screen` is the registered screen and returns `ScreenResult`, whose fields are the
 feedback effect, room and gap with their intervals and passes, and the oracle level. The first

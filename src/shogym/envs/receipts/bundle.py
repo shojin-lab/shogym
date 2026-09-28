@@ -723,16 +723,27 @@ def build(
     only then moved into place, so a directory under a digest is always a complete
     bundle. It is verified before it is returned: a bundle that does not verify is
     removed rather than left somewhere to be found later.
+
+    A new bundle is frozen only on a screen record made under the registered bars. A
+    record made under the first version is still read and verified in a bundle already
+    frozen on it, but it is not admitted into a new one: a family that passes the first
+    version's ratio can fail the registered intervals.
     """
     from shogym.envs.receipts.admission import Thresholds
     from shogym.receipts import ScreenRecord, read_payload
+    from shogym.receipts.screen import REGISTERED_BARS
 
     thresholds = Thresholds()
     held = bank_mod.population(bank, generator, thresholds)
     # Read both inputs before writing anything: a bundle half built from a screen
     # artifact that turns out to be unreadable is a directory someone has to clean up.
     screened = read_payload(Path(screen_artifact).read_text(encoding="utf-8"))
-    ScreenRecord.from_payload(screened)
+    record = ScreenRecord.from_payload(screened)
+    if record.bars != REGISTERED_BARS:
+        raise ValueError(
+            f"the screen artifact at {screen_artifact} was made under {record.bars}, and a "
+            f"new bundle is frozen only on a record made under the registered {REGISTERED_BARS}"
+        )
     pack = read_payload(Path(review_pack).read_text(encoding="utf-8"))
     if not isinstance(pack, dict):
         raise ValueError(f"the review pack at {review_pack} is not a manifest")
