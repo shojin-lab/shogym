@@ -28,6 +28,13 @@ convention, and quantifies over the whole support, which is what makes acceptanc
 function of the two batches alone: a filter that read the live draw would make rejection
 informative, and an agent that knew which pairs are accepted could exclude conventions
 from the fact that this pair was served.
+
+ONE AUDIT FOR BOTH VERSIONS OF THE FAMILY. The first version draws from 36 conventions
+and `soundchange_v2` from 54, the extra 18 being a third environment. Every predicate
+here that quantifies over the support takes the support it quantifies over, and a named
+check reads it off the generator's declared axes, so the second version is held to the
+same bars by the same code rather than by a copy of it. The support defaults to the
+first version's, which is what every caller that names none has always meant.
 """
 
 from __future__ import annotations
@@ -35,14 +42,13 @@ from __future__ import annotations
 import itertools
 import re
 from dataclasses import dataclass
-from functools import lru_cache
+from functools import cached_property, lru_cache
 from typing import Mapping, Sequence
 
 import numpy as np
 
 from shogym.envs.receipts.checks import CheckResult
 from shogym.envs.receipts.generators.soundchange import (
-    ALL_CONVENTIONS,
     AXES,
     CONSONANTS,
     MAX_DAUGHTER,
@@ -50,7 +56,7 @@ from shogym.envs.receipts.generators.soundchange import (
     VOWELS,
     SoundTable,
 )
-from shogym.envs.receipts.protocol import Instance, policy_of
+from shogym.envs.receipts.protocol import Axis, Instance, conventions, policy_of
 from shogym.envs.receipts.receipt_law import law_for
 from shogym.envs.receipts.receipt_ast import (
     GAP,
@@ -89,10 +95,6 @@ MAX_TRANSFER = 0.50
 #: failed check rather than a wider envelope nobody noticed.
 MAX_PROTO = 14
 
-#: The phones the replacement pass can introduce. Derived from the option identifiers
-#: below rather than declared twice.
-AXIS_NAMES = tuple(axis.name for axis in AXES)
-
 
 def introduced_phone(option: str) -> str:
     """The phone the reflex option named `out_g`, `out_x` or `out_s` introduces."""
@@ -119,13 +121,102 @@ def replaces_first(option: str) -> bool:
     raise ValueError(f"a sequence option names one of the two orders, not {option!r}")
 
 
-def two_sided(option: str) -> bool:
-    """Whether the environment option requires a vowel on both sides of the k."""
-    if option == "vowel_pair":
-        return True
-    if option == "right_vowel":
-        return False
-    raise ValueError(f"an environment option names one of the two contexts, not {option!r}")
+#: The k each environment option replaces, as a lookaround over the pass input. A
+#: lookbehind or lookahead for a vowel needs a character to be there, so a word boundary
+#: satisfies neither; the negative lookbehind of the third needs only that no vowel is
+#: there, so a k at the start of a form satisfies it. Those are the three conditions the
+#: task states, arrived at by the regular expression engine rather than by the
+#: production scan.
+_ENVIRONMENTS = {
+    "vowel_pair": re.compile(r"(?<=[%s])k(?=[%s])" % (VOWELS, VOWELS)),
+    "right_vowel": re.compile(r"k(?=[%s])" % VOWELS),
+    "no_left_vowel": re.compile(r"(?<![%s])k(?=[%s])" % (VOWELS, VOWELS)),
+}
+
+
+def environment_pattern(option: str) -> re.Pattern[str]:
+    """The k the environment option names: `vowel_pair` wants a vowel on both sides,
+    `right_vowel` a vowel on the right whatever is on the left, and `no_left_vowel` a
+    vowel on the right and no vowel on the left."""
+    try:
+        return _ENVIRONMENTS[option]
+    except KeyError:
+        raise ValueError(
+            f"an environment option names one of {', '.join(_ENVIRONMENTS)}, not {option!r}"
+        ) from None
+
+
+#: The axes every version of the family declares, in this order.
+AXIS_ORDER = ("reflex", "environment", "loss", "sequence")
+
+
+@dataclass(frozen=True)
+class Support:
+    """The conventions one version of the family draws from, in declared product order.
+
+    Built from the axes a generator declares, which are declarations and not
+    computation, and checked on construction against the operations this module derives
+    from each option's own identifier: an option it cannot turn into an operation is
+    refused here rather than priced as something it is not.
+    """
+
+    axes: tuple[Axis, ...]
+
+    def __post_init__(self) -> None:
+        names = tuple(axis.name for axis in self.axes)
+        if names != AXIS_ORDER:
+            raise ValueError(
+                f"a sound change support declares the axes {AXIS_ORDER}, not {names}"
+            )
+        for option in self.axes[0].options:
+            introduced_phone(option)
+        for option in self.axes[1].options:
+            environment_pattern(option)
+        for option in self.axes[2].options:
+            removed_vowel(option)
+        for option in self.axes[3].options:
+            replaces_first(option)
+
+    @cached_property
+    def conventions(self) -> tuple[dict[str, str], ...]:
+        """Every convention, first axis outermost, which is the order the law walks."""
+        return tuple(conventions(self.axes))
+
+    @cached_property
+    def _index(self) -> dict[tuple[str, ...], int]:
+        return {
+            tuple(convention[name] for name in AXIS_ORDER): position
+            for position, convention in enumerate(self.conventions)
+        }
+
+    def substituted(self, position: int, axis: str, option: str) -> int:
+        """Where the convention at `position` sits once one axis is changed."""
+        combo = [self.conventions[position][name] for name in AXIS_ORDER]
+        combo[AXIS_ORDER.index(axis)] = option
+        return self._index[tuple(combo)]
+
+    def column(self, axis: str) -> np.ndarray:
+        """Each convention's option on one axis, as that option's position."""
+        options = self.axes[AXIS_ORDER.index(axis)].options
+        return np.array(
+            [options.index(c[axis]) for c in self.conventions], dtype=np.int64
+        )
+
+
+#: The first version's support, which is what a caller that names none means.
+FIRST_VERSION = Support(tuple(AXES))
+
+
+@lru_cache(maxsize=8)
+def support_of_axes(axes: tuple[Axis, ...]) -> Support:
+    """The support a tuple of declared axes spans, built once per distinct tuple."""
+    return Support(tuple(axes))
+
+
+def support_for(generator) -> Support:
+    """The support the generator's declared axes span, refused if this module cannot
+    derive an operation for one of its options."""
+    return support_of_axes(tuple(generator.AXES))
 
 
 # --------------------------------------------------------------------------
@@ -133,8 +224,6 @@ def two_sided(option: str) -> bool:
 # --------------------------------------------------------------------------
 
 _NASAL = re.compile(r"n(?=b)")
-_RIGHT_VOWEL_K = re.compile(r"k(?=[%s])" % VOWELS)
-_VOWEL_PAIR_K = re.compile(r"(?<=[%s])k(?=[%s])" % (VOWELS, VOWELS))
 _DELETE = {
     vowel: re.compile(r"(?<=[%s])%s(?=[%s])" % (CONSONANTS, vowel, CONSONANTS))
     for vowel in VOWELS
@@ -148,8 +237,9 @@ def audit_nasal(word: str) -> str:
 
 def audit_replace(word: str, option_reflex: str, option_environment: str) -> str:
     """Every k in the named environment becomes the phone the reflex option names."""
-    pattern = _VOWEL_PAIR_K if two_sided(option_environment) else _RIGHT_VOWEL_K
-    return pattern.sub(introduced_phone(option_reflex), word)
+    return environment_pattern(option_environment).sub(
+        introduced_phone(option_reflex), word
+    )
 
 
 def audit_delete(word: str, option_loss: str) -> str:
@@ -175,23 +265,13 @@ def audit_key(protos: Sequence[str], convention: Mapping[str, str]) -> tuple[str
 # the whole support, as arrays
 # --------------------------------------------------------------------------
 
-_COMBO_INDEX = {
-    tuple(convention[name] for name in AXIS_NAMES): position
-    for position, convention in enumerate(ALL_CONVENTIONS)
-}
-
-
-def _substituted(position: int, axis: str, option: str) -> int:
-    """Where the convention at `position` sits once one axis is changed."""
-    combo = list(ALL_CONVENTIONS[position][name] for name in AXIS_NAMES)
-    combo[AXIS_NAMES.index(axis)] = option
-    return _COMBO_INDEX[tuple(combo)]
-
 
 @lru_cache(maxsize=64)
-def support_keys(protos: tuple[str, ...]) -> tuple[tuple[str, ...], ...]:
+def support_keys(
+    protos: tuple[str, ...], support: Support = FIRST_VERSION
+) -> tuple[tuple[str, ...], ...]:
     """One answer key per convention, in the declared product order."""
-    return tuple(audit_key(protos, convention) for convention in ALL_CONVENTIONS)
+    return tuple(audit_key(protos, convention) for convention in support.conventions)
 
 
 def answer_codes(keys: Sequence[Sequence[str]]) -> np.ndarray:
@@ -219,7 +299,9 @@ def _classes(matrix: np.ndarray) -> np.ndarray:
     )[1].reshape(-1)
 
 
-def row_dependence(shown: np.ndarray, reference: int) -> list[frozenset[str]]:
+def row_dependence(
+    shown: np.ndarray, reference: int, support: Support = FIRST_VERSION
+) -> list[frozenset[str]]:
     """Which axes each printed row responds to, with the rest held at the reference.
 
     THE RECEIPT ROW IS THE ANSWER. Under the canonical filing a row prints PASS with an
@@ -233,8 +315,8 @@ def row_dependence(shown: np.ndarray, reference: int) -> list[frozenset[str]]:
     out: list[frozenset[str]] = []
     for row in range(shown.shape[1]):
         responds = set()
-        for axis in AXES:
-            positions = [_substituted(reference, axis.name, o) for o in axis.options]
+        for axis in support.axes:
+            positions = [support.substituted(reference, axis.name, o) for o in axis.options]
             if len(set(shown[positions, row].tolist())) > 1:
                 responds.add(axis.name)
         out.append(frozenset(responds))
@@ -242,7 +324,10 @@ def row_dependence(shown: np.ndarray, reference: int) -> list[frozenset[str]]:
 
 
 def evident_rows(
-    shown: np.ndarray, reference: int, dependence: Sequence[frozenset[str]]
+    shown: np.ndarray,
+    reference: int,
+    dependence: Sequence[frozenset[str]],
+    support: Support = FIRST_VERSION,
 ) -> np.ndarray:
     """The rows that hand one axis over outright, derived and never declared.
 
@@ -255,20 +340,22 @@ def evident_rows(
     for row, responds in enumerate(dependence):
         if len(responds) != 1:
             continue
-        axis = next(axis for axis in AXES if axis.name in responds)
-        positions = [_substituted(reference, axis.name, o) for o in axis.options]
+        axis = next(axis for axis in support.axes if axis.name in responds)
+        positions = [support.substituted(reference, axis.name, o) for o in axis.options]
         out[row] = len(set(shown[positions, row].tolist())) == len(axis.options)
     return out
 
 
-def lookup_signature(shown: np.ndarray, reference: int) -> np.ndarray:
+def lookup_signature(
+    shown: np.ndarray, reference: int, support: Support = FIRST_VERSION
+) -> np.ndarray:
     """What a reader confined to the receipt's own labels observes, per convention.
 
     The evident rows in full, plus one all-passed bit for each class of rows a reader
     can see but not resolve. Both derived from the receipt.
     """
-    dependence = row_dependence(shown, reference)
-    evident = evident_rows(shown, reference, dependence)
+    dependence = row_dependence(shown, reference, support)
+    evident = evident_rows(shown, reference, dependence, support)
     columns = [shown[:, evident]] if evident.any() else []
     hidden = ~evident
     if hidden.any():
@@ -286,15 +373,9 @@ def lookup_signature(shown: np.ndarray, reference: int) -> np.ndarray:
     return np.concatenate(columns, axis=1)
 
 
-_REFLEX_COLUMN = np.array(
-    [AXES[0].options.index(c["reflex"]) for c in ALL_CONVENTIONS], dtype=np.int64
-)
-_LOSS_COLUMN = np.array(
-    [AXES[2].options.index(c["loss"]) for c in ALL_CONVENTIONS], dtype=np.int64
-)
-
-
-def augmented_signature(shown: np.ndarray, reference: int) -> np.ndarray:
+def augmented_signature(
+    shown: np.ndarray, reference: int, support: Support = FIRST_VERSION
+) -> np.ndarray:
     """The lookup signature with the reflex and the deleted vowel given away for free.
 
     The replacement phones never occur in a proto form and the deleted vowel can be read
@@ -303,7 +384,11 @@ def augmented_signature(shown: np.ndarray, reference: int) -> np.ndarray:
     answers would conceal that, so this hands both over and asks what is left.
     """
     return np.concatenate(
-        [lookup_signature(shown, reference), _REFLEX_COLUMN[:, None], _LOSS_COLUMN[:, None]],
+        [
+            lookup_signature(shown, reference, support),
+            support.column("reflex")[:, None],
+            support.column("loss")[:, None],
+        ],
         axis=1,
     )
 
@@ -330,15 +415,23 @@ class Room:
         return max(self.augmented)
 
 
-def room(shown: np.ndarray, answers: np.ndarray) -> Room:
+def room(
+    shown: np.ndarray, answers: np.ndarray, support: Support = FIRST_VERSION
+) -> Room:
     """The ceiling, and both floors at every reference draw in the support."""
     ceiling = _partition_score(_classes(shown), answers)
     floors: list[float] = []
     augmented: list[float] = []
-    for reference in range(len(ALL_CONVENTIONS)):
-        floors.append(_partition_score(_classes(lookup_signature(shown, reference)), answers))
+    for reference in range(len(support.conventions)):
+        floors.append(
+            _partition_score(
+                _classes(lookup_signature(shown, reference, support)), answers
+            )
+        )
         augmented.append(
-            _partition_score(_classes(augmented_signature(shown, reference)), answers)
+            _partition_score(
+                _classes(augmented_signature(shown, reference, support)), answers
+            )
         )
     return Room(ceiling=ceiling, floors=tuple(floors), augmented=tuple(augmented))
 
@@ -353,7 +446,9 @@ def distinct_keys(keys: Sequence[Sequence[str]]) -> int:
     return len({tuple(key) for key in keys})
 
 
-def movement(keys: Sequence[Sequence[str]]) -> dict[str, tuple[int, float]]:
+def movement(
+    keys: Sequence[Sequence[str]], support: Support = FIRST_VERSION
+) -> dict[str, tuple[int, float]]:
     """Per axis, the fewest and the mean rows one option change moves.
 
     Minimized over EVERY draw and every alternative option, not under the draw this
@@ -362,13 +457,13 @@ def movement(keys: Sequence[Sequence[str]]) -> dict[str, tuple[int, float]]:
     about the unlucky case.
     """
     out: dict[str, tuple[int, float]] = {}
-    for axis in AXES:
+    for axis in support.axes:
         moved: list[int] = []
-        for position in range(len(ALL_CONVENTIONS)):
+        for position in range(len(support.conventions)):
             for option in axis.options:
-                if option == ALL_CONVENTIONS[position][axis.name]:
+                if option == support.conventions[position][axis.name]:
                     continue
-                other = _substituted(position, axis.name, option)
+                other = support.substituted(position, axis.name, option)
                 moved.append(
                     sum(1 for x, y in zip(keys[position], keys[other]) if x != y)
                 )
@@ -578,14 +673,16 @@ def analogy_score(
 
 
 def worst_analogy(
-    source_protos: Sequence[str], target_protos: Sequence[str]
+    source_protos: Sequence[str],
+    target_protos: Sequence[str],
+    support: Support = FIRST_VERSION,
 ) -> tuple[float, int]:
     """The analogy baseline's worst score over the whole support, and where."""
-    source_keys = support_keys(tuple(source_protos))
-    target_keys = support_keys(tuple(target_protos))
+    source_keys = support_keys(tuple(source_protos), support)
+    target_keys = support_keys(tuple(target_protos), support)
     best = 0.0
     at = 0
-    for position in range(len(ALL_CONVENTIONS)):
+    for position in range(len(support.conventions)):
         score = analogy_score(
             source_protos, source_keys[position], target_protos, target_keys[position]
         )
@@ -617,14 +714,15 @@ def grammar_refusal(protos: Sequence[str]) -> str:
     return ""
 
 
-def side_refusal(protos: Sequence[str]) -> str:
+def side_refusal(protos: Sequence[str], support: Support = FIRST_VERSION) -> str:
     """What is wrong with one batch's answers over the whole support."""
-    keys = support_keys(tuple(protos))
-    if distinct_keys(keys) != len(ALL_CONVENTIONS):
+    keys = support_keys(tuple(protos), support)
+    if distinct_keys(keys) != len(support.conventions):
         return (
-            f"the batch separates {distinct_keys(keys)} of {len(ALL_CONVENTIONS)} draws"
+            f"the batch separates {distinct_keys(keys)} of {len(support.conventions)} "
+            "draws"
         )
-    for axis, (low, _) in movement(keys).items():
+    for axis, (low, _) in movement(keys, support).items():
         if low < MIN_MOVED_ROWS:
             return f"changing {axis} moves {low} rows somewhere in the support"
     for key in keys:
@@ -639,9 +737,11 @@ def side_refusal(protos: Sequence[str]) -> str:
     return ""
 
 
-def direction_refusal(shown: np.ndarray, answers: np.ndarray, name: str) -> str:
+def direction_refusal(
+    shown: np.ndarray, answers: np.ndarray, name: str, support: Support = FIRST_VERSION
+) -> str:
     """What is wrong with what one side's receipt leaves to do on the other."""
-    measured = room(shown, answers)
+    measured = room(shown, answers, support)
     if abs(measured.ceiling - 1.0) > 1e-12:
         return f"{name}: the full corrected key reaches {measured.ceiling:.6f}, not 1"
     if measured.worst_floor > MAX_LOOKUP_FLOOR:
@@ -658,11 +758,16 @@ def direction_refusal(shown: np.ndarray, answers: np.ndarray, name: str) -> str:
     return ""
 
 
-def pair_refusal(a_protos: tuple[str, ...], b_protos: tuple[str, ...]) -> str:
+def pair_refusal(
+    a_protos: tuple[str, ...],
+    b_protos: tuple[str, ...],
+    support: Support = FIRST_VERSION,
+) -> str:
     """Why this candidate pair cannot be served, or the empty string if it can.
 
     Cheap predicates first, so an attempt that fails on four missing clusters does not
-    pay for the support-wide partitions. Nothing here reads a convention.
+    pay for the support-wide partitions. Nothing here reads a convention: `support` is
+    the whole set a version draws from, never the one it drew.
     """
     for name, protos in (("A", a_protos), ("B", b_protos)):
         refusal = grammar_refusal(protos)
@@ -671,32 +776,32 @@ def pair_refusal(a_protos: tuple[str, ...], b_protos: tuple[str, ...]) -> str:
     if set(a_protos) & set(b_protos):
         return "the two batches share a form"
     for name, protos in (("A", a_protos), ("B", b_protos)):
-        refusal = side_refusal(protos)
+        refusal = side_refusal(protos, support)
         if refusal:
             return f"{name}: {refusal}"
-    a_codes = answer_codes(support_keys(a_protos))
-    b_codes = answer_codes(support_keys(b_protos))
+    a_codes = answer_codes(support_keys(a_protos, support))
+    b_codes = answer_codes(support_keys(b_protos, support))
     for name, shown, answers in (
         ("A to B", a_codes, b_codes),
         ("B to A", b_codes, a_codes),
     ):
-        refusal = direction_refusal(shown, answers, name)
+        refusal = direction_refusal(shown, answers, name, support)
         if refusal:
             return refusal
     for name, source, target in (
         ("A to B", a_protos, b_protos),
         ("B to A", b_protos, a_protos),
     ):
-        score, _ = worst_analogy(source, target)
+        score, _ = worst_analogy(source, target, support)
         if score > MAX_TRANSFER:
             return f"{name}: the skeleton transfer earns {score:.6f}"
-    a_keys = support_keys(a_protos)
-    b_keys = support_keys(b_protos)
+    a_keys = support_keys(a_protos, support)
+    b_keys = support_keys(b_protos, support)
     for name, source_keys, target_keys in (
         ("A to B", a_keys, b_keys),
         ("B to A", b_keys, a_keys),
     ):
-        for position in range(len(ALL_CONVENTIONS)):
+        for position in range(len(support.conventions)):
             score = character_copy_maximum(source_keys[position], target_keys[position])
             if score > MAX_TRANSFER:
                 return f"{name}: a character map earns {score:.6f} on one draw"
@@ -751,16 +856,29 @@ def _read_back(generator, instance: Instance, side: str) -> str:
     return ""
 
 
+def _declared_support(generator, check: str) -> Support | CheckResult:
+    """The support the generator declares, or the failed check that says it has none
+    this module can derive operations for."""
+    try:
+        return support_for(generator)
+    except ValueError as exc:
+        return CheckResult(check, False, f"the declared axes are not a sound change support: {exc}")
+
+
 def check_cascade(generator, instance: Instance) -> CheckResult:
     """The production cascade, recomputed by a second implementation on every draw.
 
-    It fails if any of the 36 cascades disagrees with this validator on either side, if
-    a form leaves the declared grammar, if an answer is empty or longer than the
-    registered correction slot, if the two batches intersect, if the 36 answer vectors
+    It fails if any cascade in the support the generator declares (36 for the first
+    version, 54 for the second) disagrees with this validator on either side, if a form
+    leaves the declared grammar, if an answer is empty or longer than the registered
+    correction slot, if the two batches intersect, if the answer vectors of the support
     are not distinct, if one option change moves fewer than four rows somewhere in the
     support, or if a printed identifier or correction changes under serialize and read
     back.
     """
+    support = _declared_support(generator, "cascade")
+    if isinstance(support, CheckResult):
+        return support
     reports: list[str] = []
     for side in ("a", "b"):
         table = instance.side(side).table
@@ -768,10 +886,10 @@ def check_cascade(generator, instance: Instance) -> CheckResult:
         refusal = grammar_refusal(protos)
         if refusal:
             return CheckResult("cascade", False, f"side {side.upper()}: {refusal}")
-        refusal = side_refusal(protos)
+        refusal = side_refusal(protos, support)
         if refusal:
             return CheckResult("cascade", False, f"side {side.upper()}: {refusal}")
-        for convention in ALL_CONVENTIONS:
+        for convention in support.conventions:
             produced = tuple(generator.key_for(table, convention))
             expected = audit_key(protos, convention)
             if produced != expected:
@@ -788,7 +906,7 @@ def check_cascade(generator, instance: Instance) -> CheckResult:
             "%s %d forms, longest %d, longest daughter %d"
             % (
                 side.upper(), len(protos), max(len(p) for p in protos),
-                max(len(v) for key in support_keys(protos) for v in key),
+                max(len(v) for key in support_keys(protos, support) for v in key),
             )
         )
     if set(_protos(instance.a.table)) & set(_protos(instance.b.table)):
@@ -800,7 +918,7 @@ def check_cascade(generator, instance: Instance) -> CheckResult:
     return CheckResult(
         "cascade", True,
         "an independent cascade agrees with the scorer on all %d draws of both sides; %s"
-        % (len(ALL_CONVENTIONS), "; ".join(reports)),
+        % (len(support.conventions), "; ".join(reports)),
     )
 
 
@@ -828,15 +946,18 @@ def check_phone_lookup(generator, instance: Instance) -> CheckResult:
     room bar on room a reader reaches by reading two subword correspondences has not
     left the room the design measures.
     """
-    a_codes = answer_codes(support_keys(_protos(instance.a.table)))
-    b_codes = answer_codes(support_keys(_protos(instance.b.table)))
+    support = _declared_support(generator, "phone_lookup")
+    if isinstance(support, CheckResult):
+        return support
+    a_codes = answer_codes(support_keys(_protos(instance.a.table), support))
+    b_codes = answer_codes(support_keys(_protos(instance.b.table), support))
     samples = policy_of(generator).samples
     lines: list[str] = []
     for name, shown, answers in (
         ("A to B", a_codes, b_codes),
         ("B to A", b_codes, a_codes),
     ):
-        measured = room(shown, answers)
+        measured = room(shown, answers, support)
         if measured.worst_augmented > MAX_LOOKUP_FLOOR:
             return CheckResult(
                 "phone_lookup", False,
@@ -897,6 +1018,9 @@ def check_analogy(generator, instance: Instance) -> CheckResult:
     made by renaming A's inert consonants would keep every skeleton and is what this
     refuses.
     """
+    support = _declared_support(generator, "analogy")
+    if isinstance(support, CheckResult):
+        return support
     a_protos = _protos(instance.a.table)
     b_protos = _protos(instance.b.table)
     lines: list[str] = []
@@ -905,7 +1029,7 @@ def check_analogy(generator, instance: Instance) -> CheckResult:
         ("B to A", b_protos, a_protos),
     ):
         try:
-            score, position = worst_analogy(source, target)
+            score, position = worst_analogy(source, target, support)
         except ValueError as exc:
             return CheckResult("analogy", False, str(exc))
         if score > MAX_TRANSFER:
@@ -929,15 +1053,19 @@ def check_analogy(generator, instance: Instance) -> CheckResult:
 # --------------------------------------------------------------------------
 
 
-def pair_report(a_protos: Sequence[str], b_protos: Sequence[str]) -> dict[str, object]:
+def pair_report(
+    a_protos: Sequence[str],
+    b_protos: Sequence[str],
+    support: Support = FIRST_VERSION,
+) -> dict[str, object]:
     """Everything the construction filter measured about one pair, for a human.
 
     The roster release has to carry the exact minima and the alternative means of each
     table rather than the construction lower bound, because four is what a pair had to
     clear and not what it reached.
     """
-    a_keys = support_keys(tuple(a_protos))
-    b_keys = support_keys(tuple(b_protos))
+    a_keys = support_keys(tuple(a_protos), support)
+    b_keys = support_keys(tuple(b_protos), support)
     a_codes = answer_codes(a_keys)
     b_codes = answer_codes(b_keys)
     out: dict[str, object] = {}
@@ -950,7 +1078,7 @@ def pair_report(a_protos: Sequence[str], b_protos: Sequence[str]) -> dict[str, o
             "distinct_keys": distinct_keys(keys),
             "movement": {
                 axis: {"fewest": low, "mean": mean}
-                for axis, (low, mean) in movement(keys).items()
+                for axis, (low, mean) in movement(keys, support).items()
             },
             "no_receipt_optimum": no_receipt_optimum(keys),
             "modal_filing": list(modal_filing(keys)),
@@ -959,7 +1087,7 @@ def pair_report(a_protos: Sequence[str], b_protos: Sequence[str]) -> dict[str, o
         ("a_to_b", a_codes, b_codes),
         ("b_to_a", b_codes, a_codes),
     ):
-        measured = room(shown, answers)
+        measured = room(shown, answers, support)
         out[name] = {
             "ceiling": measured.ceiling,
             "lookup_floor": {
@@ -973,15 +1101,15 @@ def pair_report(a_protos: Sequence[str], b_protos: Sequence[str]) -> dict[str, o
     for name, source, target in (
         ("a_to_b", a_protos, b_protos), ("b_to_a", b_protos, a_protos)
     ):
-        score, position = worst_analogy(source, target)
+        score, position = worst_analogy(source, target, support)
         entry = out[name]
         assert isinstance(entry, dict)
         entry["analogy"] = {"worst": score, "at_draw": position}
-        source_keys = support_keys(tuple(source))
-        target_keys = support_keys(tuple(target))
+        source_keys = support_keys(tuple(source), support)
+        target_keys = support_keys(tuple(target), support)
         entry["character_copy"] = max(
             character_copy_maximum(source_keys[i], target_keys[i])
-            for i in range(len(ALL_CONVENTIONS))
+            for i in range(len(support.conventions))
         )
     out["shared_forms"] = sorted(set(a_protos) & set(b_protos))
     return out
@@ -1013,6 +1141,8 @@ def intermediate_forms(proto: str, convention: Mapping[str, str]) -> dict[str, s
 
 
 __all__ = [
+    "AXIS_ORDER",
+    "FIRST_VERSION",
     "MAX_LOOKUP_FLOOR",
     "MAX_NO_RECEIPT",
     "MAX_PROTO",
@@ -1022,6 +1152,7 @@ __all__ = [
     "READABLE_AXES",
     "MIN_MOVED_ROWS",
     "Room",
+    "Support",
     "align",
     "analogy_score",
     "answer_codes",
@@ -1036,6 +1167,7 @@ __all__ = [
     "check_cascade",
     "check_phone_lookup",
     "distinct_keys",
+    "environment_pattern",
     "evident_rows",
     "grammar_refusal",
     "intermediate_forms",
@@ -1052,8 +1184,9 @@ __all__ = [
     "row_dependence",
     "side_refusal",
     "skeleton",
+    "support_for",
     "support_keys",
+    "support_of_axes",
     "transfer",
-    "two_sided",
     "worst_analogy",
 ]

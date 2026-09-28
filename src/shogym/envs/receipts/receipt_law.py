@@ -40,6 +40,7 @@ than averaged over all of them.
 
 from __future__ import annotations
 
+import hashlib
 import math
 from dataclasses import dataclass
 from itertools import combinations
@@ -327,11 +328,25 @@ REFERENCE_RULES = (ALL_REFERENCES, DRAWN_REFERENCE)
 #: The law is a pure function of the two tables, the drawn convention and the policy, and
 #: it is an exact walk of every mask rather than a sample of them. Verification recomputes
 #: a bank's population by rerunning admission, and a run that verifies several bundles
-#: over one bank walks the same masks for the same answer every time. The key is the two
+#: over one bank walks the same masks for the same answer every time. The key holds the two
 #: task identifiers, which are HMACs over the master key and the coordinates, so two banks
 #: under two keys never share an entry and a redrawn instance of the same bank does.
+#:
+#: AND THE ANSWERS THE WALK READS, because an identifier is an HMAC over the coordinates
+#: and not over the tables. An instance whose construction a test stubbed, or whose rows
+#: were rearranged by hand, carries a real identifier over other tables. A memo keyed by
+#: the identifiers alone handed that instance's law to the next caller asking about the
+#: real one. The two laws agreed to every place a report prints and differed in the last
+#: bit of a sum, which moved the report's digest. Coding the two sides' answers is a small
+#: part of the walk, so they are coded first and the memo is consulted after.
 _CACHE_SIZE = 512
 _CACHE: "dict[tuple[object, ...], LawResult]" = {}
+
+
+def _fingerprint(codes: np.ndarray) -> str:
+    """One coded answer table as a short digest of its shape and its values, in order."""
+    held = np.ascontiguousarray(codes, dtype=np.int64)
+    return hashlib.sha256(repr(held.shape).encode() + held.tobytes()).hexdigest()
 
 
 def law_for(
@@ -371,20 +386,6 @@ def law_for(
             f"{generator.name!r} has no axis {', '.join(unknown)}, so nothing can be "
             "given away on it"
         )
-    remembered = (
-        type(generator).__qualname__,
-        instance.a.task_id,
-        instance.b.task_id,
-        tuple(sorted(instance.convention.items())),
-        policy.as_record()["name"],
-        policy.as_record()["reported"],
-        side.strip().lower(),
-        references,
-        conceded,
-    )
-    known = _CACHE.get(remembered)
-    if known is not None:
-        return known
     task = instance.side(side)
     sibling = instance.side("b" if side.strip().lower() == "a" else "a")
     axes = tuple(axis.name for axis in generator.AXES)
@@ -415,6 +416,22 @@ def law_for(
         ],
         generator.normalize_answer,
     )
+    remembered = (
+        type(generator).__qualname__,
+        instance.a.task_id,
+        instance.b.task_id,
+        tuple(sorted(instance.convention.items())),
+        policy.as_record()["name"],
+        policy.as_record()["reported"],
+        side.strip().lower(),
+        references,
+        conceded,
+        _fingerprint(graded),
+        _fingerprint(answers),
+    )
+    known = _CACHE.get(remembered)
+    if known is not None:
+        return known
     reader = _Sibling(answers)
     # THE FLOOR IS AVERAGED OVER EVERY CANONICAL REFERENCE, not taken at the drawn
     # one. What the reader could have read off a receipt without inferring anything is

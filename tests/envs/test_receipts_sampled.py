@@ -1050,3 +1050,39 @@ def test_the_law_level_gate_reads_the_count_sound_change_declares() -> None:
             assert found.distinguishing[f"{axis.name}={option}"] == pytest.approx(
                 1.0 - comb(24 - moved, 2) / comb(24, 2)
             )
+
+
+def test_the_law_is_remembered_by_the_answers_and_not_by_the_identifiers_alone() -> None:
+    """Two instances under one pair of task identifiers are two laws when their tables differ.
+
+    FAILS IF the law remembered for one instance is handed back for another that carries
+    the same identifiers and the same rule over other tables. An identifier is an HMAC over
+    the coordinates and not over the tables, so a test that stubs the construction draws
+    other tables under a real identifier, and a memo keyed by the identifiers alone served
+    that law to the next caller asking about the real instance. Rearranging the rows alone
+    is enough to move the walk's sum in its last place, which a report digest sees.
+    """
+    import dataclasses
+
+    from shogym.envs.receipts import receipt_law
+
+    generator = soundchange.GENERATOR
+    instance = draw(generator, MASTER, 0)
+    rows = tuple(reversed(instance.a.table.rows))
+    table = dataclasses.replace(instance.a.table, rows=rows)
+    rearranged = dataclasses.replace(
+        instance,
+        a=dataclasses.replace(
+            instance.a, table=table, key=tuple(generator.key_for(table, instance.convention))
+        ),
+    )
+    assert rearranged.a.task_id == instance.a.task_id
+
+    receipt_law._CACHE.clear()
+    alone = law_for(generator, rearranged, "a")
+    receipt_law._CACHE.clear()
+    first = law_for(generator, instance, "a")
+    after = law_for(generator, rearranged, "a")
+    assert after is not first
+    assert after.as_record() == alone.as_record()
+    assert law_for(generator, instance, "a") is first
