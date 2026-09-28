@@ -1520,7 +1520,7 @@ Recorded boundaries, held by process rather than by a check:
 | `generators/soundchange.py` | the sound change genre: the phone inventory, the three passes, the keyed pair construction and its filter, the four surfaces, the oracle template. |
 | `generators/soundchange_v2.py` | the second version of that genre: the third environment, its pass, its task text and oracle phrases, and its pair search under its own name. |
 | `generators/soundchange_audit.py` | a second implementation of that cascade for both versions, the predicates the pair is filtered on over the support a version declares, and the three checks the profile adds. |
-| `soundchange_review.py` | the deterministic review pack and the private trace worksheets for that genre. |
+| `soundchange_review.py` | the deterministic review pack and the private trace worksheets for both versions of that genre. |
 | `generators/components.py` | the components genre: the contact rules, the exact board catalogue, the bounded keyed pair construction, the one surface, the oracle template. |
 | `generators/components_audit.py` | a second implementation of the island count by flood fill, the predicates the pair is filtered on, and the six checks the genre adds. |
 | `components_review.py` | the deterministic review pack and private worksheets for that genre, and the audit of a recorded screen's allocation. |

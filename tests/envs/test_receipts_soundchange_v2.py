@@ -9,13 +9,16 @@ from __future__ import annotations
 
 import hashlib
 import itertools
+import json
 import random
 import re
+from pathlib import Path
 
 import pytest
 
 from shogym.envs.receipts import bank as bank_mod
-from shogym.envs.receipts import checks, copy_profiles, streams
+from shogym.envs.receipts import bundle as bundle_mod
+from shogym.envs.receipts import checks, copy_profiles, review, soundchange_review, streams
 from shogym.envs.receipts.generators import soundchange, soundchange_v2
 from shogym.envs.receipts.generators import soundchange_audit as audit
 from shogym.envs.receipts.protocol import (
@@ -426,3 +429,54 @@ def test_a_bank_of_the_second_version_fills_under_the_registered_rule(filled) ->
     assert lookup.passed and "over all 276 masks" in lookup.detail
     assert audit.check_analogy(GENERATOR, instance).passed
 
+
+@SHARES_BANK
+def test_a_pack_is_exported_for_the_second_version_and_its_bundle_verifies(
+    filled, tmp_path: Path
+) -> None:
+    """The review pack a person reads before this version is dealt, and the bundle.
+
+    It fails if the exporter refuses a bank of this version, if the pack misses any
+    coverage the shared review asks for, if it carries fewer than the 54 oracle cells a
+    reader has to see, if it names a reviewer, or if the bundle built over the bank, a
+    screen record and the attested pack does not verify under the registered rule.
+    """
+    bank, held = filled
+    root = tmp_path / "pack"
+    pack = soundchange_review.export(bank, held, root)
+    manifest = json.loads(pack.read_text(encoding="utf-8"))
+    assert manifest["family"] == "soundchange_v2"
+    assert manifest["reviewer"] is None
+    coverage = review.required_coverage(
+        GENERATOR, checks.FILING_CLASSES, [soundchange.ROWS]
+    )
+    seen = [(e["category"], e["key"]) for e in manifest["renders"]]
+    assert coverage.missing(seen) == []
+    oracles = {e["path"] for e in manifest["renders"] if e["path"].startswith("renders/oracle-")}
+    assert len(oracles) == 54
+    assert ("option", "environment=no_left_vowel") in seen
+
+    screen = tmp_path / "screen.json"
+    screen.write_text(
+        json.dumps(
+            {
+                "family": GENERATOR.name,
+                "model": "a scripted policy",
+                "task_seeds": [str(i) for i in range(40)],
+                "pairs": [
+                    {"instance": f"task-{i:02d}", "filing": f"filing-{i:02d}",
+                     "placebo": 0.4, "graded": 0.6, "oracle": 0.95, "ideal": 0.82}
+                    for i in range(40)
+                ],
+                "min_room": 0.05, "min_ratio": 0.25, "min_pairs": 36,
+                "min_oracle": 0.90, "min_learning_gap": 0.10,
+                "floor": 0.0, "floor_rule": "drop",
+                "candidates_screened": 1, "selection_note": "",
+            }
+        ),
+        encoding="utf-8",
+    )
+    soundchange_review.attested(root, "a named reader")
+    # The build verifies the bundle before it returns, and raises when it does not.
+    built = bundle_mod.build(tmp_path / "bundles", GENERATOR, bank, screen, pack)
+    assert built.root.is_dir()
