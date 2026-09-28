@@ -6,21 +6,40 @@ receipt DID carry. It is the one-receipt criterion: each task pair is one
 execution of task A and three of task B, a graded branch, a byte-matched placebo
 branch, and an oracle branch that is told the rule, all at zero prior dose.
 
-Per pair j the two contrasts are
+Per pair j the three contrasts are
 
-    x_j = graded_j - placebo_j      the gain the graded receipt produced
+    x_j = graded_j - placebo_j      the feedback effect the graded receipt produced
     y_j = oracle_j - placebo_j      the room a perfect reader had
+    g_j = ideal_j - graded_j        the learning gap left above the receipt's ceiling
 
-and the family's extraction ratio is a ratio of two AGGREGATED differences,
+A pair is one task. A caller that executed a task more than once hands in the means
+over its executions, so every task weighs the same however often it was run.
+
+THE BARS HAVE TWO REGISTERED VERSIONS, and a record says which one it was made
+under. It is judged against that version's bars and no other, so a record, a bundle
+or a pack made under the first version keeps the verdict it had when it was made.
+
+`receipts-screen-v2` is the registered version. Over at least `REGISTERED_MIN_PAIRS`
+distinct tasks, with paired 90 percent percentile bootstrap intervals over 2,000
+resamples of the tasks, it admits a family when the feedback effect's interval lies
+wholly above zero, the room's interval lies wholly above zero, and the learning gap
+is at least `REGISTERED_MIN_LEARNING_GAP` with its interval wholly above zero. The
+oracle level is reported beside them and is not a bar.
+
+`receipts-screen-v1` is the first version, which every record without a `bars` field
+was made under and is still read under. It judges the extraction ratio, a ratio of
+two AGGREGATED differences,
 
     rho = mean_j(x_j) / mean_j(y_j),
 
-never a mean of per-pair ratios. A family whose pairs sit at the ceiling has
-y_j at or below zero and no room to extract, which is the failure this screen
-exists to catch: a receipt can pass every gate and still be worth nothing on a
-task the agent already solves.
+never a mean of per-pair ratios, against `V1_MIN_RATIO`, the room against
+`V1_MIN_ROOM` with the interval's lower bound above zero, the mean executed oracle
+level against `V1_MIN_ORACLE`, and the learning gap as the registered version does.
+A family whose pairs sit at the ceiling has y_j at or below zero and no room to
+extract, which is the failure both versions exist to catch: a receipt can pass every
+gate and still be worth nothing on a task the agent already solves.
 
-THE FLOOR
+THE FLOOR, IN THE FIRST VERSION
 
 A pooled denominator below `floor` is not turned into a ratio, because a ratio
 whose denominator is noise around zero is not a number. Three ways of not turning
@@ -30,7 +49,7 @@ with the floor, and `none` divides anyway and is kept only to show what the floo
 buys. A denominator at zero is NaN under all three: a family with no room has no
 ratio, whatever the floor was set to.
 
-THE VARIANCE
+THE VARIANCE OF THE FIRST VERSION'S RATIO
 
 Delta method, with x_bar and y_bar the means over P pairs:
 
@@ -42,24 +61,13 @@ value (x_j - rho y_j) / mu_y, and `sd_influence` computes it from the five
 moments.
 
 THE BARS ARE REGISTERED. What a family must show to be admitted is the maintainer's
-call, and the call has been made: the oracle must beat the placebo by at least
-`REGISTERED_MIN_ROOM` with the interval's lower bound above zero, and one graded
-receipt must take at least `REGISTERED_MIN_RATIO` of that room, over at least
-`REGISTERED_MIN_PAIRS` DISTINCT tasks. They are defaults rather than constants,
-because a diagnostic run may want to see what a family does against another bar: a
-result says whether the bars it was judged against were the registered ones, and a
-caller that deals families requires the registered ones or does not deal.
-
-TWO MORE, AND THEY ASK WHAT THE OTHER THREE CANNOT SEE. The mean executed oracle level
-has to reach `REGISTERED_MIN_ORACLE`, because a low one is as consistent with copies
-that could not carry out a rule they were handed as with a family that leaves nothing
-to carry, and the ratio divides by that room either way. And the graded level has to
-sit at least `REGISTERED_MIN_LEARNING_GAP` below `ideal`, the level a perfect reader of
-the SAME receipts reaches on the held-out task, with the paired interval's lower bound
-above zero. A family already at its receipt's own ceiling passes the first three bars
-emphatically and has nothing left for a later step to read better, which is the whole
-question a chain is run to answer. `ideal` is carried per case from the gate's exact
-computation over the registered mask law, never measured here.
+call, and the call has been made twice: once as the first version and once as the
+registered one. The numbers in both are defaults rather than constants, because a
+diagnostic run may want to see what a family does against another bar: a result
+says whether the bars it was judged against were its version's registered ones, and
+a caller that deals families requires them or does not deal. `ideal` is carried per
+case from the gate's exact computation over the registered mask law, never measured
+here.
 """
 
 from __future__ import annotations
@@ -67,37 +75,62 @@ from __future__ import annotations
 import json
 import math
 from dataclasses import dataclass
-from typing import Sequence
+from typing import ClassVar, Mapping, Sequence
 
 import numpy as np
 
 FLOOR_RULES = ("drop", "clamp", "none")
 
-#: The registered sample. A pair is one execution of A and three of B, so 36 pairs is
-#: 36 A executions and 108 B executions, 144 in all, which is the costing a cheap
-#: generated family was planned against. It is a default rather than a caller's
+#: THE REGISTERED VERSIONS OF THE BARS. A record names the version it was made under and
+#: is judged against that version's bars alone. The first version's records were written
+#: before the name existed and carry none, so a record that carries none is one of them
+#: and is read exactly as it was read then. A new record is made under `REGISTERED_BARS`.
+BARS_V1 = "receipts-screen-v1"
+BARS_V2 = "receipts-screen-v2"
+BAR_VERSIONS = (BARS_V1, BARS_V2)
+REGISTERED_BARS = BARS_V2
+
+#: The registered sample, in both versions. A pair is one execution of A and three of B,
+#: so 36 pairs is 36 A executions and 108 B executions, 144 in all, which is the costing
+#: a cheap generated family was planned against. It is a default rather than a caller's
 #: choice: a screen is the only evidence that a family's room can actually be
 #: converted, and a caller free to pick the sample can pick the one that passes.
 REGISTERED_MIN_PAIRS = 36
-#: The registered bars. A family whose oracle beats its placebo by less than this has
-#: too little room for one receipt to carry anything, and a family whose one graded
-#: receipt takes less than a quarter of the room it had is not converting it.
-REGISTERED_MIN_ROOM = 0.05
-REGISTERED_MIN_RATIO = 0.25
-#: Two more registered bars, beside those three and not instead of them.
+#: THERE HAS TO BE ROOM ABOVE THE RECEIPT'S OWN CEILING, in both versions. `ideal` is the
+#: level a perfect reader of THIS receipt reaches on the held-out task, carried per case
+#: from the gate's own computation over the registered mask law. A graded level already
+#: at it is a family where nothing is left to read better: reducing what the receipt says
+#: lowers the score without creating anything for a later step to improve on.
 #:
-#: THE ORACLE HAS TO BE EXECUTED. The room the ratio is a fraction of is the oracle's,
-#: and a low oracle mean is as consistent with a copy that could not carry out a rule
-#: it was handed as with a family that leaves nothing to carry. A screen that did not
-#: ask would divide by a denominator it could not account for.
-REGISTERED_MIN_ORACLE = 0.90
-#: AND THERE HAS TO BE ROOM ABOVE THE RECEIPT'S OWN CEILING. `ideal` is the level a
-#: perfect reader of THIS receipt reaches on the held-out task, carried per case from
-#: the gate's own computation over the registered mask law. A graded level already at
-#: it is a family where nothing is left to read better: reducing what the receipt says
-#: lowers the score without creating anything for a later step to improve on, which is
-#: the failure this bar exists to catch and the one the other three cannot see.
+#: THE FLOOR IS 0.10 BECAUSE THAT IS THE MINIMUM DETECTABLE RECURSION EFFECT the study
+#: registers. A recursion effect of that size is a later step reading the same feedback
+#: better by 0.10, and it can only do that where the graded level sits at least that far
+#: under what a perfect reader of the feedback reaches. Its paired interval has to lie
+#: wholly above zero as well, so the room is shown by the sample and not only by its mean.
 REGISTERED_MIN_LEARNING_GAP = 0.10
+
+#: THE REGISTERED VERSION TESTS THE FEEDBACK EFFECT AND THE ROOM. Each has to have its
+#: paired interval wholly above zero, and neither has a point bar beside it. An interval
+#: above zero is a test: it asks whether the sample shows the copy with feedback beating
+#: the placebo, and the oracle beating the placebo, at all. The first version's ratio of
+#: 0.25 and room of 0.05 were fractions chosen as enough, and a chosen fraction says how
+#: much would do without asking whether the sample shows anything. The interval on the
+#: feedback effect replaces the ratio's bar, and the one on the room drops its floor.
+#:
+#: AND IT HAS NO ORACLE BAR. The oracle is still run and its level is reported. The first
+#: version required a mean of 0.90, and that was removed: a mean of 0.90 neither
+#: guaranteed that a copy handed the rule carried it out nor made the recursion effect
+#: specific to reading, and the reason it was stated for, that the ratio divides by the
+#: oracle's room, went with the ratio.
+#:
+#: THE FIRST VERSION'S OWN BARS, kept so that a record made under them is judged as it
+#: was. Under them a family whose oracle beat its placebo by less than the room bar had
+#: too little room for one receipt to carry anything, a family whose one graded receipt
+#: took less than a quarter of the room it had was not converting it, and a low oracle
+#: mean was read as a room the ratio could not account for.
+V1_MIN_ROOM = 0.05
+V1_MIN_RATIO = 0.25
+V1_MIN_ORACLE = 0.90
 
 #: How many candidates a screen may have been selected from and still be DEAL
 #: EVIDENCE. The best of several clears a bar more easily than one does, and nothing
@@ -342,18 +375,50 @@ class ScreenRun:
 #: Everything a stored screen has to name. The rows say what was measured; these say
 #: what it was measured against, and a decision input that can be absent is a decision
 #: input the reader supplies, which means the record does not say what was decided.
+#:
+#: Each version names its own, and no field the other version decides with. The first
+#: version's record names its bars and the floor its ratio is taken under. The registered
+#: version's names the version itself, and no ratio, no room floor, no oracle bar and no
+#: floor, because none of them decides it and a field nothing reads is a field a stale
+#: conclusion travels in.
 RUN_FIELDS = ("family", "model", "task_seeds", "pairs")
-DECISION_FIELDS = (
-    "min_room",
-    "min_ratio",
-    "min_pairs",
-    "min_oracle",
-    "min_learning_gap",
-    "floor",
-    "floor_rule",
-    "candidates_screened",
-    "selection_note",
-)
+DECISION_FIELDS: Mapping[str, tuple[str, ...]] = {
+    BARS_V1: (
+        "min_room",
+        "min_ratio",
+        "min_pairs",
+        "min_oracle",
+        "min_learning_gap",
+        "floor",
+        "floor_rule",
+        "candidates_screened",
+        "selection_note",
+    ),
+    BARS_V2: (
+        "bars",
+        "min_pairs",
+        "min_learning_gap",
+        "candidates_screened",
+        "selection_note",
+    ),
+}
+
+#: Each version's bars and the values it registered for them, in the order a record names
+#: them. `registered` and `overrides` read a record against its OWN version's line here,
+#: so a first-version record is held to the numbers it was made under.
+REGISTERED_VALUES: Mapping[str, tuple[tuple[str, float], ...]] = {
+    BARS_V1: (
+        ("min_room", V1_MIN_ROOM),
+        ("min_ratio", V1_MIN_RATIO),
+        ("min_pairs", REGISTERED_MIN_PAIRS),
+        ("min_oracle", V1_MIN_ORACLE),
+        ("min_learning_gap", REGISTERED_MIN_LEARNING_GAP),
+    ),
+    BARS_V2: (
+        ("min_pairs", REGISTERED_MIN_PAIRS),
+        ("min_learning_gap", REGISTERED_MIN_LEARNING_GAP),
+    ),
+}
 
 
 @dataclass(frozen=True)
@@ -365,6 +430,10 @@ class ScreenRecord:
     who reruns it, and the selection disclosure in particular is worth nothing when it
     can be omitted and defaulted to a single candidate.
 
+    `bars` is the registered version the record was made under, and it decides which
+    screen reruns it. The first version's own bars and floor are set on a record made
+    under it and on no other, because under the registered version they decide nothing.
+
     Nothing here reads the count or the note into a number: a record of a thousand
     candidates is SCORED exactly as a record of one, so what the arithmetic establishes
     about a selected winner is what it establishes about any single candidate, and the
@@ -375,31 +444,44 @@ class ScreenRecord:
     """
 
     run: "ScreenRun"
-    min_room: float
-    min_ratio: float
+    bars: str
     min_pairs: int
-    min_oracle: float
     min_learning_gap: float
-    floor: float
-    floor_rule: str
     candidates_screened: int
     selection_note: str
+    min_room: float | None = None
+    min_ratio: float | None = None
+    min_oracle: float | None = None
+    floor: float | None = None
+    floor_rule: str | None = None
+
+    def __post_init__(self) -> None:
+        if self.bars not in BAR_VERSIONS:
+            raise ValueError(
+                f"a screen record is made under one of {', '.join(BAR_VERSIONS)}, "
+                f"not {self.bars!r}"
+            )
+        first = (self.min_room, self.min_ratio, self.min_oracle, self.floor, self.floor_rule)
+        if self.bars == BARS_V1 and any(value is None for value in first):
+            raise ValueError(
+                f"a record made under {BARS_V1} states its room, ratio and oracle bars "
+                "and the floor its ratio is taken under"
+            )
+        if self.bars != BARS_V1 and any(value is not None for value in first):
+            raise ValueError(
+                f"a record made under {self.bars} states no room, ratio or oracle bar and "
+                "no floor, because none of them decides it"
+            )
 
     @property
     def registered(self) -> bool:
-        """Whether this record was judged against the registered bars."""
+        """Whether this record was judged against its version's registered bars."""
         return not self.overrides()
 
     def overrides(self) -> list[str]:
-        """Which bars were moved off their registered values, named for printing."""
+        """Which bars were moved off their version's registered values, for printing."""
         moved = []
-        for name, registered in (
-            ("min_room", REGISTERED_MIN_ROOM),
-            ("min_ratio", REGISTERED_MIN_RATIO),
-            ("min_pairs", REGISTERED_MIN_PAIRS),
-            ("min_oracle", REGISTERED_MIN_ORACLE),
-            ("min_learning_gap", REGISTERED_MIN_LEARNING_GAP),
-        ):
+        for name, registered in REGISTERED_VALUES[self.bars]:
             value = getattr(self, name)
             if value != registered:
                 moved.append(f"{name}={value:g} against the registered {registered:g}")
@@ -416,8 +498,8 @@ class ScreenRecord:
         """
         return self.candidates_screened <= REGISTERED_MAX_CANDIDATES
 
-    def result(self, family: str) -> "ScreenResult":
-        """Rerun the screen on this record's own rows and its own bars.
+    def result(self, family: str) -> "ScreenResult | ScreenResultV1":
+        """Rerun the screen on this record's own rows, under its own version and bars.
 
         The family a caller asks about has to be the family the run says it was taken
         on. A label supplied here and nowhere else is a label anyone can change, and a
@@ -428,26 +510,49 @@ class ScreenRecord:
                 f"this screen was taken on {self.run.family!r} and is being read as "
                 f"evidence for {family!r}"
             )
+        if self.bars == BARS_V1:
+            min_room, min_ratio, min_oracle, floor, floor_rule = self._first_bars()
+            return screen_v1(
+                family,
+                self.run.outcomes(),
+                min_room=min_room,
+                min_ratio=min_ratio,
+                min_pairs=self.min_pairs,
+                min_oracle=min_oracle,
+                min_learning_gap=self.min_learning_gap,
+                candidates_screened=self.candidates_screened,
+                selection_note=self.selection_note,
+                floor=floor,
+                floor_rule=floor_rule,
+            )
         return screen(
             family,
             self.run.outcomes(),
-            min_room=self.min_room,
-            min_ratio=self.min_ratio,
             min_pairs=self.min_pairs,
-            min_oracle=self.min_oracle,
             min_learning_gap=self.min_learning_gap,
             candidates_screened=self.candidates_screened,
             selection_note=self.selection_note,
-            floor=self.floor,
-            floor_rule=self.floor_rule,
         )
+
+    def _first_bars(self) -> tuple[float, float, float, float, str]:
+        """The first version's room, ratio and oracle bars, its floor and its floor rule."""
+        if (
+            self.min_room is None
+            or self.min_ratio is None
+            or self.min_oracle is None
+            or self.floor is None
+            or self.floor_rule is None
+        ):
+            raise ValueError(f"this record was not made under {BARS_V1}")
+        return self.min_room, self.min_ratio, self.min_oracle, self.floor, self.floor_rule
 
     @classmethod
     def from_payload(cls, payload: object) -> "ScreenRecord":
-        """Read a record, requiring exactly the fields a screen is decided by."""
+        """Read a record, requiring exactly the fields its version is decided by."""
         if not isinstance(payload, dict):
             raise ValueError("a screen artifact is a mapping")
-        expected = set(RUN_FIELDS) | set(DECISION_FIELDS)
+        bars = _version_of(payload)
+        expected = set(RUN_FIELDS) | set(DECISION_FIELDS[bars])
         if set(payload) != expected:
             missing = sorted(expected - set(payload))
             extra = sorted(set(payload) - expected)
@@ -462,9 +567,11 @@ class ScreenRecord:
                 )
             )
         run = ScreenRun.from_payload({name: payload[name] for name in RUN_FIELDS})
-        rule = payload["floor_rule"]
-        if not isinstance(rule, str) or rule not in FLOOR_RULES:
-            raise ValueError(f"a floor rule is one of {FLOOR_RULES}, not {rule!r}")
+        rule = None
+        if bars == BARS_V1:
+            rule = payload["floor_rule"]
+            if not isinstance(rule, str) or rule not in FLOOR_RULES:
+                raise ValueError(f"a floor rule is one of {FLOOR_RULES}, not {rule!r}")
         note = payload["selection_note"]
         if not isinstance(note, str):
             raise ValueError("a selection note is text")
@@ -476,18 +583,63 @@ class ScreenRecord:
                 f"{candidates} candidates were screened and the record says nothing "
                 "about the selection, so the best of several would be read as one"
             )
+        if bars == BARS_V1:
+            # In the order the first version's reader converted them, so a record
+            # malformed in more than one of them is refused on the one it was refused on.
+            min_room = _bar(payload["min_room"], "min_room")
+            min_ratio = _bar(payload["min_ratio"], "min_ratio")
+            min_pairs = _whole(payload["min_pairs"], "min_pairs")
+            min_oracle = _bar(payload["min_oracle"], "min_oracle")
+            min_learning_gap = _bar(payload["min_learning_gap"], "min_learning_gap")
+            floor = _bar(payload["floor"], "floor")
+            return cls(
+                run=run,
+                bars=bars,
+                min_pairs=min_pairs,
+                min_learning_gap=min_learning_gap,
+                candidates_screened=candidates,
+                selection_note=note,
+                min_room=min_room,
+                min_ratio=min_ratio,
+                min_oracle=min_oracle,
+                floor=floor,
+                floor_rule=rule,
+            )
         return cls(
             run=run,
-            min_room=_bar(payload["min_room"], "min_room"),
-            min_ratio=_bar(payload["min_ratio"], "min_ratio"),
+            bars=bars,
             min_pairs=_whole(payload["min_pairs"], "min_pairs"),
-            min_oracle=_bar(payload["min_oracle"], "min_oracle"),
             min_learning_gap=_bar(payload["min_learning_gap"], "min_learning_gap"),
-            floor=_bar(payload["floor"], "floor"),
-            floor_rule=rule,
             candidates_screened=candidates,
             selection_note=note,
         )
+
+
+def _version_of(payload: Mapping[str, object]) -> str:
+    """Which registered bars a stored record was made under.
+
+    A record made under the first version names none, because the field did not exist
+    when those records were written, and it is read as it was read then. Every later
+    record names its version. A name that is not one of them is refused rather than read
+    as the nearest one, and so is the first version's own name: its records carry none,
+    and a second spelling of one version is a second record of one claim.
+    """
+    if "bars" not in payload:
+        return BARS_V1
+    stated = payload["bars"]
+    named = tuple(version for version in BAR_VERSIONS if version != BARS_V1)
+    if stated == BARS_V1:
+        raise ValueError(
+            f"a record made under {BARS_V1} names no bars, because its records were written "
+            f"before the field existed. A record that names its bars names one of "
+            f"{', '.join(named)}"
+        )
+    if not isinstance(stated, str) or stated not in named:
+        raise ValueError(
+            f"a record names the bars it was made under as one of {', '.join(named)}, "
+            f"not {stated!r}"
+        )
+    return stated
 
 
 def _as_float(value: object, what: str) -> float:
@@ -589,6 +741,80 @@ class Outcomes:
 
 @dataclass(frozen=True)
 class ScreenResult:
+    """What the registered screen came to over one family's pairs.
+
+    Every interval here is taken over the same resampled tasks, so the three are paired:
+    each resample draws a set of tasks and reads the feedback effect, the room and the
+    learning gap off that one set. The oracle level is reported and is not a bar.
+    """
+
+    family: str
+    n_pairs: int
+    effect: float
+    effect_low: float
+    effect_high: float
+    room: float
+    room_low: float
+    room_high: float
+    gap: float
+    gap_low: float
+    gap_high: float
+    oracle: float
+    saturated: float
+    min_pairs: int
+    min_learning_gap: float
+    candidates_screened: int
+    selection_note: str
+    effect_pass: bool
+    room_pass: bool
+    gap_pass: bool
+    verdict: bool
+    reasons: tuple[str, ...] = ()
+
+    #: The version of the bars this result was judged under.
+    bars: ClassVar[str] = BARS_V2
+
+    @property
+    def registered(self) -> bool:
+        """Whether the bars this was judged against are the registered ones."""
+        return (
+            self.min_pairs == REGISTERED_MIN_PAIRS
+            and self.min_learning_gap == REGISTERED_MIN_LEARNING_GAP
+        )
+
+    def lines(self) -> list[str]:
+        out = [
+            f"family                 {self.family}",
+            f"bars                   {self.bars}",
+            f"pairs                  {self.n_pairs}   (needs {self.min_pairs})",
+            "",
+            f"EFFECT graded - placebo   {self.effect:8.4f}   (interval "
+            f"{self.effect_low:.4f} to {self.effect_high:.4f}, needs it above zero)",
+            f"ROOM   oracle - placebo   {self.room:8.4f}   (interval "
+            f"{self.room_low:.4f} to {self.room_high:.4f}, needs it above zero)",
+            f"GAP    ideal - graded     {self.gap:8.4f}   (needs "
+            f"{self.min_learning_gap:.4f}, interval {self.gap_low:.4f} to "
+            f"{self.gap_high:.4f}, needs it above zero)",
+            f"ORACLE executed level     {self.oracle:8.4f}   (reported, not a bar)",
+            f"candidates screened       {self.candidates_screened:8d}",
+            f"pairs already at ceiling  {self.saturated:8.4f}",
+            "",
+            f"EFFECT {'PASS' if self.effect_pass else 'FAIL'}",
+            f"ROOM   {'PASS' if self.room_pass else 'FAIL'}",
+            f"GAP    {'PASS' if self.gap_pass else 'FAIL'}",
+            f"VERDICT                {'ADMITTED' if self.verdict else 'REJECTED'}",
+            "BARS                   %s"
+            % ("registered" if self.registered else "OVERRIDDEN, not the registered set"),
+        ]
+        for r in self.reasons:
+            out.append("   - " + r)
+        return out
+
+
+@dataclass(frozen=True)
+class ScreenResultV1:
+    """What the first version's screen came to, as it was reported when it was registered."""
+
     family: str
     n_pairs: int
     room: float
@@ -620,20 +846,23 @@ class ScreenResult:
     gap: float = 0.0
     gap_low: float = float("nan")
     gap_high: float = float("nan")
-    min_oracle: float = REGISTERED_MIN_ORACLE
+    min_oracle: float = V1_MIN_ORACLE
     min_learning_gap: float = REGISTERED_MIN_LEARNING_GAP
     oracle_pass: bool = True
     gap_pass: bool = True
     reasons: tuple[str, ...] = ()
 
+    #: The version of the bars this result was judged under.
+    bars: ClassVar[str] = BARS_V1
+
     @property
     def registered(self) -> bool:
-        """Whether the bars this was judged against are the registered ones."""
+        """Whether the bars this was judged against are the first version's registered ones."""
         return (
-            self.min_room == REGISTERED_MIN_ROOM
-            and self.min_ratio == REGISTERED_MIN_RATIO
+            self.min_room == V1_MIN_ROOM
+            and self.min_ratio == V1_MIN_RATIO
             and self.min_pairs == REGISTERED_MIN_PAIRS
-            and self.min_oracle == REGISTERED_MIN_ORACLE
+            and self.min_oracle == V1_MIN_ORACLE
             and self.min_learning_gap == REGISTERED_MIN_LEARNING_GAP
         )
 
@@ -795,21 +1024,175 @@ def _ratio_interval(
     return float(np.quantile(ratios, tail)), float(np.quantile(ratios, 1.0 - tail))
 
 
+def _paired_intervals(
+    contrasts: Sequence[np.ndarray], seed: int
+) -> list[tuple[float, float]]:
+    """Bootstrap intervals for the means of several contrasts, over ONE set of resamples.
+
+    Paired: each of the resamples draws one set of tasks, and every contrast is averaged
+    over that same set, so the intervals describe one sample rather than several samples
+    that happen to share a size. Seeded from the sample rule, as the first version's
+    intervals are, so a record is reproducible from what it stores. Drawn this way the
+    room and gap intervals are the first version's to the last bit.
+    """
+    n = len(contrasts[0])
+    if n < 2:
+        return [(float("nan"), float("nan")) for _ in contrasts]
+    rng = np.random.default_rng(seed)
+    picks = rng.integers(0, n, size=(BOOTSTRAP_DRAWS, n))
+    tail = (1.0 - BOOTSTRAP_MASS) / 2.0
+    held = []
+    for values in contrasts:
+        draws = values[picks].mean(axis=1)
+        held.append((float(np.quantile(draws, tail)), float(np.quantile(draws, 1.0 - tail))))
+    return held
+
+
+def _above_zero(low: float) -> bool:
+    """Whether an interval whose lower bound is `low` lies wholly above zero."""
+    return bool(math.isfinite(low) and low > 0.0)
+
+
 def screen(
     family: str,
     outcomes: Outcomes,
     *,
-    min_room: float = REGISTERED_MIN_ROOM,
-    min_ratio: float = REGISTERED_MIN_RATIO,
     min_pairs: int = REGISTERED_MIN_PAIRS,
-    min_oracle: float = REGISTERED_MIN_ORACLE,
+    min_learning_gap: float = REGISTERED_MIN_LEARNING_GAP,
+    candidates_screened: int = 1,
+    selection_note: str = "",
+) -> ScreenResult:
+    """Score one family's screen data under the registered version of the bars.
+
+    Three tests over one set of paired intervals, and a sample size. The feedback effect
+    and the room each have to have their interval wholly above zero, and the learning gap
+    has to reach `min_learning_gap` with its interval wholly above zero, over at least
+    `min_pairs` tasks. The oracle level is reported and is not a bar.
+
+    `min_pairs` and `min_learning_gap` default to the REGISTERED values. A caller may move
+    them for a diagnostic run, and the result says whether it was judged against the
+    registered ones, because a screen is the only evidence that a family's room can be
+    converted at all and a caller free to choose the bars can choose the ones that pass.
+
+    SELECTION IS DECLARED AND NOT ADJUSTED FOR, exactly as in the first version: a record
+    that screened more than one candidate has to say so, the arithmetic is the same for
+    one candidate and for a thousand, and no adjustment is implemented here.
+    """
+    if min_pairs < 2:
+        raise ValueError(
+            f"min_pairs is {min_pairs!r}; a screen taken on fewer than two pairs has no "
+            "spread to report and is a point, not a result"
+        )
+    if candidates_screened < 1:
+        raise ValueError("a screen was run on at least one candidate")
+    if not math.isfinite(min_learning_gap) or not 0.0 <= min_learning_gap <= 1.0:
+        raise ValueError(
+            f"min_learning_gap is {min_learning_gap!r}; a screen threshold is a finite "
+            "number between 0 and 1, and a bar of minus infinity is not a bar"
+        )
+    # One order for the sample before anything positional touches it, so the verdict is a
+    # fact about the observations rather than about how the file was written.
+    ordered = canonical_order(outcomes)
+    x, y = contrasts(ordered)
+    gaps = learning_gap(ordered)
+    (effect_low, effect_high), (room_low, room_high), (gap_low, gap_high) = (
+        _paired_intervals((x, y, gaps), min_pairs)
+    )
+    effect = float(x.mean())
+    room = float(y.mean())
+    gap = float(gaps.mean())
+
+    reasons: list[str] = []
+    enough = outcomes.n_pairs >= min_pairs
+    if not enough:
+        reasons.append(
+            f"the screen was taken on {outcomes.n_pairs} pairs against a required "
+            f"{min_pairs}"
+        )
+    effect_pass = _above_zero(effect_low)
+    if not effect_pass:
+        reasons.append(
+            f"the feedback effect interval reaches {effect_low:.4f}, so this sample does "
+            "not establish that the copy with feedback did better than the placebo"
+        )
+    room_pass = _above_zero(room_low)
+    if not room_pass:
+        reasons.append(
+            f"the room interval reaches {room_low:.4f}, so this sample does not "
+            "establish that there was any room at all"
+        )
+    declared = bool(candidates_screened == 1 or selection_note)
+    if not declared:
+        reasons.append(
+            f"{candidates_screened} candidates were screened and the record says nothing "
+            "about the selection, so the best of several is being read as one"
+        )
+    gap_certain = _above_zero(gap_low)
+    gap_pass = bool(at_least(gap, min_learning_gap) and gap_certain)
+    if not at_least(gap, min_learning_gap):
+        reasons.append(
+            f"the graded level sits {gap:.4f} below what a perfect reader of the same "
+            f"receipts reaches, under the registered {min_learning_gap:.4f}, so there "
+            "is nothing left for a later step to read better"
+        )
+    elif not gap_certain:
+        reasons.append(
+            f"the gap interval reaches {gap_low:.4f}, so this sample does not "
+            "establish that there is any room above the receipt's own ceiling"
+        )
+    if declared and candidates_screened > 1:
+        # Not a failure and not an adjustment, and last for the reason the first version
+        # gives: it never crowds a real reason out of the two a bundle prints.
+        reasons.append(
+            f"{candidates_screened} candidates were screened and this verdict carries "
+            "no selection adjustment, because none is registered"
+        )
+
+    return ScreenResult(
+        family=family,
+        n_pairs=outcomes.n_pairs,
+        effect=effect,
+        effect_low=effect_low,
+        effect_high=effect_high,
+        room=room,
+        room_low=room_low,
+        room_high=room_high,
+        gap=gap,
+        gap_low=gap_low,
+        gap_high=gap_high,
+        oracle=float(np.asarray(ordered.oracle, dtype=float).mean()),
+        saturated=float((y <= 0.0).mean()),
+        min_pairs=min_pairs,
+        min_learning_gap=min_learning_gap,
+        candidates_screened=candidates_screened,
+        selection_note=selection_note,
+        effect_pass=effect_pass,
+        room_pass=room_pass,
+        gap_pass=gap_pass,
+        verdict=bool(enough and effect_pass and room_pass and gap_pass and declared),
+        reasons=tuple(reasons),
+    )
+
+
+def screen_v1(
+    family: str,
+    outcomes: Outcomes,
+    *,
+    min_room: float = V1_MIN_ROOM,
+    min_ratio: float = V1_MIN_RATIO,
+    min_pairs: int = REGISTERED_MIN_PAIRS,
+    min_oracle: float = V1_MIN_ORACLE,
     min_learning_gap: float = REGISTERED_MIN_LEARNING_GAP,
     candidates_screened: int = 1,
     selection_note: str = "",
     floor: float = 0.0,
     floor_rule: str = "drop",
-) -> ScreenResult:
-    """Score one family's screen data against the bars a caller supplies.
+) -> ScreenResultV1:
+    """Score one family's screen data under the first version of the bars.
+
+    This is the screen a record without a `bars` field was made under, kept as it was so
+    that such a record reruns to the verdict it had. Its defaults are that version's
+    registered bars.
 
     `min_pairs` is REGISTERED and defaults to it. A caller may lower it for a
     diagnostic run, and the result says which bars it was judged against, because a
@@ -829,9 +1212,9 @@ def screen(
     the disclosure is audit text a reader has to price themselves. The registered
     adjustment is an open maintainer call and no adjustment is implemented here.
 
-    `min_room` and `min_ratio` default to the REGISTERED bars. A caller may move them,
-    and a record says which values it was judged against, so what a family cleared is
-    always the number beside it rather than whatever the reader assumes.
+    `min_room` and `min_ratio` default to the first version's registered bars. A caller
+    may move them, and a record says which values it was judged against, so what a family
+    cleared is always the number beside it rather than whatever the reader assumes.
     """
     if floor_rule not in FLOOR_RULES:
         raise ValueError(f"unknown floor rule {floor_rule!r}")
@@ -940,7 +1323,7 @@ def screen(
             "no selection adjustment, because none is registered"
         )
 
-    return ScreenResult(
+    return ScreenResultV1(
         family=family,
         n_pairs=outcomes.n_pairs,
         room=room,
@@ -987,21 +1370,27 @@ def screen(
 
 
 __all__ = [
+    "BAR_VERSIONS",
+    "BARS_V1",
+    "BARS_V2",
     "BOOTSTRAP_DRAWS",
     "BOOTSTRAP_MASS",
     "DECISION_FIELDS",
     "FLOOR_RULES",
     "PAIR_FIELDS",
+    "REGISTERED_BARS",
     "REGISTERED_MIN_LEARNING_GAP",
-    "REGISTERED_MIN_ORACLE",
     "REGISTERED_MIN_PAIRS",
-    "REGISTERED_MIN_RATIO",
-    "REGISTERED_MIN_ROOM",
+    "REGISTERED_VALUES",
     "RUN_FIELDS",
+    "V1_MIN_ORACLE",
+    "V1_MIN_RATIO",
+    "V1_MIN_ROOM",
     "Outcomes",
     "PairRecord",
     "ScreenRecord",
     "ScreenResult",
+    "ScreenResultV1",
     "ScreenRun",
     "COMPARISON_RESOLUTION",
     "REGISTERED_MAX_CANDIDATES",
@@ -1012,5 +1401,6 @@ __all__ = [
     "learning_gap",
     "read_payload",
     "screen",
+    "screen_v1",
     "sd_influence",
 ]

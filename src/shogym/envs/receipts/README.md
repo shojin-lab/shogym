@@ -372,10 +372,11 @@ for whoever runs it:
    run does not keep only the completed favourable triplets.
 5. Record O, P and G by initial state as well as pooled, with rule-reading mistakes, execution
    mistakes, omitted rows, tool failures, context use, time and tokens.
-6. Judge it against the registered bars: `min_room=0.05`, `min_ratio=0.25`, `min_pairs=36`,
-   `min_oracle=0.90`, `min_learning_gap=0.10`, `floor=0.0`, `floor_rule="drop"`,
-   `candidates_screened=1`. The last two of those used to be a roster-release condition beside
-   the record; they are fields of it now, and a bundle re-verifies against them.
+6. Judge it against the registered bars, `bars="receipts-screen-v2"`, `min_pairs=36`,
+   `min_learning_gap=0.10` and `candidates_screened=1`: the feedback effect's and the room's
+   paired 90 percent intervals wholly above zero, and the gap at least 0.10 with its interval
+   wholly above zero. The oracle level is reported and is not a bar. Those are fields of the
+   record, and a bundle re-verifies against them.
 
 A pooled mean can conceal a state-specific uptake failure, which is why the by-state report is
 part of the procedure rather than an extra. A solved reference implementation proves
@@ -556,23 +557,23 @@ beside 36 pairs says nothing about which case was which execution:
    `ideal`. `ideal` is the level a perfect reader of that case's receipt reaches on B. It is
    carried from the gate's exact computation over the registered mask law and is never measured
    in the screen, and this genre's row recipe puts it at 329/368 on every compliant pair. Use
-   `min_pairs=36`, `min_room=0.05`, `min_ratio=0.25`, `min_oracle=0.90`,
-   `min_learning_gap=0.10`, `floor=0.0`, `floor_rule="drop"` and a truthful candidate-selection
-   disclosure. Every one of those is a required field of the record, and a bundle whose five
-   bars are not the registered `0.05`, `0.25`, `36`, `0.90` and `0.10` is refused. Do not add a
-   state field to that strict pair record: a hashed companion allocation binds each identity to
-   its initial-state digest, bank ordinal, source and task digests, sealed checkpoint and
-   execution evidence.
-5. Require mean O minus mean P at least 0.05, its paired 90 percent bootstrap lower endpoint
-   strictly above zero, and `(mean G - mean P) / (mean O - mean P)` at least 0.25, which is a
-   ratio of pooled differences and never an average of case ratios. Require as well a mean
-   executed oracle grade of at least **0.90**, and a mean of `ideal - G` over the pairs of at
-   least **0.10** with its paired 90 percent bootstrap lower endpoint strictly above zero. The
-   screen and the bundle verifier recompute all five from the raw pair rows.
-6. Report O, P, G, room, gain, saturation and failure counts by initial state as well as pooled.
+   `bars="receipts-screen-v2"`, `min_pairs=36`, `min_learning_gap=0.10` and a truthful
+   candidate-selection disclosure. Every one of those is a required field of the record, and a
+   bundle whose bars are not the registered `36` and `0.10` is refused. Do not add a state field
+   to that strict pair record: a hashed companion allocation binds each identity to its
+   initial-state digest, bank ordinal, source and task digests, sealed checkpoint and execution
+   evidence.
+5. Require the paired 90 percent bootstrap interval of mean G minus mean P to lie wholly above
+   zero, the same interval of mean O minus mean P to lie wholly above zero, and a mean of
+   `ideal - G` over the pairs of at least **0.10** with its interval wholly above zero. The
+   three intervals are taken over one set of 2,000 resamples of the tasks. The mean executed
+   oracle grade is reported and is not a screen bar. The screen and the bundle verifier
+   recompute all three from the raw pair rows.
+6. Report O, P, G, room, feedback effect, saturation and failure counts by initial state as well
+   as pooled. The release audit keeps its own predeclared condition:
    `components_review.screen_refusals` recomputes the mean oracle grade over the cases it
-   matches to recorded pairs and refuses one under 0.90, so the release audit holds the same
-   bar over exactly the executions the allocation names.
+   matches to recorded pairs and refuses one under 0.90. It is the audit's condition over
+   exactly the executions the allocation names, not a screen bar.
 7. Classify errors from observable evidence: a payload rejected as instructions, scope limited to
    the prior task, a complete key under another rule, mixed counting mistakes, malformed or
    omitted filings, and execution failure. Match B filings against all three canonical keys and
@@ -760,17 +761,16 @@ for whoever runs it:
    perfect reader of that case's receipt reaches on B. It is carried from the gate's exact
    computation over the registered mask law and is never measured in the screen, and this
    genre's row recipe puts it at 152885/191268 (0.799323) on every compliant pair, which is the
-   ideal level stated above. Use `min_pairs=36`, `min_room=0.05`, `min_ratio=0.25`,
-   `min_oracle=0.90`, `min_learning_gap=0.10`, `floor=0.0`, `floor_rule="drop"`,
-   `candidates_screened=1` and a truthful selection note. Every one of those is a required field
-   of the record, and a bundle whose five bars are not the registered `0.05`, `0.25`, `36`,
-   `0.90` and `0.10` is refused.
-7. Require mean O minus mean P at least 0.05, its paired 90 percent bootstrap lower endpoint
-   strictly above zero, and `(mean G - mean P) / (mean O - mean P)` at least 0.25, which is a
-   ratio of pooled differences and never an average of case ratios. Require as well a mean
-   executed oracle grade of at least **0.90**, and a mean of `ideal - G` over the pairs of at
-   least **0.10** with its paired 90 percent bootstrap lower endpoint strictly above zero. The
-   screen and the bundle verifier recompute all five from the raw pair rows.
+   ideal level stated above. Use `bars="receipts-screen-v2"`, `min_pairs=36`,
+   `min_learning_gap=0.10`, `candidates_screened=1` and a truthful selection note. Every one of
+   those is a required field of the record, and a bundle whose bars are not the registered `36`
+   and `0.10` is refused.
+7. Require the paired 90 percent bootstrap interval of mean G minus mean P to lie wholly above
+   zero, the same interval of mean O minus mean P to lie wholly above zero, and a mean of
+   `ideal - G` over the pairs of at least **0.10** with its interval wholly above zero. The
+   three intervals are taken over one set of 2,000 resamples of the tasks. The mean executed
+   oracle grade is reported and is not a bar. The screen and the bundle verifier recompute all
+   three from the raw pair rows.
 
 The independent reader scores 1 on every admitted draw, and that is an admission check rather
 than a screen bar: `retail_surface` refuses a pair on which the second implementation in
@@ -1119,21 +1119,37 @@ alternative is distinguished with probability `0.3116`. The `0.75` to `0.90` ban
 choice: above it the receipt identifies too much for a later step to improve on, which is the
 saturation the sampled policy exists to undo.
 
-The room screen is registered too, and it has five bars rather than three:
-**`min_room = 0.05`** with the bootstrap interval's lower bound above zero,
-**`min_ratio = 0.25`**, over **36 distinct tasks**, plus a mean executed oracle level of at
-least **`min_oracle = 0.90`** and a graded level at least **`min_learning_gap = 0.10`** below
-the level a perfect reader of the same receipts reaches, with that paired interval's lower
-bound above zero. That level rides on each pair row as `ideal`, carried from the gate's exact
-computation over the registered mask law rather than measured in the pilot. A low oracle level
-is as consistent with copies that could not carry out a rule they were handed as with a family
-that leaves nothing to carry, and a family already at its receipt's own ceiling clears the
-first three bars emphatically while having nothing left for a later step to read better. A pair is one execution of
-A and three of B, so that is 36 A executions and 108 B executions, the costing a cheap
-generated family was planned against. Verification
-recomputes room, gain, ratio and the interval from the raw rows and compares them with those
-bars: recording that a bar was moved is not refusing to deal a family admitted under an easier
-rule, so a bundle whose recorded bars are not the registered ones is refused. `screen` is a
+The room screen is registered too, in two versions, and a record names the one it was made
+under in its `bars` field. The registered version is **`receipts-screen-v2`**. Over **36
+distinct tasks**, with paired 90 percent percentile bootstrap intervals over 2,000 resamples of
+the tasks, the feedback effect (graded minus placebo) has its interval wholly above zero, the
+room (oracle minus placebo) has its interval wholly above zero, and the graded level sits at
+least **`min_learning_gap = 0.10`** below the level a perfect reader of the same receipts
+reaches, with that interval wholly above zero too. That level rides on each pair row as
+`ideal`, carried from the gate's exact computation over the registered mask law rather than
+measured in the pilot. The oracle is still run and its level is reported. It is not a bar. A
+pair is one execution of A and three of B, so that is 36 A executions and 108 B executions, the
+costing a cheap generated family was planned against, and a task executed more than once is
+recorded as the means over its executions.
+
+An interval wholly above zero is a test of whether the sample shows the effect at all, rather
+than a fraction chosen as enough. The gap floor of `0.10` is the minimum detectable recursion
+effect the study registers: a later step can only read the same feedback better by that much
+where the graded level sits that far under what a perfect reader reaches. The first version's
+oracle bar was removed because a mean of 0.90 neither guaranteed that a copy handed the rule
+carried it out nor made the recursion effect specific to reading, and the reason it was stated
+for, that the ratio divides by the oracle's room, went with the ratio.
+
+**`receipts-screen-v1`** is the first version, and a record with no `bars` field was made under
+it. It asked for **`min_room = 0.05`** with the room interval's lower bound above zero,
+**`min_ratio = 0.25`**, a mean executed oracle level of at least **`min_oracle = 0.90`**, and
+the same gap bar and sample. Such a record is still read, rerun and verified under exactly
+those bars, so what it admitted or refused it still admits or refuses. A new bundle is not
+frozen on one: building a bundle from a record made under the first version is refused, because
+a family that clears its ratio can fail the registered intervals. Verification recomputes
+every statistic from the raw rows and compares it with the bars of the record's own version:
+recording that a bar was moved is not refusing to deal a family admitted under an easier rule,
+so a bundle whose recorded bars are not its version's registered ones is refused. `screen` is a
 diagnostic and will report against other bars, saying which it used.
 
 When more than one candidate was screened the record has to say so and say what was done
@@ -1211,12 +1227,15 @@ eligibility operation, and production, the roster and `shogym receipts verify` a
   is computed and printed, never stored;
 - each **instance entry** is compared, in order, with the recomputed sequence: its digest
   against the rebuilt canonical record, its commitment against the rebuilt convention;
-- the **screen** is rerun on its own rows and the recomputed room, ratio and interval are
-  compared with the REGISTERED bars: `min_room = 0.05` with the bootstrap interval's lower
-  bound above zero, `min_ratio = 0.25`, 36 distinct tasks, a mean oracle level of at least
-  `0.90`, and a graded level at least `0.10` below the receipts' own ideal with that interval
-  above zero. A bundle carries those bars
-  exactly, the way it carries the gate thresholds. A diagnostic run may still ask what a
+- the **screen** is rerun on its own rows, under the version of the bars its record names, and
+  the recomputed statistics are compared with that version's REGISTERED bars. Under the
+  registered `receipts-screen-v2` those are the feedback effect's and the room's paired
+  intervals wholly above zero, 36 distinct tasks, and a graded level at least `0.10` below the
+  receipts' own ideal with that interval above zero. A record with no `bars` field was made
+  under `receipts-screen-v1` and is held to its `min_room = 0.05` with the room interval's
+  lower bound above zero, `min_ratio = 0.25`, 36 distinct tasks, a mean oracle level of at
+  least `0.90` and the same gap bar. A bundle carries its version's bars exactly, the way it
+  carries the gate thresholds. A diagnostic run may still ask what a
   family does against another bar, and `screen` prints which bars it used, but recording that
   a bar was moved is not refusing to deal a family admitted under an easier rule. A pair is
   one task: task seeds and task instances must each be distinct, because forty filings against
@@ -1282,16 +1301,17 @@ against, or the one declared trust boundary at the end.
 | `instances.json` entries | exact fields, recomputed: compared in order with the rebuilt sequence |
 | `instances[].digest` | recomputed: the canonical instance record rebuilt and hashed |
 | `instances[].commitment` | recomputed from the rebuilt convention and the master key |
-| `screen.json` field set | exact: the four run fields and all nine decision inputs, none absent |
+| `screen.json` field set | exact: the four run fields and every decision input of the version the record names, none absent and none of the other version's: `bars`, `min_pairs`, `min_learning_gap`, `candidates_screened` and `selection_note` under `receipts-screen-v2`, and the first version's nine with no `bars` field |
+| `screen.bars` | exact: `receipts-screen-v2`, or absent for a record made under `receipts-screen-v1`. Any other name, the first version's included, is refused |
 | `screen.family` | exact: the family the pilot was taken on, refused when it is not this bundle's |
 | `screen.model`, `task_seeds` | validated: nonblank finite names, refused rather than defaulted |
 | `screen.pairs[]` field set | exact: exactly instance, filing, placebo, graded, oracle, ideal |
 | `screen.pairs[]` identities | validated and required distinct: one row per task, and one task seed per row. That the labels name genuinely different tasks is reported by whoever ran the pilot, in the same class as the render boundary below |
 | `screen.pairs[]` scores | bounded to `[0, 1]` and finite, then used to recompute |
-| `screen` bars (`min_room`, `min_ratio`, `min_pairs`, `min_oracle`, `min_learning_gap`) | exact: the registered `0.05`, `0.25`, `36`, `0.90` and `0.10` |
-| `screen.floor`, `floor_rule`, `selection_note` | bounded and used verbatim in the rerun; a selection of more than one candidate must be disclosed |
+| `screen` bars | exact, against the record's own version: `min_pairs` and `min_learning_gap` at the registered `36` and `0.10`, and under `receipts-screen-v1` also `min_room`, `min_ratio` and `min_oracle` at `0.05`, `0.25` and `0.90` |
+| `screen.floor`, `floor_rule` (first version only), `selection_note` | bounded and used verbatim in the rerun; a selection of more than one candidate must be disclosed |
 | `screen.candidates_screened` | exact: the registered `1`. A larger disclosed count is scored and printed as a diagnostic and refused as deal evidence, because nothing adjusts for selection |
-| room, gain, ratio, oracle level, ideal-minus-graded gap, intervals, verdict | recomputed from the raw rows and compared with the registered bars here |
+| feedback effect, room, ideal-minus-graded gap, their intervals, oracle level, the first version's ratio, verdict | recomputed from the raw rows and compared with the record's version's registered bars here |
 | distinct task units | recomputed: counted from the rows and compared with the registered 36 |
 | `review.json` field set | exact: exactly reviewer, checklist, seeds, family, bank, renders |
 | `review.family`, `review.bank` | exact: the family and the bank identity the pack was read of, refused when they are not this bundle's |

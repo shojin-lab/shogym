@@ -502,16 +502,21 @@ def test_a_bank_cannot_be_filled_by_a_caller_s_predicate() -> None:
 
 
 def test_the_screen_refuses_evidence_no_run_could_have_produced() -> None:
-    from shogym.receipts import Outcomes, screen
+    from shogym.receipts import Outcomes, screen, screen_v1
 
     with pytest.raises(ValueError, match="between 0 and 1"):
         Outcomes(placebo=(0.0,), graded=(2.0,), oracle=(1.0,))
     with pytest.raises(ValueError, match="not a bar"):
-        screen("f", Outcomes(placebo=(0.0,), graded=(0.0,), oracle=(0.0,)),
-               min_room=float("-inf"), min_ratio=0.1, min_pairs=2)
+        screen_v1("f", Outcomes(placebo=(0.0,), graded=(0.0,), oracle=(0.0,)),
+                  min_room=float("-inf"), min_ratio=0.1, min_pairs=2)
     with pytest.raises(ValueError, match="fewer than two pairs"):
-        screen("f", Outcomes(placebo=(0.4,), graded=(0.6,), oracle=(0.9,)),
-               min_room=0.1, min_ratio=0.3, min_pairs=1)
+        screen_v1("f", Outcomes(placebo=(0.4,), graded=(0.6,), oracle=(0.9,)),
+                  min_room=0.1, min_ratio=0.3, min_pairs=1)
+    with pytest.raises(ValueError, match="not a bar"):
+        screen("f", Outcomes(placebo=(0.0,), graded=(0.0,), oracle=(0.0,)),
+               min_learning_gap=float("-inf"), min_pairs=2)
+    with pytest.raises(ValueError, match="fewer than two pairs"):
+        screen("f", Outcomes(placebo=(0.4,), graded=(0.6,), oracle=(0.9,)), min_pairs=1)
 
 
 def test_a_screen_record_missing_its_shape_is_not_a_screen() -> None:
@@ -1136,13 +1141,13 @@ def test_the_oracle_table_refuses_a_phrase_contained_in_another() -> None:
 
 
 def test_a_screen_states_the_sample_it_was_required_to_have() -> None:
-    from shogym.receipts import Outcomes, screen
+    from shogym.receipts import Outcomes, screen_v1
 
     with pytest.raises(ValueError, match="fewer than two pairs"):
-        screen("f", Outcomes(placebo=(0.4,), graded=(0.6,), oracle=(0.9,)),
-               min_room=0.1, min_ratio=0.3, min_pairs=1)
-    thin = screen("f", Outcomes(placebo=(0.4,), graded=(0.6,), oracle=(0.9,)),
-                  min_room=0.1, min_ratio=0.3, min_pairs=8)
+        screen_v1("f", Outcomes(placebo=(0.4,), graded=(0.6,), oracle=(0.9,)),
+                  min_room=0.1, min_ratio=0.3, min_pairs=1)
+    thin = screen_v1("f", Outcomes(placebo=(0.4,), graded=(0.6,), oracle=(0.9,)),
+                     min_room=0.1, min_ratio=0.3, min_pairs=8)
     assert not thin.verdict
 
 
@@ -1224,7 +1229,12 @@ def test_eligibility_is_one_operation_over_one_bundle() -> None:
 def _screen_payload(
     model: str = "a scripted policy", pairs: int = 40, family: str = "ledger", **changes
 ) -> dict:
-    """A screen artifact: the rows, the family they were taken on, and the bars."""
+    """A screen artifact: the rows, the family they were taken on, and the bars.
+
+    It is made under the first version of the bars, which names none. A new bundle refuses
+    it, so a test here puts it in a bundle by rewriting the bundle's screen and resealing,
+    and the bundle then holds one the way a bundle frozen under the first version does.
+    """
     payload = {
         "family": family,
         "model": model,
@@ -1239,6 +1249,28 @@ def _screen_payload(
         "floor": 0.0, "floor_rule": "drop",
         "candidates_screened": 1, "selection_note": "",
     }
+    payload.update(changes)
+    return payload
+
+
+def _registered_screen_payload(
+    pairs: int = 40, family: str = "ledger", rows=None, **changes
+) -> dict:
+    """The same run made under the registered bars, which it names, with ``rows`` changed.
+
+    ``rows`` maps a pair's index to the branch scores that pair takes instead of the
+    steady ones, so a test can put a spread where it wants one.
+    """
+    first = _screen_payload(pairs=pairs, family=family)
+    payload = {name: first[name] for name in ("family", "model", "task_seeds", "pairs")}
+    if rows is not None:
+        payload["pairs"] = [
+            dict(pair, **rows(index)) for index, pair in enumerate(payload["pairs"])
+        ]
+    payload.update(
+        bars="receipts-screen-v2", min_pairs=36, min_learning_gap=0.10,
+        candidates_screened=1, selection_note="",
+    )
     payload.update(changes)
     return payload
 
@@ -1293,7 +1325,7 @@ def _materials(room, generator=None, master=ONE_INSTANCE_MASTER, size: int = 1):
     bank, held = _filled(generator, master, size)
     screen = room / "screen.json"
     screen.write_text(
-        json.dumps(_screen_payload(family=generator.name)), encoding="utf-8"
+        json.dumps(_registered_screen_payload(family=generator.name)), encoding="utf-8"
     )
     counts = [i.a.n_rows for i in held.instances] + [i.b.n_rows for i in held.instances]
     coverage = required_coverage(generator, checks.FILING_CLASSES, counts)
@@ -1381,6 +1413,8 @@ def test_a_verified_bundle_holds_every_named_file_and_opens(built_bundle) -> Non
     assert checked.problems == ()
     assert len(checked.instances) == 1
     assert checked.considered >= 1
+    # Frozen on a record made under the registered bars, the only kind a new bundle takes.
+    assert checked.screen.bars == "receipts-screen-v2"
 
 
 def test_a_bundle_names_nothing_outside_itself(built_bundle) -> None:
@@ -1972,10 +2006,10 @@ def test_a_bundle_carrying_a_nonfinite_screen_is_refused(bundle_room) -> None:
 
 def test_screening_several_candidates_has_to_be_declared(bundle_room) -> None:
     from shogym.envs.receipts import bundle as bundle_mod
-    from shogym.receipts import Outcomes, ScreenRecord, screen
+    from shogym.receipts import Outcomes, ScreenRecord, screen_v1
 
     rows = [{"placebo": 0.4, "graded": 0.6, "oracle": 0.9} for _ in range(40)]
-    quiet = screen(
+    quiet = screen_v1(
         "f", Outcomes.from_rows(rows), min_room=0.1, min_ratio=0.3,
         candidates_screened=6,
     )
@@ -2010,9 +2044,9 @@ def test_a_screen_below_the_registered_sample_is_not_deal_evidence(tmp_path) -> 
     room.mkdir()
     bank, screen, pack, _ = _materials(room)
     for payload, expected in (
-        (_screen_payload(pairs=4, min_pairs=REGISTERED_MIN_PAIRS - 2),
+        (_registered_screen_payload(pairs=4, min_pairs=REGISTERED_MIN_PAIRS - 2),
          "not the registered ones"),
-        (_screen_payload(pairs=4), "distinct tasks where 36 is registered"),
+        (_registered_screen_payload(pairs=4), "distinct tasks where 36 is registered"),
     ):
         screen.write_text(json.dumps(payload), encoding="utf-8")
         with pytest.raises(ValueError, match=expected):
@@ -2081,10 +2115,10 @@ def test_a_pair_with_no_identity_or_no_score_is_refused() -> None:
 
 
 def test_the_screen_reports_an_interval_and_refuses_room_it_cannot_establish() -> None:
-    from shogym.receipts import Outcomes, screen
+    from shogym.receipts import Outcomes, screen_v1
 
     steady = [{"placebo": 0.4, "graded": 0.6, "oracle": 0.9} for _ in range(40)]
-    good = screen("f", Outcomes.from_rows(steady), min_room=0.1, min_ratio=0.3)
+    good = screen_v1("f", Outcomes.from_rows(steady), min_room=0.1, min_ratio=0.3)
     assert good.verdict
     assert good.room_low > 0.0 and good.room_high >= good.room_low
     # a sample whose room straddles zero has not established that there is any
@@ -2092,7 +2126,7 @@ def test_the_screen_reports_an_interval_and_refuses_room_it_cannot_establish() -
         {"placebo": 0.5, "graded": 0.5, "oracle": 1.0 if i % 2 else 0.0}
         for i in range(40)
     ]
-    unsure = screen("f", Outcomes.from_rows(noisy), min_room=0.0, min_ratio=0.0)
+    unsure = screen_v1("f", Outcomes.from_rows(noisy), min_room=0.0, min_ratio=0.0)
     assert unsure.room_low <= 0.0
     assert not unsure.verdict
     assert any("does not establish" in r for r in unsure.reasons)
@@ -2100,12 +2134,12 @@ def test_the_screen_reports_an_interval_and_refuses_room_it_cannot_establish() -
 
 def test_the_sample_the_screen_needs_is_registered_not_chosen() -> None:
     """A caller free to pick the sample can pick the one that passes."""
-    from shogym.receipts import Outcomes, screen
+    from shogym.receipts import Outcomes, screen_v1
     from shogym.receipts.screen import REGISTERED_MIN_PAIRS
 
     assert REGISTERED_MIN_PAIRS == 36
     rows = [{"placebo": 0.4, "graded": 0.6, "oracle": 0.9} for _ in range(4)]
-    assert not screen(
+    assert not screen_v1(
         "f", Outcomes.from_rows(rows), min_room=0.1, min_ratio=0.3
     ).verdict
 
@@ -2115,27 +2149,37 @@ def test_the_screen_bars_are_registered_and_an_override_is_declared() -> None:
 
     A diagnostic run may still ask what a family does against another bar, which is
     why they are defaults rather than constants. What a bundle may carry is a
-    different question, and the answer is in the verifier.
+    different question, and the answer is in the verifier. A record made under the
+    first version is held to that version's bars, and an override of one is declared
+    against them.
     """
     from shogym.receipts import (
         REGISTERED_MIN_PAIRS,
-        REGISTERED_MIN_RATIO,
-        REGISTERED_MIN_ROOM,
         Outcomes,
         ScreenRecord,
         screen,
+        screen_v1,
+    )
+    from shogym.receipts.screen import V1_MIN_RATIO, V1_MIN_ROOM
+
+    assert (V1_MIN_ROOM, V1_MIN_RATIO) == (0.05, 0.25)
+    rows = [{"placebo": 0.4, "graded": 0.6, "oracle": 0.9} for _ in range(40)]
+    current = screen("f", Outcomes.from_rows(rows))
+    assert current.min_pairs == REGISTERED_MIN_PAIRS
+    assert current.registered and current.verdict
+    assert "BARS                   registered" in "\n".join(current.lines())
+    assert "OVERRIDDEN" in "\n".join(
+        screen("f", Outcomes.from_rows(rows), min_learning_gap=0.2).lines()
     )
 
-    assert (REGISTERED_MIN_ROOM, REGISTERED_MIN_RATIO) == (0.05, 0.25)
-    rows = [{"placebo": 0.4, "graded": 0.6, "oracle": 0.9} for _ in range(40)]
-    default = screen("f", Outcomes.from_rows(rows))
-    assert default.min_room == REGISTERED_MIN_ROOM
-    assert default.min_ratio == REGISTERED_MIN_RATIO
+    default = screen_v1("f", Outcomes.from_rows(rows))
+    assert default.min_room == V1_MIN_ROOM
+    assert default.min_ratio == V1_MIN_RATIO
     assert default.min_pairs == REGISTERED_MIN_PAIRS
     assert default.registered and default.verdict
     assert "BARS                   registered" in "\n".join(default.lines())
 
-    moved = screen("f", Outcomes.from_rows(rows), min_room=0.1, min_ratio=0.3)
+    moved = screen_v1("f", Outcomes.from_rows(rows), min_room=0.1, min_ratio=0.3)
     assert not moved.registered
     assert "OVERRIDDEN" in "\n".join(moved.lines())
 
@@ -2174,6 +2218,124 @@ def test_a_screen_under_the_registered_bars_is_refused(bundle_room) -> None:
     root = _tamper(bundle_room, bundle_mod.SCREEN, thin)
     problems = bundle_mod.verify_at(root, GENERATOR).problems
     assert any("under the registered 0.05" in problem for problem in problems)
+
+
+# ----- the registered version of the bars, in a bundle -----
+
+
+def test_a_bundle_verifies_on_a_screen_made_under_either_version(bundle_room) -> None:
+    """A registered record verifies, and a first version record in a bundle verifies as it did.
+
+    This module's bundle is frozen on a record made under the registered bars, and the test
+    that opens it holds it to verifying. This one puts a record without a `bars` field into
+    the same bundle, as a bundle frozen under the first version holds one.
+
+    FAILS IF a bundle already frozen on a record made under the first bars stops verifying
+    under them.
+    """
+    from shogym.envs.receipts import bundle as bundle_mod
+
+    root = _tamper(bundle_room, bundle_mod.SCREEN, _screen_payload())
+    checked = bundle_mod.verify_at(root, GENERATOR)
+    assert checked.verified, checked.problems
+    assert checked.screen.bars == "receipts-screen-v1"
+
+
+def _solved_or_not(index: int) -> dict:
+    """Twenty five tasks the copy with feedback solved, and eleven it did not."""
+    return {"placebo": 0.6, "graded": 1.0 if index < 25 else 0.0, "oracle": 0.9, "ideal": 1.0}
+
+
+@pytest.mark.parametrize("rows", [None, _solved_or_not], ids=["steady", "solved-or-not"])
+def test_a_new_bundle_refuses_a_record_made_under_the_first_bars(tmp_path, rows) -> None:
+    """A new bundle is frozen only on a record made under the registered bars.
+
+    Both records pass the first version's bars over otherwise valid inputs. The steady one
+    passes the registered bars too. The other is a ratio of 0.31 against the first version's
+    0.25 with a feedback effect whose interval reaches zero, so the registered bars refuse
+    it, and freezing it would deal a family that never met them.
+
+    FAILS IF a record made under the first bars is frozen into a new bundle, whatever its
+    verdict under either version, or if the refusal leaves a directory behind.
+    """
+    from shogym.envs.receipts import bundle as bundle_mod
+    from shogym.receipts import ScreenRecord
+
+    bank, screen, pack, _ = _materials(tmp_path)
+    first = _screen_payload(pairs=36)
+    if rows is not None:
+        first["pairs"] = [dict(pair, **rows(index)) for index, pair in enumerate(first["pairs"])]
+    assert ScreenRecord.from_payload(first).result("ledger").verdict
+    registered = ScreenRecord.from_payload(_registered_screen_payload(pairs=36, rows=rows))
+    assert registered.result("ledger").verdict == (rows is None)
+
+    screen.write_text(json.dumps(first), encoding="utf-8")
+    with pytest.raises(
+        ValueError,
+        match="made under receipts-screen-v1, and a new bundle is frozen only on a record "
+        "made under the registered receipts-screen-v2",
+    ):
+        bundle_mod.build(tmp_path / "bundles", GENERATOR, bank, screen, pack)
+    assert not (tmp_path / "bundles").exists()
+
+
+def _screen_problems(root: Path) -> list[str]:
+    """What the verifier's screen check says about a bundle, without walking its population.
+
+    The screen check reads only the screen and the bank's family, so a test about the
+    screen is spared the admission walk every full verification repeats.
+    """
+    from shogym.envs.receipts import bank as bank_mod
+    from shogym.envs.receipts import bundle as bundle_mod
+
+    opened = bundle_mod.load(root)
+    bank = bank_mod.bank_from_record(opened.payload(bundle_mod.BANK))
+    problems, _record = bundle_mod._verify_screen(opened, bank)
+    return problems
+
+
+@pytest.mark.parametrize(
+    "rows,expected",
+    [
+        # The copy with feedback alternates above and below its placebo.
+        (lambda i: {"graded": 0.8 if i % 2 else 0.0}, "feedback effect interval reaches"),
+        # The oracle alternates between everything and nothing.
+        (lambda i: {"oracle": 1.0 if i % 2 else 0.0}, "its room interval reaches"),
+        # The copy with feedback sits at its receipt's own ceiling.
+        (lambda i: {"graded": 0.78}, "under the registered 0.1"),
+    ],
+    ids=["effect", "room", "gap"],
+)
+def test_a_registered_screen_is_held_to_its_three_tests(bundle_room, rows, expected) -> None:
+    """The verifier holds the registered bars itself, one refusal for each test.
+
+    FAILS IF a bundle whose screen does not show a feedback effect, does not show room,
+    or leaves too little room above the receipt's own ceiling verifies.
+    """
+    from shogym.envs.receipts import bundle as bundle_mod
+
+    root = _tamper(bundle_room, bundle_mod.SCREEN, _registered_screen_payload(rows=rows))
+    problems = _screen_problems(root)
+    assert any(expected in problem for problem in problems), problems
+
+
+@pytest.mark.parametrize(
+    "change,expected",
+    [
+        ({"min_learning_gap": 0.05}, "not the registered ones"),
+        ({"min_pairs": 40}, "not the registered ones"),
+        ({"min_oracle": 0.90}, "not a readable record"),
+    ],
+)
+def test_a_registered_screen_under_other_bars_is_not_dealable(
+    bundle_room, change, expected
+) -> None:
+    """A moved bar is declared and refused, and a first-version bar is not a field of it."""
+    from shogym.envs.receipts import bundle as bundle_mod
+
+    root = _tamper(bundle_room, bundle_mod.SCREEN, _registered_screen_payload(**change))
+    problems = _screen_problems(root)
+    assert any(expected in problem for problem in problems), problems
 
 
 # ----- a pair is a task, not an observation of one -----
