@@ -433,19 +433,7 @@ def _artifacts(room: Path) -> tuple[Path, Path]:
     bank = bank_mod.load_bank(bank_path("ledger"))
     held = _held(bank)
     screen = room / "screen.json"
-    screen.write_text(json.dumps({
-        "family": generator.name,
-        "model": "a scripted policy",
-        "task_seeds": [str(i) for i in range(40)],
-        "pairs": [
-            {"instance": f"t{i:02d}", "filing": f"f{i:02d}",
-             "placebo": 0.4, "graded": 0.6, "oracle": 0.95, "ideal": 0.82}
-            for i in range(40)
-        ],
-        "min_room": 0.05, "min_ratio": 0.25, "min_pairs": 36,
-        "min_oracle": 0.90, "min_learning_gap": 0.10, "floor": 0.0,
-        "floor_rule": "drop", "candidates_screened": 1, "selection_note": "",
-    }), encoding="utf-8")
+    screen.write_text(json.dumps(screen_artifact()), encoding="utf-8")
     coverage = required_coverage(
         generator, FILING_CLASSES,
         [i.a.n_rows for i in held.instances] + [i.b.n_rows for i in held.instances],
@@ -469,6 +457,13 @@ def _artifacts(room: Path) -> tuple[Path, Path]:
     return screen, pack
 
 
+#: What the commands print about a record made under the registered bars.
+REGISTERED_BARS_LINE = (
+    "screen bars: receipts-screen-v2, effect and room intervals above zero, pairs 36, gap 0.1 "
+    "with its interval above zero (registered)"
+)
+
+
 def test_screen_scores_the_artifact_it_is_given(
     tmp_path: Path, capsys: pytest.CaptureFixture[str]
 ) -> None:
@@ -487,7 +482,38 @@ def test_screen_scores_the_artifact_it_is_given(
     out = capsys.readouterr().out
     assert "VERDICT                ADMITTED" in out
     assert "model a scripted policy, 40 task seeds" in out
-    assert "screen bars: room 0.05, ratio 0.25, pairs 36, oracle 0.9, gap 0.1 (registered)" in out
+    assert REGISTERED_BARS_LINE in out
+
+
+@pytest.mark.parametrize(
+    "graded,status,verdict",
+    [(0.6, 0, "ADMITTED"), (0.42, 1, "REJECTED")],
+    ids=["admitted", "refused-on-its-ratio"],
+)
+def test_a_record_made_under_the_first_bars_is_read_as_it_was(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str], graded: float, status: int, verdict: str
+) -> None:
+    """A record without a `bars` field is the first version's, and it keeps its verdict.
+
+    The second case is a feedback effect of 0.02 on every pair, which the registered bars
+    admit and the first version refused on a ratio of 0.036 against its 0.25. Read back
+    now, it is still refused: a record is judged by the version it was made under.
+    """
+    import json
+
+    first = {k: v for k, v in screen_artifact().items() if k != "bars"}
+    first.update(min_room=0.05, min_ratio=0.25, min_oracle=0.90, floor=0.0, floor_rule="drop")
+    first["pairs"] = [dict(pair, graded=graded, placebo=0.4) for pair in first["pairs"]]
+    artifact = tmp_path / "screen.json"
+    artifact.write_text(json.dumps(first), encoding="utf-8")
+    assert _run(["receipts", "screen", "ledger", "--outcomes", str(artifact)]) == status
+    out = capsys.readouterr().out
+    assert f"VERDICT                {verdict}" in out
+    assert "RATIO  gain / room" in out
+    assert (
+        "screen bars: receipts-screen-v1, room 0.05, ratio 0.25, pairs 36, oracle 0.9, gap 0.1 "
+        "(registered)"
+    ) in out
 
 
 def test_bundle_then_verify_then_list(
@@ -511,7 +537,7 @@ def test_bundle_then_verify_then_list(
     assert (
         "gate bars:   max_copy_score=%g" % admission_mod.REGISTERED_MAX_COPY_SCORE
     ) in verified
-    assert "screen bars: room 0.05, ratio 0.25, pairs 36, oracle 0.9, gap 0.1 (registered)" in verified
+    assert REGISTERED_BARS_LINE in verified
 
     assert _run(["receipts", "list"]) == 0
     listed = capsys.readouterr().out
@@ -519,7 +545,7 @@ def test_bundle_then_verify_then_list(
     # here too and says so, which is a different fact from this one being dealable.
     ledger_lines = _genre_lines(listed, "ledger")
     assert "DEALABLE" in ledger_lines and "NOT DEALABLE" not in ledger_lines
-    assert "screen bars: room 0.05, ratio 0.25, pairs 36, oracle 0.9, gap 0.1 (registered)" in ledger_lines
+    assert REGISTERED_BARS_LINE in ledger_lines
 
 
 def _genre_lines(listed: str, name: str) -> str:
