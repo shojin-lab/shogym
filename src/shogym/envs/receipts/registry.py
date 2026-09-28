@@ -23,6 +23,10 @@ GENRES = {
     "ledger": "shogym.envs.receipts.generators.ledger",
     "retail_refund": "shogym.envs.receipts.generators.retail_refund",
     "soundchange": "shogym.envs.receipts.generators.soundchange",
+    # The second version of sound change, beside the first rather than in place of it: a
+    # bank names its generator and recomputes its population, so the first version's
+    # banks keep drawing the instances they drew.
+    "soundchange_v2": "shogym.envs.receipts.generators.soundchange_v2",
 }
 
 #: The gate vectors. They wear the generator protocol so the gates can be exercised

@@ -124,7 +124,7 @@ not, the way it refuses one that declares no copy profile. Three policies are re
 | `sampled-4-of-24` | a verdict and that row's own answer on the **four** rows a committed mask drew, and that position's committed neutral tokens in both slots on the other twenty |
 
 **The count is registered per generator and the bars are the same for all.** Ledger
-declares four records of twenty four, sound change two forms of twenty four, components two
+declares four records of twenty four, sound change two forms of twenty four in both versions, components two
 rows of twenty four, retail four cases of twenty four, and every gate vector the full
 receipt. How many rows a receipt has to report before it stops teaching is a property of the
 family's own tables, not of the shape they share: four
@@ -305,7 +305,9 @@ under one draw. A public nasal pass runs first, once, and carries no hidden choi
 proposed and is not here. Unconditional replacement of one consonant by another commutes with
 the deletion of a vowel between consonants on every word, so the two order choices under it
 would be the same function on every possible form and no search for better words could separate
-them. Keeping them would have advertised a decision no data can reveal.
+them. Keeping them would have advertised a decision no data can reveal. A third environment
+that does not commute exists, and `soundchange_v2` below adds it as a second version rather
+than as an edit to this one.
 
 **What is easy here, said plainly.** The replacement phones g, x and s never occur in a proto
 form, and the deleted vowel can be read off the difference in vowel counts, so a reader holding
@@ -403,6 +405,57 @@ effect. A high graded arm as well as a high oracle arm leaves little scope for l
 improvement, so the mixed-chain pilot has to report the graded arm's ceiling frequency and the
 available gain by initial state. Corrections are not removed to avoid saturation without a
 separately registered change.
+
+## The genre: `soundchange_v2`, the same cascade with a third environment
+
+The first version with one more option on one axis, registered beside it under a name of its
+own. Everything else is the first version's: the batch grammar, the four surfaces, the public
+nasal pass, the reading, the scorer, the three cells and their widths, the receipt that reports
+two forms of twenty four, the `soundchange_v1` copy profile, the construction bars and the
+three checks that profile brings.
+
+| Axis | Options | The decision |
+|---|---|---|
+| `reflex` | `out_g`, `out_x`, `out_s` | which phone a matching k becomes |
+| `environment` | `vowel_pair`, `right_vowel`, `no_left_vowel` | which neighbours a k needs before it is replaced |
+| `loss` | `erase_e`, `erase_i`, `erase_a` | which vowel is deleted between consonants |
+| `sequence` | `replace_then_erase`, `erase_then_replace` | which of the two hidden passes runs first |
+
+54 conventions. `no_left_vowel` replaces a k with a vowel on its right and no vowel on its
+left: a k after a consonant, or a k that begins the form. With the first two it sorts every k
+before a vowel by its left neighbour: a vowel, anything, or no vowel.
+
+**A second version, not an edit.** A bank names its generator, its key and its size, and its
+population is recomputed by rerunning admission, so widening the first version's support would
+redraw every instance an existing bank of it holds. The first version stays at 36. This one
+draws its forms, row orders, identifiers, filler, masks and task identifiers under its own name,
+so a bank of each under one key share only the convention stream every genre shares.
+
+**Why this third environment.** Every k in a proto form has a vowel on its right, so when
+replacement runs first the only thing an environment can look at is the left neighbour, which is
+a vowel or the start of the form. The first version's two environments already replace "the one
+after a vowel" and "both". Of the two behaviours left, "neither" never shows the reflex, so a
+third environment has to replace a k that begins the form and refuse one between two vowels.
+The two obvious candidates fail: unconditional replacement commutes with the deletion, and a k
+needing only a vowel on its left is the two-sided environment whenever replacement runs first,
+which leaves 45 distinct rules of 54. `no_left_vowel` replaces only a form-initial k under
+replacement first, and under deletion first also a k whose left vowel the deletion took unless
+it took the right one too. All 54 answer vectors differ on forms the grammar makes, and on the
+first version's nine illustration forms.
+
+**It adds to the hard part.** The reflex and the deleted vowel are still read straight off a
+corrected daughter and `phone_lookup` still gives both away. The new option is on the
+environment axis, and the environment composed with the order, which is what a reader has to
+infer, is six cells here where it was four.
+
+**What it costs, measured.** Under one key, 40 ordinals all built a pair: a candidate is
+accepted on about a third of attempts (the first version: three quarters), three attempts on
+average and eleven at most of the 400 allowed, mostly refused because a reader of every
+corrected form handed the two readable axes would clear 0.90 somewhere in the support. A bank
+of 24 admitted every ordinal it considered, at a bank-mean ideal level of 0.8325 against a
+lookup floor of 0.2169, inside the registered band. A bank of 24 draws 21 distinct rules of 54,
+because the law draws each instance independently; a screen that wants distinct rules selects
+them from a larger bank.
 
 ## The genre: `components`, geometric contact connectivity
 
@@ -1017,7 +1070,7 @@ declared profiles live in `copy_profiles.py`:
 | Profile | Value maps | Who declares it |
 |---|---|---|
 | `ordered_tokens` | the registered token dictionaries between two published answer orders, closed under composition | `ledger`, `components`, `retail_refund`, the gate vectors |
-| `soundchange_v1` | the 36 global character maps: every permutation of the three deletable vowels crossed with every permutation of the three replacement phones | `soundchange` |
+| `soundchange_v1` | the 36 global character maps: every permutation of the three deletable vowels crossed with every permutation of the three replacement phones | `soundchange`, `soundchange_v2` |
 
 A generator added later declares one of these or is refused at registration, and a profile
 name this build does not register is refused the same way. The refusal is the point: a family
@@ -1483,8 +1536,9 @@ Recorded boundaries, held by process rather than by a check:
 | `generators/ledger.py` | the ledger genre: domains, the scoring function, the three renderers, the oracle template. |
 | `ledger_review.py` | the deterministic review pack and private worksheets for that genre, the eleven its sampled receipt owes, and the audit of a recorded screen's allocation. |
 | `generators/soundchange.py` | the sound change genre: the phone inventory, the three passes, the keyed pair construction and its filter, the four surfaces, the oracle template. |
-| `generators/soundchange_audit.py` | a second implementation of that cascade, the predicates the pair is filtered on, and the three checks the profile adds. |
-| `soundchange_review.py` | the deterministic review pack and the private trace worksheets for that genre. |
+| `generators/soundchange_v2.py` | the second version of that genre: the third environment, its pass, its task text and oracle phrases, and its pair search under its own name. |
+| `generators/soundchange_audit.py` | a second implementation of that cascade for both versions, the predicates the pair is filtered on over the support a version declares, and the three checks the profile adds. |
+| `soundchange_review.py` | the deterministic review pack and the private trace worksheets for both versions of that genre. |
 | `generators/components.py` | the components genre: the contact rules, the exact board catalogue, the bounded keyed pair construction, the one surface, the oracle template. |
 | `generators/components_audit.py` | a second implementation of the island count by flood fill, the predicates the pair is filtered on, and the six checks the genre adds. |
 | `components_review.py` | the deterministic review pack and private worksheets for that genre, and the audit of a recorded screen's allocation. |
