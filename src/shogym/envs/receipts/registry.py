@@ -22,6 +22,8 @@ GENRES = {
     "components": "shogym.envs.receipts.generators.components",
     "ledger": "shogym.envs.receipts.generators.ledger",
     "retail_refund": "shogym.envs.receipts.generators.retail_refund",
+    # Priority banding under a hidden points schedule, read off a full receipt.
+    "scorecard": "shogym.envs.receipts.generators.scorecard",
     "soundchange": "shogym.envs.receipts.generators.soundchange",
     # The second version of sound change, beside the first rather than in place of it: a
     # bank names its generator and recomputes its population, so the first version's

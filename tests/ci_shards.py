@@ -196,6 +196,9 @@ SHARDS: Tuple[Shard, ...] = (
     Shard(
         name="receipt-families",
         paths=(
+            # The row-banded families (scorecard and the families built beside it), each
+            # of which fills one admitted bank of twenty four.
+            "tests/envs/test_receipts_banded_families.py",
             "tests/envs/test_receipts_checks.py",
             "tests/envs/test_receipts_components.py",
             "tests/envs/test_receipts_full_policy.py",
