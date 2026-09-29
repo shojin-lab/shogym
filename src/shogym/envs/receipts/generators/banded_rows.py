@@ -426,6 +426,23 @@ def no_receipt_level(codes: np.ndarray) -> float:
     return float(np.mean([np.bincount(codes[:, c]).max() / rules for c in range(width)]))
 
 
+def coincidence(codes: np.ndarray) -> float:
+    """The chance two records drawn at random share an answer, averaged over the rules.
+
+    It is the level an arbitrary relabel of one sibling's answers reaches on the other
+    by luck, and the registered copy screen takes a maximum over hundreds of such
+    relabels and row moves, so a table keeps it low to keep that maximum under the bar.
+    """
+    rules, width = codes.shape
+    if not rules or not width:
+        return 0.0
+    total = 0.0
+    for row in codes:
+        shares = np.bincount(row) / float(width)
+        total += float((shares ** 2).sum())
+    return total / rules
+
+
 def all_pairs(axes: Sequence[Axis], need_single: int) -> tuple[list[tuple[int, int]], np.ndarray]:
     """Every unordered pair of rules, and how many records have to separate each.
 
@@ -666,6 +683,7 @@ __all__ = [
     "Separation",
     "all_pairs",
     "coded",
+    "coincidence",
     "committed_envelope",
     "consistent_rules",
     "envelope_size",

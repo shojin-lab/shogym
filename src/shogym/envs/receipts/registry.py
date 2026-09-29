@@ -29,6 +29,9 @@ GENRES = {
     # bank names its generator and recomputes its population, so the first version's
     # banks keep drawing the instances they drew.
     "soundchange_v2": "shogym.envs.receipts.generators.soundchange_v2",
+    # A member's standing after each infraction under hidden lapse, repeat, first
+    # offence and falling rules, read off a full receipt.
+    "standing": "shogym.envs.receipts.generators.standing",
 }
 
 #: The gate vectors. They wear the generator protocol so the gates can be exercised

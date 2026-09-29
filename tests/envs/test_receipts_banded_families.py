@@ -41,7 +41,7 @@ from shogym.envs.receipts.registry import GENRES, load_generator
 from shogym.envs.receipts.render import Feedback, feedback_for
 
 #: The families under test, by registered name.
-FAMILIES = ("scorecard",)
+FAMILIES = ("scorecard", "standing")
 
 #: How many admitted families each bank holds. The brief's floor is twenty four.
 BANK_SIZE = 24
@@ -408,3 +408,39 @@ def test_an_admitted_bank_of_twenty_four_builds(family: str) -> None:
     made = report(generator, first, bank.master, Thresholds())
     assert made.admitted, made.lines()
     assert made.gates.verdict and made.gates.ceiling == 1.0
+
+
+# --------------------------------------------------------------------------
+# family-specific arithmetic
+# --------------------------------------------------------------------------
+
+
+def test_the_standing_search_computes_the_rule_the_oracle_states() -> None:
+    """FAILS IF the vectorized arithmetic the standing table search runs disagrees with
+    the reference `key_for`, on any rule and any of a spread of random logs. The search
+    would then certify separation for a rule other than the one that is scored."""
+    import random
+
+    from shogym.envs.receipts.generators import standing
+
+    for seed in range(12):
+        rng = random.Random(seed)
+        surface = standing.POOL_A[seed % 4] if seed % 2 else standing.POOL_B[seed % 4]
+        dom = standing.SURFACES[surface]
+        days, members, kinds = standing._layout(rng)
+        order = standing._ordered(days, members, kinds)
+        rows = tuple(
+            standing.Entry(
+                row_id=f"E{n}", day=days[i], member=f"M{members[i]}", kind=kinds[i],
+                staff="", place="",
+            )
+            for n, i in enumerate(order)
+        )
+        table = standing.StandingTable(surface=surface, rows=rows, body="")
+        reference = np.array(
+            [
+                [dom["levels"].index(value) for value in standing.key_for(table, rule)]
+                for rule in standing.ALL_CONVENTIONS
+            ]
+        )
+        assert (reference == standing._codes(days, members, kinds, dom)).all(), seed
