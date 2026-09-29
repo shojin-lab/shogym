@@ -60,6 +60,9 @@ Construction, scoring and every cell follow the ledger through `banded_rows`: th
 task is built from the surface stream alone, only the key reads the rule, scoring is
 equal-weight exact match after the shared fold, and the placebo prints committed neutral
 tokens from the public task.
+
+AUTHORSHIP. Designed and built in one session by Claude Opus 5.5 through Claude Code, as
+one of three families built one after another; no helper agent did any part of it.
 """
 
 from __future__ import annotations
@@ -81,6 +84,7 @@ from shogym.envs.receipts.generators.banded_rows import (
     envelope_size,
     greedy_rows,
     oracle_allowance,
+    prose,
     rebalance_rows,
     render_records,
     separation,
@@ -398,19 +402,11 @@ using the scorecard extract that follows.
 
 SCORECARD EXTRACT ({manual})
 
-  Every open {entity} is given a priority score, which is the sum of the points it
-  earns on the house scorecard's four factors: its hazard grade (column {c_haz}), the
-  criticality of the asset it concerns (column {c_crit}), its exposure, and whether it
-  repeats an earlier fault (column {c_rep}). Exposure is scored either from the
-  number of people affected (column {c_ppl}) or from the days the {entity} has been
-  open (column {c_days}). The band is read off the score with this table:
+{rule}
 
 {table}
 
-  A hazard grade of none and an asset criticality of low earn no points. How many
-  points each factor earns otherwise, how exposure is measured, and how a repeat
-  fault is treated are set by the house scorecard, which this extract does not
-  reproduce. The columns {c_trade} and {c_place} play no part in the score.
+{rest}
 
 {scope}
 {receipt}
@@ -421,6 +417,22 @@ LIST ({fmtnote})
 File one line per {entity}: the id in column {c_id}, a comma, and the band, with no
 header and no other text. File every {entity}, in the order they appear above.
 """
+
+#: The extract's two paragraphs, filled to width once the surface's words are in.
+RULE_PARAGRAPH = (
+    "Every open {entity} is given a priority score, which is the sum of the points it "
+    "earns on the house scorecard's four factors: its hazard grade (column {c_haz}), the "
+    "criticality of the asset it concerns (column {c_crit}), its exposure, and whether "
+    "it repeats an earlier fault (column {c_rep}). Exposure is scored either from the "
+    "number of people affected (column {c_ppl}) or from the days the {entity} has been "
+    "open (column {c_days}). The band is read off the score with this table:"
+)
+REST_PARAGRAPH = (
+    "A hazard grade of none and an asset criticality of low earn no points. How many "
+    "points each factor earns otherwise, how exposure is measured, and how a repeat "
+    "fault is treated are set by the house scorecard, which this extract does not "
+    "reproduce. The columns {c_trade} and {c_place} play no part in the score."
+)
 
 
 RECEIPT_SENTENCE: tuple[str, ...] = (
@@ -570,10 +582,14 @@ class ScorecardGenerator(BandedRowsFamily):
         table: ScoreTable = task.table
         dom = table.dom
         cols = dom["cols"]
+        words = dict(
+            entity=dom["entity"], c_haz=cols[1], c_crit=cols[2], c_ppl=cols[3],
+            c_days=cols[4], c_rep=cols[5], c_trade=cols[6], c_place=cols[7],
+        )
         return TASK_TEMPLATE.format(
             org=dom["org"], title=dom["title"], entity=dom["entity"], manual=dom["manual"],
-            c_id=cols[0], c_haz=cols[1], c_crit=cols[2], c_ppl=cols[3], c_days=cols[4],
-            c_rep=cols[5], c_trade=cols[6], c_place=cols[7],
+            c_id=cols[0], rule=prose(RULE_PARAGRAPH.format(**words)),
+            rest=prose(REST_PARAGRAPH.format(**words)),
             table=band_table(dom), scope=scope_sentence(task.label),
             receipt=shared_filing.receipt_sentence(self.RECEIPT_POLICY, RECEIPT_SENTENCE),
             fmtnote=FORMAT_NOTE[dom["fmt"]], body=table.body,

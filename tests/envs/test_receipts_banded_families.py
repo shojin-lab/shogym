@@ -274,7 +274,8 @@ def test_the_perfect_reader_of_a_full_receipt_recovers_the_rule(family: str) -> 
             ("",) * instance.a.n_rows,
         ):
             receipt = _graded(generator, instance, filed, feedback)
-            reading = banded_rows.perfect_reader(generator, instance, receipt)
+            reading = generator.perfect_reader(instance, receipt)
+            assert reading == banded_rows.perfect_reader(generator, instance, receipt)
             assert reading.consistent == 1
             assert reading.score == 1.0 and reading.expected == 1.0
             assert reading.filing == tuple(instance.b.key)
@@ -444,3 +445,4 @@ def test_the_standing_search_computes_the_rule_the_oracle_states() -> None:
             ]
         )
         assert (reference == standing._codes(days, members, kinds, dom)).all(), seed
+

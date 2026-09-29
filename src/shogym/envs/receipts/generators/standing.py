@@ -52,6 +52,9 @@ perfect reader does by enumeration.
 WHY THE FULL RECEIPT. The difficulty is meant to be the inference, not missing
 information: every entry is reported, the perfect reader identifies the rule on every
 admitted instance, and what an agent loses against it is what it fails to infer.
+
+AUTHORSHIP. Designed and built in one session by Claude Opus 5.5 through Claude Code, as
+one of three families built one after another; no helper agent did any part of it.
 """
 
 from __future__ import annotations
@@ -74,6 +77,7 @@ from shogym.envs.receipts.generators.banded_rows import (
     envelope_size,
     no_receipt_level,
     oracle_allowance,
+    prose,
     render_records,
     shortfall,
     single_axis_pairs,
@@ -505,17 +509,11 @@ RULES EXTRACT ({manual})
 
 {points}
 
-  A {member}'s standing is read from the points that are live at the moment, using this
-  table:
+{read}
 
 {levels}
 
-  The log starts clean: no {member} has an infraction before their first entry below,
-  and every {member} starts at the first standing. Which earlier infractions are still
-  live, how an infraction of the same type as the {member}'s previous one is counted,
-  whether a {member}'s first infraction counts, and whether a standing can fall back
-  once the live points drop are set by the house rules, which this extract does not
-  reproduce. The columns {c_staff} and {c_place} play no part.
+{rest}
 
 {scope}
 {receipt}
@@ -526,6 +524,20 @@ LOG ({fmtnote}; entries in date order)
 File one line per entry: the id in column {c_id}, a comma, and the standing, with no
 header and no other text. File every entry, in the order the entries appear above.
 """
+
+#: The extract's paragraphs, filled to width once the surface's words are in.
+READ_PARAGRAPH = (
+    "A {member}'s standing is read from the points that are live at the moment, using "
+    "this table:"
+)
+REST_PARAGRAPH = (
+    "The log starts clean: no {member} has an infraction before their first entry "
+    "below, and every {member} starts at the first standing. Which earlier infractions "
+    "are still live, how an infraction of the same type as the {member}'s previous one "
+    "is counted, whether a {member}'s first infraction counts, and whether a standing "
+    "can fall back once the live points drop are set by the house rules, which this "
+    "extract does not reproduce. The columns {c_staff} and {c_place} play no part."
+)
 
 RECEIPT_SENTENCE: tuple[str, ...] = (
     "The receipt for this log reports the verdict and the correct standing for selected",
@@ -689,10 +701,12 @@ class StandingGenerator(BandedRowsFamily):
         table: StandingTable = task.table
         dom = table.dom
         cols = dom["cols"]
+        words = dict(member=dom["member"], c_staff=cols[4], c_place=cols[5])
         return TASK_TEMPLATE.format(
             org=dom["org"], title=dom["title"], member=dom["member"], manual=dom["manual"],
             points=points_table(dom), levels=level_table(dom),
-            c_id=cols[0], c_staff=cols[4], c_place=cols[5],
+            read=prose(READ_PARAGRAPH.format(**words)),
+            rest=prose(REST_PARAGRAPH.format(**words)), c_id=cols[0],
             scope=scope_sentence(task.label),
             receipt=shared_filing.receipt_sentence(self.RECEIPT_POLICY, RECEIPT_SENTENCE),
             fmtnote=FORMAT_NOTE[dom["fmt"]], body=table.body,

@@ -28,6 +28,7 @@ controller-side ideal reader and is never shown to an agent.
 from __future__ import annotations
 
 import json
+import textwrap
 from collections import Counter
 from dataclasses import dataclass
 from typing import Any, Callable, Mapping, Sequence
@@ -233,6 +234,14 @@ class BandedRowsFamily:
     def parse_oracle(self, ast: ReceiptAST) -> dict[str, str]:
         return parse_oracle_cell(self.ORACLE, ast)
 
+    # ----- the ideal reader -----
+
+    def perfect_reader(
+        self, instance: Instance, receipt: ReceiptAST, side: str = "a"
+    ) -> "PerfectReading":
+        """This family's perfect reader of one delivered receipt. See `perfect_reader`."""
+        return perfect_reader(self, instance, receipt, side)
+
 
 def oracle_allowance(template: OracleTemplate, axes: Sequence[Axis], margin: int = 64) -> int:
     """The body allowance an oracle needs, as the longest statement over the whole space.
@@ -261,6 +270,17 @@ FORMAT_NOTE = {
     "ini": "one bracketed block per record",
     "yaml": "a YAML list",
 }
+
+
+def prose(text: str, indent: str = "  ", width: int = 86) -> str:
+    """One paragraph of a task's extract, filled to a fixed width.
+
+    The paragraphs carry column names and nouns that differ between surfaces, so they
+    are filled after the words are in rather than wrapped by hand in a template.
+    """
+    return textwrap.fill(
+        " ".join(text.split()), width=width, initial_indent=indent, subsequent_indent=indent
+    )
 
 
 def render_records(header: Sequence[str], records: Sequence[Sequence[str]], fmt: str) -> str:
@@ -692,6 +712,7 @@ __all__ = [
     "no_receipt_level",
     "oracle_allowance",
     "perfect_reader",
+    "prose",
     "rebalance_rows",
     "receipt_evidence",
     "render_records",
