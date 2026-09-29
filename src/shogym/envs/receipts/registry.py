@@ -20,6 +20,9 @@ from shogym.envs.receipts.protocol import Generator, require_policy
 #: which is a different and later thing.
 GENRES = {
     "components": "shogym.envs.receipts.generators.components",
+    # Placings within heats under hidden marking, disqualification, lateness and tie
+    # rules, read off a full receipt.
+    "judging": "shogym.envs.receipts.generators.judging",
     "ledger": "shogym.envs.receipts.generators.ledger",
     "retail_refund": "shogym.envs.receipts.generators.retail_refund",
     # Priority banding under a hidden points schedule, read off a full receipt.

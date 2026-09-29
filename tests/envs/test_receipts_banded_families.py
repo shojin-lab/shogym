@@ -41,7 +41,7 @@ from shogym.envs.receipts.registry import GENRES, load_generator
 from shogym.envs.receipts.render import Feedback, feedback_for
 
 #: The families under test, by registered name.
-FAMILIES = ("scorecard", "standing")
+FAMILIES = ("scorecard", "standing", "judging")
 
 #: How many admitted families each bank holds. The brief's floor is twenty four.
 BANK_SIZE = 24
@@ -446,3 +446,24 @@ def test_the_standing_search_computes_the_rule_the_oracle_states() -> None:
         )
         assert (reference == standing._codes(days, members, kinds, dom)).all(), seed
 
+
+def test_every_judging_heat_is_placed_first_to_last_under_every_rule() -> None:
+    """FAILS IF some rule leaves a heat with two entries at one placing or a placing
+    unused. The placings are a permutation by construction, and that is what keeps the
+    answers spread evenly under every rule and a relabel of the other sibling far below
+    the copy bar."""
+    from shogym.envs.receipts.generators import judging
+
+    generator = load_generator("judging")
+    instance = draw(generator, _master("judging"), 0)
+    for task in (instance.a, instance.b):
+        places = generator.answer_ranks(task.table)
+        for rule in conventions(generator.AXES):
+            key = generator.key_for(task.table, rule)
+            for heat in range(judging.HEATS):
+                placed = sorted(
+                    places.index(value)
+                    for value, row in zip(key, task.table.rows)
+                    if row.heat == heat
+                )
+                assert placed == list(range(judging.PER_HEAT)), (rule, heat)
