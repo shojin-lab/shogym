@@ -7,11 +7,16 @@ exported it: every surface template, every option of every axis, every registere
 class, the row count the bank holds, and counterfactual renders under conventions that
 were not the ones drawn.
 
-WHAT THIS ADDS BEYOND THE SHARED COVERAGE. All 36 oracle cells on one pair, so the
-reader sees every sentence the oracle arm can state rather than the one this draw
-produced; and a one-axis counterfactual on every surface for every axis, so the reader
-can confirm that the two environments, the three losses and the two orders mean the same
-thing on a comma-separated batch as on a tab-separated one.
+WHAT THIS ADDS BEYOND THE SHARED COVERAGE. Every oracle cell on one pair, 36 for the
+first version and 54 for `soundchange_v2`, so the reader sees every sentence the oracle
+arm can state rather than the one this draw produced; and a one-axis counterfactual on
+every surface for every axis, so the reader can confirm that the environments, the three
+losses and the two orders mean the same thing on a comma-separated batch as on a
+tab-separated one.
+
+BOTH VERSIONS, ONE EXPORTER. The two versions share every mechanic a pack shows and
+differ in the list of conventions, so the version is read off the generator the bank
+names and every list below is that generator's.
 
 AND A WORKSHEET, WHICH IS NOT A TASK. Beside the renders it writes a private trace
 worksheet: for each counterfactual row the proto form, the form after the public nasal
@@ -37,8 +42,8 @@ from typing import Any, Mapping, Sequence
 
 from shogym.envs.receipts import checks
 from shogym.envs.receipts.bank import Bank, Population, bank_identity, render_fork
-from shogym.envs.receipts.generators import soundchange, soundchange_audit
-from shogym.envs.receipts.protocol import Instance, Task
+from shogym.envs.receipts.generators import soundchange, soundchange_audit, soundchange_v2
+from shogym.envs.receipts.protocol import Instance, Task, conventions
 from shogym.envs.receipts.receipt_ast import GRADED, ORACLE, PLACEBO, serialize
 from shogym.envs.receipts.review import required_coverage
 from shogym.envs.receipts.streams import digest
@@ -76,6 +81,30 @@ WORKSHEET_CASES = (
 )
 
 
+#: The versions of this genre a pack is exported for, by the generator name a bank and
+#: every instance it holds record.
+VERSIONS = {
+    soundchange.GENERATOR.name: soundchange.GENERATOR,
+    soundchange_v2.GENERATOR.name: soundchange_v2.GENERATOR,
+}
+
+
+def _family(name: str):
+    """The generator a bank or an instance names, refused when it is neither version."""
+    try:
+        return VERSIONS[name]
+    except KeyError:
+        raise ValueError(
+            f"this exporter writes packs for {', '.join(repr(n) for n in VERSIONS)} and "
+            f"the bank names {name!r}"
+        ) from None
+
+
+def _rules(generator) -> list[dict[str, str]]:
+    """Every convention the generator draws from, in declared product order."""
+    return conventions(generator.AXES)
+
+
 @dataclass(frozen=True)
 class Render:
     """One exported artifact and what it is evidence of."""
@@ -86,12 +115,12 @@ class Render:
     path: str
 
 
-def _drawn_sentences(convention: Mapping[str, str]) -> tuple[str, ...]:
+def _drawn_sentences(generator, convention: Mapping[str, str]) -> tuple[str, ...]:
     """The oracle's own wording for one convention, for the worksheet's right-hand side."""
-    return soundchange.GENERATOR.render_oracle("0" * 16, convention, soundchange.ROWS).body
+    return generator.render_oracle("0" * 16, convention, soundchange.ROWS).body
 
 
-def _retasked(task: Task, convention: Mapping[str, str]) -> Task:
+def _retasked(generator, task: Task, convention: Mapping[str, str]) -> Task:
     """The same task scored under another convention, for a counterfactual render."""
     return Task(
         label=task.label,
@@ -99,7 +128,7 @@ def _retasked(task: Task, convention: Mapping[str, str]) -> Task:
         surface=task.surface,
         table=task.table,
         text=task.text,
-        key=tuple(soundchange.key_for(task.table, convention)),
+        key=tuple(generator.key_for(task.table, convention)),
         mask=task.mask,
     )
 
@@ -108,7 +137,7 @@ def _cells(instance: Instance, task: Task, raw: object) -> dict[str, bytes]:
     """The three cells one filing would produce on one task, through the shared judge."""
     from shogym.envs.receipts.render import judge_cells
 
-    generator = soundchange.GENERATOR
+    generator = _family(instance.generator)
     canonical = generator.parse_and_canonicalize(task, raw)
     judged = judge_cells(
         generator, task, canonical, instance.convention, instance.envelope
@@ -124,8 +153,8 @@ def _counterfactual_cell(
     """The cells under a convention that was not the one drawn."""
     from shogym.envs.receipts.render import judge_cells
 
-    generator = soundchange.GENERATOR
-    retasked = _retasked(task, convention)
+    generator = _family(instance.generator)
+    retasked = _retasked(generator, task, convention)
     canonical = generator.parse_and_canonicalize(retasked, raw)
     judged = judge_cells(
         generator, retasked, canonical, convention, instance.envelope
@@ -168,8 +197,8 @@ def _worksheet_rows(
     instance: Instance, task: Task, convention: Mapping[str, str], raw: str
 ) -> list[dict[str, str]]:
     """One row of the private worksheet per printed row, with the passes spelled out."""
-    generator = soundchange.GENERATOR
-    retasked = _retasked(task, convention)
+    generator = _family(instance.generator)
+    retasked = _retasked(generator, task, convention)
     canonical = generator.parse_and_canonicalize(retasked, raw)
     _, outcomes = generator.score(retasked, canonical)
     out: list[dict[str, str]] = []
@@ -203,13 +232,14 @@ def _case_rows(population: Population) -> list[dict[str, Any]]:
     for instance in population.instances:
         if len(found) == len(WORKSHEET_CASES):
             break
+        generator = _family(instance.generator)
         for side in ("a", "b"):
             task = instance.side(side)
             for row in task.table.rows:
                 if len(found) == len(WORKSHEET_CASES):
                     break
                 after = soundchange_audit.audit_nasal(row.proto)
-                for convention in soundchange.ALL_CONVENTIONS:
+                for convention in _rules(generator):
                     vowel = soundchange_audit.removed_vowel(convention["loss"])
                     answer = soundchange_audit.audit_daughter(row.proto, convention)
                     deleted = after.count(vowel) - answer.count(vowel)
@@ -236,7 +266,7 @@ def _case_rows(population: Population) -> list[dict[str, Any]]:
                                 "side": side.upper(),
                                 "form_id": row.row_id,
                                 "convention": dict(convention),
-                                "oracle": list(_drawn_sentences(convention)),
+                                "oracle": list(_drawn_sentences(generator, convention)),
                                 **soundchange_audit.intermediate_forms(
                                     row.proto, convention
                                 ),
@@ -257,19 +287,17 @@ def _case_rows(population: Population) -> list[dict[str, Any]]:
     return [found[case] for case in WORKSHEET_CASES]
 
 
-def _position(convention: Mapping[str, str]) -> int:
+def _position(generator, convention: Mapping[str, str]) -> int:
     """Where one convention sits in the declared product order."""
     drawn = dict(convention)
-    return next(
-        n for n, other in enumerate(soundchange.ALL_CONVENTIONS) if dict(other) == drawn
-    )
+    return next(n for n, other in enumerate(_rules(generator)) if dict(other) == drawn)
 
 
-def _support(task: Task) -> list[tuple[str, ...]]:
+def _support(generator, task: Task) -> list[tuple[str, ...]]:
     """This side's answer key under every convention in the support, in product order."""
     return [
-        tuple(soundchange.key_for(task.table, convention))
-        for convention in soundchange.ALL_CONVENTIONS
+        tuple(generator.key_for(task.table, convention))
+        for convention in _rules(generator)
     ]
 
 
@@ -282,8 +310,9 @@ def _posterior(instance: Instance, side: str) -> list[int]:
     and the support and not about what was filed, which is why one filing's pack can
     show it.
     """
-    keys = _support(instance.side(side))
-    drawn = keys[_position(instance.convention)]
+    generator = _family(instance.generator)
+    keys = _support(generator, instance.side(side))
+    drawn = keys[_position(generator, instance.convention)]
     return [
         n
         for n, key in enumerate(keys)
@@ -299,15 +328,16 @@ def _witnessed(instance: Instance, side: str) -> set[str]:
     not redrawn when that happens.
     """
     task = instance.side(side)
-    keys = _support(task)
-    drawn = keys[_position(instance.convention)]
+    generator = _family(instance.generator)
+    keys = _support(generator, task)
+    drawn = keys[_position(generator, instance.convention)]
     out: set[str] = set()
-    for axis in soundchange.AXES:
+    for axis in generator.AXES:
         for option in axis.options:
             if option == instance.convention[axis.name]:
                 continue
             other = keys[
-                _position(dict(instance.convention, **{axis.name: option}))
+                _position(generator, dict(instance.convention, **{axis.name: option}))
             ]
             if any(drawn[row] != other[row] for row in task.mask):
                 out.add(axis.name)
@@ -344,7 +374,7 @@ def _document(root: Path, name: str, head: Sequence[str], payload: bytes) -> str
     )
 
 
-def _sampled_renders(population: Population, root: Path) -> list[Render]:
+def _sampled_renders(generator, population: Population, root: Path) -> list[Render]:
     """What a reader of a receipt that reports two forms of twenty four has to see.
 
     NONE OF IT IS VISIBLE IN THE COVERAGE THE OTHER CATEGORIES ENUMERATE. A surface, an
@@ -365,7 +395,6 @@ def _sampled_renders(population: Population, root: Path) -> list[Render]:
     of the rows the stream drew; a bank too small to exhibit one of them is refused here
     rather than exported with the case missing.
     """
-    generator = soundchange.GENERATOR
     if not generator.RECEIPT_POLICY.samples:
         return []
     from shogym.envs.receipts.review import SAMPLED_CASES
@@ -424,7 +453,8 @@ def _sampled_renders(population: Population, root: Path) -> list[Render]:
         )
     )
 
-    axes = tuple(axis.name for axis in soundchange.AXES)
+    axes = tuple(axis.name for axis in generator.AXES)
+    rules = _rules(generator)
     whole = _found(population, lambda i, s: _witnessed(i, s) == set(axes))
     if whole is None:
         raise ValueError(
@@ -492,11 +522,9 @@ def _sampled_renders(population: Population, root: Path) -> list[Render]:
                         "instance %s/%d/%s" % (instance.generator, instance.ordinal, held.label),
                         "reported rows %s" % ", ".join(str(r + 1) for r in held.mask),
                         "cascades this receipt cannot tell apart: %d of %d"
-                        % (len(members), len(soundchange.ALL_CONVENTIONS)),
+                        % (len(members), len(rules)),
                     )
-                    + tuple(
-                        "  %s" % _spelled(soundchange.ALL_CONVENTIONS[n]) for n in members
-                    )
+                    + tuple("  %s" % _spelled(rules[n]) for n in members)
                     + (
                         "held-out rows they disagree on: %d of %d"
                         % _held_out_cost(instance, side, members),
@@ -537,7 +565,7 @@ def _sampled_renders(population: Population, root: Path) -> list[Render]:
     raw = _mixed_filing(held)
     pair = _aliased_pair(instance, side, members)
     rendered = [
-        _counterfactual_cell(instance, held, soundchange.ALL_CONVENTIONS[n], raw)[GRADED]
+        _counterfactual_cell(instance, held, rules[n], raw)[GRADED]
         for n in pair
     ]
     if rendered[0] != rendered[1]:
@@ -555,8 +583,8 @@ def _sampled_renders(population: Population, root: Path) -> list[Render]:
                     "instance %s/%d/%s" % (instance.generator, instance.ordinal, held.label),
                     "reported rows %s" % ", ".join(str(r + 1) for r in held.mask),
                     "these two cascades render the cell below byte for byte:",
-                    "  %s" % _spelled(soundchange.ALL_CONVENTIONS[pair[0]]),
-                    "  %s" % _spelled(soundchange.ALL_CONVENTIONS[pair[1]]),
+                    "  %s" % _spelled(rules[pair[0]]),
+                    "  %s" % _spelled(rules[pair[1]]),
                     "and they disagree on %d of the %d rows of the batch this reader "
                     "files next" % (disagree, rows),
                 ),
@@ -581,13 +609,13 @@ def _ambiguous(instance: Instance, side: str) -> bool:
     members = _posterior(instance, side)
     if len(members) < 2:
         return False
-    sibling = _support(instance.side("b" if side == "a" else "a"))
+    sibling = _support(_family(instance.generator), instance.side("b" if side == "a" else "a"))
     return len({sibling[n] for n in members}) > 1
 
 
 def _aliased_pair(instance: Instance, side: str, members: Sequence[int]) -> tuple[int, int]:
     """Two of the cascades this receipt cannot tell apart whose sibling keys differ."""
-    sibling = _support(instance.side("b" if side == "a" else "a"))
+    sibling = _support(_family(instance.generator), instance.side("b" if side == "a" else "a"))
     for one in members:
         for other in members:
             if one < other and sibling[one] != sibling[other]:
@@ -605,7 +633,7 @@ def _held_out_cost(
     document names one pair and states what that pair costs. Taking the whole posterior
     for the pair overstated it whenever a third cascade survived.
     """
-    sibling = _support(instance.side("b" if side == "a" else "a"))
+    sibling = _support(_family(instance.generator), instance.side("b" if side == "a" else "a"))
     rows = len(sibling[0])
     return (
         sum(1 for row in range(rows) if len({sibling[n][row] for n in members}) > 1),
@@ -615,7 +643,7 @@ def _held_out_cost(
 
 def _spelled(convention: Mapping[str, str]) -> str:
     """One cascade as a reader of the pack reads it."""
-    return ", ".join("%s=%s" % (axis.name, convention[axis.name]) for axis in soundchange.AXES)
+    return ", ".join("%s=%s" % (name, convention[name]) for name in soundchange_audit.AXIS_ORDER)
 
 
 def export(bank: Bank, population: Population, directory: str | Path) -> Path:
@@ -628,12 +656,7 @@ def export(bank: Bank, population: Population, directory: str | Path) -> Path:
     counterfactual renders built for them rather than being left out.
     """
     root = Path(directory)
-    generator = soundchange.GENERATOR
-    if bank.generator != generator.name:
-        raise ValueError(
-            f"this exporter writes packs for {generator.name!r} and the bank names "
-            f"{bank.generator!r}"
-        )
+    generator = _family(bank.generator)
     if not population.instances:
         raise ValueError("a review pack is a reading of instances and this bank holds none")
     # Before anything is written, because a bank that cannot show the reader every
@@ -682,14 +705,14 @@ def export(bank: Bank, population: Population, directory: str | Path) -> Path:
     )
     renders.append(Render("rows", str(soundchange.ROWS), "cell", path))
 
-    # ----- all 36 oracle cells on one pair, each covering its four options -----
+    # ----- every oracle cell on one pair, each covering its four options -----
     envelope = first.envelope
-    for position, convention in enumerate(soundchange.ALL_CONVENTIONS):
+    for position, convention in enumerate(_rules(generator)):
         payload = serialize(
             generator.render_oracle(first.a.task_id, convention, first.a.n_rows), envelope
         )
         path = _write(root, f"{RENDERS}/oracle-{position:02d}.txt", payload)
-        for axis in soundchange.AXES:
+        for axis in generator.AXES:
             renders.append(
                 Render("option", f"{axis.name}={convention[axis.name]}", "cell", path)
             )
@@ -701,7 +724,7 @@ def export(bank: Bank, population: Population, directory: str | Path) -> Path:
         task = instance.side(side)
         raw = _mixed_filing(task)
         drawn = dict(instance.convention)
-        for axis in soundchange.AXES:
+        for axis in generator.AXES:
             other = next(o for o in axis.options if o != drawn[axis.name])
             alternative = dict(drawn, **{axis.name: other})
             cells = _counterfactual_cell(instance, task, alternative, raw)
@@ -721,8 +744,8 @@ def export(bank: Bank, population: Population, directory: str | Path) -> Path:
                 "axis_changed": axis.name,
                 "drawn": drawn,
                 "alternative": alternative,
-                "oracle_drawn": list(_drawn_sentences(drawn)),
-                "oracle_alternative": list(_drawn_sentences(alternative)),
+                "oracle_drawn": list(_drawn_sentences(generator, drawn)),
+                "oracle_alternative": list(_drawn_sentences(generator, alternative)),
                 "rows": _worksheet_rows(instance, task, alternative, raw),
             }
             worksheets.append(sheet)
@@ -736,7 +759,7 @@ def export(bank: Bank, population: Population, directory: str | Path) -> Path:
         root, f"{WORKSHEETS}/cases.json", json.dumps(cases, indent=1, sort_keys=True)
     )
 
-    renders.extend(_sampled_renders(population, root))
+    renders.extend(_sampled_renders(generator, population, root))
 
     coverage = required_coverage(
         generator, checks.FILING_CLASSES, [soundchange.ROWS]
@@ -822,12 +845,13 @@ def read_fork(instance: Instance, side: str, raw: object):
     Exposed so a reader can render an instance the pack did not cover without reaching
     for a second rendering route.
     """
-    return render_fork(soundchange.GENERATOR, instance, side, raw)
+    return render_fork(_family(instance.generator), instance, side, raw)
 
 
 __all__ = [
     "CHECKLIST",
     "PACK",
+    "VERSIONS",
     "RENDERS",
     "WORKSHEETS",
     "WORKSHEET_CASES",

@@ -203,6 +203,7 @@ SHARDS: Tuple[Shard, ...] = (
             "tests/envs/test_receipts_retail_refund.py",
             "tests/envs/test_receipts_sampled.py",
             "tests/envs/test_receipts_soundchange.py",
+            "tests/envs/test_receipts_soundchange_v2.py",
         ),
         workers=4,
     ),
