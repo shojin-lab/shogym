@@ -3,11 +3,11 @@
 CI is the suite, and ninety nine percent of a job is pytest. The seconds are not spread evenly
 over the tree: the receipt modules hold most of them, because every bank they fill and every bundle
 they build or verify walks admission over a population. Splitting by count would therefore split
-nothing, so the suite is split by module into six selections, and each is a job that checks out,
+nothing, so the suite is split by module into seven selections, and each is a job that checks out,
 installs, prepares only the assets its own modules need and runs only its own paths. The run then
-costs what its slowest shard costs instead of what all six cost together.
+costs what its slowest shard costs instead of what all seven cost together.
 
-Three of those jobs also run their tests in several processes. A shard's ``workers`` is how many
+Four of those jobs also run their tests in several processes. A shard's ``workers`` is how many
 pytest-xdist workers its job starts, under ``--dist loadgroup`` so that the tests one module-scoped
 bundle or bank serves go to one worker together, and zero is one process, which is what ``-n 0``
 means to pytest-xdist. Only the receipt selections have workers: their cost is admission walks,
@@ -207,8 +207,8 @@ SHARDS: Tuple[Shard, ...] = (
         ),
         workers=4,
     ),
-    # The row-banded families (scorecard, standing and judging), each of which fills one admitted
-    # bank of twenty four. Beside the other families they would have taken ``receipt-families``,
+    # The scorecard, standing and judging tests each fill an admitted bank of twenty four.
+    # Beside the other families they would have taken ``receipt-families``,
     # 652s on its own, past fifteen minutes, so they are a job of their own. Their cost is
     # admission walks too, one xdist group per family, so it runs four workers.
     Shard(
