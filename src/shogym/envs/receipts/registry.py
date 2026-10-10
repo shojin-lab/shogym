@@ -23,6 +23,11 @@ GENRES = {
     # Placings within heats under hidden marking, disqualification, lateness and tie
     # rules, read off a full receipt.
     "judging": "shogym.envs.receipts.generators.judging",
+    # The second version of judging, beside the first rather than in place of it: its
+    # extract says what the rules may do where the first says what they do, and names
+    # where every surface prints the entry number. The first version's banks keep
+    # drawing the instances the studies drew.
+    "judging_v2": "shogym.envs.receipts.generators.judging_v2",
     "ledger": "shogym.envs.receipts.generators.ledger",
     "retail_refund": "shogym.envs.receipts.generators.retail_refund",
     # Priority banding under a hidden points schedule, read off a full receipt.
