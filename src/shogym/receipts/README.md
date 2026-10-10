@@ -141,43 +141,60 @@ from shogym.receipts import Outcomes, screen
 result = screen("ledger", Outcomes.from_rows(rows))   # the registered bars
 ```
 
-    room  = mean(oracle - placebo)
-    gain  = mean(graded - placebo)
-    ratio = gain / room
+    effect = mean(graded - placebo)
+    room   = mean(oracle - placebo)
+    gap    = mean(ideal - graded)
     oracle_level = mean(oracle)
-    gap   = mean(ideal - graded)
 
-The ratio is a ratio of two **aggregated** differences, never a mean of per-pair ratios. A
-pooled denominator below `floor` is not turned into a ratio at all, under one of three rules
-(`drop`, `clamp`, `none`), because a ratio whose denominator is noise around zero is not a
-number. `sd_influence` gives the per-pair SD the delta method puts on the ratio scale, which is
-what sets a budget.
+**The bars are registered, in two versions, and a record says which one it was made under.**
+The registered version, `receipts-screen-v2`, admits a family over at least 36 DISTINCT tasks
+when, with paired 90 percent percentile bootstrap intervals over 2,000 resamples of the tasks:
+
+- the feedback effect's interval lies wholly above zero;
+- the room's interval lies wholly above zero;
+- the gap is at least `min_learning_gap = 0.10` and its interval lies wholly above zero.
+
+The oracle level is still reported and is not a bar. The intervals are paired: each resample
+draws one set of tasks and reads all three contrasts off it. An interval above zero is a test
+of whether the sample shows an effect at all, where a point bar is a fraction somebody chose.
+The gap floor of `0.10` is the minimum detectable recursion effect the study registers, because
+a later step can only read the same feedback better by that much where the graded level sits
+that far under what a perfect reader reaches.
+
+`screen_v1` is the first version, `receipts-screen-v1`, and every record without a `bars` field
+was made under it. It is kept so those records rerun to the verdicts they had. It asked for
+`min_room = 0.05` with the room interval's lower bound above zero, `min_ratio = 0.25` on the
+ratio `gain / room`, `min_oracle = 0.90` on the mean executed oracle level, and the same gap
+bar and sample. Its ratio is a ratio of two **aggregated** differences, never a mean of per-pair
+ratios. A pooled denominator below `floor` is not turned into a ratio at all, under one of three
+rules (`drop`, `clamp`, `none`), because a ratio whose denominator is noise around zero is not a
+number. `sd_influence` gives the per-pair SD the delta method puts on the ratio scale. The
+registered version replaced the ratio's bar with the feedback effect's interval, dropped the
+room's point floor, and removed the oracle bar: a mean of 0.90 neither guaranteed that a copy
+handed the rule carried it out nor made the recursion effect specific to reading, and the
+reason it was stated for, the ratio's denominator, went with the ratio.
+
+The numbers in both versions are defaults rather than constants, so a diagnostic run can ask
+what a family does against another bar. A result says whether the bars it was judged against
+were its version's registered ones. A caller that deals families requires them: recording that
+a bar was moved is not refusing to deal a family admitted under an easier rule, and
+`receipts_v1` refuses one.
 
 `saturated`, the fraction of pairs the oracle could not improve, is the number that kills a
 family quietly: a receipt can pass every gate and be worth nothing on a task the agent already
 solves.
 
-**The bars are registered.** What a family must show to earn a roster place is the
-maintainer's call, and the call is `min_room = 0.05` with the bootstrap interval's lower bound
-above zero, `min_ratio = 0.25`, and 36 DISTINCT tasks, plus `min_oracle = 0.90` on the mean
-executed oracle level and `min_learning_gap = 0.10` on how far the graded level sits below
-`ideal`, with that paired interval's lower bound above zero. They are defaults rather than
-constants, so a diagnostic run can ask what a family does against another bar; a result says
-whether the bars it was judged against were the registered ones. A caller that deals families
-requires the registered ones: recording that a bar was moved is not refusing to deal a family
-admitted under an easier rule, and `receipts_v1` refuses one.
-
 `ideal` is the level a perfect reader of THAT case's receipt reaches on the held-out task,
 carried on the pair row from the gate's exact computation over the registered mask law and
 never measured in the pilot. It is per case because it is a property of that case's tables and
 the policy. A family whose receipt identifies the whole rule carries one, and then the gap bar
-is what says there is nothing left for a later step to read better: the first three bars are
-cleared most emphatically by exactly the family a chain would learn nothing on.
+is what says there is nothing left for a later step to read better.
 
 A pair is one task, not one observation of one. `ScreenRun` requires distinct task seeds and
 distinct task instances, because repeated filings against a single table clear the sample floor
 while the pilot has one sampled unit, and the pair bootstrap would price them as independent
-draws.
+draws. A caller that executed a task more than once records the means over its executions, so
+every task weighs the same.
 
 ## Provenance
 

@@ -1655,7 +1655,8 @@ def _screen_artifact(pairs: int = 40) -> dict:
     """A recorded room screen for this family, structurally valid and not measured here.
 
     The numbers stand in for a pilot nobody ran in a test. What is being exercised is
-    the path that recomputes everything mechanical about a bundle, not the screen.
+    the path that recomputes everything mechanical about a bundle, not the screen. It is
+    made under the registered bars, the only ones a new bundle is frozen on.
     """
     return {
         "family": GENERATOR.name,
@@ -1666,9 +1667,7 @@ def _screen_artifact(pairs: int = 40) -> dict:
              "placebo": 0.3, "graded": 0.7, "oracle": 0.95, "ideal": 0.85}
             for i in range(pairs)
         ],
-        "min_room": 0.05, "min_ratio": 0.25, "min_pairs": 36,
-        "min_oracle": 0.90, "min_learning_gap": 0.10,
-        "floor": 0.0, "floor_rule": "drop",
+        "bars": "receipts-screen-v2", "min_pairs": 36, "min_learning_gap": 0.10,
         "candidates_screened": 1, "selection_note": "",
     }
 

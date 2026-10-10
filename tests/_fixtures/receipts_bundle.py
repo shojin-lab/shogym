@@ -150,7 +150,8 @@ def screen_artifact(pairs: int = 40) -> dict:
     """A pilot run and the bars it is judged against, as one artifact.
 
     Three numbers say what was measured; they do not say what it was measured on or what it had
-    to clear, so both travel with the rows.
+    to clear, so both travel with the rows. It is made under the registered bars and names them,
+    as a record a pilot writes now does.
     """
     return {
         "family": GENERATOR.name,
@@ -161,9 +162,7 @@ def screen_artifact(pairs: int = 40) -> dict:
              "placebo": 0.4, "graded": 0.6, "oracle": 0.95, "ideal": 0.82}
             for i in range(pairs)
         ],
-        "min_room": 0.05, "min_ratio": 0.25, "min_pairs": 36,
-        "min_oracle": 0.90, "min_learning_gap": 0.10,
-        "floor": 0.0, "floor_rule": "drop",
+        "bars": "receipts-screen-v2", "min_pairs": 36, "min_learning_gap": 0.10,
         "candidates_screened": 1, "selection_note": "",
     }
 

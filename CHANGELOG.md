@@ -9,6 +9,39 @@ direction.
 
 ## Unreleased
 
+### `receipts`: the room screen's registered bars are interval tests, and a record names its version
+
+The registered screen is now `receipts-screen-v2`. Over at least 36 distinct tasks, with paired 90
+percent percentile bootstrap intervals over 2,000 resamples of the tasks, it admits a family when
+the feedback effect (graded minus placebo) has its interval wholly above zero, the room (oracle
+minus placebo) has its interval wholly above zero, and the learning gap (ideal minus graded) is at
+least 0.10 with its interval wholly above zero. The three intervals share one set of resamples.
+The ratio bar of 0.25 is replaced by the interval on the feedback effect, the room's point floor
+of 0.05 is dropped, and the oracle bar of 0.90 is removed. The oracle level is still reported,
+and the candidate-selection rule is unchanged.
+
+**A record names the version it was made under**, in a new `bars` field. A registered record
+carries `bars`, `min_pairs`, `min_learning_gap`, `candidates_screened` and `selection_note` beside
+its run, and no room, ratio or oracle bar and no floor, which are refused on it. A record with no
+`bars` field was made under the first version, `receipts-screen-v1`, and is read, rerun, printed
+and verified under that version's bars exactly as before, so every record, bundle and pack made
+under them keeps its verdict. A new bundle is not frozen on one: `build` refuses a record made
+under `receipts-screen-v1` and names both versions, because a family that clears the first
+version's ratio can fail the registered intervals. Naming `receipts-screen-v1` explicitly is
+refused, because such records carry no field. The printed `screen bars:` line now starts with the
+version.
+
+Renamed: `screen` is the registered screen and returns `ScreenResult`, whose fields are the
+feedback effect, room and gap with their intervals and passes, and the oracle level. The first
+version is `screen_v1`, returning `ScreenResultV1`, which is the result class as it was.
+`REGISTERED_MIN_ROOM`, `REGISTERED_MIN_RATIO` and `REGISTERED_MIN_ORACLE` are now `V1_MIN_ROOM`,
+`V1_MIN_RATIO` and `V1_MIN_ORACLE`, because they are no longer registered for new records.
+`REGISTERED_MIN_PAIRS` and `REGISTERED_MIN_LEARNING_GAP` are unchanged, and `REGISTERED_BARS`
+names the version new records are made under. `DECISION_FIELDS` maps each version to its fields.
+
+The screen and bundle modules are in every bundle's code pin, so a bundle frozen before this
+change is refused on its pin, as it is after any change to them.
+
 ### `envs`: provisioning says which stage may download, and a stage that may not says so
 
 `SHOGYM_PROVISIONING` names the stage a run belongs to. `prepare` fetches every SHA pinned

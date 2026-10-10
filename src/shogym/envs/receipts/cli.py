@@ -312,14 +312,27 @@ def _screen(args: argparse.Namespace) -> int:
 
 
 def _bars(record) -> str:
-    """One line saying what a screen was judged against, and whether that is registered."""
-    stated = "room %g, ratio %g, pairs %d, oracle %g, gap %g" % (
-        record.min_room,
-        record.min_ratio,
-        record.min_pairs,
-        record.min_oracle,
-        record.min_learning_gap,
-    )
+    """One line saying what a screen was judged against, and whether that is registered.
+
+    It names the version the record was made under first, because the same word, room,
+    is a point bar under the first version and an interval test under the registered one.
+    """
+    from shogym.receipts.screen import BARS_V1
+
+    if record.bars == BARS_V1:
+        stated = "%s, room %g, ratio %g, pairs %d, oracle %g, gap %g" % (
+            record.bars,
+            record.min_room,
+            record.min_ratio,
+            record.min_pairs,
+            record.min_oracle,
+            record.min_learning_gap,
+        )
+    else:
+        stated = (
+            "%s, effect and room intervals above zero, pairs %d, gap %g with its "
+            "interval above zero" % (record.bars, record.min_pairs, record.min_learning_gap)
+        )
     if record.registered:
         return "screen bars: %s (registered)" % stated
     return "screen bars: %s, OVERRIDDEN: %s" % (stated, "; ".join(record.overrides()))

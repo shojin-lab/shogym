@@ -41,13 +41,16 @@ import shutil
 import uuid
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, Mapping, Sequence
+from typing import TYPE_CHECKING, Any, Mapping, Sequence
 
 from shogym.envs.receipts import bank as bank_mod
 from shogym.envs.receipts import streams
 from shogym.envs.receipts.protocol import Generator, Instance
 from shogym.envs.receipts.protocol import ConstructionExhausted
 from shogym.envs.receipts.review import identities, identity
+
+if TYPE_CHECKING:
+    from shogym.receipts.screen import ScreenResult, ScreenResultV1
 
 #: Bumped when the bundle's own layout changes. A bundle naming another version is
 #: refused rather than read leniently.
@@ -510,27 +513,24 @@ def _verify_instances(
 
 
 def _verify_screen(bundle: Bundle, bank: bank_mod.Bank) -> tuple[list[str], Any]:
-    """Rerun the room screen on its own rows, against the REGISTERED bars.
+    """Rerun the room screen on its own rows, against its version's REGISTERED bars.
 
-    The bars a dealable bundle carries are the registered ones, exactly, the same way
-    its gate thresholds are. A record is free to say what it was judged against and a
-    diagnostic run is free to move a bar, but a family judged against an easier rule
-    was not admitted under the rule the measurement is registered under, and printing
-    that the bar was moved is not refusing to deal it.
+    The bars a dealable bundle carries are the registered ones of the version its record
+    was made under, exactly, the same way its gate thresholds are. A record is free to say
+    what it was judged against and a diagnostic run is free to move a bar, but a family
+    judged against an easier rule was not admitted under the rule the measurement is
+    registered under, and printing that the bar was moved is not refusing to deal it.
+
+    A record made under the first version is held to that version's bars, as it was
+    before the registered version existed, so a bundle frozen on one verifies or is
+    refused on its screen exactly as it was then.
 
     The recomputed statistics are then compared with those bars here, rather than
     inferred from a verdict another module composed: what production requires should
     be readable where production requires it.
     """
     from shogym.receipts import ScreenRecord
-    from shogym.receipts.screen import (
-        REGISTERED_MIN_LEARNING_GAP,
-        REGISTERED_MIN_ORACLE,
-        REGISTERED_MIN_PAIRS,
-        REGISTERED_MIN_RATIO,
-        REGISTERED_MIN_ROOM,
-        at_least,
-    )
+    from shogym.receipts.screen import REGISTERED_MIN_PAIRS, ScreenResultV1
 
     try:
         record = ScreenRecord.from_payload(bundle.payload(SCREEN))
@@ -570,28 +570,89 @@ def _verify_screen(bundle: Bundle, bank: bank_mod.Bank) -> tuple[list[str], Any]
             f"its screen was taken over {record.run.distinct_instances} distinct tasks "
             f"where {REGISTERED_MIN_PAIRS} is registered"
         )
-    # `at_least` rather than `>=`, and the same helper the screen itself used, so a
-    # family exactly at a registered bar is not admitted by one and refused by the
-    # other on the last bit of a binary float.
-    if not at_least(result.room, REGISTERED_MIN_ROOM):
+    if isinstance(result, ScreenResultV1):
+        problems.extend(_first_bars_problems(result))
+    else:
+        problems.extend(_registered_bars_problems(result))
+    if not result.verdict and not problems:
         problems.append(
-            f"its oracle beats its placebo by {result.room:.4f}, under the registered "
-            f"{REGISTERED_MIN_ROOM:g}"
+            "its screen does not pass when rerun on its own rows: "
+            + "; ".join(result.reasons[:2])
+        )
+    return problems, record
+
+
+def _registered_bars_problems(result: ScreenResult) -> list[str]:
+    """The registered version's bars, over a screen rerun on its own rows.
+
+    Three tests over one set of paired intervals: the feedback effect's interval and the
+    room's interval each lie wholly above zero, and the learning gap reaches its floor
+    with its interval wholly above zero. There is no oracle bar to hold.
+    """
+    from shogym.receipts.screen import REGISTERED_MIN_LEARNING_GAP, at_least
+
+    problems: list[str] = []
+    if not (math.isfinite(result.effect_low) and result.effect_low > 0.0):
+        problems.append(
+            f"its feedback effect interval reaches {result.effect_low:.4f}, so its sample "
+            "does not establish that the copy with feedback did better than the placebo"
         )
     if not (math.isfinite(result.room_low) and result.room_low > 0.0):
         problems.append(
             f"its room interval reaches {result.room_low:.4f}, so its sample does not "
             "establish that there was any room at all"
         )
-    if not at_least(result.ratio, REGISTERED_MIN_RATIO):
+    if not at_least(result.gap, REGISTERED_MIN_LEARNING_GAP):
+        problems.append(
+            f"its graded level sits {result.gap:.4f} below what a perfect reader of "
+            f"the same receipts reaches, under the registered "
+            f"{REGISTERED_MIN_LEARNING_GAP:g}"
+        )
+    if not (math.isfinite(result.gap_low) and result.gap_low > 0.0):
+        problems.append(
+            f"its gap interval reaches {result.gap_low:.4f}, so its sample does not "
+            "establish any room above the receipt's own ceiling"
+        )
+    return problems
+
+
+def _first_bars_problems(result: ScreenResultV1) -> list[str]:
+    """The first version's bars, over a screen made under them and rerun on its own rows.
+
+    Held exactly as they were held before the registered version existed, so a record
+    made under them is refused or passed on its screen as it was then.
+    """
+    from shogym.receipts.screen import (
+        REGISTERED_MIN_LEARNING_GAP,
+        V1_MIN_ORACLE,
+        V1_MIN_RATIO,
+        V1_MIN_ROOM,
+        at_least,
+    )
+
+    problems: list[str] = []
+    # `at_least` rather than `>=`, and the same helper the screen itself used, so a
+    # family exactly at a registered bar is not admitted by one and refused by the
+    # other on the last bit of a binary float.
+    if not at_least(result.room, V1_MIN_ROOM):
+        problems.append(
+            f"its oracle beats its placebo by {result.room:.4f}, under the registered "
+            f"{V1_MIN_ROOM:g}"
+        )
+    if not (math.isfinite(result.room_low) and result.room_low > 0.0):
+        problems.append(
+            f"its room interval reaches {result.room_low:.4f}, so its sample does not "
+            "establish that there was any room at all"
+        )
+    if not at_least(result.ratio, V1_MIN_RATIO):
         problems.append(
             f"one graded receipt took {result.ratio:.4f} of the room its oracle had, "
-            f"under the registered {REGISTERED_MIN_RATIO:g}"
+            f"under the registered {V1_MIN_RATIO:g}"
         )
-    if not at_least(result.oracle, REGISTERED_MIN_ORACLE):
+    if not at_least(result.oracle, V1_MIN_ORACLE):
         problems.append(
             f"its oracle copies reached {result.oracle:.4f} on the held-out task, "
-            f"under the registered {REGISTERED_MIN_ORACLE:g}, so the room its ratio "
+            f"under the registered {V1_MIN_ORACLE:g}, so the room its ratio "
             "divides by is a room that model did not take when it was told the rule"
         )
     if not at_least(result.gap, REGISTERED_MIN_LEARNING_GAP):
@@ -605,12 +666,7 @@ def _verify_screen(bundle: Bundle, bank: bank_mod.Bank) -> tuple[list[str], Any]
             f"its gap interval reaches {result.gap_low:.4f}, so its sample does not "
             "establish any room above the receipt's own ceiling"
         )
-    if not result.verdict and not problems:
-        problems.append(
-            "its screen does not pass when rerun on its own rows: "
-            + "; ".join(result.reasons[:2])
-        )
-    return problems, record
+    return problems
 
 
 def _verify_review(
@@ -667,16 +723,27 @@ def build(
     only then moved into place, so a directory under a digest is always a complete
     bundle. It is verified before it is returned: a bundle that does not verify is
     removed rather than left somewhere to be found later.
+
+    A new bundle is frozen only on a screen record made under the registered bars. A
+    record made under the first version is still read and verified in a bundle already
+    frozen on it, but it is not admitted into a new one: a family that passes the first
+    version's ratio can fail the registered intervals.
     """
     from shogym.envs.receipts.admission import Thresholds
     from shogym.receipts import ScreenRecord, read_payload
+    from shogym.receipts.screen import REGISTERED_BARS
 
     thresholds = Thresholds()
     held = bank_mod.population(bank, generator, thresholds)
     # Read both inputs before writing anything: a bundle half built from a screen
     # artifact that turns out to be unreadable is a directory someone has to clean up.
     screened = read_payload(Path(screen_artifact).read_text(encoding="utf-8"))
-    ScreenRecord.from_payload(screened)
+    record = ScreenRecord.from_payload(screened)
+    if record.bars != REGISTERED_BARS:
+        raise ValueError(
+            f"the screen artifact at {screen_artifact} was made under {record.bars}, and a "
+            f"new bundle is frozen only on a record made under the registered {REGISTERED_BARS}"
+        )
     pack = read_payload(Path(review_pack).read_text(encoding="utf-8"))
     if not isinstance(pack, dict):
         raise ValueError(f"the review pack at {review_pack} is not a manifest")
