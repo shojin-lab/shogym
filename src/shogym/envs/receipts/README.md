@@ -1069,7 +1069,7 @@ declared profiles live in `copy_profiles.py`:
 
 | Profile | Value maps | Who declares it |
 |---|---|---|
-| `ordered_tokens` | the registered token dictionaries between two published answer orders, closed under composition | `ledger`, `components`, `retail_refund`, the gate vectors |
+| `ordered_tokens` | the registered token dictionaries between two published answer orders, closed under composition | `ledger`, `components`, `retail_refund`, `scorecard`, `standing`, `judging` and their second versions, the gate vectors |
 | `soundchange_v1` | the 36 global character maps: every permutation of the three deletable vowels crossed with every permutation of the three replacement phones | `soundchange`, `soundchange_v2` |
 
 A generator added later declares one of these or is refused at registration, and a profile
@@ -1535,6 +1535,7 @@ Recorded boundaries, held by process rather than by a check:
 | `streams.py` | keyed domain-separated randomness and the opaque task identifiers. |
 | `filing.py` | the shared line reading, the printable fold, the row parser, the equal-row scorer, and the sentences that say which tasks share a convention. |
 | `copy_profiles.py` | the registered families of maps the copy screen prices, and which generator declares which. |
+| `receipt_law.py` | what a sampled receipt tells a reader, averaged exactly over every mask its policy can draw: the consistent set, the ideal and no-receipt levels, the lookup floor and the bank band. |
 | `generators/ledger.py` | the ledger genre: domains, the scoring function, the three renderers, the oracle template. |
 | `ledger_review.py` | the deterministic review pack and private worksheets for that genre, the eleven its sampled receipt owes, and the audit of a recorded screen's allocation. |
 | `generators/soundchange.py` | the sound change genre: the phone inventory, the three passes, the keyed pair construction and its filter, the four surfaces, the oracle template. |
@@ -1547,6 +1548,13 @@ Recorded boundaries, held by process rather than by a check:
 | `generators/retail_refund.py` | the retail refund genre: the two destination classes, the three selectors, the keyed pair construction, the four surfaces, the oracle template. |
 | `generators/retail_validation.py` | a second implementation of that rule reading the printed body, the predicates the pair is filtered on, the three checks the family declares, and the two copying maxima. |
 | `retail_review.py` | the deterministic review pack, the equal-amount fixtures, the separating matrix and the private worksheets for that genre. |
+| `generators/banded_rows.py` | what the row-banded families share: the envelope, the reading, the scorer and the three cells of `BandedRowsFamily`, the helpers a table search uses to separate every rule, and the perfect reader of a delivered receipt. Its docstring calls the third family `allocation`; it shipped as `judging`. |
+| `generators/scorecard.py` | the scorecard genre as the studies ran it: priority banding under a hidden points schedule, the eight surfaces, the table search, the oracle template. |
+| `generators/scorecard_v2.py` | the second version of that genre, under its own name: the same rule, with an extract that states the score the way both repeat rules compute it, and a filing line that finds the id on the bracketed-block surface. |
+| `generators/standing.py` | the standing genre as the studies ran it: a member's standing after each infraction under hidden house rules, the eight surfaces, the vectorized log search, the oracle template. |
+| `generators/standing_v2.py` | the second version of that genre, under its own name: the same rule, with a filing line that finds the id on the bracketed-block surface. |
+| `generators/judging.py` | the judging genre as the studies ran it: placings within heats under hidden judging rules, the eight surfaces, the heat search, the oracle template. |
+| `generators/judging_v2.py` | the second version of that genre, under its own name: the same rule, with an extract that says entries may be disqualified and late entries may be penalised, and that finds the entry number on the bracketed-block surface. |
 | `bank.py` | what is frozen before launch, and the one atomic render after a filing seals. |
 | `bundle.py` | the admission bundle: one addressed directory, and the one verifier over it. |
 | `review.py` | what a review pack has to cover, enumerated from the family's declarations. |
