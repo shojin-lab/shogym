@@ -143,7 +143,7 @@ def test_exactly_one_shard_carries_the_lint_and_type_checks() -> None:
 
 
 def test_only_the_receipt_selections_run_with_workers() -> None:
-    """The three receipt selections run four workers each, and every other shard one process.
+    """The four receipt selections run four workers each, and every other shard one process.
 
     A durable test holds real time timeouts, a fork copies a process whatever its other threads
     are doing, and a test that edits the package's source moves the code pin under every test that
@@ -157,7 +157,12 @@ def test_only_the_receipt_selections_run_with_workers() -> None:
         if DURABLE_SERVICE in candidate.assets:
             assert candidate.workers == 0, f"{candidate.name} starts the test server on workers"
     running = {candidate.name: candidate.workers for candidate in SHARDS if candidate.workers}
-    assert running == {"receipt-attacks": 4, "receipt-serving": 4, "receipt-families": 4}
+    assert running == {
+        "receipt-attacks": 4,
+        "receipt-serving": 4,
+        "receipt-families": 4,
+        "receipt-banded": 4,
+    }
     for path, reason in _ONE_PROCESS_ONLY.items():
         held = [shard(name) for name in owners(path)]
         assert held, f"{path} is named by no shard"

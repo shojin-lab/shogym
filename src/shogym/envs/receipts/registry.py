@@ -20,13 +20,21 @@ from shogym.envs.receipts.protocol import Generator, require_policy
 #: which is a different and later thing.
 GENRES = {
     "components": "shogym.envs.receipts.generators.components",
+    # Placings within heats under hidden marking, disqualification, lateness and tie
+    # rules, read off a full receipt.
+    "judging": "shogym.envs.receipts.generators.judging",
     "ledger": "shogym.envs.receipts.generators.ledger",
     "retail_refund": "shogym.envs.receipts.generators.retail_refund",
+    # Priority banding under a hidden points schedule, read off a full receipt.
+    "scorecard": "shogym.envs.receipts.generators.scorecard",
     "soundchange": "shogym.envs.receipts.generators.soundchange",
     # The second version of sound change, beside the first rather than in place of it: a
     # bank names its generator and recomputes its population, so the first version's
     # banks keep drawing the instances they drew.
     "soundchange_v2": "shogym.envs.receipts.generators.soundchange_v2",
+    # A member's standing after each infraction under hidden lapse, repeat, first
+    # offence and falling rules, read off a full receipt.
+    "standing": "shogym.envs.receipts.generators.standing",
 }
 
 #: The gate vectors. They wear the generator protocol so the gates can be exercised
