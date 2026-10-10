@@ -196,9 +196,6 @@ SHARDS: Tuple[Shard, ...] = (
     Shard(
         name="receipt-families",
         paths=(
-            # The row-banded families (scorecard and the families built beside it), each
-            # of which fills one admitted bank of twenty four.
-            "tests/envs/test_receipts_banded_families.py",
             "tests/envs/test_receipts_checks.py",
             "tests/envs/test_receipts_components.py",
             "tests/envs/test_receipts_full_policy.py",
@@ -208,6 +205,15 @@ SHARDS: Tuple[Shard, ...] = (
             "tests/envs/test_receipts_soundchange.py",
             "tests/envs/test_receipts_soundchange_v2.py",
         ),
+        workers=4,
+    ),
+    # The row-banded families (scorecard, standing and judging), each of which fills one admitted
+    # bank of twenty four. Beside the other families they would have taken ``receipt-families``,
+    # 652s on its own, past fifteen minutes, so they are a job of their own. Their cost is
+    # admission walks too, one xdist group per family, so it runs four workers.
+    Shard(
+        name="receipt-banded",
+        paths=("tests/envs/test_receipts_banded_families.py",),
         workers=4,
     ),
     # Protocol v2's own tests, which drive real workflows on the Temporal test server. They used
