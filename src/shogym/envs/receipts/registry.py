@@ -45,6 +45,10 @@ GENRES = {
     # A member's standing after each infraction under hidden lapse, repeat, first
     # offence and falling rules, read off a full receipt.
     "standing": "shogym.envs.receipts.generators.standing",
+    # The second version of standing, beside the first rather than in place of it: its
+    # filing line names where every surface prints the id. The first version's banks
+    # keep drawing the instances the studies drew.
+    "standing_v2": "shogym.envs.receipts.generators.standing_v2",
 }
 
 #: The gate vectors. They wear the generator protocol so the gates can be exercised
