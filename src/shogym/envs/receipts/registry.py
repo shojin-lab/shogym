@@ -27,6 +27,11 @@ GENRES = {
     "retail_refund": "shogym.envs.receipts.generators.retail_refund",
     # Priority banding under a hidden points schedule, read off a full receipt.
     "scorecard": "shogym.envs.receipts.generators.scorecard",
+    # The second version of scorecard, beside the first rather than in place of it: its
+    # extract states the score as every repeat rule computes it, and names where every
+    # surface prints the id. The first version's banks keep drawing the instances the
+    # studies drew.
+    "scorecard_v2": "shogym.envs.receipts.generators.scorecard_v2",
     "soundchange": "shogym.envs.receipts.generators.soundchange",
     # The second version of sound change, beside the first rather than in place of it: a
     # bank names its generator and recomputes its population, so the first version's
