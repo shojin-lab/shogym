@@ -338,9 +338,10 @@ def test_scorecard_v2_states_the_band_every_repeat_rule_gives() -> None:
     """FAILS IF, under any of the 96 rules on an admitted list, a first fault's band is not
     the printed table's band for its three-factor score, if a repeat's band is below it,
     or if either repeat rule never lifts a repeat above it. Those are the second version's
-    sentences: the score totals the points earned on three factors, the band is read off
-    the table, and a repeat can move an order to a higher band. Under `oneband_up` that move
-    adds no points, which is why the first version's sum over four factors misstated it."""
+    sentences: the score totals all points earned, with hazard, criticality and exposure as
+    its three named factors, the band is read off the table, and a repeat can add points
+    before the table is read or raise the resulting band. Under `oneband_up` that move adds
+    no points, which is why the first version's sum over four factors misstated it."""
     generator = load_generator("scorecard_v2")
     lifted: Counter[str] = Counter()
     for task in _tasks("scorecard_v2", 3):

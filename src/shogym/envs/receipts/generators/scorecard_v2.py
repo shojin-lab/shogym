@@ -95,8 +95,9 @@ LIST ({fmtnote})
 {filing}
 """
 
-#: The extract's first paragraph. The score totals the points an order earns on three named
-#: factors, and a repeat fault is named as what can move an order above the band its score gives.
+#: The extract's first paragraph. The score totals all points earned; hazard, criticality and
+#: exposure are its three named factors. A repeat can add points before the table is read or
+#: raise the resulting band.
 RULE_PARAGRAPH = (
     "Every open {entity} is given a priority score, which is the total of the points it "
     "earns. It earns points on the house scorecard's three factors: its hazard grade "
