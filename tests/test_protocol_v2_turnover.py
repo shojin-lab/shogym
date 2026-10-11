@@ -54,6 +54,7 @@ from temporalio.client import (  # noqa: E402
     Client,
     WorkflowUpdateFailedError,
 )
+from temporalio.service import RPCError, RPCStatusCode  # noqa: E402
 from temporalio.testing import WorkflowEnvironment  # noqa: E402
 
 from shogym.serve.protocol_v2 import (  # noqa: E402
@@ -513,6 +514,30 @@ async def _straight_at_the_generation(
     the transport would send, sent without that answer wrapped around it.
     """
     return await caller.stream.handle.execute_update(update, args=list(args), id=update_id)
+
+
+async def _pulled_across_the_boundary(caller: "Caller", request: PullRequest) -> OfferedMessage:
+    """Pull through the transport, and send once more if the test service lost it at a boundary.
+
+    The test service picks the execution an Update goes to, then waits for that execution's lock,
+    and does not look again. An Update that arrives while a continue-as-new is being completed is
+    held on the lock of the execution that is closing, and once it has the lock it is refused as
+    not found, because that execution has completed. The production service aborts the same
+    Update with an error its client sends again, and the retry reaches the execution that came
+    next. The transport reads not found as a generation that has finished, which is right on the
+    service it runs on.
+
+    A caller that sends every few milliseconds while a boundary is crossed at a moment the test
+    does not choose meets that window now and then. So the same request goes once more, under the
+    same identifier, as the production client would have sent it. Anything else is raised as it
+    came, and so is a second not found.
+    """
+    try:
+        return await caller.stream.pull(request)
+    except RPCError as error:
+        if error.status is not RPCStatusCode.NOT_FOUND:
+            raise
+    return await caller.stream.pull(request)
 
 
 async def _accepted_updates(client: Client, workflow_id: str) -> int:
@@ -2633,11 +2658,17 @@ async def test_a_claim_reading_the_store_over_and_over_is_not_a_generation_that_
 
     So the generation counts its store reads and the caller reads that count. This drives two
     batches, each retrying to its last attempt, and holds them open well past the clock that
-    gives up. The caller waiting on them is the writer the claim installed rather than one about
+    gives up. The store gives its first answer only once the caller is waiting, so the whole of
+    both batches falls inside that wait rather than whatever part of them the steps before it
+    left over. The caller waiting on them is the writer the claim installed rather than one about
     to be fenced, which is what makes it the case that matters: a caller that was going to be
     refused anyway proves nothing about waiting.
     """
-    monkeypatch.setattr(kernel_workflow, "_ACTIVITY_TIMEOUT", timedelta(seconds=0.6))
+    # The timeout bounds an attempt and is not what fails one: every attempt that fails here
+    # raises once its delay is over. The first attempt is held until the caller is waiting, and
+    # the steps before that take as long as the runner takes, so the bound is the one this test
+    # gives the read to begin rather than a fraction of a second.
+    monkeypatch.setattr(kernel_workflow, "_ACTIVITY_TIMEOUT", timedelta(seconds=30))
     monkeypatch.setattr(
         kernel_workflow,
         "_ACTIVITY_RETRY",
@@ -2654,6 +2685,7 @@ async def test_a_claim_reading_the_store_over_and_over_is_not_a_generation_that_
     second_transcript = "f" * 64
     reading = asyncio.Event()
     began = asyncio.Event()
+    pulling = asyncio.Event()
     slow: Dict[str, Any] = {"first": None, "first_done": False, "batches": []}
 
     @activity.defn(name=VERIFY_BLOBS)
@@ -2666,6 +2698,7 @@ async def test_a_claim_reading_the_store_over_and_over_is_not_a_generation_that_
         )
         if this_one:
             began.set()
+            await pulling.wait()
             await asyncio.sleep(0.2)
             if info.attempt < 3:
                 raise ApplicationError("the store did not answer")
@@ -2685,8 +2718,8 @@ async def test_a_claim_reading_the_store_over_and_over_is_not_a_generation_that_
         claim = _in_the_background(
             _resume(env.client, start, workflow_id="stream/reading/1", claimant="the-reader")
         )
-        # The presentation commits while the first batch is still retrying, which is what gives
-        # the claim a second batch to read.
+        # The presentation commits while the first batch is still unanswered, which is what
+        # gives the claim a second batch to read.
         await asyncio.wait_for(began.wait(), timeout=30)
         ack = await caller.stream.present(
             pending,
@@ -2709,9 +2742,12 @@ async def test_a_claim_reading_the_store_over_and_over_is_not_a_generation_that_
         assert held.pending_message_id is None and held.environment_call is None
         assert held.prepared_seals == {}
 
+        # The store starts answering now, so six delays and the retries between them all fall
+        # inside this wait: over 1.2 seconds against a clock of one.
+        pulling.set()
         started = time.monotonic()
-        answer = await caller.stream.pull(
-            PullRequest(request_id=caller.next_id(), last_presented_cursor=caller.cursor)
+        answer = await _pulled_across_the_boundary(
+            caller, PullRequest(request_id=caller.next_id(), last_presented_cursor=caller.cursor)
         )
         waited = time.monotonic() - started
     assert answer.kind in ("task", "payload", "wait")
