@@ -11,8 +11,9 @@ points it earns on four factors, the fourth being whether it repeats an earlier 
 that the band is read off the score with the printed table. Under `oneband_up` a repeat
 earns no points and is placed one band above the band its score gives, so on a list drawn
 under that option the key follows no sum the extract describes: a repeat's band is lifted
-after the table is read, not by points before it. Here the score is the sum over three
-factors, and the extract says a repeat can move the order to a higher band. That is true
+after the table is read, not by points before it. Here the score is the total of the points
+an order earns, hazard, criticality and exposure are its three named factors, and the extract
+says a repeat can move the order to a higher band. That is true
 under both options: two extra points before the band is read can lift the band, and one
 band up always does unless the band is the last.
 
@@ -94,8 +95,8 @@ LIST ({fmtnote})
 {filing}
 """
 
-#: The extract's first paragraph. The score is a sum over three factors, and a repeat
-#: fault is named as what can move an order above the band its score gives.
+#: The extract's first paragraph. The score totals the points an order earns on three named
+#: factors, and a repeat fault is named as what can move an order above the band its score gives.
 RULE_PARAGRAPH = (
     "Every open {entity} is given a priority score, which is the total of the points it "
     "earns. It earns points on the house scorecard's three factors: its hazard grade "

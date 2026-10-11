@@ -339,8 +339,8 @@ def test_scorecard_v2_states_the_band_every_repeat_rule_gives() -> None:
     the printed table's band for its three-factor score, if a repeat's band is below it,
     or if either repeat rule never lifts a repeat above it. Those are the second version's
     sentences: the score totals the points earned on three factors, the band is read off
-    the table, and a repeat can move an order to a higher band. Under `oneband_up` that move adds no
-    points, which is why the first version's sum over four factors misstated it."""
+    the table, and a repeat can move an order to a higher band. Under `oneband_up` that move
+    adds no points, which is why the first version's sum over four factors misstated it."""
     generator = load_generator("scorecard_v2")
     lifted: Counter[str] = Counter()
     for task in _tasks("scorecard_v2", 3):
