@@ -247,11 +247,13 @@ def _stated_changes(name: str, task: Task) -> list[tuple[str, str]]:
     if name == "scorecard_v2":
         return [
             (
-                "four factors: its hazard grade (column %s), the criticality of the asset "
-                "it concerns (column %s), its exposure, and whether it repeats an earlier "
-                "fault (column %s)." % (cols[1], cols[2], cols[5]),
-                "three factors: its hazard grade (column %s), the criticality of the "
-                "asset it concerns (column %s) and its exposure." % (cols[1], cols[2]),
+                "which is the sum of the points it earns on the house scorecard's four "
+                "factors: its hazard grade (column %s), the criticality of the asset it "
+                "concerns (column %s), its exposure, and whether it repeats an earlier fault "
+                "(column %s)." % (cols[1], cols[2], cols[5]),
+                "which is the total of the points it earns. It earns points on the house "
+                "scorecard's three factors: its hazard grade (column %s), the criticality of "
+                "the asset it concerns (column %s) and its exposure." % (cols[1], cols[2]),
             ),
             (
                 "The band is read off the score with this table:",
@@ -336,8 +338,8 @@ def test_scorecard_v2_states_the_band_every_repeat_rule_gives() -> None:
     """FAILS IF, under any of the 96 rules on an admitted list, a first fault's band is not
     the printed table's band for its three-factor score, if a repeat's band is below it,
     or if either repeat rule never lifts a repeat above it. Those are the second version's
-    sentences: the score is a sum over three factors, the band is read off the table, and
-    a repeat can move an order to a higher band. Under `oneband_up` that move adds no
+    sentences: the score totals the points earned on three factors, the band is read off
+    the table, and a repeat can move an order to a higher band. Under `oneband_up` that move adds no
     points, which is why the first version's sum over four factors misstated it."""
     generator = load_generator("scorecard_v2")
     lifted: Counter[str] = Counter()

@@ -97,9 +97,10 @@ LIST ({fmtnote})
 #: The extract's first paragraph. The score is a sum over three factors, and a repeat
 #: fault is named as what can move an order above the band its score gives.
 RULE_PARAGRAPH = (
-    "Every open {entity} is given a priority score, which is the sum of the points it "
-    "earns on the house scorecard's three factors: its hazard grade (column {c_haz}), "
-    "the criticality of the asset it concerns (column {c_crit}) and its exposure. "
+    "Every open {entity} is given a priority score, which is the total of the points it "
+    "earns. It earns points on the house scorecard's three factors: its hazard grade "
+    "(column {c_haz}), the criticality of the asset it concerns (column {c_crit}) and "
+    "its exposure. "
     "Exposure is scored either from the number of people affected (column {c_ppl}) or "
     "from the days the {entity} has been open (column {c_days}). The band is read off the "
     "score with this table, and a repeat of an earlier fault (column {c_rep}) can move "
