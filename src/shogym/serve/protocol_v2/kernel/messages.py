@@ -2584,10 +2584,14 @@ FORK_REQUEST_SCHEMA_VERSION = 1
 class ForkChildPlan:
     """One child a controller asks for, and nothing about the experiment that wanted it.
 
-    ``dispositions`` are the rows ahead of the cursor, which is a dependency statement rather than
-    an ordering comparison over opaque identifiers: the inherited task has crossed the cursor and
-    its payload has not, so the policy of that undelivered obligation is the only one a child may
-    change. ``target_cell`` is which of the source's eligible cells this child delivers from it.
+    ``dispositions`` are the child's own rows, one for each obligation its parent resolved and
+    each on the child's own branch. They are held to the parent's rows by the obligation each one
+    resolves, its attempt and its payload position, and not by its policy or its cell, so a child
+    names its own policy and cell for the inherited obligation and for every obligation owed for a
+    task the parent had not served. The inherited obligation is delivered out of the source the
+    parent's seal committed, and a later one out of the source the child's own seal of that task
+    commits. ``target_cell`` is which cell of the inherited source this child delivers, and it is
+    the cell its own row for that obligation names.
 
     ``frozen_plan_digest`` is the plan the child's pause, clock, resource accounting and release
     policy are declared under. The plan digest crosses and the plan does not, which is how a
@@ -3342,7 +3346,7 @@ def fork_request_digest(request: ForkRequest) -> str:
 # configuration hash always differs from its parent's even under the same policy. ``location`` is
 # where the child keeps its bytes, which is outside that hash and still covered by the complete
 # start digest. ``branch`` is the slot the child serves, drawn from the set its parent declared
-# before it forked. ``delivery`` is the one thing a child changes on purpose, the policy of the
+# before it forked. ``delivery`` is the one thing a child changes on purpose, the policy of each
 # obligation nothing has delivered, with the provenance digest recomputed over its own rows.
 # ``lineage`` is the carry and the origin, which the restore matrix governs and no comparison of
 # configuration reaches.

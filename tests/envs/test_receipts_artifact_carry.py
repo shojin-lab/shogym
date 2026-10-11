@@ -168,6 +168,7 @@ from shogym.serve.protocol_v2.kernel import (  # noqa: E402
     VerifyBlobsInput,
     VerifyForkOriginInput,
     assignments_for,
+    check_checkpoint_evidence,
     configuration_hash,
     child_workflow_id,
     complete_start_digest,
@@ -189,6 +190,7 @@ from shogym.serve.protocol_v2.kernel import (  # noqa: E402
     origin_unverified,
     protocol_error_code,
     resume_stream,
+    source_seal_id,
     start_fork_child_activity,
     start_stream,
     stream_replayer,
@@ -218,11 +220,14 @@ from shogym.serve.protocol_v2.kernel.workflow import (  # noqa: E402
 )
 from shogym.serve.protocol_v2.reader import (  # noqa: E402
     RECEIPT_AVAILABLE,
+    RECEIPT_BUILT,
+    RECEIPT_COMMITTED,
     RECEIPT_UNAVAILABLE,
     inherited_work,
     local_work,
     read_records,
     receipt_availability,
+    receipt_lifecycle,
 )
 from shogym.serve.protocol_v2.kernel.messages import (  # noqa: E402
     FORK_ORIGIN_DISAGREEMENT,    CONTRACT_DRIFT,
@@ -259,8 +264,10 @@ from tests._fixtures.upstream_gate import environmental_skip  # noqa: E402
 
 ATTEMPT = "b" * 32
 SILENT = "c" * 32
+OWED = "e" * 32
 TERMINAL = "submit_filing"
 CONTRACT = "ledger_receipt"
+HELD_OUT = "ledger_receipt_held_out"
 EXECUTION = "execution-1"
 CONVERTER = default_converter().payload_converter
 
@@ -2580,6 +2587,292 @@ async def test_a_fork_of_three_serves_each_child_the_rendering_its_own_plan_name
         encoded_body_bytes=encoded_body_bytes(body_of(statement)),
     )
     assert request.fork_id == FORK
+
+
+# The same three children over a second task that owes a payload of its own, under a contract of
+# its own. Nothing had worked that task when the fork was cut, so each child seals it in a world of
+# its own, and what each is offered for it is its own row's cell of the source its own seal
+# committed.
+
+
+def owing_twice(start: StreamStart, held_out: Any) -> StreamStart:
+    """The same generation, whose second task owes a payload under a contract of its own.
+
+    ``held_out`` is that contract. The second row names it where the first row names the first
+    task's, so each seal is published under the contract its own row names.
+    """
+    [first] = start.tasks
+    [row] = start.dispositions
+    assert start.provenance is not None
+    second = replace(
+        first,
+        task_position=1,
+        attempt_id=OWED,
+        task_message_id=oid(0x105),
+        ack_message_id=oid(0x106),
+        payload_position=1,
+        payload_message_id=oid(0x107),
+    )
+    items = [first, second]
+    rows = [
+        row,
+        replace(row, attempt_id=OWED, payload_position=1, family_id=held_out.contract_id),
+    ]
+    return replace(
+        start,
+        tasks=items,
+        assignments=assignments_for(items, IMMEDIATE),
+        dispositions=rows,
+        provenance=replace(start.provenance, roster_digest=roster_digest(rows)),
+        receipt_contracts=[*start.receipt_contracts, held_out],
+    )
+
+
+async def test_a_fork_of_three_offers_each_child_its_own_cell_of_its_own_second_seal(
+    env: Any, world: ServedEpisode, frozen_bundle: Path, tmp_path: Path, turnover_at: Any
+) -> None:
+    """Each child seals the second task itself and is offered its own row's cell of that seal.
+
+    The fork is cut after the first task, so every child owes a payload against a task no
+    generation had worked. The controller's own read of the parent comes first. It names the first
+    task's acknowledgement and counts only that task's payload, because no child inherits the
+    payload owed for a task nobody was served. Each child works the second task in a world of its
+    own and seals it, and what it is offered afterwards is the cell its own row names out of the
+    source its own seal committed: the graded copy its graded cell, the placebo copy its placebo
+    cell and the oracle copy its oracle cell.
+
+    The three are worked together, the way a controller works its copies: all three are served the
+    task before any seals it, and all three seal before any is offered what it sealed. The pair
+    then take their receipts and finish with both payloads delivered. The oracle copy is left
+    where it sealed, its receipt built and offered to nobody. A Done asked of it would come after
+    its oracle cell, so the oracle's silence is the controller's to keep: it never pulls from that
+    copy again.
+
+    The three worlds are opened on three positions of this environment, so the three sources hold
+    different bodies and a body says which source it is an entry of. That is what lets the end of
+    the test show each offer is an entry of its own child's source and of no sibling's.
+    """
+    blobs = tmp_path / "blobs"
+    contract = contract_of(world.env)
+    held_out = replace(contract_of(world.env, 1), contract_id=HELD_OUT)
+    turnover_at(10_000)
+    composed = oracle_capable(owing_twice(start_for(world, contract, blobs), held_out))
+    route = WorldRoute()
+    parent = "stream/three-second-seals/1"
+    route.record(parent, ATTEMPT, world, 1)
+    opened: List[ServedEpisode] = []
+    sources: Dict[str, SourceArtifactManifest] = {}
+    offered: Dict[str, OfferedMessage] = {}
+    seals: Dict[str, str] = {}
+    try:
+        async with stream_worker(env.client, activities=a_routed_worker(world, route)):
+            caller = await worked(env, composed, blobs, parent, filing_of(world.env))
+
+            # The read a controller composes its fork from, made the way it makes it. The payload
+            # owed for the second task is not one a child inherits, so the evidence stands.
+            answered = await caller.stream.checkpoint_evidence()
+            assert answered.found and answered.evidence is not None, answered.reason
+            check_checkpoint_evidence(answered.evidence)
+            evidence = answered.evidence
+            assert evidence.source_attempt_id == ATTEMPT
+            assert evidence.capacity_in_use == 0
+            request = await a_fork_request(
+                env.client, caller, composed, tmp_path, plans=three_plans(composed, tmp_path)
+            )
+            assert (
+                evidence.parent_workflow_id,
+                evidence.parent_run_id,
+                evidence.execution_ordinal,
+                evidence.configuration_hash,
+                evidence.source_attempt_id,
+                evidence.attestation_id,
+                evidence.acknowledgement_message_id,
+                evidence.acknowledged_visible_sha256,
+                evidence.acknowledged_cursor,
+                evidence.projection_digest,
+            ) == (
+                request.parent_workflow_id,
+                request.parent_run_id,
+                request.parent_execution_ordinal,
+                request.parent_configuration_hash,
+                request.source_attempt_id,
+                request.attestation_id,
+                request.acknowledgement_message_id,
+                request.acknowledged_visible_sha256,
+                request.acknowledged_cursor,
+                request.projection_digest,
+            )
+            receipt = await fork_stream(env.client, request)
+            assert receipt.children == 3
+            children = [
+                (await started_with(env.client, child.child_workflow_id), child)
+                for child in receipt.child_receipts
+            ]
+            answer = filing_of(world.env)
+
+            # Every child takes its inherited payload and is served the second task before any of
+            # them seals it.
+            callers: Dict[str, Caller] = {}
+            for index, (start, child) in enumerate(children):
+                identity = child.child_workflow_id
+                cell = child.target_cell
+                [row] = [one for one in start.dispositions if one.attempt_id == OWED]
+                assert (row.kind, row.cell, row.policy_digest, row.branch_slot, row.family_id) == (
+                    DELIVER,
+                    cell,
+                    CELL_POLICIES[cell],
+                    child.branch_slot,
+                    HELD_OUT,
+                )
+
+                stream, _ready = await a_ready_child(env.client, start, identity, blobs)
+                child_caller = await a_child_caller(stream, start)
+                inherited = await child_caller.pull()
+                assert (inherited.kind, inherited.attempt_id, inherited.message_id) == (
+                    "payload",
+                    ATTEMPT,
+                    oid(0x103),
+                )
+                assert sha256(body_of(inherited).encode("ascii")).hexdigest() == (
+                    child.selected_body_reference
+                )
+                await child_caller.present(inherited)
+                task = await child_caller.pull()
+                assert (task.kind, task.attempt_id, task.message_id) == ("task", OWED, oid(0x105))
+                await child_caller.present(task)
+                own = await a_world_at(frozen_bundle, tmp_path, index, f"second-{index}")
+                opened.append(own)
+                route.record(identity, OWED, own, 1)
+                callers[cell] = child_caller
+
+            # Every child seals it before any of them is offered what it sealed.
+            for _start, child in children:
+                child_caller = callers[child.target_cell]
+                ack = await child_caller.seal(answer, attempt_id=OWED)
+                assert (ack.kind, ack.attempt_id, ack.message_id) == (
+                    "seal_ack",
+                    OWED,
+                    oid(0x106),
+                )
+                await child_caller.present(ack)
+
+            # Then each is read and offered its own, the last to seal first. The source is the one
+            # this child's own seal committed, under its own hidden execution and over its own
+            # filing, and the offer is the entry in it for the cell this child's own row names.
+            for start, child in reversed(children):
+                identity = child.child_workflow_id
+                cell = child.target_cell
+                records = await child_records(env.client, identity)
+                [sealed] = [one for one in records.attempts if one.attempt_id == OWED]
+                assert sealed.source_generation == identity
+                assert {one.attempt_id: one.receipt_contract_id for one in records.attempts} == {
+                    ATTEMPT: CONTRACT,
+                    OWED: HELD_OUT,
+                }
+                assert not sealed.payload_delivered
+                assert receipt_lifecycle(sealed) == RECEIPT_BUILT
+                provenance = sealed.source_provenance
+                assert provenance is not None
+                source = read_source_artifact(
+                    json.loads(
+                        FilesystemBlobStore(Path(start.blob_root or "")).read(
+                            provenance.source_commitment
+                        )
+                    )
+                )
+                origin = SourceOriginContext(
+                    hidden_execution_id=start.hidden_execution_id,
+                    execution_ordinal=start.execution_ordinal,
+                )
+                assert source.source_attempt_id == OWED
+                assert source.receipt_contract.contract_id == HELD_OUT
+                assert provenance.source_seal_id == source_seal_id(origin, OWED)
+                assert source.source_seal_id == provenance.source_seal_id
+                assert provenance.kernel_submission_digest == sealed.submission_digest
+                assert source.kernel_submission_digest == sealed.submission_digest
+                assert provenance.selected_cell == cell
+                assert provenance.selected_policy_digest == CELL_POLICIES[cell]
+                assert provenance.selected_body_reference == source.cells[cell].sha256
+                sources[cell], seals[cell] = source, provenance.source_seal_id
+                if cell == ORACLE_CELL:
+                    continue
+
+                child_caller = callers[cell]
+                payload = await child_caller.pull()
+                assert (payload.kind, payload.attempt_id, payload.message_id) == (
+                    "payload",
+                    OWED,
+                    oid(0x107),
+                )
+                raw = body_of(payload).encode("ascii")
+                assert sha256(raw).hexdigest() == source.cells[cell].sha256
+                assert len(raw) == BODY_SIZE == held_out.body_size
+                assert len(payload.visible_text.encode("utf-8")) == payload_wire_count(
+                    payload_message_id=oid(0x107),
+                    attempt_id=OWED,
+                    encoded_body_bytes=source.pair_parity.encoded_body_bytes,
+                )
+                await child_caller.present(payload)
+                offered[cell] = payload
+                [delivered] = [
+                    one
+                    for one in (await child_records(env.client, identity)).attempts
+                    if one.attempt_id == OWED
+                ]
+                assert delivered.payload_delivered
+                assert receipt_lifecycle(delivered) == RECEIPT_COMMITTED
+
+                # A copy that has taken its second receipt finishes, with both payloads delivered.
+                await child_caller.stream.close_queue()
+                done = await child_caller.pull()
+                assert (done.kind, done.message_id) == ("done", oid(2))
+                await child_caller.present(done)
+                outcome = await child_caller.stream.handle.result()
+                assert outcome.generation_state == "done"
+                assert (outcome.sealed, outcome.payloads_delivered) == (2, 2)
+
+            # The oracle copy is still where it sealed after its siblings finished: its receipt
+            # built and offered to nobody. Nothing in the kernel keeps it there. Asked for Done,
+            # it is offered its oracle cell first, so a controller that kept it silent never pulls
+            # from it again.
+            [oracle] = [child for _start, child in children if child.target_cell == ORACLE_CELL]
+            records = await child_records(env.client, oracle.child_workflow_id)
+            [held] = [one for one in records.attempts if one.attempt_id == OWED]
+            assert not held.payload_delivered
+            assert receipt_lifecycle(held) == RECEIPT_BUILT
+            assert held.source_provenance is not None
+            assert held.source_provenance.selected_cell == ORACLE_CELL
+            oracle_caller = callers[ORACLE_CELL]
+            await oracle_caller.stream.close_queue()
+            statement = await oracle_caller.pull()
+            assert (statement.kind, statement.attempt_id, statement.message_id) == (
+                "payload",
+                OWED,
+                oid(0x107),
+            )
+            raw = body_of(statement).encode("ascii")
+            assert sha256(raw).hexdigest() == sources[ORACLE_CELL].cells[ORACLE_CELL].sha256
+            assert len(raw) == BODY_SIZE
+            offered[ORACLE_CELL] = statement
+    finally:
+        for one in opened:
+            await one.close()
+
+    # Three seals and three sources, and each offer is exactly one entry among all of them: the
+    # cell its own row named, in the source its own seal committed. The pair, each out of a source
+    # of its own, still reach the transport at one length.
+    assert len(set(seals.values())) == 3
+    assert len({source_commitment(one) for one in sources.values()}) == 3
+    for cell, payload in offered.items():
+        digest = sha256(body_of(payload).encode("ascii")).hexdigest()
+        assert [
+            (owner, kind)
+            for owner, source in sources.items()
+            for kind, reference in source.cells.items()
+            if reference.sha256 == digest
+        ] == [(cell, cell)]
+    pair = [offered[GRADED_CELL], offered[PLACEBO_CELL]]
+    assert len({len(one.visible_text.encode("utf-8")) for one in pair}) == 1
 
 
 async def test_an_oracle_copy_that_fails_before_its_readout_leaves_the_pair_where_it_was(

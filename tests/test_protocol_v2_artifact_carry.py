@@ -6239,3 +6239,53 @@ def test_a_generation_owing_more_than_the_payload_a_child_inherits_answers_with_
     assert not answered.found and answered.evidence is None
     assert "the one unresolved payload" in answered.reason
     assert SILENT in answered.reason
+
+
+def test_a_payload_owed_for_a_task_nobody_was_offered_is_not_one_a_fork_refuses(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A later position owing a payload is forked over until its task is served.
+
+    The second position here owes a payload and its task has not been offered, so its obligation
+    is assigned and its attempt is planned. No child inherits that payload: each child serves the
+    task, seals it itself and delivers its own row's cell of the source its own seal commits. So
+    the evidence names the acknowledgement, the barrier refuses nothing and both children are
+    built.
+
+    The same assigned obligation over an attempt that was served and sealed is a payload owed for
+    work already done. That prefix still owes two payloads, and the evidence and the barrier both
+    still refuse it.
+    """
+    owed = [
+        CarriedObligation(
+            attempt_id=ATTEMPT, state="eligible", materialized=True, candidate=a_candidate()
+        ),
+        CarriedObligation(attempt_id=SILENT, state="assigned"),
+    ]
+    parent = a_quiet_parent(monkeypatch, start=a_two_position_parent(), obligations=owed)
+    assert parent._attempts[SILENT].state == kernel_workflow.PLANNED
+
+    answered = parent.checkpoint_evidence()
+    assert answered.found and answered.evidence is not None
+    assert answered.evidence.source_attempt_id == ATTEMPT
+    request = a_fork_request(
+        parent,
+        child_plans=[
+            a_plan_over(parent, FIRST_SLOT, GRADED_CELL),
+            a_plan_over(parent, SECOND_SLOT, PLACEBO_CELL),
+        ],
+    )
+    parent._refuse_a_fork(request)
+    assert len(parent._built_children(request)) == 2
+
+    sealed = a_quiet_parent(
+        monkeypatch,
+        start=a_two_position_parent(),
+        attempts=[a_row(), a_second_row()],
+        obligations=owed,
+    )
+    assert not sealed.checkpoint_evidence().found
+    refusal = fork_refusal(sealed, a_fork_request(sealed))
+    assert refusal.reason == FORK_NOT_QUIET
+    assert "inherits one unresolved payload" in refusal.clause
+    assert SILENT in refusal.clause

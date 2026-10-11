@@ -4087,18 +4087,16 @@ class StreamWorkflow:
         A generation whose owed payload belongs to an attempt with no acknowledgement standing
         answers with the reason rather than failing, which is what a controller asking while an
         agent is still working has asked. So does one owing more than the single payload a child
-        inherits, which is a prefix the boundary refuses rather than a read to guess between.
+        inherits, which is a prefix the boundary refuses rather than a read to guess between. A
+        payload owed for a task this generation has not served is not counted here, because no
+        child inherits it: each child serves that task and seals it itself.
         """
-        owed = sorted(
-            attempt_id
-            for attempt_id, obligation in self._obligations.items()
-            if obligation.state in UNFULFILLED_OBLIGATION
-        )
+        owed = self._owed_for_served_tasks()
         if len(owed) != 1:
             return CheckpointEvidenceAnswer(
                 found=False,
                 reason="a child inherits the one unresolved payload of the attempt a fork is cut "
-                f"over, and this generation owes {owed}",
+                f"over, and for the tasks it has served this generation owes {owed}",
             )
         attempt = self._attempts.get(owed[0])
         if attempt is None or attempt.state != ACK_PRESENTED:
@@ -4399,28 +4397,41 @@ class StreamWorkflow:
             return None
         return latest
 
+    def _owed_for_served_tasks(self) -> List[str]:
+        """Every attempt whose task this generation served and whose payload it still owes.
+
+        A payload owed for a task nobody has been offered is not one a child inherits. Every child
+        is handed that task whole, serves it, seals it in a world of its own and delivers its own
+        row's cell of the source its own seal commits, so a fork counts it nowhere. An obligation
+        still assigned after its task was served is a payload owed for work already done, and it
+        is counted like any other.
+        """
+        return sorted(
+            attempt_id
+            for attempt_id, owed in self._obligations.items()
+            if owed.state in UNFULFILLED_OBLIGATION
+            and self._attempts[attempt_id].state != PLANNED
+        )
+
     def _refuse_the_inherited_obligation(self, request: ForkRequest) -> None:
         """Refuse a prefix whose payload obligations are not the one shape a child can inherit.
 
         Quiet at capacity one does not imply the inherited payload is what a child pulls first: the
         schedule ranks eligible tasks and eligible obligations together, and a plan that puts tasks
         first would serve the next task before the receipt. So the inherited obligation has to be
-        the sole unresolved one, materialized and offerable and unpresented, and the schedule's next
-        selection has to be precisely that payload.
+        the sole unresolved one owed for a served task, materialized and offerable and unpresented,
+        and the schedule's next selection has to be precisely that payload.
 
         A fork over a prefix that already delivered a payload is refused too, so no child has to
         reconcile a new branch slot against a delivered row and the slot provenance question stays
         closed for this build.
         """
-        unresolved = sorted(
-            attempt_id
-            for attempt_id, owed in self._obligations.items()
-            if owed.state in UNFULFILLED_OBLIGATION
-        )
+        unresolved = self._owed_for_served_tasks()
         if unresolved != [request.source_attempt_id]:
             raise ForkRefused(
                 FORK_NOT_QUIET,
-                f"a child inherits one unresolved payload and this generation owes {unresolved}",
+                "a child inherits one unresolved payload and for the tasks it has served this "
+                f"generation owes {unresolved}",
             )
         owed = self._obligations[request.source_attempt_id]
         if owed.state != ELIGIBLE or not owed.materialized:
