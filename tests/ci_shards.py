@@ -17,8 +17,8 @@ selections that run in one process. A durable test holds real time timeouts that
 can miss, a fork copies a process whatever its other threads are doing, and an edited source file
 moves the code pin under every test that computes it while the edit lasts.
 
-The partition was last cut from main's run on a change to no code, whose pytest steps measured, in
-seconds:
+The partition was last cut from a run of main's code, on a change to documentation only, whose
+pytest steps measured, in seconds:
 
     receipt-families   594   four workers; retail's frozen bank fixture and rebuild test were 546
     receipt-serving    441   four workers, no long group; the CLI module was about half the work
@@ -29,11 +29,24 @@ seconds:
     frontier           134   one process, after 83s of image builds
 
 A group runs on one worker, so a job takes at least its longest group, and a test is slower when
-more workers are busy beside it: retail's rebuild test took 138s on two workers, and 218s to 473s
-on four. Runners also differ: the same test took about twice as long on some as on others, so a
-job is cut to fit the slower ones. Hence the modules holding the two longest groups, retail's and
-soundchange's, became jobs of their own on fewer workers, and the CLI and the four receipt modules
-on the test server left the jobs they were half of.
+more workers are busy beside it: retail's rebuild test took 218s to 473s on four workers, and 138s
+to 249s with fewer busy beside it. Runners differ too: one test took about twice as long on some as
+on others, so a job is cut to fit the slower ones. Hence retail's and soundchange's modules, which
+hold the two longest groups, run as jobs of their own on fewer workers, the CLI and the four
+receipt modules on the test server left the jobs they were half of, and the scheduler checks moved
+from rest to durable. The first run of this layout measured, in seconds of pytest:
+
+    receipt-banded       437   standing's bank group, in one module this partition cannot split
+    receipt-retail       343   on a slow runner, its group 338 of it
+    durable              316   on a slow runner
+    frontier             270   on a slow runner, after its image builds
+    receipt-attacks      250   then ruff and pyright
+    receipt-cli          237
+    durable-receipts     219
+    receipt-families     206
+    receipt-serving      177
+    receipt-soundchange  158   on a slow runner
+    rest                 157
 
 The selections live here rather than in the workflow because two readers need the same answer.
 The workflow asks which paths a shard runs and on how many workers, which assets it needs
@@ -103,8 +116,8 @@ SUITE_MARKER = "not network"
 
 # The asset groups tests/prepare_offline_suite.py provisions, named here because a shard declares
 # which ones its modules need and its job prepares those and nothing else. The receipt shards need
-# no upstream at all; only the frontier shard needs a task image built; only the durable shard
-# starts a test server, so it alone asks for the binary.
+# no upstream at all; only the frontier shard needs a task image built; only the two durable
+# shards start a test server, so they alone ask for the binary.
 SOURCES = "sources"
 TAU2_DATA = "tau2-data"
 DURABLE_SERVICE = "durable-service"
@@ -232,6 +245,11 @@ SHARDS: Tuple[Shard, ...] = (
     Shard(
         name="durable",
         paths=(
+            # The guard's own checks under the grouped scheduler. They are about its code rather
+            # than about any job's selection, so they run once rather than in every job. They need
+            # nothing prepared, and they run here rather than in rest, which they made one of the
+            # slowest jobs.
+            "tests/test_ci_scheduling.py",
             "tests/test_protocol_v2_finalize.py",
             "tests/test_protocol_v2_gateway_schedules.py",
             "tests/test_protocol_v2_kernel.py",
@@ -240,10 +258,6 @@ SHARDS: Tuple[Shard, ...] = (
             "tests/test_protocol_v2_resume.py",
             "tests/test_protocol_v2_scheduled_stream.py",
             "tests/test_protocol_v2_turnover.py",
-            # The guard's own checks under the grouped scheduler. They are about its code rather
-            # than about any job's selection, so they run once rather than in every job, and here
-            # because this is the lightest job. They need nothing prepared.
-            "tests/test_ci_scheduling.py",
         ),
         assets=(DURABLE_SERVICE,),
     ),
