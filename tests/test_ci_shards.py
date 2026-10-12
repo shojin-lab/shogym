@@ -166,6 +166,7 @@ def test_only_the_receipt_selections_run_with_workers() -> None:
         "receipt-soundchange": 2,
         "receipt-retail": 3,
         "receipt-banded": 4,
+        "receipt-banded-v2": 4,
     }
     for path, reason in _ONE_PROCESS_ONLY.items():
         held = [shard(name) for name in owners(path)]

@@ -23,10 +23,20 @@ GENRES = {
     # Placings within heats under hidden marking, disqualification, lateness and tie
     # rules, read off a full receipt.
     "judging": "shogym.envs.receipts.generators.judging",
+    # The second version of judging, beside the first rather than in place of it: its
+    # extract says what the rules may do where the first says what they do, and names
+    # where every surface prints the entry number. The first version's banks keep
+    # drawing the instances the studies drew.
+    "judging_v2": "shogym.envs.receipts.generators.judging_v2",
     "ledger": "shogym.envs.receipts.generators.ledger",
     "retail_refund": "shogym.envs.receipts.generators.retail_refund",
     # Priority banding under a hidden points schedule, read off a full receipt.
     "scorecard": "shogym.envs.receipts.generators.scorecard",
+    # The second version of scorecard, beside the first rather than in place of it: its
+    # extract states the score as every repeat rule computes it, and names where every
+    # surface prints the id. The first version's banks keep drawing the instances the
+    # studies drew.
+    "scorecard_v2": "shogym.envs.receipts.generators.scorecard_v2",
     "soundchange": "shogym.envs.receipts.generators.soundchange",
     # The second version of sound change, beside the first rather than in place of it: a
     # bank names its generator and recomputes its population, so the first version's
@@ -35,6 +45,10 @@ GENRES = {
     # A member's standing after each infraction under hidden lapse, repeat, first
     # offence and falling rules, read off a full receipt.
     "standing": "shogym.envs.receipts.generators.standing",
+    # The second version of standing, beside the first rather than in place of it: its
+    # filing line names where every surface prints the id. The first version's banks
+    # keep drawing the instances the studies drew.
+    "standing_v2": "shogym.envs.receipts.generators.standing_v2",
 }
 
 #: The gate vectors. They wear the generator protocol so the gates can be exercised
