@@ -10,7 +10,7 @@
    - Builders write lean comments from the start: what and why, in a few lines.
 2. Launch one cold review per PR, bottom up.
    - The reviewer runs `codex exec -m gpt-6-astra -c model_reasoning_effort="ultra"`: maximum reasoning, with delegated agents at xhigh.
-   - The brief gives the spec the PR must meet, the design and the registration, and names every other PR in the stack with one line of scope.
+   - The brief gives the spec the PR must meet and names every other PR in the stack with one line of scope.
    - Fix a finding only if, in the runs we plan to do, it could change:
      - a grade;
      - an outcome row;
