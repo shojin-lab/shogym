@@ -143,14 +143,15 @@ def test_exactly_one_shard_carries_the_lint_and_type_checks() -> None:
 
 
 def test_only_the_receipt_selections_run_with_workers() -> None:
-    """The four receipt selections run four workers each, and every other shard one process.
+    """The receipt selections that need no test server run on workers, every other in one process.
 
     A durable test holds real time timeouts, a fork copies a process whatever its other threads
     are doing, and a test that edits the package's source moves the code pin under every test that
     computes it, so none of them may share a job with workers. The durable tests are held by the
     one asset they all need: a shard that prepares the test server runs in one process. This fails
-    if a worker count is not a whole number, if a receipt selection does not run four, if any
-    other shard runs workers, or if a file listed above is in a shard that does.
+    if a worker count is not a whole number, if a receipt selection does not run the count its
+    measurement chose, if any other shard runs workers, or if a file listed above is in a shard
+    that does.
     """
     for candidate in SHARDS:
         assert isinstance(candidate.workers, int) and candidate.workers >= 0, candidate
@@ -160,7 +161,9 @@ def test_only_the_receipt_selections_run_with_workers() -> None:
     assert running == {
         "receipt-attacks": 4,
         "receipt-serving": 4,
+        "receipt-cli": 4,
         "receipt-families": 4,
+        "receipt-retail": 2,
         "receipt-banded": 4,
     }
     for path, reason in _ONE_PROCESS_ONLY.items():
