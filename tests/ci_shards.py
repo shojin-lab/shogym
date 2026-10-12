@@ -3,11 +3,11 @@
 CI is the suite, and ninety nine percent of a job is pytest. The seconds are not spread evenly
 over the tree: the receipt modules hold most of them, because every bank they fill and every bundle
 they build or verify walks admission over a population. Splitting by count would therefore split
-nothing, so the suite is split by module into seven selections, and each is a job that checks out,
+nothing, so the suite is split by module into eleven selections, and each is a job that checks out,
 installs, prepares only the assets its own modules need and runs only its own paths. The run then
-costs what its slowest shard costs instead of what all seven cost together.
+costs what its slowest shard costs instead of what all eleven cost together.
 
-Four of those jobs also run their tests in several processes. A shard's ``workers`` is how many
+Seven of those jobs also run their tests in several processes. A shard's ``workers`` is how many
 pytest-xdist workers its job starts, under ``--dist loadgroup`` so that the tests one module-scoped
 bundle or bank serves go to one worker together, and zero is one process, which is what ``-n 0``
 means to pytest-xdist. Only the receipt selections have workers: their cost is admission walks,
@@ -17,39 +17,36 @@ selections that run in one process. A durable test holds real time timeouts that
 can miss, a fork copies a process whatever its other threads are doing, and an edited source file
 moves the code pin under every test that computes it while the edit lasts.
 
-The partition was last cut from one measurement, of whole jobs in seconds, taken on the offline run
-before any selection had workers:
+The partition was last cut from a run of main's code, on a change to documentation only, whose
+pytest steps measured, in seconds:
 
-    rest              1799s   every other module; about 1560s of its pytest was receipt modules
-    receipt-serving   1172s   the receipt environment, its bank, the ledger pack and the CLI
-    receipt-attacks    950s   the attack surface of a bundle, and the cells a seal publishes
-    frontier           330s   the vendored task oracles, their containers and their verifiers
-    durable            243s   the kernel and the rest of protocol v2, on the test server
+    receipt-families   594   four workers; retail's frozen bank fixture and rebuild test were 546
+    receipt-serving    441   four workers, no long group; the CLI module was about half the work
+    receipt-banded     426   four workers; standing's bank group was about 420
+    receipt-attacks    364   four workers, then ruff and pyright
+    durable            344   one process; the four receipt modules were about half
+    rest               259   one process
+    frontier           134   one process, after 83s of image builds
 
-So the receipt modules ``rest`` held that need no server became ``receipt-families``, the four that
-serve a generation over the test server joined ``durable``, and ``rest`` kept everything else and
-the collection of the whole tree. The first run of this layout passed in every job and measured,
-as whole jobs and then as pytest alone:
+A group runs on one worker, so a job takes at least its longest group, and a test is slower when
+more workers are busy beside it: retail's rebuild test took 218s to 473s on four workers, and 138s
+to 249s with fewer busy beside it. Runners differ too: one test took about twice as long on some as
+on others, so a job is cut to fit the slower ones. Hence retail's and soundchange's modules, which
+hold the two longest groups, run as jobs of their own on fewer workers, the CLI and the four
+receipt modules on the test server left the jobs they were half of, and the scheduler checks moved
+from rest to durable. The first run of this layout measured, in seconds of pytest:
 
-    receipt-serving    731s   698s   four workers, 95 passed
-    receipt-families   643s   606s   four workers, 240 passed
-    receipt-attacks    517s   473s   four workers, 177 passed, then ruff and pyright
-    durable            472s   423s   one process, 405 passed
-    frontier           386s   276s   one process, 20 passed
-    rest               335s   254s   one process, 1992 passed and 87 skipped
-
-That is 3084 job seconds where there were 4494, and a slowest job of about twelve minutes where
-there was one of thirty. It is not every job under ten minutes: two receipt jobs are over that.
-
-Three things in that run say where the rest of the time is. A test on one of four workers took
-about 1.9 times what it took alone, so the runner's four CPUs gave about two times, not four:
-retail's rebuild test took 467s against 245s alone, and the ledger pack's bundle test 232s against
-125s. A group is as slow as its tests added up, and retail's group, its fixture at 119s and that
-rebuild test, is most of ``receipt-families`` by itself. And fixtures that are built per process
-are built per worker: the attacks' session bundle was built by all four workers, about 63s on three
-of them, and the protocol and served modules each built the verified template on a worker of their
-own, 160s and 151s. ``receipt-serving`` has no one long group; its work is spread over all four
-workers, so it is what that work costs rather than what any one test does.
+    receipt-banded       437   standing's bank group, in one module this partition cannot split
+    receipt-retail       343   on a slow runner, its group 338 of it
+    durable              316   on a slow runner
+    frontier             270   on a slow runner, after its image builds
+    receipt-attacks      250   then ruff and pyright
+    receipt-cli          237
+    durable-receipts     219
+    receipt-families     206
+    receipt-serving      177
+    receipt-soundchange  158   on a slow runner
+    rest                 157
 
 The selections live here rather than in the workflow because two readers need the same answer.
 The workflow asks which paths a shard runs and on how many workers, which assets it needs
@@ -119,8 +116,8 @@ SUITE_MARKER = "not network"
 
 # The asset groups tests/prepare_offline_suite.py provisions, named here because a shard declares
 # which ones its modules need and its job prepares those and nothing else. The receipt shards need
-# no upstream at all; only the frontier shard needs a task image built; only the durable shard
-# starts a test server, so it alone asks for the binary.
+# no upstream at all; only the frontier shard needs a task image built; only the two durable
+# shards start a test server, so they alone ask for the binary.
 SOURCES = "sources"
 TAU2_DATA = "tau2-data"
 DURABLE_SERVICE = "durable-service"
@@ -171,15 +168,13 @@ SHARDS: Tuple[Shard, ...] = (
         paths=("tests/envs/test_frontier_bench_served.py",),
         assets=(TASK_IMAGES,),
     ),
-    # The other side of the receipts port: the served environment, the bank underneath it and the
-    # CLI an operator reaches both through. These pay for bundle construction the way the attacks
-    # module does, so they are balanced against it rather than added to it, and run on four
-    # workers for the same reason.
+    # The other side of the receipts port: the served environment and the bank underneath it.
+    # These pay for bundle construction the way the attacks module does, so they are balanced
+    # against it rather than added to it, and run on four workers for the same reason.
     Shard(
         name="receipt-serving",
         paths=(
             "tests/envs/test_receipts_bank.py",
-            "tests/envs/test_receipts_cli.py",
             # The ledger review pack, here rather than beside the other genres' packs. It fills
             # one small bank and exports a pack over it, and the tests that read them run
             # together on one worker.
@@ -187,6 +182,13 @@ SHARDS: Tuple[Shard, ...] = (
             "tests/envs/test_receipts_protocol_v2.py",
             "tests/envs/test_receipts_served.py",
         ),
+        workers=4,
+    ),
+    # The CLI an operator reaches both through. Each test runs the shipped commands end to end
+    # and pays for its own walks, and together they were half of ``receipt-serving``.
+    Shard(
+        name="receipt-cli",
+        paths=("tests/envs/test_receipts_cli.py",),
         workers=4,
     ),
     # The receipt families: each genre's own module and the reading, rendering and policy modules
@@ -200,12 +202,29 @@ SHARDS: Tuple[Shard, ...] = (
             "tests/envs/test_receipts_components.py",
             "tests/envs/test_receipts_full_policy.py",
             "tests/envs/test_receipts_render.py",
-            "tests/envs/test_receipts_retail_refund.py",
             "tests/envs/test_receipts_sampled.py",
+        ),
+        workers=4,
+    ),
+    # The soundchange genre's two versions. Their frozen bank group was the longest left in
+    # ``receipt-families`` once retail had gone, so they run on two workers: the group has one to
+    # itself.
+    Shard(
+        name="receipt-soundchange",
+        paths=(
             "tests/envs/test_receipts_soundchange.py",
             "tests/envs/test_receipts_soundchange_v2.py",
         ),
-        workers=4,
+        workers=2,
+    ),
+    # Retail's frozen bank group is the longest group in the suite, and beside the other families
+    # it was the whole of ``receipt-families``. Three workers: the group has one to itself, and
+    # the other two take the module's other tests. With two, the scheduler gave the group's
+    # worker the CLI test while the group was still running, and the job waited on both.
+    Shard(
+        name="receipt-retail",
+        paths=("tests/envs/test_receipts_retail_refund.py",),
+        workers=3,
     ),
     # The scorecard, standing and judging tests each fill an admitted bank of twenty four.
     # Beside the other families they would have taken ``receipt-families``,
@@ -223,16 +242,14 @@ SHARDS: Tuple[Shard, ...] = (
     # of which 143s is the set that used to be deselected and 3s is what ``rest`` was already
     # paying for these files. Folding it in would put all 143s on the job that holds most of the
     # tree, and the rule this partition follows is to make the slowest job as fast as it can be.
-    #
-    # The four receipt modules that serve a real generation over the test server are here too,
-    # because this is the job that prepares it and runs in one process.
     Shard(
         name="durable",
         paths=(
-            "tests/envs/test_receipts_artifact_carry.py",
-            "tests/envs/test_receipts_artifact_route.py",
-            "tests/envs/test_receipts_read_back.py",
-            "tests/envs/test_receipts_recovery.py",
+            # The guard's own checks under the grouped scheduler. They are about its code rather
+            # than about any job's selection, so they run once rather than in every job. They need
+            # nothing prepared, and they run here rather than in rest, which they made one of the
+            # slowest jobs.
+            "tests/test_ci_scheduling.py",
             "tests/test_protocol_v2_finalize.py",
             "tests/test_protocol_v2_gateway_schedules.py",
             "tests/test_protocol_v2_kernel.py",
@@ -241,6 +258,19 @@ SHARDS: Tuple[Shard, ...] = (
             "tests/test_protocol_v2_resume.py",
             "tests/test_protocol_v2_scheduled_stream.py",
             "tests/test_protocol_v2_turnover.py",
+        ),
+        assets=(DURABLE_SERVICE,),
+    ),
+    # The four receipt modules that serve a real generation over the test server. They prepare it
+    # and run in one process for the reasons ``durable`` does, and they are a job of their own
+    # because beside protocol v2 they were about half of a job that passed seven minutes.
+    Shard(
+        name="durable-receipts",
+        paths=(
+            "tests/envs/test_receipts_artifact_carry.py",
+            "tests/envs/test_receipts_artifact_route.py",
+            "tests/envs/test_receipts_read_back.py",
+            "tests/envs/test_receipts_recovery.py",
         ),
         assets=(DURABLE_SERVICE,),
     ),
@@ -294,9 +324,6 @@ SHARDS: Tuple[Shard, ...] = (
             # The identity audit, here because this is the job that prepares the pinned upstream
             # sources, and the whole tests tree only collects where they are.
             "tests/test_ci_partition.py",
-            # The guard's own checks under the grouped scheduler. They are about its code rather
-            # than about any job's selection, so they run once rather than in every job.
-            "tests/test_ci_scheduling.py",
             "tests/test_cli.py",
             "tests/test_durable_service.py",
             "tests/test_env_grading.py",
