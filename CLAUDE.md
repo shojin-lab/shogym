@@ -27,9 +27,10 @@
 
 ## Guidance
 
-- CI does the testing.
-  - Tests run in CI, not locally, unless CI minutes run out.
-  - After every push, CI must be green on each PR before work goes on.
+- CI runs the full suite.
+  - Do not also run the full suite locally, unless CI minutes run out.
+  - Do run the tests you add or change, to check the new behaviour and that each test runs.
+  - After every push, get each PR's CI green before other work.
   - Time CI on every push.
   - If CI passes 10 minutes, an efficiency PR goes into the stack.
   - It reviews what made CI slow, then fixes it by sharding or cutting cost, never by raising the timeout.
