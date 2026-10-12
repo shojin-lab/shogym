@@ -1605,17 +1605,39 @@ def test_the_genre_is_registered_and_both_of_its_modules_are_in_the_code_pin() -
     assert pin["modules"]["shogym.envs.receipts.generators.retail_validation"]
 
 
+#: The key the materialize command draws in the test of the shipped commands. FIXED,
+#: because every one of those commands walks admission over the bank again, and what one
+#: admission costs moved with the key. The copy check prices its closed family in under a
+#: second on most instances, in about four seconds on one in four, and in over forty
+#: seconds on one of 240 measured, so a key fresh from the system on every run put that
+#: tail in the suite's time. Under this key admission admits ordinals 0 and 1, which is
+#: the shortest walk a bank of two has, and prices each copy check in under a second.
+SHIPPED_MASTER = hashlib.sha256(b"retail-cli-materialize").digest()
+
+
+def _run(argv: list[str]) -> int:
+    """One `shogym` invocation, and the status it exits with."""
+    from shogym.cli import main
+
+    try:
+        main(argv)
+    except SystemExit as exc:
+        return int(exc.code or 0)
+    return 0
+
+
 def test_the_shipped_commands_materialize_gate_check_and_draw_this_genre(
     tmp_path, monkeypatch, capsys
 ) -> None:
     """The four commands a reader uses, run through the real command line.
 
     It fails if materialization cannot fill a small bank of this genre under the
-    registered bars, if the frozen bank does not rebuild to the same population, if
+    registered bars, if it fills that bank from any ordinals but 0 and 1 under
+    SHIPPED_MASTER, if the frozen bank does not rebuild to the same population, if
     `gate` or `check` rejects an instance the bank holds, or if `draw` does not print
     both task texts and three cells of the registered envelope size.
     """
-    from shogym.cli import main
+    from shogym.envs.receipts import streams
     from shogym.envs.receipts.registry import BANK_DIR_VAR, HISTORY_VAR
 
     monkeypatch.setenv(BANK_DIR_VAR, str(tmp_path / "banks"))
@@ -1623,27 +1645,61 @@ def test_the_shipped_commands_materialize_gate_check_and_draw_this_genre(
     # leaves this command appending to the record of every attempt this machine has
     # made, and a second run of the suite is then refused as a repeat attempt.
     monkeypatch.setenv(HISTORY_VAR, str(tmp_path / "key-history.jsonl"))
+    # The command still draws its key, and the draw answers with SHIPPED_MASTER. The test
+    # after this one holds the draw an operator's run gets.
+    monkeypatch.setattr(streams, "new_master_key", lambda: SHIPPED_MASTER)
 
-    def run(argv: list[str]) -> int:
-        try:
-            main(argv)
-        except SystemExit as exc:
-            return int(exc.code or 0)
-        return 0
-
-    assert run(["receipts", "materialize", "retail_refund", "--size", "2"]) == 0
+    assert _run(["receipts", "materialize", "retail_refund", "--size", "2"]) == 0
     made = capsys.readouterr().out
     assert "materialized 2 instances" in made
     assert "receipts-gates-v4" in made
-    assert run(["receipts", "gate", "retail_refund", "--instances", "2"]) == 0
+    # The walk the key was chosen for, so a build that lengthens it fails here rather than
+    # in the shard's time.
+    assert "ordinals [0, 1]" in made
+    assert _run(["receipts", "gate", "retail_refund", "--instances", "2"]) == 0
     assert "0 of 2 instances rejected" in capsys.readouterr().out
-    assert run(["receipts", "check", "retail_refund", "--instances", "2"]) == 0
+    assert _run(["receipts", "check", "retail_refund", "--instances", "2"]) == 0
     assert "0 of 2 instances failed" in capsys.readouterr().out
-    assert run(["receipts", "draw", "retail_refund", "--side", "a", "--filing", "mixed"]) == 0
+    assert _run(["receipts", "draw", "retail_refund", "--side", "a", "--filing", "mixed"]) == 0
     drawn_out = capsys.readouterr().out
     assert "economic destination choice" in drawn_out
     assert "refund destination schedule" in drawn_out
     assert "all three match the envelope: True" in drawn_out
+
+
+def test_a_materialize_nobody_hands_a_key_draws_a_fresh_one_on_every_attempt(
+    tmp_path, monkeypatch, capsys
+) -> None:
+    """The key an operator's run fills its bank under is the system's, new on each attempt.
+
+    The test above fixes what the command's draw answers. This one runs the same command
+    with the draw left alone and stops the fill before it walks anything. It fails if the
+    fill is not handed a key of KEY_BYTES on each attempt, if a rerolled attempt is handed
+    the first one's key, or if either key is SHIPPED_MASTER.
+    """
+    from shogym.envs.receipts import streams
+    from shogym.envs.receipts.registry import BANK_DIR_VAR, HISTORY_VAR
+
+    monkeypatch.setenv(BANK_DIR_VAR, str(tmp_path / "banks"))
+    monkeypatch.setenv(HISTORY_VAR, str(tmp_path / "key-history.jsonl"))
+    handed: list[bytes] = []
+
+    def stopped(generator, master: bytes, size: int):
+        handed.append(master)
+        raise ValueError("stopped before the walk")
+
+    monkeypatch.setattr(bank_mod, "materialized", stopped)
+
+    assert _run(["receipts", "materialize", "retail_refund", "--size", "2"]) == 1
+    assert _run([
+        "receipts", "materialize", "retail_refund", "--size", "2",
+        "--reroll", "the first attempt was stopped before its walk",
+    ]) == 1
+    assert "this bank cannot be filled: stopped before the walk" in capsys.readouterr().out
+    assert len(handed) == 2
+    assert all(len(key) == streams.KEY_BYTES for key in handed)
+    assert handed[0] != handed[1]
+    assert SHIPPED_MASTER not in handed
 
 
 # --------------------------------------------------------------------------
