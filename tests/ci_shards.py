@@ -3,11 +3,11 @@
 CI is the suite, and ninety nine percent of a job is pytest. The seconds are not spread evenly
 over the tree: the receipt modules hold most of them, because every bank they fill and every bundle
 they build or verify walks admission over a population. Splitting by count would therefore split
-nothing, so the suite is split by module into ten selections, and each is a job that checks out,
+nothing, so the suite is split by module into eleven selections, and each is a job that checks out,
 installs, prepares only the assets its own modules need and runs only its own paths. The run then
-costs what its slowest shard costs instead of what all ten cost together.
+costs what its slowest shard costs instead of what all eleven cost together.
 
-Six of those jobs also run their tests in several processes. A shard's ``workers`` is how many
+Seven of those jobs also run their tests in several processes. A shard's ``workers`` is how many
 pytest-xdist workers its job starts, under ``--dist loadgroup`` so that the tests one module-scoped
 bundle or bank serves go to one worker together, and zero is one process, which is what ``-n 0``
 means to pytest-xdist. Only the receipt selections have workers: their cost is admission walks,
@@ -28,11 +28,12 @@ seconds:
     rest               259   one process
     frontier           134   one process, after 83s of image builds
 
-A group runs on one worker, so a job takes at least its longest group. And runners differ: the
-same test took about twice as long on some runners as on others, in one process and on four
-workers alike, so a job is cut to fit the slower ones. Hence retail's module, which holds the
-longest group, became a job of its own, and the CLI and the four receipt modules on the test
-server left the jobs they were half of.
+A group runs on one worker, so a job takes at least its longest group, and a test is slower when
+more workers are busy beside it: retail's rebuild test took 138s on two workers, and 218s to 473s
+on four. Runners also differ: the same test took about twice as long on some as on others, so a
+job is cut to fit the slower ones. Hence the modules holding the two longest groups, retail's and
+soundchange's, became jobs of their own on fewer workers, and the CLI and the four receipt modules
+on the test server left the jobs they were half of.
 
 The selections live here rather than in the workflow because two readers need the same answer.
 The workflow asks which paths a shard runs and on how many workers, which assets it needs
@@ -189,18 +190,28 @@ SHARDS: Tuple[Shard, ...] = (
             "tests/envs/test_receipts_full_policy.py",
             "tests/envs/test_receipts_render.py",
             "tests/envs/test_receipts_sampled.py",
-            "tests/envs/test_receipts_soundchange.py",
-            "tests/envs/test_receipts_soundchange_v2.py",
         ),
         workers=4,
     ),
+    # The soundchange genre's two versions. Their frozen bank group was the longest left in
+    # ``receipt-families`` once retail had gone, so they run on two workers: the group has one to
+    # itself.
+    Shard(
+        name="receipt-soundchange",
+        paths=(
+            "tests/envs/test_receipts_soundchange.py",
+            "tests/envs/test_receipts_soundchange_v2.py",
+        ),
+        workers=2,
+    ),
     # Retail's frozen bank group is the longest group in the suite, and beside the other families
-    # it was the whole of ``receipt-families``. Two workers: that group has one to itself, and the
-    # module's other tests share the other.
+    # it was the whole of ``receipt-families``. Three workers: the group has one to itself, and
+    # the other two take the module's other tests. With two, the scheduler gave the group's
+    # worker the CLI test while the group was still running, and the job waited on both.
     Shard(
         name="receipt-retail",
         paths=("tests/envs/test_receipts_retail_refund.py",),
-        workers=2,
+        workers=3,
     ),
     # The scorecard, standing and judging tests each fill an admitted bank of twenty four.
     # Beside the other families they would have taken ``receipt-families``,
@@ -229,6 +240,10 @@ SHARDS: Tuple[Shard, ...] = (
             "tests/test_protocol_v2_resume.py",
             "tests/test_protocol_v2_scheduled_stream.py",
             "tests/test_protocol_v2_turnover.py",
+            # The guard's own checks under the grouped scheduler. They are about its code rather
+            # than about any job's selection, so they run once rather than in every job, and here
+            # because this is the lightest job. They need nothing prepared.
+            "tests/test_ci_scheduling.py",
         ),
         assets=(DURABLE_SERVICE,),
     ),
@@ -295,9 +310,6 @@ SHARDS: Tuple[Shard, ...] = (
             # The identity audit, here because this is the job that prepares the pinned upstream
             # sources, and the whole tests tree only collects where they are.
             "tests/test_ci_partition.py",
-            # The guard's own checks under the grouped scheduler. They are about its code rather
-            # than about any job's selection, so they run once rather than in every job.
-            "tests/test_ci_scheduling.py",
             "tests/test_cli.py",
             "tests/test_durable_service.py",
             "tests/test_env_grading.py",

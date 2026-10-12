@@ -163,7 +163,8 @@ def test_only_the_receipt_selections_run_with_workers() -> None:
         "receipt-serving": 4,
         "receipt-cli": 4,
         "receipt-families": 4,
-        "receipt-retail": 2,
+        "receipt-soundchange": 2,
+        "receipt-retail": 3,
         "receipt-banded": 4,
     }
     for path, reason in _ONE_PROCESS_ONLY.items():
